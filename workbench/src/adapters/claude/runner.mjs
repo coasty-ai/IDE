@@ -5,10 +5,13 @@ import { existsSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
-import { buildClaudeLaunch, claudeBin, scrubEnv, userMessage, sessionFolders, DEFAULT_BUDGET_USD } from './args.mjs';
+import { buildClaudeLaunch, claudeBin, scrubEnv, userMessage, sessionFolders, sessionExists, DEFAULT_BUDGET_USD } from './args.mjs';
 import { createClaudeParser } from './parse.mjs';
 
 export const harness = 'claude';
+
+/** Does Claude Code still have this session's conversation? true, false, or null when it cannot tell. */
+export { sessionExists };
 
 /** After SIGTERM, how long the process group gets before SIGKILL. */
 export const STOP_GRACE_MS = 3000;
@@ -124,6 +127,8 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 /**
  * Create a runner for one root agent.
  * @param {object} opts  { agentId, name, task, cwd, model?, budgetUsd?, emit, hook: { url, token }, log }
+ *   `sessionId` continues an earlier session (from history) instead of starting one: call send(), not start(); the
+ *   first message resumes it with `--resume` and the whole of `budgetUsd` (the new process has spent nothing).
  *   Also accepted, mainly for tests: env (base environment), killGraceMs, now, bridgePath, nodePath, machineId.
  */
 export function createRunner(opts = {}) {
@@ -143,9 +148,9 @@ export function createRunner(opts = {}) {
 
   let proc = null;        // the current Claude Code process
   let alive = false;      // it has spawned and not exited
-  let started = false;
+  let started = !!opts.sessionId; // a runner for an earlier session is started already: its first send resumes it
   let stopRequested = false;
-  let sessionId = null;   // ours at first; then whatever Claude Code reports in system/init
+  let sessionId = opts.sessionId ? String(opts.sessionId) : null; // ours at first; then whatever Claude Code reports in system/init
   let launching = null;   // promise of a launch in progress
   let stopping = null;    // promise of a stop in progress
   let closed = null;      // resolves when the current process is fully gone and reported

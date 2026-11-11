@@ -21,6 +21,7 @@ export const EV = Object.freeze({
   MODEL: 'agent.model',           // { agentId, model }
   SESSION: 'agent.session',       // { agentId, sessionId }  harness session or thread id, for resume
   APPROVAL: 'agent.approval',     // { agentId, how: 'auto'|'person'|'timeout', decision: 'allow'|'deny', sentence }
+  RESUMED: 'agent.resumed',       // { agentId }  an earlier agent (from history) is being picked up: it is no longer "earlier"
   ENDED: 'agent.ended',           // { agentId, outcome: 'ok'|'error'|'stopped', error? }
   MACHINE: 'machine.update',      // { machine: Machine }
   NOTICE: 'notice',               // { text }  a short reply from the workbench to the person
@@ -75,6 +76,10 @@ export const SPARK_BUCKETS = 20;
  * @property {string|null} error
  * @property {string|null} sessionId
  * @property {string|null} workspace    folder it works in (shown on request only)
+ * @property {boolean} earlier          true for a root restored from history: it ran in an earlier Workbench run and has no
+ *           process now. Cleared by `agent.resumed` when the person continues it
+ * @property {boolean|null} canContinue earlier agents only (else null): its folder and session are still there
+ * @property {string|null} continueReason  when canContinue is false, why, in plain words
  */
 
 /** A machine that agents run on. */
@@ -136,5 +141,8 @@ export function newAgentView(ev, now = Date.now()) {
     error: null,
     sessionId: null,
     workspace: ev.workspace || null,
+    earlier: false,
+    canContinue: null,
+    continueReason: null,
   };
 }

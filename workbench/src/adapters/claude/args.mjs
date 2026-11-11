@@ -115,6 +115,26 @@ export function sessionFolders({ sessionId, env = process.env, uid = process.get
   return out;
 }
 
+/**
+ * Does Claude Code still have this session's conversation? It keeps one <session id>.jsonl under
+ * <config dir>/projects/<key>/. Returns true or false; null when it cannot tell (no projects folder, an id that is no UUID),
+ * so a layout Workbench does not know never blocks a resume.
+ * @param {{ sessionId: string|null, env?: Record<string,string|undefined> }} o
+ */
+export function sessionExists({ sessionId, env = process.env } = {}) {
+  if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) return null;
+  const e = env || {};
+  const config = e.CLAUDE_CONFIG_DIR || path.join(e.HOME || os.homedir(), '.claude');
+  if (!path.isAbsolute(config)) return null;
+  const projects = path.join(config, 'projects');
+  let keys;
+  try { keys = fs.readdirSync(projects, { withFileTypes: true }); } catch { return null; }
+  for (const k of keys) {
+    if (k.isDirectory() && fs.existsSync(path.join(projects, k.name, `${sessionId}.jsonl`))) return true;
+  }
+  return false;
+}
+
 /** A session name Claude Code cannot mistake for a flag: no leading dashes, no control characters. */
 function safeName(name) {
   const n = String(name || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').replace(/^[\s-]+/, '').trim();

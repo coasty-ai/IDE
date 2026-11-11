@@ -276,10 +276,17 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     if (!n || n.text == null) return;
     broadcast('notice', n.agentId ? { text: String(n.text), agentId: n.agentId } : { text: String(n.text) });
   };
+  const onRemoved = () => {
+    let snap;
+    try { snap = engine.snapshot(); } catch (err) { L.error('Snapshot failed:', err); return; }
+    broadcast('snapshot', snap);
+  };
   if (store?.on) {
     store.on('agents', onAgents);
     store.on('machines', onMachines);
     store.on('notice', onNotice);
+    // An earlier agent the person forgot: the stream has no "removed", so every page gets a fresh snapshot.
+    store.on('removed', onRemoved);
   }
 
   function openStream(req, res) {
@@ -460,6 +467,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     if (closed) return;
     closed = true;
     store?.off?.('agents', onAgents);
+    store?.off?.('removed', onRemoved);
     store?.off?.('machines', onMachines);
     store?.off?.('notice', onNotice);
     clearTimeout(flushTimer);

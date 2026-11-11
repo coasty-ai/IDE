@@ -564,6 +564,33 @@ function matchStop(core, c) {
   return { intent, strong: r.named };
 }
 
+// Earlier agents (from history) --------------------------------------------------------------
+
+/** "forget search cleanup", "forget about it": take an agent out of history. Always asked first (engine). */
+function matchForget(core, c) {
+  const ws = core.map(t => t.w);
+  if (ws[0] !== 'forget') return null;
+  let rest = core.slice(1);
+  if (rest[0] && rest[0].w === 'about') rest = rest.slice(1);
+  if (!rest.length) return null;
+  const r = resolveList(stripTrailing(rest, STOP_TAIL), c);
+  if (!r.ids.length || !r.full) return null; // "forget the old plan, use the new one" is work or an answer
+  return { intent: { kind: 'forget', agentIds: r.ids }, strong: r.named };
+}
+
+/** "continue search cleanup", "pick up it again": only for an agent from an earlier run (else the words go on). */
+function matchContinue(core, c) {
+  const ws = core.map(t => t.w);
+  const v = startsWithSeq(ws, [['pick', 'up'], ['continue'], ['resume'], ['carry', 'on']]);
+  if (!v) return null;
+  const rest = stripTrailing(core.slice(v), [['again'], ['please']]);
+  if (!rest.length) return null;
+  const r = resolveRef(rest, c);
+  const a = r.ids.length === 1 && r.full ? c.agents.find(x => x.id === r.ids[0]) : null;
+  if (!a || !a.earlier) return null;
+  return { intent: { kind: 'continue', agentId: a.id }, strong: r.named };
+}
+
 // Machines -----------------------------------------------------------------------------------
 
 const MACHINE_FILL = new Set(['sleep', 'suspend', 'hibernate', 'turn', 'switch', 'shut', 'shutdown', 'power', 'stop', 'pause', 'put',
@@ -1127,6 +1154,8 @@ function matchCommand(core, c) {
   if (matchStopAll(ws)) return { intent: { kind: 'stop_all' }, strong: true };
   return matchMachines(core, c)
     || matchStop(core, c)
+    || matchForget(core, c)
+    || matchContinue(core, c)
     || matchStatusOrSpend(core, c)
     || matchSay(core, c)
     || matchStart(core, c);
@@ -1201,6 +1230,8 @@ export function describeIntent(intent, ctx) {
     case 'task': return describeStart([{ task: it.task, harness: 'claude', machine: null }], c);
     case 'stop': return Array.isArray(it.agentIds) && it.agentIds.length ? `Stop ${names(it.agentIds)}?` : 'Stop an agent? It is not clear which one.';
     case 'stop_all': return 'Stop every agent?';
+    case 'forget': return Array.isArray(it.agentIds) && it.agentIds.length ? `Forget ${names(it.agentIds)}?` : 'Forget an agent? It is not clear which one.';
+    case 'continue': return `Continue ${agentName(it.agentId, c)} where it left off?`;
     case 'say': return it.agentId ? `Tell ${agentName(it.agentId, c)} ${quote(it.text)}?` : `Send ${quote(it.text)}? It is not clear to which agent.`;
     case 'answer': return `Answer ${agentName(it.agentId, c)} with ${quote(it.text)}?`;
     case 'allow': return `Allow the request from ${agentName(it.agentId, c)}?`;

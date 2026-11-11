@@ -354,6 +354,13 @@ export class Store extends EventEmitter {
         v.sessionId = ev.sessionId ?? null;
         this._started(v, ev.ts, batch, index, changed);
         break;
+      case EV.RESUMED:
+        v.earlier = false;
+        v.canContinue = null;
+        v.continueReason = null;
+        v.now = 'Picking up where it left off';
+        if (Number.isFinite(ev.budgetUsd) && ev.budgetUsd > 0) v.budgetUsd = ev.budgetUsd; // a fresh limit for this run
+        break;
 
       case EV.APPROVAL:
         if (ev.decision === 'deny') v.approvals.denied += 1;
@@ -385,6 +392,64 @@ export class Store extends EventEmitter {
     v.rules = null;
     v.says = null;
     v.files = null;
+  }
+
+  /**
+   * Put a root back from history: a view that shows how it ended, marked `earlier`. `rec` is a record of history.mjs;
+   * `can` is { ok, reason } (can it be continued). Not an event: it happens once, before anything runs, and is not logged.
+   */
+  restore(rec, can) {
+    if (!rec || this._views.has(rec.id)) return null;
+    const ts = rec.endedAt ?? rec.savedAt ?? Date.now();
+    const v = newAgentView({
+      agentId: rec.id, name: rec.name, task: rec.task, harness: rec.harness, model: rec.model, machineId: rec.machineId,
+      budgetUsd: rec.budgetUsd, workspace: rec.workspace?.path ?? null, startedAt: rec.startedAt,
+    }, ts);
+    v.state = rec.state;
+    v.stateReason = rec.stateReason;
+    v.stateSince = ts;
+    v.endedAt = rec.endedAt ?? ts;
+    v.lastEventAt = ts;
+    v.sparkEndsAt = bucketEnd(ts);
+    v.now = rec.state === STATE.STOPPED ? 'Stopped' : 'Done';
+    v.says = rec.says;
+    v.files = copy(rec.files);
+    v.checks = copy(rec.checks);
+    v.rules = copy(rec.rules);
+    v.approvals = { ...rec.approvals };
+    v.usage = { ...rec.usage };
+    v.sessionId = rec.sessionId;
+    v.turns = rec.turns || 0;
+    v.toolCalls = rec.toolCalls || 0;
+    v.earlier = true;
+    v.canContinue = !!can?.ok;
+    v.continueReason = can?.ok ? null : (can?.reason || null);
+    this._views.set(v.id, v);
+    this._meta.set(v.id, { seq: ++this._seq, openTools: new Map(), backgroundTasks: 0, background: null, waitedForHelpers: false });
+    this.emit('agents', [v.id]);
+    return v;
+  }
+
+  /** An earlier agent can no longer (or again) be continued: say why. */
+  markContinue(id, can) {
+    const v = this._views.get(id);
+    if (!v || !v.earlier) return;
+    v.canContinue = !!can?.ok;
+    v.continueReason = can?.ok ? null : (can?.reason || null);
+    this.emit('agents', [id]);
+  }
+
+  /** Take a root, and any helpers, out of the store (an earlier agent the person forgot). */
+  remove(id) {
+    const v = this._views.get(id);
+    if (!v) return false;
+    for (const d of [id, ...this.descendants(id).map(x => x.id)]) {
+      this._views.delete(d);
+      this._meta.delete(d);
+      this._children.delete(d);
+    }
+    this.emit('removed', [id]);
+    return true;
   }
 
   _created(ev, changed) {

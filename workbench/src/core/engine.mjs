@@ -7,6 +7,8 @@
 // This file must not import those modules directly.
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { EV } from '../shared/events.mjs';
 import { STATE, ENDED, ACTIVE, DONE, NEEDS_YOU } from '../shared/states.mjs';
 import { nameFromTask, firstSentence, extractQuestion, plain, describeRequest, quotable } from '../shared/narrate.mjs';
@@ -34,6 +36,10 @@ const HARNESS_NAMES = { claude: 'Claude Code', codex: 'Codex', sim: 'A simulated
 const AFTER_STOP_OK = new Set([EV.USAGE, EV.ENDED, EV.SESSION, EV.MODEL]);
 // States after which an agent cannot use the answer to a held request: they go through at once.
 const FINAL = new Set([STATE.FINISHED, STATE.FAILED, STATE.STOPPED]);
+// What the history file follows: a change to one of these is worth writing (debounced).
+const HISTORY_KINDS = new Set([EV.CREATED, EV.STATE, EV.SAYS, EV.FILES, EV.CHECKS, EV.RULES, EV.MODEL, EV.SESSION,
+  EV.APPROVAL, EV.USAGE, EV.ENDED, EV.RESUMED]);
+const CONTINUE_TEXT = 'Please continue where you left off.';
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
 const ALLOW_LABEL_RE = /^allow$/i;
@@ -96,6 +102,7 @@ function harnessName(h) {
 /** What "do it" does to a confirm card: "start it", "stop them", "send it". */
 function confirmVerb(c) {
   if (c.kind === 'say') return 'send it';
+  if (c.kind === 'forget') return 'forget it';
   const many = (c.kind === 'stop' ? c.agentIds?.length : c.tasks?.length) > 1;
   return `${c.kind === 'stop' ? 'stop' : 'start'} ${many ? 'them' : 'it'}`;
 }
@@ -186,6 +193,9 @@ export class Engine extends EventEmitter {
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.stuck = new StuckDetector({ silenceMs: this.options.stuckSilenceMs });
 
+    this.history = null;        // live mode: the open history of this repository (deps.history.open), or null
+    this.earlierRecs = new Map(); // rootId -> history record, for the agents restored from it that nobody has continued
+    this._resuming = new Set(); // earlier agents being continued now
     this.runs = new Map();      // rootId -> run record for agents this engine launched
     this.held = new Map();      // askId -> a held permission request
     this.later = new Map();     // agentId -> { ask?, state? }: decisions that wait until its held requests are answered
@@ -216,6 +226,7 @@ export class Engine extends EventEmitter {
     if (this.mode === 'live') {
       await this._loadRepo();
       await this._checkHarnesses();
+      this._openHistory();
     } else {
       const ok = !!this.adapters.sim;
       this.harnessInfo = { claude: { ok, simulated: true }, codex: { ok, simulated: true }, sim: { ok } };
@@ -295,6 +306,8 @@ export class Engine extends EventEmitter {
         await withTimeout(Promise.all(tidy.map(r => this._removeUnchanged(r))), this.options.tidyTimeoutMs)
           .catch(() => this.log.warn('Some agent folders were not tidied up in time.'));
       }
+      // Last, so what the tidying did (a removed folder) and the final states are in it.
+      try { this.history?.close(); } catch (err) { this.log.warn('Could not save the history:', err); }
       return { kept: this.keptFolders() };
     })();
     return this._shutdownPromise;
@@ -314,6 +327,7 @@ export class Engine extends EventEmitter {
   /** Last resort on process exit: signal every live agent process group and end every check, synchronously. */
   killAllSync() {
     try { this.deps.receipt?.killChecksSync?.(); } catch { /* ignore */ }
+    try { this.history?.save(); } catch { /* ignore */ }
     for (const r of this.runs.values()) {
       try { r.receipt?.ctl.abort(); } catch { /* ignore */ }
       let info = null;
@@ -351,6 +365,7 @@ export class Engine extends EventEmitter {
     if (!ev || typeof ev !== 'object' || typeof ev.kind !== 'string') return;
     let e = { ...ev, ts: Number.isFinite(ev.ts) ? ev.ts : this.now() };
     if (e.kind === EV.SAYS && e.text != null) e.text = plain(e.text);
+    if (e.kind === EV.USAGE && e.mode === 'set') e = this._withEarlierSpend(e);
     if (this._isStopped(e)) {
       if (!AFTER_STOP_OK.has(e.kind)) return;
       if (e.kind === EV.ENDED) e = { ...e, outcome: 'stopped', error: null };
@@ -388,6 +403,7 @@ export class Engine extends EventEmitter {
     if (!held && this.held.size) list = this._waitForHeld(list);
     if (!list.length) return;
     this.store.apply(list);
+    if (this.history && list.some(e => HISTORY_KINDS.has(e.kind))) this.history.schedule();
     const progressed = new Set();
     for (const e of list) {
       if (e.kind === EV.NOTICE || e.kind === EV.MACHINE) continue;
@@ -1200,7 +1216,7 @@ export class Engine extends EventEmitter {
     if (!text || LOOKS_GOOD_RE.test(text)) return { ok: true, reply: `Good. ${v.name} stays as it is.` };
     const sent = await this._sendTo(v, text);
     if (!sent.ok) return sent;
-    return { ok: true, reply: `Sent your follow-up to ${v.name}.` };
+    return { ok: true, reply: sent.reply || `Sent your follow-up to ${v.name}.` };
   }
 
   async _answerSim(v, ask, text) {
@@ -1225,6 +1241,164 @@ export class Engine extends EventEmitter {
     return { ok: true, reply: `Sent your answer to ${v.name}.` };
   }
 
+  // ================================================================ history
+
+  /** Live mode: open this repository's history and show what it holds as earlier agents. Never stops Workbench. */
+  _openHistory() {
+    if (this.mode !== 'live' || !this.repoInfo || typeof this.deps.history?.open !== 'function') return;
+    try {
+      const h = this.deps.history.open({
+        repoRoot: this.repoInfo.root, dir: this.options.historyDir || null, debounceMs: this.options.historyDebounceMs, log: this.log,
+      });
+      for (const rec of h.load()) {
+        if (this.store.restore(rec, this._canContinue(rec))) this.earlierRecs.set(rec.id, rec);
+      }
+      h.source(() => this._historyRecords());
+      this.history = h;
+    } catch (err) {
+      this.log.warn('Workbench could not open its history:', err);
+      this.history = null;
+    }
+  }
+
+  /** What the history file should hold now: the earlier agents nobody picked up, and this run's roots. */
+  _historyRecords() {
+    const out = [];
+    const at = this.now();
+    for (const v of this.store.list()) {
+      if (v.parentId) continue;
+      if (v.earlier) {
+        const rec = this.earlierRecs.get(v.id);
+        if (rec) out.push(rec);
+        continue;
+      }
+      const run = this.runs.get(v.id);
+      if (!run) continue;
+      const rec = this.history.recordOf(v, run.folderRemoved ? null : (run.workspace || null), at);
+      if (rec) out.push(rec);
+    }
+    return out;
+  }
+
+  /** Can an earlier agent be picked up: its program is here, and its folder and conversation are still there? */
+  _canContinue(rec) {
+    const mod = this.adapters[rec.harness];
+    if (typeof mod?.createRunner !== 'function' || this.harnessInfo[rec.harness]?.ok === false) {
+      return { ok: false, reason: `${harnessName(rec.harness)} is not available on this computer.` };
+    }
+    if (!rec.sessionId) return { ok: false, reason: 'It never saved its conversation, so there is nothing to pick up.' };
+    if (!rec.workspace) return { ok: false, reason: 'Its folder was not kept, so it cannot continue.' };
+    let there = false;
+    try { there = fs.statSync(rec.workspace.path).isDirectory() && fs.existsSync(path.join(rec.workspace.path, '.git')); } catch { /* gone */ }
+    if (!there) return { ok: false, reason: 'Its folder is gone, so it cannot continue.' };
+    let known = null;
+    try { known = typeof mod.sessionExists === 'function' ? mod.sessionExists({ sessionId: rec.sessionId }) : null; } catch { /* cannot tell */ }
+    if (known === false) return { ok: false, reason: `${harnessName(rec.harness)} no longer has its conversation, so it cannot continue.` };
+    return { ok: true };
+  }
+
+  /**
+   * Pick an earlier agent up again in its own folder: a new runner on its saved session, which resumes it with the
+   * message. The agent gets a fresh spending limit for this run (the new process has spent nothing).
+   * @returns {Promise<{ ok: boolean, reply: string }>}
+   */
+  async _continueEarlier(v, text) {
+    if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    const rec = this.earlierRecs.get(v.id);
+    if (!rec) return { ok: false, reply: `${v.name} cannot continue. Its notes from the earlier run are gone.` };
+    if (this._resuming.has(v.id)) return { ok: false, reply: `${v.name} is already being picked up.` };
+    const can = this._canContinue(rec);
+    if (!can.ok) {
+      this.store.markContinue(v.id, can);
+      return { ok: false, reply: `${v.name} cannot continue. ${can.reason}` };
+    }
+    this._resuming.add(v.id);
+    const budget = this.defaultBudgetUsd;
+    const workspace = { ...rec.workspace };
+    const run = {
+      id: v.id, harness: rec.harness, runner: null, workspace,
+      config: this._loadConfig(workspace),
+      turnSeq: 0, inTurn: false, deciding: false, stopped: false, lastText: '',
+      receipt: null, checksDone: null,
+      waiting: null, background: null, backgroundAt: 0, accepted: null,
+      // The earlier run's spend: the new process counts from zero (see _withEarlierSpend).
+      earlierSpend: { ...rec.usage },
+    };
+    try {
+      run.runner = this.adapters[rec.harness].createRunner({
+        agentId: v.id, name: v.name, task: rec.task, cwd: workspace.path, model: v.model, budgetUsd: budget,
+        sessionId: rec.sessionId,
+        emit: (ev) => this.ingest(ev),
+        hook: this.mode === 'live' && rec.harness === 'claude' ? { url: this.hook?.url ?? null, token: this._hookToken(v.id) } : null,
+        log: this.log, harness: rec.harness, machineId: v.machineId,
+      });
+      this.runs.set(v.id, run);
+      this.stopped.delete(v.id);
+      await run.runner.send(text);
+    } catch (err) {
+      this.runs.delete(v.id);
+      this._resuming.delete(v.id);
+      try { await run.runner?.stop?.(); } catch { /* it never started */ }
+      this.log.warn(`Could not continue ${v.id}:`, err);
+      return { ok: false, reply: err?.plain ? err.message : `I could not continue ${v.name}: ${plainReason(err)}` };
+    }
+    this._resuming.delete(v.id);
+    this.earlierRecs.delete(v.id);
+    this._apply([
+      { kind: EV.RESUMED, agentId: v.id, budgetUsd: budget },
+      { kind: EV.STATE, agentId: v.id, state: STATE.WORKING, reason: null },
+    ]);
+    this._refreshMachines();
+    return { ok: true, reply: `${v.name} is continuing in its own folder. It has a new spending limit of ${money(budget)} for this run.` };
+  }
+
+  /**
+   * A continued agent's new process counts its spend from zero, so its totals (`set`, at the end of a turn) start
+   * again. Add what the earlier run spent, so the card does not forget it.
+   */
+  _withEarlierSpend(e) {
+    const base = this.runs.get(e.agentId)?.earlierSpend;
+    if (!base) return e;
+    const out = { ...e };
+    for (const f of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']) {
+      if (Number.isFinite(out[f])) out[f] += base[f] || 0;
+    }
+    if (Number.isFinite(out.costUsd)) out.costUsd += (base.costUsd || 0) + (base.unreportedUsd || 0);
+    return out;
+  }
+
+  _proposeForget(views) {
+    const names = joinAnd(views.map(v => v.name));
+    const sentence = `Forget ${names}?`;
+    const detail = views.length === 1 ? 'It will not show here again. Its folder and branch stay on this computer.' : 'They will not show here again. Their folders and branches stay on this computer.';
+    const id = hex(6);
+    this.confirms.set(id, { id, kind: 'forget', agentIds: views.map(v => v.id), sentence, detail, createdAt: this.now() });
+    return { reply: sentence, confirm: { id, sentence, detail } };
+  }
+
+  /** Take earlier agents out of history, and off the board. Their folders and branches are not touched. */
+  _forgetEarlier(ids) {
+    const gone = [];
+    const refused = [];
+    for (const id of ids) {
+      const v = this.store.get(id);
+      if (!v) continue;
+      if (!v.earlier || !this.earlierRecs.has(id)) {
+        refused.push(`${v.name} is from this run, so it stays. It is kept for next time.`);
+        continue;
+      }
+      this.earlierRecs.delete(id);
+      this.history?.forget(id);
+      this.store.remove(id);
+      gone.push(v.name);
+    }
+    if (gone.length) { try { this.history?.save(); } catch { /* logged by history */ } }
+    const parts = [];
+    if (gone.length) parts.push(`Forgot ${joinAnd(gone)}. ${gone.length === 1 ? 'Its folder and branch are' : 'Their folders and branches are'} still on this computer.`);
+    parts.push(...refused);
+    return { reply: parts.join(' ') || 'There was nothing to forget.', agentIds: [] };
+  }
+
   // ================================================================ messages
 
   /** Send an agent a message: a hint while it works, or a follow-up once it is done. */
@@ -1240,6 +1414,7 @@ export class Engine extends EventEmitter {
     if (v.ask && v.ask.type === 'question') return this._answer(v.id, v.ask.id, text); // it is the answer
     const sent = await this._sendTo(v, text);
     if (!sent.ok) return sent;
+    if (sent.reply) return sent; // an earlier agent picked up again says so itself
     if (v.parentId) {
       const root = this.store.get(v.rootId);
       return { ok: true, reply: `Passed that to ${root ? root.name : 'its agent'} for its helper ${v.name}.` };
@@ -1253,6 +1428,7 @@ export class Engine extends EventEmitter {
     if (!root) return { ok: false, reply: `I can’t reach ${v.name}.` };
     if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
     const message = v.parentId ? `About your helper “${v.name}”: ${text}` : text;
+    if (root.earlier && !v.parentId) return this._continueEarlier(root, message);
     const run = this.runs.get(root.id);
     if (!run || !run.runner) {
       // An agent the simulator seeded: let the simulator take the message. A message answers a question, but never
@@ -1306,6 +1482,7 @@ export class Engine extends EventEmitter {
 
   async _stop(v) {
     if (v.parentId) return this._stopHelper(v);
+    if (v.earlier) return { ok: true, reply: `${v.name} is from an earlier run, so nothing is running.` };
     if (!ACTIVE.has(v.state)) {
       if (DONE.has(v.state)) {
         await this._closeIdle(v);
@@ -1709,6 +1886,17 @@ export class Engine extends EventEmitter {
         for (const v of views) replies.push((await this._stop(v)).reply);
         return { reply: replies.join(' '), ...(views.length === 1 ? { focusId: views[0].id } : {}) };
       }
+      case 'forget': {
+        const views = (intent.agentIds || []).map(get).filter(Boolean);
+        if (!views.length) return { reply: 'I couldn’t tell which agent to forget.' };
+        return this._proposeForget(views);
+      }
+      case 'continue': {
+        const v = get(intent.agentId || focusId);
+        if (!v) return { reply: 'Which agent should I continue?' };
+        const r = await this._say(v, CONTINUE_TEXT);
+        return { reply: r.reply, focusId: v.id };
+      }
       case 'stop_all': {
         const active = this.store.list().filter(v => !v.parentId && ACTIVE.has(v.state));
         if (!active.length) return { reply: 'Nothing is running.' };
@@ -1853,6 +2041,10 @@ export class Engine extends EventEmitter {
       return { reply: GONE };
     }
     this.confirms.delete(c.id);
+    if (c.kind === 'forget') {
+      if (!go) return { reply: c.agentIds.length === 1 ? 'OK, I won’t forget it.' : 'OK, I won’t forget them.' };
+      return this._forgetEarlier(c.agentIds);
+    }
     if (c.kind === 'stop' || c.kind === 'say') {
       if (!go) {
         if (c.kind === 'say') return { reply: 'OK, I won’t send it.' };
@@ -1927,6 +2119,11 @@ export class Engine extends EventEmitter {
   }
 
   _describe(v) {
+    if (v.earlier) {
+      let s = `${v.name} is from an earlier run. ${v.canContinue ? 'Send it a message to continue where it left off.' : v.continueReason || ''}`.trim();
+      if (v.says) s += ` Its last message: ${v.says}`;
+      return s;
+    }
     const ask = v.ask;
     if (ask && v.state === STATE.NEEDS_OK) {
       // The exact command, path or address, so a spoken "what is it doing" says what an OK would let through.

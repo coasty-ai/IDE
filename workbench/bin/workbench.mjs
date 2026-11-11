@@ -159,13 +159,13 @@ async function loadModules(demo, log) {
     ]);
     return { ...base, Simulator: sim.Simulator, policy, workspace, receipt };
   }
-  const [policy, workspace, receipt] = await Promise.all([
-    load('src/core/policy.mjs'), load('src/core/workspace.mjs'), load('src/core/receipt.mjs'),
+  const [policy, workspace, receipt, history] = await Promise.all([
+    load('src/core/policy.mjs'), load('src/core/workspace.mjs'), load('src/core/receipt.mjs'), loadOptional('src/core/history.mjs', log),
   ]);
   const [claude, codex] = await Promise.all([
     loadOptional('src/adapters/claude/runner.mjs', log), loadOptional('src/adapters/codex/runner.mjs', log),
   ]);
-  return { ...base, policy, workspace, receipt, claude, codex };
+  return { ...base, policy, workspace, receipt, history, claude, codex };
 }
 
 /** Whether an adapter can run here: { ok, version?, reason? }. */
@@ -284,7 +284,7 @@ async function main() {
     defaultModel: args.model || null,
     adapters,
     machines,
-    deps: { policy: mods.policy, commands: mods.commands, workspace: mods.workspace, receipt: mods.receipt },
+    deps: { policy: mods.policy, commands: mods.commands, workspace: mods.workspace, receipt: mods.receipt, history: mods.history },
     log,
   });
   for (const ev of early.splice(0)) engine.ingest(ev);
