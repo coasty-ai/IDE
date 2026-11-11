@@ -58,7 +58,7 @@ Screenshots of each look and view are in `docs/screens/`.
 ## What is real in this prototype
 
 - **Claude Code agents are real.** Each runs the Claude Code program installed on this machine, with your own login, in its own git worktree of the repository. Worktrees start from your last commit, so uncommitted changes are not in them.
-  - Your personal Claude Code plugins, hooks and MCP servers are deliberately **not** loaded into these agents, and neither is your own `.claude/settings.local.json`. The repository's committed `.claude/` settings are loaded too. Agents cannot change them, but treat them like the rest of your repository's code: a committed setting can change how an agent runs, including where its permission questions go.
+  - Your personal Claude Code plugins, hooks and MCP servers are deliberately **not** loaded into these agents, and neither is your own `.claude/settings.local.json`. The repository's committed `.claude/` settings are loaded too. Agents cannot change them, but treat them like the rest of your repository's code: a committed setting can change how an agent runs. It cannot switch off the permission questions or redirect them: the workbench sets those on the command line, which outranks the repository's settings.
   - Helpers (sub-agents) appear beside their agent as they start, and settle when they finish.
   - On a machine without a browser login, such as a cloud VM, set `CLAUDE_CODE_OAUTH_TOKEN` before starting the workbench; the agents use it.
 - **Permissions.** Every action an agent takes passes through the workbench first:
