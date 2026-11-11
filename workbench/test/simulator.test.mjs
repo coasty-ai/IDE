@@ -457,7 +457,7 @@ function playRunner({ seed = 5, task = 'fix the flaky checkout test', agentId = 
   let waited = 0;
   let questions = 0;
   let permissions = 0;
-  const finished = () => ['done_claimed', 'failed'].includes(mine.get(agentId).state);
+  const finished = () => ['done_claimed', 'done_checked', 'failed'].includes(mine.get(agentId).state);
   for (let i = 0; i < 2000 && !finished(); i++) {
     const v = mine.get(agentId);
     if (v.state === 'needs_ok' && v.ask) { permissions++; w.sim.onAnswer(agentId, v.ask, permission); }
@@ -474,7 +474,7 @@ test('a new task gets a scripted tree and finishes', () => {
   assert.equal(store.events.length, 0, 'events go to the runner\'s own emit');
   assert.deepEqual(mine.errors, []);
   const v = mine.get(agentId);
-  assert.equal(v.state, 'done_claimed');
+  assert.equal(v.state, v.checks && v.checks.state === 'passed' ? 'done_checked' : 'done_claimed');
   assert.ok(v.plan.total >= 3 && v.plan.total <= 5, `plan of ${v.plan.total}`);
   assert.equal(v.plan.done, v.plan.total);
   const helpers = mine.helpersOf(agentId);
@@ -503,7 +503,7 @@ test('scripted runs take about 40 to 90 simulated seconds, sometimes ask, someti
     const task = tasks[seed % tasks.length];
     const p = playRunner({ seed, task, agentId: `r${String(seed).padStart(5, '0')}`, permission: seed % 2 ? 'Allow' : 'Deny', answer: seed % 3 ? 'yes' : 'no' });
     const v = p.mine.get(p.agentId);
-    assert.equal(v.state, 'done_claimed', `${task} (seed ${seed})`);
+    assert.equal(v.state, v.checks && v.checks.state === 'passed' ? 'done_checked' : 'done_claimed', `${task} (seed ${seed})`);
     assert.deepEqual(p.mine.errors, []);
     const firstEnd = p.mine.events.find(e => e.kind === EV.TURN && e.phase === 'end' && !(e.backgroundTasks > 0));
     const work = (firstEnd.ts - p.startedAt) / 1000;   // speed 1: real seconds are simulated seconds
@@ -521,7 +521,7 @@ test('scripted runs take about 40 to 90 simulated seconds, sometimes ask, someti
 
 test('a runner finishes quickly at high speed', () => {
   const p = playRunner({ speed: 50, seed: 9 });
-  assert.equal(p.mine.get(p.agentId).state, 'done_claimed');
+  assert.match(p.mine.get(p.agentId).state, /^done_/);
   assert.ok(p.clock.t - p.startedAt <= 10_000, `took ${p.clock.t - p.startedAt} ms of real time`);
 });
 
@@ -552,7 +552,7 @@ test('a runner answers its closing question with a new turn', () => {
   }
   assert.ok(found, 'some seed ends with a question');
   const v = found.mine.get(found.agentId);
-  assert.equal(v.state, 'done_claimed');
+  assert.match(v.state, /^done_/);
   const ends = found.mine.events.filter(e => e.kind === EV.TURN && e.phase === 'end' && !(e.backgroundTasks > 0));
   assert.equal(ends.length, 2);
   assert.ok(extractQuestion(ends[0].finalText));

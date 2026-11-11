@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node bin/workbench.mjs",
     "demo": "node bin/workbench.mjs --demo",
-    "test": "node --test test/"
+    "test": "node --test \"test/*.test.mjs\""
   },
   "engines": {
     "node": ">=22"

@@ -2,15 +2,14 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server/http.mjs';
 import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.join(HERE, `.http-tmp-${process.pid}-${crypto.randomBytes(3).toString('hex')}`);
+const ROOT = path.join(os.tmpdir(), `wb-http-${process.pid}-${crypto.randomBytes(3).toString('hex')}`);
 const TOKEN = crypto.randomBytes(32).toString('hex');
 const HOOK_TOKEN = crypto.randomBytes(32).toString('hex');
 const CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'";
