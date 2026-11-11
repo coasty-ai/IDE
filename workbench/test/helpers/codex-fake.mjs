@@ -13,6 +13,8 @@
 //   FAKE_CODEX_DELAY_MS  pause between replayed lines (default 0)
 //   FAKE_CODEX_LOGIN     in (default) | out | apikey, for `login status`
 //   FAKE_CODEX_VERSION   hang: `--version` never answers
+//   FAKE_CODEX_WRITE     replay: before the turn's last line, write this file (relative, in the working folder)
+//                        with the text "written by the fake codex\n"; on `exec resume` too
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -123,7 +125,9 @@ async function run({ resume, parsed }) {
     process.exitCode = 1;
     return;
   }
-  for (const line of fixtureLines(resume ? 'codex-resume.jsonl' : 'codex-run.jsonl', threadId)) {
+  const lines = fixtureLines(resume ? 'codex-resume.jsonl' : 'codex-run.jsonl', threadId);
+  for (const [i, line] of lines.entries()) {
+    if (env.FAKE_CODEX_WRITE && i === lines.length - 1) fs.writeFileSync(env.FAKE_CODEX_WRITE, 'written by the fake codex\n');
     await write(process.stdout, line + '\n');
     if (delay) await sleep(delay);
   }

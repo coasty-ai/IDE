@@ -199,8 +199,9 @@ claude -p --input-format stream-json --output-format stream-json --verbose --for
 
 Facts observed with `codex-cli 0.166.0`. Fixtures: `test/fixtures/codex-run.jsonl`, `test/fixtures/codex-resume.jsonl`.
 
-- **Launch:** `codex exec --json -C <workspace> --sandbox workspace-write [-m <model>] <task>`, with stdin ignored. Otherwise Codex waits for stdin.
-- **Follow-up:** `codex exec resume --json <threadId> <text>`. Read `codex exec resume --help` for the options it accepts. It worked without `--ephemeral`.
+- **Launch:** `codex exec --json -C <workspace> --sandbox workspace-write [-m <model>] -- <task>`, with stdin ignored. Otherwise Codex waits for stdin. `--` ends the options, so a task that starts with "-" or is a subcommand name ("review") stays text.
+- **Follow-up:** `codex exec resume --json -c sandbox_mode="workspace-write" [-m <model>] -- <threadId> <text>`, spawned with its cwd set to the workspace. `resume` accepts neither `-C` nor `--sandbox`, so the folder is the process's cwd and the sandbox a config override. It worked without `--ephemeral`.
+- **Environment.** A copy of `process.env` without Claude Code's session markers (`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_AGENT_SDK*`), without the variables a running Codex sets for its commands (`CODEX_THREAD_ID`, `_SESSION_ID`, `_TOOL_CALL_ID`, `_SANDBOX`, `_SANDBOX_NETWORK_DISABLED`, `_PERMISSION_PROFILE`, and `CODEX_EXEC_SERVER_*`, `CODEX_NETWORK_PROXY_*`, `CODEX_SNAPSHOT_*`, `CODEX_SHELL_SNAPSHOT_*`) and without `WORKBENCH_HOOK_URL`/`WORKBENCH_HOOK_TOKEN` (Codex has no hook; its commands must not reach the engine), plus `WORKBENCH_AGENT_ID`. `CODEX_HOME`, `CODEX_API_KEY` and other sign-in and config variables stay. `test/live-fake-codex.test.mjs` runs the whole chain against `test/helpers/codex-fake.mjs`.
 - **Events:**
 
   | Codex event | Normalized |
