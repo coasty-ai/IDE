@@ -11,7 +11,9 @@ import { EV } from '../src/shared/events.mjs';
 
 const ROOT = path.join(os.tmpdir(), `wb-http-${process.pid}-${crypto.randomBytes(3).toString('hex')}`);
 const TOKEN = crypto.randomBytes(32).toString('hex');
-const HOOK_TOKEN = crypto.randomBytes(32).toString('hex');
+const HOOK_KEY = crypto.randomBytes(32);
+/** Each agent's own hook token, made the way bin/workbench.mjs makes it. */
+const hookTokenFor = (id) => crypto.createHmac('sha256', HOOK_KEY).update(`workbench-hook:${id}`).digest('hex');
 const CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'";
 
 /** An engine stand-in that records calls and lets a test release a held hook. */
@@ -70,7 +72,7 @@ before(async () => {
 
   store = new Store();
   engine = new FakeEngine(store);
-  server = createServer({ engine, store, token: TOKEN, hookToken: HOOK_TOKEN, port: 0, rootDir: ROOT, options: { coalesceMs: 250, pingMs: 150 } });
+  server = createServer({ engine, store, token: TOKEN, hookTokenFor, port: 0, rootDir: ROOT, options: { coalesceMs: 250, pingMs: 150 } });
   const { url } = await server.listen();
   port = Number(new URL(url).port);
   assert.equal(url, `http://127.0.0.1:${port}/`);
@@ -118,7 +120,9 @@ test('static files are served with the right content types', async () => {
     ['/ui/logo.svg', 'image/svg+xml', '<svg'],
     ['/ui/pic.png', 'image/png', null],
     ['/ui/fonts/mono.woff2', 'font/woff2', 'wOF2'],
-    ['/?t=whatever', 'text/html; charset=utf-8', 'Workbench'],
+    [`/?t=${TOKEN}`, 'text/html; charset=utf-8', 'Workbench'],
+    [`/?t=${TOKEN}&static=1&still=1&pin=first-root`, 'text/html; charset=utf-8', 'Workbench'],
+    ['/ui/app.js?v=2', 'text/javascript; charset=utf-8', 'console.log'],
   ];
   for (const [p, type, contains] of cases) {
     const r = await request({ path: p });
@@ -129,6 +133,28 @@ test('static files are served with the right content types', async () => {
   const head = await request({ method: 'HEAD', path: '/ui/app.js' });
   assert.equal(head.status, 200);
   assert.equal(head.text, '');
+});
+
+test('the page is served with a query only when the query carries the key; anything else goes to the plain page', async () => {
+  // Any website can send the person's tab to an address here, so the address must not change what the page does.
+  const wrong = crypto.randomBytes(32).toString('hex');
+  for (const p of ['/?say=yes', '/?static=1', '/?still=1&pin=first-root', `/?t=${wrong}`, `/?t=${wrong}&say=yes`, '/?t=&static=1',
+    '/index.html?say=yes', '/ui/index.html?say=yes', '/ui/%69ndex.html?say=yes', `/?T=${TOKEN}`, `/?say=yes&t=${wrong}`]) {
+    for (const method of ['GET', 'HEAD']) {
+      const r = await request({ method, path: p });
+      assert.equal(r.status, 303, `${method} ${p}`);
+      assert.equal(r.headers.location, '/', `${method} ${p}`);
+      assert.equal(r.text, '', `${method} ${p}`);
+      assert.equal(r.headers['cache-control'], 'no-store', `${method} ${p}`);
+      assert.equal(r.headers['x-frame-options'], 'DENY', `${method} ${p}`);
+    }
+  }
+  // The address the terminal prints, and the screenshot scripts' addresses, still open the page.
+  for (const p of ['/', '/?', `/?t=${TOKEN}`, `/?t=${TOKEN}&static=1&still=1&pin=abc`, `/ui/index.html?t=${TOKEN}`]) {
+    const r = await request({ path: p });
+    assert.equal(r.status, 200, p);
+    assert.ok(r.text.includes('Workbench'), p);
+  }
 });
 
 test('no directory listing, no hidden files, only .mjs from shared', async () => {
@@ -201,15 +227,60 @@ test('API routes need the token, in the header or (GET only) in ?t=', async () =
   assert.equal((await post('/hook/pretool', { agentId: 'x', payload: {} }, { 'X-Workbench-Token': 'b'.repeat(64) })).status, 401);
 });
 
-test('the hook token works for /hook only', async () => {
-  assert.equal((await request({ path: '/api/state', headers: { 'X-Workbench-Token': HOOK_TOKEN } })).status, 401);
-  const held = post('/hook/pretool', { agentId: 'abc123', payload: { tool_name: 'Read' } }, { 'X-Workbench-Token': HOOK_TOKEN });
+test('an agent’s hook token opens /hook for that agent only, never /api', async () => {
+  const mine = hookTokenFor('abc123');
+  assert.equal((await request({ path: '/api/state', headers: { 'X-Workbench-Token': mine } })).status, 401);
+  assert.equal((await request({ path: `/api/state?t=${mine}` })).status, 401);
+  assert.equal((await post('/api/agents/abc123/answer', { answer: 'Allow' }, { 'X-Workbench-Token': mine })).status, 401);
+  engine.releaseHook = null;
+  const held = post('/hook/pretool', { agentId: 'abc123', payload: { tool_name: 'Read' } }, { 'X-Workbench-Token': mine });
   await waitFor(() => engine.releaseHook);
+  assert.deepEqual(engine.calls.findLast(c => c[0] === 'hook').slice(1, 2), ['abc123']);
   engine.releaseHook('allow');
   const r = await held;
   assert.equal(r.status, 200);
   assert.equal(r.json.hookSpecificOutput.permissionDecision, 'allow');
   engine.releaseHook = null;
+});
+
+test('a hook token cannot ask in another agent’s name', async () => {
+  engine.calls.length = 0;
+  engine.releaseHook = null;
+  const mine = hookTokenFor('abc123');
+  // Control: the same token does work for its own agent.
+  const own = post('/hook/pretool', { agentId: 'abc123', payload: { tool_name: 'Read' } }, { 'X-Workbench-Token': mine });
+  await waitFor(() => engine.releaseHook);
+  engine.releaseHook('deny');
+  assert.equal((await own).status, 200);
+  engine.releaseHook = null;
+  engine.calls.length = 0;
+  const tries = [
+    [{ agentId: 'def456', payload: { tool_name: 'Bash', tool_input: { command: 'git push --force origin main' } } }, mine],
+    [{ agentId: 'abc123', payload: { tool_name: 'Read' } }, crypto.randomBytes(32).toString('hex')],
+    [{ agentId: 'abc123', payload: { tool_name: 'Read' } }, hookTokenFor('def456')],
+    [{ payload: { tool_name: 'Read' } }, mine],
+    [{ agentId: ['abc123'], payload: { tool_name: 'Read' } }, mine],
+    [{ agentId: '../abc123', payload: { tool_name: 'Read' } }, hookTokenFor('../abc123')],
+    [{ agentId: 'abc123', payload: { tool_name: 'Read' } }, mine.toUpperCase()],
+  ];
+  for (const [body, tok] of tries) {
+    const r = await post('/hook/pretool', body, { 'X-Workbench-Token': tok });
+    assert.equal(r.status, 401, JSON.stringify(body));
+    assert.equal(r.json.error, 'Missing or wrong token.');
+  }
+  assert.equal(engine.calls.filter(c => c[0] === 'hook').length, 0, 'the engine never sees these requests');
+  // Without a token maker, only the page token opens /hook.
+  const s = new Store();
+  const e = new FakeEngine(s);
+  const srv = createServer({ engine: e, store: s, token: TOKEN, port: 0, rootDir: ROOT });
+  const { url } = await srv.listen();
+  try {
+    const res = await fetch(new URL('hook/pretool', url), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': mine }, body: JSON.stringify({ agentId: 'abc123', payload: {} }) });
+    assert.equal(res.status, 401);
+    assert.equal(e.calls.length, 0);
+  } finally {
+    await srv.close();
+  }
 });
 
 test('POSTs need JSON, a body of at most 64 KB, and no foreign Origin', async () => {
@@ -241,19 +312,29 @@ test('POSTs need JSON, a body of at most 64 KB, and no foreign Origin', async ()
 test('API routes call the engine with the right arguments', async () => {
   engine.calls.length = 0;
   assert.equal((await post('/api/command', { text: 'what needs me', focusId: 'abc123' })).json.reply, 'You said what needs me');
+  // What the page showed when the person began: the agent, the confirm card and the ask. Anything that is not an id is
+  // passed as nothing.
+  await post('/api/command', { text: 'yes', focusId: 'abc123', confirmId: '0a1b2c3d4e5f', askId: 'ok-1a2b3c4d' });
+  await post('/api/command', { text: 'yes', focusId: 42, confirmId: '../x', askId: ['ok-1a2b3c4d'] });
+  await post('/api/command', { text: 'yes', confirmId: 'a:b', askId: { id: 'ok-1' } });
   assert.equal((await post('/api/confirm/0a1b2c3d4e5f', { go: true })).json.reply, 'Started it.');
   await post('/api/confirm/0a1b2c3d4e5f', { go: 'yes' });
   assert.equal((await post('/api/agents', { task: 'Fix login', harness: 'codex', model: null, machineId: 'laptop', budgetUsd: 3 })).json.id, 'abc123');
   await post('/api/agents/abc123/answer', { askId: 'ok-1', answer: 'Allow' });
+  await post('/api/agents/abc123/answer', { askId: 7, answer: 'Allow' });
   await post('/api/agents/abc123/say', { text: 'hello' });
   await post('/api/agents/abc123-a71ea18c/stop', {});
   await post('/api/machines/cloud-2/awake', { awake: true });
   assert.deepEqual(engine.calls, [
-    ['command', 'what needs me', { focusId: 'abc123' }],
+    ['command', 'what needs me', { focusId: 'abc123', confirmId: null, askId: null }],
+    ['command', 'yes', { focusId: 'abc123', confirmId: '0a1b2c3d4e5f', askId: 'ok-1a2b3c4d' }],
+    ['command', 'yes', { focusId: null, confirmId: null, askId: null }],
+    ['command', 'yes', { focusId: null, confirmId: null, askId: null }],
     ['confirm', '0a1b2c3d4e5f', true],
     ['confirm', '0a1b2c3d4e5f', false],
     ['startAgent', { task: 'Fix login', harness: 'codex', model: null, machineId: 'laptop', budgetUsd: 3, name: undefined }],
     ['answer', 'abc123', { askId: 'ok-1', answer: 'Allow' }],
+    ['answer', 'abc123', { askId: null, answer: 'Allow' }],
     ['say', 'abc123', 'hello'],
     ['stop', 'abc123-a71ea18c'],
     ['awake', 'cloud-2', true],

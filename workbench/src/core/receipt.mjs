@@ -16,6 +16,19 @@ const DEFAULT_TIMEOUT_SEC = 300;
 const KILL_GRACE_MS = 2000; // SIGTERM first, then SIGKILL this long after
 const DRAIN_MS = 250; // after the shell exits, how long its output may keep arriving
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;?]*[ -/]*[@-~]', 'g');
+/** Process groups of the checks running now, so a program that is exiting can end them at once. */
+const RUNNING = new Set();
+
+/**
+ * On process exit: end every running check's process group with SIGKILL, synchronously. A check is spawned in its
+ * own group and its timers live in this process, so once this process has gone nothing would ever end it.
+ */
+export function killChecksSync() {
+  for (const pid of RUNNING) {
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+  RUNNING.clear();
+}
 
 // ---------------------------------------------------------------------------------------------
 // Rules
@@ -176,6 +189,7 @@ function runOne(check, name, cwd, env, signal) {
       if (!child.pid) return;
       try { process.kill(-child.pid, sig); } catch {}
     };
+    if (child.pid) RUNNING.add(child.pid);
     const terminate = () => {
       killGroup('SIGTERM');
       later(() => killGroup('SIGKILL'), KILL_GRACE_MS);
@@ -193,6 +207,7 @@ function runOne(check, name, cwd, env, signal) {
       for (const t of timers) clearTimeout(t);
       if (signal) signal.removeEventListener('abort', onAbort);
       killGroup('SIGKILL'); // anything the check left running in the background
+      RUNNING.delete(child.pid);
       child.stdout.destroy();
       child.stderr.destroy();
       let note = '';

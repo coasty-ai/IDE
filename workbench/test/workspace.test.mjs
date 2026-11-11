@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { prepareRepo, createWorkspace, removeWorkspace, diffStats, readRepoConfig, normalizeConfig, slugify, workspacesFolder } from '../src/core/workspace.mjs';
+import { checkRules } from '../src/core/receipt.mjs';
 
 // Keep the person's own git settings (signing, hooks, default branch) out of these repositories.
 const ENV_KEYS = ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
@@ -94,6 +95,26 @@ test('prepareRepo gives plain errors', async () => {
   git(empty, 'init', '-q', '-b', 'main');
   await assert.rejects(prepareRepo(empty), /has no commits yet/);
   await assert.rejects(prepareRepo(''), /No repository folder/);
+});
+
+test('the engine\'s git never starts a program named by core.fsmonitor', async () => {
+  const r = path.join(T, 'fsmonitor');
+  fs.mkdirSync(r);
+  git(r, 'init', '-q', '-b', 'main');
+  write(path.join(r, 'x.txt'), 'x\n');
+  git(r, 'add', '-A');
+  git(r, 'commit', '-q', '-m', 'first');
+  const marker = path.join(T, 'fsmonitor-ran');
+  const hook = path.join(T, 'fsmonitor-hook.sh');
+  write(hook, `#!/bin/sh\ntouch '${marker}'\n`);
+  fs.chmodSync(hook, 0o755);
+  git(r, 'config', 'core.fsmonitor', hook);
+  // Prove the setting is live for a plain git status, so the test would catch a regression.
+  git(r, 'status', '--porcelain');
+  assert.equal(fs.existsSync(marker), true, 'plain git runs the fsmonitor program');
+  fs.rmSync(marker);
+  await prepareRepo(r); // runs git status inside the engine
+  assert.equal(fs.existsSync(marker), false, 'the engine\'s git must not run it');
 });
 
 test('prepareRepo is not fooled by GIT_DIR in the environment', async () => {
@@ -197,6 +218,151 @@ test('createWorkspace makes a worktree from the last commit, diffStats counts th
   await assert.rejects(diffStats({ path: ws.path, base: c2 }), /no longer exists/);
 });
 
+test('diffStats lists new files hidden by a .gitignore the agent added or changed, and rules see them', async () => {
+  const r = path.join(T, 'hiding');
+  fs.mkdirSync(r);
+  git(r, 'init', '-q', '-b', 'main');
+  write(path.join(r, '.gitignore'), 'node_modules/\n');
+  write(path.join(r, 'migrations/0001_init.sql'), 'create table users;\n');
+  write(path.join(r, 'src/app.js'), 'export {};\n');
+  git(r, 'add', '-A');
+  git(r, 'commit', '-q', '-m', 'first');
+  const ws = await createWorkspace({ repoRoot: r, agentId: 'h1d3e5', slug: 'hide', baseDir });
+  const w = f => path.join(ws.path, f);
+
+  // Ignored by the repository's own rules from the start: not the agent's doing, so not listed.
+  write(w('node_modules/pkg/index.js'), 'module.exports = 1;\n');
+  assert.deepEqual(await diffStats({ path: ws.path, base: ws.base }), { changed: 0, adds: 0, dels: 0, list: [] });
+
+  // The agent adds a migration and a .gitignore that hides it (and itself), hides a whole new folder the same way,
+  // and adds dist/ to the repository's .gitignore after building into it.
+  write(w('migrations/0099_drop_users.sql'), 'drop table users;\n');
+  write(w('migrations/.gitignore'), '*\n');
+  write(w('newdir/.gitignore'), '*\n');
+  write(w('newdir/a.txt'), 'a\nb\n');
+  write(w('newdir/node_modules/x.js'), 'x\n'); // inside the hidden folder, but the starting rules hid it anyway
+  write(w('.gitignore'), 'node_modules/\ndist/\n');
+  write(w('dist/out.js'), 'out\n');
+  // Untouched by any new rule: a plain new file, and the starting rules' node_modules.
+  write(w('notes.txt'), 'n\n');
+
+  const stats = await diffStats({ path: ws.path, base: ws.base });
+  assert.deepEqual(stats.list, [
+    { path: '.gitignore', adds: 1, dels: 0 },
+    { path: 'dist/out.js', adds: 1, dels: 0, untracked: true, ignored: true },
+    { path: 'migrations/.gitignore', adds: 1, dels: 0, untracked: true, ignored: true },
+    { path: 'migrations/0099_drop_users.sql', adds: 1, dels: 0, untracked: true, ignored: true },
+    { path: 'newdir/.gitignore', adds: 1, dels: 0, untracked: true, ignored: true },
+    { path: 'newdir/a.txt', adds: 2, dels: 0, untracked: true, ignored: true },
+    { path: 'notes.txt', adds: 1, dels: 0, untracked: true },
+  ]);
+  assert.equal(stats.changed, 7);
+
+  // The repository's rule about migrations sees the hidden migration.
+  const rules = checkRules([{ say: 'Do not touch migrations/', paths: ['migrations/**'] }], stats.list.map(f => f.path));
+  assert.deepEqual(rules, { kept: [], broken: [{ say: 'Do not touch migrations/', paths: ['migrations/.gitignore', 'migrations/0099_drop_users.sql'] }] });
+
+  // Compared with a commit that already ignored dist/, dist/out.js is no longer the agent's doing.
+  git(ws.path, 'add', '.gitignore');
+  git(ws.path, 'commit', '-q', '-m', 'ignore dist', '--', '.gitignore');
+  const later = await diffStats({ path: ws.path, base: git(ws.path, 'rev-parse', 'HEAD') });
+  assert.equal(later.list.some(f => f.path === 'dist/out.js'), false);
+  assert.equal(later.list.some(f => f.path === 'migrations/0099_drop_users.sql'), true);
+  await removeWorkspace({ repoRoot: r, path: ws.path });
+});
+
+/** A repository with `files` committed, and a workspace of it where `agent` writes its files. */
+let hidingRepos = 0;
+async function hidingWorkspace(files, agent) {
+  const r = path.join(T, `hiding-${++hidingRepos}`);
+  fs.mkdirSync(r);
+  git(r, 'init', '-q', '-b', 'main');
+  for (const [f, text] of Object.entries(files)) write(path.join(r, f), text);
+  git(r, 'add', '-A');
+  git(r, 'commit', '-q', '-m', 'first');
+  const ws = await createWorkspace({ repoRoot: r, agentId: `hd${hidingRepos}x`, slug: 'hide', baseDir });
+  for (const [f, text] of Object.entries(agent)) write(path.join(ws.path, f), text);
+  return { r, ws };
+}
+
+test('diffStats finds a hidden file beside a visible one, and judges a folder by what the starting rules hid inside it', async () => {
+  const start = 'node_modules/\nout/*\n!out/reports/\ngen/*\n!gen/keep/\nlogs/**\n';
+  const { r, ws } = await hidingWorkspace(
+    { '.gitignore': start, 'README.md': '#\n' },
+    {
+      // A new folder with a visible file, and a file its own .gitignore hides (git leaves that one out of a listing
+      // made with --no-empty-directory). The same through the repository's .gitignore.
+      'db/notes.md': 'notes\n', 'db/drop_users.sql': 'drop table users;\n', 'db/.gitignore': '*.sql\n',
+      'api/readme.md': 'r\n', 'api/seed.sql': 'insert;\n',
+      '.gitignore': start + 'api/seed.sql\nnest/\ngen/\n',
+      // The starting rules hide out/* and gen/*, but not out/reports/ or gen/keep/, which the agent hides itself.
+      // Asked about as "out/" or "gen/", out/* or gen/* would match the folder and take those with it. (git lists
+      // gen/ alone, since the agent's rule names the folder.)
+      'out/cache.bin': 'c\n', 'out/reports/q4.sql': 'drop\n', 'out/reports/.gitignore': '*\n',
+      'gen/x.o': 'o\n', 'gen/keep/k.sql': 'k\n',
+      // Hidden from the start: never the agent's doing.
+      'logs/a.log': 'l\n', 'node_modules/p/i.js': 'x\n',
+    });
+  // A repository of its own inside the workspace, hidden by the agent: git cannot look into it, so it shows as a folder.
+  const nest = path.join(ws.path, 'nest');
+  write(path.join(nest, 'z.txt'), 'z\n');
+  git(nest, 'init', '-q', '-b', 'main');
+
+  const stats = await diffStats({ path: ws.path, base: ws.base });
+  assert.deepEqual(stats.list.map(f => [f.path, !!f.ignored]), [
+    ['.gitignore', false],
+    ['api/readme.md', false], ['api/seed.sql', true],
+    ['db/.gitignore', false], ['db/drop_users.sql', true], ['db/notes.md', false],
+    ['gen/keep/k.sql', true],
+    ['nest/', true],
+    ['out/reports/.gitignore', true], ['out/reports/q4.sql', true],
+  ]);
+  assert.deepEqual(stats.list.find(f => f.path === 'db/drop_users.sql'), { path: 'db/drop_users.sql', adds: 1, dels: 0, untracked: true, ignored: true });
+  const rules = checkRules([
+    { say: 'No SQL files', paths: ['**/*.sql'] },
+    { say: 'Leave the reports alone', paths: ['out/reports/**'] },
+    { say: 'Leave the logs alone', paths: ['logs/**'] },
+  ], stats.list.map(f => f.path));
+  assert.deepEqual(rules, {
+    kept: [{ say: 'Leave the logs alone' }],
+    broken: [
+      { say: 'No SQL files', paths: ['api/seed.sql', 'db/drop_users.sql', 'gen/keep/k.sql', 'out/reports/q4.sql'] },
+      { say: 'Leave the reports alone', paths: ['out/reports/.gitignore', 'out/reports/q4.sql'] },
+    ],
+  });
+  await removeWorkspace({ repoRoot: r, path: ws.path });
+});
+
+test('diffStats lists the files in every hidden folder, however many folders there are', async () => {
+  // More folders than go to git in one command line (500 at a time).
+  const agent = { '.gitignore': 'part-*/\n' };
+  for (let k = 0; k < 520; k++) agent[`part-${k}/f.txt`] = `${k}\n`;
+  const { r, ws } = await hidingWorkspace({ 'README.md': '#\n', '.gitignore': '*.log\n' }, agent);
+  const stats = await diffStats({ path: ws.path, base: ws.base });
+  const hidden = stats.list.filter(f => f.ignored).map(f => f.path);
+  assert.equal(hidden.length, 520);
+  assert.equal(new Set(hidden).size, 520);
+  assert.ok(hidden.includes('part-0/f.txt') && hidden.includes('part-519/f.txt'));
+  await removeWorkspace({ repoRoot: r, path: ws.path });
+});
+
+test('diffStats reads hidden names that git could take for pathspec magic as plain names', async () => {
+  const hidden = async (files, agent) => {
+    const { r, ws } = await hidingWorkspace(files, agent);
+    const list = (await diffStats({ path: ws.path, base: ws.base })).list.filter(f => f.ignored).map(f => f.path);
+    await removeWorkspace({ repoRoot: r, path: ws.path });
+    return list;
+  };
+  // check-ignore refuses these as pathspec magic, which made the whole receipt fail.
+  assert.deepEqual(await hidden({ 'README.md': '#\n' },
+    { ':!x.txt': 'x\n', ':(glob)y.txt': 'y\n', ':(exclude)w.txt': 'w\n', '.gitignore': '/:*.txt\n' }),
+  [':!x.txt', ':(exclude)w.txt', ':(glob)y.txt']);
+  // A folder with such a name: its .gitignore is looked up in the starting commit by that name.
+  assert.deepEqual(await hidden({ 'README.md': '#\n' }, { ':!d/secret.sql': 's\n', ':!d/.gitignore': '*.sql\n' }), [':!d/secret.sql']);
+  // ":/z.txt" is z.txt in a folder named ":", not the z.txt at the top that the starting rules hide.
+  assert.deepEqual(await hidden({ 'README.md': '#\n', '.gitignore': '/z.txt\n' }, { ':/z.txt': 'z\n', ':/.gitignore': 'z.txt\n' }), [':/z.txt']);
+});
+
 test('readRepoConfig reads workbench.json from the commit, not the working copy', async () => {
   const problems = [];
   const cfg = await readRepoConfig({ repoRoot: repo, ref: 'HEAD', onProblem: p => problems.push(p) });
@@ -252,6 +418,79 @@ test('normalizeConfig and slugify', () => {
   assert.equal(slugify(''), 'task');
   assert.equal(slugify('../../etc'), 'etc');
   assert.ok(slugify('word '.repeat(30)).length <= 40);
+});
+
+test('removeWorkspace with onlyIfUnchanged removes an untouched workspace and its branch, and keeps any work', async () => {
+  const mk = id => createWorkspace({ repoRoot: repo, agentId: id, slug: 'tidy', baseDir });
+  const untouched = await mk('aa0001');
+  const ignoredOnly = await mk('aa0002');
+  write(path.join(ignoredOnly.path, 'ignored.log'), 'x\n'); // hidden by .gitignore, but it may still be work (a .env, a build)
+  const untracked = await mk('aa0003');
+  write(path.join(untracked.path, 'new.txt'), 'n\n');
+  const edited = await mk('aa0004');
+  write(path.join(edited.path, 'a.txt'), 'changed\n');
+  const committed = await mk('aa0005');
+  write(path.join(committed.path, 'c.txt'), 'c\n');
+  git(committed.path, 'add', 'c.txt');
+  git(committed.path, 'commit', '-q', '-m', 'agent commit');
+  const tidy = ws => removeWorkspace({ repoRoot: repo, path: ws.path, base: ws.base, onlyIfUnchanged: true, deleteBranch: true });
+
+  assert.deepEqual(await tidy(untouched), { removed: true, branch: untouched.branch });
+  assert.equal(fs.existsSync(untouched.path), false);
+  assert.equal(git(repo, 'branch', '--list', untouched.branch), '');
+  for (const ws of [ignoredOnly, untracked, edited, committed]) {
+    assert.deepEqual(await tidy(ws), { removed: false, kept: true });
+    assert.ok(fs.existsSync(ws.path), `${ws.path} is kept`);
+    assert.match(git(repo, 'branch', '--list', ws.branch), /workbench\/tidy-/);
+  }
+  await assert.rejects(removeWorkspace({ repoRoot: repo, path: edited.path, onlyIfUnchanged: true }), /not a commit/); // no base: refuse
+  for (const ws of [ignoredOnly, untracked, edited, committed]) await removeWorkspace({ repoRoot: repo, path: ws.path, deleteBranch: true });
+});
+
+test('a workspace that cannot be finished after git made it is taken away again, with its branch', async () => {
+  const realpath = fs.realpathSync.native;
+  let calls = 0;
+  fs.realpathSync.native = (p, ...rest) => {
+    if (String(p).includes('broken-aa0009') && ++calls === 1) throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
+    return realpath(p, ...rest);
+  };
+  try {
+    await assert.rejects(createWorkspace({ repoRoot: repo, agentId: 'aa0009', slug: 'broken', baseDir }), /could not make a workspace/);
+  } finally {
+    fs.realpathSync.native = realpath;
+  }
+  assert.equal(fs.existsSync(path.join(workspacesFolder(repo, baseDir), 'broken-aa0009')), false);
+  assert.equal(git(repo, 'branch', '--list', 'workbench/broken-aa0009'), '');
+  assert.ok(!git(repo, 'worktree', 'list', '--porcelain').includes('broken-aa0009'));
+});
+
+test('when git stops part-way through making a workspace, its new branch and folder go too; a branch already there stays', async () => {
+  const r = path.join(T, 'repo-stops');
+  fs.mkdirSync(r);
+  git(r, 'init', '-q', '-b', 'main');
+  write(path.join(r, 'a.txt'), 'a\n');
+  git(r, 'add', '-A');
+  git(r, 'commit', '-q', '-m', 'first');
+  const folder = workspacesFolder(r, baseDir);
+  // git makes the branch first, then the folder: with .git/worktrees in the way it stops in between, as after a Ctrl-C.
+  fs.writeFileSync(path.join(r, '.git', 'worktrees'), '');
+  await assert.rejects(createWorkspace({ repoRoot: r, agentId: 'bb0001', slug: 'stops', baseDir }), /could not make a workspace/);
+  fs.rmSync(path.join(r, '.git', 'worktrees'));
+  assert.equal(git(r, 'branch', '--list', 'workbench/*'), '');
+  // A post-checkout hook that fails: git finished the folder, then reported an error.
+  const hook = path.join(r, '.git', 'hooks', 'post-checkout');
+  write(hook, '#!/bin/sh\nexit 1\n');
+  fs.chmodSync(hook, 0o755);
+  await assert.rejects(createWorkspace({ repoRoot: r, agentId: 'bb0002', slug: 'stops', baseDir }), /could not make a workspace/);
+  fs.rmSync(hook);
+  assert.equal(git(r, 'branch', '--list', 'workbench/*'), '');
+  assert.equal(fs.existsSync(path.join(folder, 'stops-bb0002')), false);
+  assert.ok(!git(r, 'worktree', 'list', '--porcelain').includes('stops-bb0002'));
+  // A branch of that name from before (another session's kept work, say) is left exactly as it was.
+  git(r, 'branch', 'workbench/stops-bb0003');
+  const was = git(r, 'rev-parse', 'workbench/stops-bb0003');
+  await assert.rejects(createWorkspace({ repoRoot: r, agentId: 'bb0003', slug: 'stops', baseDir }), /could not make a workspace/);
+  assert.equal(git(r, 'rev-parse', 'workbench/stops-bb0003'), was);
 });
 
 test('nothing was written to the real home folder', () => {

@@ -1,13 +1,20 @@
 // Builds the command line and environment for launching Claude Code as a workbench agent.
 // The flags below match what was verified with Claude Code 2.1.221 (see ARCHITECTURE.md, "Claude Code adapter").
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 /** Appended to Claude Code's system prompt for every workbench agent. */
 export const WORKBENCH_PROMPT = 'You are running inside Workbench, which shows your progress to a person in plain language. Work only inside the current folder. If you need a decision from the person, end your turn with one short, clear question. When you finish, begin your final message with one plain sentence, understandable by someone who does not write code, saying what you did.';
 
-/** Tools a workbench agent may not use: they schedule work outside the workbench's view or wait for a terminal. */
-export const DISALLOWED_TOOLS = 'Workflow CronCreate CronDelete ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger';
+/**
+ * Tools a workbench agent may not use: they schedule work outside the workbench's view, wait for a terminal,
+ * or need the person to sign in to another service (DesignSync, which cannot finish in a headless run).
+ * CronList goes with CronCreate and CronDelete.
+ */
+export const DISALLOWED_TOOLS = 'Workflow CronCreate CronDelete CronList ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger DesignSync';
 
 /** How long Claude Code waits for the PreToolUse hook, in seconds. The engine may hold a request for 25 minutes. */
 export const HOOK_TIMEOUT_SEC = 1800;
@@ -15,8 +22,14 @@ export const HOOK_TIMEOUT_SEC = 1800;
 /** Spending limit per agent when none is given, in US dollars. */
 export const DEFAULT_BUDGET_USD = 2;
 
-/** Environment keys removed before launch, so a launched agent does not think it runs inside another Claude Code. */
-export const SCRUB_ENV_RE = /^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_AGENT_SDK)/;
+/**
+ * Environment keys removed before launch: the markers a Claude Code session, or an editor or SDK hosting one, sets
+ * for the programs it runs. Passed on, they would tie the agent to that session (its id, its messaging socket, the
+ * editor connection). Claude Code's docs list the session markers (code.claude.com/docs/en/env-vars); the host ones
+ * were seen in an editor session. Everything else is kept, including the person's own settings and credentials
+ * (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_BEDROCK, ...): on a cloud machine the token may be the only login.
+ */
+export const SCRUB_ENV_RE = /^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_JOB_DIR|CLAUDE_AGENT_SDK_.*|CLAUDE_CODE_(CHILD_SESSION|SESSION_.*|BRIDGE_SESSION_ID|MESSAGING_.*|REMOTE|REMOTE_.*|ENTRYPOINT|EXECPATH|SSE_PORT|EMIT_STARTUP_TIMING|ENABLE_SDK_FILE_CHECKPOINTING|ENABLE_TASKS|QUESTION_PREVIEW_FORMAT|STARTUP_FAILURE_RESULTS))$/;
 
 /** The hook bridge script that Claude Code runs before each tool call. */
 export const BRIDGE_PATH = fileURLToPath(new URL('./hook-bridge.mjs', import.meta.url));
@@ -35,14 +48,22 @@ export function shellQuote(word) {
   return `'${String(word).replace(/'/g, `'\\''`)}'`;
 }
 
-/** The hook command line: node running the bridge, both paths quoted. */
+/**
+ * The hook command line: node running the bridge, every word quoted. It starts through `env -u NODE_OPTIONS`:
+ * Claude Code takes the hook's environment from settings files, and a NODE_OPTIONS planted there (or by code the
+ * agent ran) could load a script into node that answers "allow" without asking the engine.
+ */
 export function hookCommand({ nodePath = process.execPath, bridgePath = BRIDGE_PATH } = {}) {
-  return `${shellQuote(nodePath)} ${shellQuote(bridgePath)}`;
+  return ['/usr/bin/env', '-u', 'NODE_OPTIONS', nodePath, bridgePath].map(shellQuote).join(' ');
 }
 
-/** The --settings JSON: one PreToolUse hook for every tool. */
+/**
+ * The --settings JSON: one PreToolUse hook for every tool. disableAllHooks is pinned to false: settings given on the
+ * command line outrank the repository's own, so no settings file can switch the workbench's check off.
+ */
 export function hookSettings({ nodePath, bridgePath } = {}) {
   return {
+    disableAllHooks: false,
     hooks: {
       PreToolUse: [
         {
@@ -62,6 +83,29 @@ export function scrubEnv(base = process.env) {
     env[k] = String(v);
   }
   return env;
+}
+
+/**
+ * Claude Code's own folders for one session, which its agent may read without asking (the policy's readAlso):
+ * long tool results under <config dir>/projects/<key>/<session id>/, and background task output under
+ * <temp dir>/claude-<uid>/<key>/<session id>/. Each entry is { root, session }, so only this session's folder counts:
+ * the key folder is shared with the person's other sessions. Nothing when the session id is not a UUID.
+ * @param {{ sessionId: string|null, env?: Record<string,string|undefined>, uid?: number }} o
+ *   env is the environment Claude Code was started with (CLAUDE_CONFIG_DIR, CLAUDE_CODE_TMPDIR, HOME)
+ * @returns {{ root: string, session: string }[]}
+ */
+export function sessionFolders({ sessionId, env = process.env, uid = process.getuid?.() } = {}) {
+  if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) return [];
+  const e = env || {};
+  const out = [];
+  const config = e.CLAUDE_CONFIG_DIR || path.join(e.HOME || os.homedir(), '.claude');
+  if (path.isAbsolute(config)) out.push({ root: path.join(config, 'projects'), session: sessionId });
+  if (Number.isInteger(uid)) {
+    let tmp = e.CLAUDE_CODE_TMPDIR || '/tmp';
+    try { tmp = fs.realpathSync.native(tmp); } catch { /* not there yet: the policy resolves it when it is */ }
+    if (path.isAbsolute(tmp)) out.push({ root: path.join(tmp, `claude-${uid}`), session: sessionId });
+  }
+  return out;
 }
 
 /** A session name Claude Code cannot mistake for a flag: no leading dashes, no control characters. */
@@ -120,7 +164,11 @@ export function buildClaudeLaunch(o = {}) {
     '--output-format', 'stream-json',
     '--verbose',
     '--forward-subagent-text',
-    '--setting-sources', 'project,local',
+    // The repository's committed .claude settings only: not .claude/settings.local.json, which is the person's own
+    // (and, in a worktree, is read from the person's main checkout).
+    '--setting-sources', 'project',
+    // A defaultMode in a settings file cannot turn off Claude Code's own refusal to change protected files.
+    '--permission-mode', 'default',
     '--strict-mcp-config',
     '--disallowedTools', DISALLOWED_TOOLS,
     '--settings', JSON.stringify(hookSettings({ nodePath, bridgePath })),

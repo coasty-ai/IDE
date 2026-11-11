@@ -8,13 +8,14 @@ export const EV = Object.freeze({
   STATE: 'agent.state',           // { agentId, state, reason? }
   ACTIVITY: 'agent.activity',     // { agentId, sentence, toolKind, toolUseId?, phase: 'start'|'end', ok? }
   THINKING: 'agent.thinking',     // { agentId, on: boolean }
-  USAGE: 'agent.usage',           // { agentId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd?, contextTokens?, contextWindow?, mode: 'set'|'add' }
-  TURN: 'agent.turn',             // { agentId, phase: 'start'|'end', finalText?, backgroundTasks?, isError? }
+  USAGE: 'agent.usage',           // { agentId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd?, unreportedUsd?, contextTokens?, contextWindow?, mode: 'set'|'add' }
+  TURN: 'agent.turn',             // { agentId, phase: 'start'|'end', finalText?, backgroundTasks?, background?, isError? }
+  BACKGROUND: 'agent.background', // { agentId, helpers, commands, others, work: string[], ids: string[] }  what a root's process runs in the background now
   PLAN: 'agent.plan',             // { agentId, items: [{ id?, text, status: 'pending'|'in_progress'|'completed' }] }
   SAYS: 'agent.says',             // { agentId, text }
-  ASK: 'agent.ask',               // { agentId, ask: { id, type: 'permission'|'question'|'stuck', sentence, detail?, options: string[], primary? } }
+  ASK: 'agent.ask',               // { agentId, ask: { id, type: 'permission'|'question'|'stuck', about?: 'background', sentence, detail?, why?, options: string[], primary? } }  why: the permission check's own reason
   ASK_CLEARED: 'agent.askCleared',// { agentId, askId, answer }
-  FILES: 'agent.files',           // { agentId, files: { changed, adds, dels, list: [{ path, adds, dels }] } }
+  FILES: 'agent.files',           // { agentId, files: { changed, adds, dels, list: [{ path, adds, dels, binary?, large?, untracked?, ignored? }] } }
   CHECKS: 'agent.checks',         // { agentId, checks: { state: 'none'|'running'|'passed'|'failed', results: [{ name, ok, ms }] } }
   RULES: 'agent.rules',           // { agentId, rules: { kept: [{ say }], broken: [{ say, paths: string[] }] } }
   MODEL: 'agent.model',           // { agentId, model }
@@ -58,13 +59,17 @@ export const SPARK_BUCKETS = 20;
  * @property {number[]} spark           activity per SPARK_BUCKET_MS, oldest first, length SPARK_BUCKETS
  * @property {number} sparkEndsAt       ms epoch of the end of the newest bucket
  * @property {{ total: number, working: number, done: number }} helpers
- * @property {{ inputTokens: number, outputTokens: number, cacheReadTokens: number, cacheWriteTokens: number, costUsd: number|null, contextTokens: number|null, contextWindow: number|null, contextPct: number|null }} usage
+ * @property {{ inputTokens: number, outputTokens: number, cacheReadTokens: number, cacheWriteTokens: number, costUsd: number|null, unreportedUsd: number, contextTokens: number|null, contextWindow: number|null, contextPct: number|null }} usage
+ *           costUsd: what the harness reported, null until it reports any ("not reported yet"); unreportedUsd: Workbench's
+ *           estimate of what it has spent but not reported yet (0 when none). spentText() in format.mjs words both.
  * @property {number|null} budgetUsd
  * @property {{ items: { id?: string, text: string, status: string }[], done: number, total: number }|null} plan
- * @property {{ changed: number, adds: number, dels: number, list: { path: string, adds: number, dels: number }[] }|null} files
+ * @property {{ changed: number, adds: number, dels: number, list: { path: string, adds: number, dels: number, binary?: true, large?: true, untracked?: true, ignored?: true }[] }|null} files
+ *           ignored: a new file hidden by a .gitignore the agent added or changed
  * @property {{ state: string, results: { name: string, ok: boolean, ms: number }[] }|null} checks
  * @property {{ kept: { say: string }[], broken: { say: string, paths: string[] }[] }|null} rules
- * @property {{ id: string, type: string, sentence: string, detail?: string, options: string[], primary?: string, createdAt: number }|null} ask
+ * @property {{ id: string, type: string, sentence: string, detail?: string, why?: string, options: string[], primary?: string, createdAt: number }|null} ask
+ *           why (permission asks): the permission check's reason, in plain words ("The file is outside the agent's own folder.")
  * @property {{ auto: number, byYou: number, denied: number }} approvals   permission decisions so far
  * @property {string|null} says         its latest message to the person, plain prose
  * @property {string|null} error
@@ -116,7 +121,9 @@ export function newAgentView(ev, now = Date.now()) {
     spark: new Array(SPARK_BUCKETS).fill(0),
     sparkEndsAt: now,
     helpers: { total: 0, working: 0, done: 0 },
-    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: ev.harness === 'codex' ? null : 0, contextTokens: null, contextWindow: null, contextPct: null },
+    // costUsd: what the harness reported, null until it reports any (Claude Code reports it when a turn ends; Codex
+    // never does). unreportedUsd: Workbench's estimate of what it has spent but not reported yet.
+    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: null, unreportedUsd: 0, contextTokens: null, contextWindow: null, contextPct: null },
     budgetUsd: ev.budgetUsd ?? null,
     plan: null,
     files: null,

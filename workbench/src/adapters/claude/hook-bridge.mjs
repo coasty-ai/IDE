@@ -155,8 +155,9 @@ async function main() {
   try { payload = JSON.parse(raw); } catch { block('the hook input was not valid JSON'); return; }
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) { block('the hook input was not a JSON object'); return; }
 
-  // Only PreToolUse is handled. Anything else passes silently.
-  if (payload.hook_event_name !== 'PreToolUse') { pass(''); return; }
+  // The bridge is registered for PreToolUse only. Anything else is blocked: an empty answer would let Claude Code
+  // carry on as if nothing had been asked.
+  if (payload.hook_event_name !== 'PreToolUse') { block('the hook was called for something other than a tool call'); return; }
 
   const address = process.env.WORKBENCH_HOOK_URL;
   const token = process.env.WORKBENCH_HOOK_TOKEN;

@@ -63,7 +63,7 @@ test('rule 1: parallel calls that narrate the same way do not count', () => {
   assert.deepEqual(d.check(T0 + 1000, [view()]), []);
 });
 
-test('rule 2: the same error text three times flags, even with successful steps between', () => {
+test('rule 2: the same error text three times close together flags, even with successful steps between', () => {
   const d = new StuckDetector();
   const err = (i) => 'TypeError: cart is undefined at line ' + (10 + i);
   for (let i = 0; i < 3; i++) {
@@ -115,12 +115,64 @@ test('a flagged agent reports progress when a different step succeeds, or any st
   assert.deepEqual(feed(quiet, [start('Reading a.js', 'x')]), [{ agentId: 'r1', progress: true }]);
 });
 
-test('for the error rule, only success of the failing step counts as progress', () => {
+test('for the error rule too, any step that works counts as progress', () => {
   const d = new StuckDetector();
   for (let i = 0; i < 3; i++) feed(d, [start('Running the tests', 'r' + i), end('r' + i, false, { error: 'boom' }), start('Editing cart.js', 'e' + i), end('e' + i, true)]);
   assert.equal(d.check(T0, [view()]).length, 1);
-  assert.deepEqual(feed(d, [start('Editing cart.js', 'e9'), end('e9', true)]), [], 'the loop goes on');
-  assert.deepEqual(feed(d, [start('Running the tests', 'r9'), end('r9', true)]), [{ agentId: 'r1', progress: true }]);
+  assert.deepEqual(feed(d, [start('Running the tests', 'r8'), end('r8', false, { error: 'boom' })]), [], 'failing again is no progress');
+  assert.deepEqual(feed(d, [start('Editing cart.js', 'e9'), end('e9', true)]), [{ agentId: 'r1', progress: true }], 'a different step that works is');
+  const same = new StuckDetector();
+  for (let i = 0; i < 3; i++) feed(same, [start('Running the tests', 'r' + i), end('r' + i, false, { error: 'boom' }), start('Editing cart.js', 'e' + i), end('e' + i, true)]);
+  assert.equal(same.check(T0, [view()]).length, 1);
+  assert.deepEqual(feed(same, [start('Running the tests', 'r9'), end('r9', true)]), [{ agentId: 'r1', progress: true }], 'so is the failing step working at last');
+});
+
+/** Successful steps, each started and ended on its own. */
+const goods = (d, n, tag) => { for (let i = 0; i < n; i++) feed(d, [start(`Reading ${tag}${i}.js`, `${tag}${i}`), end(`${tag}${i}`, true)]); };
+/** One failing step with this error text. */
+const miss = (d, id, error = 'File has not been read yet. Read it first before writing to it.') => feed(d, [start(`Editing ${id}.js`, id), end(id, false, { error })]);
+
+test('rule 2: the same error spread out over a long turn does not flag', () => {
+  const d = new StuckDetector();
+  for (let k = 0; k < 3; k++) {
+    miss(d, `m${k}`);
+    goods(d, 13, `g${k}-`);
+    assert.deepEqual(d.check(T0 + 1000, [view()]), [], `after miss ${k + 1}`);
+  }
+});
+
+test('rule 2: an error counts again only if it comes back within ten steps', () => {
+  const near = new StuckDetector();
+  for (let k = 0; k < 3; k++) { miss(near, `m${k}`); if (k < 2) goods(near, 9, `g${k}-`); }
+  assert.equal(near.check(T0 + 1000, [view()]).length, 1, 'each time 10 steps after the one before');
+  const far = new StuckDetector();
+  for (let k = 0; k < 3; k++) { miss(far, `m${k}`); if (k < 2) goods(far, 10, `g${k}-`); }
+  assert.deepEqual(far.check(T0 + 1000, [view()]), [], 'each time 11 steps after the one before');
+});
+
+test('rule 2: calls that fail together with the same error count once', () => {
+  const d = new StuckDetector();
+  const error = 'String to replace not found in file.';
+  feed(d, [start('Editing a.js', 'a'), start('Editing b.js', 'b'), start('Editing c.js', 'c'), end('a', false, { error }), end('b', false, { error }), end('c', false, { error })]);
+  assert.deepEqual(d.check(T0 + 1000, [view()]), [], 'one batch is one try');
+  miss(d, 'r1', error);
+  assert.deepEqual(d.check(T0 + 1000, [view()]), [], 'a retry is the second');
+  miss(d, 'r2', error);
+  assert.equal(d.check(T0 + 1000, [view()]).length, 1, 'and another one the third');
+});
+
+test('rule 2: calls made together count as one step towards the ten', () => {
+  const d = new StuckDetector();
+  const batch = (tag) => {
+    const ids = [1, 2, 3, 4, 5].map(i => `${tag}${i}`);
+    feed(d, [...ids.map(id => start(`Reading ${id}.js`, id)), ...ids.map(id => end(id, true))]);
+  };
+  for (let k = 0; k < 3; k++) {
+    miss(d, `m${k}`);
+    // Ten reads, sent five at a time, and one edit: three steps, so the error is still recent.
+    if (k < 2) { batch(`a${k}-`); batch(`b${k}-`); goods(d, 1, `e${k}-`); }
+  }
+  assert.equal(d.check(T0 + 1000, [view()]).length, 1);
 });
 
 test('leaving maybe_stuck or reset() starts the counts afresh; ended agents are forgotten', () => {

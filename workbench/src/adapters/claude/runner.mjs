@@ -5,7 +5,7 @@ import { existsSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
-import { buildClaudeLaunch, claudeBin, scrubEnv, userMessage, DEFAULT_BUDGET_USD } from './args.mjs';
+import { buildClaudeLaunch, claudeBin, scrubEnv, userMessage, sessionFolders, DEFAULT_BUDGET_USD } from './args.mjs';
 import { createClaudeParser } from './parse.mjs';
 
 export const harness = 'claude';
@@ -207,10 +207,12 @@ export function createRunner(opts = {}) {
     const p = (async () => {
       let budget = budgetUsd;
       if (resume) {
-        // A relaunch gets what is left of the agent's limit, so a resumed process cannot spend it again.
-        const spent = parser.info().costUsd;
-        if (typeof spent === 'number') budget = budgetUsd - spent;
-        if (!(budget >= 0.01)) throw new Error(`${who} has used its whole spending limit, so it cannot continue.`);
+        // A relaunch gets what is left of the agent's limit, so a resumed process cannot spend it again. Claude Code
+        // counts the limit per process and reports spend only when a turn ends, so a stopped turn's spend is
+        // Workbench's own estimate (unreportedUsd).
+        const { costUsd, unreportedUsd } = parser.info();
+        budget = budgetUsd - (typeof costUsd === 'number' ? costUsd : 0) - (unreportedUsd || 0);
+        if (!(budget >= 0.01)) throw Object.assign(new Error(`${who} has used its whole spending limit, so it can’t continue.`), { plain: true });
       }
       const spec = buildClaudeLaunch({
         name, model, budgetUsd: budget, hook, agentId, env: baseEnv,
@@ -325,6 +327,21 @@ export function createRunner(opts = {}) {
 
     info() {
       return { pid: proc && alive ? proc.pid ?? null : null, sessionId, alive };
+    },
+
+    /** Claude Code's own folders for this agent's session (see sessionFolders), for the permission check. */
+    readAlso() {
+      return sessionFolders({ sessionId, env: baseEnv });
+    },
+
+    /** The names SendMessage may use for this agent's own helpers, from Claude Code's output. */
+    recipients() {
+      return parser.recipients();
+    },
+
+    /** Which agent (the root or a helper) issued a tool call, for the PreToolUse hook. Null when unknown. */
+    agentFor(q) {
+      return parser.agentFor(q);
     },
   };
 }

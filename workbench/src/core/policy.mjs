@@ -1,39 +1,81 @@
 // The permission policy. For one tool call an agent wants to make, decide whether it may go ahead
-// on its own ('allow') or must wait for the person ('ask'). Nothing is denied outright by default.
+// on its own ('allow'), must wait for the person ('ask'), or is refused at once ('deny').
 //
 // Strict by design: anything that is not clearly safe asks. The contract in ARCHITECTURE.md lists
 // what may be allowed; this module adds a few extra conditions (documented inline) that only ever
-// turn an allow into an ask, never the other way round.
+// turn an allow into an ask, never the other way round. Refused outright, because an OK could not
+// make them safe: changes to Claude Code's own settings (.claude folders, .mcp.json) and helpers
+// that would work outside the agent's folder.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describeRequest } from '../shared/narrate.mjs';
+import { describeRequest, commandAction, shellCommands } from '../shared/narrate.mjs';
 
-/** Tools that only look at things, plan, or coordinate helpers. Always allowed. */
+/**
+ * Tools that only plan, look up tools or skills, report, search the web or manage the agent's own
+ * background tasks. Always allowed. Never add a tool that can run a command, change a file, read files
+ * or send a message: the hook is the only gate. Those are judged below by what they ask for, or kept
+ * away from agents at launch (DISALLOWED_TOOLS in src/adapters/claude/args.mjs).
+ */
 export const SAFE_TOOLS = new Set([
-  'Read', 'Glob', 'Grep', 'LS', 'NotebookRead', 'ToolSearch',
-  'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop', 'TodoWrite',
-  'Agent', 'Task', 'Monitor', 'SendMessage', 'Skill', 'WebSearch',
+  'ToolSearch', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop', 'TodoWrite',
+  'Skill', 'WebSearch', 'ReportFindings',
 ]);
 
-/** Tools that change one file. Allowed only inside the agent's folder and outside .git. */
+/**
+ * Tools that only read, and the input fields that name where. Allowed when every place they look is
+ * inside the agent's folder or one of its own scratch folders (readAlso); otherwise they ask.
+ * Grep, Glob and LS look in the agent's folder when they name no place.
+ */
+const READ_TOOLS = Object.freeze({
+  Read: ['file_path'], NotebookRead: ['notebook_path', 'file_path'], LS: ['path'], Grep: ['path'], Glob: ['path'],
+});
+
+/** Tools that change one file. Allowed only inside the agent's folder, outside .git and .claude. */
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
+
+/** Tools that start a helper (a subagent). A helper works in the agent's own folder. */
+const HELPER_TOOLS = new Set(['Agent', 'Task']);
+
+/**
+ * Claude Code's Monitor runs `command` in a background shell, or opens the WebSocket in `ws`, and
+ * streams what it prints. Its command is judged exactly like Bash. Any field not listed here asks, so
+ * a new mode cannot slip through.
+ */
+const MONITOR_FIELDS = new Set(['command', 'description', 'timeout_ms', 'persistent']);
 
 /** Plain-language reasons, shown to the person and returned to the agent. */
 const R = Object.freeze({
   noTool: 'It did not say which tool it wants to use.',
-  safeTool: 'Looking at files, searching and planning are always allowed.',
+  safeTool: 'Planning, looking up tools and searching the web are always allowed.',
   webFetch: 'Opening a web page needs your OK.',
   mcp: 'Tools that reach other services need your OK.',
   unknownTool: 'This tool is not on the list of safe tools.',
   broken: 'Something about this request could not be checked, so it needs your OK.',
   noCwd: "The agent's own folder could not be checked.",
   noFile: 'It did not say which file it wants to change.',
+  noRead: 'It did not say which file it wants to read.',
+  readInside: "Looking at files inside the agent's own folder is always allowed.",
+  readOutside: "It wants to look at something outside the agent's own folder.",
+  readLinks: "This command would follow links, which can lead outside the agent's own folder.",
+  readList: 'This command reads a list of file names from a file, and those files could be anywhere.',
   fileInside: "The file is inside the agent's own folder.",
   fileOutside: "The file is outside the agent's own folder.",
+  fileFolder: "That is the agent's own folder, not a file in it.",
   fileGit: "The file is part of git's own records, in the .git folder.",
   fileLinked: 'The file is also linked from another place on disk.',
+  fileClaude: 'Files in a .claude folder change how Claude Code itself runs, so agents may not change them.',
+  fileMcp: 'The .mcp.json file connects Claude Code to other services, so agents may not change it.',
+  helper: "Helpers work in the agent's own folder, and each of their steps is checked too.",
+  helperElsewhere: "Helpers must work in this agent's own folder, not in a separate copy or on another computer. Start the helper again without isolation.",
+  message: "The message goes to this agent's own helpers.",
+  messageAddress: 'The address belongs to another Claude session, outside this agent and its helpers.',
+  messageOther: "It is not one of this agent's helpers, so it could be another Claude session.",
+  messageUnchecked: 'Who would receive this message could not be checked.',
+  monitorWeb: 'Keeping a live connection open to a web address needs your OK.',
+  monitorOther: 'This watch uses a setting that could not be checked.',
   pathUnclear: 'The path could not be checked.',
+  pathPadded: 'The path starts or ends with blank space, so where it leads could not be checked.',
   pathBack: 'The path steps back out of a folder that does not exist yet.',
   pathLink: 'The path goes through a link that points to something missing.',
   noCommand: 'It did not say which command it wants to run.',
@@ -56,29 +98,66 @@ const R = Object.freeze({
   tests: "This runs the project's tests, checks or build.",
   testsExtra: 'Extra options for this command need your OK.',
   testsOutside: "The command points at something outside the agent's own folder.",
+  testsGit: "The command points into git's own records, in the .git folder.",
+  testsClaude: "The command points into a .claude folder, which holds Claude Code's own settings.",
   testsOption: 'This test command uses an option that can delete files, upload results or run other programs.',
+  codeAddress: 'Part of this command is an address (data:, file: or a web address) that could be loaded and run as code.',
   nodeInside: "The script is inside the agent's own folder.",
   nodeOutside: "The script is outside the agent's own folder.",
+  nodeGit: "The script is part of git's own records, in the .git folder.",
+  nodeClaude: "The script is in a .claude folder, which holds Claude Code's own settings.",
   nodeMissing: "The script is not a file in the agent's own folder.",
   nodeOption: 'This node command uses an option that can run code it was not given as a file.',
+  nodeValue: 'An option of this node command has a value that could not be checked.',
   extra: "This command is on the repository's list of allowed commands.",
 });
 
-const allow = reason => ({ decision: 'allow', reason });
-const ask = reason => ({ decision: 'ask', reason });
+/**
+ * How an ask says where, added to its sentence ("wants to change app.js outside its own folder"), so the
+ * person sees it without opening the details. The "uses" forms follow a sentence about running something.
+ */
+const WHERE = Object.freeze({
+  outside: ' outside its own folder',
+  git: " in git's own records",
+  claude: " in Claude Code's own settings",
+  linked: ', which is also linked from another place',
+  usesOutside: ', using something outside its own folder',
+  usesGit: ", using git's own records",
+  usesClaude: ", using Claude Code's own settings",
+  usesLinked: ', using a file that is also linked from another place',
+  mayLeave: ', which may reach outside its own folder',
+});
+const USES = Object.freeze({ outside: 'usesOutside', git: 'usesGit', claude: 'usesClaude', linked: 'usesLinked' });
+
+// A verdict: the decision and its reason, plus optionally where (a WHERE key), what an ask does in plain words
+// when the policy knows better than the command's everyday reading (does), or a whole sentence (say).
+const allow = (reason, where) => ({ decision: 'allow', reason, where });
+const ask = (reason, where, does) => ({ decision: 'ask', reason, where, does });
+const deny = (reason, where) => ({ decision: 'deny', reason, where });
+
+/** What an ask says when the command, or the option that made it ask, has no plainer words. */
+const RUN = 'run a command';
 
 /**
  * Decide on one tool call.
- * @param {{ tool: string, input?: object, cwd: string, extraAllow?: string[] }} req
+ * @param {{ tool: string, input?: object, cwd: string, extraAllow?: string[],
+ *           readAlso?: (string | { root: string, session: string })[], recipients?: string[] }} req
  *   cwd is the agent's own folder (its workspace); extraAllow holds command prefixes from workbench.json.
+ *   readAlso names the agent's own scratch folders, which it may read without asking: a string is a folder
+ *   that belongs to this agent alone; { root, session } covers <root>/<any key>/<session id>/..., where
+ *   Claude Code keeps one session's files (the key folder is shared with other sessions, so only the
+ *   folder named after this session's id counts).
+ *   recipients are the names SendMessage may reach without asking: "main" and this agent's own helpers.
  * @returns {{ decision: 'allow'|'ask'|'deny', reason: string, sentence: string, detail: string }}
  */
 export function decide(req) {
-  const { tool, input, cwd, extraAllow } = req && typeof req === 'object' ? req : {};
+  const { tool, input, cwd, extraAllow, readAlso, recipients } = req && typeof req === 'object' ? req : {};
   const inp = input && typeof input === 'object' ? input : {};
+  const ctx = { cwd, extraAllow, also: [], recipients };
   let verdict;
   try {
-    verdict = judge(tool, inp, cwd, extraAllow);
+    ctx.also = readRoots(readAlso);
+    verdict = judge(tool, inp, ctx);
   } catch {
     verdict = ask(R.broken); // fail closed on anything unexpected
   }
@@ -88,17 +167,179 @@ export function decide(req) {
   } catch {
     desc = { sentence: 'wants to use a tool', detail: '' };
   }
-  return { decision: verdict.decision, reason: verdict.reason, sentence: desc.sentence, detail: desc.detail };
+  // The words never change the decision: anything that goes wrong here falls back to plainer words.
+  let sentence;
+  try {
+    sentence = sentenceFor(tool, inp, verdict, desc.sentence, ctx);
+  } catch {
+    sentence = null;
+  }
+  if (typeof sentence !== 'string' || !sentence) sentence = tool === 'Bash' && verdict.decision !== 'allow' ? 'wants to ' + RUN : desc.sentence;
+  return { decision: verdict.decision, reason: verdict.reason, sentence, detail: desc.detail };
 }
 
-function judge(tool, input, cwd, extraAllow) {
+function judge(tool, input, ctx) {
   if (typeof tool !== 'string' || !tool) return ask(R.noTool);
   if (SAFE_TOOLS.has(tool)) return allow(R.safeTool);
-  if (EDIT_TOOLS.has(tool)) return judgeEdit(tool, input, cwd);
-  if (tool === 'Bash') return judgeBash(input, cwd, extraAllow);
+  if (HELPER_TOOLS.has(tool)) return judgeHelper(input);
+  if (Object.hasOwn(READ_TOOLS, tool)) return judgeRead(tool, input, ctx);
+  if (EDIT_TOOLS.has(tool)) return judgeEdit(tool, input, ctx.cwd);
+  if (tool === 'Bash') return judgeBash(input, ctx);
+  if (tool === 'Monitor') return judgeMonitor(input, ctx);
+  if (tool === 'SendMessage') return judgeMessage(input, ctx.recipients);
   if (tool === 'WebFetch') return ask(R.webFetch);
   if (tool.startsWith('mcp__')) return ask(R.mcp);
   return ask(R.unknownTool);
+}
+
+/**
+ * A helper works in the agent's own folder. One that would get its own copy of the repository
+ * (isolation 'worktree') or run on another computer ('remote') is refused, not asked about: the
+ * workbench could neither show nor limit that work. The agent can start it again without isolation.
+ */
+function judgeHelper(input) {
+  return input.isolation !== undefined ? deny(R.helperElsewhere) : allow(R.helper);
+}
+
+/**
+ * SendMessage may reach the agent's own helpers: the names the engine lists. Anything else, such as
+ * another of the person's Claude sessions on this machine or beyond, asks. An address (uds:..., bridge:...,
+ * a path) is never one of its helpers, even when a helper was given that name. The sentence says only what
+ * is known: without the engine's list, a plain name could be a helper or not.
+ */
+function judgeMessage(input, recipients) {
+  const to = input.to;
+  if (typeof to !== 'string' || !to) return { ...ask(R.messageUnchecked), say: 'wants to send a message' };
+  if (/[:/\\]/.test(to)) return { ...ask(R.messageAddress), say: 'wants to send a message to another Claude session' };
+  if (!Array.isArray(recipients)) return { ...ask(R.messageUnchecked), say: 'wants to send a message' };
+  if (!recipients.includes(to)) return { ...ask(R.messageOther), say: 'wants to send a message to someone other than its helpers' };
+  return { ...allow(R.message), say: `wants to send a message to ${to === 'main' ? 'the main agent' : to}` };
+}
+
+/** Monitor: a WebSocket, or any field it does not know, asks; its command gets the same answer as Bash. */
+function judgeMonitor(input, ctx) {
+  if (input.ws !== undefined) return ask(R.monitorWeb);
+  if (Object.keys(input).some(k => !MONITOR_FIELDS.has(k))) return ask(R.monitorOther);
+  return judgeBash({ command: input.command }, ctx); // its sentence stays "run a command in the background..."
+}
+
+// ---------------------------------------------------------------------------------------------
+// What an ask says
+
+/** Reasons that are only about where a command reaches. Such an ask keeps the command's everyday words. */
+const WHERE_REASONS = new Set([R.readOutside, R.readLinks, R.readList, R.testsOutside, R.testsGit, R.testsClaude,
+  R.nodeOutside, R.nodeGit, R.nodeClaude, R.fileLinked, R.pathUnclear, R.pathBack, R.pathLink]);
+
+/** Words that read oddly before " outside its own folder": they get ", using something outside its own folder". */
+const OFF_PLACE = /internet|another computer|on this computer|administrator|stop a program/;
+
+const suffix = where => (typeof where === 'string' && Object.hasOwn(WHERE, where) ? WHERE[where] : '');
+
+/**
+ * The sentence for the person. A command that waits is named by what it does and where it reaches. An everyday
+ * word ("read a file", "run the tests") is used only when the policy itself, judging each part of the command
+ * alone, would allow it or asks only because of where it reaches. Otherwise the sentence names the riskier
+ * part, the option that made it ask ("write to a file", "delete files", "run another program"), or says
+ * "run a command"; the exact command is always the detail. Never the agent's own description.
+ */
+function sentenceFor(tool, input, verdict, plain, ctx) {
+  if (verdict.say) return verdict.say;
+  const command = tool === 'Bash' || (tool === 'Monitor' && input.ws === undefined) ? input.command : undefined;
+  if (verdict.decision === 'allow' || typeof command !== 'string' || !command.trim()) return plain + suffix(verdict.where);
+  const base = realFolder(ctx.cwd);
+  const wheres = [];
+  // Output of another command used as words ($(…), `…`, <(…)) can be anything, so no part is vouched for.
+  const filled = /\$\(|`|[<>]\(/.test(command);
+  const act = commandAction(command, base && !filled ? c => vouch(c, base, ctx, wheres) : () => false);
+  // The single command's own where; otherwise the most serious place any part reaches.
+  const where = verdict.where ?? strongest([...wheres, base ? scanWhere(command, base, ctx.also) : undefined]);
+  if (tool === 'Monitor') return plain + suffix(USES[where] ?? where);
+  const does = act && !act.routine ? act.does : verdict.does ?? act?.does ?? RUN;
+  return 'wants to ' + does + suffix(OFF_PLACE.test(does) ? USES[where] ?? where : where);
+}
+
+/** How serious a place is, for picking one when parts of a command reach several. */
+const WHERE_RANK = { outside: 3, usesOutside: 3, claude: 2, usesClaude: 2, git: 1, usesGit: 1, linked: 1, usesLinked: 1, mayLeave: 1 };
+const strongest = list => list.reduce((best, w) => ((WHERE_RANK[w] ?? 0) > (WHERE_RANK[best] ?? 0) ? w : best), undefined);
+
+/** Redirections that only move output between the terminal, its error stream and /dev/null. */
+const QUIET_REDIRECT = /^\d*(>|>>|&>|>&)(&\d|&-|\/dev\/(null|stdout|stderr|tty))$/;
+const REDIRECT_ALONE = /^\d*(>|>>|&>|>&)$/;
+const QUIET_TARGET = /^(&\d|&-|\/dev\/(null|stdout|stderr|tty))$/;
+
+/**
+ * Whether one part of a command (from shellCommands) is the everyday thing its words say: the policy, judging
+ * that part alone, would allow it, or would ask only because of where it reaches (noted in `wheres`). A part
+ * with a value the shell fills in ($VAR, `…`) or an escape, a variable set before it, `env` or `xargs` before
+ * it, or a redirection other than to the terminal or /dev/null, is not vouched for: what it runs is not known.
+ */
+function vouch(c, base, ctx, wheres) {
+  if (c.words.some(w => /[$`\\]/.test(w) || CONTROL.test(w))) return false;
+  if (c.words.slice(0, c.at).some(w => /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(w) || w === 'env' || w === 'xargs')) return false;
+  const rest = [];
+  for (let k = c.at; k < c.words.length; k++) {
+    const w = c.words[k];
+    if (QUIET_REDIRECT.test(w)) continue;
+    if (REDIRECT_ALONE.test(w) && QUIET_TARGET.test(c.words[k + 1] ?? '')) { k++; continue; }
+    if (/[<>]/.test(w)) return false;
+    rest.push(w);
+  }
+  if (c.inline) {
+    // A shell given its command inline stands for that command (judged as its own part), if nothing else is added.
+    return (rest.length === 3 && /^-l?c$|^-cl$/.test(rest[1])) || (c.prog === 'eval' && rest.length === 2);
+  }
+  const words = rest.map(text => {
+    const glob = /[*?[^#]/.test(text);
+    return { text, glob, globLead: glob && /^[-*?[^#]/.test(text) };
+  });
+  const v = judgeWords(words, base, ctx);
+  if (v.decision === 'allow') return true;
+  if (!WHERE_REASONS.has(v.reason)) return false;
+  if (v.where) wheres.push(v.where);
+  return true;
+}
+
+/**
+ * Best effort, for the sentence of a command that already waits: does any word of any part name something
+ * that exists outside the agent's folder (or in its .claude or .git folders)? `~` and $HOME are expanded, and
+ * relative words are also tried from every folder the command `cd`s into. A `cd` out of the folder (a bare
+ * `cd` goes to the home folder) counts as outside by itself.
+ */
+function scanWhere(command, base, also) {
+  const cmds = shellCommands(command);
+  const home = text => text.replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.homedir());
+  const rank = { outside: 3, claude: 2, git: 1 };
+  let found;
+  const note = w => { if (!found || rank[w] > rank[found]) found = w; };
+  const bases = [base];
+  for (const c of cmds) {
+    if (c.prog !== 'cd' && c.prog !== 'pushd') continue;
+    const to = c.args.filter(a => !a.startsWith('-')).at(-1) ?? (c.prog === 'cd' && !c.args.includes('-') ? '~' : null);
+    const r = to === null ? null : resolveReal(home(to), base);
+    if (!r?.ok || !r.exists) continue;
+    bases.push(r.real);
+    if (placeOf(r.real, base) === 'outside' && !also.some(test => test(r.real))) note('outside');
+  }
+  for (const c of cmds) {
+    for (let k = 0; k < c.words.length; k++) {
+      if (k === c.at && !c.script) continue; // the program itself
+      const text = home(c.words[k]);
+      const word = { text, glob: /[*?[]/.test(text) };
+      if (word.glob && globClimbs(text)) note('outside');
+      for (const piece of readPieces(word)) {
+        for (const b of bases) {
+          const r = resolveReal(piece, b);
+          if (!r.ok) continue;
+          const place = placeOf(r.real, base);
+          if (place === 'outside') {
+            if (also.some(test => test(r.real))) continue;
+            if (r.exists || climbsOut(piece)) note('outside');
+          } else if (place === 'claude' || place === 'git') note(place);
+        }
+      }
+    }
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -120,7 +361,8 @@ function realFolder(cwd) {
  * The longest existing prefix goes through realpath(3) (fs.realpathSync.native: unlike the JS
  * version it resolves `link/..` after following the link). The missing remainder is appended as
  * text, which is only safe when it has no '..' and does not start with a dangling link.
- * @returns {{ ok: true, real: string, exists: boolean } | { ok: false, reason: string }}
+ * @returns {{ ok: true, real: string, exists: boolean }
+ *   | { ok: false, reason: string, link?: string, rest?: string[] }}  link: the dangling link, and the rest after it
  */
 export function resolveReal(p, baseReal) {
   if (typeof p !== 'string' || p === '' || p.includes('\0')) return { ok: false, reason: R.pathUnclear };
@@ -144,7 +386,7 @@ export function resolveReal(p, baseReal) {
       // realpath said "missing" but the entry is there: a link pointing at something missing.
       try {
         fs.lstatSync(path.join(real, rest[0]));
-        return { ok: false, reason: R.pathLink };
+        return { ok: false, reason: R.pathLink, link: path.join(real, rest[0]), rest: rest.slice(1) };
       } catch (e) {
         if (!e || e.code !== 'ENOENT') return { ok: false, reason: R.pathUnclear };
       }
@@ -154,32 +396,242 @@ export function resolveReal(p, baseReal) {
   return { ok: false, reason: R.pathUnclear };
 }
 
-/** Where a real path sits relative to the agent's real folder: 'cwd', 'inside', 'git' or 'outside'. */
+/**
+ * Where writing through a link to something missing would land: the link's target, resolved the same way.
+ * Links to links are followed a few times; past that, or when the link cannot be read, it stays unclear.
+ */
+function throughLinks(r, baseReal) {
+  for (let hops = 0; !r.ok && r.link && hops < 8; hops++) {
+    let to;
+    try {
+      to = fs.readlinkSync(r.link);
+    } catch {
+      return { ok: false, reason: R.pathLink };
+    }
+    const target = (to.startsWith('/') ? to : path.dirname(r.link) + '/' + to) + (r.rest.length ? '/' + r.rest.join('/') : '');
+    r = resolveReal(target, baseReal);
+  }
+  return r.ok || !r.link ? r : { ok: false, reason: R.pathLink };
+}
+
+/**
+ * The folder names that hold Claude Code's own settings: a .claude folder at any depth (settings, hooks,
+ * skills, agents, commands) and .mcp.json. Compared case-insensitively: on a default macOS disk
+ * ".CLAUDE/settings.json" is the same file as ".claude/settings.json".
+ */
+function claudeSetting(rel) {
+  return rel.split('/').some(seg => { const s = seg.toLowerCase(); return s === '.claude' || s === '.mcp.json'; });
+}
+
+/** Where a real path sits relative to the agent's real folder: 'cwd', 'inside', 'git', 'claude' or 'outside'. */
 function placeOf(real, baseReal) {
   if (real === baseReal) return 'cwd';
   const prefix = baseReal.endsWith('/') ? baseReal : baseReal + '/';
   if (!real.startsWith(prefix)) return 'outside';
+  const rel = real.slice(prefix.length);
+  if (claudeSetting(rel)) return 'claude'; // before .git: a .claude folder is refused at any depth
   // Case-insensitive: on a default macOS disk ".GIT/config" is the same file as ".git/config".
-  const segs = real.slice(prefix.length).split('/');
-  return segs.some(seg => seg.toLowerCase() === '.git') ? 'git' : 'inside';
+  return rel.split('/').some(seg => seg.toLowerCase() === '.git') ? 'git' : 'inside';
 }
+
+/** For a sentence: where a path a command writes or deletes sits ('outside', 'git', 'claude'), if anywhere special. */
+function placeWhere(p, base) {
+  if (typeof p !== 'string' || !p) return undefined;
+  const r = resolveReal(p, base);
+  if (!r.ok) return undefined;
+  const place = placeOf(r.real, base);
+  return place === 'outside' || place === 'git' || place === 'claude' ? place : undefined;
+}
+
+/** A file that shares its contents with another path (a hard link), possibly outside the folder. */
+function linkedFile(real) {
+  try {
+    const st = fs.statSync(real);
+    return st.isFile() && st.nlink > 1; // folders always have more than one link
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Claude Code trims a path before it uses it (2.1.221: its expandPath, `Wi`, for Grep's and Glob's `path` and Glob's
+ * folder), so blank space at either end can hide a `~` or a `/`: " ~/.ssh" reads as a folder inside the agent's own.
+ * The policy never vouches for such a path. JavaScript's trim() is exactly what Claude Code strips.
+ */
+const padded = v => typeof v === 'string' && v !== v.trim();
 
 function judgeEdit(tool, input, cwd) {
   const target = tool === 'NotebookEdit' ? (input.notebook_path ?? input.file_path) : (input.file_path ?? input.notebook_path);
   if (typeof target !== 'string' || !target.trim()) return ask(R.noFile);
   const base = realFolder(cwd);
   if (!base) return ask(R.noCwd);
-  const r = resolveReal(target, base);
+  if (padded(target)) {
+    // Claude Code expands an edit's path before the hook sees it, so this should not happen. Should it, the path is
+    // refused when either reading of it would be (an OK must not open .claude), and asks otherwise.
+    const refused = [target, target.trim()].map(t => judgeEditTarget(t, base)).find(v => v.decision === 'deny');
+    return refused ?? ask(R.pathPadded, 'mayLeave');
+  }
+  return judgeEditTarget(target, base);
+}
+
+function judgeEditTarget(target, base) {
+  // Through a link to something missing, writing would create the link's target: judge that instead.
+  const r = throughLinks(resolveReal(target, base), base);
   if (!r.ok) return ask(r.reason);
   const where = placeOf(r.real, base);
-  if (where === 'git') return ask(R.fileGit);
-  if (where !== 'inside') return ask(R.fileOutside);
-  if (r.exists) {
-    // A hard link shares its contents with another path, possibly outside the folder.
-    const st = fs.statSync(r.real);
-    if (st.isFile() && st.nlink > 1) return ask(R.fileLinked);
+  // Claude Code's own settings, in the agent's folder or anywhere else (the person's ~/.claude, the main
+  // checkout's .claude): refused, since they could switch off this very check.
+  if (where === 'claude' || (where === 'outside' && claudeSetting(r.real))) {
+    const rel = where === 'claude' ? path.relative(base, r.real) : r.real;
+    return deny(rel.split('/').some(s => s.toLowerCase() === '.claude') ? R.fileClaude : R.fileMcp, 'claude');
   }
+  if (where === 'git') return ask(R.fileGit, 'git');
+  if (where === 'cwd') return ask(R.fileFolder);
+  if (where !== 'inside') return ask(R.fileOutside, 'outside');
+  if (r.exists && linkedFile(r.real)) return ask(R.fileLinked, 'linked');
   return allow(R.fileInside);
+}
+
+const SESSION_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The agent's own scratch folders (decide's readAlso), as tests on a real path. Entries that are not
+ * absolute paths, roots that do not exist, and session ids that are not UUIDs are ignored.
+ */
+function readRoots(list) {
+  const out = [];
+  const real = p => {
+    if (typeof p !== 'string' || !path.isAbsolute(p) || p.includes('\0')) return null;
+    try { return fs.realpathSync.native(p); } catch { return null; } // missing: nothing to read there
+  };
+  for (const e of Array.isArray(list) ? list : []) {
+    if (typeof e === 'string') {
+      const r = real(e);
+      if (r && r !== '/') out.push(p => p === r || p.startsWith(r + '/'));
+    } else if (e && typeof e === 'object' && typeof e.session === 'string' && SESSION_RE.test(e.session)) {
+      const r = real(e.root);
+      const session = e.session.toLowerCase();
+      // <root>/<any key>/<session id>, and anything in it
+      if (r && r !== '/') out.push(p => p.startsWith(r + '/') && (p.slice(r.length + 1).split('/')[1] || '').toLowerCase() === session);
+    }
+  }
+  return out;
+}
+
+/**
+ * A relative path that climbs out of the folder it starts from. Claude Code keeps the shell in a subfolder
+ * after a `cd`, so such words are not judged by whether they exist from the agent's folder.
+ */
+function climbsOut(p) {
+  if (/^[/~]/.test(p)) return false;
+  const n = path.posix.normalize(p);
+  return n === '..' || n.startsWith('../');
+}
+
+/**
+ * null when reading `p` stays inside the agent's folder (its .git and .claude included) or one of its
+ * scratch folders; otherwise an ask. `missingOk`: a path that does not exist names nothing to read, such
+ * as the grep pattern "/api/users"; used for command words, never for the file tools. A missing relative
+ * path that climbs out of the folder still asks (see climbsOut).
+ */
+function readCheck(p, base, also, missingOk = false) {
+  if (typeof p !== 'string' || !p.trim()) return ask(R.pathUnclear);
+  if (p === '/dev/null') return null;
+  const r = resolveReal(p, base);
+  if (!r.ok) return ask(r.reason, 'mayLeave'); // ~user, a missing link target: it could be anywhere
+  if (placeOf(r.real, base) !== 'outside') return null;
+  if (also.some(test => test(r.real))) return null;
+  if (missingOk && !r.exists && !climbsOut(p)) return null;
+  return ask(R.readOutside, 'outside');
+}
+
+/** The folder a wildcard pattern searches: its literal text up to the last '/' before the first wildcard. */
+function globFolder(text) {
+  const at = text.search(/[*?[^#{]/);
+  if (at < 0) return text;
+  const cut = text.lastIndexOf('/', at);
+  return cut < 0 ? '' : text.slice(0, cut + 1);
+}
+
+/**
+ * Whether one segment of a wildcard path could match "..": bash before 5.2, sh, dash and ksh let `.*`,
+ * `..*`, `.?` and `.[.]` match it, so the wildcard climbs out of the folder it searches. Only a segment
+ * that starts with a dot (or with a bracket listing one) and whose other literal characters are all dots
+ * can; `.env*` and `.eslintrc*` cannot. A bracket may stand for a dot.
+ */
+function mayClimb(seg) {
+  if (seg === '..') return true;
+  if (!/[*?[]/.test(seg)) return false;
+  const lead = /^\[([!^]?)(\]?[^\]]*)\]/.exec(seg);
+  if (seg[0] !== '.' && !(lead && !lead[1] && lead[2].includes('.'))) return false; // a wildcard never matches a leading dot
+  return /^\.*$/.test(seg.replace(/\[[!^]?\]?[^\]]*\]/g, '').replace(/[*?]/g, ''));
+}
+
+/**
+ * Where Claude Code itself takes a place to be (2.1.221: its expandPath, `Wi`, after the trim): "~" and "~/" are the
+ * home folder, and ".." is taken away as text, before the system follows any link. So with a link that leads deeper
+ * inside the folder ("deep" -> "a/b"), "deep/../.." is the folder above the agent's own, although the system would land
+ * back inside it. Checked as well as the system's own reading.
+ */
+function claudePlace(v, base) {
+  if (v === '~') return os.homedir();
+  if (v.startsWith('~/')) return path.join(os.homedir(), v.slice(2));
+  return path.isAbsolute(v) ? path.normalize(v) : path.resolve(base, v);
+}
+
+/**
+ * The folder Claude Code's Glob searches for an absolute pattern (2.1.221: kTy), before it trims it: the text before
+ * the last '/' ahead of the first *, ?, [ or { ("/" when that is the first character), or the pattern's own folder
+ * when it has none of them. It can be deeper than globFolder's, which also stops at ^ and #.
+ */
+function claudeGlobFolder(pattern) {
+  const at = pattern.search(/[*?[{]/);
+  if (at < 0) return path.dirname(pattern);
+  const cut = pattern.lastIndexOf('/', at);
+  return cut <= 0 ? '/' : pattern.slice(0, cut);
+}
+
+/** A wildcard word with '..', or a segment that can match it, at or after its first wildcard. */
+function globClimbs(text) {
+  const segs = text.split('/');
+  const first = segs.findIndex(s => /[*?[^#]/.test(s));
+  return first >= 0 && segs.slice(first).some(mayClimb);
+}
+
+function judgeRead(tool, input, { cwd, also }) {
+  const base = realFolder(cwd);
+  if (!base) return ask(R.noCwd);
+  const targets = [];
+  for (const k of READ_TOOLS[tool]) {
+    const v = input[k];
+    if (v === undefined || v === null || (v === '' && tool !== 'Read')) continue; // no place: the agent's folder
+    if (padded(v)) return ask(R.pathPadded, 'mayLeave'); // " ~/.codex" searches the home folder's .codex
+    targets.push(v);
+    if (typeof v === 'string' && v) targets.push(claudePlace(v, base)); // and as Claude Code reads it
+  }
+  if (tool === 'Read' && !targets.length) return ask(R.noRead);
+  if (tool === 'Glob') {
+    const pattern = input.pattern;
+    if (typeof pattern !== 'string' || !pattern) return ask(R.pathUnclear);
+    if (pattern.includes('..')) return ask(R.readOutside, 'outside'); // even inside {a,..} or [.][.]
+    // The search starts at the folder before the pattern's first wildcard: its own when absolute,
+    // otherwise inside `path` (or the agent's folder). Joined as text, so the system resolves any link.
+    const folder = globFolder(pattern);
+    const from = typeof input.path === 'string' && input.path ? input.path.replace(/\/+$/, '') + '/' : '';
+    if (/^[/~]/.test(folder)) targets.push(folder);
+    else if (folder) targets.push(from + folder);
+    // An absolute pattern is searched from the folder Claude Code reads in it, trimmed: judged as it reads it too.
+    if (pattern.startsWith('/')) {
+      const searched = claudeGlobFolder(pattern);
+      if (padded(searched)) return ask(R.pathPadded, 'mayLeave'); // "<folder>/link /*" searches <folder>/link
+      targets.push(searched);
+    }
+  }
+  for (const t of targets) {
+    const v = readCheck(t, base, also);
+    if (v) return v;
+  }
+  return allow(R.readInside);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -245,100 +697,234 @@ function longIs(arg, names) {
   return names.some(n => n.startsWith(name));
 }
 
+/** Whether an option matches a { short, long } spec. */
+const optionIs = (arg, o) => shortHas(arg, o.short ?? '') || longIs(arg, o.long ?? []);
+
+/**
+ * The value an option takes, given as --opt=value, --opt value, -ovalue (in a cluster such as -uovalue) or
+ * -o value. `letters` are the short forms that take it.
+ */
+function optionValue(args, k, letters) {
+  const a = args[k];
+  if (a.startsWith('--')) {
+    const eq = a.indexOf('=');
+    return eq >= 0 ? a.slice(eq + 1) : args[k + 1];
+  }
+  const at = [...a.slice(1)].findIndex(ch => letters.includes(ch));
+  return (at >= 0 && a.slice(at + 2)) || args[k + 1];
+}
+
 /**
  * Read-only commands from the contract. `null`: no option of the command writes or runs anything,
- * so wildcards are harmless. Otherwise the listed options make it ask (extra strictness: these are
- * the options that turn a "read-only" command into one that writes files or starts programs).
+ * so wildcards are harmless. Otherwise the options in `writes` and `runs` make it ask (extra strictness:
+ * these are the options that turn a "read-only" command into one that writes files or starts programs);
+ * `target` is the option whose value is the file written, so the ask can say where it is.
  */
 const READ_ONLY = {
   ls: null, pwd: null, cat: null, head: null, tail: null, wc: null, echo: null, which: null,
   stat: null, diff: null, cut: null, grep: null,
-  file: { short: 'C', long: ['compile'], why: R.writesFile },
-  tree: { short: 'oR', long: ['output'], why: R.writesFile },
-  sort: { short: 'o', long: ['output', 'compress-program'], why: R.writesFile },
-  rg: { short: 'z', long: ['pre', 'pre-glob', 'search-zip', 'hostname-bin'], why: R.runsProgram },
+  file: { writes: { short: 'C', long: ['compile'] } },
+  tree: { writes: { short: 'oR', long: ['output'] }, target: 'o' },
+  sort: { writes: { short: 'o', long: ['output'] }, runs: { long: ['compress-program'] }, target: 'o' },
+  rg: { runs: { short: 'z', long: ['pre', 'pre-glob', 'search-zip', 'hostname-bin'] } },
   uniq: { uniq: true },
 };
 
-const FIND_BAD = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls']);
+// In an agent's shell, Claude Code replaces `find` and `grep` with its own embedded bfs and ugrep, so their
+// extra options are on these lists too (bfs: -rm, -files0-from; ugrep: --dereference-files, --from).
+const FIND_BAD = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-rm', '-fprint', '-fprint0', '-fprintf', '-fls']);
+const FIND_WRITES = new Set(['-fprint', '-fprint0', '-fprintf', '-fls']); // the next word is the file written
+const findDoes = opt => (opt === '-delete' || opt === '-rm' ? 'delete files' : FIND_WRITES.has(opt) ? 'write to a file' : 'run another program');
 const GIT_READ = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'blame', 'grep', 'branch']);
 // git branch: only options that list branches. Creating a branch (a plain name) is fine.
 const BRANCH_SHORT_OK = 'arvliq';
 const BRANCH_LONG_OK = new Set(['all', 'remotes', 'verbose', 'list', 'show-current', 'merged', 'no-merged', 'contains',
   'no-contains', 'points-at', 'sort', 'format', 'color', 'no-color', 'column', 'no-column', 'ignore-case', 'abbrev',
   'no-abbrev', 'quiet']);
-// node --test: test-runner options only. --import, --require, -e and friends run other code.
-const NODE_TEST_OPT = /^--(test(-[a-z0-9-]+)?|experimental-test-[a-z0-9-]+|no-warnings|enable-source-maps|(no-)?experimental-strip-types|experimental-transform-types)(=.*)?$/;
+/**
+ * Options `node --test` may take, from `node --help` on Node 26, and what each one's value may be (null: a
+ * switch with no value). Every other option asks, among them each option that loads a module: --import,
+ * --require, --loader, --test-global-setup, and --test-reporter with anything but Node's own reporters
+ * (a module path or a data: URL is code, run as the person).
+ */
+const NODE_TEST_OPTS = Object.freeze({
+  '--test': null, '--test-only': null, '--test-force-exit': null, '--test-update-snapshots': null, '--test-randomize': null,
+  '--test-coverage-include-all': null, '--experimental-test-coverage': null, '--experimental-test-module-mocks': null,
+  '--test-concurrency': 'number', '--test-timeout': 'number', '--test-random-seed': 'number',
+  '--test-coverage-branches': 'number', '--test-coverage-functions': 'number', '--test-coverage-lines': 'number',
+  '--test-shard': 'shard', '--test-isolation': 'isolation', '--experimental-test-isolation': 'isolation',
+  // Patterns matched against test names, tags or file names: never opened or run.
+  '--test-name-pattern': 'text', '--test-skip-pattern': 'text', '--experimental-test-tag-filter': 'text',
+  '--test-coverage-include': 'text', '--test-coverage-exclude': 'text',
+  '--test-reporter': 'reporter', '--test-reporter-destination': 'destination', '--test-rerun-failures': 'file',
+  // Not test options, and harmless with them.
+  '--no-warnings': null, '--enable-source-maps': null,
+  '--experimental-strip-types': null, '--no-strip-types': null, '--no-experimental-strip-types': null, '--experimental-transform-types': null,
+});
+const NODE_REPORTERS = new Set(['spec', 'tap', 'dot', 'junit', 'lcov']);
+/**
+ * node's options that load or run code, or let another program run code in it (a debugger), wherever they
+ * appear: -r (--require), -e (--eval), -p (--print), -C (--conditions) and these. Node reads `_` as `-` in
+ * option names (--experimental_loader is --experimental-loader).
+ */
+const NODE_CODE_SHORT = 'repC';
+const NODE_CODE_OPTS = new Set(['--import', '--require', '--loader', '--experimental-loader', '--eval', '--print',
+  '--env-file', '--env-file-if-exists', '--experimental-config-file', '--experimental-default-config-file', '--inspect',
+  '--inspect-brk', '--inspect-wait', '--inspect-port', '--debug-port', '--run', '--entry-url', '--snapshot-blob',
+  '--build-snapshot', '--build-snapshot-config', '--openssl-config', '--experimental-network-imports',
+  '--experimental-policy', '--conditions', '--experimental-addon-modules']);
 
-function judgeBash(input, cwd, extraAllow) {
+/** Read-only commands whose words are never opened as files. */
+const NO_FILE_ARGS = new Set(['echo', 'which', 'pwd']);
+/** Options that make a command follow links while it walks through folders (or compares them). */
+const FOLLOWS = {
+  // -R (GNU), -S (BSD grep on macOS; ugrep's --dereference-files)
+  grep: a => shortHas(a, 'RS') || longIs(a, ['dereference-recursive', 'dereference-files']),
+  rg: a => shortHas(a, 'L') || longIs(a, ['follow']),
+  find: a => a === '-L' || a === '-follow',
+  tree: a => shortHas(a, 'l'),
+  ls: a => shortHas(a, 'L') || longIs(a, ['dereference']),
+  diff: a => shortHas(a, 'r') || longIs(a, ['recursive']),
+};
+/** Options that read the names of the files to open from another file. */
+const NAMES_FROM = {
+  sort: a => longIs(a, ['files0-from']),
+  wc: a => longIs(a, ['files0-from']),
+  file: a => shortHas(a, 'f') || longIs(a, ['files-from']),
+  find: a => a === '-files0-from', // bfs
+  grep: a => longIs(a, ['from']), // ugrep: "Read additional pathnames of files to search from FILE"
+};
+
+function judgeBash(input, ctx) {
   const command = input.command;
   if (typeof command !== 'string' || !command.trim()) return ask(R.noCommand);
   if (SHELL_META.test(command)) return ask(R.meta);
-  if (CONTROL.test(command)) return ask(R.control);
-  const base = realFolder(cwd);
+  if (CONTROL.test(command)) return ask(R.control, undefined, RUN);
+  const base = realFolder(ctx.cwd);
   if (!base) return ask(R.noCwd);
   const split = splitWords(command);
-  if (split.error) return ask(split.error);
-  const words = split.words;
+  if (split.error) return ask(split.error, undefined, RUN);
+  return judgeWords(split.words, base, ctx);
+}
+
+/** One simple command, already split into words, against the agent's real folder. */
+function judgeWords(words, base, { extraAllow, also = [] }) {
   if (!words.length || !words[0].text) return ask(R.noCommand);
-  if (words[0].glob) return ask(R.globCommand);
+  if (words[0].glob) return ask(R.globCommand, undefined, RUN);
   const argv = words.map(w => w.text);
 
   // The repository owner's own prefixes. Their options are unknown to us, so wildcards that
   // could become options still ask.
   if (matchesExtra(argv, extraAllow)) {
-    return words.some(w => w.globLead) ? ask(R.globOption) : allow(R.extra);
+    return words.some(w => w.globLead) ? ask(R.globOption, undefined, RUN) : allow(R.extra);
   }
 
+  // Commands that only read must also read only inside the agent's folder (or its scratch folders).
   const cmd = argv[0];
-  if (Object.hasOwn(READ_ONLY, cmd)) return judgeReadOnly(READ_ONLY[cmd], argv, words);
-  if (cmd === 'find') {
-    if (argv.slice(1).some(a => FIND_BAD.has(a))) return ask(R.findDanger);
-    if (words.some(w => w.globLead)) return ask(R.globOption);
-    return allow(R.readOnly);
+  if (Object.hasOwn(READ_ONLY, cmd)) {
+    const v = judgeReadOnly(READ_ONLY[cmd], argv, words, base);
+    return v.decision === 'allow' ? (wordsStayInside(cmd, words.slice(1), base, also) || v) : v;
   }
-  if (cmd === 'git') return judgeGit(argv, words);
+  if (cmd === 'find') {
+    const k = argv.findIndex((a, i) => i > 0 && FIND_BAD.has(a));
+    if (k > 0) return ask(R.findDanger, FIND_WRITES.has(argv[k]) ? placeWhere(argv[k + 1], base) : undefined, findDoes(argv[k]));
+    if (words.some(w => w.globLead)) return ask(R.globOption, undefined, RUN);
+    return wordsStayInside(cmd, words.slice(1), base, also) || allow(R.readOnly);
+  }
+  if (cmd === 'git') {
+    const v = judgeGit(argv, words, base);
+    // diff --no-index, blame --contents and friends read any file they are given.
+    return v.decision === 'allow' ? (wordsStayInside(cmd, words.slice(1), base, also) || v) : v;
+  }
   return judgeRunner(argv, words, base) || ask(R.notSafe);
 }
 
-function judgeReadOnly(spec, argv, words) {
+/**
+ * Every piece of a word that could name a path; a piece with a wildcard stands for the folder it searches.
+ * The parts of a value are split on = : and , except that the slashes right after "scheme:" in a web address
+ * (the "//" of "http://") are not a path of their own.
+ */
+function readPieces(w) {
+  const t = w.text;
+  const out = new Set();
+  const add = s => {
+    if (!s || s.startsWith('-')) return;
+    if (w.glob && /[*?[^#]/.test(s)) s = globFolder(s);
+    if (s) out.add(s);
+  };
+  // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail.
+  if (/^-[^-]/.test(t)) for (let k = 2; k < t.length; k++) add(t.slice(k));
+  add(t);
+  const parts = t.split(/([=:,])/);
+  for (let i = 0; i < parts.length; i += 2) {
+    if (parts[i - 1] === ':' && /^\/+$/.test(parts[i])) continue;
+    add(parts[i]);
+  }
+  return out;
+}
+
+/** null when no word of a read-only command reaches outside the agent's folder; otherwise an ask. */
+function wordsStayInside(cmd, words, base, also) {
+  if (NO_FILE_ARGS.has(cmd)) return null;
+  for (const w of words) {
+    if (FOLLOWS[cmd]?.(w.text)) return ask(R.readLinks, 'mayLeave');
+    if (NAMES_FROM[cmd]?.(w.text)) return ask(R.readList, 'mayLeave');
+    // After the first wildcard, '..' or a segment that can match it climbs out of the folder it searches.
+    if (w.glob && globClimbs(w.text)) return ask(R.readOutside, 'outside');
+    for (const piece of readPieces(w)) {
+      const v = readCheck(piece, base, also, true);
+      if (v) return v;
+    }
+  }
+  return null;
+}
+
+function judgeReadOnly(spec, argv, words, base) {
   if (!spec) return allow(R.readOnly);
   if (spec.uniq) {
     // uniq writes its second file argument, and a wildcard can supply one.
-    if (words.some(w => w.glob)) return ask(R.globOption);
-    let files = 0;
+    if (words.some(w => w.glob)) return ask(R.globOption, undefined, RUN);
+    const files = [];
+    let operands = false; // after "--" every word is a file, even one that starts with "-"
     for (let k = 1; k < argv.length; k++) {
       const a = argv[k];
-      if (/^-[fsw]$/.test(a)) { k++; continue; } // these take a separate number
-      if (!a.startsWith('-') || a === '-') files++;
+      if (!operands && a === '--') { operands = true; continue; }
+      if (!operands && /^-[fsw]$/.test(a)) { k++; continue; } // these take a separate number
+      if (operands || !a.startsWith('-') || a === '-') files.push(a);
     }
-    return files > 1 ? ask(R.writesFile) : allow(R.readOnly);
+    return files.length > 1 ? ask(R.writesFile, placeWhere(files[1], base), 'write to a file') : allow(R.readOnly);
   }
-  if (words.some(w => w.globLead)) return ask(R.globOption);
+  if (words.some(w => w.globLead)) return ask(R.globOption, undefined, RUN);
   const args = argv.slice(1);
-  if (args.some(a => shortHas(a, spec.short) || longIs(a, spec.long))) return ask(spec.why);
+  if (spec.runs && args.some(a => optionIs(a, spec.runs))) return ask(R.runsProgram, undefined, 'run another program');
+  const k = spec.writes ? args.findIndex(a => optionIs(a, spec.writes)) : -1;
+  if (k >= 0) {
+    const into = spec.target && (args[k].startsWith('--') || args[k].includes(spec.target)) ? optionValue(args, k, spec.target) : undefined;
+    return ask(R.writesFile, placeWhere(into, base), 'write to a file');
+  }
   return allow(R.readOnly);
 }
 
-function judgeGit(argv, words) {
+function judgeGit(argv, words, base) {
   let i = 1;
   // Extra: --no-pager / -P only turn the pager off. Any other option before the subcommand
   // (-c, -C, --exec-path, --git-dir...) can change what git runs, so it asks.
   while (argv[i] === '--no-pager' || argv[i] === '-P') i++;
   const sub = argv[i];
-  if (!sub || sub.startsWith('-')) return ask(R.gitOption);
-  if (!GIT_READ.has(sub)) return ask(R.gitSub);
+  if (!sub || sub.startsWith('-')) return ask(R.gitOption, undefined, 'run a git command');
+  if (!GIT_READ.has(sub)) return ask(R.gitSub, undefined, 'run a git command');
   const rest = argv.slice(i + 1);
-  if (words.slice(i + 1).some(w => w.globLead)) return ask(R.globOption);
-  if (rest.some(a => longIs(a, ['output']))) return ask(R.writesFile); // diff/log/show --output=<file>
-  if (sub === 'grep' && rest.some(a => shortHas(a, 'O') || longIs(a, ['open-files-in-pager']))) return ask(R.runsProgram);
+  if (words.slice(i + 1).some(w => w.globLead)) return ask(R.globOption, undefined, RUN);
+  const out = rest.findIndex(a => longIs(a, ['output'])); // diff/log/show --output=<file>
+  if (out >= 0) return ask(R.writesFile, placeWhere(optionValue(rest, out, ''), base), 'write to a file');
+  if (sub === 'grep' && rest.some(a => shortHas(a, 'O') || longIs(a, ['open-files-in-pager']))) return ask(R.runsProgram, undefined, 'run another program');
   if (sub === 'branch') {
     for (const a of rest) {
       if (a.startsWith('--')) {
         const name = a.slice(2).split('=')[0];
-        if (!BRANCH_LONG_OK.has(name)) return ask('delete'.startsWith(name) && name ? R.gitBranchDelete : R.gitBranchChange);
+        if (!BRANCH_LONG_OK.has(name)) return ask('delete'.startsWith(name) && name ? R.gitBranchDelete : R.gitBranchChange, undefined, 'change the repository');
       } else if (a.startsWith('-') && a.length > 1) {
-        if ([...a.slice(1)].some(ch => !BRANCH_SHORT_OK.includes(ch))) return ask(/[dD]/.test(a) ? R.gitBranchDelete : R.gitBranchChange);
+        if ([...a.slice(1)].some(ch => !BRANCH_SHORT_OK.includes(ch))) return ask(/[dD]/.test(a) ? R.gitBranchDelete : R.gitBranchChange, undefined, 'change the repository');
       }
     }
   }
@@ -358,10 +944,10 @@ function judgeRunner(argv, words, base) {
   else if ((c0 === 'pnpm' || c0 === 'yarn') && c1 === 'test') scriptAt = 2;
   if (scriptAt) {
     if (n === scriptAt) return allow(R.tests);
-    if (argv[scriptAt] !== '--') return ask(R.testsExtra);
-    return runnerArgs(words.slice(scriptAt + 1), base, null);
+    if (argv[scriptAt] !== '--') return ask(R.testsExtra, undefined, RUN);
+    return scriptArgs(words.slice(scriptAt + 1), base);
   }
-  if (c0 === 'make' && c1 === 'test') return n === 2 ? allow(R.tests) : ask(R.testsExtra);
+  if (c0 === 'make' && c1 === 'test') return n === 2 ? allow(R.tests) : ask(R.testsExtra, undefined, RUN);
 
   if (c0 === 'pytest') return runnerArgs(words.slice(1), base, PYTEST_BAD);
   if ((c0 === 'python' || c0 === 'python3') && c1 === '-m' && c2 === 'pytest') return runnerArgs(words.slice(3), base, PYTEST_BAD);
@@ -370,44 +956,146 @@ function judgeRunner(argv, words, base) {
   if (c0 === 'npx' && (c1 === 'jest' || c1 === 'vitest')) return runnerArgs(words.slice(2), base, null);
 
   if (c0 === 'node') {
-    if (c1 === '--test') {
-      for (const w of words.slice(2)) {
-        if (w.text.startsWith('-') && !NODE_TEST_OPT.test(w.text)) return ask(R.nodeOption);
-      }
-      return runnerArgs(words.slice(2), base, null);
-    }
-    if (!c1 || c1.startsWith('-')) return ask(R.nodeOption); // -e, -p, --import, a REPL...
-    if (words[1].glob) return ask(R.globOption);
+    if (c1 === '--test') return judgeNodeTest(words, base);
+    if (!c1 || c1.startsWith('-')) return ask(R.nodeOption, undefined, 'run a script'); // -e, -p, --import, a REPL...
+    if (words[1].glob) return ask(R.globOption, undefined, RUN);
     const r = resolveReal(c1, base);
     if (!r.ok) return ask(r.reason);
-    if (placeOf(r.real, base) !== 'inside') return ask(R.nodeOutside);
+    const where = placeOf(r.real, base);
+    if (where === 'git') return ask(R.nodeGit, 'git');
+    if (where === 'claude') return ask(R.nodeClaude, 'claude');
+    if (where === 'outside') return ask(R.nodeOutside, 'outside');
     // It must be a file that is there: "node inspect /tmp/x.js" names no file but runs one.
-    if (!r.exists || !fs.statSync(r.real).isFile()) return ask(R.nodeMissing);
+    if (where !== 'inside' || !r.exists || !fs.statSync(r.real).isFile()) return ask(R.nodeMissing);
     return allow(R.nodeInside); // arguments after the script belong to the script
-
   }
   return null;
 }
 
-// Test-runner options that delete folders, upload results or wrap the tests in another program.
-const PYTEST_BAD = arg => longIs(arg, ['basetemp', 'pastebin']);
-const GO_BAD = arg => /^--?(exec|toolexec)(=|$)/.test(arg);
-const CARGO_BAD = arg => /^--config(=|$)/.test(arg) || arg.startsWith('-Z');
+/**
+ * `node --test [options] [files]`. Each option must be on NODE_TEST_OPTS, with a value that fits, given
+ * as --opt=value or as the next word. The rest are test files, which must be inside the folder.
+ */
+function judgeNodeTest(words, base) {
+  const files = [];
+  for (let k = 2; k < words.length; k++) {
+    const w = words[k];
+    if (w.globLead) return ask(R.globOption, undefined, RUN); // a wildcard could turn file names into options
+    if (!w.text.startsWith('-')) { files.push(w); continue; }
+    const eq = w.text.indexOf('=');
+    const name = eq < 0 ? w.text : w.text.slice(0, eq);
+    if (!Object.hasOwn(NODE_TEST_OPTS, name)) return ask(R.nodeOption, undefined, 'run a script');
+    const v = nodeTestOption(name, eq < 0 ? undefined : w.text.slice(eq + 1), words[k + 1], base);
+    if (v) return v;
+    if (eq < 0 && NODE_TEST_OPTS[name] !== null) k++; // the value was the next word
+  }
+  return runnerArgs(files, base, null);
+}
 
 /**
- * Arguments of a test runner: no option from the runner's bad list, no wildcard that could
- * become an option, and nothing that points outside the agent's folder (extra strictness:
- * a config, plugin or output path outside the folder would run or write things elsewhere).
+ * null when one option from NODE_TEST_OPTS has a value that fits (`value` given with "=", or else the next word).
+ * A next word that starts with "-" asks: node refuses it, but another program would read it as an option of
+ * its own (mocha's `-r x` after `--test-name-pattern`), and it would be skipped here as a value.
+ */
+function nodeTestOption(name, value, next, base) {
+  const kind = NODE_TEST_OPTS[name];
+  if (kind === null) return value === undefined ? null : ask(R.nodeValue, undefined, RUN);
+  if (value === undefined) {
+    if (!next || next.text.startsWith('-')) return ask(R.nodeValue, undefined, RUN);
+    if (next.glob) return ask(R.globOption, undefined, RUN);
+    value = next.text;
+  }
+  return nodeTestValue(kind, value, base);
+}
+
+/** null when the value fits its kind; otherwise an ask. */
+function nodeTestValue(kind, value, base) {
+  switch (kind) {
+    case 'text': return null;
+    case 'number': return /^\d+(\.\d+)?$/.test(value) ? null : ask(R.nodeValue, undefined, RUN);
+    case 'shard': return /^\d+\/\d+$/.test(value) ? null : ask(R.nodeValue, undefined, RUN);
+    case 'isolation': return value === 'process' || value === 'none' ? null : ask(R.nodeValue, undefined, RUN);
+    case 'reporter': return NODE_REPORTERS.has(value) ? null : ask(R.nodeOption, undefined, 'run a script'); // anything else is loaded as code
+    case 'destination': if (value === 'stdout' || value === 'stderr') return null; // otherwise a file it writes
+    // falls through
+    case 'file': {
+      const r = resolveReal(value, base);
+      if (!r.ok) return ask(R.testsOutside, 'usesOutside');
+      const where = placeOf(r.real, base);
+      if (where === 'git') return ask(R.testsGit, 'usesGit');
+      if (where === 'claude') return ask(R.testsClaude, 'usesClaude');
+      if (where !== 'inside') return ask(R.testsOutside, 'usesOutside');
+      return r.exists && linkedFile(r.real) ? ask(R.fileLinked, 'usesLinked') : null;
+    }
+    default: return ask(R.nodeValue, undefined, RUN);
+  }
+}
+
+/**
+ * The words after `--` of a package script (`npm test -- …`). npm hands them to the script, which can be any
+ * program and is often `node --test`, so on top of the usual runner checks they follow node's rules: an option
+ * that loads code asks wherever it appears, and node's own test options must fit as for `node --test`.
+ */
+function scriptArgs(words, base) {
+  for (let k = 0; k < words.length; k++) {
+    const t = words[k].text;
+    if (!t.startsWith('-') || t === '-' || t === '--') continue;
+    const eq = t.indexOf('=');
+    const name = (eq < 0 ? t : t.slice(0, eq)).replace(/_/g, '-'); // node reads --foo_bar as --foo-bar
+    if (!name.startsWith('--')) {
+      if (shortHas(name, NODE_CODE_SHORT)) return ask(R.nodeOption, undefined, 'run a script');
+      continue;
+    }
+    if (NODE_CODE_OPTS.has(name)) return ask(R.nodeOption, undefined, 'run a script');
+    if (!/^--(experimental-)?test(-|$)/.test(name)) continue; // another program's option, such as jest's --watch=false
+    if (!Object.hasOwn(NODE_TEST_OPTS, name)) return ask(R.nodeOption, undefined, 'run a script');
+    const v = nodeTestOption(name, eq < 0 ? undefined : t.slice(eq + 1), words[k + 1], base);
+    if (v) return v;
+    if (eq < 0 && NODE_TEST_OPTS[name] !== null) k++;
+  }
+  return runnerArgs(words, base, null);
+}
+
+// Test-runner options that delete folders, upload results or wrap the tests in another program. Each returns
+// what the option does in plain words, and whether its value names the folder it deletes.
+const PYTEST_BAD = a => (longIs(a, ['basetemp']) ? { does: 'delete files', named: true }
+  : longIs(a, ['pastebin']) ? { does: 'send data to the internet' } : null);
+const GO_BAD = a => (/^--?(exec|toolexec)(=|$)/.test(a) ? { does: 'run another program' } : null);
+const CARGO_BAD = a => (/^--config(=|$)/.test(a) ? { does: 'run another program' } : a.startsWith('-Z') ? { does: RUN } : null);
+
+/**
+ * An address a runner could load code from: data:, file:, http(s): or blob:, at the start of a word, of a
+ * value (after "=" or ","), or after a short option. Node ignores the case of the scheme, spaces before it
+ * and tabs or new lines inside it, so this does too.
+ */
+function codeAddress(text) {
+  return /(^|[=,]|^-[A-Za-z]+)[\x00-\x20]*(data|file|https?|blob):/i.test(text.replace(/[\t\n\r]/g, ''));
+}
+
+/**
+ * Arguments of a test runner: no option from the runner's bad list, no wildcard that could become an
+ * option, no address code could be loaded from, and nothing that points outside the agent's folder, or
+ * into its .git or .claude folders (extra strictness: a config, plugin or output path there would run or
+ * write things elsewhere, or change git's records or Claude Code's settings), or at a hard-linked file.
  */
 function runnerArgs(words, base, bad) {
-  for (const w of words) {
-    if (w.globLead) return ask(R.globOption);
-    if (bad && bad(w.text)) return ask(R.testsOption);
+  for (let k = 0; k < words.length; k++) {
+    const w = words[k];
+    if (w.globLead) return ask(R.globOption, undefined, RUN);
+    const b = bad ? bad(w.text) : null;
+    if (b) {
+      const value = w.text.includes('=') ? w.text.slice(w.text.indexOf('=') + 1) : words[k + 1]?.text;
+      return ask(R.testsOption, b.named ? placeWhere(value, base) : undefined, b.does);
+    }
+    if (codeAddress(w.text)) return ask(R.codeAddress, undefined, 'run a script');
     for (const piece of pathPieces(w)) {
       const r = resolveReal(piece, base);
-      if (!r.ok) return ask(R.testsOutside);
+      if (!r.ok) return ask(R.testsOutside, 'usesOutside');
       const where = placeOf(r.real, base);
-      if (where !== 'inside' && where !== 'cwd') return ask(R.testsOutside);
+      if (where === 'git') return ask(R.testsGit, 'usesGit');
+      if (where === 'claude') return ask(R.testsClaude, 'usesClaude');
+      if (where === 'outside') return ask(R.testsOutside, 'usesOutside');
+      if (r.exists && linkedFile(r.real)) return ask(R.fileLinked, 'usesLinked');
     }
   }
   return allow(R.tests);

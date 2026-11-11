@@ -257,9 +257,11 @@ async function main() {
   }
 
   const token = crypto.randomBytes(32).toString('hex');
-  // Agents get only this second token: it opens /hook, never /api.
-  const hookToken = crypto.randomBytes(32).toString('hex');
-  const hook = { url: null, token: hookToken };
+  // Each Claude Code agent gets its own hook token: an HMAC of its id under a key that never leaves this process.
+  // A token opens /hook for that one agent only, and never /api.
+  const hookKey = crypto.randomBytes(32);
+  const hookTokenFor = (agentId) => crypto.createHmac('sha256', hookKey).update(`workbench-hook:${agentId}`).digest('hex');
+  const hook = { url: null, tokenFor: hookTokenFor };
   const store = new mods.Store({ logPath: args.eventLog ? path.resolve(args.eventLog) : null, log });
   const machines = new mods.Machines({ demo: args.demo });
 
@@ -287,27 +289,58 @@ async function main() {
   });
   for (const ev of early.splice(0)) engine.ingest(ev);
 
-  const server = mods.createServer({ engine, store, token, hookToken, port: args.port, host: '127.0.0.1', rootDir: ROOT, log });
+  const server = mods.createServer({ engine, store, token, hookTokenFor, port: args.port, host: '127.0.0.1', rootDir: ROOT, log });
 
   // From here on, every way out stops the agents first: orphaned agents keep spending.
+  // The only copy of an agent's work is its own folder: every way out also says where the folders are.
+  let toldKept = false;
+  const tellKept = (kept, tidied) => {
+    if (toldKept || !kept.length) return;
+    toldKept = true;
+    const one = kept.length === 1;
+    // After a clean shutdown the folders with no changes are gone. A forced exit skips that, so it claims no work.
+    if (tidied) say(one ? 'What the agent did stays on this computer, in its own folder:' : 'What the agents did stays on this computer, each in its own folder:');
+    else say(one ? 'The agent’s folder is still on this computer:' : 'The agents’ folders are still on this computer:');
+    for (const k of kept) say(`  ${k.name}: ${k.path}${k.branch ? ` (branch ${k.branch})` : ''}`);
+  };
+  /** Exit once what was said has reached the terminal or a pipe, or after half a second. */
+  const exitAfterOutput = (code) => {
+    process.exitCode = code;
+    process.stdout.write('', () => process.exit(code));
+    setTimeout(() => process.exit(code), 500).unref();
+  };
+  let forcing = false;
+  /** Stop waiting (a second Ctrl-C, or 12 seconds): end every agent and check now, say where the folders are, exit. */
+  const forceExit = (code) => {
+    if (forcing) { process.exit(code); return; } // asked again while the words go out
+    forcing = true;
+    try { engine.killAllSync(); } catch (err) { log.error('Could not stop everything:', err); }
+    let kept = [];
+    try { kept = engine.keptFolders(); } catch (err) { log.error('Could not list the agent folders:', err); }
+    tellKept(kept, false);
+    exitAfterOutput(code);
+  };
   let stopping = null;
   const stopAll = (code) => {
     if (stopping) return stopping;
     stopping = (async () => {
       say('Stopping the agents and closing Workbench…');
-      const force = setTimeout(() => { engine.killAllSync(); process.exit(code); }, 12_000);
+      const force = setTimeout(() => forceExit(code), 12_000);
       force.unref();
-      try { await engine.shutdown(); } catch (err) { log.error('Shutdown failed:', err); }
+      let kept = [];
+      try { kept = (await engine.shutdown())?.kept || []; } catch (err) { log.error('Shutdown failed:', err); }
       try { await server.close(); } catch (err) { log.error('Closing the server failed:', err); }
       try { store.close(); } catch { /* ignore */ }
-      process.exit(code);
+      if (forcing) return; // a forced exit is already on its way out
+      tellKept(kept, true);
+      exitAfterOutput(code);
     })();
     return stopping;
   };
   process.on('SIGINT', () => {
     if (stopping) { // a second Ctrl-C: stop waiting
-      engine.killAllSync();
-      process.exit(130);
+      forceExit(130);
+      return;
     }
     stopAll(0);
   });

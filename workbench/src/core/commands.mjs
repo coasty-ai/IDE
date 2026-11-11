@@ -9,8 +9,10 @@
 //   allow { agentId } / deny { agentId }            stop { agentIds }    stop_all
 //   say { agentId, text }   status { agentId? }     spend                sleep / wake { machineIds }
 //   sleep_idle              confirm { go }          unknown { text }
-// Extra fields some intents carry: askId (allow, deny, answer), text (allow/deny: the rest of a
-// reply such as "no, use the staging database"), needsMe (status: "what needs me").
+// Extra fields some intents carry: askId (allow, deny, answer), text (deny: the person's words, such as
+// "no, use the staging database"), conditional (deny: a yes that came with conditions, "yes but only in the
+// tests folder"; text is the whole reply), sure: false (stop, say: the words found the agent but did not name
+// it, so the engine asks first), needsMe (status: "what needs me"). An allow never carries words.
 import { clip } from '../shared/format.mjs';
 import { ENDED, LOOK } from '../shared/states.mjs';
 
@@ -134,12 +136,12 @@ function stripPolite(toks) {
   return cur;
 }
 
-function stripTrailing(toks) {
+function stripTrailing(toks, seqs = TRAILING) {
   let cur = toks;
   for (let changed = true; changed;) {
     changed = false;
     const ws = cur.map(t => t.w);
-    for (const seq of TRAILING) {
+    for (const seq of seqs) {
       if (seq.length < cur.length && seqAt(ws, ws.length - seq.length, seq)) {
         cur = cur.slice(0, cur.length - seq.length);
         changed = true;
@@ -280,19 +282,46 @@ function scoreAgent(ws, a) {
 }
 
 /**
+ * How many words of the agent's name the reference says, when it says nothing but words of the
+ * name; 0 when it says anything else. "the check out fix" says both words of Checkout fix.
+ */
+function nameWords(ws, a) {
+  const A = agentWords(a);
+  let n = 0;
+  for (let i = 0; i < ws.length; i++) {
+    if (i + 1 < ws.length && !REF_STOP.has(ws[i]) && A.nameW.has(stem(ws[i] + ws[i + 1]))) { n += 2; i++; continue; }
+    if (REF_STOP.has(ws[i])) continue;
+    if (!hit(A.nameW, stem(ws[i].replace(/-/g, '')))) return 0;
+    n++;
+  }
+  return n;
+}
+
+/** The reference names this agent: two or more words of its name, or all of a shorter name, and nothing else. */
+function names(ws, a) {
+  const n = nameWords(ws, a);
+  const size = agentWords(a).nameKey ? agentWords(a).nameKey.split(' ').length : 0;
+  return n > 0 && n >= Math.min(2, size);
+}
+
+/**
  * Resolve one reference ("the flaky test", "it", "search cleanup") to an agent.
  * `full`: every word of the reference matched. `sure`: also unmistakable, because it is "it",
  * an id, the agent's whole name, or at least two matching words ("stop the tests" is not sure).
- * @returns {{ ids: string[], full: boolean, sure: boolean, pronoun?: boolean, coverage: number, total: number }}
+ * `named`: stricter, for what acts at once (stop, tell): "it", an id, or two or more words of one
+ * agent's name (all of it, when the name is one word) and nothing else. Words of its task or state
+ * find an agent but do not name it ("stop the stuck one", "cancel the half-finished orders"), and
+ * neither do words that another running agent's name has too. A helper does not count against its root.
+ * @returns {{ ids: string[], full: boolean, sure: boolean, named: boolean, pronoun?: boolean, coverage: number, total: number }}
  */
 function resolveRef(toks, c) {
   const ws = toks.map(t => t.w);
-  const none = { ids: [], full: false, sure: false, coverage: 0, total: 0 };
+  const none = { ids: [], full: false, sure: false, named: false, coverage: 0, total: 0 };
   if (!ws.length) return none;
   if (PRONOUN_REFS.has(ws.join(' '))) {
-    return c.focusId ? { ids: [c.focusId], full: true, sure: true, pronoun: true, coverage: 1, total: 99 } : { ...none, pronoun: true };
+    return c.focusId ? { ids: [c.focusId], full: true, sure: true, named: true, pronoun: true, coverage: 1, total: 99 } : { ...none, pronoun: true };
   }
-  for (const a of c.agents) if (ws.includes(a.id.toLowerCase())) return { ids: [a.id], full: true, sure: true, coverage: 1, total: 99 };
+  for (const a of c.agents) if (ws.includes(a.id.toLowerCase())) return { ids: [a.id], full: true, sure: true, named: true, coverage: 1, total: 99 };
   let best = null;
   for (const a of c.agents) {
     const sc = scoreAgent(ws, a);
@@ -305,7 +334,9 @@ function resolveRef(toks, c) {
   if (!best) return none;
   const full = best.coverage === 1;
   const sure = full && (best.matched >= 2 || refKey(ws) === agentWords(best.a).nameKey);
-  return { ids: [best.a.id], full, sure, coverage: best.coverage, total: best.total };
+  const named = full && names(ws, best.a) && !c.agents.some(a => a !== best.a && !ENDED.has(a.state)
+    && (best.a.kind === 'helper' || a.kind !== 'helper') && nameWords(ws, a) > 0);
+  return { ids: [best.a.id], full, sure, named, coverage: best.coverage, total: best.total };
 }
 
 function compareKeys(x, y) {
@@ -329,7 +360,7 @@ function resolveList(toks, c) {
   const each = parts.map(p => resolveRef(p, c));
   if (each.every(r => r.ids.length)) {
     const ids = [...new Set(each.flatMap(r => r.ids))];
-    return { ids, full: each.every(r => r.full), sure: each.every(r => r.sure), coverage: 1, total: 0 };
+    return { ids, full: each.every(r => r.full), sure: each.every(r => r.sure), named: each.every(r => r.named), coverage: 1, total: 0 };
   }
   return whole;
 }
@@ -359,31 +390,132 @@ const CONFIRM_NO = new Set(['no', 'nope', 'nah', 'cancel', 'never', 'abort', 'st
 const CONFIRM_NO_FILL = new Set(['mind', 'it', 'that', 'this', 'please', 'thanks', 'thank', 'you', 'on', 'off', 'now', 'yet',
   'the', 'idea', 'way', 'actually', 'maybe', 'later', 'do', 'about', 'sorry', 'a', 'second', 'sec', 'minute', 'one']);
 
-function confirmReply(toks) {
-  const ws = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w) || CONFIRM_YES.has(w));
+/** Yes words that say what a launch does: "start it" is no yes to "Stop Flaky test?" or to "Tell Flaky test …?". */
+const START_YES = new Set(['start', 'launch']);
+
+/**
+ * A reply to the confirm card on screen: true (yes), false (no), 'asks' (a yes asked rather than said, such as
+ * "is that right?": it answers nothing, so the card stays), or null (not a reply).
+ */
+function confirmReply(toks, kind) {
+  // While "Stop Flaky test?" waits, "stop" and "stop it" mean yes; while "Tell Flaky test …?" waits, "send it" does.
+  const launch = kind !== 'stop' && kind !== 'say';
+  const isYes = w => (CONFIRM_YES.has(w) && (launch || !START_YES.has(w))) || (kind === 'stop' && w === 'stop') || (kind === 'say' && w === 'send');
+  const isNo = w => CONFIRM_NO.has(w) && !(kind === 'stop' && w === 'stop');
+  // Before the fillers go: "so" is one.
+  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : true;
+  const ws = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w) || isYes(w));
   if (!ws.length) return null;
-  if (ws.length === 3 && ws[0] === 'make' && ws[1] === 'it' && ws[2] === 'so') return true;
-  const no = ws.some(w => CONFIRM_NO.has(w));
-  const yes = ws.some(w => CONFIRM_YES.has(w));
-  if (no && !yes && ws.every(w => CONFIRM_NO.has(w) || CONFIRM_NO_FILL.has(w))) return false;
-  if (yes && !no && ws.every(w => CONFIRM_YES.has(w) || CONFIRM_YES_FILL.has(w))) return true;
+  const no = ws.some(isNo);
+  const yes = ws.some(isYes);
+  if (no && !yes && ws.every(w => isNo(w) || CONFIRM_NO_FILL.has(w))) return false;
+  if (yes && !no && ws.every(w => isYes(w) || CONFIRM_YES_FILL.has(w))) return yesAsked(toks) ? 'asks' : true;
   return null;
 }
 
-/** "yes", "go ahead", "allow it" / "no", "don't", "deny". Returns { kind, text? } or null. */
+// A clear yes or no at the start of a longer reply. "go", "do", "okay" and "fine" are not here: they also begin
+// commands and work requests ("go to search cleanup", "okay fix the login"), which are tried first.
+const FIRST_YES = new Set(['yes', 'yeah', 'yep', 'yup', 'ya', 'yah', 'yea', 'sure', 'allow', 'allowed', 'approve', 'approved',
+  'accept', 'accepted', 'permit', 'grant', 'granted', 'proceed', 'lgtm', 'absolutely', 'definitely', 'certainly', 'affirmative']);
+const FIRST_NO = new Set(['no', 'nope', 'nah', 'deny', "don't"]);
+
+/** Where the reply really starts: past "so", "well", "hey" (but not past "okay", which can be the yes itself). */
+function replyStart(toks) {
+  const k = toks.findIndex(t => !SOFT_LEAD.has(t.w) || YES_STRONG.has(t.w));
+  return k < 0 ? toks.length : k;
+}
+
+const QUESTION_START = new Set(['what', 'why', 'how', 'which', 'who', 'whom', 'whose', 'where', 'when', 'is', 'are', 'was',
+  'were', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'shall', 'may', 'might', 'must', 'has', 'have']);
+
+/**
+ * Words that ask something rather than answer: they end with "?", or start like a question ("what does it delete",
+ * "should I allow it", "do I need to approve this"; "do it" is not one).
+ */
+function asksSomething(toks) {
+  if (!toks.length) return false;
+  if (/\?["'”’)]*$/.test(toks[toks.length - 1].raw)) return true;
+  const ws = stripSoft(toks).map(t => t.w);
+  return QUESTION_START.has(ws[0]) || (ws[0] === 'do' && ['i', 'we', 'you', 'they'].includes(ws[1]));
+}
+
+/** Words a reply can open with before it says, or asks, anything: "yes", "okay", "go ahead", "so", "stop" on a stop card. */
+const OPENERS = new Set([...SOFT_LEAD, ...YES_STRONG, ...CONFIRM_YES, 'ahead', 'please', 'thanks', 'for', 'stop', 'send', 'run', 'let', 'make']);
+/** Words whose "it" is the thing said yes to: "do it", "allow it", "go for it", "stop it". In "yes it is", "it" is no such word. */
+const YES_VERB = new Set(['do', 'allow', 'approve', 'accept', 'permit', 'grant', 'confirm', 'start', 'launch', 'run', 'send', 'stop', 'let', 'make', 'for']);
+
+/** Words a left-out "is" or "are" leaves next to what is asked about: "that okay", "you sure", "that the right one". */
+const STATE_YES = new Set(['okay', 'alright', 'fine', 'good', 'great', 'sure', 'right', 'correct', 'allowed', 'approved', 'accepted',
+  'granted', 'perfect', 'cool', 'nice']);
+const PERMIT = new Set(['allow', 'approve', 'accept', 'permit', 'grant']);
+
+/**
+ * A question said with its "is", "are" or "do" left out, as people say them: "that okay", "you sure", "it fine",
+ * "that the right one", "you allow it", "okay with you". Typed, "that's okay" keeps its "is" and is no question; so are
+ * "you go ahead", "allow it" and "thank you".
+ */
+function leftOutVerb(ws) {
+  for (let i = 0; i < ws.length; i++) {
+    if (!['it', 'that', 'this', 'you', 'we'].includes(ws[i])) continue;
+    if (i > 0 && (YES_VERB.has(ws[i - 1]) || ws[i - 1] === 'thank')) continue; // "allow it", "thank you"
+    if ((ws[i] === 'you' || ws[i] === 'we') && PERMIT.has(ws[i + 1])) return true;
+    let j = i + 1;
+    while (['the', 'one', 'thing', 'command', 'request'].includes(ws[j])) j++;
+    if (STATE_YES.has(ws[j])) return true;
+  }
+  return /\b(?:with|for|by) you\b/.test(ws.join(' '));
+}
+
+/**
+ * A yes asked rather than said, which answers nothing: it asks something (see asksSomething), it leaves out its "is"
+ * (see leftOutVerb), or a question follows its opening yes ("yes is that right", "go ahead, is that okay", "do it, is
+ * that right"). Spoken words have no "?". "yes do it", "that is fine" and "yes it is" are a yes.
+ */
+function yesAsked(toks) {
+  if (asksSomething(toks)) return true;
+  const ws = toks.map(t => t.w);
+  if (leftOutVerb(ws)) return true;
+  for (let i = 0; i < ws.length; i++) {
+    if (QUESTION_START.has(ws[i]) || (ws[i] === 'do' && ['i', 'we', 'you', 'they'].includes(ws[i + 1]))) return true;
+    const object = i > 0 && YES_VERB.has(ws[i - 1]) && ['it', 'that', 'this', 'them'].includes(ws[i]);
+    if (!OPENERS.has(ws[i]) && !object) return false;
+  }
+  return false;
+}
+
+/**
+ * "yes", "go ahead", "allow it" / "no", "don't", "deny". Returns { kind, text?, conditional? } or null.
+ * Only a plain yes allows. A yes with more words ("yes but only in the tests folder", "allow it but only once") is a
+ * no that carries the whole reply (`conditional`), so the agent hears the condition; an allow could not carry it.
+ * A no with more words ("no, use the staging database") carries the words after the no.
+ * A yes asked rather than said ("is it okay?", "do you allow it", "yes?") gives { kind: 'asks' }: it answers nothing.
+ */
 function permissionReply(toks) {
   const ws = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w) || YES_STRONG.has(w));
   if (!ws.length) return null;
-  const s = ws.join(' ');
-  if (/^(no problem|no worries|not a problem|why not)$/.test(s)) return { kind: 'allow' };
   const no = ws.some(w => NO_STRONG.has(w));
   const yes = ws.some(w => YES_STRONG.has(w));
+  const plainYes = /^(no problem|no worries|not a problem)$/.test(ws.join(' '))
+    || (yes && !no && ws.every(w => YES_STRONG.has(w) || YES_FILL.has(w)));
+  if (plainYes) return yesAsked(toks) ? { kind: 'asks' } : { kind: 'allow' };
   if (no && ws.every(w => NO_STRONG.has(w) || NO_FILL.has(w) || YES_STRONG.has(w))) return { kind: 'deny' };
-  if (yes && !no && ws.every(w => YES_STRONG.has(w) || YES_FILL.has(w))) return { kind: 'allow' };
-  // A clear first word followed by more: "no, use the staging database instead".
-  const rest = tidy(spanText(toks.slice(1)));
-  if (['yes', 'yeah', 'yep', 'yup', 'allow', 'approve', 'approved'].includes(ws[0]) && !no) return { kind: 'allow', text: rest };
-  if (['no', 'nope', 'nah', 'deny', "don't"].includes(ws[0])) return { kind: 'deny', text: rest };
+  const k = replyStart(toks);
+  if (FIRST_NO.has(ws[0])) return { kind: 'deny', text: tidy(spanText(toks.slice(k + 1))) };
+  // "yes, but what does it delete?" asks first: no answer yet (see parse, step 5).
+  if (FIRST_YES.has(ws[0]) && !asksSomething(toks)) return { kind: 'deny', text: tidy(spanText(toks.slice(k))), conditional: true };
+  return null;
+}
+
+/**
+ * A reply to a permission that is no command and no work, but starts like a yes or a no ("okay but not on main",
+ * "fine, only the tests folder", "not on main"): a no that carries the words. Anything else stays unanswered.
+ */
+function looseReply(toks) {
+  const k = replyStart(toks);
+  const first = toks[k] && toks[k].w;
+  if (!first || k + 1 >= toks.length) return null;
+  if (NO_STRONG.has(first)) return { kind: 'deny', text: tidy(spanText(toks.slice(k))) };
+  if (YES_STRONG.has(first)) return { kind: 'deny', text: tidy(spanText(toks.slice(k))), conditional: true };
   return null;
 }
 
@@ -395,6 +527,8 @@ const STOP_ALL_WORDS = new Set(['everything', 'everyone', 'everybody', 'all', 'e
 const STOP_ALL_FILL = new Set(['the', 'of', 'them', 'agents', 'agent', 'single', 'work', 'lot', 'now', 'right', 'at', 'once',
   'it', 'things', 'stuff', 'jobs', 'tasks', 'running', 'working', 'that', 'is', 'are', 'helpers', 'immediately']);
 const STOP_VERBS = [['shut', 'down'], ['stop'], ['pause'], ['halt'], ['kill'], ['cancel'], ['abort'], ['terminate'], ['end'], ['quit'], ['interrupt']];
+// "stop the flaky test immediately": how soon, not which agent.
+const STOP_TAIL = [['right', 'away'], ['at', 'once'], ['immediately'], ['already'], ['again'], ['too']];
 
 function matchStopAll(ws) {
   if (ws.length === 2 && STOP_ALL_WORDS.has(ws[0]) && ['stop', 'pause', 'halt'].includes(ws[1])) return true; // "everyone stop"
@@ -418,8 +552,13 @@ function matchStop(core, c) {
   }
   const refWords = rest.map(t => t.w).join(' ');
   if (ws[0] === 'cancel' && PRONOUN_REFS.has(refWords)) return null; // "cancel that" is not about an agent
-  const r = resolveList(rest, c);
-  return { intent: { kind: 'stop', agentIds: r.ids }, strong: r.sure };
+  const r = resolveList(stripTrailing(rest, STOP_TAIL), c);
+  // Words that match nothing beside the agent's words say what to do, not which agent:
+  // "stop the flaky test from timing out" is work, so it gets the start confirm like other work.
+  if (r.ids.length && !r.full) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
+  const intent = { kind: 'stop', agentIds: r.ids };
+  if (r.ids.length && !r.named) intent.sure = false; // found, but not by its name: the engine asks first
+  return { intent, strong: r.named };
 }
 
 // Machines -----------------------------------------------------------------------------------
@@ -429,8 +568,6 @@ const MACHINE_FILL = new Set(['sleep', 'suspend', 'hibernate', 'turn', 'switch',
   'computer', 'computers', 'box', 'boxes', 'server', 'servers', 'please', 'and', 'both', 'my', 'our', 'your', 'ones', 'one',
   'them', 'that', 'are', 'is', 'of', 'back']);
 const LAPTOP_WORDS = new Set(['laptop', 'mac', 'macbook', 'local']);
-// Verbs that also mean something for agents; with these the rest must be only machines.
-const SHARED_VERBS = new Set(['stop', 'pause', 'start', 'spin', 'fire', 'boot']);
 
 /** A machine that is really there, by number: "cloud 2". Null when there is no such machine. */
 function existingCloud(n, c) {
@@ -495,8 +632,11 @@ function matchMachines(core, c) {
   if (!mode) return null;
   const men = machineMentions(ws, c);
   if (!men.any) return null;
+  // Sleep and wake act at once, so every word must be about machines. Any other word makes it something else:
+  // "start an agent on cloud 2 to ..." is a launch, "turn off the laptop screen saver" and
+  // "shut down cloud 2 search index" are work.
   const leftover = ws.filter((w, i) => !men.used.has(i) && !MACHINE_FILL.has(w));
-  if (leftover.length && SHARED_VERBS.has(ws[0])) return null; // "start an agent on cloud 2 to ..." is a launch
+  if (leftover.length) return null;
   if (mode === 'sleep' && men.idle) return { intent: { kind: 'sleep_idle' }, strong: true };
   return { intent: { kind: mode, machineIds: men.ids }, strong: true };
 }
@@ -627,7 +767,13 @@ function matchSay(core, c) {
     if (!best || compareKeys(key, best.key) > 0) best = { key, r, cand };
   }
   if (best) {
-    return { intent: { kind: 'say', agentId: best.r.ids[0], text: tidy(spanText(best.cand.msg)) }, strong: best.r.sure };
+    // A name that only partly matches is not a name: "warn the user when the onboarding flow fails" is work.
+    if (!best.r.full) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
+    // One step needs the name and a clear break before the message: "tell search cleanup to ...".
+    const sure = best.r.named && (best.cand.sep || !!best.r.pronoun);
+    const intent = { kind: 'say', agentId: best.r.ids[0], text: tidy(spanText(best.cand.msg)) };
+    if (!sure) intent.sure = false;
+    return { intent, strong: sure };
   }
   // "tell it to ..." with nothing focused: a say with no agent, so the engine can ask which one.
   // A name that matches no agent is not a say: sending it to whatever is focused would be wrong.
@@ -931,19 +1077,26 @@ function parse(said, c) {
   const holder = c.asker; // the focused agent, or its one helper that is waiting on the person
   const ask = holder ? holder.ask : null;
 
-  // 1. A launch is waiting for "yes" or "cancel".
+  // 1. A confirm on screen is waiting for "yes" or "cancel" (only the one the page shows: see the engine).
+  // "is that right?" asks about the card rather than answering it: it settles nothing, and the card stays.
   if (c.pendingConfirm) {
-    const go = confirmReply(base);
+    const go = confirmReply(base, c.pendingConfirm.kind);
+    if (go === 'asks') return { kind: 'unknown', text: said };
     if (go !== null) return { kind: 'confirm', go };
   }
   // 2. The focused agent is waiting for permission.
-  if (ask && ask.type === 'permission') {
+  const permission = ask && ask.type === 'permission';
+  const reply = (r) => {
+    const intent = { kind: r.kind, agentId: holder.id, askId: ask.id ?? null };
+    if (r.text) intent.text = r.text;
+    if (r.conditional) intent.conditional = true;
+    return intent;
+  };
+  if (permission) {
     const r = permissionReply(base);
-    if (r) {
-      const intent = { kind: r.kind, agentId: holder.id, askId: ask.id ?? null };
-      if (r.text) intent.text = r.text;
-      return intent;
-    }
+    // "is it okay?" gets what exactly is asked for, and the request keeps waiting (as in step 5).
+    if (r && r.kind === 'asks') return { kind: 'status', agentId: holder.id };
+    if (r) return reply(r);
   }
   // 3. Commands. While a question waits, only unmistakable commands win over an answer.
   const core = stripTrailing(stripPolite(stripSoft(base)));
@@ -954,6 +1107,14 @@ function parse(said, c) {
   // 4. A work request with no start verb.
   const task = matchTask(core, c);
   if (task) return task;
+  // 5. Words for the permission that are no command and no work. A question about it ("do I need to approve this?")
+  // gets what exactly it asks for, and the request keeps waiting; words that start like a yes or a no but say more
+  // are a no that carries them.
+  if (permission) {
+    if (asksSomething(base)) return { kind: 'status', agentId: holder.id };
+    const r = looseReply(base);
+    if (r) return reply(r);
+  }
   return { kind: 'unknown', text: said };
 }
 

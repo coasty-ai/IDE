@@ -30,6 +30,30 @@ export function money(usd) {
   return '$' + Math.round(usd);
 }
 
+/**
+ * A spend figure in words: "$0.42"; "about $0.42" when part of it is Workbench's estimate; "under $0.01" for less than a
+ * cent, estimated or not (never "<$0.01" or "about <$0.01").
+ */
+export function spentAmount(usd, estimated = false) {
+  const n = Number(usd);
+  if (n > 0 && n < 0.01) return 'under $0.01';
+  return (estimated ? 'about ' : '') + money(n);
+}
+
+/**
+ * What an agent has spent, from its usage and its harness: "$0.42"; "about $0.42" while part of it is Workbench's
+ * estimate (Claude Code reports cost only when a turn ends); "under $0.01". When nothing is known: "not reported" for
+ * Codex, which never reports cost, and "not reported yet" otherwise (a Claude agent before its first turn ends; also
+ * when no harness is given). Never "$0" for spend that was not reported.
+ */
+export function spentText(usage, harness = null) {
+  const u = usage || {};
+  const est = Number(u.unreportedUsd) > 0 ? Number(u.unreportedUsd) : 0;
+  const reported = typeof u.costUsd === 'number' && Number.isFinite(u.costUsd) ? u.costUsd : null;
+  if (reported == null && !est) return harness === 'codex' ? 'not reported' : 'not reported yet';
+  return spentAmount((reported || 0) + est, est > 0);
+}
+
 /** "12%" */
 export function percent(fraction) {
   if (fraction == null || !isFinite(fraction)) return '–';

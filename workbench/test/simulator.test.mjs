@@ -114,10 +114,12 @@ test('the seeded asks match the mockup exactly', () => {
   assert.equal(ok.type, 'permission');
   assert.equal(ok.sentence, 'Checkout fix wants to run a command');
   assert.equal(ok.detail, 'npm run db:migrate -- --env test');
+  assert.equal(ok.why, 'This command is not on the list of safe commands.', 'why it asks, in the permission check\'s own words');
   assert.deepEqual(ok.options, ['Allow', 'Deny']);
   assert.equal(ok.primary, 'Allow');
   assert.equal(T - ok.createdAt, 4 * MIN, 'waiting 4 minutes');
-  assert.equal(by['Checkout fix'].now, 'Update the test database', 'the held step shows as what it is doing');
+  // The held step reads as what it runs, never as the agent's own description of it ("Update the test database").
+  assert.equal(by['Checkout fix'].now, 'Running the db:migrate script', 'the held step shows as what it is doing');
 
   const q = by['Search cleanup'].ask;
   assert.equal(q.type, 'question');
@@ -319,7 +321,7 @@ test('Allow: Checkout fix runs the command, carries on and finishes', () => {
   assert.deepEqual(v.checks.results.map(r => r.name), ['Unit tests', 'Type check']);
   assert.match(v.says, /^I fixed the checkout bug/);
   assert.equal(v.plan.done, v.plan.total);
-  const end = store.eventsFor(cid).find(e => e.kind === EV.ACTIVITY && e.phase === 'end' && e.sentence === 'Update the test database');
+  const end = store.eventsFor(cid).find(e => e.kind === EV.ACTIVITY && e.phase === 'end' && e.sentence === 'Running the db:migrate script');
   assert.equal(end.ok, true, 'the held command ran');
   assert.deepEqual(store.errors, []);
 });
@@ -332,7 +334,7 @@ test('Deny: Checkout fix tries another way and still finishes', () => {
   const v = store.get(cid);
   assert.equal(v.approvals.denied, 1);
   const end = store.eventsFor(cid).filter(e => e.kind === EV.ACTIVITY && e.phase === 'end').at(-1);
-  assert.equal(end.sentence, 'Update the test database');
+  assert.equal(end.sentence, 'Running the db:migrate script');
   assert.equal(end.ok, false, 'the denied step failed');
   until(() => store.get(cid).state !== 'working', 3 * MIN);
   assert.equal(v.state, 'done_checked');
@@ -403,6 +405,31 @@ test('each ask moves an agent on once, whichever way the answer arrives', () => 
   assert.equal(store.get(sid).turns, 2, 'one new turn, not two');
 
   assert.deepEqual(sim.onAnswer('nope00', null, 'Allow'), { ok: false, reply: 'That agent is not part of the demo.' });
+});
+
+test('the demo takes answers by the same rules as the engine: only "Allow" allows, and an answer names its ask', () => {
+  // Words that sound like a yes, or a yes with conditions, are a no.
+  for (const words of ['yes', 'go ahead', 'yes but only in the tests folder', 'OK']) {
+    const { sim, store, id } = seeded();
+    const cid = id('Checkout fix');
+    const r = sim.onAnswer(cid, store.get(cid).ask, words);
+    assert.equal(r.reply, 'Checkout fix will not do that and will try another way.', words);
+    assert.equal(store.get(cid).approvals.denied, 1, words);
+    assert.equal(store.get(cid).approvals.byYou, 0, words);
+  }
+  // An answer that names no ask is a message: the request keeps waiting.
+  const { sim, store, id } = seeded();
+  const cid = id('Checkout fix');
+  const ask = store.get(cid).ask;
+  assert.equal(sim.onAnswer(cid, null, 'Allow').reply, 'Checkout fix got your message and will take it into account.');
+  assert.equal(store.get(cid).state, 'needs_ok');
+  assert.equal(store.get(cid).ask.id, ask.id);
+  assert.equal(sim.say(cid, 'go ahead and finish it').ok, true);
+  assert.equal(store.get(cid).state, 'needs_ok');
+  // A stuck agent stops only on "Stop it": other words that start with "stop" are a hint.
+  const fid = id('Flaky test');
+  assert.equal(sim.onAnswer(fid, store.get(fid).ask, 'stop using the old fixture').reply, 'Flaky test will try your hint.');
+  assert.equal(store.get(fid).state, 'working');
 });
 
 test('finished demo agents take follow-ups', () => {
@@ -539,6 +566,8 @@ test('a runner asks permission the way the engine would, and Deny is respected',
   assert.deepEqual(ask.options, ['Allow', 'Deny']);
   assert.equal(ask.primary, 'Allow');
   assert.ok(ask.detail);
+  // Why it asks, in the permission check's own words for that kind of step.
+  assert.equal(ask.why, /^https?:/.test(ask.detail) ? 'Opening a web page needs your OK.' : 'This command is not on the list of safe commands.');
   const v = found.mine.get(found.agentId);
   assert.equal(v.approvals.denied, 1);
   assert.match(v.says + ' ' + found.mine.events.filter(e => e.kind === EV.TURN && e.finalText).map(e => e.finalText).join(' '), /I did not /);

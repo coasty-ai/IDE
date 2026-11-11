@@ -83,14 +83,16 @@ class Rng {
 const round4 = x => Math.round(x * 10000) / 10000;
 const ACCEPT_RE = /^(looks good|keep it|accept( it)?|ok(ay)?|fine|great|good|thanks?|thank you|leave it)\b/i;
 const NEGATIVE_RE = /^(no\b|nope|don'?t|do not|not now|skip|leave it|no thanks|never mind|nah)/i;
-const STOP_RE = /^(stop|kill|cancel)\b/i;
+// A stuck agent stops only on its button's words, as in the engine: "stop using the old fixture" is a hint.
+const STOP_RE = /^(stop it|stop)[.!]*$/i;
 const KEEP_TRYING_RE = /keep (it )?trying|let it (keep )?try/i;
 
-/** Is a permission answer a yes? Anything unclear counts as no, like the real permission flow. */
+/**
+ * Is a permission answer a yes? Only the Allow button's own word, as in the engine: the engine turns a typed or
+ * spoken plain "yes" into "Allow", and anything else, "yes but only in the tests folder" included, is a no.
+ */
 function isAllow(text) {
-  const t = String(text || '').trim().toLowerCase();
-  if (/\b(deny|don'?t|do not|no|not|never|stop|cancel|reject)\b/.test(t)) return false;
-  return /\b(allow|yes|go ahead|ok(ay)?|approve|sure|fine|do it|go)\b/.test(t);
+  return /^allow$/i.test(String(text || '').trim());
 }
 
 function familyOf(model) {
@@ -124,6 +126,9 @@ function stepOf(t) {
 }
 
 const isTestCommand = input => /\btest\b/.test(String(input?.command || ''));
+
+/** Why the workbench's permission check asks about a scripted risky step, in the check's own words. */
+const whyAsk = step => (step.tool === 'WebFetch' ? 'Opening a web page needs your OK.' : 'This command is not on the list of safe commands.');
 
 // ---------------------------------------------------------------------------
 // Reading a task: what is it about, and what would the agent say when done?
@@ -927,7 +932,7 @@ export class Simulator {
         const pending = this._at(t1 - 1500, () => this._toolStart(a, step.tool, step.input, { auto: false }));
         const req = describeRequest(step.tool, step.input);
         this._at(t1, () => this._raiseAsk(a, {
-          type: 'permission', sentence: `${a.name} ${req.sentence}`, detail: req.detail, options: ['Allow', 'Deny'], primary: 'Allow',
+          type: 'permission', sentence: `${a.name} ${req.sentence}`, detail: req.detail, why: whyAsk(step), options: ['Allow', 'Deny'], primary: 'Allow',
         }, STATE.NEEDS_OK));
         a.state = STATE.NEEDS_OK;
         live.push([a, this._afterCheckoutAsk(a, pending)]);
@@ -1255,7 +1260,8 @@ export class Simulator {
     const askId = ask && ask.id ? String(ask.id) : null;
     if (askId && this._answered.has(askId)) return { ok: true, reply: 'That was already answered.' };
     const own = a.pendingAsk;
-    if (own && (!askId || askId === own.id)) return this._resolveOwnAsk(a, own, text);
+    // Its own ask is answered only by its id; words that name no ask are a message, as in the engine.
+    if (own && askId === own.id) return this._resolveOwnAsk(a, own, text);
     if (askId) this._answered.add(askId);
     const type = ask ? ask.type : null;
     if (type === 'stuck') {
@@ -1362,7 +1368,12 @@ export class Simulator {
     const sim = this;
     return {
       async start() { sim._sync(); if (start) start(); },
-      async send(text) { sim._sync(); sim._message(a, String(text ?? '').trim(), null); },
+      async send(text) {
+        sim._sync();
+        // A simulated agent that has stopped or failed cannot be picked up again: say so, rather than "Sent".
+        const res = sim._message(a, String(text ?? '').trim(), null);
+        if (res && res.ok === false) throw Object.assign(new Error(res.reply), { plain: true });
+      },
       async stop() { sim._sync(); if (a.phase !== 'stopped') sim._stopTree(a, false); },   // the engine emits the stopped state
       info() { return { pid: null, sessionId: a.sessionId, alive: !['new', 'stopped', 'failed'].includes(a.phase) }; },
     };
@@ -1480,7 +1491,7 @@ export class Simulator {
     const pending = this._toolStart(a, step.tool, step.input, { auto: false });
     yield a.rng.between(300, 700);
     const req = describeRequest(step.tool, step.input);
-    this._raiseAsk(a, { type: 'permission', sentence: `${a.name} ${req.sentence}`, detail: req.detail, options: ['Allow', 'Deny'], primary: 'Allow' }, STATE.NEEDS_OK);
+    this._raiseAsk(a, { type: 'permission', sentence: `${a.name} ${req.sentence}`, detail: req.detail, why: whyAsk(step), options: ['Allow', 'Deny'], primary: 'Allow' }, STATE.NEEDS_OK);
     const ans = yield { wait: 'answer', kind: 'permission' };
     if (ans.allow) {
       yield this._durFor(a, pending);

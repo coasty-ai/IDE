@@ -1,12 +1,14 @@
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createRunner, createClaudeRunner, available, harness, createLineSplitter, STOP_GRACE_MS, STDERR_TAIL_CHARS,
 } from '../src/adapters/claude/runner.mjs';
 import {
-  buildClaudeLaunch, userMessage, shellQuote, hookCommand, hookSettings, scrubEnv,
+  buildClaudeLaunch, userMessage, shellQuote, hookCommand, hookSettings, scrubEnv, sessionFolders,
   WORKBENCH_PROMPT, DISALLOWED_TOOLS, BRIDGE_PATH, DEFAULT_BUDGET_USD,
 } from '../src/adapters/claude/args.mjs';
 import { EV } from '../src/shared/events.mjs';
@@ -90,12 +92,13 @@ test('buildClaudeLaunch builds the verified command line', () => {
   });
   assert.equal(l.bin, '/x/fake');
   const settings = JSON.stringify({
-    hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: "'/usr/local/bin/node' '/opt/work bench/hook-bridge.mjs'", timeout: 1800 }] }] },
+    disableAllHooks: false,
+    hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: "'/usr/bin/env' '-u' 'NODE_OPTIONS' '/usr/local/bin/node' '/opt/work bench/hook-bridge.mjs'", timeout: 1800 }] }] },
   });
   assert.deepEqual(l.args, [
     '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--forward-subagent-text',
-    '--setting-sources', 'project,local', '--strict-mcp-config',
-    '--disallowedTools', 'Workflow CronCreate CronDelete ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger',
+    '--setting-sources', 'project', '--permission-mode', 'default', '--strict-mcp-config',
+    '--disallowedTools', 'Workflow CronCreate CronDelete CronList ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger DesignSync',
     '--settings', settings,
     '--append-system-prompt', WORKBENCH_PROMPT,
     '--max-budget-usd', '2', '--session-id', sid, '--name', 'Fix login', '--model', 'claude-haiku-4-5',
@@ -103,7 +106,28 @@ test('buildClaudeLaunch builds the verified command line', () => {
   assert.equal(l.sessionId, sid);
   assert.equal(l.resume, false);
   assert.equal(WORKBENCH_PROMPT, 'You are running inside Workbench, which shows your progress to a person in plain language. Work only inside the current folder. If you need a decision from the person, end your turn with one short, clear question. When you finish, begin your final message with one plain sentence, understandable by someone who does not write code, saying what you did.');
-  assert.equal(DISALLOWED_TOOLS.split(' ').length, 9);
+  assert.equal(DISALLOWED_TOOLS.split(' ').length, 11);
+  for (const tool of ['DesignSync', 'CronList']) assert.ok(DISALLOWED_TOOLS.split(' ').includes(tool), tool);
+});
+
+test('repository settings cannot switch the workbench hook off, or loosen Claude Code\'s own checks', () => {
+  for (const l of [
+    buildClaudeLaunch({ name: 'A', hook: HOOK, agentId: 'abc123', env: {} }),
+    buildClaudeLaunch({ name: 'A', resumeSessionId: 'sess-9', hook: HOOK, agentId: 'abc123', env: {} }),
+  ]) {
+    const at = (flag) => l.args[l.args.indexOf(flag) + 1];
+    // Only the repository's committed settings: not the person's own .claude/settings.local.json.
+    assert.equal(at('--setting-sources'), 'project');
+    assert.ok(!l.args.includes('project,local'));
+    // No settings file can pick bypassPermissions as the mode.
+    assert.equal(at('--permission-mode'), 'default');
+    // Settings on the command line outrank the repository's, so disableAllHooks: true there changes nothing.
+    const settings = JSON.parse(at('--settings'));
+    assert.equal(settings.disableAllHooks, false);
+    assert.deepEqual(Object.keys(settings), ['disableAllHooks', 'hooks']);
+    assert.deepEqual(Object.keys(settings.hooks), ['PreToolUse'], 'the bridge is registered for tool calls only');
+    assert.match(settings.hooks.PreToolUse[0].hooks[0].command, /^'\/usr\/bin\/env' '-u' 'NODE_OPTIONS' /);
+  }
 });
 
 test('buildClaudeLaunch: resume, defaults and refusals', () => {
@@ -139,14 +163,57 @@ test('the environment is scrubbed and carries the hook details', () => {
   assert.deepEqual(scrubEnv({ CLAUDECODE: '1', A: 'b', U: undefined }), { A: 'b' });
 });
 
+test('the person\'s own Claude Code settings and login reach the agent; session markers do not', () => {
+  const markers = {
+    CLAUDECODE: '1', CLAUDE_PID: '5', CLAUDE_EFFORT: 'high', CLAUDE_JOB_DIR: '/j', CLAUDE_AGENT_SDK_VERSION: '1',
+    CLAUDE_CODE_CHILD_SESSION: '1', CLAUDE_CODE_SESSION_ID: 's', CLAUDE_CODE_SESSION_ATTENDED: '1',
+    CLAUDE_CODE_BRIDGE_SESSION_ID: 'b', CLAUDE_CODE_MESSAGING_SOCKET: '/sock', CLAUDE_CODE_MESSAGING_TOKEN: 't',
+    CLAUDE_CODE_REMOTE: 'true', CLAUDE_CODE_REMOTE_SESSION_ID: 'r', CLAUDE_CODE_ENTRYPOINT: 'sdk-ts',
+    CLAUDE_CODE_EXECPATH: '/x', CLAUDE_CODE_SSE_PORT: '1234',
+  };
+  const own = {
+    CLAUDE_CODE_OAUTH_TOKEN: 'oauth', CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_USE_VERTEX: '1',
+    CLAUDE_CODE_CLIENT_CERT: '/cert', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '9000', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CONFIG_DIR: '/c', ANTHROPIC_API_KEY: 'k',
+  };
+  assert.deepEqual(scrubEnv({ ...markers, ...own, PATH: '/bin' }), { ...own, PATH: '/bin' });
+  const l = buildClaudeLaunch({ name: 'A', hook: HOOK, agentId: 'abc123', env: { ...markers, ...own } });
+  assert.equal(l.env.CLAUDE_CODE_OAUTH_TOKEN, 'oauth');
+  for (const k of Object.keys(markers)) assert.equal(l.env[k], undefined, k);
+});
+
 test('the hook command quotes its paths for the shell', () => {
   assert.equal(shellQuote("/tmp/it's here"), `'/tmp/it'\\''s here'`);
-  assert.equal(hookCommand({ nodePath: '/n o/node', bridgePath: "/b/x'y.mjs" }), `'/n o/node' '/b/x'\\''y.mjs'`);
-  assert.equal(hookCommand(), `${shellQuote(process.execPath)} ${shellQuote(BRIDGE_PATH)}`);
+  assert.equal(hookCommand({ nodePath: '/n o/node', bridgePath: "/b/x'y.mjs" }), `'/usr/bin/env' '-u' 'NODE_OPTIONS' '/n o/node' '/b/x'\\''y.mjs'`);
+  assert.equal(hookCommand(), `'/usr/bin/env' '-u' 'NODE_OPTIONS' ${shellQuote(process.execPath)} ${shellQuote(BRIDGE_PATH)}`);
   assert.match(BRIDGE_PATH, /src\/adapters\/claude\/hook-bridge\.mjs$/);
   const s = hookSettings();
   assert.equal(s.hooks.PreToolUse[0].hooks[0].timeout, 1800);
   assert.equal(s.hooks.PreToolUse[0].matcher, '*');
+});
+
+test('sessionFolders: Claude Code\'s own folders for one session, keyed by its id', () => {
+  const sid = '0bdffedf-c0cd-41ae-8bb3-6183f7e1be41';
+  const real = (p) => realpathSync.native(p);
+  assert.deepEqual(sessionFolders({ sessionId: sid, env: { HOME: '/h' }, uid: 501 }), [
+    { root: '/h/.claude/projects', session: sid },
+    { root: path.join(real('/tmp'), 'claude-501'), session: sid },
+  ]);
+  // The person's own CLAUDE_CONFIG_DIR and CLAUDE_CODE_TMPDIR are where Claude Code writes, so they count instead.
+  const tmp = mkdtempSync(path.join(tmpdir(), 'wb-cctmp-'));
+  try {
+    assert.deepEqual(sessionFolders({ sessionId: sid, env: { HOME: '/h', CLAUDE_CONFIG_DIR: '/c', CLAUDE_CODE_TMPDIR: tmp }, uid: 7 }), [
+      { root: '/c/projects', session: sid },
+      { root: path.join(real(tmp), 'claude-7'), session: sid },
+    ]);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+  // No session yet, or one that is not a UUID: nothing. No user id (Windows): no temp folder.
+  assert.deepEqual(sessionFolders({ sessionId: null, env: { HOME: '/h' }, uid: 501 }), []);
+  assert.deepEqual(sessionFolders({ sessionId: 'sess-9', env: { HOME: '/h' }, uid: 501 }), []);
+  assert.deepEqual(sessionFolders({ sessionId: sid, env: { HOME: '/h' }, uid: null }), [{ root: '/h/.claude/projects', session: sid }]);
+  assert.deepEqual(sessionFolders({ sessionId: sid, env: { HOME: '/h', CLAUDE_CONFIG_DIR: 'relative' }, uid: null }), []);
 });
 
 test('userMessage is one stream-json line', () => {
@@ -218,6 +285,22 @@ test('start launches Claude Code, sends the task and turns its output into event
   await r.stop();
   assert.equal(r.info().alive, false);
   assert.ok(!c.events.some((e) => e.kind === EV.STATE && e.agentId === 'abc123'), 'a stop is reported by the engine, not the runner');
+});
+
+test('the runner names its own session\'s folders and its helpers, for the permission check', async () => {
+  const c = collector();
+  const r = makeRunner(c, { env: { FAKE_CLAUDE_FIXTURE: 'claude-subagent-run.jsonl', HOME: '/home/someone', CLAUDE_CONFIG_DIR: '' } });
+  assert.deepEqual(r.readAlso(), [], 'no session before it starts');
+  assert.deepEqual(r.recipients(), []);
+  await r.start();
+  await c.until((evs) => evs.filter((e) => e.kind === EV.TURN && e.phase === 'end').length === 3, 'three turn ends');
+  const { sessionId } = r.info();
+  const folders = r.readAlso();
+  assert.deepEqual(folders[0], { root: '/home/someone/.claude/projects', session: sessionId }, 'from the environment Claude Code was started with');
+  assert.ok(folders.every((f) => f.session === sessionId), 'only its own session');
+  // Claude Code tells the root to continue its helper with to: 'a71ea18c16a7bba8d'.
+  assert.deepEqual(r.recipients().sort(), ['a71ea18c16a7bba8d', 'abc123-a71ea18c'].sort());
+  await r.stop();
 });
 
 test('send writes the next message to the running process', async () => {
@@ -367,4 +450,45 @@ test('the fixture replays the same through the runner in small pieces', async ()
   const denied = c.events.find((e) => e.kind === EV.ACTIVITY && e.phase === 'end');
   assert.equal(denied.ok, false);
   await r.stop();
+});
+
+test('agentFor says which agent issued a tool call, for the hook', async () => {
+  const c = collector();
+  const r = makeRunner(c, { env: { FAKE_CLAUDE_FIXTURE: 'claude-subagent-run.jsonl', FAKE_CLAUDE_FIXTURE_LINES: '280' } });
+  await r.start();
+  await c.until((evs) => evs.find((e) => e.kind === EV.ACTIVITY && e.toolUseId === 'toolu_01S2aSEWS7CLR2yGuSGh7FQM'), 'the helper’s Bash call');
+  assert.equal(r.agentFor({ toolUseId: 'toolu_01S2aSEWS7CLR2yGuSGh7FQM', taskId: 'a71ea18c16a7bba8d' }), 'abc123-a71ea18c');
+  assert.equal(r.agentFor({ taskId: 'a71ea18c16a7bba8d' }), 'abc123-a71ea18c');
+  assert.equal(r.agentFor({ toolUseId: 'toolu_other' }), null);
+  await r.stop();
+});
+
+/** The recorded held-bash turn has two API messages; both have been read once two root usage events are in. */
+const bothMessages = (evs) => evs.filter((e) => e.kind === EV.USAGE && e.agentId === 'abc123' && e.mode === 'add').length >= 2;
+
+test('a relaunch after a stop in the middle of a turn gets the limit minus what that turn spent', async () => {
+  const c = collector();
+  // The recorded turn without its result: Claude Code reports cost only when a turn ends, so nothing is reported.
+  const r = makeRunner(c, { env: { FAKE_CLAUDE_FIXTURE: 'claude-held-bash.jsonl', FAKE_CLAUDE_FIXTURE_LINES: '32' } });
+  await r.start();
+  await c.until(bothMessages, 'the turn’s two messages');
+  const { sessionId } = r.info();
+  await r.stop();
+  await r.send('Please continue');
+  const hit = await c.until(replyIs(/^You said \(resumed /), 'the resumed reply');
+  // 1 - 0.0231 estimated for the stopped turn (Claude Code later reported 0.0246 for the same recorded turn).
+  assert.equal(hit.finalText, `You said (resumed ${sessionId} with budget 0.9769): Please continue`);
+  await r.stop();
+});
+
+test('a relaunch is refused in plain words when the stopped turn used up the limit', async () => {
+  const c = collector();
+  const r = makeRunner(c, { budgetUsd: 0.03, env: { FAKE_CLAUDE_FIXTURE: 'claude-held-bash.jsonl', FAKE_CLAUDE_FIXTURE_LINES: '32' } });
+  await r.start();
+  await c.until(bothMessages, 'the turn’s two messages');
+  await r.stop();
+  const err = await r.send('Please continue').then(() => null, (e) => e);
+  assert.equal(err?.message, 'Test agent has used its whole spending limit, so it can’t continue.');
+  assert.equal(err.plain, true, 'meant for the person as it is');
+  assert.equal(r.info().alive, false, 'nothing was launched');
 });

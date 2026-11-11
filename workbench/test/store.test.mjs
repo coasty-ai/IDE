@@ -169,7 +169,8 @@ test('agent.usage set and add, cost replacement, context percentage', () => {
   assert.equal(u.inputTokens, 20);
   assert.equal(u.outputTokens, 10);
   assert.equal(u.cacheReadTokens, 1);
-  assert.equal(u.costUsd, 0, 'cost is untouched when the field is absent');
+  assert.equal(u.costUsd, null, 'cost is not reported until the harness reports it, and untouched when the field is absent');
+  assert.equal(u.unreportedUsd, 0);
   s.apply({ kind: EV.USAGE, ts: T0, agentId: 'r1', mode: 'set', inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0.05, contextTokens: 50_000, contextWindow: 200_000 });
   u = s.get('r1').usage;
   assert.equal(u.inputTokens, 100);
@@ -186,15 +187,15 @@ test('agent.turn start counts turns and wakes resting roots; helpers do not resu
   s.apply([created('r1'), created('r1-h', { parentId: 'r1' })]);
   s.apply({ kind: EV.TURN, ts: T0, agentId: 'r1', phase: 'start' });
   assert.equal(s.get('r1').turns, 1);
-  for (const rest of ['question', 'done_checked', 'done_claimed', 'checks_failed', 'waiting_helpers']) {
+  for (const rest of ['question', 'done_checked', 'done_claimed', 'checks_failed', 'waiting_helpers', 'failed']) {
     s.apply(state('r1', rest, T0 + 100));
     s.apply({ kind: EV.TURN, ts: T0 + 200, agentId: 'r1', phase: 'start' });
     assert.equal(s.get('r1').state, 'working', `${rest} returns to working`);
     assert.equal(s.get('r1').endedAt, null);
   }
-  s.apply(state('r1', 'failed', T0 + 300));
+  s.apply(state('r1', 'stopped', T0 + 300));
   s.apply({ kind: EV.TURN, ts: T0 + 400, agentId: 'r1', phase: 'start' });
-  assert.equal(s.get('r1').state, 'failed', 'failed is not resumed by a turn');
+  assert.equal(s.get('r1').state, 'stopped', 'only the person brings a stopped agent back, with a message');
 
   s.apply(state('r1-h', 'finished'));
   s.apply({ kind: EV.TURN, ts: T0, agentId: 'r1-h', phase: 'start' });
@@ -203,6 +204,43 @@ test('agent.turn start counts turns and wakes resting roots; helpers do not resu
   s.apply(state('r1', 'working'));
   s.apply({ kind: EV.TURN, ts: T0 + 500, agentId: 'r1', phase: 'end', finalText: 'Done.' });
   assert.equal(s.get('r1').state, 'working', 'turn end changes no state');
+});
+
+test('agent.turn start: a failed root resumes, saying it is working on the message that waited', () => {
+  const { s } = recording();
+  s.apply([created('r1'), state('r1', 'working')]);
+  s.apply([{ kind: EV.ENDED, ts: T0 + 2000, agentId: 'r1', outcome: 'error', error: 'Codex lost its connection to the model.' }, state('r1', 'failed', T0 + 2000, { reason: 'Codex lost its connection to the model.' })]);
+  assert.equal(s.get('r1').error, 'Codex lost its connection to the model.');
+  s.apply({ kind: EV.TURN, ts: T0 + 3000, agentId: 'r1', phase: 'start' });
+  const v = s.get('r1');
+  assert.equal(v.state, 'working');
+  assert.equal(v.now, 'Working on your message');
+  assert.equal(v.endedAt, null);
+  assert.equal(v.error, null, 'the earlier run’s error no longer describes it');
+  assert.equal(v.stateReason, null);
+});
+
+test('agent.turn start leaves an agent that is asking alone', () => {
+  const { s } = recording();
+  const ask = (agentId, id, type) => ({ kind: EV.ASK, ts: T0 + 10, agentId, ask: { id, type, sentence: 'x', options: ['A', 'B'] } });
+  s.apply([created('r1'), created('r2')]);
+  s.apply([ask('r1', 'ok-1', 'permission'), state('r1', 'needs_ok')]);
+  s.apply([ask('r2', 'stuck-1', 'stuck'), state('r2', 'maybe_stuck')]);
+  s.apply([{ kind: EV.TURN, ts: T0 + 20, agentId: 'r1', phase: 'start' }, { kind: EV.TURN, ts: T0 + 20, agentId: 'r2', phase: 'start' }]);
+  assert.equal(s.get('r1').state, 'needs_ok');
+  assert.equal(s.get('r1').ask.id, 'ok-1');
+  assert.equal(s.get('r2').state, 'maybe_stuck');
+  assert.equal(s.get('r2').ask.id, 'stuck-1');
+});
+
+test('a root picked up again by a message drops the error of its earlier run', () => {
+  const { s } = recording();
+  s.apply([created('r1'), state('r1', 'working')]);
+  s.apply([{ kind: EV.ENDED, ts: T0 + 2000, agentId: 'r1', outcome: 'error', error: 'Exit code 3' }, state('r1', 'failed', T0 + 2000)]);
+  s.apply(state('r1', 'working', T0 + 3000)); // the engine, after "Try again" reached the agent
+  assert.equal(s.get('r1').error, null);
+  s.apply([{ kind: EV.ENDED, ts: T0 + 4000, agentId: 'r1', outcome: 'error', error: 'Exit code 4' }, state('r1', 'failed', T0 + 4000)]);
+  assert.equal(s.get('r1').error, 'Exit code 4', 'a later failure says its own error');
 });
 
 test('plan, says, files, checks, rules, model, session, approvals and ended', () => {
@@ -364,4 +402,56 @@ test('the event log appends JSONL and never throws on write errors', async () =>
   assert.equal(bad.get('r2').state, 'working', 'the store keeps working');
   assert.ok(warnings.length >= 1);
   bad.close();
+});
+
+test('a root waiting only on a background command says so, and the line follows the live split', () => {
+  const s = new Store();
+  s.apply([created('r1'), created('h1', { parentId: 'r1', name: 'Read docs' }), state('h1', 'working')]);
+  s.apply(state('r1', 'waiting_helpers', T0 + 2000, { backgroundTasks: 2, background: { helpers: 1, commands: 1, others: 0 } }));
+  assert.equal(s.get('r1').now, 'Waiting for its helper and a background command');
+  s.apply([state('h1', 'finished', T0 + 3000), { kind: EV.BACKGROUND, ts: T0 + 3000, agentId: 'r1', helpers: 0, commands: 1, others: 0, work: [] }]);
+  assert.equal(s.get('r1').now, 'Waiting for a background command', 'not "Waiting for 2 helpers"');
+  s.apply({ kind: EV.BACKGROUND, ts: T0 + 4000, agentId: 'r1', helpers: 0, commands: 0, others: 0, work: [] });
+  assert.equal(s.get('r1').now, 'Its background work is done');
+});
+
+test('a turn after a wait for background commands only does not mention helpers; after helpers it does', () => {
+  const s = new Store();
+  s.apply([created('r1'), state('r1', 'working')]);
+  s.apply(state('r1', 'waiting_helpers', T0 + 2000, { backgroundTasks: 1, background: { helpers: 0, commands: 1, others: 0 } }));
+  s.apply({ kind: EV.TURN, ts: T0 + 3000, agentId: 'r1', phase: 'start' });
+  assert.equal(s.get('r1').state, 'working');
+  assert.equal(s.get('r1').now, 'Reading what came back');
+  s.apply(state('r1', 'waiting_helpers', T0 + 4000, { backgroundTasks: 1, background: { helpers: 1, commands: 0, others: 0 } }));
+  s.apply({ kind: EV.TURN, ts: T0 + 5000, agentId: 'r1', phase: 'start' });
+  assert.equal(s.get('r1').now, 'Reading what its helpers found');
+});
+
+test('a turn that starts by itself while an agent is done does not claim a follow-up was sent; a follow-up does', () => {
+  const s = new Store();
+  s.apply([created('r1'), state('r1', 'working'), state('r1', 'done_claimed', T0 + 2000)]);
+  s.apply({ kind: EV.TURN, ts: T0 + 3000, agentId: 'r1', phase: 'start' }); // Claude Code woke it: its command ended
+  assert.equal(s.get('r1').state, 'working');
+  assert.equal(s.get('r1').now, 'Picking up where it left off');
+  s.apply(state('r1', 'done_claimed', T0 + 4000));
+  s.apply(state('r1', 'working', T0 + 5000)); // the engine, once the person's follow-up reached it
+  assert.equal(s.get('r1').now, 'Working on your follow-up');
+});
+
+test('spend not reported yet is kept apart from the reported cost, and counted, as such, in spend today', () => {
+  const { s } = recording();
+  const now = new Date(2026, 10, 10, 15, 0, 0).getTime();
+  s.apply(created('a', { ts: now, startedAt: now - 1000, harness: 'claude' }));
+  assert.equal(s.get('a').usage.costUsd, null, 'nothing reported yet: not "$0"');
+  assert.equal(s.get('a').usage.unreportedUsd, 0);
+  assert.equal(s.spendTodayEstimated(now), false);
+  s.apply({ kind: EV.USAGE, ts: now, agentId: 'a', mode: 'add', inputTokens: 10, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, unreportedUsd: 0.04 });
+  assert.equal(s.get('a').usage.costUsd, null, 'costUsd is only what the harness reported');
+  assert.equal(s.get('a').usage.unreportedUsd, 0.04);
+  assert.equal(s.spendTodayUsd(now), 0.04);
+  assert.equal(s.spendTodayEstimated(now), true);
+  assert.deepEqual([s.snapshot(now).spendTodayUsd, s.snapshot(now).spendTodayEstimated], [0.04, true]);
+  s.apply({ kind: EV.USAGE, ts: now, agentId: 'a', mode: 'set', inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0.05, unreportedUsd: 0 });
+  assert.equal(s.spendTodayUsd(now), 0.05);
+  assert.equal(s.spendTodayEstimated(now), false);
 });

@@ -3,11 +3,22 @@
 // events (EV in src/shared/events.mjs). Pure: no I/O and no Node imports. Keep one parser per root agent
 // for its whole life, including relaunches with --resume, so helpers, the plan and spend carry over.
 import { EV } from '../../shared/events.mjs';
-import { narrate, nameFromTask, firstSentence, plain, KIND } from '../../shared/narrate.mjs';
+import { narrate, nameFromTask, firstSentence, plain } from '../../shared/narrate.mjs';
 import { clip } from '../../shared/format.mjs';
 
 /** Tools that launch a sub-agent (a helper). */
 const HELPER_TOOLS = new Set(['Agent', 'Task']);
+
+/** Tools that run a shell command, which can go on in the background (run_in_background, a timeout, a Monitor). */
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
+
+/**
+ * Tools whose task_progress words Claude Code builds from the call's own input ("Reading greet.js", "Searching for
+ * x"). For other tools they are the agent's own words: "Running <the Bash call's description>", "Monitoring:
+ * <description>", an Agent call's description, or the helper's task. Those progress lines are not shown; the
+ * forwarded call names the step by what it really does.
+ */
+const PROGRESS_FROM_INPUT = new Set(['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
 
 /** Task statuses that end a helper, and the helper state each one leads to. */
 const END_STATE = Object.freeze({ completed: 'finished', failed: 'failed', killed: 'stopped', stopped: 'stopped' });
@@ -34,7 +45,47 @@ export function helperIdFor(rootId, taskId, length = 8) {
   return `${rootId}-${(clean || 'helper').slice(0, length)}`;
 }
 
+/**
+ * Prices in US dollars per million tokens: new input, output, cache read, and cache write for 5 minutes (1 hour costs
+ * twice the input price). Used only to estimate what Claude Code has spent but not reported yet: it reports cost only
+ * when a turn ends. Where they come from: the Haiku row reproduces the recorded runs' totals exactly; the 5/25 and
+ * 10/50 tiers are constants in Claude Code 2.1.221; the Opus 4/4.1 and Sonnet rows are Anthropic's list prices
+ * (assumed). A row that is too low would let a relaunch spend too much, so a model not listed is priced as the most
+ * expensive one, and newer, cheaper models in a family are priced high rather than low.
+ */
+const PRICES = [
+  [/opus-4-(?:0|1)\b|opus-4-20/, { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 }],
+  [/opus/, { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }],
+  [/fable|mythos/, { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 }],
+  [/sonnet/, { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }],
+  [/haiku/, { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 }],
+];
+const PRICIEST = PRICES[0][1];
+
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+
+/**
+ * Estimated cost of one API message from its usage. Input-side tokens are exact; output_tokens in the stream is only
+ * what the API had counted when the message began, so the estimate is a little low (the result's real total came out
+ * 6 to 14 percent higher in the recorded runs).
+ */
+export function estimateUsd(model, u) {
+  const m = String(model || '').toLowerCase();
+  const p = (m && PRICES.find(([re]) => re.test(m))?.[1]) || PRICIEST;
+  const write = num(u.cache_creation_input_tokens);
+  const write1h = u.cache_creation && typeof u.cache_creation === 'object' ? Math.min(write, num(u.cache_creation.ephemeral_1h_input_tokens)) : 0;
+  const usd = num(u.input_tokens) * p.input + num(u.output_tokens) * p.output + num(u.cache_read_input_tokens) * p.cacheRead
+    + (write - write1h) * p.cacheWrite + write1h * p.input * 2;
+  return (usd / 1e6) * (u.speed === 'fast' ? 6 : 1) * (u.inference_geo === 'us' ? 1.1 : 1);
+}
+
+const ZERO = Object.freeze({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 });
+const addSpend = (a, b) => ({
+  inputTokens: a.inputTokens + b.inputTokens, outputTokens: a.outputTokens + b.outputTokens,
+  cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens, cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+  costUsd: (a.costUsd || 0) + (b.costUsd || 0),
+});
+const inSide = (t) => t.inputTokens + t.cacheReadTokens + t.cacheWriteTokens;
 
 function normStatus(s) {
   const v = String(s || '').toLowerCase().replace(/[\s-]+/g, '_');
@@ -68,7 +119,7 @@ function rememberId(set, id) {
  * Create a parser for one root agent.
  * @param {{ rootId: string, now?: () => number, machineId?: string, workspace?: string, onError?: (err: Error) => void }} opts
  * @returns {{ push(obj: object): object[], endOpenHelpers(state?: string, reason?: string): object[],
- *            processRestarted(): void, info(): object }}
+ *            processRestarted(): void, info(): object, recipients(): string[] }}
  */
 export function createClaudeParser({ rootId, now = Date.now, machineId, workspace, onError } = {}) {
   if (!rootId) throw new Error('createClaudeParser needs the id of the root agent.');
@@ -89,11 +140,17 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     byToolUse: new Map(),     // Agent/Task tool_use id -> helper
     plans: new Map(),         // agentId -> plan items
     taskCreates: new Map(),   // TaskCreate tool_use id -> plan item, until its result gives the real id
-    bgIds: new Set(),         // running background task ids, from background_tasks_changed
+    bg: new Map(),            // running background task id -> { type, description }, from background_tasks_changed
     bgSeen: false,
-    // Spend: Claude Code reports totals for the whole process. `base` carries totals across a relaunch.
-    // `rootInSince` sums the input-side tokens of root messages since the last relaunch.
-    spend: { base: null, lastRaw: null, last: null, restartPending: false, rootInSince: 0 },
+    bgSent: '',               // the last background split sent, so it is sent again only when it changes
+    commands: new Map(),      // shell tool_use id -> what the command does, in Workbench's own words (never the agent's)
+    bgWords: new Map(),       // background task id -> what its command does, from the call that started it
+    // Spend: Claude Code reports totals for the whole process, at the end of each turn. `base` carries totals
+    // across a relaunch. `rootInSince` sums the input-side tokens of root messages since the last relaunch.
+    // `tail` is what this process's messages since its last result used (tokens, and an estimated cost); `carry`
+    // is the tail of a process that ended before reporting it (a stopped turn), until the next result shows
+    // whether the new process counted it; `lostUsd` is the estimated cost that will never be reported.
+    spend: { base: null, lastRaw: null, last: null, restartPending: false, rootInSince: 0, tail: { ...ZERO }, carry: null, lostUsd: 0 },
   };
 
   let out = [];
@@ -141,10 +198,11 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     return `${base}-${k}`;
   }
 
-  function createHelper({ taskId, toolUseId, parentId, description, subagentType, prompt }) {
+  function createHelper({ taskId, toolUseId, parentId, description, subagentType, prompt, callName }) {
     const id = uniqueHelperId(taskId || toolUseId);
     const h = {
       id, taskId: taskId || null, toolUseId: toolUseId || null, parentId: parentId || rootId,
+      callName: typeof callName === 'string' && callName ? callName : null, // the Agent call's own `name`, for SendMessage
       ended: false, said: false, model: null, lastSentence: null,
       fwdTools: 0,    // tool_use blocks seen in its forwarded messages
       shownTools: 0,  // highest tool number already shown as an activity start (from either source)
@@ -194,7 +252,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
       ev(EV.SAYS, h.id, { text: firstSentence(summary) });
     }
     h.ended = true;
-    if (h.taskId) s.bgIds.delete(h.taskId);
+    if (h.taskId) s.bg.delete(h.taskId);
     setThinking(h.id, false);
     let why = null;
     const given = reason && String(reason).trim() ? firstSentence(reason, 200) : '';
@@ -286,9 +344,18 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
       mode: 'add', inputTokens: input, outputTokens: num(u.output_tokens),
       cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, contextTokens,
     };
+    // Helpers' spend counts toward the root's: Claude Code's totals include its sub-agents.
+    s.spend.tail = addSpend(s.spend.tail, { ...e, costUsd: estimateUsd(msg.model || (isHelper ? null : s.model), u) });
+    if (!isHelper) e.unreportedUsd = unreportedUsd();
     const win = contextWindowFor(msg.model);
     if (win) e.contextWindow = win;
     ev(EV.USAGE, agentId, e);
+  }
+
+  /** Estimated cost that Claude Code has not reported (yet, or ever, for a stopped turn). */
+  function unreportedUsd() {
+    const sp = s.spend;
+    return sp.tail.costUsd + (sp.carry ? sp.carry.costUsd : 0) + sp.lostUsd;
   }
 
   function onToolUse(agentId, helper, b) {
@@ -298,13 +365,19 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     if (id && s.tools.has(id)) { setThinking(agentId, false); return; } // the same block seen twice
     const { sentence, kind } = narrate(name, input);
     if (id) s.tools.set(id, { agentId, sentence, toolKind: kind, name });
+    // A shell command can go on in the background; the task that tracks it then needs these words.
+    if (id && SHELL_TOOLS.has(name)) {
+      s.commands.set(id, sentence);
+      if (s.commands.size > MAX_SEEN_IDS) s.commands.delete(s.commands.keys().next().value);
+    }
 
     let show = true;
     if (helper) {
-      // task_progress may already have announced this step (it can arrive before the forwarded message).
+      // task_progress may already have announced this step (it can arrive before the forwarded message). Only a
+      // step it described from the call's input is left out here; any other step is shown with what it really does.
       helper.fwdTools += 1;
-      if (helper.fwdTools <= helper.shownTools) show = false;
-      else helper.shownTools = helper.fwdTools;
+      if (PROGRESS_FROM_INPUT.has(name) && helper.fwdTools <= helper.shownTools) show = false;
+      else helper.shownTools = Math.max(helper.shownTools, helper.fwdTools);
     }
     if (show) {
       setThinking(agentId, false, { silent: true }); // an activity start turns thinking off in the store
@@ -320,6 +393,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
         description: input.description,
         subagentType: input.subagent_type,
         prompt: input.prompt,
+        callName: input.name, // SendMessage can reach the helper by this name
       });
     }
     if (name === 'TaskCreate') planTaskCreate(id, input);
@@ -406,6 +480,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     const taskId = o.task_id ? String(o.task_id) : null;
     const toolUseId = o.tool_use_id ? String(o.tool_use_id) : null;
     if (!taskId && !toolUseId) return;
+    if (taskId && toolUseId && s.commands.has(toolUseId)) s.bgWords.set(taskId, s.commands.get(toolUseId));
     if (findHelper(o)) return; // a duplicate, or created early from its messages
     const pending = toolUseId ? s.pending.get(toolUseId) : null;
     // Only sub-agents become helpers. Other background work (a long shell command, say) does not.
@@ -418,6 +493,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
       description: o.description ?? (pending && pending.description),
       subagentType: o.subagent_type ?? (pending && pending.subagentType),
       prompt: o.prompt ?? (pending && pending.prompt),
+      callName: pending && pending.callName,
     });
   }
 
@@ -425,9 +501,10 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     let h = findHelper(o);
     if (!h) { onTaskStarted(o); h = findHelper(o); }
     if (!h || h.ended) return;
+    // Only words Claude Code built from the call's input are shown. For any other tool, or none named, they are the
+    // helper's own words: the forwarded call shows that step instead, with what it really does, and counts it once.
     const tool = o.last_tool_name ? String(o.last_tool_name) : '';
-    const desc = typeof o.description === 'string' ? o.description.trim() : '';
-    const sentence = desc || (tool ? narrate(tool, {}).sentence : '');
+    const sentence = PROGRESS_FROM_INPUT.has(tool) && typeof o.description === 'string' ? o.description.trim() : '';
     if (!sentence) return;
     // Do not count a step twice: the forwarded tool_use may already have shown it.
     const count = o.usage && typeof o.usage.tool_uses === 'number' ? o.usage.tool_uses : null;
@@ -438,9 +515,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
       return;
     }
     setThinking(h.id, false, { silent: true });
-    const e = { phase: 'start', sentence, toolKind: tool ? narrate(tool, {}).kind : KIND.OTHER };
-    if (tool) e.tool = tool;
-    ev(EV.ACTIVITY, h.id, e);
+    ev(EV.ACTIVITY, h.id, { phase: 'start', sentence, toolKind: narrate(tool, {}).kind, tool });
     h.lastSentence = sentence;
   }
 
@@ -448,13 +523,13 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     const status = o.patch && typeof o.patch === 'object' ? String(o.patch.status || '') : '';
     const state = END_STATE[status];
     if (!state) return;
-    if (o.task_id) s.bgIds.delete(String(o.task_id));
+    if (o.task_id) s.bg.delete(String(o.task_id));
     const h = findHelper(o);
     if (h) endHelper(h, state, { reason: o.patch.error });
   }
 
   function onTaskNotification(o) {
-    if (o.task_id) s.bgIds.delete(String(o.task_id));
+    if (o.task_id) s.bg.delete(String(o.task_id));
     const h = findHelper(o);
     if (!h) return;
     // task_updated usually ends the helper first, without a summary; still say the summary once.
@@ -468,7 +543,43 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
 
   function onBackgroundTasks(o) {
     s.bgSeen = true;
-    s.bgIds = new Set((Array.isArray(o.tasks) ? o.tasks : []).map((t, i) => String((t && t.task_id) || `task-${i}`)));
+    s.bg = new Map((Array.isArray(o.tasks) ? o.tasks : []).map((t, i) => [
+      String((t && t.task_id) || `task-${i}`),
+      { type: String((t && t.task_type) || ''), description: t && typeof t.description === 'string' ? t.description.trim() : '' },
+    ]));
+  }
+
+  /**
+   * What runs in the background now. A task is a helper when this parser shows a live helper for it; otherwise it is a
+   * command (Claude Code's task type `local_bash`: Bash run_in_background, a command moved to the background at its
+   * timeout, a Monitor watch) or some other background task. Unknown kinds are never taken for helpers.
+   */
+  function backgroundSplit() {
+    if (!s.bgSeen) return { helpers: openHelpers().length, commands: 0, others: 0, work: [], ids: [] };
+    let helpers = 0;
+    let commands = 0;
+    let others = 0;
+    const work = [];
+    const ids = [];
+    for (const [id, t] of s.bg) {
+      const h = s.byTask.get(id);
+      if (h && !h.ended) { helpers++; continue; }
+      if (t.type === 'local_bash') commands++; else others++;
+      ids.push(id);
+      // In Workbench's own words for the command that started it; the task's description is the agent's.
+      if (work.length < 3) work.push(s.bgWords.get(id) || (t.type === 'local_bash' ? 'Running a command' : 'A background task'));
+    }
+    return { helpers, commands, others, work, ids };
+  }
+
+  /** Send the background split when it changed, so the waiting line stays true between turns. */
+  function sendBackground() {
+    if (!s.bgSeen) return;
+    const split = backgroundSplit();
+    const key = JSON.stringify(split);
+    if (key === s.bgSent) return;
+    s.bgSent = key;
+    ev(EV.BACKGROUND, rootId, split);
   }
 
   function onThinkingTokens(o) {
@@ -504,14 +615,26 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
    */
   function continueSpend(raw) {
     const sp = s.spend;
+    const before = sp.last || ZERO; // the totals before this result
+    let folded = ZERO;
     if (sp.restartPending) {
       sp.restartPending = false;
       const prev = sp.lastRaw;
-      const inSide = (t) => t.inputTokens + t.cacheReadTokens + t.cacheWriteTokens;
       let reset = false;
       if (prev && (inSide(raw) > 0 || inSide(prev) > 0)) reset = inSide(raw) < inSide(prev) + sp.rootInSince;
       else if (prev && raw.costUsd != null && prev.costUsd != null) reset = raw.costUsd <= prev.costUsd;
       if (reset) sp.base = { ...sp.last };
+      // What the stopped process used after its last result. If the new totals do not include it (the same test),
+      // its tokens stay in the totals and its estimated cost counts as never reported; if they do, it is covered.
+      const carry = sp.carry;
+      sp.carry = null;
+      if (carry && (reset || inSide(raw) < (prev ? inSide(prev) : 0) + inSide(carry) + sp.rootInSince)) {
+        folded = { ...carry, costUsd: 0 };
+        sp.base = addSpend(sp.base || ZERO, folded);
+        sp.lostUsd += carry.costUsd;
+      } else if (carry) {
+        sp.tail = addSpend(sp.tail, carry);
+      }
     }
     sp.lastRaw = raw;
     const b = sp.base;
@@ -523,6 +646,17 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
       costUsd: raw.costUsd == null ? null : (b.costUsd || 0) + raw.costUsd,
     } : { ...raw };
     sp.last = shown;
+    // The result covers what the totals grew by. A message can be billed later than it streams (a helper's message
+    // shows before a result but is counted in the next one), so keep what they used beyond that.
+    const grew = (k) => Math.max(0, (shown[k] || 0) - (before[k] || 0) - (folded[k] || 0));
+    const t = sp.tail;
+    sp.tail = {
+      inputTokens: Math.max(0, t.inputTokens - grew('inputTokens')),
+      outputTokens: Math.max(0, t.outputTokens - grew('outputTokens')),
+      cacheReadTokens: Math.max(0, t.cacheReadTokens - grew('cacheReadTokens')),
+      cacheWriteTokens: Math.max(0, t.cacheWriteTokens - grew('cacheWriteTokens')),
+      costUsd: Math.max(0, t.costUsd - grew('costUsd')),
+    };
     return shown;
   }
 
@@ -561,6 +695,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
         e.costUsd = continueSpend({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: cost }).costUsd;
       }
     }
+    e.unreportedUsd = unreportedUsd();
     if (s.rootContext != null) e.contextTokens = s.rootContext;
     const win = contextWindowFor(s.model);
     if (win) e.contextWindow = win;
@@ -570,8 +705,8 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     s.inTurn = false;
     const isError = !!o.is_error || o.subtype !== 'success';
     const finalText = typeof o.result === 'string' && o.result.trim() ? o.result : s.rootText;
-    const backgroundTasks = s.bgSeen ? s.bgIds.size : openHelpers().length;
-    const turn = { phase: 'end', finalText, backgroundTasks, isError };
+    const backgroundTasks = s.bgSeen ? s.bg.size : openHelpers().length;
+    const turn = { phase: 'end', finalText, backgroundTasks, background: backgroundSplit(), isError };
     if (isError) turn.reason = errorReason(o);
     ev(EV.TURN, rootId, turn);
   }
@@ -589,6 +724,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
         case 'result': onResult(obj); break;
         default: break; // unknown message types are ignored
       }
+      sendBackground();
     } catch (err) {
       // A malformed object must not stop the stream. Keep what was produced and report the problem.
       if (onError) onError(err);
@@ -600,18 +736,22 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
   function endOpenHelpers(state = 'stopped', reason) {
     out = [];
     for (const h of openHelpers()) endHelper(h, state, { reason });
-    s.bgIds.clear();
+    s.bg.clear();
     return out;
   }
 
   /** Call before a relaunch: the new process may count spend from zero again. */
   function processRestarted() {
-    s.spend.restartPending = true;
-    s.spend.rootInSince = 0;
+    const sp = s.spend;
+    // What the old process used after its last result: no result of that process will report it now.
+    if (inSide(sp.tail) > 0 || sp.tail.outputTokens > 0) sp.carry = addSpend(sp.carry || ZERO, sp.tail);
+    sp.tail = { ...ZERO };
+    sp.restartPending = true;
+    sp.rootInSince = 0;
     s.inTurn = false;
     s.tools.clear();   // tool calls of the old process will never report back
     s.pending.clear();
-    s.bgIds.clear();
+    s.bg.clear();
   }
 
   function info() {
@@ -619,11 +759,41 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
       sessionId: s.sessionId,
       model: s.model,
       inTurn: s.inTurn,
-      backgroundTasks: s.bgSeen ? s.bgIds.size : openHelpers().length,
+      backgroundTasks: s.bgSeen ? s.bg.size : openHelpers().length,
+      background: backgroundSplit(),
       openHelpers: openHelpers().map(h => h.id),
-      costUsd: s.spend.last ? s.spend.last.costUsd : null,
+      costUsd: s.spend.last ? s.spend.last.costUsd : null, // as Claude Code reported it
+      unreportedUsd: unreportedUsd(),                     // Workbench's estimate of what it has not reported
     };
   }
 
-  return { push, endOpenHelpers, processRestarted, info };
+  /**
+   * What SendMessage may call this root's own helpers, from Claude Code's own output: each helper's workbench id,
+   * its full task id (Claude Code tells the agent to continue a helper with `to: '<task id>'`) and the `name` its
+   * Agent call gave it. Helpers that have ended count too: a message can continue them.
+   */
+  function recipients() {
+    const out = new Set();
+    for (const h of s.helpers.values()) {
+      out.add(h.id);
+      if (h.taskId) out.add(h.taskId);
+      if (h.callName) out.add(h.callName);
+    }
+    return [...out];
+  }
+
+  /**
+   * The agent behind a PreToolUse hook call: the one that issued the tool call (`tool_use_id`, while the call is
+   * open), else the helper running that task (`agent_id`). Null when neither is known yet. It works whether the
+   * helper was made from task_started or, before it, from its forwarded messages (then its id comes from the Agent
+   * call, not from its task id).
+   */
+  function agentFor({ toolUseId, taskId } = {}) {
+    const t = toolUseId ? s.tools.get(String(toolUseId)) : null;
+    if (t) return t.agentId;
+    const h = taskId ? s.byTask.get(String(taskId)) : null;
+    return h ? h.id : null;
+  }
+
+  return { push, endOpenHelpers, processRestarted, info, recipients, agentFor };
 }

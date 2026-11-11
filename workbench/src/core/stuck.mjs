@@ -3,12 +3,15 @@
 // An agent that is working is possibly stuck when:
 //   1. the same step (sentence and input) started 3 times in a row, each retry coming after the
 //      previous try failed, with no successful step in between;
-//   2. the same error text came back 3 times (only events that carry error text count);
+//   2. the same error text came back 3 times, each time within 10 steps of the time before and from
+//      a step started after it (only events that carry error text count). Calls made together count
+//      as one step, so a batch that fails the same way counts once. Successful steps in between do
+//      not reset the count: that is the agent editing and retrying into the same error;
 //   3. no event arrived for `silenceMs` (4 minutes by default) and none of its helpers is working.
 //
 // Once flagged, an agent is not flagged again until it leaves maybe_stuck. observe() reports
-// progress for a flagged agent so the engine can clear the state: any successful step for rules 1
-// and 3 (or any new step for rule 3), and success of the step that kept failing for rule 2.
+// progress for a flagged agent so the engine can clear the state: any successful step, whatever
+// the rule (and, after a silence, any new step).
 import { EV } from '../shared/events.mjs';
 import { STATE, ENDED } from '../shared/states.mjs';
 import { duration, clip } from '../shared/format.mjs';
@@ -37,12 +40,14 @@ function errorText(ev) {
 export class StuckDetector {
   /**
    * @param {object} [opts]
-   * @param {number} [opts.silenceMs]  quiet time before rule 3 fires
-   * @param {number} [opts.repeats]    how many repeats rules 1 and 2 need
+   * @param {number} [opts.silenceMs]   quiet time before rule 3 fires
+   * @param {number} [opts.repeats]     how many repeats rules 1 and 2 need
+   * @param {number} [opts.errorSteps]  rule 2: how many steps an error stays current after it came back
    */
-  constructor({ silenceMs = 4 * 60_000, repeats = 3 } = {}) {
+  constructor({ silenceMs = 4 * 60_000, repeats = 3, errorSteps = 10 } = {}) {
     this.silenceMs = silenceMs;
     this.repeats = repeats;
+    this.errorSteps = errorSteps;
     this._agents = new Map();
   }
 
@@ -51,10 +56,11 @@ export class StuckDetector {
     if (!t) {
       t = {
         lastEventAt: 0,
-        last: null,          // the latest step started: { key, sentence, ended, failed }
+        last: null,          // the latest step started: { key, sentence, ended, failed, at }
         open: new Map(),     // toolUseId -> step record, for steps still running
         streak: 0,           // same step started in a row, each after a failed try
-        errors: new Map(),   // normalized error text -> { count, key, sentence, text }
+        steps: 0,            // steps finished so far, whatever their outcome; calls made together are one step (never reset)
+        errors: new Map(),   // normalized error text -> { count, at, key, sentence, text }
         pending: null,       // a rule that fired, waiting for check()
         flag: null,          // the rule that flagged the agent, until it leaves maybe_stuck
       };
@@ -98,7 +104,7 @@ export class StuckDetector {
     // narrate the same way ("Checking what changed" three times at once) do not count.
     if (prev && prev.key === key && prev.ended && prev.failed && t.streak > 0) t.streak += 1;
     else t.streak = 1;
-    const rec = { key, sentence: String(ev.sentence ?? ''), ended: false, failed: false };
+    const rec = { key, sentence: String(ev.sentence ?? ''), ended: false, failed: false, at: t.steps };
     t.last = rec;
     if (ev.toolUseId != null) t.open.set(ev.toolUseId, rec);
     if (!t.flag && !t.pending && t.streak >= this.repeats) {
@@ -121,12 +127,14 @@ export class StuckDetector {
       rec.failed = ev.ok === false;
     }
     const key = rec ? rec.key : stepKey(ev);
+    // Calls made together are one step: only the first of them to finish moves the count on.
+    if (!rec || rec.at === t.steps) t.steps += 1;
 
     if (ev.ok === true) {
       t.streak = 0;
       if (t.pending && t.pending.rule === 'repeat') t.pending = null;
-      const f = t.flag;
-      if (f && (f.rule !== 'error' || f.key === key)) return { agentId: ev.agentId, progress: true };
+      // Any step that works is progress, whichever rule flagged the agent.
+      if (t.flag) return { agentId: ev.agentId, progress: true };
       return null;
     }
 
@@ -134,8 +142,12 @@ export class StuckDetector {
       const text = errorText(ev);
       if (text) {
         const norm = text.toLowerCase().replace(/\d+/g, '#').slice(0, 300);
-        const e = t.errors.get(norm) || { count: 0 };
-        e.count += 1;
+        let e = t.errors.get(norm);
+        // Not seen for more than errorSteps steps: it starts counting afresh.
+        if (!e || t.steps - e.at > this.errorSteps) e = { count: 0, at: 0 };
+        // Calls that were already running when it last came back failed together with it: count once.
+        if (!rec || rec.at >= e.at) e.count += 1;
+        e.at = t.steps;
         e.key = key;
         e.sentence = rec ? rec.sentence : String(ev.sentence ?? '');
         e.text = text;

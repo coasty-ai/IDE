@@ -5,7 +5,7 @@
 export const STATE = Object.freeze({
   STARTING: 'starting',          // process launched, nothing heard yet
   WORKING: 'working',            // tool calls or model output are flowing
-  WAITING_HELPERS: 'waiting_helpers', // root turn ended, but its helpers (sub-agents) still run
+  WAITING_HELPERS: 'waiting_helpers', // root turn ended, but its helpers or background commands still run
   NEEDS_OK: 'needs_ok',          // a risky action is held until the person allows or denies it
   QUESTION: 'question',          // the agent ended its turn with a question for the person
   MAYBE_STUCK: 'maybe_stuck',    // same tool call or error repeated, or silent for too long
@@ -36,7 +36,7 @@ export const ENDED = new Set([STATE.DONE_CHECKED, STATE.DONE_CLAIMED, STATE.CHEC
 export const LOOK = Object.freeze({
   starting:        { label: 'starting',              shape: 'work',  tone: 'work', live: true },
   working:         { label: 'working',               shape: 'work',  tone: 'work', live: true },
-  waiting_helpers: { label: 'waiting on its helpers', shape: 'work', tone: 'work', live: true },
+  waiting_helpers: { label: 'waiting on background work', shape: 'work', tone: 'work', live: true },
   needs_ok:        { label: 'needs your OK',          shape: 'need',  tone: 'need' },
   question:        { label: 'has a question',         shape: 'need',  tone: 'need' },
   maybe_stuck:     { label: 'might be stuck',         shape: 'stuck', tone: 'stuck' },

@@ -9,7 +9,8 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EV, newAgentView, SPARK_BUCKET_MS, SPARK_BUCKETS } from '../shared/events.mjs';
-import { STATE, ENDED, ACTIVE, PRIORITY } from '../shared/states.mjs';
+import { STATE, ENDED, ACTIVE, PRIORITY, DONE } from '../shared/states.mjs';
+import { waitingFor } from '../shared/narrate.mjs';
 
 const RECENT_MAX = 8;
 const TOKEN_FIELDS = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'];
@@ -21,9 +22,13 @@ const ASK_TYPE_OF_STATE = Object.freeze({
   [STATE.MAYBE_STUCK]: 'stuck',
 });
 
-/** A root in one of these states goes back to working when a new turn starts. */
+/**
+ * A root in one of these states goes back to working when a new turn starts: a new turn means it works again. That
+ * includes `failed`: a message that waited while the failed turn ran starts the next one. `stopped` comes back only
+ * through the person's own message, and `needs_ok` and `maybe_stuck` keep their ask.
+ */
 const RESUMES_ON_TURN = new Set([
-  STATE.QUESTION, STATE.DONE_CHECKED, STATE.DONE_CLAIMED, STATE.CHECKS_FAILED, STATE.WAITING_HELPERS,
+  STATE.QUESTION, STATE.DONE_CHECKED, STATE.DONE_CLAIMED, STATE.CHECKS_FAILED, STATE.WAITING_HELPERS, STATE.FAILED,
 ]);
 
 /** What a root is doing right after it leaves a resting state. */
@@ -33,7 +38,14 @@ const RESUME_NOW = Object.freeze({
   [STATE.DONE_CHECKED]: 'Working on your follow-up',
   [STATE.DONE_CLAIMED]: 'Working on your follow-up',
   [STATE.CHECKS_FAILED]: 'Working on your follow-up',
+  [STATE.FAILED]: 'Working on your message',
 });
+
+/** The counts of an agent.background split (or of a turn end's `background`). */
+function splitOf(b) {
+  const n = (x) => (Number.isFinite(x) && x > 0 ? x : 0);
+  return { helpers: n(b.helpers), commands: n(b.commands), others: n(b.others) };
+}
 
 function copy(value) {
   if (value == null || typeof value !== 'object') return value ?? null;
@@ -54,7 +66,7 @@ export class Store extends EventEmitter {
   constructor({ logPath = null, log = null } = {}) {
     super();
     this._views = new Map();     // id -> AgentView, in creation order
-    this._meta = new Map();      // id -> { seq, openTools: Map<toolUseId, sentence>, backgroundTasks }
+    this._meta = new Map();      // id -> { seq, openTools: Map<toolUseId, sentence>, backgroundTasks, background, waitedForHelpers }
     this._children = new Map();  // parentId -> child ids, in creation order
     this._machines = new Map();  // id -> Machine
     this._seq = 0;
@@ -120,23 +132,35 @@ export class Store extends EventEmitter {
     return [...this._machines.values()];
   }
 
-  /** Sum of root costs that are reported, for roots started since local midnight. */
+  /** Sum of root costs, reported and estimated (not reported yet), for roots started since local midnight. */
   spendTodayUsd(now = Date.now()) {
+    return this._spendToday(now).usd;
+  }
+
+  /** Is part of today's spend Workbench's own estimate of cost not reported yet? */
+  spendTodayEstimated(now = Date.now()) {
+    return this._spendToday(now).estimated;
+  }
+
+  _spendToday(now) {
     const d = new Date(now);
     d.setHours(0, 0, 0, 0);
     const midnight = d.getTime();
     let sum = 0;
+    let estimated = false;
     for (const v of this._views.values()) {
       if (v.parentId || v.startedAt < midnight) continue;
       const c = v.usage.costUsd;
       if (typeof c === 'number' && Number.isFinite(c)) sum += c;
+      if (v.usage.unreportedUsd > 0) { sum += v.usage.unreportedUsd; estimated = true; }
     }
-    return Math.round(sum * 1e6) / 1e6;
+    return { usd: Math.round(sum * 1e6) / 1e6, estimated };
   }
 
   /** The store's part of the engine snapshot. */
   snapshot(now = Date.now()) {
-    return { agents: this.list(), machines: this.machines(), spendTodayUsd: this.spendTodayUsd(now) };
+    const spend = this._spendToday(now);
+    return { agents: this.list(), machines: this.machines(), spendTodayUsd: spend.usd, spendTodayEstimated: spend.estimated };
   }
 
   // ---------------------------------------------------------------- writing
@@ -220,7 +244,10 @@ export class Store extends EventEmitter {
     switch (ev.kind) {
       case EV.STATE: {
         if (!Object.hasOwn(PRIORITY, ev.state)) return; // unknown state: ignore
-        if (Number.isFinite(ev.backgroundTasks)) meta.backgroundTasks = ev.backgroundTasks;
+        if (Number.isFinite(ev.backgroundTasks)) {
+          meta.backgroundTasks = ev.backgroundTasks;
+          meta.background = ev.background && typeof ev.background === 'object' ? splitOf(ev.background) : null;
+        }
         this._setState(v, ev.state, ev.reason ?? null, ev.ts, batch, index, changed);
         break;
       }
@@ -266,6 +293,7 @@ export class Store extends EventEmitter {
           const c = ev.costUsd;
           u.costUsd = (c == null || !Number.isFinite(Number(c))) ? null : Number(c);
         }
+        if (Object.hasOwn(ev, 'unreportedUsd')) u.unreportedUsd = Number(ev.unreportedUsd) > 0 ? Number(ev.unreportedUsd) : 0;
         if (Object.hasOwn(ev, 'contextTokens')) u.contextTokens = Number.isFinite(ev.contextTokens) ? ev.contextTokens : null;
         if (Object.hasOwn(ev, 'contextWindow')) u.contextWindow = Number.isFinite(ev.contextWindow) ? ev.contextWindow : null;
         u.contextPct = (u.contextTokens != null && u.contextWindow) ? u.contextTokens / u.contextWindow : null;
@@ -276,7 +304,11 @@ export class Store extends EventEmitter {
         if (ev.phase === 'start') {
           v.turns += 1;
           if (!v.parentId && RESUMES_ON_TURN.has(v.state)) {
+            const prev = v.state;
             this._setState(v, STATE.WORKING, null, ev.ts, batch, index, changed);
+            // No message from the person started this turn (that one sets working first): Claude Code did, for
+            // example when a command it left running ended.
+            if (DONE.has(prev)) v.now = 'Picking up where it left off';
           }
         } else if (ev.phase === 'end') {
           // Nothing runs once a turn is over; the engine decides the state.
@@ -294,6 +326,11 @@ export class Store extends EventEmitter {
 
       case EV.SAYS:
         v.says = ev.text == null ? null : String(ev.text);
+        break;
+
+      case EV.BACKGROUND:
+        meta.background = splitOf(ev);
+        if (!v.parentId && v.state === STATE.WAITING_HELPERS) v.now = this._waitingText(v);
         break;
 
       case EV.ASK:
@@ -355,7 +392,7 @@ export class Store extends EventEmitter {
     const v = newAgentView(init, ev.ts);
     v.sparkEndsAt = bucketEnd(ev.ts);
     this._views.set(id, v);
-    this._meta.set(id, { seq: ++this._seq, openTools: new Map(), backgroundTasks: 0 });
+    this._meta.set(id, { seq: ++this._seq, openTools: new Map(), backgroundTasks: 0, background: null, waitedForHelpers: false });
     if (parentId) {
       if (!this._children.has(parentId)) this._children.set(parentId, []);
       this._children.get(parentId).push(id);
@@ -371,13 +408,21 @@ export class Store extends EventEmitter {
     if (next !== prev) {
       v.stateSince = ts;
       if (ENDED.has(next)) v.endedAt = ts;
-      else if (ENDED.has(prev)) v.endedAt = null; // picked up again after a follow-up
+      else if (ENDED.has(prev)) {
+        // Picked up again after a follow-up: the earlier run's error no longer describes it.
+        v.endedAt = null;
+        v.error = null;
+      }
       if (ASK_TYPE_OF_STATE[prev] && v.ask && !this._askSurvives(v, next, batch, index)) v.ask = null;
       if (ENDED.has(next)) {
         this._meta.get(v.id)?.openTools.clear();
         v.thinking = false;
       }
-      if (!v.parentId && next === STATE.WORKING && RESUME_NOW[prev]) v.now = RESUME_NOW[prev];
+      if (!v.parentId && next === STATE.WORKING && RESUME_NOW[prev]) {
+        // After a wait for commands only, there were no helpers to read from.
+        v.now = prev === STATE.WAITING_HELPERS && !this._meta.get(v.id)?.waitedForHelpers ? 'Reading what came back' : RESUME_NOW[prev];
+      }
+      if (!v.parentId && next === STATE.WAITING_HELPERS) this._meta.get(v.id).waitedForHelpers = false;
     }
     if (!v.parentId && next === STATE.WAITING_HELPERS) v.now = this._waitingText(v);
     changed.add(v.id);
@@ -422,11 +467,20 @@ export class Store extends EventEmitter {
     }
   }
 
+  /**
+   * "Waiting for 2 helpers", "Waiting for a background command", "Waiting for its helper and a background command".
+   * Helpers are the working helper views, else the ones in the latest split; without a split (Codex, the simulator)
+   * the background task count is of helpers.
+   */
   _waitingText(v) {
-    let n = v.helpers.working;
-    if (!n) n = this._meta.get(v.id)?.backgroundTasks || 0;
-    if (!n) return 'Waiting for its helpers';
-    return `Waiting for ${n} helper${n === 1 ? '' : 's'}`;
+    const meta = this._meta.get(v.id);
+    const bg = meta?.background;
+    const helpers = v.helpers.working || (bg ? bg.helpers : meta?.backgroundTasks) || 0;
+    if (meta && helpers) meta.waitedForHelpers = true;
+    if (!bg) return helpers ? `Waiting for ${helpers} helper${helpers === 1 ? '' : 's'}` : 'Waiting for its helpers';
+    if (!helpers && !bg.commands && !bg.others) return 'Its background work is done'; // a new turn follows
+    const words = waitingFor({ helpers, commands: bg.commands, others: bg.others });
+    return `Waiting for ${words === 'its helper' ? '1 helper' : words}`;
   }
 
   // ---------------------------------------------------------------- sparkline

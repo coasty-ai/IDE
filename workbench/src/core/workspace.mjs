@@ -30,13 +30,22 @@ function gitEnv() {
 }
 
 /**
+ * Settings for every git command the engine runs. core.fsmonitor names a program that git status starts; an agent
+ * that managed to change the repository's config must not get a program run inside the engine that way.
+ */
+const GIT_SAFE_CONFIG = ['-c', 'core.fsmonitor=false'];
+
+/**
  * Run git with an argument array.
+ * @param {{ cwd?: string, timeout?: number, input?: string, okCodes?: number[] }} [o]
+ *   input goes to git's stdin; okCodes are exit codes that still count as success (check-ignore exits 1 when
+ *   nothing matches)
  * @returns {Promise<{ stdout: string, stderr: string }>} rejects with the execFile error (plus .stderr)
  */
-export function git(args, { cwd, timeout = GIT_TIMEOUT_MS } = {}) {
+export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [] } = {}) {
   return new Promise((resolve, reject) => {
-    execFile('git', args, { cwd, timeout, maxBuffer: MAX_BUFFER, encoding: 'utf8', env: gitEnv(), windowsHide: true }, (err, stdout, stderr) => {
-      if (err) {
+    const child = execFile('git', [...GIT_SAFE_CONFIG, ...args], { cwd, timeout, maxBuffer: MAX_BUFFER, encoding: 'utf8', env: gitEnv(), windowsHide: true }, (err, stdout, stderr) => {
+      if (err && !(typeof err.code === 'number' && okCodes.includes(err.code) && !err.killed)) {
         err.stdout = stdout;
         err.stderr = String(stderr || '');
         reject(err);
@@ -44,6 +53,10 @@ export function git(args, { cwd, timeout = GIT_TIMEOUT_MS } = {}) {
         resolve({ stdout, stderr });
       }
     });
+    if (input != null) {
+      child.stdin.on('error', () => {}); // git may finish before reading all of it
+      child.stdin.end(input);
+    }
   });
 }
 
@@ -183,14 +196,31 @@ export async function createWorkspace({ repoRoot, agentId, slug, baseDir } = {})
   const branch = `workbench/${s}-${id}`;
   fs.mkdirSync(folder, { recursive: true });
   if (fs.existsSync(wsPath)) throw plainError(`A workspace already exists at ${wsPath}.`);
+  // Only a branch that is not there yet may be taken away again below: one that is could hold kept work.
+  const fresh = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: root, okCodes: [1] })
+    .then(r => r.stdout.trim() === '', () => false);
   try {
     await git(['worktree', 'add', '-b', branch, wsPath, 'HEAD'], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
   } catch (e) {
+    // Stopped part-way (a Ctrl-C in the terminal reaches git too, or a post-checkout hook failed): git takes a half-made
+    // folder away itself, but not the branch it made first, nor a folder it finished.
+    if (fresh) await takeBack(root, wsPath, branch);
     throw gitTrouble(e) || plainError(`Git could not make a workspace for this agent: ${firstLine(e.stderr)}`, e);
   }
-  const real = fs.realpathSync.native(wsPath);
-  const base = (await git(['rev-parse', 'HEAD'], { cwd: real })).stdout.trim();
-  return { path: real, branch, base };
+  try {
+    const real = fs.realpathSync.native(wsPath);
+    const base = (await git(['rev-parse', 'HEAD'], { cwd: real })).stdout.trim();
+    return { path: real, branch, base };
+  } catch (e) {
+    await takeBack(root, wsPath, branch);
+    throw gitTrouble(e) || plainError(`Git could not make a workspace for this agent: ${firstLine(e.stderr || e.message)}`, e);
+  }
+}
+
+/** Nothing has run in a new workspace yet: take it and its branch away again. */
+async function takeBack(root, wsPath, branch) {
+  await git(['worktree', 'remove', '--force', wsPath], { cwd: root, timeout: WORKTREE_TIMEOUT_MS }).catch(() => {});
+  await git(['branch', '-D', branch], { cwd: root }).catch(() => {});
 }
 
 function canonical(p) {
@@ -216,17 +246,38 @@ async function listWorktrees(root) {
 /**
  * Remove an agent's worktree. Only removes folders git lists as worktrees of this repository,
  * never the main folder. The branch is kept unless deleteBranch is set (and it is a workbench/ branch).
- * @returns {Promise<{ removed: boolean, branch?: string|null }>}
+ * With onlyIfUnchanged (and the commit it started from, `base`), it removes nothing that might hold work: the folder
+ * goes only while its HEAD is still `base`, `git status` lists nothing at all (not even a file .gitignore hides, such
+ * as a .env or a build) and `git worktree remove` without --force agrees; then the branch goes only while it still
+ * points at `base` (`update-ref -d`). In that order: update-ref would delete the branch of a folder that was kept.
+ * @returns {Promise<{ removed: boolean, branch?: string|null, kept?: true }>}
  */
-export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = false } = {}) {
+export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = false, onlyIfUnchanged = false, base = null } = {}) {
   const root = realRoot(repoRoot);
   if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath)) throw plainError('No workspace folder was given.');
   const target = canonical(wsPath);
   if (target === root) throw plainError('That is the main folder of the repository, not a workspace.');
+  const start = onlyIfUnchanged ? validRef(base) : null;
   const entry = (await listWorktrees(root)).find(w => w.path === target || canonical(w.path) === target);
   if (!entry || canonical(entry.path) === root) {
     await git(['worktree', 'prune'], { cwd: root }).catch(() => {});
     return { removed: false };
+  }
+  if (onlyIfUnchanged) {
+    const head = await git(['rev-parse', 'HEAD'], { cwd: entry.path }).then(r => r.stdout.trim(), () => null);
+    if (head !== start) return { removed: false, kept: true }; // the agent made commits, or the folder is unreadable
+    const status = await git(['status', '--porcelain', '--ignored', '--untracked-files=all'], { cwd: entry.path }).then(r => r.stdout, () => null);
+    if (status !== '') return { removed: false, kept: true };
+    try {
+      await git(['worktree', 'remove', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
+    } catch {
+      return { removed: false, kept: true }; // git found something changed after all: it keeps it, and so do we
+    }
+    if (deleteBranch && entry.branch && entry.branch.startsWith('workbench/')) {
+      await git(['update-ref', '-d', `refs/heads/${entry.branch}`, start], { cwd: root }).catch(() => {});
+    }
+    try { fs.rmdirSync(path.dirname(entry.path)); } catch {} // the per-repository folder, only if now empty
+    return { removed: true, branch: entry.branch };
   }
   try {
     await git(['worktree', 'remove', '--force', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
@@ -245,10 +296,109 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
 
 // ---------------------------------------------------------------------------------------------
 
+const nulList = (out) => String(out).split('\0').filter(Boolean);
+
+/** Paths handed to git on its command line, a few hundred at a time, so thousands of them still fit. */
+const ARG_BATCH = 500;
+
+/** The parts of a relative path, or null for one that could leave the folder it is relative to. */
+function safeParts(rel) {
+  const parts = rel.split('/');
+  return parts.some(x => x === '' || x === '.' || x === '..') ? null : parts;
+}
+
 /**
- * What changed in a workspace since `base`: tracked changes (committed or not) plus new files.
+ * Which of `paths` (relative to the workspace, a folder ending in "/") the ignore rules of commit `ref` would hide.
+ * The commit's .gitignore files on the way to each path are written to a scratch folder, and `git check-ignore`
+ * reads them there, together with the repository's own info/exclude and the person's global excludes, which are the
+ * same now as then. A path inside a hidden folder counts as hidden.
+ * - A folder is asked about by its name, made as a real folder in the scratch folder. As "out/", a rule such as
+ *   `out/*` would match it (the * matching nothing), although git looks inside out/ and judges each file there.
+ *   Made as a folder, rules for folders only (`node_modules/`) still apply to it.
+ * - Every path goes to git as "./<path>", and folder names to ls-tree as literal paths, so a name such as ":!x" or
+ *   ":/x" is that file, not pathspec magic (which check-ignore refuses, or reads as a different path).
+ */
+async function ignoredAt(wsPath, ref, paths) {
+  if (!paths.length) return new Set();
+  const dirs = new Set(['']);
+  for (const p of paths) {
+    const parts = p.replace(/\/+$/, '').split('/');
+    for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
+  }
+  const wanted = [...dirs].map(d => (d ? `${d}/.gitignore` : '.gitignore'));
+  const found = new Map(); // path -> blob id
+  for (let i = 0; i < wanted.length; i += ARG_BATCH) {
+    const out = (await git(['--literal-pathspecs', 'ls-tree', '-z', ref, '--', ...wanted.slice(i, i + ARG_BATCH)], { cwd: wsPath })).stdout;
+    for (const rec of nulList(out)) {
+      const m = /^100(644|755) blob ([0-9a-f]+)\t([\s\S]+)$/.exec(rec); // a plain file: git does not follow linked ones
+      if (m) found.set(m[3], m[2]);
+    }
+  }
+  const gitDir = (await git(['rev-parse', '--absolute-git-dir'], { cwd: wsPath })).stdout.trim();
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-ignore-'));
+  try {
+    for (const [file, oid] of found) {
+      const parts = safeParts(file);
+      if (!parts) continue;
+      const text = (await git(['cat-file', 'blob', oid], { cwd: wsPath })).stdout;
+      const dest = path.join(scratch, ...parts);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, text, { flag: 'wx' });
+    }
+    const asked = paths.map(p => p.replace(/\/+$/, ''));
+    paths.forEach((p, i) => {
+      const parts = p.endsWith('/') && safeParts(asked[i]);
+      if (!parts) return;
+      try {
+        fs.mkdirSync(path.join(scratch, ...parts), { recursive: true });
+      } catch {} // a base .gitignore file sits there: judged without folder-only rules, and its files one by one
+    });
+    const out = (await git([`--git-dir=${gitDir}`, `--work-tree=${scratch}`, 'check-ignore', '--no-index', '-z', '--stdin'],
+      { cwd: scratch, input: asked.map(p => './' + p).join('\0') + '\0', okCodes: [1] })).stdout;
+    const hit = new Set(nulList(out).map(p => p.replace(/^\.\//, '')));
+    return new Set(paths.filter((p, i) => hit.has(asked[i])));
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * New files the agent hid with ignore rules of its own: a .gitignore it wrote (one holding `*` hides itself too) or
+ * a change to one the repository had. These are the files the ignore rules hide now but the rules at `ref`, the commit
+ * the workspace was made from, would not. A hidden folder is listed file by file, leaving out what the rules at `ref`
+ * hid inside it (such as a node_modules folder).
+ * @returns {Promise<string[]>} paths relative to the workspace root
+ */
+async function hiddenByAgent(wsPath, ref) {
+  const list = async (args) => nulList((await git(args, { cwd: wsPath })).stdout);
+  // What the ignore rules hide now. A folder git does not look into shows as "folder/" (node_modules/, say). No
+  // --no-empty-directory: with it, git leaves out a hidden file in a new folder that also holds a visible file. Without
+  // it, git can list a folder and the files inside it too, so the result is a set.
+  const now = await list(['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z']);
+  if (!now.length) return [];
+  const before = await ignoredAt(wsPath, ref, now);
+  const hidden = new Set();
+  const folders = [];
+  for (const p of now) {
+    if (before.has(p)) continue;
+    if (p.endsWith('/')) folders.push(p);
+    else hidden.add(p);
+  }
+  for (let i = 0; i < folders.length; i += ARG_BATCH) {
+    // Everything inside, ignored or not, judged again by the rules at `ref`. A folder git cannot look into (another
+    // repository) comes back as itself.
+    const inside = await list(['ls-files', '--others', '-z', '--', ...folders.slice(i, i + ARG_BATCH).map(f => `:(literal)${f}`)]);
+    const hiddenBefore = await ignoredAt(wsPath, ref, inside);
+    for (const p of inside) if (!hiddenBefore.has(p)) hidden.add(p);
+  }
+  return [...hidden];
+}
+
+/**
+ * What changed in a workspace since `base`: tracked changes (committed or not) plus new files, including new files
+ * hidden by a .gitignore the agent added or changed (marked `ignored`), so they reach the receipt and the rules.
  * @param {{ path: string, base?: string }} opts
- * @returns {Promise<{ changed: number, adds: number, dels: number, list: { path: string, adds: number, dels: number, binary?: true, large?: true, untracked?: true }[] }>}
+ * @returns {Promise<{ changed: number, adds: number, dels: number, list: { path: string, adds: number, dels: number, binary?: true, large?: true, untracked?: true, ignored?: true }[] }>}
  *   Paths are relative to the repository root with forward slashes. Renames count as a deletion
  *   and an addition, so rules see both the old and the new path.
  */
@@ -272,11 +422,19 @@ export async function diffStats({ path: wsPath, base } = {}) {
   }
 
   const others = (await git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: wsPath })).stdout.split('\0').filter(Boolean);
+  const seen = new Set([...list.map(f => f.path), ...others]);
+  let hidden;
+  try {
+    hidden = (await hiddenByAgent(wsPath, ref)).filter(p => !seen.has(p));
+  } catch (e) {
+    throw gitTrouble(e) || plainError(`Git could not list the files hidden by the agent's own ignore rules: ${firstLine(e.stderr || e.message)}`, e);
+  }
   let budget = COUNT_TOTAL_MAX_BYTES;
-  for (const rel of others) {
+  for (const [rel, ignored] of [...others.map(p => [p, false]), ...hidden.map(p => [p, true])]) {
     const c = countLines(path.join(wsPath, rel), budget);
     budget -= c.bytes;
     const entry = { path: rel, adds: c.adds, dels: 0, untracked: true };
+    if (ignored) entry.ignored = true;
     if (c.binary) entry.binary = true;
     if (c.large) entry.large = true;
     list.push(entry);

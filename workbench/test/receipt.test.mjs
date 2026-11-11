@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { matchGlob, checkRules, runChecks, scrubEnv } from '../src/core/receipt.mjs';
+import { matchGlob, checkRules, runChecks, scrubEnv, killChecksSync } from '../src/core/receipt.mjs';
 
 let T;
 before(() => { T = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-receipt-')); });
@@ -201,4 +201,29 @@ test('a check in a missing folder, or stopped by the engine, fails plainly', asy
   assert.deepEqual(stopped.results.map(r => [r.name, r.ok]), [['Long', false], ['Next', false]]);
   assert.match(stopped.results[0].tail, /stopped/i);
   assert.match(stopped.results[1].tail, /Not run/);
+});
+
+test('stopping checks ends the whole group, including what it started in the background', async () => {
+  const pidFile = path.join(T, 'abort-child.pid');
+  const ac = new AbortController();
+  const out = runChecks({ cwd: T, signal: ac.signal, checks: [{ name: 'Background', run: `sleep 30 & echo $! > ${pidFile}; sleep 30` }] });
+  for (const t0 = Date.now(); !(fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim()) && Date.now() - t0 < 3000;) await sleep(20);
+  ac.abort();
+  const r = (await out).results[0];
+  assert.equal(r.ok, false);
+  assert.match(r.tail, /Stopped because the agent was stopped\./);
+  assert.ok(await goneWithin(Number(fs.readFileSync(pidFile, 'utf8')), 2000), 'the background child was ended with the group');
+});
+
+test('killChecksSync ends every running check at once, even one that ignores SIGTERM', async () => {
+  const pidFile = path.join(T, 'stubborn.pid');
+  const out = runChecks({ cwd: T, checks: [{ name: 'Stubborn', run: `trap '' TERM; echo $$ > ${pidFile}; sleep 30` }] });
+  for (const t0 = Date.now(); !(fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim()) && Date.now() - t0 < 3000;) await sleep(20);
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  const t0 = Date.now();
+  killChecksSync();
+  assert.ok(await goneWithin(pid, 500), 'gone without waiting for a grace period');
+  const res = await out;
+  assert.ok(Date.now() - t0 < 2000, `took ${Date.now() - t0} ms`);
+  assert.equal(res.results[0].ok, false);
 });

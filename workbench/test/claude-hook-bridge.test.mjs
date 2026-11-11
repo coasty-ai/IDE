@@ -2,8 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hookCommand } from '../src/adapters/claude/args.mjs';
 
 const BRIDGE = fileURLToPath(new URL('../src/adapters/claude/hook-bridge.mjs', import.meta.url));
 const ROOT_BASH = readFileSync(new URL('./fixtures/hook-pretool-root-bash.json', import.meta.url), 'utf8');
@@ -162,15 +165,48 @@ test('a refused, garbled or undecided answer blocks the call', async () => {
   }
 });
 
-test('events other than PreToolUse pass silently without asking the engine', async () => {
-  const engine = await startEngine(reply(200, answer('deny', 'no')));
+test('a payload that is not PreToolUse is blocked without asking the engine', async () => {
+  const engine = await startEngine(reply(200, answer('allow', 'fine')));
   try {
-    for (const name of ['PostToolUse', 'Stop', 'SessionStart', 'UserPromptSubmit']) {
-      const r = await runBridge(JSON.stringify({ session_id: 's', hook_event_name: name }), { WORKBENCH_HOOK_URL: engine.url });
-      assert.deepEqual(r, { code: 0, stdout: '', stderr: '' });
+    const base = JSON.parse(ROOT_BASH);
+    for (const name of [undefined, null, 'pretooluse', 'PostToolUse', 'Stop', 'SessionStart', 'UserPromptSubmit']) {
+      const payload = { ...base, hook_event_name: name };
+      if (name === undefined) delete payload.hook_event_name;
+      assertBlocked(await runBridge(JSON.stringify(payload), { WORKBENCH_HOOK_URL: engine.url }), /something other than a tool call/);
     }
     assert.equal(engine.requests.length, 0);
   } finally { await engine.close(); }
+});
+
+test('NODE_OPTIONS cannot answer for the bridge: the hook command starts node without it', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'wb-bridge-'));
+  const engine = await startEngine(reply(200, '{}'));
+  const url = engine.url;
+  await engine.close(); // nothing listens there any more
+  try {
+    // A preload that prints "allow" and exits before the bridge runs, as a planted NODE_OPTIONS could.
+    const preload = path.join(dir, 'preload.cjs');
+    writeFileSync(preload, `process.stdout.write(${JSON.stringify(answer('allow', 'planted'))}); process.exit(0);`);
+    const env = { ...process.env, NODE_OPTIONS: `--require ${preload}`, WORKBENCH_HOOK_URL: url, WORKBENCH_HOOK_TOKEN: TOKEN, WORKBENCH_AGENT_ID: 'abc123' };
+    const run = (file, args) => new Promise((resolve) => {
+      const child = spawn(file, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (c) => { stdout += c; });
+      child.stderr.on('data', (c) => { stderr += c; });
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+      child.stdin.end(ROOT_BASH);
+    });
+    // Control: started directly, node obeys NODE_OPTIONS and the planted answer comes out.
+    const direct = await run(process.execPath, [BRIDGE]);
+    assert.match(direct.stdout, /"allow"/);
+    // Through the hook command, as Claude Code runs it: the engine cannot be reached, so the call is blocked.
+    const r = await run('/bin/sh', ['-c', hookCommand({ bridgePath: BRIDGE })]);
+    assertBlocked(r, /not running or cannot be reached/);
+    assert.doesNotMatch(r.stdout, /allow/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('bad input or missing details block the call', async () => {

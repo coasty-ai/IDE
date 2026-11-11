@@ -89,8 +89,13 @@ export function gate() {
   return { wait, open };
 }
 
-export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'passed', checksGate = null, intent = null } = {}) {
-  const calls = { decide: [], parse: [], createWorkspace: [], diffStats: [], readRepoConfig: [], checkRules: [], runChecks: [] };
+/**
+ * The engine's injected deps, with every call recorded.
+ * checksGate holds every runChecks call until it opens; checksGates holds call i on gate i. An aborted signal ends a
+ * held call at once with its checks stopped, as the real runChecks does.
+ */
+export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'passed', checksGate = null, checksGates = null, intent = null } = {}) {
+  const calls = { decide: [], parse: [], createWorkspace: [], diffStats: [], readRepoConfig: [], checkRules: [], runChecks: [], removeWorkspace: [], killChecksSync: 0 };
   const policy = {
     decide(req) {
       calls.decide.push(req);
@@ -123,6 +128,10 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
       calls.readRepoConfig.push(o);
       return { checks, rules, allow };
     },
+    async removeWorkspace(o) {
+      calls.removeWorkspace.push(o);
+      return { removed: true, branch: null };
+    },
   };
   const receipt = {
     checkRules(rs, paths) {
@@ -130,12 +139,21 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
       return { kept: rs.map(r => ({ say: r.say })), broken: [] };
     },
     async runChecks(o) {
-      calls.runChecks.push(o);
+      const n = calls.runChecks.push(o) - 1;
       const ok = checkState === 'passed';
       for (const c of o.checks) o.onProgress?.({ name: c.name, ok, ms: 5, tail: ok ? '' : 'expected 3, got 4' });
-      if (checksGate) await checksGate.wait;
+      const g = checksGates ? checksGates[n] : checksGate;
+      if (g) {
+        const aborted = new Promise(r => {
+          if (o.signal?.aborted) r(); else o.signal?.addEventListener('abort', r, { once: true });
+        });
+        if (await Promise.race([g.wait.then(() => false), aborted.then(() => true)])) {
+          return { state: 'failed', results: o.checks.map(c => ({ name: c.name, ok: false, ms: 0, tail: 'Stopped because the agent was stopped.' })) };
+        }
+      }
       return { state: checkState, results: o.checks.map(c => ({ name: c.name, ok, ms: 5, tail: ok ? '' : 'expected 3, got 4' })) };
     },
+    killChecksSync() { calls.killChecksSync += 1; },
   };
   return { deps: { policy, commands, workspace, receipt }, calls };
 }

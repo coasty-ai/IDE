@@ -1,7 +1,8 @@
 // The local web server: the UI files, a JSON API, a Server-Sent Events stream, and the
 // PreToolUse hook endpoint. It listens on 127.0.0.1 only and checks, on every request it must:
-// the Host header, a 32-byte token compared in constant time, and for POSTs the Origin,
-// the JSON content type and a 64 KB body limit. No CORS headers are ever sent.
+// the Host header, a 32-byte token compared in constant time (on the hook route, also the asking
+// agent's own hook token), and for POSTs the Origin, the JSON content type and a 64 KB body limit.
+// A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
 import http from 'node:http';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -87,7 +88,8 @@ function makeLog(log) {
  * @param {object} opts.engine     the Engine (or a fake with the same methods)
  * @param {object} opts.store      the Store, for live updates
  * @param {string} opts.token      32 random bytes as hex; needed by every /api and /hook route
- * @param {string} [opts.hookToken] a second token that works for /hook routes only (given to agents)
+ * @param {(agentId: string) => string} [opts.hookTokenFor] each agent's own hook token (64 hex characters); it opens
+ *        /hook/pretool for that one agent only, and never /api
  * @param {number} [opts.port]     0 picks a free port
  * @param {string} [opts.host]     always 127.0.0.1
  * @param {string} [opts.rootDir]  folder that holds ui/ and src/shared/
@@ -95,7 +97,7 @@ function makeLog(log) {
  * @param {object} [opts.options]  { coalesceMs = 250, pingMs = 15000, requestTimeoutMs, checkIntervalMs } (tests shorten these)
  * @returns {{ listen(): Promise<{ url: string }>, close(): Promise<void>, readonly url: string|null, readonly port: number|null }}
  */
-export function createServer({ engine, store, token, hookToken = null, port = 4317, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
+export function createServer({ engine, store, token, hookTokenFor = null, port = 4317, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
   if (!engine) throw new Error('The server needs the engine.');
   if (typeof token !== 'string' || !/^[0-9a-f]{64}$/i.test(token)) {
     throw new Error('The server token must be 32 random bytes written as hex.');
@@ -186,7 +188,8 @@ export function createServer({ engine, store, token, hookToken = null, port = 43
     return realRoots.get(dir);
   }
 
-  async function serveStatic(req, res, pathname) {
+  async function serveStatic(req, res, url) {
+    const pathname = url.pathname;
     let base;
     let rel;
     if (pathname === '/' || pathname === '/index.html') { base = uiDir; rel = 'index.html'; }
@@ -212,6 +215,14 @@ export function createServer({ engine, store, token, hookToken = null, port = 43
     let st;
     try { st = await fsp.stat(real); } catch { return sendJson(res, 404, { error: 'Not found.' }); }
     if (!st.isFile()) return sendJson(res, 404, { error: 'Not found.' }); // no directory listing
+
+    // The page reads its own address (the key and the debug switches). Any website can send the person's tab to an
+    // address here, so a page address with a query is served only when the query carries this run's key; anything
+    // else goes to the plain page. Checked on the file found, so /index.html, /ui/index.html and encoded forms count.
+    if (url.search && path.extname(real).toLowerCase() === '.html' && !tokenMatches(url.searchParams.get('t'), token)) {
+      res.writeHead(303, { Location: '/', 'Content-Length': 0, 'Cache-Control': 'no-store' });
+      return res.end();
+    }
 
     res.writeHead(200, {
       'Content-Type': TYPES[path.extname(real).toLowerCase()] || 'application/octet-stream',
@@ -310,17 +321,23 @@ export function createServer({ engine, store, token, hookToken = null, port = 43
     return v;
   };
   const str = (v) => (v == null ? '' : String(v));
+  // An id from a body, or null: anything that is not an id string is as if nothing was sent.
+  const optId = (v) => (typeof v === 'string' && ID_RE.test(v) ? v : null);
 
   const routes = [
     { method: 'GET', re: /^\/api\/state$/, run: () => engine.snapshot() },
     { method: 'GET', re: /^\/api\/stream$/, stream: true },
-    { method: 'POST', re: /^\/api\/command$/, run: (b) => engine.command(str(b.text), { focusId: b.focusId ?? null }) },
+    {
+      // What the page showed when the person began: the agent, the confirm card and the ask on screen.
+      method: 'POST', re: /^\/api\/command$/,
+      run: (b) => engine.command(str(b.text), { focusId: optId(b.focusId), confirmId: optId(b.confirmId), askId: optId(b.askId) }),
+    },
     { method: 'POST', re: /^\/api\/confirm\/([^/]+)$/, run: (b, m) => engine.confirm(id(m[1]), b.go === true) },
     {
       method: 'POST', re: /^\/api\/agents$/,
       run: (b) => engine.startAgent({ task: str(b.task), harness: b.harness, model: b.model, machineId: b.machineId, budgetUsd: b.budgetUsd, name: b.name }),
     },
-    { method: 'POST', re: /^\/api\/agents\/([^/]+)\/answer$/, run: (b, m) => engine.answer(id(m[1]), { askId: b.askId ?? null, answer: b.answer }) },
+    { method: 'POST', re: /^\/api\/agents\/([^/]+)\/answer$/, run: (b, m) => engine.answer(id(m[1]), { askId: optId(b.askId), answer: b.answer }) },
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/say$/, run: (b, m) => engine.say(id(m[1]), str(b.text)) },
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/stop$/, run: (b, m) => engine.stop(id(m[1])) },
     { method: 'POST', re: /^\/api\/machines\/([^/]+)\/awake$/, run: (b, m) => engine.setMachineAwake(id(m[1]), b.awake === true) },
@@ -332,10 +349,10 @@ export function createServer({ engine, store, token, hookToken = null, port = 43
     const isHook = pathname.startsWith('/hook/');
     const header = req.headers['x-workbench-token'];
     const given = typeof header === 'string' ? header : (req.method === 'GET' ? url.searchParams.get('t') : null);
-    const allowed = isHook
-      ? tokenMatches(given, token) || (hookToken ? tokenMatches(given, hookToken) : false)
-      : tokenMatches(given, token);
-    if (!allowed) return sendJson(res, 401, { error: 'Missing or wrong token.' });
+    const pageToken = tokenMatches(given, token);
+    // An agent's own hook token is checked against the agent the body names, once the body is read.
+    const maybeHook = isHook && typeof hookTokenFor === 'function' && typeof given === 'string' && /^[0-9a-f]{64}$/.test(given);
+    if (!pageToken && !maybeHook) return sendJson(res, 401, { error: 'Missing or wrong token.' });
 
     const matches = routes.filter(r => r.re.test(pathname));
     if (!matches.length) return sendJson(res, 404, { error: 'Not found.' });
@@ -362,10 +379,21 @@ export function createServer({ engine, store, token, hookToken = null, port = 43
     }
 
     if (route.stream) return openStream(req, res);
-    if (route.hook) return handleHook(req, res, body);
+    if (route.hook) {
+      if (!pageToken && !hookTokenOk(given, body.agentId)) return sendJson(res, 401, { error: 'Missing or wrong token.' });
+      return handleHook(req, res, body);
+    }
     const m = pathname.match(route.re);
     const result = await route.run(body, m);
     sendJson(res, 200, result ?? {});
+  }
+
+  /** Whether `given` is the hook token of exactly this agent (compared in constant time). */
+  function hookTokenOk(given, agentId) {
+    if (typeof hookTokenFor !== 'function' || typeof agentId !== 'string' || !ID_RE.test(agentId)) return false;
+    let expected;
+    try { expected = hookTokenFor(agentId); } catch { return false; }
+    return typeof expected === 'string' && tokenMatches(given, expected);
   }
 
   /** POST /hook/pretool may wait many minutes for the person: no timeouts on this request. */
@@ -400,7 +428,7 @@ export function createServer({ engine, store, token, hookToken = null, port = 43
       res.setHeader('Allow', 'GET, HEAD');
       return sendJson(res, 405, { error: 'That method is not allowed here.' });
     }
-    return serveStatic(req, res, p);
+    return serveStatic(req, res, url);
   }
 
   // requestTimeout only limits receiving a request; held hook and SSE responses are not cut by it

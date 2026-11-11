@@ -198,6 +198,22 @@ test('a failed turn ends as an error in plain words, and the exit marks the agen
   assert.equal(runner.info().sessionId, RUN_THREAD, 'the thread can still be resumed');
 });
 
+test('a message sent during a turn that fails still goes out: failed first, then the next turn starts', async t => {
+  const s = setup(t, { FAKE_CODEX_MODE: 'fail-first', FAKE_CODEX_DELAY_MS: '150' });
+  const runner = createRunner({ agentId: 'ff1', name: 'Fix bug', task: 'Fix the bug', cwd: s.ws, emit: s.emit });
+  await runner.start();
+  await waitFor(() => s.events.some(e => e.kind === EV.TURN && e.phase === 'start'), 5000, 'the first turn');
+  await runner.send('also keep the old API');
+  await waitFor(() => turnEnds(s.events).length === 2 && !runner.info().alive, 8000, 'the queued turn');
+  // The engine relies on this order: the root is marked failed, and only then does the waiting message start a turn.
+  const order = s.events
+    .filter(e => e.kind === EV.TURN || e.kind === EV.ENDED || e.kind === EV.STATE)
+    .map(e => (e.kind === EV.TURN ? `turn.${e.phase}${e.isError ? '(error)' : ''}` : e.kind === EV.ENDED ? `ended.${e.outcome}` : e.state));
+  assert.deepEqual(order, ['turn.start', 'turn.end(error)', 'ended.error', 'failed', 'turn.start', 'turn.end']);
+  const [, resume] = s.calls();
+  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', '--', RUN_THREAD, 'also keep the old API']);
+});
+
 test('if the first run never started a thread, send() starts over with the task and the message', async t => {
   const s = setup(t, { FAKE_CODEX_MODE: 'crash' });
   const runner = createRunner({ agentId: 'c1', name: 'Fix bug', task: 'Fix the bug', cwd: s.ws, emit: s.emit });

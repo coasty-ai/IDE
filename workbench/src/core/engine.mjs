@@ -9,8 +9,8 @@ import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
 import { EV } from '../shared/events.mjs';
 import { STATE, ENDED, ACTIVE, DONE, NEEDS_YOU } from '../shared/states.mjs';
-import { nameFromTask, firstSentence, extractQuestion, plain, describeRequest } from '../shared/narrate.mjs';
-import { money, duration, clip } from '../shared/format.mjs';
+import { nameFromTask, firstSentence, extractQuestion, plain, describeRequest, quotable } from '../shared/narrate.mjs';
+import { money, spentAmount, duration, clip } from '../shared/format.mjs';
 import { StuckDetector } from './stuck.mjs';
 
 const MIN = 60_000;
@@ -23,6 +23,7 @@ const DEFAULTS = Object.freeze({
   repoEveryMs: 15_000,
   confirmTtlMs: 10 * MIN,        // how long a "Start …?" question stays answerable
   stopTimeoutMs: 8000,           // give up waiting for a runner to stop after this
+  tidyTimeoutMs: 3000,           // at shutdown, give up removing unchanged agent folders after this
   helperWaitMs: 1500,            // wait this long for a helper the hook names but the parser has not shown yet
   exitGraceMs: 1000,             // after a process exits, wait this long for its last lines
   availableTimeoutMs: 15_000,
@@ -31,17 +32,21 @@ const DEFAULT_CONFIG = Object.freeze({ checks: [], rules: [], allow: [] });
 const HARNESS_NAMES = { claude: 'Claude Code', codex: 'Codex', sim: 'A simulated agent' };
 // After the person stops an agent, these late events from its process are still useful.
 const AFTER_STOP_OK = new Set([EV.USAGE, EV.ENDED, EV.SESSION, EV.MODEL]);
+// States after which an agent cannot use the answer to a held request: they go through at once.
+const FINAL = new Set([STATE.FINISHED, STATE.FAILED, STATE.STOPPED]);
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
-const ALLOW_RE = /^(allow|allow it|yes|y|ok|okay|approve|approved|go ahead|sure|do it)[.!]*$/i;
-const DENY_RE = /^(deny|deny it|no|n|nope|don'?t|do not|reject|refuse)[.!]*$/i;
+// A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
+const ALLOW_LABEL_RE = /^allow$/i;
+const DENY_LABEL_RE = /^deny$/i;
 const LOOKS_GOOD_RE = /^(looks good|look good|lgtm|great|thanks|thank you|good|fine|ok|okay|all good)[.!]*$/i;
 const HELP = 'I did not catch that. Try “start an agent to fix the login bug”, “what needs me”, or “stop everything”.';
+const GONE = 'That request is no longer waiting. Ask again if you still want it.';
 
 /** How a state reads after an agent's name: "Checkout fix needs your OK". */
 const PHRASE = Object.freeze({
   starting: 'is starting',
   working: 'is working',
-  waiting_helpers: 'is waiting on its helpers',
+  waiting_helpers: 'is waiting', // _describe says what for, from its `now`
   needs_ok: 'needs your OK',
   question: 'has a question',
   maybe_stuck: 'might be stuck',
@@ -86,6 +91,13 @@ function joinAnd(items) {
 
 function harnessName(h) {
   return HARNESS_NAMES[h] || 'That kind of agent';
+}
+
+/** What "do it" does to a confirm card: "start it", "stop them", "send it". */
+function confirmVerb(c) {
+  if (c.kind === 'say') return 'send it';
+  const many = (c.kind === 'stop' ? c.agentIds?.length : c.tasks?.length) > 1;
+  return `${c.kind === 'stop' ? 'stop' : 'start'} ${many ? 'them' : 'it'}`;
 }
 
 function slugify(name) {
@@ -152,8 +164,9 @@ export class Engine extends EventEmitter {
    * @param {import('./store.mjs').Store} o.store
    * @param {'demo'|'live'} o.mode
    * @param {object|string|null} o.repo   live mode: prepareRepo() result, or a path to prepare in start()
-   * @param {{ url: string|null, token: string|null }} o.hook  where Claude Code's PreToolUse hook posts;
-   *        the object is read at each launch, so the URL can be filled in after the server listens
+   * @param {{ url: string|null, tokenFor: (agentId: string) => string }} o.hook  where Claude Code's PreToolUse hook
+   *        posts, and each agent's own hook token; the object is read at each launch, so the URL can be filled in
+   *        after the server listens
    */
   constructor({ store, mode = 'demo', repo = null, hook = null, defaultBudgetUsd = 2, defaultModel = null, adapters = {}, machines = null, deps = {}, log = null, options = {} } = {}) {
     super();
@@ -162,7 +175,7 @@ export class Engine extends EventEmitter {
     this.mode = mode === 'live' ? 'live' : 'demo';
     this.repo = repo;
     this.repoInfo = repo && typeof repo === 'object' ? repo : null;
-    this.hook = hook || { url: null, token: null };
+    this.hook = hook || { url: null, tokenFor: null };
     this.defaultBudgetUsd = Number.isFinite(+defaultBudgetUsd) && +defaultBudgetUsd > 0 ? +defaultBudgetUsd : 2;
     this.defaultModel = defaultModel || null;
     this.adapters = adapters || {};
@@ -175,14 +188,18 @@ export class Engine extends EventEmitter {
 
     this.runs = new Map();      // rootId -> run record for agents this engine launched
     this.held = new Map();      // askId -> a held permission request
+    this.later = new Map();     // agentId -> { ask?, state? }: decisions that wait until its held requests are answered
+    this._checkingHeld = false;
     this.asks = new Map();      // askId -> { agentId, type } for asks the engine created
-    this.confirms = new Map();  // confirmId -> a launch waiting for "yes"
+    this.confirms = new Map();  // confirmId -> a launch, stop or message waiting for "yes"
     this.stopped = new Set();   // agents the person stopped; late events from them are filtered
+    this.stopAsked = new Set(); // live helpers whose root was asked to stop them: no more tools, but their events count
     this.harnessInfo = { claude: null, codex: null, sim: null };
     this._timers = [];
     this._started = false;
     this._shuttingDown = false;
     this._shutdownPromise = null;
+    this._launching = new Set(); // launches under way (_startAgent): shutdown lets them finish first
     this._machineKeys = new Map();
     this._lastMachinesAt = 0;
     this._lastRepoAt = 0;
@@ -222,7 +239,11 @@ export class Engine extends EventEmitter {
     }
   }
 
-  /** Stop every runner and answer every held permission request with "no". */
+  /**
+   * Stop every runner and every running check, and wait for them; answer every held permission request with "no";
+   * remove the agent folders that hold nothing. Resolves to `{ kept }`: the folders that hold an agent's work, which
+   * stay after Workbench stops ([{ id, name, path, branch }], as keptFolders() gives them).
+   */
   shutdown() {
     if (this._shutdownPromise) return this._shutdownPromise;
     this._shuttingDown = true;
@@ -230,16 +251,33 @@ export class Engine extends EventEmitter {
       for (const t of this._timers) clearInterval(t);
       this._timers = [];
       try { this.machines?.off?.('update', this._onMachinesUpdate); this.machines?.dispose?.(); } catch { /* ignore */ }
+      for (const id of [...this.later.keys()]) this._dropLater(id);
       for (const held of [...this.held.values()]) {
         this._resolveHeld(held, { decision: 'deny', how: 'auto', reason: 'Workbench is shutting down.', silent: true });
+      }
+      // A launch under way (git still making its folder, a process starting) finishes first, so no agent starts unseen
+      // after this: one whose folder was made too late starts nothing and gives the folder back (_launch), and one
+      // already starting is stopped below with the others.
+      if (this._launching.size) {
+        await withTimeout(Promise.allSettled([...this._launching]), this.options.stopTimeoutMs)
+          .catch(() => this.log.warn('A launch did not finish in time.'));
       }
       const runs = [...this.runs.values()].filter(r => r.runner);
       for (const r of runs) {
         r.stopped = true;
         this.stopped.add(r.id);
       }
+      // Checks end alongside the agents (SIGTERM now, SIGKILL 2 s later in receipt.mjs): wait for them too.
+      const checks = [];
+      for (const r of this.runs.values()) {
+        this._cancelReceipt(r);
+        if (r.checksDone) checks.push(r.checksDone);
+      }
+      const checksEnded = withTimeout(Promise.all(checks), this.options.stopTimeoutMs)
+        .catch(() => this.log.warn('Some checks did not end in time.'));
       const results = await Promise.allSettled(runs.map(r => withTimeout(Promise.resolve().then(() => r.runner.stop()), this.options.stopTimeoutMs)));
       results.forEach((res, i) => { if (res.status === 'rejected') this.log.warn(`Could not stop ${runs[i].id}:`, res.reason); });
+      await checksEnded;
       const batch = [];
       for (const r of runs) {
         const v = this.store.get(r.id);
@@ -250,13 +288,34 @@ export class Engine extends EventEmitter {
         batch.push({ kind: EV.STATE, agentId: v.id, state: STATE.STOPPED, reason: 'Workbench was closed' });
       }
       if (batch.length) this._apply(batch);
+      // Folders where nothing changed go; the others stay, so the person can look at the work afterwards.
+      // A runner that would not stop may still be writing in its folder: that one stays.
+      const tidy = [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved && this._runnerInfo(r)?.alive !== true);
+      if (tidy.length) {
+        await withTimeout(Promise.all(tidy.map(r => this._removeUnchanged(r))), this.options.tidyTimeoutMs)
+          .catch(() => this.log.warn('Some agent folders were not tidied up in time.'));
+      }
+      return { kept: this.keptFolders() };
     })();
     return this._shutdownPromise;
   }
 
-  /** Last resort on process exit: signal every live agent process group, synchronously. */
+  /**
+   * The agent folders still on this computer, with their branches: [{ id, name, path, branch }]. Synchronous, so a
+   * forced exit can say where they are too. After shutdown() these hold work; before it, or when the exit was forced
+   * before the tidying, they may include folders where nothing changed.
+   */
+  keptFolders() {
+    return [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved).map(r => ({
+      id: r.id, name: this.store.get(r.id)?.name || r.name || r.id, path: r.workspace.path, branch: r.workspace.branch ?? null,
+    }));
+  }
+
+  /** Last resort on process exit: signal every live agent process group and end every check, synchronously. */
   killAllSync() {
+    try { this.deps.receipt?.killChecksSync?.(); } catch { /* ignore */ }
     for (const r of this.runs.values()) {
+      try { r.receipt?.ctl.abort(); } catch { /* ignore */ }
       let info = null;
       try { info = r.runner?.info?.(); } catch { info = null; }
       if (!info || !info.alive || !info.pid) continue;
@@ -270,6 +329,7 @@ export class Engine extends EventEmitter {
   tick(now = this.now()) {
     try { this.store.tick(now); } catch (err) { this.log.error('Store tick failed:', err); }
     try { this._checkStuck(now); } catch (err) { this.log.error('Stuck check failed:', err); }
+    try { this._checkWaiting(now); } catch (err) { this.log.error('Background check failed:', err); }
     for (const [id, c] of this.confirms) if (now - c.createdAt > this.options.confirmTtlMs) this.confirms.delete(id);
     if (now - this._lastMachinesAt >= this.options.machinesEveryMs) {
       this._lastMachinesAt = now;
@@ -316,11 +376,16 @@ export class Engine extends EventEmitter {
     return !!v && this.stopped.has(v.rootId);
   }
 
-  /** Apply events to the store and feed them to the stuck detector. */
-  _apply(events) {
-    const list = (Array.isArray(events) ? events : [events])
+  /**
+   * Apply events to the store and feed them to the stuck detector. No held permission request may leave the view:
+   * see _waitForHeld and _keepHeldVisible.
+   * @param {{ held?: boolean }} [opts]  held: the batch shows or settles held requests itself (_hold, _resolveHeld)
+   */
+  _apply(events, { held = false } = {}) {
+    let list = (Array.isArray(events) ? events : [events])
       .filter(Boolean)
       .map(e => (Number.isFinite(e.ts) ? e : { ...e, ts: this.now() }));
+    if (!held && this.held.size) list = this._waitForHeld(list);
     if (!list.length) return;
     this.store.apply(list);
     const progressed = new Set();
@@ -330,6 +395,78 @@ export class Engine extends EventEmitter {
       if (sig && sig.progress) progressed.add(sig.agentId);
     }
     for (const id of progressed) this._clearStuck(id);
+    if (this.held.size) this._keepHeldVisible();
+  }
+
+  /** The held request an agent is showing, if any. */
+  _heldShowing(agentId) {
+    const a = agentId ? this.store.get(agentId)?.ask : null;
+    const h = a ? this.held.get(a.id) : null;
+    return h && h.agentId === agentId ? h : null;
+  }
+
+  /**
+   * While an agent shows a held request, the engine's other decisions about it (the end of a turn: waiting on
+   * helpers, a question, the receipt's done state) wait until the person has answered, so the request never leaves
+   * the view. Ending states (finished, failed, stopped) go through; _keepHeldVisible then answers the requests no.
+   */
+  _waitForHeld(list) {
+    const out = [];
+    for (const e of list) {
+      const waits = e.kind === EV.ASK || (e.kind === EV.STATE && !FINAL.has(e.state));
+      if (waits && this._heldShowing(e.agentId)) {
+        const later = this.later.get(e.agentId) || {};
+        if (e.kind === EV.ASK) later.ask = e;
+        else later.state = e;
+        this.later.set(e.agentId, later);
+        continue;
+      }
+      out.push(e);
+    }
+    return out;
+  }
+
+  /** Forget decisions that waited for an agent's held requests: a new turn or a stop makes them out of date. */
+  _dropLater(agentId) {
+    const later = this.later.get(agentId);
+    if (!later) return;
+    this.later.delete(agentId);
+    const id = later.ask?.ask?.id;
+    if (id && !this.held.has(id)) this.asks.delete(id);
+  }
+
+  /**
+   * The invariant, checked after every batch: each held request shows on its agent, which is in needs_ok, or waits
+   * behind another held request of the same agent that shows. An agent that has gone or ended cannot use an answer,
+   * so its requests are answered no. Anything else that slipped past _waitForHeld is shown again.
+   */
+  _keepHeldVisible() {
+    if (this._checkingHeld) return;
+    this._checkingHeld = true;
+    try {
+      const first = new Map();
+      for (const h of this.held.values()) if (!h.done && !first.has(h.agentId)) first.set(h.agentId, h);
+      for (const [agentId, h] of first) {
+        const v = this.store.get(agentId);
+        if (v && v.state === STATE.NEEDS_OK && this._heldShowing(agentId)) continue;
+        if (!v || ENDED.has(v.state)) {
+          this._denyHeldFor(agentId, v?.parentId ? 'The helper is no longer running.' : 'The agent is no longer running.');
+          continue;
+        }
+        this.log.warn(`A held request of ${agentId} was not showing, so it is shown again.`);
+        const later = this.later.get(agentId) || {};
+        // Keep a question or a stuck ask for afterwards; a permission ask that is not held can no longer be answered.
+        if (v.ask && !this.held.has(v.ask.id) && v.ask.type !== 'permission') later.ask = { kind: EV.ASK, agentId, ask: v.ask };
+        later.state = { kind: EV.STATE, agentId, state: v.state, reason: v.stateReason ?? null };
+        this.later.set(agentId, later);
+        this._apply([
+          { kind: EV.ASK, agentId, ask: h.ask },
+          { kind: EV.STATE, agentId, state: STATE.NEEDS_OK, reason: null },
+        ], { held: true });
+      }
+    } finally {
+      this._checkingHeld = false;
+    }
   }
 
   _notice(text, agentId = null) {
@@ -345,7 +482,11 @@ export class Engine extends EventEmitter {
           if (run) {
             run.turnSeq += 1;
             run.inTurn = true;
+            run.waiting = null;
+            this._cancelReceipt(run); // the last turn's receipt no longer describes the folder
           }
+          this._dropLater(e.agentId); // what the last turn decided while a request was held is out of date
+          this._clearBackgroundAsk(e.agentId, null); // it works again, so "is it done?" is moot
         } else if (e.phase === 'end') {
           this._onTurnEnd(e);
         }
@@ -353,6 +494,14 @@ export class Engine extends EventEmitter {
       case EV.ENDED:
         this._onEnded(e);
         break;
+      case EV.BACKGROUND: {
+        const run = this.runs.get(e.agentId);
+        if (run) {
+          run.backgroundAt = e.ts;
+          run.background = { helpers: e.helpers || 0, commands: e.commands || 0, others: e.others || 0, work: Array.isArray(e.work) ? e.work : [], ids: Array.isArray(e.ids) ? e.ids : [] };
+        }
+        break;
+      }
       default:
         break;
     }
@@ -373,34 +522,45 @@ export class Engine extends EventEmitter {
     this._decide(v.id, run, e, seq).catch(err => this.log.error('Could not finish a turn:', err));
   }
 
-  /** The contract's order: helpers still running, error, closing question, then the receipt. */
+  /**
+   * The contract's order: helpers still running, error, then what changed so far (files and rules, whether or not a
+   * question follows), then the closing question, else the declared checks and a done state.
+   */
   async _decide(agentId, run, e, seq) {
     const finalText = String(e.finalText ?? '');
-    const stale = () => this._shuttingDown || !this.store.get(agentId) || (run && (run.stopped || run.turnSeq !== seq));
+    let receipt = null; // this turn's receipt once it starts; a new turn, a message, a stop or shutdown cancels it
+    const stale = () => this._shuttingDown || !this.store.get(agentId)
+      || (run && (run.stopped || run.turnSeq !== seq)) || !!receipt?.ctl.signal.aborted;
     this._dropEngineAsk(agentId);
 
-    const background = Number(e.backgroundTasks) || 0;
+    let background = Number(e.backgroundTasks) || 0;
+    const bg = e.background && typeof e.background === 'object' ? e.background : null;
+    // Commands the person already called done ("It is done") are not waited for again while they run.
+    if (background > 0 && bg && !bg.helpers && run?.accepted && Array.isArray(bg.ids) && bg.ids.length
+      && bg.ids.every(id => run.accepted.has(id))) background = 0;
     if (background > 0) {
-      this._apply([{ kind: EV.STATE, agentId, state: STATE.WAITING_HELPERS, reason: null, backgroundTasks: background }]);
+      // Claude Code starts a new turn when background work ends. Work that may never end (a dev server) gets one
+      // question once things have been quiet: see _checkWaiting.
+      if (run) run.waiting = { e, seq, asked: false };
+      const st = { kind: EV.STATE, agentId, state: STATE.WAITING_HELPERS, reason: null, backgroundTasks: background };
+      if (bg) st.background = bg;
+      this._apply([st]);
       return;
     }
     if (e.isError) {
       this._apply([{ kind: EV.STATE, agentId, state: STATE.FAILED, reason: errorReason(e) }]);
       return;
     }
-    const question = extractQuestion(finalText);
-    if (question) {
-      const ask = this._newAsk(agentId, 'question', { sentence: question, options: [] });
-      const batch = [];
-      const intro = firstSentence(finalText);
-      if (intro && intro !== question) batch.push({ kind: EV.SAYS, agentId, text: intro });
-      batch.push({ kind: EV.ASK, agentId, ask }, { kind: EV.STATE, agentId, state: STATE.QUESTION, reason: null });
-      this._apply(batch);
-      return;
-    }
 
-    // The receipt: files changed, rules, declared checks.
-    if (run) run.deciding = true;
+    // One receipt at a time per agent, the record made before a question included.
+    if (run) {
+      this._cancelReceipt(run);
+      receipt = { ctl: new AbortController() };
+      run.receipt = receipt;
+      run.deciding = true; // a clean exit while this runs is not a failure (Codex exits after every turn)
+    }
+    // The checks judge finished work: a turn that ends with a question runs none, but what it changed is recorded.
+    const question = extractQuestion(finalText);
     let checksState = 'none';
     let reason = null;
     try {
@@ -417,8 +577,11 @@ export class Engine extends EventEmitter {
           if (stale()) return;
           if (rules) this._apply([{ kind: EV.RULES, agentId, rules }]);
         }
-        if (Array.isArray(config.checks) && config.checks.length && typeof this.deps.receipt?.runChecks === 'function') {
+        if (!question && Array.isArray(config.checks) && config.checks.length && typeof this.deps.receipt?.runChecks === 'function') {
           const partial = [];
+          // Checks of a receipt that was cancelled can take a moment to end: never run two sets in one folder.
+          if (run.checksDone) await run.checksDone;
+          if (stale()) return;
           this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: [] } }]);
           const onProgress = (p) => {
             if (!p || typeof p !== 'object' || stale()) return;
@@ -431,7 +594,11 @@ export class Engine extends EventEmitter {
           };
           let res;
           try {
-            res = await this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress });
+            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal }));
+            const done = running.then(() => {}, () => {});
+            run.checksDone = done;
+            done.then(() => { if (run.checksDone === done) run.checksDone = null; });
+            res = await running;
           } catch (err) {
             if (stale()) return;
             this.log.warn('The checks could not run:', err);
@@ -447,18 +614,33 @@ export class Engine extends EventEmitter {
             reason = failed.length ? `The ${failed.length === 1 ? 'check' : 'checks'} ${joinAnd(failed)} did not pass.` : null;
           }
         }
-      } else {
+      } else if (!question) {
         // No workspace (the demo): use whatever checks the simulator reported.
         const cur = this.store.get(agentId)?.checks?.state;
         if (cur === 'passed' || cur === 'failed') checksState = cur;
       }
     } catch (err) {
       this.log.warn('Could not build the receipt:', err);
-      reason = err?.plain ? err.message : 'Workbench could not check its work.';
+      // A question is still asked: the person can answer it without the record of what changed.
+      if (!question) reason = err?.plain ? err.message : 'Workbench could not check its work.';
     } finally {
-      if (run) run.deciding = false;
+      if (run && run.receipt === receipt) { // a newer receipt keeps its own
+        run.receipt = null;
+        run.deciding = false;
+      }
     }
     if (stale()) return;
+    if (question) {
+      const ask = this._newAsk(agentId, 'question', { sentence: question, options: [] });
+      const batch = [];
+      const intro = firstSentence(finalText);
+      if (intro && intro !== question) batch.push({ kind: EV.SAYS, agentId, text: intro });
+      // Results of earlier checks would sit beside newer files.
+      if (this.store.get(agentId)?.checks) batch.push({ kind: EV.CHECKS, agentId, checks: null });
+      batch.push({ kind: EV.ASK, agentId, ask }, { kind: EV.STATE, agentId, state: STATE.QUESTION, reason: null });
+      this._apply(batch);
+      return;
+    }
     const state = checksState === 'passed' ? STATE.DONE_CHECKED
       : checksState === 'failed' ? STATE.CHECKS_FAILED
       : STATE.DONE_CLAIMED;
@@ -467,6 +649,18 @@ export class Engine extends EventEmitter {
     if (says) batch.push({ kind: EV.SAYS, agentId, text: says });
     batch.push({ kind: EV.STATE, agentId, state, reason });
     this._apply(batch);
+  }
+
+  /** End a receipt still being built: its checks stop, nothing from it is applied, "checks running" goes away. */
+  _cancelReceipt(run) {
+    const r = run && run.receipt;
+    if (!r) return;
+    run.receipt = null;
+    run.deciding = false;
+    try { r.ctl.abort(); } catch (err) { this.log.warn('Could not stop the checks:', err); }
+    if (this.store.get(run.id)?.checks?.state === 'running') {
+      this._apply([{ kind: EV.CHECKS, agentId: run.id, checks: { state: 'none', results: [] } }]);
+    }
   }
 
   /** A process ended. Helpers get their final state; a root's helpers and held requests are closed. */
@@ -484,6 +678,7 @@ export class Engine extends EventEmitter {
     }
     const run = this.runs.get(v.id);
     this._denyHeldFor(v.id, 'The agent is no longer running.', true);
+    if (run) run.waiting = null; // whatever it left running ended with it
     const batch = [];
     for (const d of this.store.descendants(v.id)) {
       if (ACTIVE.has(d.state)) batch.push({ kind: EV.STATE, agentId: d.id, state: STATE.STOPPED, reason: 'Its agent is no longer running' });
@@ -497,13 +692,76 @@ export class Engine extends EventEmitter {
       const cur = this.store.get(v.id);
       if (!cur || run.stopped || run.deciding || run.turnSeq !== seq || this._shuttingDown) return;
       if (run.runner?.info?.()?.alive) return;
-      const unfinished = cur.state === STATE.STARTING || cur.state === STATE.WAITING_HELPERS
+      const background = cur.state === STATE.MAYBE_STUCK && cur.ask?.about === 'background';
+      const unfinished = cur.state === STATE.STARTING || cur.state === STATE.WAITING_HELPERS || background
         || (cur.state === STATE.WORKING && run.inTurn);
       if (!unfinished) return;
       run.inTurn = false;
+      if (background) this.asks.delete(cur.ask.id);
       this._apply([{ kind: EV.STATE, agentId: v.id, state: STATE.FAILED, reason: 'It stopped before finishing its work.' }]);
     }, this.options.exitGraceMs);
     timer.unref?.();
+  }
+
+  // ================================================================ background work that may never end
+
+  /**
+   * A root that waits only for background commands (no helper working) gets one question once nothing has happened
+   * for stuckSilenceMs: is it done? A dev server never ends; a build does, and then Claude Code starts a new turn by
+   * itself, which takes the question back.
+   */
+  _checkWaiting(now) {
+    for (const [id, run] of this.runs) {
+      const w = run.waiting;
+      if (!w || w.asked || run.stopped || run.inTurn || run.deciding || run.turnSeq !== w.seq) continue;
+      const v = this.store.get(id);
+      if (!v || v.state !== STATE.WAITING_HELPERS || this.stopped.has(id)) continue;
+      const bg = this._backgroundOf(run);
+      if (!bg || bg.helpers > 0 || (v.helpers?.working || 0) > 0) continue; // helpers have their own stuck checks
+      const helperEnds = this.store.descendants(id).map(d => d.endedAt || 0);
+      const quietSince = Math.max(v.lastEventAt || 0, v.stateSince || 0, run.backgroundAt || 0, ...helperEnds);
+      if (now - quietSince < this.options.stuckSilenceMs) continue;
+      w.asked = true;
+      if (!(bg.commands + bg.others > 0)) {
+        // Everything it waited for has ended, yet no new turn came: finish the turn it had.
+        run.waiting = null;
+        this._decide(id, run, { ...w.e, backgroundTasks: 0, background: null }, w.seq).catch(err => this.log.error('Could not finish a turn:', err));
+        continue;
+      }
+      const ask = this._newAsk(id, 'stuck', {
+        about: 'background',
+        sentence: `${v.name} has finished, but ${bg.commands > 0 ? 'a command it started' : 'something it started'} is still running.`,
+        ...(bg.work?.length ? { detail: bg.work.join('\n') } : {}),
+        options: ['It is done', 'Keep waiting'],
+      });
+      this._dropEngineAsk(id);
+      this._apply([
+        { kind: EV.ASK, agentId: id, ask },
+        { kind: EV.STATE, agentId: id, state: STATE.MAYBE_STUCK, reason: 'It left something running' },
+      ]);
+    }
+  }
+
+  /** The latest background split of a run: from the parser's live updates, else from the turn end. */
+  _backgroundOf(run) {
+    const latest = run.background || run.waiting?.e?.background;
+    return latest && typeof latest === 'object' ? latest : null;
+  }
+
+  /** Take back the "is it done?" question about background work, if it shows. Returns true if it did. */
+  _clearBackgroundAsk(agentId, answer, state = STATE.WORKING) {
+    const v = this.store.get(agentId);
+    const ask = v?.ask;
+    if (!ask || ask.type !== 'stuck' || ask.about !== 'background' || !this.asks.has(ask.id)) return false;
+    this.asks.delete(ask.id);
+    const batch = [{ kind: EV.ASK_CLEARED, agentId, askId: ask.id, answer }];
+    if (v.state === STATE.MAYBE_STUCK) {
+      // Through waiting_helpers, so a root that works again says what it is reading (the store words it).
+      batch.push({ kind: EV.STATE, agentId, state: STATE.WAITING_HELPERS, reason: null });
+      if (state !== STATE.WAITING_HELPERS) batch.push({ kind: EV.STATE, agentId, state, reason: null });
+    }
+    this._apply(batch);
+    return true;
   }
 
   // ================================================================ stuck agents
@@ -569,14 +827,22 @@ export class Engine extends EventEmitter {
     if (this._shuttingDown) return hookResponse('deny', 'Workbench is shutting down.');
     const root = this.store.get(String(agentId || ''));
     const run = root && !root.parentId ? this.runs.get(root.id) : null;
-    if (!root || !run) return hookResponse('deny', 'Workbench does not know this agent, so it said no.');
+    // Only real Claude Code agents ask through the hook: Codex works in its own sandbox and never asks, and the
+    // demo's agents are simulated. A request in any other agent's name is refused and shows nothing.
+    if (!root || !run || this.mode !== 'live' || run.harness !== 'claude') return hookResponse('deny', 'Workbench does not know this agent, so it said no.');
     if (run.stopped) return hookResponse('deny', 'This agent was stopped.');
+    // A hook left running after its Claude Code process has gone must not ask (or bring a failed agent back).
+    if (this._runnerInfo(run)?.alive === false) return hookResponse('deny', 'This agent is no longer running.');
     const p = payload && typeof payload === 'object' ? payload : {};
     const tool = typeof p.tool_name === 'string' ? p.tool_name : '';
     const input = p.tool_input && typeof p.tool_input === 'object' ? p.tool_input : {};
     if (!tool) return hookResponse('deny', 'The request did not say which tool it wants to use.');
 
     const asker = await this._findAsker(root, p);
+    // A helper the person stopped gets no tools at all, not even the ones the rules allow. That includes a live helper
+    // whose root was asked to stop it: it runs on until it ends.
+    const stoppedHelper = () => !!asker.parentId && (this.stopped.has(asker.id) || this.stopAsked.has(asker.id));
+    if (stoppedHelper()) return hookResponse('deny', 'The person stopped this helper.');
     let config = DEFAULT_CONFIG;
     try { config = (await run.config) || DEFAULT_CONFIG; } catch { config = DEFAULT_CONFIG; }
     let d;
@@ -587,11 +853,16 @@ export class Engine extends EventEmitter {
         input,
         cwd: run.workspace?.path ?? null, // the engine's workspace, never the payload's cwd
         extraAllow: Array.isArray(config.allow) ? config.allow : [],
+        // Claude Code's own folders for this agent's session, from its runner: never the payload's session id.
+        readAlso: this._readAlso(run),
+        // Who SendMessage may reach without asking: the main agent and this agent's own helpers, as its output named them.
+        recipients: this._recipients(root, run),
       });
     } catch (err) {
       this.log.error('The permission policy failed:', err);
       return hookResponse('deny', 'Workbench could not check this request, so it said no.');
     }
+    if (stoppedHelper()) return hookResponse('deny', 'The person stopped this helper.'); // stopped while it was checked
     const described = describeRequest(tool, input);
     const sentence = `${asker.name} ${d?.sentence || described.sentence}`;
     if (d?.decision === 'allow') {
@@ -604,26 +875,72 @@ export class Engine extends EventEmitter {
     }
     if (this._shuttingDown || run.stopped) return hookResponse('deny', 'This agent was stopped.');
     if (signal?.aborted) return hookResponse('deny', 'The request was cancelled.');
-    return this._hold({ asker, root, sentence, detail: d.detail ?? described.detail, signal });
+    // A late request must not bring back a helper that has ended: asking would leave it "working" for good.
+    // Checked after the waits above, since the helper can end while its request is being checked.
+    const askerNow = this.store.get(asker.id);
+    if (asker.parentId && (!askerNow || ENDED.has(askerNow.state))) return hookResponse('deny', 'The helper is no longer running.');
+    const why = typeof d.reason === 'string' && d.reason.trim() ? clip(d.reason, 300) : null;
+    return this._hold({ asker, root, sentence, detail: d.detail ?? described.detail, why, signal });
   }
 
-  /** The helper the hook names (payload.agent_id is its task id), or the root. */
+  /** The runner's info(), or null when it has none or it fails. */
+  _runnerInfo(run) {
+    try { return run.runner?.info?.() ?? null; } catch { return null; }
+  }
+
+  /** The agent's own scratch folders, as its runner names them for its own session. */
+  _readAlso(run) {
+    try {
+      const list = run.runner?.readAlso?.();
+      return Array.isArray(list) ? list : [];
+    } catch (err) {
+      this.log.warn('Could not list the agent’s own folders:', err);
+      return [];
+    }
+  }
+
+  /** "main", and this root's helpers: their workbench ids, and the task ids and names its output gave them. */
+  _recipients(root, run) {
+    const names = new Set(['main']);
+    for (const h of this.store.descendants(root.id)) names.add(h.id);
+    try {
+      const more = run.runner?.recipients?.();
+      for (const n of Array.isArray(more) ? more : []) if (typeof n === 'string' && n) names.add(n);
+    } catch (err) {
+      this.log.warn('Could not list the agent’s helpers:', err);
+    }
+    return [...names];
+  }
+
+  /**
+   * The agent behind a hook call: the root, unless payload.agent_id names a helper. The runner says which agent
+   * issued the call (payload.tool_use_id) or runs that task (payload.agent_id), from Claude Code's own output; a
+   * runner that cannot say gets the helper id rule. The hook can arrive before the parser has shown the helper: wait
+   * a moment, then ask in the root's place.
+   */
   async _findAsker(root, p) {
     const taskId = p.agent_id ? String(p.agent_id) : '';
     if (!taskId) return root;
-    const id = `${root.id}-${taskId.slice(0, 8)}`;
-    // The hook can arrive before the parser has shown the helper; wait a moment for it.
+    const toolUseId = p.tool_use_id ? String(p.tool_use_id) : '';
+    const runner = this.runs.get(root.id)?.runner;
+    const find = () => {
+      let id = null;
+      try { id = runner?.agentFor?.({ toolUseId, taskId }) || null; } catch { id = null; }
+      const v = (id && this.store.get(id)) || this.store.get(`${root.id}-${taskId.slice(0, 8)}`);
+      return v && v.rootId === root.id ? v : null;
+    };
     const deadline = Date.now() + this.options.helperWaitMs;
     for (;;) {
-      const v = this.store.get(id);
+      const v = find();
       if (v) return v;
       if (Date.now() >= deadline) return root;
       await sleep(25);
     }
   }
 
-  _hold({ asker, root, sentence, detail, signal }) {
-    const ask = { id: `ok-${hex(4)}`, type: 'permission', sentence, detail: String(detail ?? ''), options: ['Allow', 'Deny'], primary: 'Allow' };
+  _hold({ asker, root, sentence, detail, why = null, signal }) {
+    // `why` is the permission check's own reason, so the page can say why it asks.
+    const ask = { id: `ok-${hex(4)}`, type: 'permission', sentence, detail: String(detail ?? ''), ...(why ? { why } : {}), options: ['Allow', 'Deny'], primary: 'Allow' };
     return new Promise((resolve) => {
       // Remember the state to go back to: a root asked on behalf of an unknown helper may be waiting on helpers.
       const cur0 = this.store.get(asker.id);
@@ -649,7 +966,7 @@ export class Engine extends EventEmitter {
         this._apply([
           { kind: EV.ASK, agentId: asker.id, ask },
           { kind: EV.STATE, agentId: asker.id, state: STATE.NEEDS_OK, reason: null },
-        ]);
+        ], { held: true });
       }
     });
   }
@@ -664,18 +981,29 @@ export class Engine extends EventEmitter {
     const batch = [];
     if (!silent) batch.push({ kind: EV.APPROVAL, agentId: held.agentId, how, decision, sentence: held.ask.sentence });
     const v = this.store.get(held.agentId);
+    const next = [...this.held.values()].find(h => h.agentId === held.agentId && !h.done);
     if (v && v.ask && v.ask.id === held.askId) {
       batch.push({ kind: EV.ASK_CLEARED, agentId: held.agentId, askId: held.askId, answer: decision === 'allow' ? 'Allow' : 'Deny' });
-      const next = [...this.held.values()].find(h => h.agentId === held.agentId && !h.done);
       if (next) batch.push({ kind: EV.ASK, agentId: held.agentId, ask: next.ask });
       else if (v.state === STATE.NEEDS_OK) {
-        const back = held.prevState === STATE.WAITING_HELPERS ? STATE.WAITING_HELPERS : STATE.WORKING;
-        batch.push({ kind: EV.STATE, agentId: held.agentId, state: back, reason: null });
+        // Go on to what the engine decided while the request waited, or else back to what the agent was doing.
+        const later = this.later.get(held.agentId);
+        this.later.delete(held.agentId);
+        const ts = this.now();
+        if (later?.ask) batch.push({ ...later.ask, ts });
+        batch.push(later?.state ? { ...later.state, ts } : { kind: EV.STATE, agentId: held.agentId, state: this._stateAfterHeld(held), reason: null });
       }
     }
+    if (!next) this._dropLater(held.agentId);
     if (notice) batch.push({ kind: EV.NOTICE, text: notice, agentId: held.agentId });
-    if (batch.length) this._apply(batch);
+    if (batch.length) this._apply(batch, { held: true });
     return true;
+  }
+
+  /** After its last held request: working while its turn runs, else back to waiting on helpers, or working. */
+  _stateAfterHeld(held) {
+    if (this.runs.get(held.agentId)?.inTurn) return STATE.WORKING;
+    return held.prevState === STATE.WAITING_HELPERS ? STATE.WAITING_HELPERS : STATE.WORKING;
   }
 
   /** Say no to every held request from an agent (and, for a root, from its helpers). */
@@ -689,7 +1017,12 @@ export class Engine extends EventEmitter {
 
   // ================================================================ answers
 
-  /** Answer an agent's ask (or, for a finished agent, accept it or send a follow-up). */
+  /**
+   * Answer from a button or the reply box (POST /api/agents/:id/answer). `askId` names the ask the page showed: an
+   * ask is answered only by its own id, never as "whatever is showing now". A permission takes only its buttons'
+   * words, Allow or Deny; typed or spoken words reach it through command(), bound to the ask on screen. With no ask,
+   * a finished agent takes "Looks good" or a follow-up, and any other agent a message.
+   */
   async answer(agentId, { askId = null, answer } = {}) {
     const out = await this._answer(agentId, askId, answer);
     this._notice(out.reply, agentId);
@@ -700,48 +1033,85 @@ export class Engine extends EventEmitter {
     const v = this.store.get(agentId);
     if (!v) return { ok: false, reply: 'I can’t find that agent.' };
     const text = answer == null ? '' : String(answer).trim();
-    // A held permission request can be answered by its id, even while another one is showing.
-    const heldId = askId || v.ask?.id;
-    const held = heldId ? this.held.get(heldId) : null;
-    if (held && held.agentId === v.id) return this._answerPermission(v, held, text);
-
-    const ask = v.ask;
+    const named = this._askFor(v, askId);
+    if (named.reply) return { ok: false, reply: named.reply };
+    const ask = named.ask;
     if (!ask) {
-      if (askId) return { ok: false, reply: `${v.name} is not waiting for that any more.` };
       if (DONE.has(v.state) && !v.parentId) return this._answerDone(v, text);
       if (!text) return { ok: false, reply: `${v.name} is not waiting for an answer.` };
       return this._say(v, text);
     }
-    if (askId && ask.id !== askId) return { ok: false, reply: `${v.name} is not waiting for that any more.` };
-    // Asks the simulator made itself go back to the simulator.
-    if (!this.asks.has(ask.id) && this.mode === 'demo' && this.adapters.sim) return this._answerSim(v, ask, text);
-
-    switch (ask.type) {
-      case 'stuck':
-        return this._answerStuck(v, ask, text);
-      case 'permission': {
-        // Nothing is held for it any more (it timed out or was cancelled): just clear it.
-        this.asks.delete(ask.id);
-        const batch = [{ kind: EV.ASK_CLEARED, agentId: v.id, askId: ask.id, answer: text }];
-        if (v.state === STATE.NEEDS_OK) batch.push({ kind: EV.STATE, agentId: v.id, state: STATE.WORKING, reason: null });
-        this._apply(batch);
-        return { ok: false, reply: `${v.name} is no longer waiting for that.` };
-      }
-      case 'question':
-      default:
-        return this._answerQuestion(v, ask, text);
+    if (ask.type === 'permission') {
+      const allow = ALLOW_LABEL_RE.test(text) ? true : DENY_LABEL_RE.test(text) ? false : null;
+      if (allow === null) return { ok: false, reply: 'Choose Allow or Deny.' };
+      return this._answerPermission(v, ask, { allow });
     }
+    return this._answerAsk(v, ask, text);
   }
 
-  _answerPermission(v, held, text) {
-    if (!text) return { ok: false, reply: 'Choose Allow or Deny.' };
-    const allow = ALLOW_RE.test(text);
+  /**
+   * The ask an answer names by its id: the agent's ask on screen, or one of its held permission requests (one shows
+   * at a time). With no id, an agent that has an ask is not answered: "yes" must never reach an ask nobody saw.
+   * @returns {{ ask?: object, reply?: string }}  no ask and no reply: the agent has no ask, and none was named
+   */
+  _askFor(v, askId) {
+    const id = typeof askId === 'string' && askId ? askId : null;
+    const held = id ? this.held.get(id) : null;
+    if (held && held.agentId === v.id) return { ask: held.ask };
+    if (id && v.ask && v.ask.id === id) return { ask: v.ask };
+    if (!id) return v.ask ? { reply: `Have a look at what ${v.name} is asking first.` } : {};
+    return { reply: v.ask ? `${v.name} is asking something else now. Have a look, then answer again.` : `${v.name} is not waiting for that any more.` };
+  }
+
+  /** A question or a stuck agent: the text is the answer, or a hint. Asks the simulator made go back to it. */
+  async _answerAsk(v, ask, text) {
+    if (!this.asks.has(ask.id) && this.mode === 'demo' && this.adapters.sim) return this._answerSim(v, ask, text);
+    if (ask.type === 'stuck') return this._answerStuck(v, ask, text);
+    if (ask.type === 'permission') return this._answerPermission(v, ask, { allow: false, words: text }); // free text never allows
+    return this._answerQuestion(v, ask, text);
+  }
+
+  /**
+   * Settle a permission ask with the person's decision, the same way in live mode and in the demo. An allow never
+   * carries words. A no can: the person's words after "no", or the whole of a yes that came with conditions
+   * (`conditional`), which is a no because an allow cannot carry the condition: the step would run exactly as asked.
+   */
+  async _answerPermission(v, ask, { allow, words = '', conditional = false }) {
+    const said = clip(String(words ?? '').trim(), 300);
     let reason;
-    if (allow) reason = 'The person allowed it.';
-    else if (DENY_RE.test(text)) reason = 'The person said no.';
-    else reason = `The person said no, and added: ${clip(text, 300)}`; // free text never grants permission
-    this._resolveHeld(held, { decision: allow ? 'allow' : 'deny', how: 'person', reason });
-    return { ok: true, reply: allow ? `OK, ${v.name} can go ahead.` : `OK, ${v.name} will not do that.` };
+    let reply;
+    if (allow) {
+      reason = 'The person allowed it.';
+      reply = `OK, ${v.name} can go ahead.`;
+    } else if (said && conditional) {
+      reason = `The person did not allow this step as asked. They said: “${said}”`;
+      reply = `OK, ${v.name} will not do it as asked. I passed on your words.`;
+    } else if (said) {
+      reason = `The person said no, and added: ${said}`;
+      reply = `OK, ${v.name} will not do that. I passed on your words.`;
+    } else {
+      reason = 'The person said no.';
+      reply = `OK, ${v.name} will not do that.`;
+    }
+    const held = this.held.get(ask.id);
+    if (held && held.agentId === v.id) {
+      this._resolveHeld(held, { decision: allow ? 'allow' : 'deny', how: 'person', reason });
+      return { ok: true, reply };
+    }
+    // Asks the simulator made itself go back to it, already decided: it hears "Allow", or the words of a no. The
+    // person hears the same words as in live mode.
+    if (!this.asks.has(ask.id) && this.mode === 'demo' && this.adapters.sim) {
+      const res = await this._answerSim(v, ask, allow ? 'Allow' : (said || 'Deny'));
+      return res.ok === false ? res : { ok: true, reply };
+    }
+    // Nothing is held for it any more (it timed out or was cancelled): just clear it.
+    if (v.ask && v.ask.id === ask.id) {
+      this.asks.delete(ask.id);
+      const batch = [{ kind: EV.ASK_CLEARED, agentId: v.id, askId: ask.id, answer: allow ? 'Allow' : 'Deny' }];
+      if (v.state === STATE.NEEDS_OK) batch.push({ kind: EV.STATE, agentId: v.id, state: STATE.WORKING, reason: null });
+      this._apply(batch);
+    }
+    return { ok: false, reply: `${v.name} is no longer waiting for that.` };
   }
 
   async _answerQuestion(v, ask, text) {
@@ -758,6 +1128,7 @@ export class Engine extends EventEmitter {
 
   async _answerStuck(v, ask, text) {
     const n = text.toLowerCase().replace(/[.!]+$/, '').trim();
+    if (ask.about === 'background' && n !== 'stop it' && n !== 'stop') return this._answerBackground(v, ask, text, n);
     if (n === 'stop it' || n === 'stop') {
       this.asks.delete(ask.id);
       return this._stop(v); // leaving maybe_stuck clears the ask
@@ -781,6 +1152,49 @@ export class Engine extends EventEmitter {
     return { ok: true, reply: `Passed your hint to ${v.name}.` };
   }
 
+  /**
+   * The question about background work: "It is done" builds the receipt (what it left running keeps running), "Keep
+   * waiting" goes back to waiting and is not asked again for that turn, and anything else is a message for the agent.
+   * Once its process has ended, neither button applies: the exit makes it failed (see _onEnded).
+   */
+  async _answerBackground(v, ask, text, n) {
+    const run = this.runs.get(v.id);
+    const w = run && run.waiting;
+    const done = /^(it is done|it’s done|it's done|done|it is finished|finished)$/.test(n);
+    const wait = /^(keep waiting|wait|let it keep trying|keep trying|let it keep waiting)$/.test(n);
+    if ((done || wait) && run && !run.inTurn && this._runnerInfo(run)?.alive === false) {
+      // What it left running ended with it; the exit timer marks it failed and takes the question back.
+      return { ok: false, reply: `${v.name} stopped running before your answer reached it.` };
+    }
+    if (done) {
+      if (!w || run.inTurn || run.turnSeq !== w.seq) {
+        this._clearBackgroundAsk(v.id, text);
+        return { ok: true, reply: `${v.name} is working again, so I will wait for it.` };
+      }
+      const bg = this._backgroundOf(run);
+      run.accepted = new Set([...(run.accepted || []), ...(bg && Array.isArray(bg.ids) ? bg.ids : [])]);
+      run.waiting = null;
+      this.asks.delete(ask.id);
+      // Out of maybe_stuck at once: the receipt is built while it is working, as after any turn (run.deciding keeps the
+      // stuck checks off meanwhile), and a turn that starts during its checks is working, not "might be stuck".
+      this._apply([
+        { kind: EV.ASK_CLEARED, agentId: v.id, askId: ask.id, answer: text },
+        { kind: EV.STATE, agentId: v.id, state: STATE.WORKING, reason: null },
+      ]);
+      this._decide(v.id, run, { ...w.e, backgroundTasks: 0, background: null }, w.seq).catch(err => this.log.error('Could not finish a turn:', err));
+      return { ok: true, reply: `OK, ${v.name} is done. What it left running keeps running until you stop ${v.name} or close Workbench.` };
+    }
+    if (wait) {
+      this._clearBackgroundAsk(v.id, text, STATE.WAITING_HELPERS);
+      return { ok: true, reply: `OK, ${v.name} keeps waiting.` };
+    }
+    if (!text) return { ok: false, reply: 'Choose “It is done” or “Keep waiting”, or type a message for it.' };
+    const sent = await this._sendTo(v, text); // anything else is a message for the agent
+    if (!sent.ok) return sent;
+    this._clearBackgroundAsk(v.id, text);
+    return { ok: true, reply: `Passed your message to ${v.name}.` };
+  }
+
   async _answerDone(v, text) {
     if (!text || LOOKS_GOOD_RE.test(text)) return { ok: true, reply: `Good. ${v.name} stays as it is.` };
     const sent = await this._sendTo(v, text);
@@ -801,7 +1215,7 @@ export class Engine extends EventEmitter {
     // The simulator words its own replies; otherwise use ours.
     if (res && typeof res.reply === 'string' && res.reply) return { ok: res.ok !== false, reply: res.reply };
     const n = text.toLowerCase().replace(/[.!]+$/, '').trim();
-    if (ask.type === 'permission') return { ok: true, reply: ALLOW_RE.test(text) ? `OK, ${v.name} can go ahead.` : `OK, ${v.name} will not do that.` };
+    if (ask.type === 'permission') return { ok: true, reply: ALLOW_LABEL_RE.test(text) ? `OK, ${v.name} can go ahead.` : `OK, ${v.name} will not do that.` };
     if (ask.type === 'stuck') {
       if (n === 'stop it' || n === 'stop') return { ok: true, reply: `Stopped ${v.name}.` };
       if (n === 'let it keep trying' || n === 'keep trying') return { ok: true, reply: `OK, ${v.name} will keep trying.` };
@@ -840,11 +1254,13 @@ export class Engine extends EventEmitter {
     const message = v.parentId ? `About your helper “${v.name}”: ${text}` : text;
     const run = this.runs.get(root.id);
     if (!run || !run.runner) {
-      // An agent the simulator seeded: let the simulator take the message.
+      // An agent the simulator seeded: let the simulator take the message. A message answers a question, but never
+      // settles a permission or a stuck ask: as in live mode, where a held request stays held.
       const sim = this.mode === 'demo' ? this.adapters.sim : null;
       if (sim && (typeof sim.say === 'function' || typeof sim.onAnswer === 'function')) {
         try {
-          const res = v.ask && typeof sim.onAnswer === 'function'
+          const question = v.ask && v.ask.type === 'question';
+          const res = question && typeof sim.onAnswer === 'function'
             ? await sim.onAnswer(v.id, v.ask, text)
             : typeof sim.say === 'function' ? await sim.say(v.id, text) : await sim.onAnswer(v.id, null, text);
           if (res && res.ok === false) return { ok: false, reply: res.reply || `${v.name} could not take that.` };
@@ -866,10 +1282,14 @@ export class Engine extends EventEmitter {
         this.stopped.add(root.id);
       }
       this.log.warn('Could not send a message:', err);
-      return { ok: false, reply: `I could not reach ${root.name}: ${plainReason(err)}` };
+      // A runner's own plain sentence says it all ("Fix cart total has used its whole spending limit, so it can’t
+      // continue."); anything else was a failure to reach it.
+      return { ok: false, reply: err?.plain ? err.message : `I could not reach ${root.name}: ${plainReason(err)}` };
     }
+    this._cancelReceipt(run); // it works on again: checks of the folder as it was would mislead
     const cur = this.store.get(root.id);
-    // A turn start resumes done roots by itself, but not stopped or failed ones; do it now for all.
+    // A turn start resumes done and failed roots by itself, but not stopped ones, and it may come much later (a
+    // relaunch): do it now for all.
     if (cur && ENDED.has(cur.state)) this._apply([{ kind: EV.STATE, agentId: root.id, state: STATE.WORKING, reason: null }]);
     return { ok: true };
   }
@@ -900,6 +1320,9 @@ export class Engine extends EventEmitter {
     const run = this.runs.get(v.id);
     this.stopped.add(v.id);
     if (run) run.stopped = true;
+    this._cancelReceipt(run); // stopping an agent stops the checks it is running
+    // What a turn decided while a request was held would otherwise show for a moment before "stopped".
+    for (const a of [v, ...this.store.descendants(v.id)]) this._dropLater(a.id);
     this._denyHeldFor(v.id, 'The agent was stopped.', true);
     if (run && run.runner) {
       try {
@@ -953,6 +1376,11 @@ export class Engine extends EventEmitter {
     if (this.mode === 'live' && run && run.runner && !run.stopped) {
       const sent = await this._sendTo(root, `Please stop your helper “${v.name}” now, because it may be stuck, and carry on without it.`);
       if (sent.ok) {
+        // Its root can act on that only once the helper moves on, and a held request would keep it waiting: say no to
+        // its held requests now, and to every tool it asks for from now on (it keeps running until it ends).
+        this.stopAsked.add(v.id);
+        this._dropLater(v.id);
+        this._denyHeldFor(v.id, 'The person stopped this helper.');
         const ask = this.store.get(v.id)?.ask;
         if (ask && this.asks.has(ask.id) && !this.held.has(ask.id)) {
           this.asks.delete(ask.id);
@@ -963,6 +1391,7 @@ export class Engine extends EventEmitter {
     }
     // Simulated (or unreachable) helpers are stopped right here.
     this.stopped.add(v.id);
+    this._dropLater(v.id);
     this._denyHeldFor(v.id, 'The helper was stopped.');
     if (this.mode === 'demo') await this._simStop(v.id);
     const batch = [];
@@ -983,7 +1412,16 @@ export class Engine extends EventEmitter {
     return v;
   }
 
-  async _startAgent({ task, harness, model, machineId, budgetUsd, name } = {}) {
+  /** A launch, tracked while it is under way so that shutdown can wait for it (see shutdown). */
+  _startAgent(opts) {
+    const p = this._launch(opts);
+    this._launching.add(p);
+    const done = () => this._launching.delete(p);
+    p.then(done, done);
+    return p;
+  }
+
+  async _launch({ task, harness, model, machineId, budgetUsd, name } = {}) {
     if (this._shuttingDown) throw plainError('Workbench is shutting down.');
     const text = String(task ?? '').trim();
     if (!text) throw plainError('Tell me what the agent should work on.');
@@ -1014,12 +1452,21 @@ export class Engine extends EventEmitter {
       const repo = await this._loadRepo();
       if (typeof this.deps.workspace?.createWorkspace !== 'function') throw plainError('Workbench cannot make workspaces right now.');
       workspace = await this.deps.workspace.createWorkspace({ repoRoot: repo.root, agentId: id, slug: slugify(agentName) });
+      if (this._shuttingDown) {
+        // Workbench began to close while git made the folder: nothing starts in it, so it goes again. One that cannot
+        // go is listed with the other folders that stay (keptFolders), never left unmentioned.
+        const late = { id, name: agentName, workspace };
+        if (!(await this._removeUnchanged(late))) this.runs.set(id, late);
+        throw plainError('Workbench is shutting down.');
+      }
     }
 
     const run = {
       id, harness: h, runner: null, workspace,
       config: this._loadConfig(workspace),
       turnSeq: 0, inTurn: false, deciding: false, stopped: false, lastText: '',
+      receipt: null, checksDone: null, // the receipt being built (cancellable) and when its checks have ended
+      waiting: null, background: null, backgroundAt: 0, accepted: null, // background work left running
     };
     this.runs.set(id, run);
     this._apply([
@@ -1035,7 +1482,8 @@ export class Engine extends EventEmitter {
         model: mdl,
         budgetUsd: budget,
         emit: (ev) => this.ingest(ev),
-        hook: { url: this.hook?.url ?? null, token: this.hook?.token ?? null },
+        // Only a real Claude Code agent has the hook, with its own token. Codex and the simulator get none.
+        hook: this.mode === 'live' && h === 'claude' ? { url: this.hook?.url ?? null, token: this._hookToken(id) } : null,
         log: this.log,
         harness: h,
         machineId: mach,
@@ -1048,9 +1496,40 @@ export class Engine extends EventEmitter {
         { kind: EV.ENDED, agentId: id, outcome: 'error', error: why },
         { kind: EV.STATE, agentId: id, state: STATE.FAILED, reason: `It could not start: ${why}` },
       ]);
+      if (this._runnerInfo(run)?.alive !== true) await this._removeUnchanged(run); // nothing ran in its folder
     }
     this._refreshMachines();
     return this.store.get(id);
+  }
+
+  /**
+   * Remove an agent's folder and branch when they hold nothing: never while it might hold work (see removeWorkspace's
+   * onlyIfUnchanged). Used when an agent could not start, and at shutdown. Never during the session otherwise:
+   * stopped, failed and done agents all take follow-ups in the same folder.
+   */
+  async _removeUnchanged(run) {
+    const ws = run && run.workspace;
+    if (!ws || run.folderRemoved || !this.repoInfo || typeof this.deps.workspace?.removeWorkspace !== 'function') return false;
+    try {
+      const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace({
+        repoRoot: this.repoInfo.root, path: ws.path, base: ws.base, onlyIfUnchanged: true, deleteBranch: true,
+      })), this.options.stopTimeoutMs);
+      if (out?.removed) run.folderRemoved = true;
+      return !!out?.removed;
+    } catch (err) {
+      this.log.warn(`Could not tidy up the folder of ${run.id}:`, err);
+      return false;
+    }
+  }
+
+  /** This agent's own hook token, or null (Claude Code then refuses to start: fail closed). */
+  _hookToken(agentId) {
+    try {
+      const t = typeof this.hook?.tokenFor === 'function' ? this.hook.tokenFor(agentId) : null;
+      return typeof t === 'string' && t ? t : null;
+    } catch {
+      return null;
+    }
   }
 
   _newRootId() {
@@ -1119,14 +1598,22 @@ export class Engine extends EventEmitter {
 
   // ================================================================ commands and confirms
 
-  /** Plain-language command from the bar at the bottom (typed or spoken). Launches need a confirm. */
-  async command(text, { focusId = null } = {}) {
+  /**
+   * Plain-language command from the bar at the bottom (typed or spoken). Launches need a confirm, and so do stops and
+   * messages whose words found the agent without naming it.
+   * The page sends what it showed when the person began: `focusId`, the agent in the centre; `confirmId`, the confirm
+   * card on screen; `askId`, the ask on screen. A yes or no settles only that confirm, and an answer (allow, deny,
+   * free text) reaches only that ask. Commands (stop, tell, status, start, ...) act on what the words and the focus
+   * name, even when the ask on screen has changed since.
+   */
+  async command(text, { focusId = null, confirmId = null, askId = null } = {}) {
     const t = String(text ?? '').trim();
     let out;
     if (!t) {
       out = { reply: 'Type or say what you would like to do.' };
     } else {
-      const ctx = this._commandContext(focusId);
+      const ctx = this._commandContext(focusId, confirmId);
+      const shown = ctx.pendingConfirm;
       let intent = null;
       try {
         if (typeof this.deps.commands?.parseCommand === 'function') intent = await this.deps.commands.parseCommand(t, ctx);
@@ -1134,63 +1621,89 @@ export class Engine extends EventEmitter {
         this.log.warn('Could not understand a command:', err);
       }
       if (!intent || typeof intent !== 'object') intent = { kind: 'unknown', text: t };
-      try {
-        out = await this._runIntent(intent, focusId);
-      } catch (err) {
-        this.log.error('A command failed:', err);
-        out = { reply: err?.plain ? err.message : 'Something went wrong while doing that. The details are in the log.' };
+      if (shown && intent.kind === 'unknown') {
+        // A near miss ("yes start the agent") keeps the card in the centre, so saying "yes" again still answers it,
+        // and not whatever would have taken its place.
+        out = shown.gone
+          ? { reply: GONE }
+          : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: { id: shown.id, sentence: shown.sentence, detail: shown.detail } };
+      } else {
+        // Any other command withdraws the card on screen, without a notice: the page lets go of it.
+        if (shown && !shown.gone && intent.kind !== 'confirm') this.confirms.delete(shown.id);
+        try {
+          // With a card on screen, no ask was: the centre shows one thing at a time.
+          out = await this._runIntent(intent, { focusId, askId: shown ? null : askId, shown });
+        } catch (err) {
+          this.log.error('A command failed:', err);
+          out = { reply: err?.plain ? err.message : 'Something went wrong while doing that. The details are in the log.' };
+        }
       }
     }
     if (out.reply && !out.confirm) this._notice(out.reply, out.focusId || null);
     return out;
   }
 
-  _commandContext(focusId) {
+  _commandContext(focusId, confirmId = null) {
     return {
       agents: this.store.list(),
       focusId: focusId || null,
       machines: this.store.machines(),
       harnesses: this._harnessFlags(),
-      pendingConfirm: this._pendingConfirm(),
+      pendingConfirm: this._shownConfirm(confirmId),
     };
   }
 
-  _pendingConfirm() {
-    let latest = null;
-    const now = this.now();
-    for (const c of this.confirms.values()) {
-      if (now - c.createdAt > this.options.confirmTtlMs) continue;
-      if (!latest || c.createdAt >= latest.createdAt) latest = c;
-    }
-    return latest ? { id: latest.id, kind: latest.kind, sentence: latest.sentence, detail: latest.detail, tasks: latest.tasks } : null;
+  /**
+   * The confirm the page says it shows. Never "the latest one": a card the person no longer sees must not catch a
+   * "yes" or a "stop" meant for an agent. One that has run out still counts as shown, so "yes" to it hears that it
+   * is no longer waiting instead of reaching something else.
+   */
+  _shownConfirm(confirmId) {
+    const id = typeof confirmId === 'string' ? confirmId : '';
+    if (!id) return null;
+    const c = this.confirms.get(id);
+    if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) return { id, gone: true };
+    return { id: c.id, kind: c.kind, sentence: c.sentence, detail: c.detail, tasks: c.tasks, agentIds: c.intent?.agentIds };
   }
 
-  async _runIntent(intent, focusId) {
+  async _runIntent(intent, { focusId = null, askId = null, shown = null } = {}) {
     const get = (id) => (id ? this.store.get(id) : null);
     switch (intent.kind) {
       case 'start':
         return this._proposeStart(intent.tasks);
       case 'task':
         return this._proposeStart([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
-      case 'answer': {
-        const v = get(intent.agentId || focusId);
-        if (!v) return { reply: 'Which agent is that for?' };
-        const r = await this._answer(v.id, intent.askId ?? v.ask?.id ?? null, intent.text);
-        return { reply: r.reply, focusId: v.id };
-      }
+      case 'answer':
       case 'allow':
       case 'deny': {
-        const { v, reply } = this._permissionTarget(intent.agentId || focusId);
-        if (!v) return { reply };
-        const askId = intent.askId && this.held.has(intent.askId) ? intent.askId : v.ask.id;
-        // "No, use the staging database" denies and passes the words on; an allow is always a plain Allow.
-        const words = intent.kind === 'allow' ? 'Allow' : (String(intent.text ?? '').trim() || 'Deny');
-        const r = await this._answer(v.id, askId, words);
+        const target = intent.kind === 'answer' ? { v: get(intent.agentId || focusId) } : this._permissionTarget(intent.agentId || focusId);
+        const v = target.v;
+        if (!v) return { reply: target.reply || 'Which agent is that for?' };
+        // Words answer only the ask that was on screen when the person began: its id comes with them, and it must be
+        // the ask the words were read against. Otherwise nothing is answered and the request keeps waiting.
+        const named = this._askFor(v, askId);
+        if (named.reply) return { reply: named.reply, focusId: v.id };
+        const ask = named.ask;
+        if (!ask) return { reply: `${v.name} is not waiting for an answer.`, focusId: v.id };
+        if (intent.askId && intent.askId !== ask.id) return { reply: `${v.name} is asking something else now. Have a look, then answer again.`, focusId: v.id };
+        let r;
+        if (ask.type === 'permission') {
+          // "yes" allows; "no, use the staging database" and "yes but only in the tests folder" say no with the words.
+          r = intent.kind === 'allow'
+            ? await this._answerPermission(v, ask, { allow: true })
+            : await this._answerPermission(v, ask, { allow: false, words: intent.text, conditional: !!intent.conditional });
+        } else if (intent.kind === 'answer') {
+          r = await this._answerAsk(v, ask, String(intent.text ?? '').trim());
+        } else {
+          r = { reply: `${v.name} is not asking for your OK.` };
+        }
         return { reply: r.reply, focusId: v.id };
       }
       case 'stop': {
         const views = (intent.agentIds || []).map(get).filter(Boolean);
         if (!views.length) return { reply: 'I couldn’t tell which agent to stop.' };
+        // Found by its task or state words, or one loose word, not by its name: ask first ("Stop Flaky test?").
+        if (intent.sure === false) return this._proposeIntent({ kind: 'stop', agentIds: views.map(v => v.id) });
         const replies = [];
         for (const v of views) replies.push((await this._stop(v)).reply);
         return { reply: replies.join(' '), ...(views.length === 1 ? { focusId: views[0].id } : {}) };
@@ -1204,7 +1717,10 @@ export class Engine extends EventEmitter {
       case 'say': {
         const v = get(intent.agentId || focusId);
         if (!v) return { reply: 'Which agent should I tell?' };
-        const r = await this._say(v, String(intent.text ?? '').trim());
+        const words = String(intent.text ?? '').trim();
+        // Found without its name, or with no clear break before the message: ask first ("Tell Flaky test “…”?").
+        if (intent.sure === false) return this._proposeIntent({ kind: 'say', agentId: v.id, text: words });
+        const r = await this._say(v, words);
         return { reply: r.reply, focusId: v.id };
       }
       case 'status':
@@ -1222,9 +1738,12 @@ export class Engine extends EventEmitter {
       case 'sleep_idle':
         return this._sleepIdle();
       case 'confirm': {
-        const c = this._pendingConfirm();
-        if (!c) return { reply: 'There is nothing waiting for a yes or no.' };
-        return this._confirm(c.id, !!intent.go);
+        // Only the card on screen: never "the latest one".
+        if (!shown) return { reply: 'There is nothing waiting for a yes or no.' };
+        const r = await this._confirm(shown.id, !!intent.go);
+        // A typed or spoken yes that started agents puts the first one in the centre, so a second "yes" said out of
+        // habit finds nothing to answer, rather than whatever asks next.
+        return r.agentIds?.length && !r.focusId ? { ...r, focusId: r.agentIds[0] } : r;
       }
       default:
         return { reply: HELP };
@@ -1295,10 +1814,34 @@ export class Engine extends EventEmitter {
     return parts.join(' ');
   }
 
-  /** Execute (go = true) or cancel a launch proposed by command(). */
+  /**
+   * A stop or a message whose words found the agent without naming it ("stop the stuck one"): ask first, with the
+   * same kind of confirm card as a launch.
+   */
+  _proposeIntent(intent) {
+    let sentence = null;
+    try {
+      const s = this.deps.commands?.describeIntent?.(intent, this._commandContext(null));
+      if (typeof s === 'string' && s.trim()) sentence = s.trim();
+    } catch (err) {
+      this.log.debug('describeIntent failed:', err);
+    }
+    const views = (intent.kind === 'stop' ? intent.agentIds : [intent.agentId]).map(id => this.store.get(id)).filter(Boolean);
+    if (!sentence) {
+      const names = joinAnd(views.map(v => v.name)) || 'that agent';
+      sentence = intent.kind === 'stop' ? `Stop ${names}?` : `Tell ${names} “${clip(intent.text, 80)}”?`;
+    }
+    // Which one, in the person's own words: two agents can have the same name.
+    const detail = views.length === 1 && views[0].task ? `Its task: “${clip(views[0].task, 90)}”` : null;
+    const id = hex(6);
+    this.confirms.set(id, { id, kind: intent.kind, intent, sentence, detail, createdAt: this.now() });
+    return { reply: sentence, confirm: { id, sentence, detail } };
+  }
+
+  /** Execute (go = true) or cancel a launch, stop or message proposed by command(). */
   async confirm(confirmId, go) {
     const out = await this._confirm(confirmId, go);
-    this._notice(out.reply);
+    this._notice(out.reply, out.focusId || null);
     return out;
   }
 
@@ -1306,9 +1849,16 @@ export class Engine extends EventEmitter {
     const c = this.confirms.get(String(confirmId ?? ''));
     if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) {
       if (c) this.confirms.delete(c.id);
-      return { reply: 'That request is no longer waiting. Ask again if you still want it.' };
+      return { reply: GONE };
     }
     this.confirms.delete(c.id);
+    if (c.kind === 'stop' || c.kind === 'say') {
+      if (!go) {
+        if (c.kind === 'say') return { reply: 'OK, I won’t send it.' };
+        return { reply: c.intent.agentIds.length === 1 ? 'OK, I won’t stop it.' : 'OK, I won’t stop them.' };
+      }
+      return this._runIntent({ ...c.intent, sure: true });
+    }
     if (!go) return { reply: c.tasks.length === 1 ? 'OK, I won’t start it.' : 'OK, I won’t start them.' };
     const used = new Set();
     const started = [];
@@ -1365,7 +1915,7 @@ export class Engine extends EventEmitter {
     const working = all.filter(v => !v.parentId && (v.state === STATE.WORKING || v.state === STATE.STARTING || v.state === STATE.WAITING_HELPERS));
     const parts = [];
     if (needs.length) {
-      const what = needs.slice(0, 4).map(v => `${v.name} ${PHRASE[v.state]}`);
+      const what = needs.slice(0, 4).map(v => `${v.name} ${v.ask?.about === 'background' ? 'left a command running' : PHRASE[v.state]}`);
       if (needs.length > 4) what.push(`${needs.length - 4} more`);
       parts.push(`${needs.length === 1 ? 'One thing needs' : `${needs.length} things need`} you: ${joinAnd(what)}.`);
     } else {
@@ -1377,11 +1927,20 @@ export class Engine extends EventEmitter {
 
   _describe(v) {
     const ask = v.ask;
-    if (ask && v.state === STATE.NEEDS_OK) return `${ask.sentence}. It needs your OK.`;
+    if (ask && v.state === STATE.NEEDS_OK) {
+      // The exact command, path or address, so a spoken "what is it doing" says what an OK would let through.
+      const exact = quotable(ask.detail);
+      return `${ask.sentence}${exact ? `: “${exact}”` : ''}. It needs your OK.`;
+    }
     if (ask && v.state === STATE.QUESTION) return `${v.name} has a question: ${ask.sentence}`;
+    if (ask && v.state === STATE.MAYBE_STUCK && ask.about === 'background') return `${ask.sentence} Is it done, or should it keep waiting?`;
     if (ask && v.state === STATE.MAYBE_STUCK) return `${ask.sentence} Stop it, or let it keep trying?`;
     let s;
     if (v.state === STATE.WORKING && v.now) s = `${v.name} is working: ${lowerFirst(v.now)}.`;
+    else if (v.state === STATE.WAITING_HELPERS && v.now) {
+      // "… is waiting for a background command."; "… is waiting: its background work is done."
+      s = /^Waiting /.test(v.now) ? `${v.name} is ${lowerFirst(v.now)}.` : `${v.name} is waiting: ${lowerFirst(v.now)}.`;
+    }
     else s = `${v.name} ${PHRASE[v.state] || 'is working'}.`;
     if (v.stateReason && (v.state === STATE.FAILED || v.state === STATE.CHECKS_FAILED)) s += ` ${v.stateReason}`;
     if (v.says && ENDED.has(v.state)) s += ` It says: ${v.says}`;
@@ -1392,9 +1951,11 @@ export class Engine extends EventEmitter {
 
   _spendSentence() {
     const spend = this.store.spendTodayUsd(this.now());
+    // Claude Code reports cost only when a turn ends: until then part of it is Workbench's estimate ("about").
+    const estimated = !!this.store.spendTodayEstimated?.(this.now());
     let s = this.mode === 'demo'
-      ? `The demo agents have spent ${money(spend)} today. It is simulated, so nothing was really spent.`
-      : `You have spent ${money(spend)} today.`;
+      ? `The demo agents have spent ${spentAmount(spend)} today. It is simulated, so nothing was really spent.`
+      : `You have spent ${spentAmount(spend, estimated)} today.`;
     const d = new Date(this.now());
     d.setHours(0, 0, 0, 0);
     const codex = this.store.list().some(v => !v.parentId && v.harness === 'codex' && v.startedAt >= d.getTime());
@@ -1508,6 +2069,7 @@ export class Engine extends EventEmitter {
       agents: s.agents,
       machines: s.machines,
       spendTodayUsd: s.spendTodayUsd,
+      spendTodayEstimated: !!s.spendTodayEstimated, // part of it is Workbench's estimate: say "about"
       defaultBudgetUsd: this.defaultBudgetUsd,
     };
   }

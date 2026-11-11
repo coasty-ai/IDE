@@ -7,7 +7,9 @@
 //
 // Environment:
 //   FAKE_CODEX_LOG       file that gets one JSON line per call: { argv, cwd, stdin, env, pid, grandchild? }
-//   FAKE_CODEX_MODE      replay (default) | hang | stubborn | fail | crash
+//   FAKE_CODEX_MODE      replay (default) | hang | stubborn | fail | crash | fail-first
+//                        fail-first: the first `exec` starts its turn, waits FAKE_CODEX_DELAY_MS, then fails as
+//                        `fail` does; `exec resume` replays normally (FAKE_CODEX_MODE applies to every call)
 //   FAKE_CODEX_DELAY_MS  pause between replayed lines (default 0)
 //   FAKE_CODEX_LOGIN     in (default) | out | apikey, for `login status`
 //   FAKE_CODEX_VERSION   hang: `--version` never answers
@@ -111,10 +113,12 @@ async function run({ resume, parsed }) {
     process.exitCode = 101;
     return;
   }
-  if (mode === 'fail') {
+  if (mode === 'fail' || (mode === 'fail-first' && !resume)) {
     const message = 'unexpected status 401 Unauthorized: {"error":{"message":"Missing bearer authentication"}}';
     const [started] = fixtureLines('codex-run.jsonl', threadId);
-    await write(process.stdout, [started, '{"type":"turn.started"}', JSON.stringify({ type: 'error', message }), JSON.stringify({ type: 'turn.failed', error: { message } })].join('\n') + '\n');
+    await write(process.stdout, [started, '{"type":"turn.started"}'].join('\n') + '\n');
+    if (mode === 'fail-first' && delay) await sleep(delay); // a message can arrive while this turn runs
+    await write(process.stdout, [JSON.stringify({ type: 'error', message }), JSON.stringify({ type: 'turn.failed', error: { message } })].join('\n') + '\n');
     await write(process.stderr, 'ERROR: unexpected status 401 Unauthorized\n');
     process.exitCode = 1;
     return;
