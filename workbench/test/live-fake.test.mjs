@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -102,7 +102,7 @@ async function setup(t, extraEnv = {}, { config = null, claudeSettings = null } 
   };
   const agents = async () => (await get('/api/state')).agents;
 
-  return { dir, proc, exited, pidfile, envDir, home, post, agents, log: () => log.replace(/t=[0-9a-f]+/g, 't=<token>') };
+  return { dir, repo, env, proc, exited, pidfile, envDir, home, post, agents, log: () => log.replace(/t=[0-9a-f]+/g, 't=<token>') };
 }
 
 async function startAgent(w) {
@@ -421,4 +421,119 @@ test('a committed .claude/settings.json cannot redirect the hook bridge or chang
   assert.equal(helper.state, 'needs_ok');
   assert.equal(hits.length, 0, 'nothing went to the address the repository named');
   await stopEngine(w);
+});
+
+/** Another Workbench on the same repository and home folder as `w` (which has stopped), as after a restart. */
+async function relaunch(t, w) {
+  const proc = spawn(process.execPath, [BIN, '--repo', w.repo, '--no-open', '--port', '0', '--budget', '0.5'], { env: w.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let log = '';
+  proc.stdout.on('data', (d) => { log += d; });
+  proc.stderr.on('data', (d) => { log += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code, signal) => resolve({ code, signal })));
+  t.after(async () => {
+    if (proc.exitCode == null && proc.signalCode == null) {
+      proc.kill('SIGINT');
+      const gone = await Promise.race([exited.then(() => true), sleep(15_000).then(() => false)]);
+      if (!gone) { proc.kill('SIGKILL'); await exited; }
+    }
+  });
+  const m = await until('the engine to print its address', () => /(http:\/\/127\.0\.0\.1:\d+)\/\?t=([0-9a-f]+)/.exec(log), { timeoutMs: 20_000 });
+  const [, base, token] = m;
+  const headers = { 'Content-Type': 'application/json', 'X-Workbench-Token': token };
+  const get = async (p) => (await fetch(base + p, { headers })).json();
+  const post = async (p, body) => {
+    const res = await fetch(base + p, { method: 'POST', headers, body: JSON.stringify(body ?? {}) });
+    return { status: res.status, body: await res.json().catch(() => null) };
+  };
+  const stop = async () => {
+    proc.kill('SIGINT');
+    const ex = await Promise.race([exited, sleep(15_000).then(() => null)]);
+    assert.ok(ex, `Workbench did not stop within 15 s.\n${log}`);
+    assert.equal(ex.code, 0, log);
+  };
+  return { post, agents: async () => (await get('/api/state')).agents, stop, log: () => log };
+}
+
+test('history: stop Workbench, start it again, and the agent is there to continue in the same folder', async (t) => {
+  // No recorded run: the stand-in answers each message with one line, so a turn ends at once.
+  const w = await setup(t, { FAKE_CLAUDE_FIXTURE: '' });
+  const asked = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
+  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  const id = go.body.agentIds[0];
+  const first = await until('the agent to finish', async () => (await w.agents()).find((a) => a.id === id && a.state === 'done_claimed'));
+  assert.match(first.says, /^You said: /);
+  assert.ok(first.sessionId, 'the session id is known');
+  writeFileSync(path.join(first.workspace, 'notes.txt'), 'work the agent left\n'); // a folder with changes is kept
+  await stopEngine(w);
+
+  // What was written: one file under the home folder, with the agent and no key.
+  const dir = path.join(w.home, '.workbench', 'history');
+  const files = readdirSync(dir);
+  assert.equal(files.length, 1, files.join(', '));
+  assert.match(files[0], /^repo-[0-9a-f]{8}\.json$/);
+  const text = readFileSync(path.join(dir, files[0]), 'utf8');
+  const rec = JSON.parse(text).agents[0];
+  assert.equal(rec.id, id);
+  assert.equal(rec.sessionId, first.sessionId);
+  assert.equal(rec.workspace.path, first.workspace);
+  assert.match(rec.workspace.branch, /^workbench\//);
+  assert.equal(/[0-9a-f]{64}/.test(text), false, 'no page token or hook token');
+
+  // A second Workbench: the agent is back, earlier, finished, and can continue.
+  const w2 = await relaunch(t, w);
+  const back = (await w2.agents()).find((a) => a.id === id);
+  assert.ok(back, 'the earlier agent is in the snapshot');
+  assert.equal(back.earlier, true);
+  assert.equal(back.state, 'done_claimed');
+  assert.ok(back.endedAt > 0);
+  assert.equal(back.canContinue, true);
+  assert.equal(back.workspace, first.workspace);
+
+  const said = await w2.post(`/api/agents/${id}/say`, { text: 'now say goodbye' });
+  assert.equal(said.status, 200);
+  assert.equal(said.body.ok, true, JSON.stringify(said.body));
+  assert.match(said.body.reply, /is continuing in its own folder\. It has a new spending limit of \$0\.50 for this run\./);
+  const again = await until('the agent to finish its second run', async () => {
+    const a = (await w2.agents()).find((x) => x.id === id);
+    return a && a.earlier === false && a.state === 'done_claimed' && /goodbye/.test(a.says || '') ? a : null;
+  });
+  // The stand-in says which session it resumed and with what budget.
+  assert.equal(again.says, `You said (resumed ${first.sessionId} with budget 0.5): now say goodbye`);
+  assert.equal(again.workspace, first.workspace);
+  assert.equal(again.budgetUsd, 0.5);
+  await w2.stop();
+
+  // A third: forget it. It asks first; yes removes it from the board and the file, and the folder stays.
+  const w3 = await relaunch(t, w);
+  assert.equal((await w3.agents()).find((a) => a.id === id)?.earlier, true);
+  const ask = await w3.post('/api/command', { text: 'forget it', focusId: id });
+  assert.ok(ask.body.confirm?.id, JSON.stringify(ask.body));
+  assert.equal((await w3.agents()).length, 1, 'nothing is forgotten before the yes');
+  const yes = await w3.post(`/api/confirm/${encodeURIComponent(ask.body.confirm.id)}`, { go: true });
+  assert.match(yes.body.reply, /^Forgot /);
+  assert.equal((await w3.agents()).length, 0);
+  await w3.stop();
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, files[0]), 'utf8')).agents, []);
+  assert.equal(existsSync(path.join(first.workspace, 'notes.txt')), true, 'forgetting does not delete the folder');
+});
+
+test('history: an earlier agent whose folder was removed is shown, and refuses to continue in plain words', async (t) => {
+  const w = await setup(t, { FAKE_CLAUDE_FIXTURE: '' });
+  const asked = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
+  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  const id = go.body.agentIds[0];
+  const first = await until('the agent to finish', async () => (await w.agents()).find((a) => a.id === id && a.state === 'done_claimed'));
+  writeFileSync(path.join(first.workspace, 'notes.txt'), 'x\n');
+  await stopEngine(w);
+  execFileSync('git', ['-C', w.repo, 'worktree', 'remove', '--force', first.workspace], { stdio: 'pipe' });
+
+  const w2 = await relaunch(t, w);
+  const back = (await w2.agents()).find((a) => a.id === id);
+  assert.equal(back.earlier, true);
+  assert.equal(back.canContinue, false);
+  assert.equal(back.continueReason, 'Its folder is gone, so it cannot continue.');
+  const said = await w2.post(`/api/agents/${id}/say`, { text: 'carry on' });
+  assert.equal(said.body.ok, false);
+  assert.match(said.body.reply, /cannot continue\. Its folder is gone/);
+  await w2.stop();
 });
