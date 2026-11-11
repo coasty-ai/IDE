@@ -768,7 +768,7 @@ export class Engine extends EventEmitter {
   // ================================================================ stuck agents
 
   _checkStuck(now) {
-    const views = this.store.list().filter(v => v.state === STATE.WORKING
+    const views = this.store.list().filter(v => (v.state === STATE.WORKING || v.state === STATE.STARTING)
       && !this.stopped.has(v.id) && !this.stopped.has(v.rootId)
       && !this.runs.get(v.id)?.deciding);
     for (const f of this.stuck.check(now, views)) {

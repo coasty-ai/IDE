@@ -485,3 +485,25 @@ test('a follow-up that brings a stopped agent back also clears the old receipt',
   assert.equal(s.get('r2').says, null);
   assert.equal(s.get('r2').checks.state, 'none');
 });
+
+test('any output moves a starting root to working: init, a turn, thinking, text', () => {
+  const outputs = {
+    session: { kind: EV.SESSION, sessionId: 's1' },
+    turn: { kind: EV.TURN, phase: 'start' },
+    thinking: { kind: EV.THINKING, on: true },
+    text: { kind: EV.SAYS, text: 'Looking at the code.' },
+  };
+  for (const [name, out] of Object.entries(outputs)) {
+    const { s } = recording();
+    s.apply(created('s1'));
+    s.apply(state('s1', 'starting', T0 + 500));
+    assert.equal(s.get('s1').state, 'starting', name);
+    s.apply({ ...out, ts: T0 + 1000, agentId: 's1' });
+    assert.equal(s.get('s1').state, 'working', name);
+  }
+  const { s } = recording();
+  s.apply(created('s2'));
+  s.apply(state('s2', 'starting', T0 + 500));
+  s.apply({ kind: EV.THINKING, ts: T0 + 1000, agentId: 's2', on: false });
+  assert.equal(s.get('s2').state, 'starting', 'thinking switching off is not output');
+});

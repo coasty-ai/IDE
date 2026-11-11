@@ -278,6 +278,7 @@ export class Store extends EventEmitter {
 
       case EV.THINKING: {
         v.thinking = !!ev.on;
+        if (v.thinking) this._started(v, ev.ts, batch, index, changed);
         if (v.thinking && meta.openTools.size === 0) v.now = 'Thinking';
         break;
       }
@@ -303,6 +304,7 @@ export class Store extends EventEmitter {
       case EV.TURN: {
         if (ev.phase === 'start') {
           v.turns += 1;
+          this._started(v, ev.ts, batch, index, changed);
           if (!v.parentId) this._clearReceipt(v);
           if (!v.parentId && RESUMES_ON_TURN.has(v.state)) {
             const prev = v.state;
@@ -327,6 +329,7 @@ export class Store extends EventEmitter {
 
       case EV.SAYS:
         v.says = ev.text == null ? null : String(ev.text);
+        if (v.says) this._started(v, ev.ts, batch, index, changed);
         break;
 
       case EV.BACKGROUND:
@@ -347,7 +350,10 @@ export class Store extends EventEmitter {
       case EV.CHECKS: v.checks = copy(ev.checks); break;
       case EV.RULES: v.rules = copy(ev.rules); break;
       case EV.MODEL: v.model = ev.model ?? null; break;
-      case EV.SESSION: v.sessionId = ev.sessionId ?? null; break;
+      case EV.SESSION:
+        v.sessionId = ev.sessionId ?? null;
+        this._started(v, ev.ts, batch, index, changed);
+        break;
 
       case EV.APPROVAL:
         if (ev.decision === 'deny') v.approvals.denied += 1;
@@ -366,6 +372,11 @@ export class Store extends EventEmitter {
         return; // unknown kinds are ignored
     }
     changed.add(v.id);
+  }
+
+  /** Any output (init, a turn, thinking, text) means a starting agent is working, not only a tool call. */
+  _started(v, ts, batch, index, changed) {
+    if (v.state === STATE.STARTING) this._setState(v, STATE.WORKING, null, ts, batch, index, changed);
   }
 
   /** A new turn starts: the last turn's result (files, checks, rules, what it said) must not read as current. */

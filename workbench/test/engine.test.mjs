@@ -2265,6 +2265,17 @@ test('a root flagged "might be stuck" mid-turn that then exits cleanly becomes f
   await t.engine.shutdown();
 });
 
+test('a root that stays "starting" and prints nothing is flagged as quiet', async () => {
+  const t = live({ options: { stuckSilenceMs: 1000 } });
+  const { id } = await started(t);
+  const v = t.store.get(id);
+  assert.equal(v.state, 'starting');
+  t.engine.tick(Math.max(v.lastEventAt, v.stateSince) + 1000);
+  assert.equal(t.store.get(id).state, 'maybe_stuck');
+  assert.equal(t.store.get(id).ask.type, 'stuck');
+  await t.engine.shutdown();
+});
+
 // ------------------------------------------------------------------ snapshot
 
 test('snapshot has the contract fields, including repo and harness availability', async () => {

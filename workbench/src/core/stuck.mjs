@@ -1,6 +1,6 @@
 // Notices when an agent might be stuck. Fed with every event; asked on each engine tick.
 //
-// An agent that is working is possibly stuck when:
+// An agent that is working (or still starting) is possibly stuck when:
 //   1. the same step (sentence and input) started 3 times in a row, each retry coming after the
 //      previous try failed, with no successful step in between;
 //   2. the same error text came back 3 times, each time within 10 steps of the time before and from
@@ -176,7 +176,7 @@ export class StuckDetector {
   check(now, views) {
     const flags = [];
     for (const v of views || []) {
-      if (!v || v.state !== STATE.WORKING) continue;
+      if (!v || (v.state !== STATE.WORKING && v.state !== STATE.STARTING)) continue;
       const t = this._track(v.id);
       if (t.flag) continue;
       let f = t.pending;
