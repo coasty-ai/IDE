@@ -1,132 +1,123 @@
-// The hover card: live progress and the important numbers for one agent or helper.
-import { lookOf } from '/shared/states.mjs';
+// The card: a small datasheet for one agent or helper, shown beside its chip on hover or keyboard focus.
+// Calm shows the essentials (now, helpers, plan, time, cost); "more" shows the whole datasheet.
 import { duration, tokens, money, percent, clip, shortModel } from '/shared/format.mjs';
 import { pastTense } from '/shared/narrate.mjs';
-import { S, childrenOf, machineName, harnessLabel } from './model.js';
-import { shortStatus } from './orbit.js';
+import { LOOK, NEEDS_YOU } from '/shared/states.mjs';
+import { SPARK_BUCKET_MS, SPARK_BUCKETS } from '/shared/events.mjs';
+import { S, machineName, harnessLabel, helpersOf, helpersAtWork } from './model.js';
+import { markOf, markOfAgent } from './look.js';
+import { newTokens, stepsInWindow, windowMinutes, spentWords, calmDuration } from './numbers.js';
 import { esc } from './util.js';
 
-function sparkSvg(values, tone) {
-  const w = 96, h = 16, n = values.length || 1, max = Math.max(1, ...values);
-  const bw = w / n;
-  const bars = values.map((v, i) => {
+const mark = (shape, tone) => `<svg class="g c-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
+
+function sparkSvg(values) {
+  const w = 84, h = 14, n = values.length || 1, max = Math.max(1, ...values), bw = w / n;
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true">${values.map((v, i) => {
     const bh = v ? Math.max(2, Math.round((v / max) * h)) : 1;
-    return `<rect x="${(i * bw + 0.5).toFixed(1)}" y="${h - bh}" width="${Math.max(1, bw - 1.5).toFixed(1)}" height="${bh}" rx="1" fill="currentColor" opacity="${v ? 0.85 : 0.18}"/>`;
-  }).join('');
-  return `<svg class="spark t-${tone}" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true">${bars}</svg>`;
+    return `<rect x="${(i * bw + 0.5).toFixed(1)}" y="${h - bh}" width="${Math.max(1, bw - 1.5).toFixed(1)}" height="${bh}" rx="1" fill="currentColor" opacity="${v ? 0.9 : 0.25}"/>`;
+  }).join('')}</svg>`;
 }
-
-function planBar(plan) {
-  const n = Math.min(plan.total, 10);
-  const on = Math.round((plan.done / Math.max(1, plan.total)) * n);
-  return `<span class="bar" aria-hidden="true">${Array.from({ length: n }, (_, i) => `<i class="${i < on ? 'on' : ''}"></i>`).join('')}</span>`;
-}
-
-const shapeOf = a => { const l = lookOf(a.state); return `<svg class="sh t-${l.tone}" aria-hidden="true"><use href="#s-${l.shape}"/></svg>`; };
 
 function nowLine(a, now) {
-  if (a.ask && (a.state === 'needs_ok' || a.state === 'question' || a.state === 'maybe_stuck')) {
-    // The header already names the agent, so drop a leading name from the sentence.
-    let sentence = a.ask.sentence || '';
-    if (sentence.startsWith(a.name + ' ')) sentence = sentence.slice(a.name.length + 1).replace(/^./, c => c.toUpperCase());
-    return `<span class="now">${esc(clip(sentence, 56))}</span> <i>· ${esc(duration(now - (a.ask.createdAt || a.stateSince)))}</i>`;
+  if (a.ask && NEEDS_YOU.has(a.state)) {
+    let s = a.ask.sentence || '';
+    if (s.startsWith(a.name + ' ')) s = s.slice(a.name.length + 1).replace(/^./, c => c.toUpperCase());
+    return `<span class="now">${esc(clip(s, 90))}</span> <em>· ${esc(calmDuration(now - (a.ask.createdAt || a.stateSince), duration, 'just now'))}</em>`;
   }
   if (a.state === 'working' || a.state === 'starting') {
     const what = a.thinking && (!a.now || a.now === 'Thinking') ? 'Thinking' : (a.now || 'Working');
-    const quiet = now - (a.lastEventAt || a.stateSince);
-    // Only mention silence when it is long enough to matter.
-    return `<span class="now">${esc(clip(what, 40))}</span>${quiet > 20000 ? ` <i>· quiet for ${esc(duration(quiet))}</i>` : ''}`;
+    // whole minutes only: the card does not tick every second
+    const quietFor = now - (a.lastEventAt || a.stateSince);
+    return `<span class="now">${esc(clip(what, 70))}</span>${quietFor >= 60000 ? ` <em>· quiet for ${esc(duration(quietFor))}</em>` : ''}`;
   }
   if (a.state === 'waiting_helpers') {
-    const k = childrenOf(a.id).filter(c => c.state === 'working' || c.state === 'starting').length;
-    return `<span class="now">Waiting for ${k || 'its'} helper${k === 1 ? '' : 's'}</span>`;
+    // what it waits for, in the engine's words ("Waiting for a background command"), never a count of helper views
+    return `<span class="now">${esc(clip(/^waiting/i.test(a.now || '') ? a.now : 'Waiting for its background work', 70))}</span>`;
   }
-  return `<span class="now">${esc(a.says ? clip(a.says, 70) : lookOf(a.state).label)}</span>`;
+  if (a.state === 'failed') return `<span class="now">${esc(clip(a.error || a.stateReason || 'It stopped with an error.', 110))}</span>`;
+  return `<span class="now">${esc(a.says ? clip(a.says, 110) : markOf(a.state, LOOK).label)}</span>`;
 }
 
-/** Card HTML for one agent. `pinned` shows the unpin control. */
-export function cardHtml(a, now, pinned) {
-  const look = lookOf(a.state);
-  const helper = !!a.parentId;
-  const sub = [
-    helper ? '' : harnessLabel(a.harness),   // a helper's engine is its parent's; the room is better spent on whose it is
-    shortModel(a.model),
-    helper ? `helper of ${S.agents.get(a.parentId)?.name || 'an agent'}` : machineName(a.machineId),
-  ].filter(Boolean).join(' · ');
-
-  const lastStep = (a.recent || []).slice(-1).map(s =>
-    `<span class="${s.ok === false ? 'x' : ''}">${s.ok === false ? '✗' : '✓'} ${esc(clip(pastTense(s.sentence), 44))}</span>`).join('');
-
-  // The tree, in words: each helper with what it is doing.
-  const kids = helper ? [] : childrenOf(a.id);
-  const activeKids = kids.filter(k => !['finished', 'failed', 'stopped'].includes(k.state));
-  const listed = [...activeKids, ...kids.filter(k => !activeKids.includes(k)).reverse()].slice(0, 4);
-  const kidsHtml = listed.map(k => `<span>${shapeOf(k)}${esc(clip(k.name, 22))} <em>· ${esc(shortStatus(k))}</em></span>`).join('')
-    + (kids.length > listed.length ? `<span><em>and ${kids.length - listed.length} more</em></span>` : '');
-
-  const u = a.usage || {};
-  const totalTokens = (u.inputTokens || 0) + (u.outputTokens || 0) + (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0);
-  const tokenTitle = `New input ${tokens(u.inputTokens)} · output ${tokens(u.outputTokens)} · re-read from cache ${tokens(u.cacheReadTokens)} · written to cache ${tokens(u.cacheWriteTokens)}`;
-  const ctx = u.contextPct;
-  const elapsed = (a.endedAt || now) - a.startedAt;
-  const f = a.files;
-  const files = f && f.changed ? `${f.changed} (+${f.adds} −${f.dels})` : '–';
-  let cost = money(u.costUsd);
-  if (!helper && u.costUsd != null && a.budgetUsd != null) cost += ` of ${money(a.budgetUsd).replace(/\.00$/, '')}`;
-  if (helper) cost = a.harness === 'claude' ? 'in parent' : cost;
-  const ap = a.approvals || { auto: 0, byYou: 0, denied: 0 };
-  const approvals = ap.auto || ap.byYou || ap.denied ? `${ap.auto} auto${ap.byYou ? ` · ${ap.byYou} you` : ''}` : '–';
-
-  const foot = [];
-  if (ap.denied) foot.push(`${ap.denied} denied`);
-  if (a.checks && a.checks.state === 'passed') foot.push('checks passed');
-  if (a.checks && a.checks.state === 'failed') foot.push('a check failed');
-  if (a.checks && a.checks.state === 'running') foot.push('checks running');
-  if (a.rules && a.rules.broken && a.rules.broken.length) foot.push(`${a.rules.broken.length} rule broken`);
-
-  return `
-  <div class="hd"><b>${esc(a.name)}</b><span class="stt t-${look.tone}"><svg class="sh" aria-hidden="true"><use href="#s-${look.shape}"/></svg>${esc(look.label)}</span>${pinned ? '<button class="pin" data-unpin title="Unpin (Esc)">×</button>' : ''}</div>
-  <div class="sub">${esc(sub)}</div>
-  <hr>
-  <div class="ln"><span>Now</span><span>${nowLine(a, now)}</span></div>
-  ${lastStep ? `<div class="ln"><span>Last</span><span class="steps">${lastStep}</span></div>` : ''}
-  ${kidsHtml ? `<div class="ln"><span>Helpers</span><span class="kids">${kidsHtml}</span></div>` : ''}
-  ${a.plan && a.plan.total ? `<div class="ln"><span>Its plan</span><span>${planBar(a.plan)}${a.plan.done} of ${a.plan.total} steps</span></div>` : ''}
-  <div class="ln"><span>Activity</span><span>${sparkSvg(a.spark || [], look.tone)}${a.toolCalls} step${a.toolCalls === 1 ? '' : 's'}${a.turns > 1 ? ` · ${a.turns} turns` : ''}</span></div>
-  <hr>
-  <div class="grid">
-    <div><em>Time</em><strong>${esc(duration(elapsed) || '0 s')}</strong></div>
-    <div><em>Cost</em><strong>${esc(cost)}</strong></div>
-    <div title="${esc(tokenTitle)}"><em>Tokens</em><strong>${esc(tokens(totalTokens))}</strong></div>
-    <div><em>Context used</em><strong>${esc(percent(ctx))}</strong>${ctx != null ? `<div class="meter"><i class="${ctx > 0.8 ? 'hot' : ''}" style="width:${Math.round(Math.min(1, ctx) * 100)}%"></i></div>` : ''}</div>
-    <div title="Approved automatically, and by you"><em>Approvals</em><strong>${esc(approvals)}</strong></div>
-    <div><em>Files changed</em><strong>${esc(files)}</strong></div>
-  </div>
-  ${foot.length ? `<div class="foot">${esc(foot.join(' · '))}</div>` : ''}`;
+/** A one-sentence summary, for screen readers (the chip's aria-describedby points here). */
+function summary(a, now) {
+  const parts = [];
+  if (a.ask && NEEDS_YOU.has(a.state)) parts.push(a.ask.sentence);
+  else if (a.state === 'working' || a.state === 'starting') parts.push(a.now || 'Working');
+  else parts.push(markOf(a.state, LOOK).label);
+  if (!a.parentId) {
+    const kids = helpersOf(a);
+    if (kids.length) parts.push(`${kids.length} helper${kids.length === 1 ? '' : 's'}, ${helpersAtWork(a)} at work`);
+  }
+  parts.push(calmDuration((a.endedAt || now) - a.startedAt, duration, 'under 1 min'));
+  if (!a.parentId) parts.push(spentWords(a.usage, money, a.harness) + (a.usage?.costUsd != null && a.budgetUsd != null ? ` of ${money(a.budgetUsd)}` : ''));
+  return parts.filter(Boolean).join('. ') + '.';
 }
 
 /**
- * Place the card beside a node. Candidates, in order: the side away from the centre, above or below (away from the
- * centre first), then the side towards it. The first that fits the window and stays off the centre circle wins.
+ * The card's markup for one agent or helper.
+ * @param {object} a        the AgentView
+ * @param {{ detail: 'calm'|'more', now: number, one: boolean, pinned?: boolean }} o   one: a single column (small windows)
  */
-export function placeCardAt(card, p) {
-  // A root's name sits under it (about 50 px each side), so leave room for the label too.
-  const w = card.offsetWidth || 352, h = card.offsetHeight || 300, gap = p.kind === 'moon' ? 22 : 62, vgap = p.kind === 'moon' ? 22 : 50;
-  const M = 12, top0 = 56, W = innerWidth, H = innerHeight;
-  const clampX = x => Math.max(M, Math.min(x, W - w - M));
-  const clampY = y => Math.max(top0, Math.min(y, H - h - M));
-  const outerRight = p.x >= p.cx, awayUp = p.y < p.cy;
-  const side = right => ({ left: right ? p.x + gap : p.x - gap - w, top: clampY(p.y - h / 2) });
-  const vert = up => ({ left: clampX(p.x - w / 2), top: up ? p.y - vgap - h : p.y + vgap });
-  const cands = [side(outerRight), vert(awayUp), vert(!awayUp), side(!outerRight)];
-  const fits = c => c.left >= M && c.left + w <= W - M && c.top >= top0 && c.top + h <= H - M;
-  const hitsCore = c => {
-    if (!p.coreR) return false;
-    const nx = Math.max(c.left, Math.min(p.cx, c.left + w)), ny = Math.max(c.top, Math.min(p.cy, c.top + h));
-    return Math.hypot(nx - p.cx, ny - p.cy) < p.coreR;
-  };
-  const best = cands.find(c => fits(c) && !hitsCore(c)) || cands.find(fits) || cands[0];
-  card.style.transformOrigin = best.left > p.x ? 'left center' : 'right center';
-  card.style.left = best.left.toFixed(0) + 'px';
-  card.style.top = best.top.toFixed(0) + 'px';
+export function cardHtml(a, o) {
+  const now = o.now || Date.now();
+  const more = o.detail === 'more';
+  const look = markOfAgent(a, LOOK);
+  const helper = !!a.parentId;
+  const parent = helper ? S.agents.get(a.parentId) : null;
+  const sub = [helper ? '' : harnessLabel(a.harness), shortModel(a.model), helper ? `helper of ${parent?.name || 'an agent'}` : machineName(a.machineId)].filter(Boolean).join(' · ');
+  const kids = helper ? [] : helpersOf(a);
+  // helpers by need (asking, working, latest ended): a few on hover, more once pinned, then a count of the rest
+  const cap = o.pinned ? 10 : more ? 6 : 4;
+  const listed = kids.length > cap ? kids.slice(0, cap - 1) : kids;
+  const kidsHtml = listed.map(k => { const m = markOf(k.state, LOOK); return `<div class="kid">${mark(m.shape, m.tone)}<span>${esc(k.name)}${more ? ` <em>· ${esc(k.state === 'working' || k.state === 'starting' ? clip(k.now || 'working', 40) : m.label)}</em>` : ''}</span></div>`; }).join('')
+    + (kids.length > listed.length ? `<div class="kid"><em>and ${kids.length - listed.length} more${o.pinned ? '' : ' (click to see more)'}</em></div>` : '');
+  const u = a.usage || {};
+  const elapsed = (a.endedAt || now) - a.startedAt;
+  let cost = spentWords(u, money, a.harness);
+  if (!helper && u.costUsd != null && a.budgetUsd != null) cost += ` of ${money(a.budgetUsd).replace(/\.00$/, '')}`;
+  if (helper && a.harness === 'claude') cost = 'in its agent';
+  const plan = a.plan && a.plan.total ? (() => {
+    const nb = Math.min(a.plan.total, 8), on = Math.round(a.plan.done / a.plan.total * nb);
+    return `<span class="bar" aria-hidden="true">${Array.from({ length: nb }, (_, i) => `<i class="${i < on ? 'on' : ''}"></i>`).join('')}</span>${a.plan.done} of ${a.plan.total} steps`;
+  })() : '';
+  const lines = [`<div class="ln"><span>Now</span><span>${nowLine(a, now)}</span></div>`];
+  if (more) {
+    const last = (a.recent || []).slice(-1).map(s => `<span class="${s.ok === false ? 'x' : ''}">${s.ok === false ? '✗' : '✓'} ${esc(clip(pastTense(s.sentence), 60))}</span>`).join('');
+    if (last) lines.push(`<div class="ln"><span>Last</span><span>${last}</span></div>`);
+  }
+  if (kidsHtml) lines.push(`<div class="ln"><span>Helpers</span><span>${kidsHtml}</span></div>`);
+  if (plan) lines.push(`<div class="ln"><span>Its plan</span><span>${plan}</span></div>`);
+  if (more) {
+    const inWindow = stepsInWindow(a.spark);
+    const mins = windowMinutes(SPARK_BUCKET_MS, SPARK_BUCKETS);
+    const bars = inWindow ? `<span title="Steps in each half minute, last ${mins} minutes">${sparkSvg(a.spark || [])}</span>` : '';
+    lines.push(`<div class="ln"><span>Activity</span><span>${bars}${inWindow ? `${inWindow} step${inWindow === 1 ? '' : 's'} in ${mins} min` : `none in the last ${mins} min`}<em> · ${a.toolCalls} in all</em></span></div>`);
+  }
+  const cells = [`<div><em>Time</em><strong>${esc(calmDuration(elapsed, duration, 'under 1 min'))}</strong></div>`, `<div><em>Cost</em><strong>${esc(cost)}</strong></div>`];
+  if (more) {
+    const fresh = newTokens(u), reread = u.cacheReadTokens || 0;
+    const tip = `${tokens(fresh)} new: ${tokens(u.outputTokens || 0)} written by the agent, ${tokens((u.inputTokens || 0) + (u.cacheWriteTokens || 0))} read for the first time or added to its memory. Plus ${tokens(reread)} re-read from memory, which is cheaper and already in Cost.`;
+    const ctx = u.contextPct;
+    const ap = a.approvals || { auto: 0, byYou: 0, denied: 0 };
+    const approvals = ap.auto || ap.byYou ? `${ap.auto} auto${ap.byYou ? ` · ${ap.byYou} you` : ''}` : '–';
+    const f = a.files, files = f && f.changed ? `${f.changed} (+${f.adds} −${f.dels})` : '–';
+    cells.push(`<div title="${esc(tip)}"><em>Tokens</em><strong>${esc(tokens(fresh))} new</strong></div>`,
+      `<div><em>Context used</em><strong>${esc(percent(ctx))}</strong>${ctx != null ? `<div class="meter"><i style="width:${Math.round(Math.min(1, ctx) * 100)}%"></i></div>` : ''}</div>`,
+      `<div title="Approved automatically, and by you"><em>Approvals</em><strong>${esc(approvals)}</strong></div>`,
+      `<div><em>Files changed</em><strong>${esc(files)}</strong></div>`);
+  }
+  const foot = [];
+  if (more) {
+    if (a.approvals?.denied) foot.push(`${a.approvals.denied} denied`);
+    if (a.checks?.state === 'passed') foot.push('checks passed');
+    if (a.checks?.state === 'failed') foot.push('a check failed');
+    if (a.checks?.state === 'running') foot.push('checks running');
+    if (a.rules?.broken?.length) foot.push(`${a.rules.broken.length} rule broken: ${clip(a.rules.broken[0].say, 50)}`);
+  }
+  return `<p class="sr" id="cardSum">${esc(a.name)}: ${esc(summary(a, now))}</p>
+    <div class="hd"><b>${esc(a.name)}</b><span class="stt">${mark(look.shape, look.tone)}${esc(look.label)}</span></div>
+    ${more || helper ? `<div class="sub">${esc(sub)}</div>` : ''}<hr>
+    <div class="cols"><div>${lines.join('')}</div>${o.one ? '' : '<div class="vr"></div>'}
+    <div class="grid">${cells.join('')}</div></div>${foot.length ? `<div class="foot">${esc(foot.join(' · '))}</div>` : ''}`;
 }

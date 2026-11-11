@@ -1,0 +1,635 @@
+// What the page does, checked in headless Chrome against the mock API (scripts/ui-mock.mjs): answers bound to what was
+// drawn, the half-second guard after the core changes, holding the core while the person is busy with it, focus never
+// landing on an answer, failed answers that can be retried, "Look later", stepping with "next", typed words bound to the
+// ask on screen, launch questions answered by id and withdrawn when dropped, the look and detail words, the stale key,
+// rest (no motion while waiting), reduced motion, space to talk, and the keyboard rules. Prints PASS or FAIL per point,
+// then every request the page sent, with its body. Not part of npm test (it needs Chrome). No dependencies.
+//   node scripts/ui-behaviour-check.mjs [--only name] [--log]
+import { startMock } from './ui-mock.mjs';
+import { launch, sleep, errorsOf } from './ui-cdp.mjs';
+
+const args = process.argv.slice(2);
+const only = args.includes('--only') ? args[args.indexOf('--only') + 1].split('|') : null;   // one or more name parts, split by |
+const mock = await startMock({ quiet: true });
+const base = `http://127.0.0.1:${mock.port}`;
+const ctl = (p, b) => fetch(base + '/ctl/' + p, { method: p === 'log' || p === 'state' ? 'GET' : 'POST', body: p === 'log' || p === 'state' ? undefined : JSON.stringify(b || {}) }).then(r => r.json());
+const results = [];
+const allPosts = [];
+const check = (name, ok, detail = '') => { results.push({ name, ok: !!ok }); console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` (${detail})` : ''}`); };
+
+const b = await launch({ width: 1440, height: 900 });
+// the failures this script causes on purpose (a refused key, a 500, a dropped connection, a dropped stream) are expected
+const errors = errorsOf(b, /status of 401|status of 500|ERR_EMPTY_RESPONSE|favicon|ERR_INCOMPLETE_CHUNKED|api\/stream/);
+// A stand-in for the browser's speech recognition: records what the page asks of it.
+await b.beforeLoad(`(() => {
+  window.__sr = { starts: 0, stops: 0, aborts: 0, last: null };
+  class FakeSR { constructor() { window.__sr.last = this; } start() { window.__sr.starts++; } stop() { window.__sr.stops++; this.onend && this.onend(); }
+    abort() { window.__sr.aborts++; this.onerror && this.onerror({ error: 'aborted' }); this.onend && this.onend(); }
+    hear(text) { this.onresult && this.onresult({ resultIndex: 0, results: [Object.assign([{ transcript: text }], { isFinal: true })] }); } }
+  window.SpeechRecognition = FakeSR; window.webkitSpeechRecognition = FakeSR;
+  try { sessionStorage.setItem('wb-voice-told', '1'); } catch (e) {}
+})()`);
+
+const page = () => `document.querySelector('#pages .page:not(.old)')`;
+const h1 = () => b.ev(`${page()}?.querySelector('h1')?.textContent || ''`);
+const posts = async () => { const l = await ctl('log'); return l; };
+const clearLog = async () => { allPosts.push(...(await posts())); await ctl('clear'); };
+async function open(scenario, { still = false, theme = 'green', detail = 'calm', mode = {} } = {}) {
+  await clearLog();
+  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, ...mode });
+  await ctl('scenario', { name: scenario, push: false });
+  await b.ev(`(() => { try { localStorage.setItem('wb-theme', ${JSON.stringify(theme)}); localStorage.setItem('wb-detail', ${JSON.stringify(detail)}); localStorage.setItem('wb-answered', '1'); sessionStorage.removeItem('wb-later'); sessionStorage.removeItem('wb-reviewed'); } catch (e) {} return 1; })()`).catch(() => {});
+  await b.goto(`${base}/?t=k${still ? '&still=1' : ''}`, 1600);
+}
+const click = sel => b.ev(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return false; e.click(); return true; })()`);
+const clickIn = sel => click(`#pages .page:not(.old) ${sel}`);
+const push = (event, data) => ctl('push', { event, data });
+const agentOf = async (id) => (await ctl('state')).agents.find(a => a.id === id);
+const run = async (name, fn) => { if (only && !only.some(o => name.includes(o))) return; try { await fn(); } catch (e) { check(name, false, 'threw ' + e.message.slice(0, 200)); } };
+// Real input, as a person gives it: the pointer stays where it clicked, and keys go where the focus is.
+const centre = sel => b.ev(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return null; const r = e.getBoundingClientRect(); return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)]; })()`);
+const realClick = async sel => { const p = await centre(sel); if (!p) return false; await b.mouse(p[0], p[1], true); return true; };
+const realClickIn = sel => realClick(`#pages .page:not(.old) ${sel}`);
+const lidNow = async () => `${await b.ev(`${page()}?.querySelector('.count')?.textContent || ''`)} / ${await h1()}${(await b.ev(`!!${page()}?.querySelector('.also')`)) ? ' +also' : ''}`;
+const focusNow = () => b.ev(`(() => { const a = document.activeElement; if (!a || a === document.body) return 'body'; return (a.closest('#core') ? 'core:' : a.closest('#parts') ? 'board:' : '') + a.tagName + (a.dataset.act ? ':' + a.dataset.act : '') + (a.id ? '#' + a.id : ''); })()`);
+const tabTo = async (pred, max = 16) => { for (let i = 0; i < max; i++) { await b.key('Tab'); await sleep(40); if (await b.ev(`(() => { const a = document.activeElement; return !!a && (${pred}); })()`)) return true; } return false; };
+const askOf = (id, who, cmd) => ({ id, type: 'permission', sentence: `${who} wants to run a command`, detail: cmd, options: ['Allow', 'Deny'], createdAt: Date.now() });
+
+try {
+  await b.goto(`${base}/?t=k`, 800);
+
+  await run('answers carry the drawn agent and ask', async () => {
+    await open('race2');
+    await sleep(700);
+    await clickIn('[data-act="answer"][data-answer="Allow"]');
+    await sleep(500);
+    const p = (await posts()).filter(x => x.path.includes('/answer'));
+    check('answers carry the drawn agent and ask', p.length === 1 && p[0].path === '/api/agents/A/answer' && p[0].body.askId === 'pa' && p[0].body.answer === 'Allow', JSON.stringify(p.map(x => [x.path, x.body])));
+  });
+
+  await run('a click right after the core changes is ignored', async () => {
+    await open('race');
+    await sleep(700);
+    const B = await (await fetch(`${base}/ctl/state`)).json();
+    void B;
+    const newAsk = { ...(await agentOf('A')), id: 'B', name: 'Release prep', state: 'needs_ok', ask: { id: 'pb', type: 'permission', sentence: 'Release prep wants to push its changes', detail: 'git push --force origin main', options: ['Allow', 'Deny'], createdAt: Date.now() } };
+    await push('agents', [newAsk]);
+    await sleep(260);
+    const shown = await h1();
+    await clickIn('[data-act="answer"]');
+    await sleep(300);
+    const early = (await posts()).filter(x => x.path.includes('/answer'));
+    await sleep(700);
+    await clickIn('[data-act="answer"][data-answer="Deny"]');
+    await sleep(400);
+    const later = (await posts()).filter(x => x.path.includes('/answer'));
+    check('a click right after the core changes is ignored', /Release prep/.test(shown) && early.length === 0 && later.length === 1 && later[0].path === '/api/agents/B/answer' && later[0].body.askId === 'pb',
+      `shown "${shown}", early ${early.length}, later ${JSON.stringify(later.map(x => x.body))}`);
+  });
+
+  await run('the core holds while the pointer is on it', async () => {
+    await open('race');
+    await sleep(700);
+    const r = await b.ev(`(() => { const c = document.getElementById('core').getBoundingClientRect(); return [c.left + c.width / 2, c.top + 30]; })()`);
+    await b.mouse(r[0], r[1]);
+    await sleep(150);
+    await push('agents', [{ ...(await agentOf('A')), id: 'B', name: 'Release prep', state: 'needs_ok', ask: { id: 'pb', type: 'permission', sentence: 'Release prep wants to push its changes', detail: 'git push', options: ['Allow', 'Deny'], createdAt: Date.now() } }]);
+    await sleep(500);
+    const held = await h1();
+    const also = await b.ev(`!!${page()}?.querySelector('.also')`);
+    await b.mouse(5, 5);
+    await sleep(900);
+    const after = await h1();
+    check('the core holds while the pointer is on it', /old search address/.test(held) && also && /Release prep/.test(after), `held "${held}", also ${also}, after "${after}"`);
+  });
+
+  // The hold resists changes that arrive on the stream, never the person's own moves (real mouse, pointer left on the core).
+  for (const [scen, sel, label, pick] of [['demo', '[data-act="next"]', '"next"'], ['setaside', '[data-act="later"]', '"Look later"'], ['alldone', '[data-act="looksgood"]', '"Looks good"'], ['race', '[data-act="unpick"]', '"Back to what needs me"', 'C']]) {
+    await run(`own moves take effect at once with the pointer on the core: ${label}`, async () => {
+      await open(scen);
+      await sleep(800);
+      if (pick) { await realClick(`.chip[data-id="${pick}"]`); await sleep(1100); }
+      const before = await lidNow();
+      const ok = await realClickIn(sel);
+      await sleep(1300);
+      const during = await lidNow();
+      check(`own moves take effect at once with the pointer on the core: ${label}`, ok && during !== before && !/\+also/.test(during), `"${before}" -> "${during}"`);
+    });
+  }
+  for (const [scen, act, label] of [['demo', 'next', '"next"'], ['setaside', 'later', '"Look later"'], ['alldone', 'looksgood', '"Looks good"']]) {
+    await run(`own moves take effect at once by keyboard, and focus stays in the core: ${label}`, async () => {
+      await open(scen);
+      await sleep(800);
+      await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+      const before = await lidNow();
+      const ok = await tabTo(`a.dataset.act === '${act}'`);
+      await b.key('Enter');
+      await sleep(1500);
+      const during = await lidNow(), f = await focusNow();
+      check(`own moves take effect at once by keyboard, and focus stays in the core: ${label}`, ok && during !== before && !/\+also/.test(during) && f.startsWith('core:'), `"${before}" -> "${during}", focus ${f}`);
+    });
+  }
+  await run('→ steps the queue with focus on the sentence', async () => {
+    await open('demo');
+    await sleep(800);
+    await b.ev(`${page()}.querySelector('h1').focus(), 1`);
+    const before = await lidNow();
+    await b.key('ArrowRight'); await sleep(1300);
+    const after = await lidNow();
+    check('→ steps the queue with focus on the sentence', after !== before && /2 of 3/.test(after), `"${before}" -> "${after}"`);
+  });
+  await run('a typed launch shows its card at once (pointer on the core), and "yes" then answers the card', async () => {
+    await open('demo');
+    await sleep(800);
+    await realClick('#say'); await sleep(150);
+    await b.type('start an agent to fix the login page'); await b.key('Enter');
+    await sleep(1300);
+    const shown = await h1();
+    await b.type('yes'); await b.key('Enter');
+    await sleep(700);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const yes = p.find(x => x.body.text === 'yes');
+    check('a typed launch shows its card at once (pointer on the core), and "yes" then answers the card', /^Start a simulated Claude/.test(shown) && yes && /^c/.test(yes.body.confirmId || '') && yes.body.askId === null,
+      `"${shown}" ${JSON.stringify(p.map(x => x.body))}`);
+  });
+  await run('a failed answer keeps the core held on what the person answered, and its button can be tried again', async () => {
+    await open('race', { mode: { answer: '500' } });
+    await sleep(800);
+    const p0 = await centre('#pages .page:not(.old) [data-act="answer"][data-answer="Yes"]');
+    await b.mouse(p0[0], p0[1]); await sleep(150);
+    await push('agents', [{ ...(await agentOf('A')), id: 'B', name: 'Release prep', state: 'needs_ok', ask: askOf('pb', 'Release prep', 'git push --force origin main') }]);
+    await sleep(900);
+    const held = await lidNow();
+    await realClickIn('[data-act="answer"][data-answer="Yes"]');
+    await sleep(1000);
+    const after = await lidNow();
+    const enabled = await b.ev(`!${page()}?.querySelector('[data-act="answer"][data-answer="Yes"]')?.disabled`);
+    check('a failed answer keeps the core held on what the person answered, and its button can be tried again', /old search address/.test(held) && /\+also/.test(held) && /old search address/.test(after) && /\+also/.test(after) && enabled === true,
+      `held "${held}", after the failed answer "${after}", Yes enabled ${enabled}`);
+    await b.mouse(5, 5);
+  });
+  await run('the agent a confirmed launch starts comes to the core when it arrives (pointer on the core)', async () => {
+    await open('demo');
+    await sleep(800);
+    await realClick('#say'); await sleep(150);
+    await b.type('start an agent to tidy the export'); await b.key('Enter');
+    await sleep(1300);
+    await b.type('yes'); await b.key('Enter');
+    await sleep(1800);
+    const shown = await lidNow();
+    check('the agent a confirmed launch starts comes to the core when it arrives (pointer on the core)', /is working/.test(shown) && /Tidy the export/i.test(shown) && !/\+also/.test(shown), `"${shown}"`);
+  });
+  await run('a typed "next" and a reply\'s focusId move the core at once (pointer on the core)', async () => {
+    await open('demo');
+    await sleep(800);
+    await realClick('#say'); await sleep(150);
+    await b.type('next'); await b.key('Enter'); await sleep(1300);
+    const stepped = await lidNow();
+    await realClick('.chip[data-id="902d13"]'); await sleep(1100);
+    await realClick('#say'); await sleep(150);
+    await b.type('what needs me'); await b.key('Enter'); await sleep(1300);
+    const back = await lidNow();
+    check('a typed "next" and a reply\'s focusId move the core at once (pointer on the core)', /2 of 3/.test(stepped) && /Checkout fix wants/.test(back) && !/\+also/.test(back), `"${stepped}" then "${back}"`);
+  });
+  // Typed and spoken words are bound to nothing while the core swaps: the item on screen then is not the one coming in.
+  for (const d of [60, 140, 240, 360]) {
+    await run(`typed words during a swap are bound to nothing (first key at +${d} ms)`, async () => {
+      await open('race2');
+      await sleep(900);
+      await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+      const A = await agentOf('A');
+      await push('agents', [{ ...A, state: 'working', ask: null }, { ...A, id: 'B', name: 'Release prep', ask: askOf('pb', 'Release prep', 'git push --force origin main') }]);
+      await sleep(d);
+      await b.key('y'); await sleep(200);
+      await b.type('es'); await b.key('Enter');
+      await sleep(600);
+      const p = (await posts()).filter(x => x.path === '/api/command');
+      check(`typed words during a swap are bound to nothing (first key at +${d} ms)`, p.length === 1 && p[0].body.askId !== 'pb' && p[0].body.focusId !== 'B', JSON.stringify(p.map(x => x.body)));
+    });
+  }
+  for (const d of [80, 240]) {
+    await run(`voice started during a swap is bound to nothing (+${d} ms)`, async () => {
+      await open('race2');
+      await sleep(900);
+      await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+      const A = await agentOf('A');
+      await push('agents', [{ ...A, state: 'working', ask: null }, { ...A, id: 'B', name: 'Release prep', ask: askOf('pb', 'Release prep', 'git push --force origin main') }]);
+      await sleep(d);
+      await b.key(' ', { phase: 'down' }); await sleep(300);
+      await b.ev(`window.__sr.last && window.__sr.last.hear('yes'), 1`);
+      await b.key(' ', { phase: 'up' }); await sleep(600);
+      const p = (await posts()).filter(x => x.path === '/api/command');
+      check(`voice started during a swap is bound to nothing (+${d} ms)`, p.length === 1 && p[0].body.askId !== 'pb' && p[0].body.focusId !== 'B', JSON.stringify(p.map(x => x.body)));
+    });
+  }
+  await run('words typed before the person moves the core are not sent to an ask that has left it', async () => {
+    await open('race2');
+    await sleep(900);
+    const A = await agentOf('A');
+    await push('agents', [{ ...A, id: 'B', name: 'Release prep', ask: { ...askOf('pb', 'Release prep', 'git push --force origin main'), createdAt: Date.now() + 60000 } }]);
+    await sleep(900);
+    await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+    await b.type('ye'); await sleep(150);
+    await realClickIn('[data-act="next"]'); await sleep(1300);
+    const shown = await lidNow();
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('s'); await b.key('Enter'); await sleep(600);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const sentTo = p[0]?.body.askId;
+    const onScreenAtEnter = /Release prep/.test(shown) ? 'pb' : 'pa';
+    check('words typed before the person moves the core are not sent to an ask that has left it', p.length === 1 && (sentTo === null || sentTo === onScreenAtEnter) && !(sentTo === 'pa' && onScreenAtEnter === 'pb'), `shown "${shown}", sent ${JSON.stringify(p.map(x => x.body))}`);
+  });
+  await run('keyboard focus is kept: after an answer, a machine switch, the done tray', async () => {
+    await open('race2');
+    await sleep(900);
+    await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+    await tabTo(`a.dataset.answer === 'Deny'`);
+    await b.key('Enter'); await sleep(900);
+    const afterAnswer = await focusNow();
+    await open('demo');
+    await sleep(800);
+    await b.ev(`document.querySelector('.mach[data-id="cloud-2"]').focus(), 1`);
+    await b.key('Enter'); await sleep(300);
+    await b.ev(`document.querySelector('#pop [data-machine="cloud-2"]').focus(), 1`);
+    await b.key(' '); await sleep(500);
+    const afterSwitch = await focusNow();
+    await b.key('Escape'); await sleep(200);
+    const afterPopEsc = await focusNow();
+    await open('many');
+    await sleep(900);
+    await b.ev(`document.getElementById('tray').focus(), 1`);
+    await b.key('Enter'); await sleep(300);
+    const inList = await focusNow();
+    await b.key('Escape'); await sleep(200);
+    const afterTrayEsc = await focusNow();
+    await b.key('Enter'); await sleep(300);
+    await b.key('Enter'); await sleep(1100);
+    const afterRow = await focusNow();
+    check('keyboard focus is kept: after an answer, a machine switch, the done tray',
+      afterAnswer.startsWith('core:') && afterSwitch === 'BUTTON' && afterPopEsc === 'BUTTON' && /^BUTTON/.test(inList) && afterTrayEsc === 'BUTTON#tray' && afterRow.startsWith('core:'),
+      `answer ${afterAnswer}, switch ${afterSwitch}, Esc ${afterPopEsc}, list ${inList}, tray Esc ${afterTrayEsc}, row ${afterRow}`);
+  });
+
+  await run('focus never moves to an answer when the core changes', async () => {
+    await open('race');
+    await sleep(700);
+    for (let i = 0; i < 6; i++) { await b.key('Tab'); if (await b.ev(`document.activeElement?.classList.contains('big')`)) break; }
+    const onAnswer = await b.ev(`document.activeElement?.dataset.act === 'answer'`);
+    // A's question is answered elsewhere and B's permission arrives: the core must change, focus must not land on Allow
+    await push('agents', [{ ...(await agentOf('A')), state: 'working', ask: null }, { ...(await agentOf('A')), id: 'B', name: 'Release prep', state: 'needs_ok', ask: { id: 'pb', type: 'permission', sentence: 'Release prep wants to push its changes', detail: 'git push', options: ['Allow', 'Deny'], createdAt: Date.now() } }]);
+    await sleep(900);
+    const where = await b.ev(`(() => { const a = document.activeElement; return a ? a.tagName + (a.dataset.act ? ':' + a.dataset.act : '') : 'none'; })()`);
+    const shown = await h1();
+    await b.key(' ', { phase: 'down' }); await sleep(120); await b.key(' ', { phase: 'up' }); await sleep(300);
+    const p = (await posts()).filter(x => x.path.includes('/answer'));
+    check('focus never moves to an answer when the core changes', onAnswer && /Release prep/.test(shown) && where === 'H1' && p.length === 0, `focus ${where}, posts ${p.length}`);
+  });
+
+  for (const how of ['refuse', '500', 'drop']) {
+    await run(`a failed answer can be tried again (${how})`, async () => {
+      await open('race2', { mode: { answer: how } });
+      await sleep(700);
+      await clickIn('[data-act="answer"][data-answer="Deny"]');
+      await sleep(900);
+      const enabled = await b.ev(`!${page()}?.querySelector('[data-act="answer"][data-answer="Deny"]')?.disabled`);
+      const said = await b.ev(`document.getElementById('said').textContent`);
+      const stillShown = await h1();
+      check(`a failed answer can be tried again (${how})`, enabled && said.length > 0 && /Checkout fix/.test(stillShown) && !/token|fetch/i.test(said), `enabled ${enabled}, said "${said}"`);
+    });
+  }
+
+  await run('"Look later" really defers a failed check', async () => {
+    await open('setaside');
+    await sleep(800);
+    const first = await h1();
+    await clickIn('[data-act="later"]');
+    await sleep(900);
+    const next = await h1();
+    const stop = await b.ev(`(() => { const c = document.querySelector('.chip[data-id="X"]'); return c ? c.classList.contains('ghost') : null; })()`);
+    const x = await agentOf('X');
+    await push('agents', [{ ...x, endedAt: Date.now() + 5, stateSince: Date.now() + 5 }]);
+    await sleep(900);
+    const back = await h1();
+    check('"Look later" really defers a failed check', /check failed/.test(first) && /Help pages/.test(next) && stop === true && /check failed/.test(back), `"${first}" → "${next}" → "${back}"`);
+  });
+
+  await run('"next" steps through the queue without sending anything', async () => {
+    await open('demo');
+    await sleep(800);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('next'); await b.key('Enter');
+    await sleep(900);
+    const count2 = await b.ev(`${page()}?.querySelector('.count')?.textContent || ''`);
+    await b.ev(`document.activeElement.blur(), 1`);
+    await b.key('ArrowRight'); await sleep(900);
+    const count3 = await b.ev(`${page()}?.querySelector('.count')?.textContent || ''`);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check('"next" steps through the queue without sending anything', /2 of 3/.test(count2) && /3 of 3/.test(count3) && p.length === 0, `"${count2}" → "${count3}", commands ${p.length}`);
+  });
+
+  await run('typed words go to the ask that was on screen', async () => {
+    await open('demo');
+    await sleep(800);
+    await b.key('y');
+    await sleep(100);
+    await b.type('es'); await b.key('Enter');
+    await sleep(600);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check('typed words go to the ask that was on screen', p.length === 1 && p[0].body.text === 'yes' && p[0].body.focusId === '399e17' && p[0].body.askId === 'sim-1-12a274' && p[0].body.confirmId === null, JSON.stringify(p.map(x => x.body)));
+  });
+
+  await run('a launch question is answered by its id, and withdrawn when the page drops it', async () => {
+    await open('demo');
+    await sleep(800);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('start an agent to fix the flaky test'); await b.key('Enter');
+    await sleep(900);
+    const card1 = await h1();
+    await b.key('Escape'); await sleep(200);
+    if (await b.ev(`document.activeElement === document.getElementById('say')`)) { await b.key('Escape'); await sleep(200); }
+    await b.key('Escape'); await sleep(600);
+    let p = await posts();
+    const dropped = p.find(x => x.path.startsWith('/api/confirm/'));
+    await clearLog();
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('start an agent to write the docs'); await b.key('Enter');
+    await sleep(1100);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('yes'); await b.key('Enter');
+    await sleep(700);
+    p = await posts();
+    const yes = p.filter(x => x.path === '/api/command').pop();
+    await clearLog();
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('start an agent to tidy the export'); await b.key('Enter');
+    await sleep(1100);
+    await clickIn('[data-act="confirm"][data-go="1"]');
+    await sleep(600);
+    p = await posts();
+    const doIt = p.find(x => x.path.startsWith('/api/confirm/'));
+    check('a launch question is answered by its id, and withdrawn when the page drops it',
+      /^Start/.test(card1) && dropped && dropped.body.go === false && yes && yes.body.text === 'yes' && yes.body.focusId === null && /^c/.test(yes.body.confirmId || '') && doIt && doIt.body.go === true,
+      JSON.stringify({ dropped: dropped && [dropped.path, dropped.body], yes: yes && yes.body, doIt: doIt && [doIt.path, doIt.body] }));
+  });
+
+  await run('the look and detail words change the page and never reach the engine', async () => {
+    await open('demo');
+    await sleep(800);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('black and gold'); await b.key('Enter'); await sleep(700);
+    const t1 = await b.ev(`document.documentElement.dataset.theme`);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('more detail'); await b.key('Enter'); await sleep(700);
+    const d1 = await b.ev(`document.documentElement.dataset.detail`);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('ivory'); await b.key('Enter'); await sleep(700);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('less detail'); await b.key('Enter'); await sleep(700);
+    const kept = await b.ev(`[document.documentElement.dataset.theme, document.documentElement.dataset.detail, localStorage.getItem('wb-theme'), localStorage.getItem('wb-detail')].join(',')`);
+    await b.goto(`${base}/?t=k`, 1400);
+    const afterReload = await b.ev(`document.documentElement.dataset.theme + ',' + document.documentElement.dataset.detail`);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check('the look and detail words change the page and never reach the engine', t1 === 'black-gold' && d1 === 'more' && kept === 'ivory,calm,ivory,calm' && afterReload === 'ivory,calm' && p.length === 0, `${t1} ${d1} ${kept} ${afterReload}, commands ${p.length}`);
+    await b.ev(`(localStorage.setItem('wb-theme', 'green'), 1)`);
+  });
+
+  await run('the menu under the workbench mark changes the look', async () => {
+    await open('demo');
+    await sleep(700);
+    await click('#brand'); await sleep(300);
+    const openNow = await b.ev(`!document.getElementById('look').hidden && document.getElementById('brand').getAttribute('aria-expanded')`);
+    await click('#look input[value="black-gold"]'); await sleep(700);
+    await click('#look input[value="more"]'); await sleep(700);
+    const state = await b.ev(`document.documentElement.dataset.theme + ',' + document.documentElement.dataset.detail`);
+    await b.key('Escape'); await sleep(200);
+    const closed = await b.ev(`document.getElementById('look').hidden`);
+    check('the menu under the workbench mark changes the look', openNow === 'true' && state === 'black-gold,more' && closed, `${openNow} ${state} ${closed}`);
+    await b.ev(`(localStorage.setItem('wb-theme', 'green'), localStorage.setItem('wb-detail', 'calm'), 1)`);
+  });
+
+  await run('a refused key shows the stale-key state and stops typing', async () => {
+    await open('race2');
+    await sleep(700);
+    await ctl('mode', { auth: 'bad' });
+    await clickIn('[data-act="answer"][data-answer="Deny"]');
+    await sleep(900);
+    const link = await b.ev(`document.documentElement.dataset.link`);
+    const words = await h1();
+    const barHidden = await b.ev(`getComputedStyle(document.getElementById('bar')).visibility === 'hidden'`);
+    await b.key('x'); await sleep(100);
+    const typed = await b.ev(`document.getElementById('say').value`);
+    check('a refused key shows the stale-key state and stops typing', link === 'stale' && /key no longer works/.test(words) && barHidden && typed === '', `${link} "${words}" bar hidden ${barHidden} typed "${typed}"`);
+    await ctl('mode', { auth: 'ok' });
+  });
+
+  await run('nothing moves at rest, even while something waits', async () => {
+    await open('demo');
+    await sleep(9000);
+    const running = await b.ev(`document.getAnimations().filter(a => a.playState === 'running').map(a => (a.effect?.target?.getAttribute?.('class') || a.effect?.target?.tagName || '') + ':' + (a.animationName || a.constructor.name))`);
+    check('nothing moves at rest, even while something waits', running.length === 0, running.join(', '));
+  });
+
+  await run('a new ask lights its line once, then rests', async () => {
+    await open('race');
+    await sleep(1500);
+    await push('agents', [{ ...(await agentOf('C')), state: 'needs_ok', ask: { id: 'pc', type: 'permission', sentence: 'Docs site wants to run a command', detail: 'npm run build', options: ['Allow', 'Deny'], createdAt: Date.now() } }]);
+    await sleep(700);
+    const during = await b.ev(`document.getAnimations().filter(a => a.playState === 'running').length`);
+    await sleep(8000);
+    const after = await b.ev(`document.getAnimations().filter(a => a.playState === 'running').length`);
+    check('a new ask lights its line once, then rests', during > 0 && after === 0, `running during ${during}, after ${after}`);
+  });
+
+  await run('with reduced motion, chips jump instead of sliding (watched live)', async () => {
+    await open('race');
+    await sleep(1200);
+    await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+    await sleep(200);
+    await push('agents', [{ ...(await agentOf('C')), state: 'needs_ok', ask: { id: 'pc2', type: 'permission', sentence: 'Docs site wants to run a command', detail: 'npm run build', options: ['Allow', 'Deny'], createdAt: Date.now() } }]);
+    await sleep(400);
+    const slides = await b.ev(`[...document.querySelectorAll('.node')].flatMap(n => n.getAnimations()).length`);
+    await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+    check('with reduced motion, chips jump instead of sliding (watched live)', slides === 0, `node animations ${slides}`);
+  });
+
+  await run('steps pulse along the copper, at most one per agent every 1.1 s', async () => {
+    await open('demo', { mode: { steps: true } });
+    let seen = 0, max = 0;
+    for (let i = 0; i < 20; i++) { await sleep(150); const n = await b.ev(`document.querySelectorAll('#wires .pulse').length`); seen += n ? 1 : 0; max = Math.max(max, n); }
+    await ctl('mode', { steps: false });
+    check('steps pulse along the copper, at most one per agent every 1.1 s', seen > 0 && max <= 3, `seen in ${seen} of 20 samples, at most ${max} at once`);
+  });
+
+  await run('hold space to talk; letting go sends; leaving the window throws it away', async () => {
+    await open('race');
+    await sleep(800);
+    await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+    await b.key(' ', { phase: 'down' }); await sleep(150);
+    const listening = await b.ev(`document.getElementById('bar').classList.contains('listening') && window.__sr.starts`);
+    await b.ev(`window.__sr.last.hear('keep it working'), 1`);
+    await b.key(' ', { phase: 'up' }); await sleep(600);
+    let p = (await posts()).filter(x => x.path === '/api/command');
+    const sent = p.length === 1 && p[0].body.text === 'keep it working' && p[0].body.askId === 'qa';
+    await clearLog();
+    await b.key(' ', { phase: 'down' }); await sleep(150);
+    await b.ev(`window.__sr.last.hear('this should not go'), window.dispatchEvent(new Event('blur')), 1`);
+    await sleep(300);
+    await b.key(' ', { phase: 'up' }); await sleep(400);
+    p = (await posts()).filter(x => x.path === '/api/command');
+    const aborted = await b.ev(`window.__sr.aborts`);
+    check('hold space to talk; letting go sends; leaving the window throws it away', listening >= 1 && sent && p.length === 0 && aborted >= 1, `listening ${listening}, sent ${sent}, after blur ${p.length}, aborts ${aborted}`);
+  });
+
+  await run('the core lets go by itself after 20 s without input', async () => {
+    await open('race');
+    await sleep(700);
+    const r = await b.ev(`(() => { const c = document.getElementById('core').getBoundingClientRect(); return [c.left + c.width / 2, c.top + 30]; })()`);
+    await b.mouse(r[0], r[1]);
+    await sleep(150);
+    await push('agents', [{ ...(await agentOf('A')), id: 'B', name: 'Release prep', state: 'needs_ok', ask: { id: 'pb', type: 'permission', sentence: 'Release prep wants to push its changes', detail: 'git push', options: ['Allow', 'Deny'], createdAt: Date.now() } }]);
+    await sleep(1500);
+    const held = await h1();
+    await sleep(21500);
+    const after = await h1();
+    check('the core lets go by itself after 20 s without input', /old search address/.test(held) && /Release prep/.test(after), `held "${held}", after 21 s "${after}"`);
+    await b.mouse(5, 5);
+  });
+
+  await run('roles: chips, helpers and machines are buttons; the board is a toolbar', async () => {
+    await open('demo', { still: true });
+    await sleep(600);
+    const r = await b.ev(`JSON.stringify({ parts: document.getElementById('parts').getAttribute('role'), machines: document.getElementById('machines').getAttribute('role'),
+      odd: [...document.querySelectorAll('.chip, .part, .mach, .more')].filter(e => e.tagName !== 'BUTTON' || e.hasAttribute('role')).length,
+      named: [...document.querySelectorAll('.chip, .part, .mach')].every(e => (e.getAttribute('aria-label') || '').length > 3) })`);
+    const v = JSON.parse(r);
+    check('roles: chips, helpers and machines are buttons; the board is a toolbar', v.parts === 'toolbar' && v.machines === 'group' && v.odd === 0 && v.named, r);
+  });
+
+  await run('keyboard: the core comes first, the board is one stop, arrows move inside it', async () => {
+    await open('demo', { still: true });
+    await sleep(600);
+    await b.ev(`document.activeElement.blur(), 1`);
+    const stops = [];
+    for (let i = 0; i < 14; i++) { await b.key('Tab'); stops.push(await b.ev(`(() => { const a = document.activeElement; return a.closest('#core') ? 'core' : a.closest('#parts') ? 'board' : a.closest('#machines') ? 'machine' : a.id || a.tagName; })()`)); }
+    const firstBoard = stops.indexOf('board');
+    const boardStops = stops.filter(s => s === 'board').length;
+    const firstIsCore = stops[0] === 'core';
+    // arrows inside the board
+    for (let i = 0; i < 14 && (await b.ev(`!document.activeElement.closest('#parts')`)); i++) await b.key('Tab');
+    const before = await b.ev(`document.activeElement.dataset.id`);
+    await b.key('ArrowDown'); await sleep(100);
+    const after = await b.ev(`document.activeElement.dataset.id`);
+    const card = await b.ev(`!document.getElementById('card').hidden && document.activeElement.getAttribute('aria-describedby')`);
+    check('keyboard: the core comes first, the board is one stop, arrows move inside it', firstIsCore && firstBoard > 0 && boardStops === 1 && before !== after && card === 'cardSum',
+      `stops ${stops.join(' ')}, ${before} → ${after}, describedby ${card}`);
+  });
+
+  await run('after clicking a chip, typing still goes to the input', async () => {
+    await open('demo', { still: true });
+    await sleep(600);
+    const r = await b.ev(`(() => { const c = document.querySelector('.chip').getBoundingClientRect(); return [c.left + c.width / 2, c.top + c.height / 2]; })()`);
+    await b.mouse(r[0], r[1], true); await sleep(300);
+    const active = await b.ev(`document.activeElement === document.body`);
+    await b.type('st'); await sleep(100);
+    const typed = await b.ev(`document.getElementById('say').value`);
+    const pinned = await b.ev(`!document.getElementById('card').hidden`);
+    check('after clicking a chip, typing still goes to the input', active && typed === 'st' && pinned, `focus stays ${active}, typed "${typed}", card ${pinned}`);
+  });
+
+  await run('"Looks good" answers finished work without an ask id, and it leaves the core', async () => {
+    await open('alldone', { still: true });
+    await sleep(700);
+    const first = await h1();
+    await clickIn('[data-act="looksgood"]');
+    await sleep(800);
+    const p = (await posts()).filter(x => x.path.includes('/answer'));
+    const next = await h1();
+    check('"Looks good" answers finished work without an ask id, and it leaves the core', p.length === 1 && p[0].body.answer === 'Looks good' && !('askId' in p[0].body) && next !== first,
+      `${JSON.stringify(p.map(x => [x.path, x.body]))} "${first}" → "${next}"`);
+  });
+
+  await run('a picked chip dropping a launch question withdraws it', async () => {
+    await open('demo', { still: true });
+    await sleep(600);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('start an agent to fix the login page'); await b.key('Enter');
+    await sleep(800);
+    const r = await b.ev(`(() => { const c = document.querySelector('.chip').getBoundingClientRect(); return [c.left + c.width / 2, c.top + c.height / 2]; })()`);
+    await b.mouse(r[0], r[1], true); await sleep(600);
+    const p = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
+    check('a picked chip dropping a launch question withdraws it', p.length === 1 && p[0].body.go === false, JSON.stringify(p.map(x => [x.path, x.body])));
+  });
+
+  await run('a picked agent: "Tell it something" sends a message, "Stop it" stops it', async () => {
+    await open('demo', { still: true });
+    await sleep(600);
+    const r = await b.ev(`(() => { const c = document.querySelector('.chip[data-id="902d13"]').getBoundingClientRect(); return [c.left + c.width / 2, c.top + c.height / 2]; })()`);
+    await b.mouse(r[0], r[1], true); await sleep(900);
+    const shown = await h1();
+    await clickIn('[data-act="reply"]'); await sleep(200);
+    const chip = await b.ev(`document.getElementById('toText').textContent`);
+    await b.type('use the staging database'); await b.key('Enter'); await sleep(600);
+    await b.mouse(r[0], r[1], true); await sleep(200); await b.mouse(r[0], r[1], true); await sleep(900);
+    await clickIn('[data-act="stop"]'); await sleep(600);
+    const p = (await posts()).filter(x => /\/(say|stop)$/.test(x.path));
+    check('a picked agent: "Tell it something" sends a message, "Stop it" stops it', /Onboarding is working/.test(shown) && /tell Onboarding/.test(chip) && p.length === 2 &&
+      p[0].path === '/api/agents/902d13/say' && p[0].body.text === 'use the staging database' && p[1].path === '/api/agents/902d13/stop', `"${shown}" "${chip}" ${JSON.stringify(p.map(x => [x.path, x.body]))}`);
+  });
+
+  await run('a message is not sent once its agent has changed', async () => {
+    await open('race', { still: true });
+    await sleep(600);
+    const r = await b.ev(`(() => { const c = document.querySelector('.chip[data-id="C"]').getBoundingClientRect(); return [c.left + c.width / 2, c.top + c.height / 2]; })()`);
+    await b.mouse(r[0], r[1], true); await sleep(900);
+    await clickIn('[data-act="reply"]'); await sleep(200);
+    await b.type('please also update the changelog');
+    await push('agents', [{ ...(await agentOf('C')), state: 'question', ask: { id: 'qc', type: 'question', sentence: 'Which changelog?', options: [], createdAt: Date.now() } }]);
+    await sleep(500);
+    await b.key('Enter'); await sleep(600);
+    const p = (await posts()).filter(x => /\/(say|answer)$/.test(x.path) || x.path === '/api/command');
+    const said = await b.ev(`document.getElementById('said').textContent`);
+    const kept = await b.ev(`document.getElementById('say').value`);
+    check('a message is not sent once its agent has changed', p.length === 0 && /That changed/.test(said) && kept === 'please also update the changelog', `posts ${p.length}, said "${said}", kept "${kept}"`);
+  });
+
+  await run('machines: a section of the connector opens the menu; the switch posts awake', async () => {
+    await open('demo', { still: true });
+    await sleep(600);
+    await click('.mach[data-id="cloud-2"]'); await sleep(300);
+    const shown = await b.ev(`!document.getElementById('pop').hidden`);
+    await click('#pop [data-machine="cloud-2"]'); await sleep(500);
+    const p = (await posts()).filter(x => x.path.includes('/awake'));
+    check('machines: a section of the connector opens the menu; the switch posts awake', shown && p.length === 1 && p[0].body.awake === true, JSON.stringify(p.map(x => [x.path, x.body])));
+  });
+
+  await run('reply chip: an answer in your own words goes to that ask', async () => {
+    await open('longcmd', { still: true });
+    await sleep(600);
+    await clickIn('[data-act="next"]'); await sleep(700);
+    await clickIn('[data-act="reply"]'); await sleep(300);
+    await b.type('keep it for a month'); await b.key('Enter'); await sleep(600);
+    const p = (await posts()).filter(x => x.path.includes('/answer'));
+    check('reply chip: an answer in your own words goes to that ask', p.length === 1 && p[0].path === '/api/agents/r1/answer' && p[0].body.askId === 'k1' && p[0].body.answer === 'keep it for a month', JSON.stringify(p.map(x => [x.path, x.body])));
+  });
+
+  if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);
+  else check('no script errors', true);
+} finally {
+  allPosts.push(...(await posts()));
+  await b.close();
+  await mock.close();
+}
+
+if (args.includes('--log') || !only) {
+  console.log('\nEvery request the page sent (method, path, body):');
+  const seen = new Set();
+  for (const p of allPosts) {
+    const shape = `${p.method} ${p.path.replace(/\/api\/agents\/[^/]+\//, '/api/agents/:id/').replace(/\/api\/confirm\/[^/]+/, '/api/confirm/:id').replace(/\/api\/machines\/[^/]+\//, '/api/machines/:id/')} ${JSON.stringify(Object.keys(p.body || {}).sort())} ${p.body && 'go' in p.body ? p.body.go : ''} ${p.body && p.body.confirmId ? 'confirm' : ''}`;
+    if (seen.has(shape)) continue;
+    seen.add(shape);
+    console.log(`  ${p.method} ${p.path} ${JSON.stringify(p.body)}`);
+  }
+}
+const failed = results.filter(r => !r.ok).length;
+console.log(`\n${results.length - failed} of ${results.length} passed.`);
+process.exit(failed ? 1 : 0);

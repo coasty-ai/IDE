@@ -1,62 +1,90 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="green" data-detail="calm" class="boot">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Workbench</title>
+<link rel="icon" href="data:,">
+<script src="/ui/boot.js"></script>
 <link rel="stylesheet" href="/ui/app.css">
 <link rel="preload" href="/ui/fonts/JetBrainsMono-Regular.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="preload" href="/ui/fonts/JetBrainsMono-Bold.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/ui/fonts/JetBrainsMono-Medium.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/ui/fonts/JetBrainsMono-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/ui/fonts/JetBrainsMono-Bold.woff2" as="font" type="font/woff2" crossorigin>
 <script type="module" src="/ui/app.js"></script>
 </head>
 <body>
 
-<!-- One shape per state, so state reads without colour. -->
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <symbol id="s-need" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="2" fill="currentColor"/></symbol>
-  <symbol id="s-stuck" viewBox="0 0 12 12"><path d="M6 1.2 11.3 10.6H.7z" fill="currentColor"/></symbol>
-  <symbol id="s-ok" viewBox="0 0 12 12"><path d="M6 .6 11.4 6 6 11.4.6 6z" fill="currentColor"/></symbol>
-  <symbol id="s-word" viewBox="0 0 12 12"><path d="M6 1.6 10.4 6 6 10.4 1.6 6z" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
-  <symbol id="s-work" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.6" fill="currentColor"/></symbol>
-  <symbol id="s-fail" viewBox="0 0 12 12"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
-  <symbol id="s-off" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.2" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
-  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></symbol>
-  <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="5" y="5.5" width="14" height="9.5" rx="1.6"/><path d="M3 18.5h18"/></symbol>
-  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7.5 18.5h9.2a3.8 3.8 0 0 0 .5-7.57A5.4 5.4 0 0 0 6.9 9.9 4.3 4.3 0 0 0 7.5 18.5z"/></symbol>
-  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.2A7.8 7.8 0 1 1 9.8 4.5a6.2 6.2 0 0 0 9.7 9.7z"/></symbol>
+<!-- One mark per state, so state never reads by colour alone. -->
+<svg id="sprite" width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="g-need" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="2" fill="currentColor"/></symbol>
+  <symbol id="g-ask" viewBox="0 0 12 12"><path d="M3 1.4h6a2 2 0 0 1 2 2v3.7a2 2 0 0 1-2 2H5.7l-3 2.5V9a2 2 0 0 1-1.7-1.9V3.4a2 2 0 0 1 2-2z" fill="currentColor"/></symbol>
+  <symbol id="g-stuck" viewBox="0 0 12 12"><path d="M6 1.2 11.3 10.6H.7z" fill="currentColor"/></symbol>
+  <symbol id="g-ok" viewBox="0 0 12 12"><path d="M6 .6 11.4 6 6 11.4.6 6z" fill="currentColor"/></symbol>
+  <symbol id="g-word" viewBox="0 0 12 12"><path d="M6 1.6 10.4 6 6 10.4 1.6 6z" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="g-work" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.6" fill="currentColor"/></symbol>
+  <symbol id="g-wait" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6 1.7a4.3 4.3 0 0 1 0 8.6z" fill="currentColor"/></symbol>
+  <symbol id="g-fail" viewBox="0 0 12 12"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+  <symbol id="g-cfail" viewBox="0 0 12 12"><path d="M6 1.4 10.6 6 6 10.6 1.4 6z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4.4 4.4l3.2 3.2M7.6 4.4 4.4 7.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  <symbol id="g-off" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.2" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="g-sleep" viewBox="0 0 24 24"><path d="M19.5 14.2A7.8 7.8 0 1 1 9.8 4.5a6.2 6.2 0 0 0 9.7 9.7z" fill="currentColor"/></symbol>
+  <symbol id="g-mic" viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></symbol>
+  <symbol id="g-laptop" viewBox="0 0 24 24"><rect x="5" y="5.5" width="14" height="9.5" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 18.5h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="g-cloud" viewBox="0 0 24 24"><path d="M7.5 18.5h9.2a3.8 3.8 0 0 0 .5-7.57A5.4 5.4 0 0 0 6.9 9.9 4.3 4.3 0 0 0 7.5 18.5z" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
 </svg>
 
-<header class="chrome">
-  <div class="left"><span class="mark" aria-hidden="true"></span><span class="brand">workbench</span><span class="repo" id="repo"></span><span class="badge" id="mode" hidden></span><span class="conn" id="conn" hidden>reconnecting…</span></div>
-  <div class="right">
-    <span id="spend" title="What your agents have cost so far today. Agents that do not report cost are not included."></span>
-    <button class="pill" id="mbtn" aria-expanded="false" aria-controls="pop"><svg class="ic"><use href="#i-cloud"/></svg><span id="mcount">machines</span></button>
-  </div>
-</header>
-<div class="pop" id="pop" role="dialog" aria-label="Machines" hidden></div>
+<!-- The board itself, drawn once per size: decoration only. -->
+<svg id="board" class="layer" aria-hidden="true"></svg>
+<!-- Copper that changes with state: connections, lit lines, queue pads, brackets, pulses. -->
+<svg id="wires" class="layer" aria-hidden="true"></svg>
 
-<main class="stage" id="stage">
-  <svg class="sky" id="sky" aria-hidden="true"></svg>
-  <div class="ripples" id="ripples" aria-hidden="true"></div>
-  <div class="nodes" id="nodes" role="list" aria-label="Agents and their helpers"></div>
-
-  <section class="core" id="core" aria-label="What needs you">
-    <div class="core-glow" aria-hidden="true"></div>
-    <div class="core-in" id="focus" aria-live="polite"></div>
-    <form class="ask" id="bar" autocomplete="off">
+<main id="main">
+  <!-- The core is you. It comes first, so it is the first thing the keyboard reaches. -->
+  <section id="core" aria-label="What needs you" data-box="core">
+    <div class="pages" id="pages" data-box="pages"></div>
+    <div class="pages probe" id="probe" aria-hidden="true"></div>
+    <form id="bar" autocomplete="off" data-box="bar">
       <span class="to" id="to"><span id="toText"></span><button type="button" id="toCancel" aria-label="Stop replying">×</button></span>
       <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-      <input id="say" placeholder="type, or hold space to talk" aria-label="Type what you want, or hold the space bar to talk">
-      <span class="heard" id="heard"></span>
-      <button type="button" class="mic" id="mic" aria-pressed="false" aria-label="Talk"><svg class="ic"><use href="#i-mic"/></svg></button>
+      <span class="field" data-box="field"><input id="say" aria-label="Type what you want, or hold the space bar to talk"><span class="ph" id="ph" aria-hidden="true"></span></span>
+      <span class="heard" id="heard" data-clip-ok="the words heard so far; all of them are sent"></span>
+      <button type="button" id="mic" aria-pressed="false" aria-label="Talk"><svg aria-hidden="true"><use href="#g-mic"/></svg></button>
     </form>
   </section>
-  <p class="said" id="said" role="status" aria-live="polite"></p>
-</main>
-<p class="legend" aria-hidden="true"><i></i>closer to the centre means it needs you more</p>
+  <p class="sr" id="announce" aria-live="polite"></p>
 
-<div class="card" id="card" role="tooltip"></div>
+  <!-- Agents and helpers: buttons over the board, one tab stop, arrow keys move between them. -->
+  <div id="parts" role="toolbar" aria-orientation="vertical" aria-label="Your agents and their helpers"></div>
+
+  <div id="machines" role="group" aria-label="Machines"></div>
+  <button id="tray" type="button" hidden aria-haspopup="dialog" aria-controls="trayList" aria-expanded="false"></button>
+  <p id="said" role="status" aria-live="polite" data-box="said"></p>
+</main>
+
+<header id="top">
+  <button id="brand" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="look" data-box="brand"><span class="mk" aria-hidden="true"></span><span>workbench</span></button>
+  <span class="badge" id="mode" hidden data-box="badge"></span>
+  <span class="silk repo" id="repo" hidden data-box="repo"></span>
+  <span class="silk link-note" id="conn" hidden role="status" data-box="conn"></span>
+  <span class="silk spend" id="spend" hidden data-box="spend" title="What your agents have cost so far today. Agents that have not reported a cost are not included."></span>
+</header>
+
+<!-- Look and detail: the quiet menu under the workbench mark. -->
+<div id="look" class="pop menu" role="dialog" aria-label="Look and detail" hidden data-box="menu">
+  <fieldset><legend>Look</legend>
+    <label><input type="radio" name="theme" value="green"><span>Green</span></label>
+    <label><input type="radio" name="theme" value="black-gold"><span>Black and gold</span></label>
+    <label><input type="radio" name="theme" value="ivory"><span>Ivory</span></label>
+  </fieldset>
+  <fieldset><legend>Detail</legend>
+    <label><input type="radio" name="detail" value="calm"><span>Calm</span></label>
+    <label><input type="radio" name="detail" value="more"><span>More</span></label>
+  </fieldset>
+  <p class="note">You can also type or say “ivory”, “black and gold”, “green board”, “more detail” or “less detail”.</p>
+</div>
+
+<div id="card" role="tooltip" hidden data-box="card"></div>
+<div id="pop" class="pop" role="dialog" aria-label="Machines" hidden data-box="pop"></div>
+<div id="trayList" class="pop" role="dialog" aria-label="Done or stopped" hidden data-box="traylist"></div>
 </body>
 </html>

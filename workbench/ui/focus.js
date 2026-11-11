@@ -1,143 +1,282 @@
-// The centre of the screen: one thing at a time, in one sentence, with at most two answers.
-import { lookOf, NEEDS_YOU } from '/shared/states.mjs';
-import { clip, money } from '/shared/format.mjs';
-import { S, childrenOf, machineName, harnessLabel } from './model.js';
+// The core's lid: one thing at a time, in one sentence, with at most two answers.
+// lidView() only builds markup; app.js decides when to swap or patch it. Every button carries what it was drawn for
+// (data-agent, data-ask, data-confirm), so a click acts on exactly what the person read.
+import { clip, money, duration } from '/shared/format.mjs';
+import { LOOK } from '/shared/states.mjs';
+import { S, machineName, harnessLabel } from './model.js';
+import { markOfAgent } from './look.js';
+import { spentWords } from './numbers.js';
+import { visibleControls, clipMiddle, whoAsks, headlineClass } from './words.js';
 import { esc } from './util.js';
 
-const shape = (st, live) => {
-  const l = lookOf(st);
-  return `<svg class="sh t-${l.tone}${live ? ' breathe' : ''}" aria-hidden="true"><use href="#s-${l.shape}"/></svg>`;
-};
-const btn = (label, act, extra = '', pri = false) =>
-  `<button class="big${pri ? ' pri' : ''}" data-act="${act}" ${extra}>${esc(label)}</button>`;
-const since = (ms, suffix = '') => `<span data-since="${ms}" data-suffix="${esc(suffix)}"></span>`;
-/** Long sentences get smaller type so they still fit inside the centre circle. */
-const lenClass = t => (t.length <= 38 ? '' : t.length <= 80 ? 'len-m' : t.length <= 150 ? 'len-l' : 'len-xl');
+const mark = (shape, tone) => `<svg class="g k-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
+// "waiting 4 min": whole minutes only, so the lid does not tick every second while something waits ("asked just now" first)
+const sinceText = (ms, prefix, fresh) => { const age = Date.now() - (Number(ms) || 0); return age < 60000 ? fresh : prefix + (duration(age) || 'a moment'); };
+const since = (ms, prefix = '', fresh = 'just now') => `<span data-since="${Number(ms) || 0}" data-prefix="${esc(prefix)}" data-fresh="${esc(fresh)}">${esc(sinceText(ms, prefix, fresh))}</span>`;
+const attrs = o => Object.entries(o).filter(([, v]) => v != null && v !== false).map(([k, v]) => ` data-${k}="${esc(v)}"`).join('');
 
-/** "Claude · Cloud 1 · <extraHtml>". Text parts are escaped; `extraHtml` is trusted markup built here. */
-function metaFor(a, extraHtml) {
-  const parts = [esc(harnessLabel(a.harness)), esc(a.parentId ? `helper of ${S.agents.get(a.parentId)?.name || 'an agent'}` : machineName(a.machineId))];
-  if (extraHtml) parts.push(extraHtml);
-  return parts.filter(Boolean).join(' · ');
+/** A big answer button. `d` becomes data-* attributes (act, agent, ask, answer, confirm, …). */
+function bigButton(label, d, pri = false) {
+  return `<button type="button" class="big${pri ? ' pri' : ''}"${attrs({ ...d, key: `${d.act}:${label}` })}>${esc(label)}</button>`;
 }
+function quiet(label, d, extra = '') {
+  return `<button type="button" class="quiet"${attrs({ ...d, key: `${d.act}:${label}` })}${extra}>${esc(label)}</button>`;
+}
+
+/** The count line: a mark, a few words, and "next" when two or more things wait. */
+function countLine(shape, tone, words, f) {
+  const step = f && f.total > 1 ? `<button type="button" class="step" data-act="next" data-key="next" aria-label="Show the next one (or press the right arrow)">next</button>` : '';
+  return `<div class="count"><span class="who">${mark(shape, tone)}<span>${esc(words)}</span></span>${step}</div>`;
+}
+
+/** The whole of a long text, in a box of its own that scrolls (the only place the lid lets text scroll). */
+const readAllBox = inner => `<div class="readall" data-scroll="1" tabindex="0" aria-label="All of it">${inner}</div>`;
 
 function filesList(a) {
   const f = a.files;
-  if (!f || !f.changed) return '<p class="more-text" hidden>No files changed.</p>';
-  const items = (f.list || []).slice(0, 6).map(x => `<li>${esc(x.path)} <span style="color:var(--faint)">+${x.adds} −${x.dels}</span></li>`).join('');
-  const rest = f.changed > 6 ? `<li style="color:var(--faint)">and ${f.changed - 6} more</li>` : '';
-  return `<div class="more-text" hidden><ul>${items}${rest}</ul></div>`;
+  if (!f || !f.changed) return '<div class="more-text">No files changed.</div>';
+  const items = (f.list || []).slice(0, 6).map(x => `<li>${esc(x.path)} <span>+${x.adds} −${x.dels}</span>${x.ignored ? ' <em>(hidden by a .gitignore it changed)</em>' : ''}</li>`).join('');
+  const rest = f.changed > 6 ? `<li>and ${f.changed - 6} more</li>` : '';
+  return `<div class="more-text"><ul>${items}${rest}</ul></div>`;
 }
 
-/** Build the centre view. Returns { sig, html }; the caller re-renders only when sig changes. */
-export function focusView(f) {
+/** "Claude · Cloud 1 · <extra>" in "more"; just the extra (and whose helper it is) when calm. */
+function metaLine(a, extraHtml, more) {
+  const parent = a.parentId ? S.agents.get(a.parentId) : null;
+  const whose = parent ? esc(`helper of ${parent.name}`) : '';
+  const parts = more ? [esc(harnessLabel(a.harness)), whose || esc(machineName(a.machineId)), extraHtml] : [whose, extraHtml];
+  return parts.filter(Boolean).join(' · ');
+}
+
+/**
+ * How the lid makes room, step by step, when its content does not fit the core (the window is small, or the text long):
+ *   1-3  the headline steps down a size each time;
+ *   2    the meta line keeps only its essentials;      3  the meta line goes (whose helper it is stays);
+ *   4    a text over 200 characters is cut, with "Read all of it";
+ *   5    secondary links go, the answer buttons tighten and the command sits closer; a permission still shows about 160
+ *        characters of its command and the whole of its reason (security over calm);
+ *   6    the last resort: long texts 140, the command 72, the reason 60 (all of both under "See all of it").
+ */
+export function fitSteps(fit) {
+  return {
+    hDown: Math.min(3, fit), meta: fit >= 3 ? 0 : fit >= 2 ? 1 : 2, longCut: fit >= 6 ? 140 : fit >= 4 ? 190 : Infinity,
+    cmd: fit >= 6 ? 72 : 160, why: fit >= 6 ? 60 : Infinity, extras: fit < 5, tight: fit >= 5, close: fit >= 5,
+  };
+}
+
+/**
+ * Build the lid for one focus (see currentFocus in model.js).
+ * @param {object} f        the focus
+ * @param {object} o        { detail: 'calm'|'more', fit: 0..6 (see fitSteps), open: { exact, changed, all }, link, late }
+ * @returns {{ key: string, html: string, say: string, count: string, idle: boolean, bind: object }}
+ */
+export function lidView(f, o = {}) {
+  const more = o.detail === 'more';
+  const fs = fitSteps(o.fit || 0);
+  const open = o.open || {};
+  const h1 = text => `<h1 tabindex="-1" class="${headlineClass(text, fs.hDown)}">${esc(text)}</h1>`;
+  // the answer buttons drawn in this call, so the row can be laid out for their words (see buttonRow in words.js)
+  const labels = [];
+  const big = (label, d, pri) => { labels.push(label); return bigButton(label, d, pri); };
+  const page = (count, sentence, rest) => {
+    const row = rest.acts && o.row ? o.row(labels) : '';
+    const cls = `acts${fs.tight || row === 'tight' ? ' tight' : ''}${row === 'stack' ? ' stack' : ''}`;
+    return `<div class="msg">${count}${sentence}${rest.msg || ''}</div>${rest.acts ? `<div class="${cls}">${rest.acts}</div>` : ''}${rest.after || ''}`;
+  };
+  const metaP = html => (html ? `<p class="meta">${html}</p>` : '');
+  // a long text: cut past the fit's limit, with "Read all of it" opening the whole of it in its own scroll box
+  const long = (text, done) => {
+    if (text.length <= fs.longCut) return { html: h1(text), toggle: '' };
+    const toggle = quiet(open.all ? 'Show less' : 'Read all of it', { act: 'readall' }, ` aria-expanded="${!!open.all}"`);
+    return { html: open.all ? readAllBox(h1(text)) : h1(clip(text, fs.longCut)), toggle, done };
+  };
+
+  if (o.link === 'no-key' || o.link === 'stale' || o.link === 'down') {
+    const t = o.link === 'no-key'
+      ? ['Not connected', 'Open the link printed in the terminal.', 'It ends with ?t= and a key, so only you can use this page.']
+      : o.link === 'stale'
+        ? ['Not connected', 'This page’s key no longer works.', 'Workbench makes a new key each time it starts. Open the link it printed in the terminal.']
+        : ['Not connected', 'Workbench isn’t answering.', 'If you restarted it, open the new link from the terminal.'];
+    return { key: 'link:' + o.link, idle: true, count: t[0], say: `${t[1]} ${t[2]}`, bind: {},
+      html: page(countLine('off', 'word', t[0]), h1(t[1]), { msg: fs.meta ? metaP(esc(t[2])) : '' }) };
+  }
+  if (o.link === 'connecting') {
+    return { key: 'link:connecting', idle: true, count: '', say: '', bind: {}, html: o.late ? page('', metaP('Connecting…'), {}) : '' };
+  }
+
   if (f.confirm) {
     const c = f.confirm;
+    const t = long(c.sentence);
     return {
-      sig: 'confirm:' + c.id,
-      html: `<div class="count">You said</div><h1 class="${lenClass(c.sentence)}">${esc(c.sentence)}</h1>${c.detail ? `<p class="meta">${esc(c.detail)}</p>` : ''}
-        <div class="acts">${btn('Do it', 'confirm', 'data-go="1"', true)}${btn('Cancel', 'confirm', 'data-go="0"')}</div>`,
+      key: 'confirm:' + c.id, idle: false, count: 'You said', say: `You said: ${c.sentence} ${c.detail || ''}`.trim(), bind: { confirmId: c.id },
+      html: page(countLine('ask', 'work', 'You said'), t.html,
+        { msg: c.detail && fs.meta ? metaP(esc(c.detail)) : '',
+          acts: big('Do it', { act: 'confirm', confirm: c.id, go: '1' }, true) + big('Cancel', { act: 'confirm', confirm: c.id, go: '0' }),
+          after: t.toggle }),
     };
   }
+
   if (f.empty) {
     const working = [...S.agents.values()].filter(a => !a.parentId && ['working', 'starting', 'waiting_helpers'].includes(a.state)).length;
-    const live = S.meta.mode === 'live';
-    const sub = working ? `${working} agent${working === 1 ? ' is' : 's are'} working quietly.` :
-      (live ? 'Say or type what you want an agent to do, for example: start an agent to fix the flaky checkout test.' : 'Say or type what you want.');
+    const aside = f.aside || [];
+    const sub = working ? `${working} agent${working === 1 ? ' is' : 's are'} working quietly.`
+      : S.agents.size ? 'Say or type what you want.' : 'Say or type what you want an agent to do, for example “start an agent to fix the flaky checkout test”.';
+    const asideBtn = aside.length ? quiet(`Look at ${clip(aside[0].name, 28)} now`, { act: 'pick', agent: aside[0].id }) : '';
+    const count = aside.length ? `${aside.length} set aside` : 'All clear';
     return {
-      sig: `empty:${working}:${live}`,
-      html: `<div class="count">${shape('done_checked')}All clear</div><h1>Nothing needs you.</h1><p class="meta">${esc(sub)}</p>`,
+      key: 'empty', idle: true, count, say: `${count}. Nothing needs you.`, bind: {},
+      html: page(countLine('ok', 'ok', count), h1('Nothing needs you.'), { msg: fs.meta ? metaP(esc(sub)) : '', after: asideBtn }),
     };
   }
 
   const a = f.agent;
   const ask = a.ask;
-  const q = f.total ? `${f.index + 1} of ${f.total} need${f.total === 1 ? 's' : ''} you` : (f.review ? 'Ready for you to look at' : lookOf(a.state).label);
-  const count = `<div class="count">${shape(a.state, lookOf(a.state).live)}${esc(q)}</div>`;
-  const sigBase = [a.id, a.state, ask && ask.id, a.name, a.says, a.files && a.files.changed, a.rules && a.rules.broken.length, a.checks && a.checks.state, a.now, f.total, f.index, S.reply && S.reply.agentId].join('|');
-  let h1 = '', meta = '', body = '', acts = '', quiet = '';
+  const m = markOfAgent(a, LOOK);
+  const parent = a.parentId ? S.agents.get(a.parentId) : null;
+  const inQueue = f.total != null && !f.review;
+  const countWords = inQueue ? `${f.index + 1} of ${f.total} need${f.total === 1 ? 's' : ''} you`
+    : f.review ? (f.total > 1 ? `${f.index + 1} of ${f.total} to look at` : 'Ready for you to look at')
+    : m.label;
+  const waited = ask?.createdAt || a.stateSince;
+  const id = { agent: a.id };
+  const withAsk = ask ? { agent: a.id, ask: ask.id } : id;
+  const st = { agent: a.id, state: a.state };
+  const step = (inQueue || f.review) && f.total > 1 ? `<button type="button" class="step" data-act="next" data-key="next" aria-label="Show the next one (or press the right arrow)">next</button>` : '';
+  let count = `<div class="count"><span class="who">${mark(m.shape, m.tone)}<span>${esc(countWords)}</span></span>${step}</div>`;
+  let sentence = null, msg = '', acts = '', after = '';
+  // the meta line: everything in "more", the essentials when calm, nothing once the lid is short of room
+  const meta = (extraHtml, essentials = extraHtml) => metaP(fs.meta === 2 && more ? metaLine(a, extraHtml, true) : fs.meta ? metaLine(a, essentials, false) : '');
 
   switch (a.state) {
     case 'needs_ok': {
-      h1 = `${clip(ask?.sentence || `${a.name} needs your OK`, 140)}.`.replace(/\.\.$/, '.');
-      meta = metaFor(a, `waiting ${since(ask?.createdAt || a.stateSince)}`);
-      acts = btn(ask?.options?.[0] || 'Allow', 'answer', `data-answer="${esc(ask?.options?.[0] || 'Allow')}"`, true) +
-             btn(ask?.options?.[1] || 'Deny', 'answer', `data-answer="${esc(ask?.options?.[1] || 'Deny')}"`);
-      if (ask?.detail) { quiet = `<button class="quiet" data-act="more">What exactly?</button>`; body = `<div class="more-text" hidden><span class="detail">${esc(ask.detail)}</span></div>`; }
+      sentence = `${(ask?.sentence || `${a.name} needs your OK`).replace(/[.\s]+$/, '')}.`;
+      // Security over calm: the exact command or path, always, with the check's own reason.
+      const full = ask?.detail ? visibleControls(ask.detail) : '';
+      const cm = clipMiddle(full, fs.cmd);
+      const whyFull = ask?.why || '';
+      const whyShown = whyFull.length > fs.why ? clip(whyFull, fs.why) : whyFull;
+      const cut = cm.clipped || whyShown !== whyFull;
+      if (full) {
+        const toggle = cut ? `<button type="button" class="quiet" data-act="exact" data-key="exact" aria-expanded="${!!open.exact}">${open.exact ? 'Show less' : 'See all of it'}</button>` : '';
+        const code = open.exact && cut
+          ? `<code class="all" tabindex="0" data-scroll="1" aria-label="The exact command, in full">${esc(full)}${whyFull ? `\n\n${esc(whyFull)}` : ''}</code>`
+          : `<code>${esc(cm.text)}</code>`;
+        msg += `<div class="exact${fs.close ? ' close' : ''}">${code}${toggle}</div>`;
+      }
+      if (whyFull && !(open.exact && cut)) msg += `<p class="why${fs.close ? ' close' : ''}">${esc(whyShown)}</p>`;
+      msg += fs.meta ? meta(since(waited, 'waiting ', 'asked just now')) : parent ? metaP(esc(`helper of ${parent.name}`)) : '';
+      const opts = ask?.options?.length ? ask.options.slice(0, 2) : ['Allow', 'Deny'];
+      // Allow and Deny carry equal weight: the person reads before answering.
+      acts = opts.map(o2 => big(o2, { act: 'answer', ...withAsk, answer: o2 })).join('');
       break;
     }
     case 'question': {
-      h1 = clip(ask?.sentence || a.says || `${a.name} has a question.`, 220);
-      meta = metaFor(a, `waiting ${since(ask?.createdAt || a.stateSince)}`);
+      const who = whoAsks(parent ? `${parent.name}’s helper` : a.name, inQueue ? f.index : 0, inQueue ? f.total : 1, o.whoMax ? o.whoMax(inQueue ? f.total : 1) : 28);
+      count = `<div class="count"><span class="who">${mark(m.shape, m.tone)}<span>${esc(who)}</span></span>${step}</div>`;
+      const t = long(ask?.sentence || a.says || `${a.name} has a question.`);
+      sentence = t;
+      msg += meta(since(waited, 'waiting ', 'asked just now'));
       const opts = (ask?.options || []).slice(0, 2);
-      acts = opts.length ? opts.map((o, i) => btn(o, 'answer', `data-answer="${esc(o)}"`, i === 0)).join('') : btn('Answer', 'reply', 'data-mode="answer"', true);
-      quiet = opts.length ? `<button class="quiet" data-act="reply" data-mode="answer">Answer in your own words</button>` : '';
+      acts = opts.length ? opts.map((o2, i) => big(o2, { act: 'answer', ...withAsk, answer: o2 }, i === 0)).join('')
+        : big('Answer', { act: 'reply', ...withAsk, mode: 'answer' }, true);
+      if (opts.length && more && fs.extras) after = quiet('Answer in your own words', { act: 'reply', ...withAsk, mode: 'answer' });
+      // a live question comes with what the agent changed so far
+      if (more && fs.extras && a.files?.changed) after += quiet(open.changed ? 'Hide the changes' : 'What changed?', { act: 'changed' }, ` aria-expanded="${!!open.changed}"`) + (open.changed ? filesList(a) : '');
       break;
     }
     case 'maybe_stuck': {
-      h1 = `${a.name} might be stuck.`;
-      meta = esc(ask?.sentence ? clip(ask.sentence, 120) : 'It has not made progress for a while.');
+      if (ask?.about === 'background') {
+        // not stuck: it finished, but something it started still runs ("It is done" / "Keep waiting")
+        sentence = `${(ask.sentence || `${a.name} has finished, but something it started is still running`).replace(/[.\s]+$/, '')}.`;
+        const work = String(ask.detail || '').split('\n').map(x => x.trim()).filter(Boolean).join(' · ');
+        if (work) msg += metaP(esc(clip(work, fs.meta ? 110 : 70)));
+        const opts = ask.options?.length ? ask.options.slice(0, 2) : ['It is done', 'Keep waiting'];
+        acts = opts.map((o2, i) => big(o2, { act: 'answer', ...withAsk, answer: o2 }, i === 0)).join('');
+        break;
+      }
+      sentence = `${a.name} might be stuck.`;
+      const why = ask?.sentence ? ask.sentence.replace(new RegExp('^' + a.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' has'), 'It has') : 'It has not made progress for a while.';
+      msg += metaP(esc(clip(why, fs.meta ? 110 : 70)));
+      if (more && ask?.detail && fs.meta === 2) msg += `<p class="why">${esc(clip(ask.detail, 160))}</p>`;
       const opts = ask?.options?.length ? ask.options.slice(0, 2) : ['Stop it', 'Let it keep trying'];
-      acts = opts.map((o, i) => btn(o, 'answer', `data-answer="${esc(o)}"`, i === 0)).join('');
-      quiet = `<button class="quiet" data-act="reply" data-mode="say">Give it a hint</button>`;
+      acts = opts.map((o2, i) => big(o2, { act: 'answer', ...withAsk, answer: o2 }, i === 0)).join('');
+      if (more && fs.extras) after = quiet('Give it a hint', { act: 'reply', ...withAsk, mode: 'answer' });
       break;
     }
     case 'checks_failed': {
       const failed = (a.checks?.results || []).filter(r => !r.ok).map(r => r.name);
-      h1 = `${a.name} is done, but a check failed.`;
-      meta = metaFor(a, failed.length ? esc(`failed: ${failed.join(', ')}`) : '');
-      acts = btn('Ask it to fix that', 'fix', `data-text="${esc(`A check failed (${failed.join(', ') || 'see the output'}). Please fix it.`)}"`, true) + btn('Look later', 'reviewed');
-      quiet = `<button class="quiet" data-act="more">What changed?</button>`; body = filesList(a);
+      sentence = `${a.name} is done, but a check failed.`;
+      const what = failed.length ? esc(`failed: ${clip(failed.join(', '), 60)}`) : '';
+      msg += fs.meta ? meta(what) : metaP(what);
+      acts = big('Ask it to fix that', { act: 'fix', ...st, text: `A check failed (${failed.join(', ') || 'see the output'}). Please fix it.` }, true)
+        + big('Look later', { act: 'later', ...st });
+      if (more && fs.extras) after = quiet(open.changed ? 'Hide the changes' : 'What changed?', { act: 'changed' }, ` aria-expanded="${!!open.changed}"`) + (open.changed ? filesList(a) : '');
       break;
     }
     case 'done_checked': case 'done_claimed': {
-      h1 = a.state === 'done_checked' ? `${a.name} is done and checked.` : `${a.name} says it is done.`;
-      meta = a.state === 'done_checked' ? metaFor(a, 'the workbench ran its checks') : metaFor(a, 'nothing was set up to check it');
+      sentence = a.state === 'done_checked' ? `${a.name} is done and checked.` : `${a.name} says it is done.`;
       const broken = a.rules?.broken || [];
-      if (broken.length) body += `<p class="know">One thing to know: it broke a rule you set (${esc(clip(broken[0].say, 60))}).</p>`;
-      if (a.says) body += `<p class="more-text">${esc(clip(a.says, 220))}</p>`;
-      acts = btn('Looks good', 'reviewed', '', true) + btn('Ask for a change', 'reply', 'data-mode="say"');
-      quiet = `<button class="quiet" data-act="more">What changed?</button>`; body += filesList(a);
+      if (broken.length) msg += `<p class="know">One thing to know: it broke a rule you set (${esc(clip(broken[0].say, 60))}).</p>`;
+      if (a.says && fs.meta) msg += metaP(esc(clip(a.says, more && fs.meta === 2 ? 200 : 110)));
+      else if (more && fs.meta === 2) msg += meta(a.state === 'done_checked' ? 'its checks passed' : 'nothing checked it');
+      acts = big('Looks good', { act: 'looksgood', ...st, answer: 'Looks good' }, true) + big('Ask for a change', { act: 'reply', ...st, mode: 'say' });
+      if (more && fs.extras) after = quiet(open.changed ? 'Hide the changes' : 'What changed?', { act: 'changed' }, ` aria-expanded="${!!open.changed}"`) + (open.changed ? filesList(a) : '');
       break;
     }
     case 'failed': {
-      h1 = `${a.name} stopped with an error.`;
-      meta = esc(clip(a.error || a.stateReason || 'The agent exited unexpectedly.', 140));
-      acts = a.parentId ? btn('Back', 'parent', '', true) : btn('Try again', 'fix', 'data-text="Please try again."', true) + btn('Dismiss', 'reviewed');
+      sentence = `${a.name} stopped with an error.`;
+      msg += metaP(esc(clip(a.error || a.stateReason || 'The agent exited unexpectedly.', fs.meta ? 120 : 70)));
+      acts = a.parentId ? big('Back', { act: 'parent', ...id }, true)
+        : big('Try again', { act: 'fix', ...st, text: 'Please try again.' }, true) + big('Dismiss', { act: 'reviewed', ...st });
       break;
     }
     case 'stopped': {
-      h1 = `${a.name} was stopped.`;
-      meta = metaFor(a);
-      acts = a.parentId ? btn('Back', 'parent', '', true) : btn('Continue', 'fix', 'data-text="Please continue where you left off."', true) + btn('Dismiss', 'reviewed');
+      sentence = `${a.name} was stopped.`;
+      if (more && fs.meta === 2) msg += meta('');
+      acts = a.parentId ? big('Back', { act: 'parent', ...id }, true)
+        : big('Continue', { act: 'fix', ...st, text: 'Please continue where you left off.' }, true) + big('Dismiss', { act: 'reviewed', ...st });
       break;
     }
     case 'finished': {
-      h1 = `${a.name} finished its part.`;
-      meta = metaFor(a);
-      if (a.says) body = `<p class="more-text">${esc(clip(a.says, 220))}</p>`;
-      acts = btn(`Back to ${clip(S.agents.get(a.parentId)?.name || 'its agent', 24)}`, 'parent', '', true);
+      sentence = `${a.name} finished its part.`;
+      if (a.says && fs.meta) msg += metaP(esc(clip(a.says, more && fs.meta === 2 ? 200 : 110)));
+      acts = big(`Back to ${clip(parent?.name || 'its agent', 24)}`, { act: 'parent', ...id }, true);
       break;
     }
     case 'waiting_helpers': {
-      const k = childrenOf(a.id).filter(c => ['working', 'starting', 'needs_ok'].includes(c.state)).length;
-      h1 = `${a.name} is waiting for ${k === 1 ? 'its helper' : `${k || 'its'} helpers`}.`;
-      meta = metaFor(a, `for ${since(a.stateSince)}`);
-      acts = btn('Tell it something', 'reply', 'data-mode="say"', true) + btn('Stop it', 'stop');
+      // what it waits for, in the engine's words ("Waiting for a background command"), never a count of helper views:
+      // it may be waiting on a command it left running
+      const w = /^waiting for /i.test(a.now || '') ? a.now.replace(/^waiting for /i, '').replace(/[.\s]+$/, '') : '';
+      sentence = `${a.name} is waiting for ${w || 'its background work'}.`;
+      msg += meta(since(a.stateSince, 'for '));
+      acts = big('Tell it something', { act: 'reply', ...st, mode: 'say' }, true) + big('Stop it', { act: 'stop', ...st });
       break;
     }
     default: { // working, starting
-      h1 = `${a.name} is working.`;
-      meta = `${esc(clip(a.thinking && (!a.now || a.now === 'Thinking') ? 'Thinking' : (a.now || 'Starting'), 70))} · ${metaFor(a)}`;
-      acts = btn('Tell it something', 'reply', 'data-mode="say"', true) + btn('Stop it', 'stop');
-      if (a.usage?.costUsd != null && !a.parentId) quiet = `<span class="quiet" style="text-decoration:none">${esc(money(a.usage.costUsd))} so far${a.budgetUsd != null ? ` of ${esc(money(a.budgetUsd))}` : ''}</span>`;
+      sentence = `${a.name} is working.`;
+      const now = a.thinking && (!a.now || a.now === 'Thinking') ? 'Thinking' : (a.now || 'Starting');
+      msg += fs.meta === 2 && more ? metaP(`${esc(clip(now, 70))} · ${metaLine(a, '', true)}`) : metaP(esc(clip(now, 70)));
+      acts = big('Tell it something', { act: 'reply', ...st, mode: 'say' }, true) + big('Stop it', { act: 'stop', ...st });
+      if (more && fs.extras && !a.parentId && a.usage) { const sw = spentWords(a.usage, money, a.harness); after = metaP(esc(/^not reported/.test(sw) ? `cost ${sw}` : `${sw} so far${a.budgetUsd != null ? ` of ${money(a.budgetUsd)}` : ''}`)); }
     }
   }
-
-  // When the person picked something that does not need them, offer the way back to what does.
-  const back = f.picked && !NEEDS_YOU.has(a.state) ? `<button class="quiet" data-act="unpick" style="margin-left:14px">Back to what needs me</button>` : '';
+  // Something the person picked that does not need them: the way back to what does.
+  if (f.picked && !inQueue && !f.review) after += quiet(f.queued ? 'Back to what needs me' : 'Close', { act: 'unpick' });
+  const head = typeof sentence === 'string' ? { html: h1(sentence), toggle: '' } : sentence;
+  const text = typeof sentence === 'string' ? sentence : (ask?.sentence || a.says || '');
+  const say = `${inQueue || f.review ? countWords + '. ' : ''}${text}${ask?.detail && a.state === 'needs_ok' ? ' It will run: ' + clip(ask.detail, 160) + '.' : ''}`;
   return {
-    sig: sigBase + '|' + !!back,
-    html: `${count}<h1 class="${lenClass(h1)}">${esc(h1)}</h1>${meta ? `<p class="meta">${meta}</p>` : ''}${body}<div class="acts">${acts}</div>${quiet}${back}`,
+    key: `${a.id}|${a.state}|${ask ? ask.id : ''}`, idle: false, count: countWords, say,
+    bind: { agentId: a.id, askId: ask ? ask.id : null },
+    html: page(count, head.html, { msg, acts, after: head.toggle + after }),
   };
 }
+
+/** Refresh the "waiting 4 min" style counters inside an element, in place. Their words change at most once a minute. */
+export function tickSince(root) {
+  for (const s of root.querySelectorAll('[data-since]')) {
+    const t = sinceText(s.dataset.since, s.dataset.prefix || '', s.dataset.fresh || 'just now');
+    if (s.textContent !== t) s.textContent = t;
+  }
+}
+

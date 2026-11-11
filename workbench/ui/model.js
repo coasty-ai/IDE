@@ -1,86 +1,88 @@
-// Client-side state and the orderings the screen is built from.
-import { PRIORITY, NEEDS_YOU, DONE, ACTIVE } from '/shared/states.mjs';
+// Client-side state and the orderings the page is built from.
+import { PRIORITY, NEEDS_YOU, DONE, ACTIVE, ENDED, LOOK } from '/shared/states.mjs';
+import * as Q from './queue.js';
+import { spendTodayOf } from './numbers.js';
+
+export const STATES = { PRIORITY, NEEDS_YOU, DONE, ACTIVE, ENDED, LOOK };
 
 export const S = {
   agents: new Map(),     // id -> AgentView
   machines: [],
-  meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null },
-  focusId: null,         // set when the person picks an agent; null = follow the queue
-  confirm: null,         // a pending "Do it / Cancel" from a typed or spoken command
-  hoverId: null,         // tree row under the pointer
+  meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null },
+  loaded: false,         // a snapshot has arrived
+  focusId: null,         // set when the person picks an agent or steps the queue; null = follow the queue
+  confirm: null,         // a launch question on screen: { id, sentence, detail }
+  hoverId: null,         // chip or helper under the pointer or keyboard
   pinId: null,           // card pinned by a click
-  collapsed: new Set(),  // roots whose helpers are hidden
-  expanded: new Set(),   // roots showing all their finished helpers
-  reviewed: new Set(),   // finished roots the person has already looked at
-  reply: null,           // { agentId, mode: 'answer'|'say', askId, label }
-  connected: false,
+  reply: null,           // { agentId, mode: 'answer'|'say', askId }
+  reviewed: load('wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Dismiss")
+  later: load('wb-later'),         // finishKeys of failed checks set aside ("Look later")
 };
 
-try { for (const id of JSON.parse(sessionStorage.getItem('wb-reviewed') || '[]')) S.reviewed.add(id); } catch {}
-export function markReviewed(id) {
-  S.reviewed.add(id);
-  try { sessionStorage.setItem('wb-reviewed', JSON.stringify([...S.reviewed].slice(-200))); } catch {}
+function load(key) {
+  try { const v = JSON.parse(sessionStorage.getItem(key) || '[]'); return new Set(Array.isArray(v) ? v.filter(x => typeof x === 'string') : []); } catch { return new Set(); }
 }
+function keep(key, set) {
+  try { sessionStorage.setItem(key, JSON.stringify([...set].slice(-300))); } catch { /* full or private */ }
+}
+
+export const finishKey = Q.finishKey;
+
+/** "Looks good" / "Dismiss": this finish has been looked at. */
+export function markReviewed(a) { S.reviewed.add(finishKey(a)); keep('wb-reviewed', S.reviewed); }
+/** "Look later" on a failed check: not now, for this finish. */
+export function setAside(a) { S.later.add(finishKey(a)); keep('wb-later', S.later); }
 
 export function upsert(list) {
   for (const a of list) if (a && a.id) S.agents.set(a.id, a);
 }
 
-const prio = a => PRIORITY[a.state] ?? 9;
-
-/** Does this root, or any agent below it, need the person? */
-export function treeNeedsYou(root) {
-  if (NEEDS_YOU.has(root.state)) return true;
-  for (const a of S.agents.values()) if (a.rootId === root.id && a.id !== root.id && NEEDS_YOU.has(a.state)) return true;
-  return false;
-}
-
-export function rootsInGroups() {
-  const roots = [...S.agents.values()].filter(a => !a.parentId);
-  const effective = r => (treeNeedsYou(r) ? Math.min(prio(r), 0.5) : prio(r));
-  roots.sort((a, b) => effective(a) - effective(b) || b.startedAt - a.startedAt);
-  const groups = [
-    { key: 'needs', label: 'Needs you', items: [] },
-    { key: 'working', label: 'Working', items: [] },
-    { key: 'done', label: 'Done', items: [] },
-    { key: 'ended', label: 'Stopped', items: [] },
-  ];
-  for (const r of roots) {
-    if (treeNeedsYou(r)) groups[0].items.push(r);
-    else if (ACTIVE.has(r.state)) groups[1].items.push(r);
-    else if (DONE.has(r.state)) groups[2].items.push(r);
-    else groups[3].items.push(r);
-  }
-  return groups.filter(g => g.items.length);
-}
+const ctx = () => ({ NEEDS_YOU, PRIORITY, later: S.later });
+export const needsPerson = a => Q.needsPerson(a, ctx());
+export const needsQueue = () => Q.needsQueue(S.agents.values(), ctx());
+export const reviewQueue = () => Q.reviewQueue(S.agents.values(), { reviewed: S.reviewed });
+export const setAsideList = () => Q.setAsideList(S.agents.values(), { later: S.later });
 
 export function childrenOf(id) {
-  return [...S.agents.values()].filter(a => a.parentId === id).sort((a, b) => a.startedAt - b.startedAt);
+  return [...S.agents.values()].filter(a => a.parentId === id).sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
 }
-
-/** Things waiting on the person, most urgent first: asks and stuck agents, roots or helpers. */
-export function needsQueue() {
-  return [...S.agents.values()]
-    .filter(a => NEEDS_YOU.has(a.state))
-    .sort((a, b) => prio(a) - prio(b) || (a.ask?.createdAt || a.stateSince) - (b.ask?.createdAt || b.stateSince));
+/** Every helper below a root, need first (the order the board and the card use). */
+export function helpersOf(root) {
+  return Q.helpersByNeed([...S.agents.values()].filter(a => a.id !== root.id && (a.rootId === root.id || a.parentId === root.id)), { NEEDS_YOU, ENDED });
 }
+export const helpersAtWork = a => Q.helpersAtWork(childrenOf(a.id), ACTIVE);
 
-/** Finished roots the person has not looked at yet, newest first. */
-export function reviewQueue() {
-  return [...S.agents.values()]
-    .filter(a => !a.parentId && (a.state === 'done_checked' || a.state === 'done_claimed' || a.state === 'failed') && !S.reviewed.has(a.id))
-    .sort((a, b) => (b.endedAt || b.stateSince) - (a.endedAt || a.stateSince));
-}
-
-/** What the centre shows: a pending confirm, the picked agent, the next thing that needs you, or nothing. */
+/**
+ * What the core shows, in this order: a launch question on screen; the agent the person picked or stepped to (with its
+ * place in a queue, when it is in one); the most urgent thing that needs the person; finished work not yet looked at;
+ * otherwise nothing.
+ */
 export function currentFocus() {
   if (S.confirm) return { confirm: S.confirm };
-  if (S.focusId && S.agents.has(S.focusId)) return { agent: S.agents.get(S.focusId), picked: true };
   const q = needsQueue();
+  if (S.focusId && S.agents.has(S.focusId)) {
+    const a = S.agents.get(S.focusId);
+    const i = q.findIndex(x => x.id === a.id);
+    if (i >= 0) return { agent: a, index: i, total: q.length, picked: true };
+    const r = reviewQueue(), j = r.findIndex(x => x.id === a.id);
+    if (j >= 0 && !q.length) return { agent: a, review: true, index: j, total: r.length, picked: true };
+    return { agent: a, picked: true, queued: q.length };
+  }
   if (q.length) return { agent: q[0], index: 0, total: q.length };
   const r = reviewQueue();
-  if (r.length) return { agent: r[0], review: true };
-  return { empty: true };
+  if (r.length) return { agent: r[0], review: true, index: 0, total: r.length };
+  return { empty: true, aside: setAsideList() };
+}
+
+/** Step through what needs the person (or, when nothing does, what is waiting to be looked at). */
+export function stepQueue(dir = 1) {
+  const q = needsQueue();
+  const list = q.length ? q : reviewQueue();
+  if (list.length < 2) return false;
+  const shown = currentFocus().agent;
+  S.focusId = Q.stepFrom(list, shown ? shown.id : null, dir);
+  if (S.focusId === list[0].id) S.focusId = null;    // back at the head: follow the queue again
+  return true;
 }
 
 export function machineName(id) {
@@ -88,14 +90,10 @@ export function machineName(id) {
   return m ? m.name : (id === 'laptop' ? 'Your laptop' : id);
 }
 
+/** Spend today: { usd, estimated }. `estimated` while part of it is Workbench's estimate of cost not reported yet ("about"). */
 export function spendToday() {
   const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
-  let sum = 0, any = false;
-  for (const a of S.agents.values()) {
-    if (a.parentId || a.startedAt < midnight.getTime()) continue;
-    if (a.usage && a.usage.costUsd != null) { sum += a.usage.costUsd; any = true; }
-  }
-  return any ? sum : 0;
+  return spendTodayOf(S.agents.values(), midnight.getTime());
 }
 
 export function harnessLabel(h) {
