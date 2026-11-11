@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent workbench: one thing at a time (JetBrains Mono)</title>
+<style>
+  :root {
+    --bg: #f5f2ec; --card: #ffffff; --ink: #1c1b19; --muted: #77746d; --faint: #a39f96; --line: #e4dfd4;
+    --need: #b96d00; --stuck: #c8490f; --ok: #178a54; --word: #8a8d93; --work: #2f66dd; --sleep: #6a5fc0; --talk: #d6453d;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); display: flex; flex-direction: column; overflow: hidden;
+         font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "Helvetica Neue", sans-serif; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  svg.sh { width: 13px; height: 13px; flex: none; }
+  svg.ic { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .need { color: var(--need); } .stuck { color: var(--stuck); } .ok { color: var(--ok); } .word { color: var(--word); } .work { color: var(--work); }
+
+  /* top: almost nothing */
+  .top { display: flex; align-items: center; gap: 10px; padding: 18px 26px; color: var(--muted); font-size: 14px; }
+  .top b { color: var(--ink); font-size: 15px; }
+  .top .sp { margin-left: auto; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; background: #fffdf8; border: 1px solid var(--line); border-radius: 99px; padding: 6px 13px; font-size: 14px; color: #47453f; }
+  .pill:hover { border-color: #cfc8ba; }
+  .pop { position: absolute; right: 26px; top: 60px; width: 300px; background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+         box-shadow: 0 18px 50px rgba(40, 30, 10, .16); padding: 8px; z-index: 5; }
+  .pop[hidden] { display: none; }
+  .m { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 12px; font-size: 15px; }
+  .m small { color: var(--faint); margin-left: auto; font-size: 13px; }
+  .m .i { color: var(--work); display: grid; } .m.off .i { color: var(--sleep); }
+  .sw { width: 38px; height: 22px; border-radius: 99px; border: 0; background: #3aa76d; position: relative; padding: 0; flex: none; }
+  .sw::after { content: ""; position: absolute; top: 3px; left: 19px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }
+  .sw[aria-checked="false"] { background: #cdc8bc; } .sw[aria-checked="false"]::after { left: 3px; }
+  .hint { margin: 6px 4px 4px; padding: 10px 12px; border-radius: 12px; background: #eeebfb; color: #3d3488; font-size: 14px; display: flex; align-items: center; gap: 10px; }
+  .hint button { margin-left: auto; border: 0; background: var(--ink); color: #fff; border-radius: 99px; padding: 4px 12px; font-size: 13.5px; }
+
+  /* stage: the one thing to read */
+  .stage { flex: 1; display: grid; place-items: center; padding: 0 26px; min-height: 0; }
+  .focus { width: 100%; max-width: 760px; text-align: center; }
+  .count { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--muted); margin-bottom: 18px; }
+  h1 { font-size: 44px; line-height: 1.12; letter-spacing: -1px; font-weight: 700; margin: 0; text-wrap: balance; }
+  .meta { color: var(--faint); font-size: 15px; margin-top: 14px; }
+  .know { display: inline-block; margin-top: 16px; background: #fff0cc; color: #6a4300; border-radius: 99px; padding: 6px 16px; font-size: 16px; }
+  .acts { display: flex; justify-content: center; gap: 12px; margin-top: 30px; }
+  .big { border: 1px solid #d8d2c5; background: #fff; padding: 13px 30px; border-radius: 99px; font-size: 18px; font-weight: 620; min-width: 150px; }
+  .big:hover { border-color: #bdb6a7; }
+  .big.pri { background: var(--ink); border-color: var(--ink); color: #fff; }
+  .big.pri:hover { background: #33312d; }
+  .quiet { display: inline-block; margin-top: 16px; border: 0; background: none; color: var(--muted); font-size: 15px; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: #cfc9bc; }
+  .more { margin: 14px auto 0; max-width: 520px; color: #55524c; font-size: 16px; }
+  .more a { color: var(--faint); font-size: 14px; }
+
+  /* strip: everything else, at a glance */
+  .strip { display: flex; justify-content: center; align-items: flex-end; gap: 26px; padding: 0 26px 18px; flex-wrap: wrap; }
+  .grp { display: flex; flex-direction: column; align-items: center; gap: 7px; }
+  .grp span { font-size: 11.5px; letter-spacing: .7px; text-transform: uppercase; color: var(--faint); font-weight: 600; }
+  .grp div { display: flex; gap: 6px; }
+  .ag { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: #fffdf8; border-radius: 99px; padding: 7px 14px 7px 11px; font-size: 14.5px; font-weight: 560; color: #3b3934; }
+  .ag:hover { border-color: #cfc8ba; }
+  .ag[aria-current="true"] { border-color: var(--ink); background: #fff; box-shadow: 0 0 0 1px var(--ink); }
+
+  /* talk or type */
+  .dock { padding: 0 26px 22px; }
+  .said { max-width: 760px; margin: 0 auto 10px; text-align: center; color: var(--muted); font-size: 15px; min-height: 22px; }
+  .bar { max-width: 760px; margin: 0 auto; display: flex; align-items: center; gap: 12px; background: #fff; border: 1px solid #d9d3c6; border-radius: 99px;
+         padding: 8px 8px 8px 24px; box-shadow: 0 8px 28px rgba(40, 30, 10, .10); min-height: 64px; }
+  .bar input { flex: 1; min-width: 0; border: 0; outline: 0; font: inherit; font-size: 18px; background: transparent; color: var(--ink); }
+  .bar input::placeholder { color: var(--faint); }
+  .heard { flex: 1; min-width: 0; font-size: 18px; display: none; }
+  .wave { display: none; align-items: center; gap: 3px; height: 28px; }
+  .wave i { width: 4px; border-radius: 2px; background: var(--talk); height: 8px; }
+  .mic { width: 48px; height: 48px; border-radius: 50%; border: 0; background: var(--ink); color: #fff; display: grid; place-items: center; flex: none; position: relative; }
+  .mic svg { width: 22px; height: 22px; }
+  .listening .bar { border-color: #f0b4b0; }
+  .listening .bar input { display: none; }
+  .listening .wave { display: flex; } .listening .heard { display: block; }
+  .listening .mic { background: var(--talk); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .breathe { animation: breathe 2.4s ease-in-out infinite; }
+    @keyframes breathe { 50% { opacity: .35; } }
+    .focus.rise { animation: rise .28s ease-out; }
+    @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+    .listening .wave i { animation: wave .9s ease-in-out infinite; }
+    .listening .wave i:nth-child(2) { animation-delay: .12s; } .listening .wave i:nth-child(3) { animation-delay: .24s; }
+    .listening .wave i:nth-child(4) { animation-delay: .36s; } .listening .wave i:nth-child(5) { animation-delay: .48s; }
+    @keyframes wave { 0%, 100% { height: 8px; } 50% { height: 26px; } }
+  }
+</style>
+<style>
+  /* JetBrains Mono, SIL Open Font License 1.1 (see fonts/jetbrains-mono/OFL.txt) */
+  @font-face { font-family: "JetBrains Mono"; font-weight: 400; font-display: block; src: local("JetBrains Mono Regular"), local("JetBrainsMono-Regular"), url("fonts/jetbrains-mono/JetBrainsMono-Regular.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 500; font-display: block; src: local("JetBrains Mono Medium"), local("JetBrainsMono-Medium"), url("fonts/jetbrains-mono/JetBrainsMono-Medium.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 600; font-display: block; src: local("JetBrains Mono SemiBold"), local("JetBrainsMono-SemiBold"), url("fonts/jetbrains-mono/JetBrainsMono-SemiBold.woff2") format("woff2"); }
+  @font-face { font-family: "JetBrains Mono"; font-weight: 700; font-display: block; src: local("JetBrains Mono Bold"), local("JetBrainsMono-Bold"), url("fonts/jetbrains-mono/JetBrainsMono-Bold.woff2") format("woff2"); }
+
+  /* Sizes retuned for a monospaced face, which runs wider than the system font */
+  body { font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 15px; font-feature-settings: "liga" 0, "calt" 0; }
+  .top { font-size: 13px; } .top b { font-size: 14px; font-weight: 700; }
+  .pill { font-size: 13px; }
+  .count { font-size: 13px; font-weight: 500; }
+  .focus { max-width: 880px; }
+  h1 { font-size: 36px; line-height: 1.2; letter-spacing: -1.3px; font-weight: 700; }
+  .meta { font-size: 13.5px; } .know { font-size: 14.5px; }
+  .big { font-size: 16px; font-weight: 600; min-width: 164px; }
+  .quiet { font-size: 14px; } .more { font-size: 14.5px; max-width: 620px; }
+  .grp span { font-size: 11px; letter-spacing: 1.1px; font-weight: 600; }
+  .ag { font-size: 13.5px; font-weight: 500; }
+  .said { font-size: 14px; }
+  .bar input, .heard { font-size: 16px; }
+  .m { font-size: 14px; } .m small { font-size: 12.5px; } .hint { font-size: 13px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="s-need" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="2" fill="currentColor"/></symbol>
+  <symbol id="s-stuck" viewBox="0 0 12 12"><path d="M6 1.2 11.3 10.6H.7z" fill="currentColor"/></symbol>
+  <symbol id="s-ok" viewBox="0 0 12 12"><path d="M6 .6 11.4 6 6 11.4.6 6z" fill="currentColor"/></symbol>
+  <symbol id="s-word" viewBox="0 0 12 12"><path d="M6 1.6 10.4 6 6 10.4 1.6 6z" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="s-work" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.6" fill="currentColor"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></symbol>
+  <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="5" y="5.5" width="14" height="9.5" rx="1.6"/><path d="M3 18.5h18"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7.5 18.5h9.2a3.8 3.8 0 0 0 .5-7.57A5.4 5.4 0 0 0 6.9 9.9 4.3 4.3 0 0 0 7.5 18.5z"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.2A7.8 7.8 0 1 1 9.8 4.5a6.2 6.2 0 0 0 9.7 9.7z"/></symbol>
+</svg>
+
+<header class="top">
+  <b>Workbench</b><span>Billing service</span>
+  <span class="sp"></span>
+  <span title="Most of it went on agents re-reading earlier work after pauses">$6 today</span>
+  <button class="pill" id="mbtn" aria-expanded="false"><svg class="ic"><use href="#i-cloud"/></svg><span id="mcount">4 machines · 1 asleep</span></button>
+</header>
+
+<div class="pop" id="pop" hidden>
+  <div class="m"><span class="i"><svg class="ic"><use href="#i-laptop"/></svg></span>Your laptop<small>3 agents</small></div>
+  <div class="m" id="m1"><span class="i"><svg class="ic"><use href="#i-cloud"/></svg></span>Cloud 1<small>idle</small><button class="sw" role="switch" aria-checked="true" aria-label="Cloud 1 awake"></button></div>
+  <div class="m off"><span class="i"><svg class="ic"><use href="#i-moon"/></svg></span>Cloud 2<small>asleep</small><button class="sw" role="switch" aria-checked="false" aria-label="Cloud 2 awake"></button></div>
+  <div class="m"><span class="i"><svg class="ic"><use href="#i-cloud"/></svg></span>Cloud 3<small>1 agent</small><button class="sw" role="switch" aria-checked="true" aria-label="Cloud 3 awake"></button></div>
+  <div class="hint" id="hint">Cloud 1 is idle. Sleep it?<button id="sleep1">Sleep</button></div>
+</div>
+
+<main class="stage"><div class="focus" id="focus"></div></main>
+
+<nav class="strip" id="strip" aria-label="Agents"></nav>
+
+<div class="dock" id="dock">
+  <p class="said" id="said" role="status" aria-live="polite"></p>
+  <form class="bar" id="bar">
+    <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+    <input id="say" autocomplete="off" placeholder="Say or type what you want" aria-label="Say or type what you want">
+    <span class="heard" id="heard"></span>
+    <button type="button" class="mic" id="mic" aria-pressed="false" aria-label="Talk"><svg class="ic"><use href="#i-mic"/></svg></button>
+  </form>
+</div>
+
+<script>
+  const $ = s => document.querySelector(s);
+  const words = { need: 'needs you', stuck: 'might be stuck', ok: 'done and checked', word: 'says it is done', work: 'working' };
+
+  // Each agent: one sentence, two answers, one optional "tell me more"
+  const agents = [
+    { name: 'Checkout fix', st: 'need', ask: 'Checkout fix wants to change the test database.', meta: 'Claude · Cloud 1 · waiting 4 min',
+      a: ['Go ahead', "Don't"], more: ['Why?', 'It adds one detail to each order so half-finished checkouts can be picked up again. Nothing live is touched.'] },
+    { name: 'Search cleanup', st: 'need', ask: 'Keep the old search address working?', meta: 'Claude · your laptop · waiting 11 min',
+      a: ['Keep it', 'Remove it'], more: ['Trade-offs?', 'Three customers still use the old address. Keeping it means a little more to look after.'] },
+    { name: 'Flaky test', st: 'stuck', ask: 'Flaky test looks stuck.', meta: 'Codex · Cloud 3 · same error 3 times · $3.40 of $4.00 used',
+      a: ['Stop it', 'Let it try'], more: ['Give it a hint', 'Say or type your hint below and I will pass it on.'] },
+    { name: 'Invoice export', st: 'ok', ask: 'Invoice export is done and checked.', meta: 'Claude · Cloud 2 · all 143 tests pass',
+      know: 'It changed the database setup you put off limits.',
+      a: ['Undo that part', 'Keep it'], more: ['Walk me through it', 'Invoices now go out in small batches. It also added a faster lookup to the database, which is the off-limits part. <a href="#">See the exact changes</a>'] },
+    { name: 'Help pages', st: 'word', ask: 'Help pages says it is done.', meta: 'Codex · your laptop · nothing was set up to check it',
+      a: ['Get it checked', 'Accept it'], more: ['What changed?', 'It rewrote three pages: getting started, billing and exports.'] },
+    { name: 'Onboarding', st: 'work', ask: 'Onboarding is working.', meta: 'Claude · your laptop · 12 min in · nothing needed', a: ['Pause it'] },
+  ];
+  let cur = 0, plan = false, machines = 4, asleep = 1, first = true;
+
+  const needsYou = () => agents.filter(a => a.st === 'need' || a.st === 'stuck');
+  const shape = (st, live) => '<svg class="sh ' + st + (live ? ' breathe' : '') + '"><use href="#s-' + st + '"/></svg>';
+
+  function draw() {
+    const f = $('#focus'), n = needsYou(), a = agents[cur];
+    f.classList.remove('rise'); if (!first) { void f.offsetWidth; f.classList.add('rise'); } first = false;
+    if (plan) {
+      f.innerHTML = '<div class="count">You said</div><h1>Start Claude and Codex on the checkout bug?</h1>' +
+        '<p class="meta">Two new cloud machines · about $0.80 an hour · I only interrupt you if one gets stuck</p>' +
+        '<div class="acts"><button class="big pri" data-plan="go">Do it</button><button class="big" data-plan="no">Cancel</button></div>';
+    } else if (!a) {
+      f.innerHTML = '<div class="count">' + shape('ok') + 'All clear</div><h1>Nothing needs you.</h1><p class="meta">Say or type what you want next.</p>';
+    } else {
+      const i = n.indexOf(a);
+      f.innerHTML = '<div class="count">' + shape(a.st, a.st === 'work') + (i >= 0 ? (i + 1) + ' of ' + n.length + ' need you' : words[a.st]) + '</div>' +
+        '<h1>' + a.ask + '</h1><p class="meta">' + a.meta + '</p>' + (a.know ? '<p class="know">' + a.know + '</p>' : '') +
+        '<div class="acts">' + a.a.map((t, k) => '<button class="big' + (k ? '' : ' pri') + '" data-ans="' + t + '">' + t + '</button>').join('') + '</div>' +
+        (a.more ? '<button class="quiet" data-more>' + a.more[0] + '</button><p class="more" hidden>' + a.more[1] + '</p>' : '');
+    }
+    const groups = [['Need you', ['need', 'stuck']], ['Done', ['ok', 'word']], ['Working', ['work']]];
+    $('#strip').innerHTML = groups.map(([label, sts]) => {
+      const list = agents.filter(x => sts.includes(x.st));
+      return list.length ? '<div class="grp"><span>' + label + '</span><div>' + list.map(x =>
+        '<button class="ag" title="' + words[x.st] + '" data-go="' + agents.indexOf(x) + '"' + (x === a && !plan ? ' aria-current="true"' : '') + '>' +
+        shape(x.st, x.st === 'work') + x.name + '</button>').join('') + '</div></div>' : '';
+    }).join('');
+    $('#mcount').textContent = machines + ' machines · ' + asleep + ' asleep';
+  }
+  const say = t => { $('#said').textContent = t; };
+
+  document.addEventListener('click', e => {
+    const t = e.target.closest('button, a'); if (!t) return;
+    if (t.dataset.go !== undefined) { plan = false; cur = +t.dataset.go; say(''); draw(); }
+    else if (t.dataset.more !== undefined) { const m = t.nextElementSibling; m.hidden = !m.hidden; }
+    else if (t.dataset.ans) {
+      const a = agents[cur];
+      say(a.name + ': ' + t.dataset.ans.toLowerCase() + '.');
+      a.st = 'work'; a.ask = a.name + ' is working.'; a.meta = 'You said “' + t.dataset.ans + '”'; a.a = ['Pause it']; a.more = a.know = null;
+      const next = needsYou()[0]; cur = next ? agents.indexOf(next) : -1; draw();
+    }
+    else if (t.dataset.plan === 'go') {
+      ['Claude', 'Codex'].forEach(w => agents.push({ name: 'Checkout bug · ' + w, st: 'work', ask: w + ' is working on the checkout bug.', meta: w + ' · new cloud machine · just started', a: ['Pause it'] }));
+      machines += 2; plan = false; stopTalking(); say('Started both. I will only interrupt you if one gets stuck.'); draw();
+    }
+    else if (t.dataset.plan === 'no') { plan = false; stopTalking(); say(''); draw(); }
+  });
+
+  // Machines popover
+  $('#mbtn').addEventListener('click', () => { const p = $('#pop'); p.hidden = !p.hidden; $('#mbtn').setAttribute('aria-expanded', String(!p.hidden)); });
+  function sleepOne() {
+    const m = $('#m1'); if (m.classList.contains('off')) return;
+    m.classList.add('off'); m.querySelector('use').setAttribute('href', '#i-moon'); m.querySelector('small').textContent = 'asleep';
+    m.querySelector('.sw').setAttribute('aria-checked', 'false'); $('#hint').hidden = true; asleep++; draw();
+  }
+  $('#sleep1').addEventListener('click', () => { sleepOne(); say('Cloud 1 is asleep. It wakes in about 10 seconds when needed.'); });
+  document.querySelectorAll('.sw').forEach(s => s.addEventListener('click', () => {
+    const on = s.getAttribute('aria-checked') !== 'true', m = s.closest('.m');
+    s.setAttribute('aria-checked', String(on)); m.classList.toggle('off', !on);
+    m.querySelector('use').setAttribute('href', on ? '#i-cloud' : '#i-moon'); m.querySelector('small').textContent = on ? 'awake' : 'asleep';
+    asleep += on ? -1 : 1; draw();
+  }));
+
+  // Typing
+  $('#bar').addEventListener('submit', e => {
+    e.preventDefault(); const v = $('#say').value.trim(); if (!v) return; $('#say').value = '';
+    if (/needs me|what.s up|status/i.test(v)) { const n = needsYou()[0]; cur = n ? agents.indexOf(n) : -1; say(needsYou().length + ' need you. Here is the first.'); draw(); }
+    else if (/sleep/i.test(v)) { sleepOne(); say('Cloud 1 is asleep.'); }
+    else if (/pause/i.test(v)) say('Paused everything that was working.');
+    else if (/start/i.test(v)) { plan = true; draw(); }
+    else say('Got it.');
+  });
+
+  // Talking: show what was heard, then ask before doing anything
+  const spoken = 'Start Claude and Codex on the checkout bug, each on its own cloud machine';
+  let timer = null;
+  function stopTalking() { clearInterval(timer); timer = null; $('#dock').classList.remove('listening'); $('#mic').setAttribute('aria-pressed', 'false'); }
+  function heardAll() { clearInterval(timer); timer = null; $('#heard').textContent = spoken; plan = true; say(''); draw(); }
+  $('#mic').addEventListener('click', () => {
+    if ($('#dock').classList.contains('listening')) { timer ? heardAll() : (plan = false, stopTalking(), draw()); return; }
+    $('#dock').classList.add('listening'); $('#mic').setAttribute('aria-pressed', 'true'); $('#heard').textContent = ''; say('Listening…');
+    const w = spoken.split(' '); let i = 0;
+    timer = setInterval(() => { $('#heard').textContent = w.slice(0, ++i).join(' '); if (i >= w.length) heardAll(); }, 150);
+  });
+
+  if (location.hash === '#voice') { $('#dock').classList.add('listening'); $('#mic').setAttribute('aria-pressed', 'true'); heardAll(); }
+  else if (location.hash === '#machines') { $('#pop').hidden = false; draw(); }
+  else draw();
+</script>
+</body>
+</html>

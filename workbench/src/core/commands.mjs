@@ -1,0 +1,1054 @@
+// Natural-language commands: turn what the person typed or said into an intent for the engine.
+//
+// Rule-based, no model calls. Forgiving of speech-to-text output: no punctuation, all lowercase,
+// filler words ("um", "okay so", "please"), contractions with or without apostrophes, and a few
+// common mishearings ("code x" for Codex, "cloud and codex" for "Claude and Codex").
+//
+// Intents (see ARCHITECTURE.md, "Natural-language commands"):
+//   start { tasks: [{ task, harness, machine }] }   task { task }        answer { agentId, text }
+//   allow { agentId } / deny { agentId }            stop { agentIds }    stop_all
+//   say { agentId, text }   status { agentId? }     spend                sleep / wake { machineIds }
+//   sleep_idle              confirm { go }          unknown { text }
+// Extra fields some intents carry: askId (allow, deny, answer), text (allow/deny: the rest of a
+// reply such as "no, use the staging database"), needsMe (status: "what needs me").
+import { clip } from '../shared/format.mjs';
+import { ENDED, LOOK } from '../shared/states.mjs';
+
+// ---------------------------------------------------------------------------------------------
+// Words
+
+const CONTRACTIONS = {
+  "what's": ['what', 'is'], whats: ['what', 'is'], "how's": ['how', 'is'], hows: ['how', 'is'],
+  "it's": ['it', 'is'], "that's": ['that', 'is'], thats: ['that', 'is'], "where's": ['where', 'is'],
+  "who's": ['who', 'is'], "there's": ['there', 'is'], "here's": ['here', 'is'],
+  "i'm": ['i', 'am'], "i'd": ['i', 'would'], "i've": ['i', 'have'], "i'll": ['i', 'will'],
+  "we're": ['we', 'are'], "you're": ['you', 'are'], "they're": ['they', 'are'], "we've": ['we', 'have'],
+  dont: ["don't"], cant: ["can't"], wont: ["won't"], lets: ["let's"], "let's": ["let's"],
+  didnt: ["didn't"], doesnt: ["doesn't"], isnt: ["isn't"],
+  ok: ['okay'], k: ['okay'], kay: ['okay'], 'o.k': ['okay'], okey: ['okay'],
+  pls: ['please'], plz: ['please'], thx: ['thanks'], nevermind: ['never', 'mind'],
+  todays: ["today's"],
+};
+
+/** Disfluencies, dropped wherever they appear. */
+const DISFLUENCY = new Set(['um', 'umm', 'ummm', 'uh', 'uhh', 'uhhh', 'uhm', 'er', 'erm', 'err', 'hmm', 'hm', 'hmmm', 'mm', 'mmm', 'ah', 'ahh', 'eh']);
+/** Soft openers, dropped from the start ("okay so", "hey", "right"). */
+const SOFT_LEAD = new Set(['okay', 'so', 'well', 'hey', 'hi', 'hello', 'alright', 'right', 'like', 'actually', 'basically', 'oh', 'and', 'then', 'now', 'also', 'workbench', 'yo', 'listen']);
+/** Polite or framing openers, dropped from the start of commands and tasks. */
+const POLITE = [
+  ['please'], ['kindly'], ['just'], ['maybe'], ['can', 'you'], ['could', 'you'], ['would', 'you'], ['will', 'you'],
+  ['can', 'we'], ['could', 'we'], ['i', 'want', 'you', 'to'], ['i', 'need', 'you', 'to'],
+  ['i', 'would', 'like', 'you', 'to'], ['i', 'want', 'to'], ['i', 'would', 'like', 'to'], ['we', 'need', 'to'],
+  ['i', 'need', 'to'], ['we', 'should'], ['you', 'should'], ['i', 'think', 'we', 'should'], ['go', 'ahead', 'and'],
+  ['go', 'and'], ["let's"], ['try', 'and'], ['help', 'me'],
+];
+const TRAILING = [['please'], ['thanks'], ['thank', 'you'], ['for', 'me'], ['right', 'now'], ['now'], ['asap'], ['if', 'you', 'can'], ['okay']];
+
+/** Words that never identify an agent. */
+const REF_STOP = new Set(['the', 'a', 'an', 'this', 'that', 'these', 'those', 'my', 'our', 'your', 'its', 'it', 'one', 'ones',
+  'agent', 'agents', 'helper', 'helpers', 'task', 'tasks', 'job', 'jobs', 'thing', 'things', 'guy', 'bot', 'worker',
+  'please', 'now', 'just', 'on', 'in', 'of', 'for', 'to', 'with', 'and', 'or', 'is', 'are', 'was', 'be', 'doing',
+  'about', 'up', 'all', 'any', 'some', 'which', 'who', 'called', 'named', 'working', 'running', 'session', 'instance',
+  'from', 'at', 'by', 'there', 'here', 'me', 'i', 'you', 'we', 'do', 'does', 'did', 'has', 'have', 'had']);
+
+/** Phrases that point at the focused agent. */
+const PRONOUN_REFS = new Set(['it', 'this', 'that', 'this one', 'that one', 'the current one', 'current one', 'the current agent',
+  'this agent', 'that agent', 'the agent', 'the focused one', 'the selected one', 'the one i am looking at', 'him', 'her']);
+
+const NUMBER = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+// Speech-to-text often writes these for numbers right after "cloud": "cloud to" is Cloud 2.
+const NUMBER_SOUNDALIKE = { won: 1, to: 2, too: 2, tree: 3, free: 3, for: 4, fore: 4, ate: 8 };
+
+function normWord(raw) {
+  return raw.toLowerCase().replace(/[‘’ʼ`´]/g, "'").replace(/^[^a-z0-9]+/, '').replace(/[^a-z0-9]+$/, '');
+}
+
+/**
+ * Split text into tokens. `w` is the normalized word used for matching; `raw`, `start` and `end`
+ * point back into the original text, so task and message text keep the person's own wording.
+ */
+function lex(text) {
+  const toks = [];
+  const re = /\S+/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const raw = m[0];
+    const start = m.index;
+    const end = start + raw.length;
+    const tail = /[,;:.!?]["'”’)]*$/.test(raw); // the token ends a phrase
+    if (raw === '&' || raw === '+') { toks.push({ w: 'and', raw, start, end, tail }); continue; }
+    const w = normWord(raw);
+    if (!w) continue;
+    const parts = CONTRACTIONS[w] || [w.endsWith("'s") ? w.slice(0, -2) : w];
+    for (const p of parts) toks.push({ w: p, raw, start, end, tail });
+  }
+  return toks;
+}
+
+/** The person's own words for a run of tokens. */
+function spanText(toks) {
+  const seen = new Set();
+  const parts = [];
+  for (const t of toks) {
+    if (seen.has(t.start)) continue;
+    seen.add(t.start);
+    parts.push(t.raw);
+  }
+  return parts.join(' ');
+}
+
+/** Trim quotes and closing punctuation from task or message text. */
+function tidy(s) {
+  return String(s).replace(/^["'“”‘’]+/, '').replace(/["'“”‘’]+$/, '').replace(/[\s,;:.!]+$/, '').replace(/["'“”‘’]+$/, '').trim();
+}
+
+function seqAt(ws, i, seq) {
+  return seq.every((x, k) => ws[i + k] === x);
+}
+
+/** Length of the first sequence in `seqs` that `ws` starts with, or 0. */
+function startsWithSeq(ws, seqs) {
+  for (const seq of seqs) if (seqAt(ws, 0, seq)) return seq.length;
+  return 0;
+}
+
+function stripSoft(toks) {
+  let k = 0;
+  while (k < toks.length - 1 && SOFT_LEAD.has(toks[k].w)) k++;
+  return toks.slice(k);
+}
+
+function stripPolite(toks) {
+  let cur = toks;
+  for (let changed = true; changed;) {
+    changed = false;
+    const ws = cur.map(t => t.w);
+    for (const seq of POLITE) {
+      if (seq.length < cur.length && seqAt(ws, 0, seq)) {
+        cur = stripSoft(cur.slice(seq.length));
+        changed = true;
+        break;
+      }
+    }
+  }
+  return cur;
+}
+
+function stripTrailing(toks) {
+  let cur = toks;
+  for (let changed = true; changed;) {
+    changed = false;
+    const ws = cur.map(t => t.w);
+    for (const seq of TRAILING) {
+      if (seq.length < cur.length && seqAt(ws, ws.length - seq.length, seq)) {
+        cur = cur.slice(0, cur.length - seq.length);
+        changed = true;
+        break;
+      }
+    }
+  }
+  return cur;
+}
+
+/** Light stemming so "tests", "testing" and "tested" all match "test". */
+function stem(w) {
+  let s = w;
+  if (s.length > 5 && s.endsWith('ing')) {
+    s = s.slice(0, -3);
+    if (/([b-df-hj-np-tv-z])\1$/.test(s)) s = s.slice(0, -1); // running -> run
+  } else if (s.length > 4 && s.endsWith('ies')) s = s.slice(0, -3) + 'y';
+  else if (s.length > 4 && /(ss|sh|ch|x|z)es$/.test(s)) s = s.slice(0, -2);
+  else if (s.length > 4 && s.endsWith('ed')) s = s.slice(0, -2);
+  else if (s.length > 3 && s.endsWith('s') && !s.endsWith('ss')) s = s.slice(0, -1);
+  return s;
+}
+
+/** "fixes" -> "fix", for "start an agent that fixes the login". */
+function baseVerb(raw) {
+  const lower = raw.toLowerCase();
+  const irregular = { does: 'do', goes: 'go', has: 'have', is: 'be' };
+  if (irregular[lower]) return irregular[lower];
+  if (lower.length <= 3 || !lower.endsWith('s') || lower.endsWith('ss')) return raw;
+  if (lower.endsWith('ies')) return raw.slice(0, -3) + 'y';
+  if (/(ss|sh|ch|x|z)es$/.test(lower)) return raw.slice(0, -2);
+  return raw.slice(0, -1);
+}
+
+function numberish(w, soundalikes) {
+  if (w == null) return null;
+  if (/^\d{1,2}$/.test(w)) return Number(w);
+  if (Object.hasOwn(NUMBER, w)) return NUMBER[w];
+  if (soundalikes && Object.hasOwn(NUMBER_SOUNDALIKE, w)) return NUMBER_SOUNDALIKE[w];
+  return null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Context
+
+function context(ctx) {
+  const x = ctx && typeof ctx === 'object' ? ctx : {};
+  const agents = Array.isArray(x.agents) ? x.agents.filter(a => a && typeof a === 'object' && typeof a.id === 'string') : [];
+  const machines = Array.isArray(x.machines) ? x.machines.filter(m => m && typeof m === 'object' && typeof m.id === 'string') : [];
+  const focusId = typeof x.focusId === 'string' && x.focusId ? x.focusId : null;
+  const focus = focusId ? agents.find(a => a.id === focusId) || null : null;
+  return { agents, machines, focusId, focus, asker: askHolder(focus, agents), pendingConfirm: x.pendingConfirm || null };
+}
+
+const hasAsk = a => !!(a && a.ask && typeof a.ask === 'object');
+
+/**
+ * The agent whose question a short reply answers: the focused agent, or, when the focused agent
+ * waits on nothing itself, its one helper that does.
+ */
+function askHolder(focus, agents) {
+  if (!focus) return null;
+  if (hasAsk(focus)) return focus;
+  const waiting = agents.filter(a => a.id !== focus.id && (a.parentId === focus.id || a.rootId === focus.id) && hasAsk(a));
+  return waiting.length === 1 ? waiting[0] : null;
+}
+
+function laptopId(c) {
+  const m = c.machines.find(x => x.kind === 'laptop');
+  return m ? m.id : 'laptop';
+}
+
+function cloudMachineId(n, c) {
+  const m = c.machines.find(x => normName(x.name) === `cloud ${n}` || x.id === `cloud-${n}` || x.id === `cloud${n}`);
+  return m ? m.id : 'cloud';
+}
+
+function normName(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Agent references: fuzzy word overlap with name and task
+
+const wordCache = new WeakMap();
+
+function wordSet(text) {
+  const words = String(text || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const set = new Set();
+  for (let i = 0; i < words.length; i++) {
+    if (!REF_STOP.has(words[i])) set.add(stem(words[i]));
+    if (i + 1 < words.length) set.add(stem(words[i] + words[i + 1])); // "check out" also reads as "checkout"
+  }
+  return set;
+}
+
+function agentWords(a) {
+  const cached = wordCache.get(a);
+  if (cached && cached.name === a.name && cached.task === a.task && cached.state === a.state) return cached;
+  const label = (LOOK[a.state] && LOOK[a.state].label) || '';
+  const v = { name: a.name, task: a.task, state: a.state, nameW: wordSet(a.name), taskW: wordSet(a.task), stateW: wordSet(label), nameKey: refKey(String(a.name || '').toLowerCase().split(/[^a-z0-9]+/)) };
+  wordCache.set(a, v);
+  return v;
+}
+
+/** The meaningful words of a name, for "is this the whole name?": "the Onboarding agent" = "onboarding". */
+function refKey(words) {
+  return [...new Set(words.filter(w => w && !REF_STOP.has(w)).map(w => stem(w.replace(/-/g, ''))))].sort().join(' ');
+}
+
+function hit(set, s) {
+  if (set.has(s)) return true;
+  if (s.length >= 4) for (const x of set) if (x.startsWith(s)) return true; // "clean" finds "cleanup"
+  return false;
+}
+
+/** How well the reference words match one agent. Name words count 2, task or state words 1. */
+function scoreAgent(ws, a) {
+  const A = agentWords(a);
+  let units = 0;
+  let matched = 0;
+  let total = 0;
+  for (let i = 0; i < ws.length; i++) {
+    if (i + 1 < ws.length) {
+      const pair = stem(ws[i] + ws[i + 1]);
+      if (A.nameW.has(pair) || A.taskW.has(pair)) {
+        // Two words matched as one ("check out" = "checkout"): worth the same as two word matches.
+        units += 2; matched += 2; total += A.nameW.has(pair) ? 4 : 2; i++;
+        continue;
+      }
+    }
+    if (REF_STOP.has(ws[i])) continue;
+    const s = stem(ws[i].replace(/-/g, ''));
+    units++;
+    if (hit(A.nameW, s)) { matched++; total += 2; } else if (hit(A.taskW, s) || A.stateW.has(s)) { matched++; total += 1; }
+  }
+  return { units, matched, total };
+}
+
+/**
+ * Resolve one reference ("the flaky test", "it", "search cleanup") to an agent.
+ * `full`: every word of the reference matched. `sure`: also unmistakable, because it is "it",
+ * an id, the agent's whole name, or at least two matching words ("stop the tests" is not sure).
+ * @returns {{ ids: string[], full: boolean, sure: boolean, pronoun?: boolean, coverage: number, total: number }}
+ */
+function resolveRef(toks, c) {
+  const ws = toks.map(t => t.w);
+  const none = { ids: [], full: false, sure: false, coverage: 0, total: 0 };
+  if (!ws.length) return none;
+  if (PRONOUN_REFS.has(ws.join(' '))) {
+    return c.focusId ? { ids: [c.focusId], full: true, sure: true, pronoun: true, coverage: 1, total: 99 } : { ...none, pronoun: true };
+  }
+  for (const a of c.agents) if (ws.includes(a.id.toLowerCase())) return { ids: [a.id], full: true, sure: true, coverage: 1, total: 99 };
+  let best = null;
+  for (const a of c.agents) {
+    const sc = scoreAgent(ws, a);
+    if (!sc.units || !sc.matched) continue;
+    const coverage = sc.matched / sc.units;
+    if (coverage < 0.5) continue;
+    const key = [coverage, sc.total, a.kind === 'helper' ? 0 : 1, ENDED.has(a.state) ? 0 : 1, a.id === c.focusId ? 1 : 0];
+    if (!best || compareKeys(key, best.key) > 0) best = { a, key, coverage, total: sc.total, matched: sc.matched };
+  }
+  if (!best) return none;
+  const full = best.coverage === 1;
+  const sure = full && (best.matched >= 2 || refKey(ws) === agentWords(best.a).nameKey);
+  return { ids: [best.a.id], full, sure, coverage: best.coverage, total: best.total };
+}
+
+function compareKeys(x, y) {
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i];
+  return 0;
+}
+
+/** Resolve "the flaky test and search cleanup" to one or more agents. */
+function resolveList(toks, c) {
+  const whole = resolveRef(toks, c);
+  if (whole.full) return whole;
+  const parts = [];
+  let cur = [];
+  for (const t of toks) {
+    if (t.w === 'and' || t.w === 'plus') { if (cur.length) parts.push(cur); cur = []; continue; }
+    cur.push(t);
+    if (t.tail) { parts.push(cur); cur = []; }
+  }
+  if (cur.length) parts.push(cur);
+  if (parts.length < 2) return whole;
+  const each = parts.map(p => resolveRef(p, c));
+  if (each.every(r => r.ids.length)) {
+    const ids = [...new Set(each.flatMap(r => r.ids))];
+    return { ids, full: each.every(r => r.full), sure: each.every(r => r.sure), coverage: 1, total: 0 };
+  }
+  return whole;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Short replies: yes / no
+
+const YES_STRONG = new Set(['yes', 'yeah', 'yep', 'yup', 'ya', 'yah', 'yea', 'sure', 'okay', 'alright', 'fine', 'go', 'allow',
+  'allowed', 'approve', 'approved', 'accept', 'accepted', 'permit', 'grant', 'granted', 'proceed', 'lgtm', 'affirmative',
+  'absolutely', 'definitely', 'certainly', 'do']);
+const YES_FILL = new Set(['ahead', 'for', 'it', 'that', 'this', 'one', 'please', 'just', 'once', 'now', 'then', 'run', 'let',
+  'the', 'command', 'request', 'thing', 'is', 'good', 'great', 'sounds', 'looks', 'right', 'thanks', 'thank', 'you', 'and',
+  'so', 'with', 'them', 'him', 'her', 'in', 'to', 'sure', 'go', 'yes', 'okay', 'do', 'whatever']);
+const NO_STRONG = new Set(['no', 'nope', 'nah', 'nay', 'deny', 'denied', 'reject', 'rejected', 'refuse', 'block', 'never',
+  "don't", 'not', 'decline', 'negative']);
+const NO_FILL = new Set(['it', 'that', 'this', 'please', 'thanks', 'thank', 'you', 'way', 'allow', 'do', 'let', 'run', 'now',
+  'yet', 'the', 'command', 'request', 'one', 'for', 'go', 'ahead', 'with', 'them', 'him', 'her', 'and', 'i', 'said']);
+
+const CONFIRM_YES = new Set(['yes', 'yeah', 'yep', 'yup', 'ya', 'yah', 'yea', 'sure', 'okay', 'alright', 'right', 'go', 'do', 'confirm',
+  'confirmed', 'start', 'launch', 'proceed', 'absolutely', 'definitely', 'lgtm', 'correct', 'affirmative', 'good', 'great',
+  'perfect', 'cool', 'nice', 'fine', 'please']);
+const CONFIRM_YES_FILL = new Set(['it', 'that', 'ahead', 'for', 'please', 'now', 'then', 'sounds', 'looks', "let's", 'thanks',
+  'thank', 'you', 'so', 'is', 'right', 'and', 'them', 'both', 'the', 'one', 'way', 'all', 'run', 'make', 'thing', 'just',
+  'yes', 'okay', 'go', 'do', 'sure', 'very', 'that is', 'all', 'of']);
+const CONFIRM_NO = new Set(['no', 'nope', 'nah', 'cancel', 'never', 'abort', 'stop', "don't", 'forget', 'scratch', 'wait',
+  'hold', 'not', 'negative']);
+const CONFIRM_NO_FILL = new Set(['mind', 'it', 'that', 'this', 'please', 'thanks', 'thank', 'you', 'on', 'off', 'now', 'yet',
+  'the', 'idea', 'way', 'actually', 'maybe', 'later', 'do', 'about', 'sorry', 'a', 'second', 'sec', 'minute', 'one']);
+
+function confirmReply(toks) {
+  const ws = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w) || CONFIRM_YES.has(w));
+  if (!ws.length) return null;
+  if (ws.length === 3 && ws[0] === 'make' && ws[1] === 'it' && ws[2] === 'so') return true;
+  const no = ws.some(w => CONFIRM_NO.has(w));
+  const yes = ws.some(w => CONFIRM_YES.has(w));
+  if (no && !yes && ws.every(w => CONFIRM_NO.has(w) || CONFIRM_NO_FILL.has(w))) return false;
+  if (yes && !no && ws.every(w => CONFIRM_YES.has(w) || CONFIRM_YES_FILL.has(w))) return true;
+  return null;
+}
+
+/** "yes", "go ahead", "allow it" / "no", "don't", "deny". Returns { kind, text? } or null. */
+function permissionReply(toks) {
+  const ws = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w) || YES_STRONG.has(w));
+  if (!ws.length) return null;
+  const s = ws.join(' ');
+  if (/^(no problem|no worries|not a problem|why not)$/.test(s)) return { kind: 'allow' };
+  const no = ws.some(w => NO_STRONG.has(w));
+  const yes = ws.some(w => YES_STRONG.has(w));
+  if (no && ws.every(w => NO_STRONG.has(w) || NO_FILL.has(w) || YES_STRONG.has(w))) return { kind: 'deny' };
+  if (yes && !no && ws.every(w => YES_STRONG.has(w) || YES_FILL.has(w))) return { kind: 'allow' };
+  // A clear first word followed by more: "no, use the staging database instead".
+  const rest = tidy(spanText(toks.slice(1)));
+  if (['yes', 'yeah', 'yep', 'yup', 'allow', 'approve', 'approved'].includes(ws[0]) && !no) return { kind: 'allow', text: rest };
+  if (['no', 'nope', 'nah', 'deny', "don't"].includes(ws[0])) return { kind: 'deny', text: rest };
+  return null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Commands. Each matcher returns { intent, strong } or null. `strong` means the words cannot
+// reasonably be an answer to a question the focused agent asked.
+
+const STOP_ALL_WORDS = new Set(['everything', 'everyone', 'everybody', 'all', 'every']);
+const STOP_ALL_FILL = new Set(['the', 'of', 'them', 'agents', 'agent', 'single', 'work', 'lot', 'now', 'right', 'at', 'once',
+  'it', 'things', 'stuff', 'jobs', 'tasks', 'running', 'working', 'that', 'is', 'are', 'helpers', 'immediately']);
+const STOP_VERBS = [['shut', 'down'], ['stop'], ['pause'], ['halt'], ['kill'], ['cancel'], ['abort'], ['terminate'], ['end'], ['quit'], ['interrupt']];
+
+function matchStopAll(ws) {
+  if (ws.length === 2 && STOP_ALL_WORDS.has(ws[0]) && ['stop', 'pause', 'halt'].includes(ws[1])) return true; // "everyone stop"
+  if (ws.join(' ') === 'emergency stop') return true;
+  const v = startsWithSeq(ws, STOP_VERBS);
+  if (!v) return false;
+  const rest = ws.slice(v);
+  return rest.length > 0 && rest.some(w => STOP_ALL_WORDS.has(w)) && rest.every(w => STOP_ALL_WORDS.has(w) || STOP_ALL_FILL.has(w));
+}
+
+function matchStop(core, c) {
+  const ws = core.map(t => t.w);
+  const v = startsWithSeq(ws, STOP_VERBS);
+  if (!v) return null;
+  let rest = core.slice(v);
+  if (rest.length >= 2 && (rest[0].w === 'working' || rest[0].w === 'work') && rest[1].w === 'on') rest = rest.slice(2);
+  if (!rest.length) {
+    // A bare "stop" means the focused agent. A bare "cancel" or "end" is too vague to stop anything.
+    if (!['stop', 'pause', 'halt', 'kill', 'abort', 'terminate'].includes(ws[0])) return null;
+    return { intent: { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] }, strong: !!c.focusId };
+  }
+  const refWords = rest.map(t => t.w).join(' ');
+  if (ws[0] === 'cancel' && PRONOUN_REFS.has(refWords)) return null; // "cancel that" is not about an agent
+  const r = resolveList(rest, c);
+  return { intent: { kind: 'stop', agentIds: r.ids }, strong: r.sure };
+}
+
+// Machines -----------------------------------------------------------------------------------
+
+const MACHINE_FILL = new Set(['sleep', 'suspend', 'hibernate', 'turn', 'switch', 'shut', 'shutdown', 'power', 'stop', 'pause', 'put',
+  'send', 'to', 'off', 'down', 'wake', 'up', 'on', 'boot', 'start', 'resume', 'spin', 'fire', 'the', 'machine', 'machines',
+  'computer', 'computers', 'box', 'boxes', 'server', 'servers', 'please', 'and', 'both', 'my', 'our', 'your', 'ones', 'one',
+  'them', 'that', 'are', 'is', 'of', 'back']);
+const LAPTOP_WORDS = new Set(['laptop', 'mac', 'macbook', 'local']);
+// Verbs that also mean something for agents; with these the rest must be only machines.
+const SHARED_VERBS = new Set(['stop', 'pause', 'start', 'spin', 'fire', 'boot']);
+
+/** A machine that is really there, by number: "cloud 2". Null when there is no such machine. */
+function existingCloud(n, c) {
+  const id = cloudMachineId(n, c);
+  return id === 'cloud' ? null : id;
+}
+
+function machineMentions(ws, c) {
+  const ids = [];
+  const used = new Set();
+  let idle = false;
+  let all = false;
+  let any = false;
+  let lastWasCloud = false;
+  const addCloud = n => { const id = existingCloud(n, c); if (id) ids.push(id); };
+  for (let i = 0; i < ws.length; i++) {
+    const w = ws[i];
+    const m = /^cloud-?(\d+)$/.exec(w);
+    if (m) { addCloud(+m[1]); used.add(i); any = true; lastWasCloud = true; continue; }
+    if (w === 'cloud' || w === 'clouds') {
+      const n = numberish(ws[i + 1], true);
+      used.add(i);
+      any = true;
+      if (n != null) { addCloud(n); used.add(i + 1); i++; lastWasCloud = true; }
+      else if (w === 'clouds' || ['machines', 'ones', 'boxes', 'servers', 'computers'].includes(ws[i + 1])) all = true; // "the cloud machines"
+      continue;
+    }
+    if (lastWasCloud && (w === 'and' || w === 'plus') && numberish(ws[i + 1], false) != null) { // "cloud 2 and 3"
+      addCloud(numberish(ws[i + 1], false));
+      used.add(i); used.add(i + 1); i++;
+      continue;
+    }
+    lastWasCloud = false;
+    if (LAPTOP_WORDS.has(w)) { ids.push(laptopId(c)); used.add(i); any = true; continue; }
+    if (w === 'idle') { idle = true; used.add(i); any = true; continue; }
+    if (STOP_ALL_WORDS.has(w)) { all = true; used.add(i); continue; }
+    if (w === 'machine' || w === 'machines') any = true;
+    // A machine named something else ("GPU box"): match its whole name.
+    for (const mc of c.machines) {
+      const name = normName(mc.name).split(' ').filter(Boolean);
+      if (name.length && name[0] !== 'cloud' && seqAt(ws, i, name)) {
+        ids.push(mc.id);
+        name.forEach((_, k) => used.add(i + k));
+        any = true;
+      }
+    }
+  }
+  if (all && !idle) {
+    for (const mc of c.machines) if (mc.kind !== 'laptop') ids.push(mc.id);
+  }
+  return { ids: [...new Set(ids)], used, idle, any: any || (all && ws.some(w => w === 'machines' || w === 'clouds')) };
+}
+
+function matchMachines(core, c) {
+  const ws = core.map(t => t.w);
+  const s = ws.join(' ');
+  let mode = null;
+  if (/^(sleep|suspend|hibernate|turn off|switch off|shut down|shutdown|power down|power off|stop|pause)\b/.test(s)
+    || /^(put|send)\b.*\bto sleep$/.test(s) || /^(shut|turn|switch|power)\b.* (down|off)$/.test(s)) mode = 'sleep';
+  else if (/^(wake|turn on|switch on|power on|power up|boot|start|resume|spin up|fire up)\b/.test(s)
+    || /^(turn|switch|power)\b.* on$/.test(s)) mode = 'wake';
+  if (!mode) return null;
+  const men = machineMentions(ws, c);
+  if (!men.any) return null;
+  const leftover = ws.filter((w, i) => !men.used.has(i) && !MACHINE_FILL.has(w));
+  if (leftover.length && SHARED_VERBS.has(ws[0])) return null; // "start an agent on cloud 2 to ..." is a launch
+  if (mode === 'sleep' && men.idle) return { intent: { kind: 'sleep_idle' }, strong: true };
+  return { intent: { kind: mode, machineIds: men.ids }, strong: true };
+}
+
+// Status and spend ----------------------------------------------------------------------------
+
+const GENERAL_STATUS = new Set(['status', 'status update', 'status report', 'update', 'updates', 'an update', 'any updates',
+  'report', 'progress', 'progress report', 'overview', 'summary', 'give me an update', 'give me a status update',
+  'give me the status', 'give me a status', 'give me a summary', 'give me an overview', 'what is the status',
+  'what is the latest', 'what is new', 'anything new', 'what did i miss', 'catch me up', 'what is going on',
+  'what is happening', 'what is up', 'how are things', 'how are things going', 'how is everything', 'how is everything going',
+  'how is it all going', 'how are we doing', 'how are we', 'where are we', 'where are we at', 'where are things',
+  'what is everyone doing', 'what is everybody doing', 'what are the agents doing', 'what are my agents doing',
+  'what are they doing', 'what are they all doing', 'how are the agents doing', 'how are my agents doing', 'show status',
+  'show me the status', 'show me everything', 'show me all agents', 'show all agents', 'list agents', 'list the agents',
+  'list all agents', 'who is working', 'what is running', 'status please']);
+
+// Questions about one agent. `ask: true` patterns are questions, so an unknown name still asks
+// for a general status; the others only count when the name matches an agent.
+const STATUS_AGENT = [
+  { re: /^(?:what|wat) (?:is|was|has|are) (?<ref>.+?) (?:doing|been doing|up to|working on|done|thinking)$/d, ask: true },
+  { re: /^what did (?<ref>.+?) (?:do|change|find|say|finish|get done)$/d, ask: true },
+  { re: /^what is the (?:status|progress|latest) (?:of|on|for|with) (?<ref>.+)$/d, ask: true },
+  { re: /^how (?:is|are) (?<ref>.+?)(?: doing| going| getting on| coming along| progressing| looking)?$/d, ask: true },
+  { re: /^how far (?:along )?(?:is|are) (?<ref>.+?)(?: along)?$/d, ask: true },
+  { re: /^where (?:is|are) (?<ref>.+?)(?: at| up to| with it)?$/d, ask: true },
+  { re: /^(?:is|has|did) (?<ref>.+?) (?:done|finished|finish|stuck|working|still working|still going|okay|alright|running|still running|ready|failing|broken|complete|completed|making progress|waiting)$/d, ask: true },
+  { re: /^(?:status|update|progress|news) (?:of|on|for|about) (?<ref>.+)$/d, ask: true },
+  { re: /^(?:give me|get me|show me) (?:the|a|an) (?:status|update|progress) (?:of|on|for|about) (?<ref>.+)$/d, ask: true },
+  { re: /^(?<ref>.+?) status$/d, ask: false },
+  { re: /^(?:check on|check in on|check up on|look in on|look at|check) (?<ref>.+)$/d, ask: false },
+  { re: /^(?:show me|show|open|focus on|focus|go to|switch to|jump to|zoom in on|select|pull up|bring up|take me to) (?<ref>.+)$/d, ask: false },
+  { re: /^(?:tell me about|what about|how about) (?<ref>.+)$/d, ask: false },
+];
+
+const SPEND_EXACT = [
+  /^(?:how much|what) (?:money )?(?:in total )?(?:have|did|has|had) (?:i|we|you|it|this|they|everything|the agents|my agents|all this|all of this)(?: all)?(?: been)? (?:spent|spend|cost|costing|used)(?: (?:so far|today|in total|altogether|total|overall|this session))*$/,
+  /^(?:how much|what) (?:is|are) (?:this|it|everything|all this|all of this|the agents|my agents) costing(?: me| us)?(?: (?:so far|today))*$/,
+  /^what (?:is|are) (?:my|our|the|today's|total) (?:spend|spending|costs?|total|bill|total spend|total cost|budget)(?: (?:so far|today|total))*$/,
+  /^(?:my |total |today's |the )?(?:spend|spending|costs?|cost so far|money spent|budget)(?: (?:so far|today|total))*$/,
+  /^how much (?:money )?(?:so far|today)$/,
+  /^(?:show|tell) me (?:my|the) (?:spend|spending|costs?)(?: (?:so far|today))*$/,
+];
+const SPEND_WORD = /\b(spen[dt]|spending|cost|costs|costing|money|bill|budget|dollars|bucks)\b/;
+
+function isNeedsMe(ws) {
+  if (!ws.length || ws.length > 12) return false;
+  const NEED = new Set(['need', 'needs', 'needing', 'needed', 'waiting', 'wait', 'waits', 'blocked', 'blocking', 'want', 'wants', 'require', 'requires']);
+  const ME = new Set(['me', 'my', 'attention', 'approval', 'input', 'okay', 'decision', 'answer', 'help', 'review', 'reviewing', 'eyes']);
+  const Q = new Set(['what', 'who', 'which', 'anything', 'anyone', 'anybody', 'something', 'is', 'are', 'does', 'do', 'show', 'list', 'tell', 'any', 'whatever']);
+  const lead = Q.has(ws[0]) || (ws.length <= 4 && NEED.has(ws[0]));
+  return lead && ws.some(w => NEED.has(w)) && ws.some(w => ME.has(w));
+}
+
+/** Map a regex capture group back to tokens (words are joined by single spaces). */
+function refTokens(m, s, core) {
+  const g = m.indices && m.indices.groups && m.indices.groups.ref;
+  if (!g) return [];
+  const spaces = str => (str.match(/ /g) || []).length;
+  const from = spaces(s.slice(0, g[0]));
+  const to = from + spaces(s.slice(g[0], g[1])) + 1;
+  return core.slice(from, to);
+}
+
+function matchStatusOrSpend(core, c) {
+  const ws = core.map(t => t.w);
+  const s = ws.join(' ');
+  // One word ("update", "cost") could be the answer to a question, so only longer phrases are strong.
+  if (GENERAL_STATUS.has(s)) return { intent: { kind: 'status' }, strong: ws.length > 1 };
+  if (isNeedsMe(ws)) return { intent: { kind: 'status', needsMe: true }, strong: true };
+  if (SPEND_EXACT.some(re => re.test(s))) return { intent: { kind: 'spend' }, strong: ws.length > 1 };
+  for (const { re, ask } of STATUS_AGENT) {
+    const m = re.exec(s);
+    if (!m) continue;
+    const ref = refTokens(m, s, core);
+    if (SPEND_WORD.test(ref.map(t => t.w).join(' '))) break; // "how much is this costing" is spend, below
+    const r = resolveRef(ref, c);
+    if (r.ids.length) return { intent: { kind: 'status', agentId: r.ids[0] }, strong: r.sure };
+    if (r.pronoun) return { intent: { kind: 'status' }, strong: true }; // "how is it going", nothing focused
+    if (ask) return { intent: { kind: 'status' }, strong: false };
+  }
+  if (SPEND_WORD.test(s) && /^(how|what|show|tell)\b/.test(s)) return { intent: { kind: 'spend' }, strong: false };
+  return null;
+}
+
+// Say -----------------------------------------------------------------------------------------
+
+const SAY_VERBS = new Set(['tell', 'ask', 'remind', 'message', 'inform', 'instruct', 'nudge', 'ping', 'warn', 'advise']);
+const SAY_SPLIT = new Set(['to', 'that', 'if', 'whether', 'why', 'what', 'how', 'when', 'where', 'which', 'about', 'not']);
+const SAY_DROP = new Set(['to', 'that']);
+const MAX_REF_WORDS = 8;
+
+function matchSay(core, c) {
+  const ws = core.map(t => t.w);
+  let v = 0;
+  let know = -1;
+  if (SAY_VERBS.has(ws[0])) v = 1;
+  else if (ws[0] === 'let' && (know = ws.indexOf('know')) > 1) v = 1;
+  else if (ws[0] === 'say' && ws[1] === 'to') v = 2;
+  if (!v) return null;
+  const rest = core.slice(v);
+  if (rest.length < 2) return null;
+  if (launchNoun(rest.map(t => t.w))) return null; // "ask codex to write tests" starts an agent
+
+  const candidates = [];
+  if (know > 1) {
+    const k = know - v;
+    let msg = rest.slice(k + 1);
+    if (msg[0] && msg[0].w === 'that') msg = msg.slice(1);
+    candidates.push({ ref: rest.slice(0, k), msg, sep: true });
+  } else {
+    // Agent names are short, so only the first few words can be the name: this keeps long dictation fast.
+    const maxRef = Math.min(rest.length, MAX_REF_WORDS + 1);
+    for (let k = 1; k < maxRef; k++) {
+      if (SAY_SPLIT.has(rest[k].w)) candidates.push({ ref: rest.slice(0, k), msg: rest.slice(SAY_DROP.has(rest[k].w) ? k + 1 : k), sep: true });
+      else if (rest[k - 1].tail) candidates.push({ ref: rest.slice(0, k), msg: rest.slice(k), sep: true });
+    }
+    for (let k = 1; k < maxRef; k++) candidates.push({ ref: rest.slice(0, k), msg: rest.slice(k), sep: false });
+  }
+  let best = null;
+  let pronoun = null;
+  for (const cand of candidates) {
+    if (!cand.ref.length || !cand.msg.length) continue;
+    const r = resolveRef(cand.ref, c);
+    if (r.pronoun && !pronoun) pronoun = cand;
+    if (!r.ids.length) continue;
+    const key = [r.full ? 1 : 0, r.coverage, cand.sep ? 1 : 0, r.total, -cand.ref.length];
+    if (!best || compareKeys(key, best.key) > 0) best = { key, r, cand };
+  }
+  if (best) {
+    return { intent: { kind: 'say', agentId: best.r.ids[0], text: tidy(spanText(best.cand.msg)) }, strong: best.r.sure };
+  }
+  // "tell it to ..." with nothing focused: a say with no agent, so the engine can ask which one.
+  // A name that matches no agent is not a say: sending it to whatever is focused would be wrong.
+  if (pronoun) {
+    const text = tidy(spanText(pronoun.msg));
+    return text ? { intent: { kind: 'say', agentId: null, text }, strong: false } : null;
+  }
+  return null;
+}
+
+// Start ---------------------------------------------------------------------------------------
+
+const HARNESS_ALIAS = { claude: 'claude', claud: 'claude', clawed: 'claude', clod: 'claude', claudes: 'claude',
+  'claude-code': 'claude', codex: 'codex', codecs: 'codex', codexes: 'codex', 'codex-cli': 'codex' };
+// Words that name an agent for sure, and generic ones that only count after a clear start verb
+// ("start a new task to ..."): "add a job to the queue" and "make a copy" are work, not launches.
+const AGENT_WORD = new Set(['agent', 'agents', 'someone', 'somebody']);
+const GENERIC_NOUN = new Set(['instance', 'instances', 'session', 'sessions', 'worker', 'workers', 'bot', 'bots', 'copy', 'copies',
+  'assistant', 'assistants', 'task', 'tasks', 'job', 'jobs', 'one', 'ones']);
+const AGENT_NOUN = new Set([...AGENT_WORD, ...GENERIC_NOUN]);
+const NOUN_DET = new Set(['a', 'an', 'another', 'some', 'new', 'fresh', 'separate', 'extra', 'more', 'of', 'both', 'each',
+  'second', 'different', 'brand', 'the', 'my', 'couple', 'pair']);
+const COUNT = { two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, couple: 2, pair: 2,
+  2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9, 10: 10 };
+const MAX_LAUNCH = 5;
+
+const START_STRONG = [['spin', 'up'], ['kick', 'off'], ['fire', 'up'], ['boot', 'up'], ['start', 'up'], ['set', 'off'], ['start'], ['launch'], ['spawn'], ['begin']];
+// These only start an agent when an agent or harness is named: "have codex write tests".
+const START_WEAK = [['i', 'want'], ['i', 'need'], ['i', 'would', 'like'], ['get', 'me'], ['give', 'me'], ['set', 'up'], ['have'],
+  ['get'], ['put'], ['use'], ['let'], ['ask'], ['tell'], ['assign'], ['send'], ['run'], ['create'], ['open'], ['make'], ['add'], ['bring', 'in'], ['bring']];
+
+/** A harness named at ws[j]: { harness, len } or null. */
+function harnessAt(ws, j) {
+  const w = ws[j];
+  if (w == null) return null;
+  const h = HARNESS_ALIAS[w];
+  if (h === 'claude' && ws[j + 1] === 'code') return { harness: 'claude', len: 2 }; // "claude code"
+  if (h) return { harness: h, len: 1 };
+  if (w === 'code' && ws[j + 1] === 'x') return { harness: 'codex', len: 2 }; // "code x"
+  // Speech-to-text hears "Claude" as "cloud"; only trusted right next to "and codex".
+  if (w === 'cloud' && ws[j + 1] === 'and' && HARNESS_ALIAS[ws[j + 2]] === 'codex') return { harness: 'claude', len: 1 };
+  if (w === 'cloud' && ws[j - 1] === 'and' && HARNESS_ALIAS[ws[j - 2]] === 'codex') return { harness: 'claude', len: 1 };
+  if (w === 'cloud' && ws[j + 1] === 'code') return { harness: 'claude', len: 2 };
+  return null;
+}
+
+/** The agent noun phrase after a start verb: "a new claude agent", "claude and codex", "two agents". */
+function parseNoun(ws, i) {
+  const harnesses = [];
+  let count = null;
+  let hasNoun = false;
+  let named = false; // a harness or "agent" was said, not only a generic noun
+  let cloud = false;
+  let definite = false;
+  let j = i;
+  while (j < ws.length) {
+    const w = ws[j];
+    const h = harnessAt(ws, j);
+    if (h) { harnesses.push(h.harness); hasNoun = true; named = true; j += h.len; continue; }
+    if (w === 'one' && (AGENT_NOUN.has(ws[j + 1]) || harnessAt(ws, j + 1))) { count = 1; j++; continue; }
+    if (Object.hasOwn(COUNT, w) && (AGENT_NOUN.has(ws[j + 1]) || harnessAt(ws, j + 1) || ws[j + 1] === 'of' || ws[j + 1] === 'new' || ws[j + 1] === 'cloud')) { count = COUNT[w]; j++; continue; }
+    if (AGENT_NOUN.has(w)) { hasNoun = true; named = named || AGENT_WORD.has(w); j++; continue; }
+    if (w === 'cloud' && numberish(ws[j + 1], false) == null && (AGENT_NOUN.has(ws[j + 1]) || harnessAt(ws, j + 1))) { cloud = true; j++; continue; }
+    if (NOUN_DET.has(w) && w !== 'couple' && w !== 'pair') { if (w === 'the' || w === 'my') definite = true; j++; continue; }
+    if (['and', 'plus', 'with', 'using', 'via'].includes(w) && harnessAt(ws, j + 1)) { j++; continue; }
+    if (w === 'and' && hasNoun && (ws[j + 1] === 'a' || ws[j + 1] === 'an' || ws[j + 1] === 'one') && harnessAt(ws, j + 2)) { j += 2; continue; }
+    break;
+  }
+  if (!hasNoun) return { end: i, harnesses: [], count: null, hasNoun: false, named: false, cloud: false, definite: false };
+  return { end: j, harnesses: [...new Set(harnesses)], count, hasNoun, named, cloud, definite };
+}
+
+/** True when words start with a launchable noun: a harness, or "a new agent", "someone". */
+function launchNoun(ws) {
+  const n = parseNoun(ws, 0);
+  if (!n.named) return false;
+  return n.harnesses.length > 0 || !n.definite;
+}
+
+const MACHINE_PREP = new Set(['on', 'in', 'onto', 'using', 'with', 'at', 'via']); // not "to": "migrate the database to the cloud"
+const MACHINE_DET = new Set(['its', 'their', 'his', 'her', 'a', 'an', 'the', 'my', 'our', 'your', 'one', 'separate', 'own',
+  'different', 'dedicated', 'new', 'individual', 'each', 'single', 'remote', 'this']);
+const MACHINE_NOUN = new Set(['machine', 'machines', 'computer', 'computers', 'box', 'boxes', 'server', 'servers', 'instance',
+  'instances', 'vm', 'vms', 'host', 'hosts', 'node', 'nodes']);
+const AFTER_MACHINE = new Set(['to', 'and', 'for', 'with', 'each', 'both', 'please', 'so', 'then', 'that', 'which', 'who', 'on', 'working']);
+
+/**
+ * Take a machine phrase out of the task words: "each on its own cloud machine", "on cloud 2",
+ * "in the cloud", "on my laptop", "locally". Returns { machine, toks } (machine null when none).
+ */
+function takeMachine(toks, c) {
+  const ws = toks.map(t => t.w);
+  for (let i = 0; i < ws.length; i++) {
+    if (!MACHINE_PREP.has(ws[i])) continue;
+    let j = i + 1;
+    while (j < ws.length && MACHINE_DET.has(ws[j])) j++;
+    let machine = null;
+    let end = j;
+    let sure = false; // a number or a machine noun makes it unambiguous
+    const m = /^cloud-?(\d+)$/.exec(ws[j] || '');
+    if (m) { machine = cloudMachineId(+m[1], c); end = j + 1; sure = true; }
+    else if (ws[j] === 'cloud' || ws[j] === 'clouds') {
+      const n = numberish(ws[j + 1], true);
+      if (n != null && !(ws[j + 1] === 'to' && !numberIsLikely(ws, j + 2))) { machine = cloudMachineId(n, c); end = j + 2; sure = true; }
+      else { machine = 'cloud'; end = j + 1; }
+    } else if (LAPTOP_WORDS.has(ws[j]) || ((ws[j] === 'computer' || ws[j] === 'machine') && j > i + 1 && ['my', 'this', 'your', 'the'].includes(ws[j - 1]))) {
+      machine = laptopId(c); end = j + 1; sure = true;
+    }
+    if (!machine) continue;
+    if (MACHINE_NOUN.has(ws[end])) { end++; sure = true; }
+    if (!sure && end < ws.length && !AFTER_MACHINE.has(ws[end]) && !toks[end - 1].tail) continue; // "the cloud sync bug"
+    let from = i;
+    if (from > 0 && ['each', 'both', 'all'].includes(ws[from - 1])) from--;
+    return { machine, toks: [...toks.slice(0, from), ...toks.slice(end)] };
+  }
+  const k = ws.indexOf('locally');
+  if (k >= 0) return { machine: laptopId(c), toks: [...toks.slice(0, k), ...toks.slice(k + 1)] };
+  for (let i = 0; i + 1 < ws.length; i++) {
+    if (ws[i] === 'cloud' && MACHINE_NOUN.has(ws[i + 1])) return { machine: 'cloud', toks: [...toks.slice(0, i), ...toks.slice(i + 2)] };
+  }
+  return { machine: null, toks };
+}
+
+/** "cloud to fix the bug": the "to" is a connector, not "two". */
+function numberIsLikely(ws, next) {
+  return next >= ws.length || AFTER_MACHINE.has(ws[next]) || MACHINE_NOUN.has(ws[next]);
+}
+
+/** Take "using codex", "with claude", "in codex", or a harness as the very last word. */
+function takeHarness(toks) {
+  const ws = toks.map(t => t.w);
+  for (let i = 0; i < ws.length; i++) {
+    if (!['using', 'use', 'with', 'via', 'in', 'on', 'through', 'by'].includes(ws[i])) continue;
+    const h = harnessAt(ws, i + 1);
+    if (!h) continue;
+    let end = i + 1 + h.len;
+    if (AGENT_NOUN.has(ws[end]) || ws[end] === 'cli') end++;
+    return { harness: h.harness, toks: [...toks.slice(0, i), ...toks.slice(end)] };
+  }
+  // An afterthought after a comma: "fix the login, codex". Without the comma it may be part of
+  // the task ("review codex").
+  const last = ws.length - 1;
+  if (last > 0 && HARNESS_ALIAS[ws[last]] && toks[last - 1].tail) return { harness: HARNESS_ALIAS[ws[last]], toks: toks.slice(0, last) };
+  return { harness: null, toks };
+}
+
+/** Drop the words that join the noun phrase to the task: "to", "on", "that fixes", "and have it". */
+function stripConnectors(toks) {
+  const ws = toks.map(t => t.w);
+  let k = 0;
+  let conj = false;
+  if (ws[0] === 'and' && ['have', 'get', 'ask', 'tell', 'let', 'make'].includes(ws[1]) && ['it', 'them', 'him', 'her'].includes(ws[2])) {
+    k = ws[3] === 'to' ? 4 : 3;
+  } else if (['to', 'on', 'for', 'about', 'with', 'at', 'into', 'and'].includes(ws[0])) {
+    k = 1;
+    if (['the', 'a', 'this'].includes(ws[1]) && ['task', 'job'].includes(ws[2])) k = ['of', 'to'].includes(ws[3]) ? 4 : 3;
+  } else if (['that', 'which', 'who'].includes(ws[0])) {
+    k = 1;
+    if (['will', 'can', 'should', 'could', 'would', 'must'].includes(ws[1])) k = 2;
+    else conj = true;
+  } else if (ws[0] === 'working' && ws[1] === 'on') k = 2;
+  const rest = toks.slice(k);
+  if (conj && rest.length) rest[0] = { ...rest[0], raw: baseVerb(rest[0].raw) };
+  return rest;
+}
+
+/** Only pronouns and fillers: "start an agent on it" has no task. */
+function emptyTask(toks) {
+  return !toks.some(t => !['it', 'this', 'that', 'them', 'one', 'please', 'now', 'the', 'a', 'an'].includes(t.w));
+}
+
+/**
+ * Build the start tasks from the words after the noun phrase.
+ * @returns {{ task: string, harness: string, machine: string }[] | null}
+ */
+function buildTasks(rest, noun, c) {
+  const mach = takeMachine(rest, c);
+  let toks = mach.toks;
+  const har = takeHarness(toks);
+  toks = har.toks;
+  toks = stripConnectors(toks);
+  const machine = mach.machine || (noun.cloud ? 'cloud' : laptopId(c));
+  const ws = toks.map(t => t.w);
+
+  // Different work for each: "start claude on the parser and codex on the docs".
+  for (let k = 1; k < ws.length - 2; k++) {
+    if (ws[k] !== 'and') continue;
+    const h = harnessAt(ws, k + 1);
+    if (!h || !['on', 'to', 'for', 'with'].includes(ws[k + 1 + h.len])) continue;
+    const first = tidy(spanText(toks.slice(0, k)));
+    const second = tidy(spanText(toks.slice(k + 2 + h.len)));
+    if (!first || !second) break;
+    const h1 = noun.harnesses[0] || har.harness || 'claude';
+    return [{ task: first, harness: h1, machine }, { task: second, harness: h.harness, machine }];
+  }
+
+  if (!toks.length || emptyTask(toks)) return null;
+  const task = tidy(spanText(toks));
+  if (!task) return null;
+  let harnesses = noun.harnesses.length ? noun.harnesses : [har.harness || 'claude'];
+  if (harnesses.length === 1 && noun.count > 1) harnesses = new Array(Math.min(noun.count, MAX_LAUNCH)).fill(harnesses[0]);
+  return harnesses.slice(0, MAX_LAUNCH).map(harness => ({ task, harness, machine }));
+}
+
+function matchStart(core, c) {
+  const ws = core.map(t => t.w);
+  let v = startsWithSeq(ws, START_STRONG);
+  let strongVerb = v > 0;
+  if (!v) v = startsWithSeq(ws, START_WEAK);
+  let noun = parseNoun(ws, v);
+  if (!v) {
+    // No verb, but a launchable noun and a clear join: "codex, write tests", "new agent to fix the login".
+    if (!noun.named || !launchNoun(ws) || noun.definite) return null;
+    const joined = core[noun.end - 1] && core[noun.end - 1].tail;
+    if (!joined && !['to', 'on', 'for', 'that'].includes(ws[noun.end])) return null;
+  } else if (!strongVerb && !noun.named) {
+    return null;
+  }
+  if (noun.hasNoun && noun.definite && !noun.harnesses.length) return null; // "start the agent" refers to one that exists
+  const tasks = buildTasks(core.slice(noun.end), noun, c);
+  if (!tasks) return null;
+  return { intent: { kind: 'start', tasks }, strong: noun.named };
+}
+
+// Work requests without a start verb ----------------------------------------------------------
+
+const WORK_VERBS = new Set(['add', 'fix', 'write', 'rewrite', 'create', 'build', 'implement', 'refactor', 'update', 'upgrade',
+  'remove', 'delete', 'rename', 'move', 'clean', 'tidy', 'improve', 'optimize', 'optimise', 'speed', 'make', 'change',
+  'convert', 'migrate', 'port', 'document', 'investigate', 'debug', 'find', 'research', 'figure', 'explain', 'set', 'setup',
+  'configure', 'install', 'bump', 'replace', 'split', 'merge', 'translate', 'generate', 'draft', 'design', 'profile', 'audit',
+  'lint', 'format', 'polish', 'simplify', 'extract', 'handle', 'support', 'test', 'review', 'look', 'check', 'see', 'try',
+  'sort', 'prepare', 'organize', 'organise', 'increase', 'reduce', 'lower', 'raise', 'enable', 'disable', 'turn', 'revert',
+  'undo', 'restore', 'patch', 'resolve', 'address', 'finish', 'complete', 'summarize', 'summarise', 'list', 'compare',
+  'benchmark', 'measure', 'cache', 'wire', 'hook', 'connect', 'integrate', 'run', 'use', 'deploy', 'publish', 'release',
+  'ship', 'commit', 'push', 'open', 'close', 'archive', 'scan', 'verify', 'validate', 'trace', 'diagnose', 'reproduce',
+  'rerun', 'retry', 'harden', 'secure', 'localize', 'style', 'restyle', 'redesign', 'rework', 'reorganize', 'decouple',
+  'inline', 'expose', 'hide', 'show', 'display', 'render', 'log', 'track', 'record', 'map', 'parse', 'read', 'tighten',
+  'loosen', 'drop', 'pin', 'unpin', 'stub', 'mock', 'cover', 'type', 'annotate', 'comment', 'describe', 'plan', 'outline',
+  'study', 'analyze', 'analyse', 'evaluate', 'assess', 'explore', 'search', 'locate', 'identify', 'prevent', 'avoid', 'get',
+  'bring', 'teach', 'shorten', 'lengthen', 'split', 'combine', 'dedupe', 'deduplicate', 'untangle', 'fill', 'draw', 'build']);
+
+function matchTask(core, c) {
+  if (core.length < 2 || !WORK_VERBS.has(core[0].w)) return null;
+  if (emptyTask(core.slice(1))) return null; // "fix it", "do that"
+  const last = core[core.length - 1].raw;
+  if (/\?["'”’]*$/.test(last)) return null; // a question, not a request
+  // An explicit harness or machine makes it a launch: "fix the login redirect using codex".
+  const mach = takeMachine(core, c);
+  const har = takeHarness(mach.toks);
+  if (mach.machine || har.harness) {
+    const task = tidy(spanText(har.toks));
+    if (task && !emptyTask(har.toks)) {
+      return { kind: 'start', tasks: [{ task, harness: har.harness || 'claude', machine: mach.machine || laptopId(c) }] };
+    }
+  }
+  return { kind: 'task', task: tidy(spanText(core)) };
+}
+
+// Answers -------------------------------------------------------------------------------------
+
+const KEEP_TRYING = new Set(['keep trying', 'keep going', 'let it keep trying', 'let it keep going', 'let it try', 'let it continue',
+  'carry on', 'continue', 'leave it', 'leave it be', 'let it be', 'it is fine', 'fine', 'let it run', 'give it more time',
+  'let it go on', 'try again', 'keep at it', 'let it keep at it']);
+
+function answerIntent(base, focus, ask) {
+  const toks = stripSoft(base);
+  let text = spanText(toks).replace(/[\s,]+$/, '').trim();
+  const said = toks.map(t => t.w).join(' ');
+  const options = Array.isArray(ask.options) ? ask.options.filter(o => typeof o === 'string') : [];
+  // A reply that names one of the offered choices uses that choice's exact words.
+  const exact = options.find(o => normName(o) === normName(said));
+  if (exact) text = exact;
+  else if (KEEP_TRYING.has(said)) {
+    const keep = options.find(o => /keep trying/i.test(o));
+    if (keep) text = keep;
+  }
+  return { kind: 'answer', agentId: focus.id, askId: ask.id ?? null, text };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entry points
+
+/**
+ * Parse what the person typed or said.
+ * @param {string} text
+ * @param {{ agents?: object[], focusId?: string|null, machines?: object[], harnesses?: object, pendingConfirm?: any }} [ctx]
+ * @returns {object} an intent; never throws
+ */
+export function parseCommand(text, ctx) {
+  const said = (typeof text === 'string' ? text : text == null ? '' : String(text)).trim();
+  try {
+    return parse(said, context(ctx));
+  } catch {
+    return { kind: 'unknown', text: said };
+  }
+}
+
+function parse(said, c) {
+  const base = lex(said).filter(t => !DISFLUENCY.has(t.w));
+  if (!base.length) return { kind: 'unknown', text: said };
+  const holder = c.asker; // the focused agent, or its one helper that is waiting on the person
+  const ask = holder ? holder.ask : null;
+
+  // 1. A launch is waiting for "yes" or "cancel".
+  if (c.pendingConfirm) {
+    const go = confirmReply(base);
+    if (go !== null) return { kind: 'confirm', go };
+  }
+  // 2. The focused agent is waiting for permission.
+  if (ask && ask.type === 'permission') {
+    const r = permissionReply(base);
+    if (r) {
+      const intent = { kind: r.kind, agentId: holder.id, askId: ask.id ?? null };
+      if (r.text) intent.text = r.text;
+      return intent;
+    }
+  }
+  // 3. Commands. While a question waits, only unmistakable commands win over an answer.
+  const core = stripTrailing(stripPolite(stripSoft(base)));
+  const found = matchCommand(core, c);
+  const waiting = ask && (ask.type === 'question' || ask.type === 'stuck');
+  if (found && (found.strong || !waiting)) return found.intent;
+  if (waiting) return answerIntent(base, holder, ask);
+  // 4. A work request with no start verb.
+  const task = matchTask(core, c);
+  if (task) return task;
+  return { kind: 'unknown', text: said };
+}
+
+function matchCommand(core, c) {
+  if (!core.length) return null;
+  const ws = core.map(t => t.w);
+  if (matchStopAll(ws)) return { intent: { kind: 'stop_all' }, strong: true };
+  return matchMachines(core, c)
+    || matchStop(core, c)
+    || matchStatusOrSpend(core, c)
+    || matchSay(core, c)
+    || matchStart(core, c);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sentences for confirm cards
+
+const HARNESS_NAME = { claude: 'Claude', codex: 'Codex', sim: 'simulated' };
+const NUM_WORD = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+const quote = t => '“' + clip(String(t ?? ''), 80) + '”';
+
+function joinAnd(parts) {
+  if (parts.length <= 1) return parts.join('');
+  return parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1];
+}
+
+function agentName(id, c) {
+  const a = c.agents.find(x => x.id === id);
+  return a && a.name ? a.name : 'that agent';
+}
+
+function machineName(id, c) {
+  if (id === 'cloud') return 'a cloud machine';
+  const m = c.machines.find(x => x.id === id);
+  return m && m.name ? m.name : String(id);
+}
+
+/** "Claude and Codex", "two Claude agents", "Claude". */
+function whoStarts(harnesses) {
+  const counts = new Map();
+  for (const h of harnesses) counts.set(h, (counts.get(h) || 0) + 1);
+  return joinAnd([...counts].map(([h, n]) => {
+    const name = HARNESS_NAME[h] || String(h);
+    if (h === 'sim') return n === 1 ? 'a simulated agent' : `${NUM_WORD[n] || n} simulated agents`;
+    return n === 1 ? name : `${NUM_WORD[n] || n} ${name} agents`;
+  }));
+}
+
+function placePhrase(machine, n, c) {
+  if (!machine || machine === laptopId(c) || machine === 'laptop') return '';
+  if (machine === 'cloud') return n === 1 ? ' on a cloud machine' : ', each on a cloud machine';
+  const name = machineName(machine, c);
+  if (n === 1) return ` on ${name}`;
+  return n === 2 ? `, both on ${name}` : `, all on ${name}`;
+}
+
+function describeStart(tasks, c) {
+  const ts = (Array.isArray(tasks) ? tasks : []).filter(t => t && typeof t.task === 'string' && t.task);
+  if (!ts.length) return 'Start an agent?';
+  const machines = ts.map(t => t.machine || laptopId(c));
+  const sameMachine = machines.every(m => m === machines[0]);
+  const where = sameMachine ? placePhrase(machines[0], ts.length, c) : '';
+  if (ts.every(t => t.task === ts[0].task)) {
+    return `Start ${whoStarts(ts.map(t => t.harness || 'claude'))} on ${quote(ts[0].task)}${where}?`;
+  }
+  const parts = ts.map((t, k) => `${whoStarts([t.harness || 'claude'])} on ${quote(t.task)}${sameMachine ? '' : placePhrase(machines[k], 1, c)}`);
+  return `Start ${joinAnd(parts)}${where}?`;
+}
+
+/**
+ * A plain sentence describing an intent, for a confirm card.
+ * "Start Claude on “fix the flaky checkout test”?"
+ */
+export function describeIntent(intent, ctx) {
+  const c = context(ctx);
+  const it = intent && typeof intent === 'object' ? intent : { kind: 'unknown', text: '' };
+  const names = ids => joinAnd((Array.isArray(ids) ? ids : []).map(id => agentName(id, c)));
+  const machines = ids => (Array.isArray(ids) && ids.length ? joinAnd(ids.map(id => machineName(id, c))) : 'that machine');
+  switch (it.kind) {
+    case 'start': return describeStart(it.tasks, c);
+    case 'task': return describeStart([{ task: it.task, harness: 'claude', machine: null }], c);
+    case 'stop': return Array.isArray(it.agentIds) && it.agentIds.length ? `Stop ${names(it.agentIds)}?` : 'Stop an agent? It is not clear which one.';
+    case 'stop_all': return 'Stop every agent?';
+    case 'say': return it.agentId ? `Tell ${agentName(it.agentId, c)} ${quote(it.text)}?` : `Send ${quote(it.text)}? It is not clear to which agent.`;
+    case 'answer': return `Answer ${agentName(it.agentId, c)} with ${quote(it.text)}?`;
+    case 'allow': return `Allow the request from ${agentName(it.agentId, c)}?`;
+    case 'deny': return `Deny the request from ${agentName(it.agentId, c)}?`;
+    case 'status':
+      if (it.agentId) return `Show what ${agentName(it.agentId, c)} is doing?`;
+      return it.needsMe ? 'Show what needs you?' : 'Show how every agent is doing?';
+    case 'spend': return 'Show what you have spent today?';
+    case 'sleep': return `Put ${machines(it.machineIds)} to sleep?`;
+    case 'wake': return `Wake ${machines(it.machineIds)}?`;
+    case 'sleep_idle': return 'Put the idle machines to sleep?';
+    case 'confirm': return it.go ? 'Go ahead?' : 'Cancel?';
+    default: return `Not sure what ${quote(it.text)} means.`;
+  }
+}

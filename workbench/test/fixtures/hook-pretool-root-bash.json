@@ -1,0 +1,14 @@
+{
+ "session_id": "2ec20342-9d0d-4021-84b7-56de6b399622",
+ "transcript_path": "/Users/someone/.claude/projects/-private-tmp-claude-501--Users-someone-IDE-ed114e51-b43a-411f-bfd4-b2193a0c62c3-scratch-exp1-repo/2ec20342-9d0d-4021-84b7-56de6b399622.jsonl",
+ "cwd": "/workspace/repo",
+ "prompt_id": "bb4ef594-e9dd-43e1-b3b2-0906fd1cdac2",
+ "permission_mode": "default",
+ "hook_event_name": "PreToolUse",
+ "tool_name": "Bash",
+ "tool_input": {
+  "command": "node test.mjs",
+  "description": "Run test.mjs to test the greet function"
+ },
+ "tool_use_id": "toolu_018qN7tnjL5Fj3DifhqbVXaz"
+}

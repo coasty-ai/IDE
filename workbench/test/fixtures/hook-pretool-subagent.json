@@ -1,0 +1,16 @@
+{
+ "session_id": "2ec20342-9d0d-4021-84b7-56de6b399622",
+ "transcript_path": "/Users/someone/.claude/projects/-private-tmp-claude-501--Users-someone-IDE-ed114e51-b43a-411f-bfd4-b2193a0c62c3-scratch-exp1-repo/2ec20342-9d0d-4021-84b7-56de6b399622.jsonl",
+ "cwd": "/workspace/repo",
+ "prompt_id": "046b3f29-2e16-4f06-a858-d932b129c638",
+ "permission_mode": "default",
+ "agent_id": "a71ea18c16a7bba8d",
+ "agent_type": "Explore",
+ "hook_event_name": "PreToolUse",
+ "tool_name": "Bash",
+ "tool_input": {
+  "command": "find /workspace/repo -type f -not -path '*/\\.*' | sort",
+  "description": "List all files in the repository"
+ },
+ "tool_use_id": "toolu_01S2aSEWS7CLR2yGuSGh7FQM"
+}

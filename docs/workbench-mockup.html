@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent workbench: mockup</title>
+<style>
+  :root {
+    --bg: #0e1014; --panel: #151920; --panel2: #1b2029; --line: #272d39;
+    --text: #e7eaf0; --muted: #98a2b3; --faint: #6b7586;
+    --blocked: #f6b93b; --stuck: #ff8f4d; --verified: #3fcf8e; --claimed: #aab3c2;
+    --working: #5ba8ff; --broken: #ff6464; --accent: #8b7cf6;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    display: grid; grid-template-rows: 44px 1fr; overflow: hidden;
+  }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  svg.shape { width: 14px; height: 14px; flex: none; }
+
+  /* top bar */
+  .top { display: flex; align-items: center; gap: 18px; padding: 0 16px;
+         border-bottom: 1px solid var(--line); background: var(--panel); }
+  .top .name { font-weight: 650; letter-spacing: .2px; }
+  .top .repo { color: var(--muted); font-family: var(--mono); font-size: 12.5px; }
+  .tally { display: flex; gap: 14px; margin-left: auto; color: var(--muted); font-size: 12.5px; }
+  .tally span { display: inline-flex; align-items: center; gap: 6px; }
+  .spend { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px;
+           padding-left: 18px; border-left: 1px solid var(--line); }
+  .spend b { color: var(--text); font-weight: 600; }
+  .split { display: flex; width: 110px; height: 6px; border-radius: 3px; overflow: hidden; background: var(--line); }
+  .split i { display: block; height: 100%; }
+
+  /* layout */
+  .app { display: grid; grid-template-columns: 372px 1fr; min-height: 0; }
+  .queue { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  .queue h2, .main h2 { font-size: 11.5px; letter-spacing: .9px; text-transform: uppercase; color: var(--faint); margin: 0; font-weight: 650; }
+  .qhead { display: flex; justify-content: space-between; align-items: baseline; padding: 14px 16px 8px; }
+  .qhead em { font-style: normal; color: var(--blocked); font-size: 12.5px; }
+  .items { overflow: auto; padding: 0 8px 8px; }
+  .group { color: var(--faint); font-size: 11px; letter-spacing: .6px; text-transform: uppercase; padding: 12px 8px 6px; }
+  .item { display: grid; grid-template-columns: 14px 1fr auto; gap: 4px 10px; align-items: start;
+          padding: 10px; border-radius: 9px; border: 1px solid transparent; }
+  .item + .item { margin-top: 2px; }
+  .item:hover { background: var(--panel2); }
+  .item.sel { background: var(--panel2); border-color: #39415180; box-shadow: inset 3px 0 0 var(--verified); }
+  .item svg { margin-top: 3px; }
+  .item .title { font-weight: 600; font-family: var(--mono); font-size: 13px; }
+  .item .why { color: var(--text); grid-column: 2 / 4; }
+  .item .meta { color: var(--muted); font-size: 12.5px; grid-column: 2 / 4; }
+  .item .wait { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .item .acts { grid-column: 2 / 4; display: flex; gap: 6px; margin-top: 4px; }
+  .warn { color: var(--blocked); }
+  .bad { color: var(--broken); }
+  .btn { border: 1px solid var(--line); background: #222836; padding: 4px 11px; border-radius: 7px; font-size: 12.5px; }
+  .btn:hover { border-color: #46506380; background: #2a3141; }
+  .btn.pri { background: #2b3a2f; border-color: #3fcf8e55; color: #bff2d9; }
+  .btn.ghost { background: transparent; }
+  .held { margin-top: auto; padding: 10px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12.5px;
+          display: flex; justify-content: space-between; }
+  .held a { color: var(--accent); text-decoration: none; }
+
+  /* main */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .mhead { display: flex; align-items: center; gap: 12px; padding: 12px 22px; border-bottom: 1px solid var(--line); }
+  .mhead .t { font-family: var(--mono); font-weight: 650; font-size: 15px; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px; border-radius: 99px; font-size: 12.5px;
+          border: 1px solid var(--line); background: var(--panel2); }
+  .pill.ok { border-color: #3fcf8e55; color: #bff2d9; }
+  .pill.no { border-color: #ff646455; color: #ffc9c9; }
+  .tabs { margin-left: auto; display: flex; background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
+  .tabs button { border: 0; background: transparent; padding: 5px 14px; border-radius: 7px; color: var(--muted); }
+  .tabs button[aria-selected="true"] { background: #2a3141; color: var(--text); }
+  .scroll { overflow: auto; padding: 18px 22px 28px; }
+  .view[hidden] { display: none; }
+
+  /* receipt */
+  .receipt { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .rhead { display: flex; justify-content: space-between; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .scope { display: flex; gap: 2px; font-size: 12.5px; color: var(--muted); }
+  .scope b { color: var(--text); font-weight: 600; background: #2a3141; padding: 2px 9px; border-radius: 6px; }
+  .scope span { padding: 2px 9px; }
+  .row { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; padding: 10px 16px; align-items: start; }
+  .row + .row { border-top: 1px solid #20252f; }
+  .row .k { color: var(--muted); font-size: 12.5px; padding-top: 1px; }
+  .row .v { min-width: 0; }
+  .row .v small { color: var(--muted); display: block; margin-top: 2px; }
+  .quote { color: var(--claimed); font-style: italic; }
+  .src { font-size: 11px; letter-spacing: .3px; color: var(--faint); border: 1px solid var(--line); border-radius: 5px; padding: 1px 7px; white-space: nowrap; }
+  .src.obs { color: #9fe3c4; border-color: #3fcf8e40; }
+  .src.rep { color: #a9cdfd; border-color: #5ba8ff40; }
+  .src.said { color: #c9cfda; }
+  .checks { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chk { display: inline-flex; align-items: center; gap: 6px; background: var(--panel2); border: 1px solid var(--line);
+         border-radius: 7px; padding: 2px 9px; font-size: 12.5px; }
+  .chk i { color: var(--muted); font-style: normal; }
+  .rule { display: flex; align-items: center; gap: 8px; }
+  .rule + .rule { margin-top: 4px; }
+  .tick { color: var(--verified); font-weight: 700; }
+  .cross { color: var(--broken); font-weight: 700; }
+  details.claim { margin: 14px 0 0; color: var(--muted); font-size: 13px; }
+  details.claim summary { cursor: pointer; }
+  details.claim p { margin: 8px 0 0; padding: 10px 12px; background: var(--panel); border: 1px dashed var(--line); border-radius: 9px; }
+
+  /* diff */
+  .file { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .file.flag { border-color: #ff646466; }
+  .fhead { display: flex; align-items: center; gap: 10px; padding: 8px 12px 8px 16px; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; }
+  .fhead > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fhead .stat { color: var(--muted); white-space: nowrap; }
+  .fhead .tag { font-family: inherit; font-size: 11px; border-radius: 5px; padding: 1px 7px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .fhead .tag.bad { color: #ffc9c9; border-color: #ff646466; background: #3a1f24; }
+  .fhead .sp { margin-left: auto; display: flex; gap: 6px; flex: none; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  pre { margin: 0; padding: 8px 0; font: 12.5px/1.6 var(--mono); overflow: auto; }
+  pre span { display: block; padding: 0 16px; white-space: pre; }
+  .hunk { color: var(--faint); }
+  .del { background: #3a1f2466; color: #ffb4b4; }
+  .add { background: #1f3a2c66; color: #b4f0d2; }
+  .file.accepted { opacity: .62; }
+  .file.accepted .fhead::after { content: "accepted"; color: var(--verified); font-size: 11.5px; margin-left: 8px; }
+  .file.reverted { opacity: .45; }
+  .file.reverted .fhead::after { content: "will revert"; color: var(--broken); font-size: 11.5px; margin-left: 8px; }
+  .bar { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+  .bar .note { color: var(--muted); font-size: 12.5px; margin-left: auto; }
+
+  /* session */
+  .facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .fact { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .fact .n { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .fact .l { color: var(--muted); font-size: 12.5px; }
+  .budget { height: 6px; background: var(--line); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  .budget i { display: block; height: 100%; width: 46%; background: var(--working); }
+  .noeta { color: var(--faint); font-size: 12.5px; margin: 10px 2px 18px; }
+  .turn { display: grid; grid-template-columns: 22px 1fr; gap: 0 12px; }
+  .rail { display: flex; flex-direction: column; align-items: center; }
+  .rail::after { content: ""; flex: 1; width: 1px; background: var(--line); margin: 4px 0; }
+  .turn:last-child .rail::after { display: none; }
+  .rail svg { margin-top: 4px; }
+  .tbody { padding-bottom: 18px; min-width: 0; }
+  .tbody .h { display: flex; gap: 10px; align-items: baseline; }
+  .tbody .h b { font-weight: 650; }
+  .tbody .h span { color: var(--muted); font-size: 12.5px; }
+  .ask { margin: 4px 0 6px; }
+  .ask::before { content: "You: "; color: var(--muted); }
+  .line { color: var(--muted); font-size: 13px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .line + .line { margin-top: 3px; }
+  .cap { margin-top: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; }
+  .cap h2 { margin-bottom: 8px; }
+  .cap ul { list-style: none; margin: 0; padding: 0; display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+
+  /* restrained motion: only the working dot, and only once on verified */
+  @media (prefers-reduced-motion: no-preference) {
+    .pulse { animation: pulse 2.2s ease-in-out infinite; transform-origin: center; }
+    @keyframes pulse { 50% { opacity: .45; } }
+    .spark { animation: spark .9s ease-out 1; transform-origin: center; }
+    @keyframes spark { 0% { transform: scale(.7); opacity: .5; } 60% { transform: scale(1.25); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }
+  }
+  .foot { color: var(--faint); font-size: 11.5px; margin-top: 22px; }
+</style>
+</head>
+<body>
+
+<!-- shape per state, so state reads without colour -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="s-blocked" viewBox="0 0 14 14"><rect x="2" y="2" width="10" height="10" rx="1.5" fill="var(--blocked)"/></symbol>
+  <symbol id="s-stuck" viewBox="0 0 14 14"><path d="M7 1.8 13 12H1z" fill="var(--stuck)"/></symbol>
+  <symbol id="s-verified" viewBox="0 0 14 14"><path d="M7 .8 13.2 7 7 13.2.8 7z" fill="var(--verified)"/></symbol>
+  <symbol id="s-claimed" viewBox="0 0 14 14"><path d="M7 1.8 12.2 7 7 12.2 1.8 7z" fill="none" stroke="var(--claimed)" stroke-width="1.6"/></symbol>
+  <symbol id="s-working" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5" fill="var(--working)"/></symbol>
+  <symbol id="s-failed" viewBox="0 0 14 14"><path d="M3 3l8 8M11 3l-8 8" stroke="var(--broken)" stroke-width="2.2" stroke-linecap="round"/></symbol>
+</svg>
+
+<header class="top">
+  <span class="name">Workbench</span>
+  <span class="repo">acme/billing-service</span>
+  <div class="tally" aria-label="Sessions by state">
+    <span><svg class="shape"><use href="#s-blocked"/></svg>2 blocked</span>
+    <span><svg class="shape"><use href="#s-stuck"/></svg>1 stuck?</span>
+    <span><svg class="shape"><use href="#s-verified"/></svg>2 to review</span>
+    <span><svg class="shape pulse"><use href="#s-working"/></svg>1 working</span>
+  </div>
+  <div class="spend" title="Estimate. Cache reads 71%, cache writes 22%, output 7%">
+    <span>Today <b>$6.12</b> est.</span>
+    <span class="split" aria-hidden="true"><i style="width:71%;background:#5ba8ff"></i><i style="width:22%;background:#8b7cf6"></i><i style="width:7%;background:#3fcf8e"></i></span>
+    <span>reads · writes · output</span>
+  </div>
+</header>
+
+<div class="app">
+  <!-- QUEUE -->
+  <aside class="queue" aria-label="Queue">
+    <div class="qhead"><h2>Queue</h2><em>2 blocked on you</em></div>
+    <div class="items">
+      <div class="group">Blocked on you</div>
+      <div class="item" id="q1">
+        <svg class="shape"><use href="#s-blocked"/></svg>
+        <span class="title">checkout-refactor</span><span class="wait">4 min</span>
+        <span class="why">Permission: run <code>npm run db:migrate</code>?</span>
+        <span class="meta">Claude Code · <span class="warn">cache likely expires in 1 min</span></span>
+        <span class="acts"><button class="btn pri" data-answer="q1">Allow</button><button class="btn" data-answer="q1">Deny</button></span>
+      </div>
+      <div class="item" id="q2">
+        <svg class="shape"><use href="#s-blocked"/></svg>
+        <span class="title">search-api</span><span class="wait">11 min</span>
+        <span class="why">Question: keep the v1 route, or remove it?</span>
+        <span class="meta">Claude Code · cache likely cold · resuming re-sends 84k tokens</span>
+        <span class="acts"><button class="btn" data-answer="q2">Answer</button></span>
+      </div>
+
+      <div class="group">Worth a look</div>
+      <div class="item">
+        <svg class="shape"><use href="#s-stuck"/></svg>
+        <span class="title">flaky-test-fix</span><span class="wait">now</span>
+        <span class="why">Same error 3 times in a row</span>
+        <span class="meta">Codex · $3.40 of $4.00 budget</span>
+      </div>
+
+      <div class="group">Ready for review</div>
+      <div class="item sel" aria-current="true">
+        <svg class="shape spark"><use href="#s-verified"/></svg>
+        <span class="title">billing-export</span><span class="wait">2 min</span>
+        <span class="why">Done, checks passed · <span class="bad">1 rule broken</span></span>
+        <span class="meta">Claude Code · turn 4 · 6 files</span>
+      </div>
+      <div class="item">
+        <svg class="shape"><use href="#s-claimed"/></svg>
+        <span class="title">docs-update</span><span class="wait">26 min</span>
+        <span class="why">Done, claimed · no checks declared</span>
+        <span class="meta">Codex · turn 2 · 3 files</span>
+      </div>
+
+      <div class="group">Running</div>
+      <div class="item">
+        <svg class="shape pulse"><use href="#s-working"/></svg>
+        <span class="title">onboarding-flow</span><span class="wait">12 min</span>
+        <span class="why">Turn 7 · editing 2 files</span>
+        <span class="meta">Claude Code · $1.90 of $5.00 budget</span>
+      </div>
+    </div>
+    <div class="held"><span>4 notifications held back today</span><a href="#">See them</a></div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main">
+    <div class="mhead">
+      <span class="t">billing-export</span>
+      <span class="pill ok"><svg class="shape"><use href="#s-verified"/></svg>Done, checks passed</span>
+      <span class="pill no">1 rule broken</span>
+      <div class="tabs" role="tablist">
+        <button role="tab" aria-selected="true" data-tab="review">Review</button>
+        <button role="tab" aria-selected="false" data-tab="session">Session</button>
+      </div>
+    </div>
+
+    <div class="scroll">
+      <!-- REVIEW -->
+      <section class="view" id="review">
+        <div class="receipt">
+          <div class="rhead">
+            <h2>Receipt · turn 4</h2>
+            <div class="scope"><b>This turn</b><span>Whole task</span></div>
+          </div>
+          <div class="row"><span class="k">Claimed</span>
+            <span class="v quote">"Export now streams rows instead of loading them all. All tests pass."</span>
+            <span class="src said">said by the model</span></div>
+          <div class="row"><span class="k">Changed</span>
+            <span class="v">6 files, +212 −48<small>2 files were changed by shell commands, not by the agent's edit tool</small></span>
+            <span class="src obs">observed</span></div>
+          <div class="row"><span class="k">Checks</span>
+            <span class="v"><span class="checks">
+              <span class="chk"><span class="tick">✓</span>unit <i>41 s</i></span>
+              <span class="chk"><span class="tick">✓</span>lint <i>3 s</i></span>
+              <span class="chk"><span class="tick">✓</span>types <i>9 s</i></span></span>
+              <small>Run by the workbench on snapshot a3f9c1. Checks were not modified this turn.</small></span>
+            <span class="src obs">observed</span></div>
+          <div class="row"><span class="k">Rules</span>
+            <span class="v">
+              <span class="rule"><span class="tick">✓</span>Add no new dependencies</span>
+              <span class="rule"><span class="cross">✕</span>Do not touch <code>migrations/</code> <span class="bad">· 1 file changed</span></span></span>
+            <span class="src obs">observed</span></div>
+          <div class="row"><span class="k">Not seen</span>
+            <span class="v">Network calls and database writes<small>The workbench only watches this worktree.</small></span>
+            <span class="src">limit</span></div>
+          <div class="row"><span class="k">Cost</span>
+            <span class="v">$0.84 this turn · $2.31 of $5.00 for the task</span>
+            <span class="src rep">reported, estimate</span></div>
+        </div>
+
+        <details class="claim">
+          <summary>Agent's own summary (a claim, not checked)</summary>
+          <p>I replaced the in-memory query with a streaming cursor, wrote rows in batches of 500, and added an index so the stream stays fast on large accounts. All 143 tests pass.</p>
+        </details>
+
+        <div class="file" data-file>
+          <div class="fhead"><span>src/billing/export.ts</span><span class="stat">+38 −21</span>
+            <span class="sp"><button class="btn pri" data-act="accepted">Accept</button><button class="btn" data-act="reverted">Revert</button><button class="btn ghost">Comment</button></span></div>
+<pre><span class="hunk">@@ -41,6 +41,11 @@ export async function exportInvoices(req, res) {</span><span>   const accountId = req.params.accountId;</span><span class="del">-  const rows = await db.invoices.findAll({ where: { accountId } });</span><span class="del">-  res.json(rows.map(toCsvRow));</span><span class="add">+  res.setHeader("Content-Type", "text/csv");</span><span class="add">+  const cursor = db.invoices.stream({ where: { accountId }, batch: 500 });</span><span class="add">+  for await (const batch of cursor) {</span><span class="add">+    res.write(batch.map(toCsvRow).join("\n") + "\n");</span><span class="add">+  }</span><span class="add">+  res.end();</span><span> }</span></pre>
+        </div>
+
+        <div class="file flag" data-file>
+          <div class="fhead"><span>migrations/20261110_export_index.sql</span><span class="stat">+3 −0</span>
+            <span class="tag bad">rule broken: off limits</span><span class="tag">changed by shell command</span>
+            <span class="sp"><button class="btn" data-act="accepted">Accept</button><button class="btn pri" data-act="reverted">Revert</button><button class="btn ghost">Comment</button></span></div>
+<pre><span class="add">+CREATE INDEX CONCURRENTLY idx_invoices_account_created</span><span class="add">+  ON invoices (account_id, created_at);</span><span class="add">+</span></pre>
+        </div>
+
+        <div class="bar">
+          <button class="btn">Open in my editor</button>
+          <button class="btn">Rewind files to turn 3</button>
+          <button class="btn">Post receipt to pull request</button>
+          <span class="note">4 more files in this turn · approvals are recorded as yours</span>
+        </div>
+      </section>
+
+      <!-- SESSION -->
+      <section class="view" id="session" hidden>
+        <div class="facts">
+          <div class="fact"><div class="n">47 min</div><div class="l">elapsed · 19 min of it waiting on you</div></div>
+          <div class="fact"><div class="n">4 turns</div><div class="l">61 tool calls · 38 read, 9 search, 14 edit or run</div></div>
+          <div class="fact"><div class="n">9 files</div><div class="l">changed across the task</div></div>
+          <div class="fact"><div class="n">$2.31 <span style="font-size:13px;color:var(--muted);font-weight:400">of $5.00</span></div><div class="l">budget you set · estimate</div><div class="budget"><i></i></div></div>
+        </div>
+        <p class="noeta">No percentage and no finish time are shown. Neither can be computed honestly.</p>
+
+        <div class="turn"><div class="rail"><svg class="shape"><use href="#s-failed"/></svg></div><div class="tbody">
+          <div class="h"><b>Turn 1</b><span>09:12 · 11 min · $0.61</span></div>
+          <div class="ask">Make the invoice export stream instead of loading everything.</div>
+          <div class="line"><span class="src obs">observed</span>2 files changed · checks: unit failed (2 tests)</div>
+          <div class="line"><span class="src said">said by the model</span>"Done. The export now streams."</div>
+        </div></div>
+        <div class="turn"><div class="rail"><svg class="shape"><use href="#s-verified"/></svg></div><div class="tbody">
+          <div class="h"><b>Turn 2</b><span>09:31 · 6 min · $0.44</span></div>
+          <div class="ask">Two tests fail. Fix them.</div>
+          <div class="line"><span class="src obs">observed</span>3 files changed · checks passed</div>
+        </div></div>
+        <div class="turn"><div class="rail"><svg class="shape"><use href="#s-blocked"/></svg></div><div class="tbody">
+          <div class="h"><b>Turn 3</b><span>09:40 · blocked 6 min · $0.42</span></div>
+          <div class="ask">Write the rows as proper CSV with quoting.</div>
+          <div class="line"><span class="src rep">reported</span>Asked permission to run <code>npm install csv-stringify</code> · you denied it</div>
+          <div class="line"><span class="src obs">observed</span>1 file changed · checks passed · rule kept: no new dependencies</div>
+        </div></div>
+        <div class="turn"><div class="rail"><svg class="shape"><use href="#s-verified"/></svg></div><div class="tbody">
+          <div class="h"><b>Turn 4</b><span>09:52 · 9 min · $0.84</span></div>
+          <div class="ask">Add an index so the stream query stays fast.</div>
+          <div class="line"><span class="src obs">observed</span>6 files changed · checks passed · <span class="bad">rule broken: migrations/</span></div>
+          <div class="line"><span class="src said">said by the model</span>"All tests pass."</div>
+        </div></div>
+
+        <div class="cap">
+          <h2>What this agent can report here</h2>
+          <ul>
+            <li><span class="tick">✓</span> tool calls</li><li><span class="tick">✓</span> permission requests</li>
+            <li><span class="tick">✓</span> sub-agents</li><li>~ usage (estimate)</li><li><span class="cross">✕</span> background tasks</li>
+          </ul>
+        </div>
+      </section>
+
+      <p class="foot">Mockup with made-up data. Shapes: square blocked, triangle possibly stuck, hollow diamond done but only claimed, filled diamond done and checks passed, circle working, cross failed or checks failed.</p>
+    </div>
+  </main>
+</div>
+
+<script>
+  // Tabs: Review / Session (also selectable with #session in the URL)
+  const tabs = document.querySelectorAll('[data-tab]');
+  function show(name) {
+    tabs.forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === name)));
+    document.querySelectorAll('.view').forEach(v => { v.hidden = v.id !== name; });
+  }
+  tabs.forEach(t => t.addEventListener('click', () => show(t.dataset.tab)));
+  if (location.hash === '#session') show('session');
+
+  // Accept / revert a file
+  document.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => {
+    const f = b.closest('[data-file]');
+    const on = f.classList.contains(b.dataset.act);
+    f.classList.remove('accepted', 'reverted');
+    if (!on) f.classList.add(b.dataset.act);
+  }));
+
+  // Answer a blocked agent in place
+  document.querySelectorAll('[data-answer]').forEach(b => b.addEventListener('click', () => {
+    const item = document.getElementById(b.dataset.answer);
+    item.querySelector('.acts').innerHTML = '<span class="meta">Answered: ' + b.textContent.toLowerCase() + ' · agent resumed</span>';
+    item.querySelector('use').setAttribute('href', '#s-working');
+  }));
+</script>
+</body>
+</html>
