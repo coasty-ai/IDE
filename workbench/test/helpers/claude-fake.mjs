@@ -15,6 +15,9 @@
 //         "spawn a child"  starts a grandchild process and replies "child <pid>"
 //         "exit <code>"    writes a line to stderr and exits with that code
 //         "long <n>"       replies with a text of n characters, ending in "✓"
+//   It also checks that --settings carries WORKBENCH_HOOK_URL and WORKBENCH_AGENT_ID in `env`, and that the hook
+//   key is not in argv. Hooks run with the environment of the process, then the `env` of the repository's
+//   .claude/settings.json, then the `env` of --settings (which wins).
 // - It exits 0 when stdin closes, unless FAKE_CLAUDE_STUBBORN is set: then it ignores SIGTERM and stdin
 //   closing, and only SIGKILL ends it (its grandchildren ignore SIGTERM too).
 // - FAKE_CLAUDE_CHUNKY=1 writes its output in small pieces, cutting lines and characters apart.
@@ -69,6 +72,11 @@ function main() {
   need(settings && settings.disableAllHooks === false, 'disableAllHooks: false in --settings');
   let hook = null;
   try { hook = settings.hooks.PreToolUse[0].hooks[0]; } catch { hook = null; }
+  // The bridge's address and agent id are pinned in --settings (flag settings outrank the repository's), the key is not.
+  const pinned = (settings && settings.env) || {};
+  need(pinned.WORKBENCH_HOOK_URL === env.WORKBENCH_HOOK_URL && !!pinned.WORKBENCH_HOOK_URL, 'WORKBENCH_HOOK_URL in --settings env');
+  need(pinned.WORKBENCH_AGENT_ID === env.WORKBENCH_AGENT_ID && !!pinned.WORKBENCH_AGENT_ID, 'WORKBENCH_AGENT_ID in --settings env');
+  need(!JSON.stringify(argv).includes(env.WORKBENCH_HOOK_TOKEN || '\u0000none'), 'the hook key is not in argv');
   need(hook && hook.type === 'command' && hook.timeout === 1800 && /^'\/usr\/bin\/env' '-u' 'NODE_OPTIONS' '.+hook-bridge\.mjs'$/.test(hook.command), 'a PreToolUse hook in --settings');
   need(String(value('--append-system-prompt') || '').startsWith('You are running inside Workbench'), '--append-system-prompt');
   need(Number(value('--max-budget-usd')) > 0, '--max-budget-usd');
@@ -136,10 +144,16 @@ function main() {
     }
   }
 
+  // The hook's environment as Claude Code makes it: the process's, then the `env` of the repository's committed
+  // .claude/settings.json (--setting-sources project), then the `env` of --settings, which outranks it.
+  let repoEnv = {};
+  try { repoEnv = JSON.parse(readFileSync(path.join(process.cwd(), '.claude', 'settings.json'), 'utf8')).env || {}; } catch { /* none */ }
+  const hookEnv = { ...env, ...repoEnv, ...pinned };
+
   /** Run the PreToolUse hook as Claude Code does. Resolves to { decision: 'allow'|'deny'|'block'|'error'|'none', reason }. */
   function runHook(payload) {
     return new Promise((resolve) => {
-      const child = spawn('/bin/sh', ['-c', hook.command], { stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = spawn('/bin/sh', ['-c', hook.command], { env: hookEnv, stdio: ['pipe', 'pipe', 'pipe'] });
       if (env.FAKE_CLAUDE_PIDFILE && child.pid) writeFileSync(env.FAKE_CLAUDE_PIDFILE + '.hook', String(child.pid));
       let stdout = '';
       let stderr = '';

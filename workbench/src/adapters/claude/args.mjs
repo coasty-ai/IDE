@@ -59,11 +59,18 @@ export function hookCommand({ nodePath = process.execPath, bridgePath = BRIDGE_P
 
 /**
  * The --settings JSON: one PreToolUse hook for every tool. disableAllHooks is pinned to false: settings given on the
- * command line outrank the repository's own, so no settings file can switch the workbench's check off.
+ * command line outrank the repository's own, so no settings file can switch the workbench's check off. The same goes
+ * for the bridge's address and agent id: they are also in `env` here, so an `env` block in a committed
+ * .claude/settings.json cannot point the bridge elsewhere. The hook key is not (argv is public): it stays in the
+ * process environment only.
  */
-export function hookSettings({ nodePath, bridgePath } = {}) {
+export function hookSettings({ nodePath, bridgePath, url, agentId } = {}) {
+  const env = {};
+  if (url) env.WORKBENCH_HOOK_URL = String(url);
+  if (agentId) env.WORKBENCH_AGENT_ID = String(agentId);
   return {
     disableAllHooks: false,
+    ...(Object.keys(env).length ? { env } : {}),
     hooks: {
       PreToolUse: [
         {
@@ -171,7 +178,7 @@ export function buildClaudeLaunch(o = {}) {
     '--permission-mode', 'default',
     '--strict-mcp-config',
     '--disallowedTools', DISALLOWED_TOOLS,
-    '--settings', JSON.stringify(hookSettings({ nodePath, bridgePath })),
+    '--settings', JSON.stringify(hookSettings({ nodePath, bridgePath, url: hook.url, agentId })),
     '--append-system-prompt', WORKBENCH_PROMPT,
     '--max-budget-usd', budgetArg(budget),
     ...(resume ? ['--resume', session] : ['--session-id', session]),

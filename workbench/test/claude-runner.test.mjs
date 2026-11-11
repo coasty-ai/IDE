@@ -93,6 +93,7 @@ test('buildClaudeLaunch builds the verified command line', () => {
   assert.equal(l.bin, '/x/fake');
   const settings = JSON.stringify({
     disableAllHooks: false,
+    env: { WORKBENCH_HOOK_URL: HOOK.url, WORKBENCH_AGENT_ID: 'abc123' },
     hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: "'/usr/bin/env' '-u' 'NODE_OPTIONS' '/usr/local/bin/node' '/opt/work bench/hook-bridge.mjs'", timeout: 1800 }] }] },
   });
   assert.deepEqual(l.args, [
@@ -124,7 +125,12 @@ test('repository settings cannot switch the workbench hook off, or loosen Claude
     // Settings on the command line outrank the repository's, so disableAllHooks: true there changes nothing.
     const settings = JSON.parse(at('--settings'));
     assert.equal(settings.disableAllHooks, false);
-    assert.deepEqual(Object.keys(settings), ['disableAllHooks', 'hooks']);
+    assert.deepEqual(Object.keys(settings), ['disableAllHooks', 'env', 'hooks']);
+    // The bridge's address and agent id are pinned too: an env block in the repository's settings cannot redirect it.
+    assert.deepEqual(settings.env, { WORKBENCH_HOOK_URL: HOOK.url, WORKBENCH_AGENT_ID: 'abc123' });
+    // The key is only in the process environment, never in argv.
+    assert.ok(!JSON.stringify(l.args).includes(HOOK.token));
+    assert.equal(l.env.WORKBENCH_HOOK_TOKEN, HOOK.token);
     assert.deepEqual(Object.keys(settings.hooks), ['PreToolUse'], 'the bridge is registered for tool calls only');
     assert.match(settings.hooks.PreToolUse[0].hooks[0].command, /^'\/usr\/bin\/env' '-u' 'NODE_OPTIONS' /);
   }
