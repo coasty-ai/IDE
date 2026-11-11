@@ -556,6 +556,9 @@ function matchStop(core, c) {
   // Words that match nothing beside the agent's words say what to do, not which agent:
   // "stop the flaky test from timing out" is work, so it gets the start confirm like other work.
   if (r.ids.length && !r.full) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
+  // No agent matches (and it is no "it" or "that"): a work request that starts with a stop verb, so it gets the
+  // start confirm with the whole sentence as the task: "Start an agent to stop the flaky test from timing out?"
+  if (!r.ids.length && !PRONOUN_REFS.has(refWords)) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
   const intent = { kind: 'stop', agentIds: r.ids };
   if (r.ids.length && !r.named) intent.sure = false; // found, but not by its name: the engine asks first
   return { intent, strong: r.named };

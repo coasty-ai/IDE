@@ -261,7 +261,8 @@ test(`parseCommand handles ${TABLE.length} phrasings`, () => {
 });
 
 test('unresolved references still give the intent, with no agent', () => {
-  assert.deepEqual(parseCommand('stop the frobnicator', CTX.none), { kind: 'stop', agentIds: [] });
+  // ...except a stop verb with words that match no agent: that is work, with the whole sentence as its task.
+  assert.deepEqual(parseCommand('stop the frobnicator', CTX.none), { kind: 'task', task: 'stop the frobnicator' });
   assert.deepEqual(parseCommand('tell it to hurry up', CTX.none), { kind: 'say', agentId: null, text: 'hurry up' });
   // A name that matches nothing is not sent anywhere, not even to the focused agent.
   assert.deepEqual(parseCommand('tell the frobnicator to hurry up', CTX.onboarding), { kind: 'unknown', text: 'tell the frobnicator to hurry up' });
@@ -468,4 +469,15 @@ test('describeIntent writes plain confirm sentences', () => {
   for (const odd of [null, undefined, 5, {}, { kind: 'start' }, { kind: 'start', tasks: [null, { task: 3 }] }, { kind: 'stop' }, { kind: 'nope' }]) {
     assert.equal(typeof describeIntent(odd, null), 'string');
   }
+});
+
+test('a stop verb that matches no agent is a work request; a name still stops at once', () => {
+  assert.deepEqual(parseCommand('stop the flaky test from timing out', { agents: [] }), { kind: 'task', task: 'stop the flaky test from timing out' });
+  assert.equal(describeIntent(parseCommand('stop the flaky test from timing out', { agents: [] }), { agents: [] }),
+    'Start Claude on “stop the flaky test from timing out”?');
+  assert.deepEqual(parseCommand('stop it', { agents: [] }), { kind: 'stop', agentIds: [] });
+  assert.deepEqual(parseCommand('stop', { agents: [] }), { kind: 'stop', agentIds: [] });
+  assert.deepEqual(parseCommand('stop the onboarding agent', CTX.none), { kind: 'stop', agentIds: ['7a8b9c'] });
+  // While a question waits, the words answer it.
+  assert.deepEqual(parseCommand('stop the frobnicator', CTX.question), answer('stop the frobnicator'));
 });
