@@ -253,7 +253,7 @@ test('an agent that was working when Workbench was killed comes back stopped, in
   const v = await first.engine.startAgent({ task: 'Long job' });
   first.claude.runners.at(-1).emit({ kind: EV.SESSION, sessionId: SESSION });
   first.engine.killAllSync(); // a forced exit: the file is written with the agent still working
-  assert.equal(readFile(first).agents[0].state, 'starting');
+  assert.equal(readFile(first).agents[0].state, 'working'); // the session line already moved it on from starting
   const second = world(t, dir);
   await second.engine.start();
   const e = second.store.get(v.id);
