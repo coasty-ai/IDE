@@ -692,12 +692,13 @@ export class Engine extends EventEmitter {
       const cur = this.store.get(v.id);
       if (!cur || run.stopped || run.deciding || run.turnSeq !== seq || this._shuttingDown) return;
       if (run.runner?.info?.()?.alive) return;
-      const background = cur.state === STATE.MAYBE_STUCK && cur.ask?.about === 'background';
-      const unfinished = cur.state === STATE.STARTING || cur.state === STATE.WAITING_HELPERS || background
+      // An unresolved stuck ask of any kind (background, silence, repeats): the process is gone, so it cannot be answered.
+      const stuckAsk = cur.state === STATE.MAYBE_STUCK && cur.ask;
+      const unfinished = cur.state === STATE.STARTING || cur.state === STATE.WAITING_HELPERS || cur.state === STATE.MAYBE_STUCK
         || (cur.state === STATE.WORKING && run.inTurn);
       if (!unfinished) return;
       run.inTurn = false;
-      if (background) this.asks.delete(cur.ask.id);
+      if (stuckAsk) this.asks.delete(stuckAsk.id);
       this._apply([{ kind: EV.STATE, agentId: v.id, state: STATE.FAILED, reason: 'It stopped before finishing its work.' }]);
     }, this.options.exitGraceMs);
     timer.unref?.();

@@ -2247,6 +2247,24 @@ test('background: an answer that comes just after its process ended is refused p
   }
 });
 
+test('a root flagged "might be stuck" mid-turn that then exits cleanly becomes failed, and the ask is cleared', async () => {
+  const t = live({ options: { stuckSilenceMs: 1000, exitGraceMs: 30 } });
+  const { id, runner } = await started(t);
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.ACTIVITY, phase: 'start', sentence: 'Running the tests', toolKind: 'run', toolUseId: 't1' });
+  const v0 = t.store.get(id);
+  t.engine.tick(Math.max(v0.lastEventAt, v0.stateSince) + 1000);
+  assert.equal(t.store.get(id).state, 'maybe_stuck');
+  assert.equal(t.store.get(id).ask.type, 'stuck');
+  runner.alive = false;
+  runner.emit({ kind: EV.ENDED, outcome: 'ok' });
+  await until(() => t.store.get(id).state === 'failed');
+  assert.equal(t.store.get(id).stateReason, 'It stopped before finishing its work.');
+  assert.equal(t.store.get(id).ask, null);
+  assert.equal(t.engine.asks.size, 0);
+  await t.engine.shutdown();
+});
+
 // ------------------------------------------------------------------ snapshot
 
 test('snapshot has the contract fields, including repo and harness availability', async () => {
