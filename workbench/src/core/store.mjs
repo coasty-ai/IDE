@@ -400,6 +400,7 @@ export class Store extends EventEmitter {
       depth: parentId ? (parent ? parent.depth + 1 : 1) : 0,
       kind: parentId ? 'helper' : 'agent',
       name: ev.name,
+      fullName: ev.fullName,
       task: ev.task,
       harness: ev.harness || parent?.harness,
       helperType: ev.helperType,

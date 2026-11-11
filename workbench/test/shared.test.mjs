@@ -351,3 +351,14 @@ test('extractQuestion: short closing courtesies ending in "?" ask nothing; real 
   assert.equal(extractQuestion('I fixed it. Want me to do anything else with the tests?'), 'Want me to do anything else with the tests?');
   assert.equal(extractQuestion('I fixed it. Which database should I use?\n\nAnything else?'), 'Which database should I use?');
 });
+
+test('nameFromTask never cuts a word in half or ends on an ellipsis when whole words fit', () => {
+  assert.equal(nameFromTask('Repository exploration and architecture mapping'), 'Repository exploration');
+  assert.equal(nameFromTask('Investigate authentication middleware implementation details'), 'Investigate authentication');
+  assert.equal(nameFromTask('Find all usages of deprecated API calls across the codebase'), 'Find all usages');
+  for (const name of [nameFromTask('Explore the repository structure and dependencies'), nameFromTask('Check the docs for broken links in every folder')]) {
+    assert.ok(name.length <= 30 && !name.endsWith('…'), name);
+  }
+  // One word longer than the limit is the only thing that is cut.
+  assert.match(nameFromTask('Internationalization-and-localization-configuration'), /…$/);
+});

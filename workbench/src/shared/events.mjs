@@ -4,7 +4,7 @@
 
 /** Event kinds. Every event is { kind, agentId?, ts, ...fields }. */
 export const EV = Object.freeze({
-  CREATED: 'agent.created',       // { agentId, parentId|null, name, task, harness, kind, helperType?, model?, machineId, budgetUsd?, workspace? }
+  CREATED: 'agent.created',       // { agentId, parentId|null, name, fullName?, task, harness, kind, helperType?, model?, machineId, budgetUsd?, workspace? }
   STATE: 'agent.state',           // { agentId, state, reason? }
   ACTIVITY: 'agent.activity',     // { agentId, sentence, toolKind, toolUseId?, phase: 'start'|'end', ok? }
   THINKING: 'agent.thinking',     // { agentId, on: boolean }
@@ -38,7 +38,7 @@ export const SPARK_BUCKETS = 20;
  * @property {string} rootId
  * @property {number} depth             0 for a root agent
  * @property {string} name              short plain-language name
- * @property {string} task              the instruction it was given
+ * @property {string} fullName          the whole description the name was made from ("Repository exploration and architecture mapping"); the name itself when there is none
  * @property {'claude'|'codex'|'sim'} harness
  * @property {'agent'|'helper'} kind
  * @property {string|null} helperType   e.g. "Explore" for a Claude Code sub-agent
@@ -100,6 +100,7 @@ export function newAgentView(ev, now = Date.now()) {
     rootId: ev.rootId || ev.agentId,
     depth: ev.depth || 0,
     name: ev.name || 'Agent',
+    fullName: ev.fullName || ev.name || 'Agent',
     task: ev.task || '',
     harness: ev.harness || 'sim',
     kind: ev.kind || (ev.parentId ? 'helper' : 'agent'),

@@ -672,3 +672,15 @@ test('a stopped turn is still counted after a relaunch, once, whether or not the
   assert.equal(set2.costUsd, 0.0575);
   assert.equal(set2.unreportedUsd, 0);
 });
+
+test('a helper with a long description gets a short name cut between words, and the whole description as fullName', () => {
+  const description = 'Repository exploration and architecture mapping';
+  const { events } = run([
+    init(),
+    assistant('m1', [toolUse('call', 'Agent', { description, subagent_type: 'Explore', prompt: 'Map it' })]),
+    { type: 'system', subtype: 'task_started', task_id: 'feedbeef00', tool_use_id: 'call', description, subagent_type: 'Explore' },
+  ]);
+  const created = of(events, EV.CREATED, 'abc123-feedbeef')[0];
+  assert.equal(created.name, 'Repository exploration');
+  assert.equal(created.fullName, description);
+});

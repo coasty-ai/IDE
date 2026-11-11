@@ -544,7 +544,10 @@ export function nameFromTask(task, maxWords = 4) {
     if (picked.length >= maxWords) break;
     if (/[.;:!?]$/.test(w)) break;
   }
-  while (picked.length > 1 && TRAILING.has(picked[picked.length - 1].toLowerCase())) picked.pop();
+  const trim = () => { while (picked.length > 1 && TRAILING.has(picked[picked.length - 1].toLowerCase())) picked.pop(); };
+  trim();
+  // Too long: drop whole words from the end rather than cut one in half; only a single long word is clipped.
+  while (picked.length > 1 && picked.join(' ').length > 30) { picked.pop(); trim(); }
   const name = picked.join(' ');
   return cap(clip(name || 'New task', 30));
 }

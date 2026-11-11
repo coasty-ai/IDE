@@ -507,3 +507,12 @@ test('any output moves a starting root to working: init, a turn, thinking, text'
   s.apply({ kind: EV.THINKING, ts: T0 + 1000, agentId: 's2', on: false });
   assert.equal(s.get('s2').state, 'starting', 'thinking switching off is not output');
 });
+
+test('a view has fullName: the event\'s whole description, or the name itself', () => {
+  const { s } = recording();
+  s.apply(created('f1', { name: 'Repository exploration', fullName: 'Repository exploration and architecture mapping' }));
+  s.apply(created('f2'));
+  assert.equal(s.get('f1').fullName, 'Repository exploration and architecture mapping');
+  assert.equal(s.get('f1').name, 'Repository exploration');
+  assert.equal(s.get('f2').fullName, 'Fix login');
+});

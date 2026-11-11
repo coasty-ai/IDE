@@ -216,6 +216,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     const created = {
       parentId: h.parentId,
       name: desc ? nameFromTask(desc) : 'Helper',
+      fullName: desc ? clip(plain(desc), 200) || 'Helper' : 'Helper',
       task: String(prompt || desc || ''),
       harness: 'claude',
       helperType: subagentType || null,
