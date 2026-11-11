@@ -437,6 +437,27 @@ test('Claude Code that is no longer installed: continuing is refused in plain wo
   assert.equal(second.store.get(id).continueReason, 'Claude Code is not available on this computer.');
 });
 
+test('an earlier agent whose checks had failed does not count as needing the person', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir, {});
+  first.deps.receipt.runChecks = async () => ({ state: 'failed', results: [{ name: 'tests', ok: false, ms: 5, tail: 'SECRET-OUTPUT' }] });
+  first.deps.workspace.readRepoConfig = async () => ({ checks: [{ name: 'tests', run: 'npm test' }], rules: [], allow: [] });
+  await first.engine.start();
+  const v = await first.engine.startAgent({ task: 'Break a test' });
+  const r = first.claude.runners.at(-1);
+  r.emit({ kind: EV.SESSION, sessionId: SESSION });
+  r.emit({ kind: EV.TURN, phase: 'start' });
+  r.emit({ kind: EV.TURN, phase: 'end', finalText: 'Done.', backgroundTasks: 0 });
+  await until(() => first.store.get(v.id).state === 'checks_failed');
+  assert.match(first.engine._status().reply, /needs you/, 'in its own run it needs the person');
+  await first.engine.shutdown();
+  assert.ok(!fs.readFileSync(historyMod.historyFile(first.repoRoot, { dir: first.historyDir }), 'utf8').includes('SECRET-OUTPUT'), 'a check’s output is not kept');
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.equal(second.store.get(v.id).state, 'checks_failed');
+  assert.match(second.engine._status().reply, /^Nothing needs you right now\./);
+});
+
 // ------------------------------------------------------------------ forget
 
 test('"forget <name>" asks first; yes removes the agent from the board and the file, and keeps its folder', async (t) => {

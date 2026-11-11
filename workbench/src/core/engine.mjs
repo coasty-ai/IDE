@@ -2104,7 +2104,7 @@ export class Engine extends EventEmitter {
     }
     const all = this.store.list();
     if (!all.length) return { reply: 'No agents yet. Say “start an agent to …” to begin.' };
-    const needs = all.filter(v => NEEDS_YOU.has(v.state));
+    const needs = all.filter(v => !v.earlier && NEEDS_YOU.has(v.state)); // an earlier agent waits on nobody
     const working = all.filter(v => !v.parentId && (v.state === STATE.WORKING || v.state === STATE.STARTING || v.state === STATE.WAITING_HELPERS));
     const parts = [];
     if (needs.length) {

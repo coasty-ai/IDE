@@ -76,6 +76,16 @@ Screenshots of each look and view are in `docs/screens/`.
 - **Cloud machines are simulated** and appear only in demo mode.
 - **Voice** uses the browser's speech recognition. In Chrome this sends the audio to Google's speech service. Typing works everywhere.
 
+## Earlier agents
+
+The workbench remembers the last 50 agents of each repository in `~/.workbench/history/`, one small file per repository (written when something meaningful changes, and when the workbench stops). Start it again on the same repository and they are back:
+
+- They wait in the done tray, dimmed, marked “from earlier”, and are never counted as needing you. Pick one from the tray and the middle says how it ended and how long ago.
+- **Continue** (or sending it a message, or typing “continue search cleanup”) picks it up where it left off, in its own folder and with its own conversation: Claude Code resumes its session, Codex its thread. It gets a **fresh spending limit** for this run (your `--budget`), and the middle says so before you press the button.
+- If its folder or conversation is gone, it still shows, says why in plain words (“Its folder is gone, so it cannot continue.”) and offers only **Forget**.
+- **Forget** (or typing “forget search cleanup”) takes it out of the list after asking you first. It does not delete its folder or branch: remove those yourself, as described below.
+- The file holds the task, the agent's last words, what it changed, its cost and where its folder and conversation are. It holds no keys. Delete the file to forget everything. The demo keeps nothing.
+
 ## Checks and rules (optional)
 
 Put a `workbench.json` at the root of your repository and commit it:
@@ -105,7 +115,7 @@ The workbench reads this file from your last commit, never from an agent's copy,
 
 ## Limits (first prototype)
 
-- The workbench keeps no history: after it stops, earlier agents do not appear again and cannot be resumed.
+- Only agents started by the workbench come back (see “Earlier agents” above). Their helpers, plans and step lists are not kept, and an agent that was working when the workbench closed comes back stopped.
 - Each agent's changes stay on your computer after the workbench stops, in its own folder under `~/.workbench/worktrees/`, on a branch named `workbench/<task>-<id>`; the terminal lists them when the workbench stops. The changes may not be committed. Folders where an agent changed nothing are removed, unless you press Ctrl-C twice: then the workbench stops without tidying up, every folder stays, and the terminal lists them all. To remove one yourself: `git worktree remove <folder>`, then `git branch -D workbench/<task>-<id>`.
 - Sessions started outside the workbench, for example `claude` in your own terminal, do not appear.
 - How far along an agent is cannot be measured honestly, so there is no percentage or finish time. The card shows elapsed time, steps, the agent's own plan and spend instead.

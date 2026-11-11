@@ -612,6 +612,62 @@ try {
     check('reply chip: an answer in your own words goes to that ask', p.length === 1 && p[0].path === '/api/agents/r1/answer' && p[0].body.askId === 'k1' && p[0].body.answer === 'keep it for a month', JSON.stringify(p.map(x => [x.path, x.body])));
   });
 
+  await run('earlier agents: in the tray, never in the queue; Continue picks one up; Forget asks first', async () => {
+    await open('earlier');
+    await sleep(900);
+    const first = await h1();
+    // the board's own ask comes first; the earlier agents wait in the tray with their own words
+    const trayText = await b.ev(`document.getElementById('tray').textContent`);
+    const chips = await b.ev(`[...document.querySelectorAll('#parts .chip')].map(c => c.dataset.id).join(',')`);
+    check('earlier agents sit in the tray, not on a lane, and the queue is only what needs you now',
+      /^5 from earlier/.test(trayText) && chips === 'e-live1,e-live2' && /Checkout fix wants/.test(first), `tray "${trayText}", chips ${chips}, lid "${first}"`);
+    // pick one from the tray's list
+    await click('#tray'); await sleep(300);
+    const rows = await b.ev(`[...document.querySelectorAll('#trayList .row')].map(r => r.textContent.trim() + (r.classList.contains('earlier') ? ' [earlier]' : '')).join(' | ')`);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="e-old0"]').click(), 1`); await sleep(900);
+    const lid = `${await b.ev(`${page()}?.querySelector('.count')?.textContent || ''`)} / ${await h1()}`;
+    check('picking an earlier agent from the tray puts it in the core with Continue and Forget',
+      /From an earlier run/.test(lid) && /Invoice export was done and checked/.test(lid) && /\[earlier\]/.test(rows)
+      && (await b.ev(`!!${page()}?.querySelector('[data-act="fix"]') && !!${page()}?.querySelector('[data-act="forget"]')`)), `${lid}; rows ${rows.slice(0, 120)}`);
+    // Forget: asks first, with the engine's card
+    await clearLog();
+    await clickIn('[data-act="forget"]'); await sleep(900);
+    const asked = await h1();
+    const cmd = (await posts()).filter(x => x.path === '/api/command');
+    check('Forget sends "forget it" for that agent and shows the engine’s question; nothing is forgotten yet',
+      cmd.length === 1 && cmd[0].body.text === 'forget it' && cmd[0].body.focusId === 'e-old0' && /^Forget Invoice export\?/.test(asked) && !!(await agentOf('e-old0')), `${JSON.stringify(cmd.map(x => x.body))} / ${asked}`);
+    await clickIn('[data-act="confirm"][data-go="0"]'); await sleep(600);
+    check('Cancel keeps it', !!(await agentOf('e-old0')) && (await posts()).some(x => /\/api\/confirm\//.test(x.path) && x.body.go === false));
+    // Forget, yes: gone from the page after the fresh snapshot
+    await open('earlier'); await sleep(700);
+    await click('#tray'); await sleep(250);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="e-old3"]').click(), 1`); await sleep(900);
+    await clickIn('[data-act="forget"]'); await sleep(900);
+    await clickIn('[data-act="confirm"][data-go="1"]'); await sleep(1000);
+    const left = await b.ev(`document.getElementById('tray').textContent`);
+    check('Forget, yes: the agent leaves the tray and the state', !(await agentOf('e-old3')) && /^4 from earlier/.test(left), `tray "${left}"`);
+    // Continue: a message, in the same folder; the agent is an ordinary one again, on a lane
+    await open('earlier'); await sleep(700);
+    await click('#tray'); await sleep(250);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="e-old1"]').click(), 1`); await sleep(900);
+    await clearLog();
+    await clickIn('[data-act="fix"]'); await sleep(1200);
+    const say = (await posts()).filter(x => x.path.includes('/say'));
+    const chips2 = await b.ev(`[...document.querySelectorAll('#parts .chip')].map(c => c.dataset.id).join(',')`);
+    check('Continue sends the message to that agent, which then has a lane and leaves the tray',
+      say.length === 1 && say[0].path === '/api/agents/e-old1/say' && say[0].body.text === 'Please continue where you left off.' && /e-old1/.test(chips2) && !(await agentOf('e-old1')).earlier,
+      `${JSON.stringify(say.map(x => [x.path, x.body]))}; chips ${chips2}`);
+  });
+
+  await run('an earlier agent that cannot continue offers only Forget', async () => {
+    await open('earlier'); await sleep(700);
+    await click('#tray'); await sleep(250);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="e-old2"]').click(), 1`); await sleep(900);
+    const txt = await b.ev(`${page()}?.textContent || ''`);
+    const acts = await b.ev(`[...${page()}.querySelectorAll('[data-act]')].map(x => x.dataset.act).join(',')`);
+    check('an earlier agent whose folder is gone says so and has no Continue', /Its folder is gone, so it cannot continue\./.test(txt) && !/fix/.test(acts) && /forget/.test(acts), `${acts} / ${txt.slice(0, 160)}`);
+  });
+
   if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);
   else check('no script errors', true);
 } finally {
