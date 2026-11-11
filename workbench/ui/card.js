@@ -8,6 +8,7 @@ import { S, machineName, harnessLabel, helpersOf, helpersAtWork } from './model.
 import { markOf, markOfAgent } from './look.js';
 import { newTokens, stepsInWindow, windowMinutes, spentWords, calmDuration } from './numbers.js';
 import { esc } from './util.js';
+import { agoText } from './boardmodel.js';
 
 const mark = (shape, tone) => `<svg class="g c-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
 
@@ -20,6 +21,8 @@ function sparkSvg(values) {
 }
 
 function nowLine(a, now) {
+  // restored from history: no process, nothing "now"; where it ended is what the person wants to know
+  if (a.earlier) return `<span class="now">From an earlier run</span> <em>· ${esc(agoText(now - (a.endedAt || a.stateSince)))}</em>`;
   if (a.ask && NEEDS_YOU.has(a.state)) {
     let s = a.ask.sentence || '';
     if (s.startsWith(a.name + ' ')) s = s.slice(a.name.length + 1).replace(/^./, c => c.toUpperCase());
@@ -42,6 +45,7 @@ function nowLine(a, now) {
 /** A one-sentence summary, for screen readers (the chip's aria-describedby points here). */
 function summary(a, now) {
   const parts = [];
+  if (a.earlier) parts.push(`From an earlier run, ${agoText(now - (a.endedAt || a.stateSince))}`);
   if (a.ask && NEEDS_YOU.has(a.state)) parts.push(a.ask.sentence);
   else if (a.state === 'working' || a.state === 'starting') parts.push(a.now || 'Working');
   else parts.push(markOf(a.state, LOOK).label);

@@ -13,7 +13,7 @@ import { launch, sleep } from './ui-cdp.mjs';
 const SIZES = ['960x900', '1024x700', '1280x680', '1440x789', '1512x862', '1728x1000', '1920x970', '2560x1300'];
 const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
-const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap'];
+const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap'];
 
 const args = process.argv.slice(2);
 const opt = k => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : null; };
@@ -228,6 +228,22 @@ try {
         const shown = await b.ev(`!document.getElementById('trayList').hidden`);
         if (!shown) failures.push(`${tag}: the done tray did not open its list`);
         await check(tag);
+      } else if (v === 'earlier') {
+        // agents from an earlier run: in the lid (one that can continue, one that cannot), the tray's list, the forget
+        // question, and a card pinned on one
+        await load('earlier', '&focus=e-old0'); await check(tag + ' (can continue)');
+        await load('earlier', '&focus=e-old2'); await check(tag + ' (cannot continue)');
+        await load('earlier', '&focus=e-old4'); await check(tag + ' (failed)');
+        await load('earlier', '&pin=e-old0'); await check(tag + ' (pinned card)');
+        await load('earlier-many');
+        await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
+        if (!(await b.ev(`!document.getElementById('trayList').hidden`))) failures.push(`${tag}: the tray did not open its list`);
+        await check(tag + ' (tray list)');
+        await load('earlier', '&focus=e-old1');
+        await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="forget"]')?.click(), true`); await sleep(900); await settle(100);
+        const q = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
+        if (!/^Forget /.test(q)) failures.push(`${tag}: the forget question did not show (${q.slice(0, 40)})`);
+        await check(tag + ' (forget question)');
       } else if (v === 'menu') {
         await load('demo');
         await b.ev(`document.getElementById('brand').click(), true`); await settle(150); await check(tag);

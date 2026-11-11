@@ -8,6 +8,7 @@ import { markOfAgent } from './look.js';
 import { spentWords } from './numbers.js';
 import { visibleControls, clipMiddle, whoAsks, headlineClass } from './words.js';
 import { esc } from './util.js';
+import { agoText } from './boardmodel.js';
 
 const mark = (shape, tone) => `<svg class="g k-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
 // "waiting 4 min": whole minutes only, so the lid does not tick every second while something waits ("asked just now" first)
@@ -147,7 +148,23 @@ export function lidView(f, o = {}) {
   // the meta line: everything in "more", the essentials when calm, nothing once the lid is short of room
   const meta = (extraHtml, essentials = extraHtml) => metaP(fs.meta === 2 && more ? metaLine(a, extraHtml, true) : fs.meta ? metaLine(a, essentials, false) : '');
 
-  switch (a.state) {
+  switch (a.earlier && !a.parentId ? 'earlier' : a.state) {
+    case 'earlier': {
+      // Restored from history: it has no process. It can be picked up where it left off (a new spending limit for this
+      // run), or forgotten; either way what it did stays in its folder.
+      count = `<div class="count"><span class="who">${mark(m.shape, m.tone)}<span>From an earlier run</span></span></div>`;
+      const ended = { done_checked: 'was done and checked', done_claimed: 'said it was done', checks_failed: 'was done, but a check failed', failed: 'stopped with an error', stopped: 'was stopped' }[a.state] || 'ran earlier';
+      sentence = `${a.name} ${ended}.`;
+      const budget = S.meta.defaultBudgetUsd;
+      const note = a.canContinue
+        ? (budget ? `It would get a new spending limit of ${money(budget)} for this run.` : 'It would pick up where it left off.')
+        : (a.continueReason || 'It cannot continue.');
+      msg += metaP(esc(`${agoText(Date.now() - (a.endedAt || a.stateSince))}${fs.meta && a.says ? ` · ${clip(a.says, more ? 110 : 70)}` : ''}`));
+      if (fs.meta) msg += metaP(esc(note));
+      acts = (a.canContinue ? big('Continue', { act: 'fix', ...st, text: 'Please continue where you left off.' }, true) : '')
+        + big('Forget', { act: 'forget', ...st }, !a.canContinue);
+      break;
+    }
     case 'needs_ok': {
       sentence = `${(ask?.sentence || `${a.name} needs your OK`).replace(/[.\s]+$/, '')}.`;
       // Security over calm: the exact command or path, always, with the check's own reason.

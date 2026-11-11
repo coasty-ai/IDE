@@ -317,9 +317,9 @@ export class Board {
     const t = this.tray;
     if (!G.tray || !tray || !tray.count) { t.hidden = true; delete t.dataset.box; return; }
     t.hidden = false;
-    const html = `<span class="bank" aria-hidden="true">${tray.marks.slice(0, 8).map(m => `<i>${glyph(m.shape, m.tone)}</i>`).join('')}</span><span><b>${tray.count} done</b> or stopped${tray.over ? `, ${tray.over} more working` : ''}</span>`;
+    const html = `<span class="bank" aria-hidden="true">${tray.marks.slice(0, 8).map(m => `<i>${glyph(m.shape, m.tone)}</i>`).join('')}</span><span><b>${esc(tray.lead)}</b>${esc(tray.rest)}</span>`;
     if (t.dataset.html !== html) { t.innerHTML = html; t.dataset.html = html; }
-    t.setAttribute('aria-label', `${tray.count} agent${tray.count === 1 ? ' is' : 's are'} done or stopped${tray.over ? `, and ${tray.over} more are working` : ''}. Show them.`);
+    t.setAttribute('aria-label', tray.aria);
     Object.assign(t.style, { left: G.tray.x + 'px', top: G.tray.y + 'px', maxWidth: G.tray.w + 40 + 'px' });
     t.dataset.box = 'tray';
   }

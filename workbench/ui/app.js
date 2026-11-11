@@ -6,7 +6,7 @@ import { money, clip } from '/shared/format.mjs';
 import { initToken, hasToken, whenRefused, api, connect } from './api.js';
 import { linkState, cannotSend } from './link.js';
 import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName } from './model.js';
-import { boardModel } from './boardmodel.js';
+import { boardModel, splitEarlier, trayWords, agoText } from './boardmodel.js';
 import { Lanes, denseLanes } from './lanes.js';
 import { sizeClass, frame, layoutBoard, maxDenseRows } from './layout.js';
 import { Board } from './board.js';
@@ -304,12 +304,15 @@ function renderNow(o = {}) {
   const { f, also } = showData ? shownFocus() : { f: { empty: true }, also: false };
   const agents = showData ? [...S.agents.values()] : [];
   const bm = boardModel(agents, { ...STATES, later: S.later, currentId: f.agent ? f.agent.id : null, machineName });
-  if (bm.roots.length) lanes.assign(bm.roots.map(r => ({ id: r.id, startedAt: r.startedAt, laptop: (S.machines.find(m => m.id === r.machineId)?.kind || (r.machineId === 'laptop' ? 'laptop' : 'cloud')) === 'laptop' })));
+  // agents from an earlier run wait in the done tray: they never take a lane
+  const { current, earlier } = splitEarlier(bm.roots);
+  if (current.length) lanes.assign(current.map(r => ({ id: r.id, startedAt: r.startedAt, laptop: (S.machines.find(m => m.id === r.machineId)?.kind || (r.machineId === 'laptop' ? 'laptop' : 'cloud')) === 'laptop' })));
   // past twelve agents, finished work moves to the done tray and each lane splits in two
-  const dense = bm.roots.length > 12;
-  let roots = bm.roots, laneOf = id => lanes.get(id), nRows = 6, tray = null, overflow = [];
+  const dense = current.length > 12;
+  let roots = current, laneOf = id => lanes.get(id), nRows = 6, tray = null, overflow = [];
+  let done = [];
   if (dense) {
-    const done = roots.filter(r => r.ghost);
+    done = roots.filter(r => r.ghost);
     // newcomers take the free rows in this order: whatever needs the person first, so an asker always has a chip
     const active = roots.filter(r => !r.ghost).sort((a, b) => (b.stop === 'inner') - (a.stop === 'inner'));
     const d = denseLanes(active, id => lanes.get(id), maxDenseRows(H, P));
@@ -317,11 +320,13 @@ function renderNow(o = {}) {
     roots = active.filter(r => !overflow.includes(r.id));
     laneOf = id => d.at.get(id) || null;
     nRows = d.rows;
-    const marks = done.map(r => markOf(r.state, STATES.LOOK));
-    tray = { count: done.length, over: overflow.length, ids: done.map(r => r.id).concat(overflow), marks, text: `${done.length} done or stopped${overflow.length ? `, ${overflow.length} more working` : ''}` };
-    if (!done.length && !overflow.length) tray = null;
   }
-  trayIds = tray ? { done: tray.ids.slice(0, tray.count), over: overflow.slice() } : { done: [], over: [] };
+  if (done.length || earlier.length || overflow.length) {
+    const marks = done.concat(earlier).map(r => markOf(r.state, STATES.LOOK));
+    const words = trayWords({ done: done.length, earlier: earlier.length, over: overflow.length });
+    tray = { count: done.length + earlier.length, done: done.length, earlier: earlier.length, over: overflow.length, ids: done.map(r => r.id).concat(earlier.map(r => r.id), overflow), marks, ...words };
+  }
+  trayIds = tray ? { done: tray.ids.slice(0, tray.done), earlier: tray.ids.slice(tray.done, tray.count), over: overflow.slice() } : { done: [], earlier: [], over: [] };
   const fr = frame(W, H, P, { nRows, dense });
   const maxPage = fr.lidMaxH - P.lid.padT - P.lid.padB - P.lid.inh - P.lid.gap3;
   const v = buildLid(f, also, P, maxPage);
@@ -415,7 +420,7 @@ function renderCard(quiet = false) {
 
 // ---------------------------------------------------------------- answering what the core shows
 const changed = () => { say('That changed. Have another look.', 5000); render(); };
-const GUARDED = new Set(['answer', 'looksgood', 'fix', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick']);
+const GUARDED = new Set(['answer', 'looksgood', 'fix', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick', 'forget']);
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 /**
  * The engine says where to look next (the asker after a refused answer, a stopped agent, a new one): follow it. An agent
@@ -490,6 +495,11 @@ el.pages.addEventListener('click', async e => {
       const r = await api.say(a.id, b.dataset.text);
       say(r.reply || `Sent to ${a.name}.`);
       if (S.focusId === a.id) S.focusId = null;
+    } else if (act === 'forget') {
+      // an agent from an earlier run: the engine asks first, with a card like a launch's
+      busy(b);
+      const r = await api.command('forget it', { focusId: a.id });
+      if (r.confirm) S.confirm = r.confirm; else say(r.reply || '');
     } else if (act === 'looksgood') {
       // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is
       busy(b);
@@ -795,16 +805,17 @@ function closeTray() {
   el.tray.setAttribute('aria-expanded', 'false');
   if (inside) el.tray.focus({ preventScroll: true });
 }
-let trayIds = { done: [], over: [] };
+let trayIds = { done: [], earlier: [], over: [] };
 function renderTrayList() {
   const row = id => {
     const a = S.agents.get(id);
     if (!a) return '';
     const m = markOf(a.state, STATES.LOOK);
-    return `<button type="button" class="row" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(a.name)} <em>· ${esc(m.label)}</em></span></button>`;
+    const note = a.earlier ? agoText(Date.now() - (a.endedAt || a.stateSince)) : m.label;
+    return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(a.name)} <em>· ${esc(note)}</em></span></button>`;
   };
-  const done = trayIds.done.map(row).join(''), over = trayIds.over.map(row).join('');
-  patchChildren(el.trayList, `<h2>Done or stopped</h2>${done || '<p class="note">Nothing yet.</p>'}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  const done = trayIds.done.map(row).join(''), over = trayIds.over.map(row).join(''), early = (trayIds.earlier || []).map(row).join('');
+  patchChildren(el.trayList, `${done || !early ? `<h2>Done or stopped</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
   const r = el.tray.getBoundingClientRect();
   // above the tray, inside the board and beside the core (never on it, never on the top band)
   const top = G ? G.board.y + G.P.topBand : 8;

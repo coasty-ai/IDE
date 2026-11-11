@@ -448,6 +448,7 @@ svg.g { width: 10px; height: 10px; flex: none; }
 :root[data-theme="ivory"] .pop button:focus-visible, :root[data-theme="ivory"] .pop input:focus-visible + span { outline-color: var(--focus); }
 #trayList .row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; border: 0; padding: 6px 8px; }
 #trayList .row:hover { background: var(--card-1); }
+#trayList .row.earlier { opacity: .78; }
 #trayList .row span { min-width: 0; overflow-wrap: anywhere; }
 #trayList .row em { font-style: normal; color: var(--card-sub); }
 #trayList h2 { margin: 2px 8px 6px; font-size: 11px; font-weight: 600; color: var(--card-ink-2); letter-spacing: .4px; }

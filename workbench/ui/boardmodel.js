@@ -43,7 +43,7 @@ export function boardModel(agents, ctx) {
       status: askingKid && !rootNeeds ? 'helper needs you' : statusWords(a, LOOK),
       stop, lit: inner ? (markOfAgent(asker, LOOK).tone === 'stuck' ? 'stuck' : 'need') : null,
       qno: qi == null ? null : qi + 1, current: currentRoot === a.id,
-      ghost: finished && !inner, failed: a.state === 'failed' && !inner,
+      ghost: finished && !inner, failed: a.state === 'failed' && !inner, earlier: !!a.earlier,
       working: (a.state === 'working' || a.state === 'starting') && stop === 'mid',
       kids: kids.map(k => {
         const m = markOfAgent(k, LOOK);
@@ -53,4 +53,36 @@ export function boardModel(agents, ctx) {
     };
   });
   return { roots, queue, byId };
+}
+
+/**
+ * Agents from an earlier run (restored from history) never take a lane: they wait in the done tray, so a fresh start with
+ * a long history still leaves the board to the agents that run now. One that is continued stops being `earlier` and gets a lane.
+ */
+export function splitEarlier(roots) {
+  return { current: roots.filter(r => !r.earlier), earlier: roots.filter(r => r.earlier) };
+}
+
+/** "just now", "12 min ago", "3 hours ago", "2 days ago": coarse, so it does not change every second. */
+export function agoText(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return 'a while ago';
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min} min ago`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h} hour${h === 1 ? '' : 's'} ago`;
+  const d = Math.floor(h / 24);
+  return `${d} day${d === 1 ? '' : 's'} ago`;
+}
+
+/**
+ * What the done tray says. `done`: finished or stopped agents on the board's own run, `earlier`: agents from earlier runs,
+ * `over`: working agents with no room on the board. lead is the bold part; text is all of it, plain (for measuring).
+ */
+export function trayWords({ done = 0, earlier = 0, over = 0 }) {
+  const lead = done ? `${done} done` : `${earlier} from earlier`;
+  const rest = [done ? ' or stopped' : '', done && earlier ? `, ${earlier} from earlier` : '', over ? `, ${over} more working` : ''].join('');
+  const aria = [done ? `${done} done or stopped` : '', earlier ? `${earlier} from an earlier run` : '', over ? `${over} more working with no room on the board` : '']
+    .filter(Boolean).join(', ');
+  return { lead, rest, text: lead + rest, aria: `${aria}. Show them.` };
 }

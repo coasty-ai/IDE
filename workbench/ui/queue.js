@@ -11,7 +11,7 @@ export const finishKey = a => `${a.id}@${a.endedAt ?? a.stateSince ?? 0}`;
  * @param {{ NEEDS_YOU: Set<string>, later?: Set<string> }} ctx
  */
 export function needsPerson(a, { NEEDS_YOU, later }) {
-  if (!a || !NEEDS_YOU.has(a.state)) return false;
+  if (!a || a.earlier || !NEEDS_YOU.has(a.state)) return false; // an agent from an earlier run waits on nobody
   return !(a.state === 'checks_failed' && later && later.has(finishKey(a)));
 }
 
@@ -26,7 +26,7 @@ export function needsQueue(agents, { NEEDS_YOU, PRIORITY, later }) {
 /** Finished roots not looked at yet (in this finish), newest first. */
 export function reviewQueue(agents, { reviewed }) {
   return [...agents]
-    .filter(a => !a.parentId && (a.state === 'done_checked' || a.state === 'done_claimed' || a.state === 'failed') && !(reviewed && reviewed.has(finishKey(a))))
+    .filter(a => !a.parentId && !a.earlier && (a.state === 'done_checked' || a.state === 'done_claimed' || a.state === 'failed') && !(reviewed && reviewed.has(finishKey(a))))
     .sort((a, b) => (b.endedAt || b.stateSince || 0) - (a.endedAt || a.stateSince || 0));
 }
 

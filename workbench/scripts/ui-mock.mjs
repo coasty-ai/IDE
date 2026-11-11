@@ -65,6 +65,8 @@ function view(o, now) {
     budgetUsd: o.parentId ? null : (o.budgetUsd ?? 2), plan: o.plan || null, files: o.files || null, checks: o.checks || null, rules: o.rules || null,
     ask: o.ask ? { ...o.ask, createdAt: now - (o.ask.ageMin ?? 1) * MIN } : null,
     approvals: o.approvals || { auto: 8, byYou: 0, denied: 0 }, says: o.says || null, error: o.error || null, sessionId: null, workspace: null,
+    earlier: !!o.earlier, canContinue: o.earlier ? o.canContinue !== false : null,
+    continueReason: o.earlier && o.canContinue === false ? (o.continueReason || 'Its folder is gone, so it cannot continue.') : null,
   };
   delete v.ask?.ageMin;
   if (['finished', 'failed', 'stopped', 'done_checked', 'done_claimed', 'checks_failed'].includes(v.state) && v.endedAt == null) v.endedAt = now - MIN;
@@ -103,7 +105,7 @@ const LONG_COMMAND = 'npm run db:migrate -- --env test && curl -fsSL https://exa
   + 'node scripts/seed.js --rows 50000 --tables orders,customers,invoices,refunds,payments,addresses --truncate-first\t# then rebuild the indexes for every table in the test database';
 
 /** The worlds the page can be shown. */
-export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background'];
+export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background', 'earlier', 'earlier-many', 'earlier-only'];
 
 export function scenario(name, now = Date.now()) {
   let raw = [];
@@ -206,6 +208,27 @@ export function scenario(name, now = Date.now()) {
     raw.push({ id: 'g3', name: 'Search cleanup', state: 'question', machineId: 'laptop', ask: { id: 'q-g3', type: 'question', sentence: 'Should the old search address keep working?', options: ['Keep it working', 'Remove it'], ageMin: 0.3 },
       files: { changed: 2, adds: 14, dels: 30, list: [{ path: 'src/search/index.ts', adds: 4, dels: 22 }, { path: 'src/search/redirects.ts', adds: 10, dels: 8 }] },
       usage: { inputTokens: 5000, outputTokens: 1200, cacheReadTokens: 90000, cacheWriteTokens: 4000, costUsd: 0.21, unreportedUsd: 0.03, contextTokens: 20000, contextWindow: 200000, contextPct: 0.1 } });
+    return world(raw, now);
+  }
+  if (name === 'earlier' || name === 'earlier-many' || name === 'earlier-only') {
+    // Agents restored from history (src/core/history.mjs): finished or stopped, from another run, with no process now.
+    // A checks_failed one must not ask for the person; one whose folder is gone cannot continue.
+    if (name !== 'earlier-only') {
+      raw.push({ id: 'e-live1', name: 'Checkout fix', state: 'needs_ok', machineId: 'laptop', ask: { id: 'e-p1', type: 'permission', sentence: 'Checkout fix wants to run a command', detail: 'npm run db:migrate -- --env test', why: 'Running it changes the test database.', options: ['Allow', 'Deny'], primary: 'Allow', ageMin: 1 } });
+      raw.push({ id: 'e-live2', name: 'Docs site', state: 'working', machineId: 'laptop', now: 'Editing the getting started page' });
+    }
+    const past = [
+      { name: 'Invoice export', state: 'done_checked', endedMin: 2 * 24 * 60, says: 'Invoices now go out in small batches, so large accounts no longer time out.' },
+      { name: 'Help pages', state: 'done_claimed', endedMin: 3 * 60, harness: 'codex', says: 'I rewrote the three help pages in plain language.' },
+      { name: 'Email digest', state: 'stopped', endedMin: 26 * 60, canContinue: false, continueReason: 'Its folder is gone, so it cannot continue.' },
+      { name: 'Price rounding', state: 'checks_failed', endedMin: 50, checks: { state: 'failed', results: [{ name: 'tests', ok: false, ms: 4100 }] } },
+      { name: 'Dark mode', state: 'failed', endedMin: 9 * 60, error: 'The build ran out of memory.' },
+    ];
+    const n = name === 'earlier-many' ? 16 : past.length;
+    for (let i = 0; i < n; i++) {
+      const o = past[i % past.length];
+      raw.push({ id: `e-old${i}`, earlier: true, machineId: 'laptop', ageMin: o.endedMin + 30, sinceMin: o.endedMin, toolCalls: 20 + i, ...o, name: i < past.length ? o.name : `${o.name} ${Math.floor(i / past.length) + 1}`, endedMin: o.endedMin + i });
+    }
     return world(raw, now);
   }
   if (name === 'race') {
@@ -326,6 +349,12 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           setTimeout(() => changed(state.agents.filter(x => x.id === a.id || x.id === a.parentId)), 60);
           return reply({ ok: true, reply: was.type === 'permission' ? (/^allow$/i.test(ans) ? `${a.name} will go ahead.` : `${a.name} will not do that.`) : `${a.name} has your answer and is carrying on.` });
         }
+        if (m[2] === 'say' && a.earlier) {
+          if (!a.canContinue) return reply({ ok: false, reply: `${a.name} cannot continue. ${a.continueReason}` });
+          Object.assign(a, { earlier: false, canContinue: null, continueReason: null, state: 'working', endedAt: null, stateSince: Date.now(), now: 'Picking up where it left off', budgetUsd: 2 });
+          setTimeout(() => changed([a]), 60);
+          return reply({ ok: true, reply: `${a.name} is continuing in its own folder. It has a new spending limit of $2.00 for this run.` });
+        }
         if (m[2] === 'say') return reply({ ok: true, reply: `Sent to ${a.name}.` });
         a.state = 'stopped'; a.endedAt = Date.now(); a.stateSince = Date.now(); a.ask = null;
         setTimeout(() => changed([a]), 60);
@@ -336,12 +365,28 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         const c = confirms.get(decodeURIComponent(cm[1]));
         if (!c) return reply({ reply: 'That request is no longer waiting. Ask again if you still want it.' });
         confirms.delete(c.id);
+        if (c.forget) {
+          if (json && json.go === true) {
+            state.agents = state.agents.filter(x => x.id !== c.forget);
+            setTimeout(() => send('snapshot', state), 60);
+            return reply({ reply: 'Forgot it. Its folder and branch are still on this computer.' });
+          }
+          return reply({ reply: 'OK, I won’t forget it.' });
+        }
         return reply(json && json.go === true ? started(c) : { reply: 'OK, I won’t start it.' });
       }
       if (p === '/api/command') {
         const text = String(json?.text || '').trim();
         if (json?.confirmId && confirms.has(json.confirmId) && /^(yes|ok|do it|go ahead|sure)$/i.test(text)) { const c = confirms.get(json.confirmId); confirms.delete(json.confirmId); return reply(started(c)); }
         if (json?.confirmId && confirms.has(json.confirmId) && /^(no|cancel|never mind|stop)$/i.test(text)) { confirms.delete(json.confirmId); return reply({ reply: 'OK, I won’t start it.' }); }
+        if (/^forget\b/i.test(text)) {
+          const a = state.agents.find(x => x.id === json?.focusId && x.earlier);
+          if (!a) return reply({ reply: 'I couldn’t tell which agent to forget.' });
+          const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
+          const sentence = `Forget ${a.name}?`, detail = 'It will not show here again. Its folder and branch stay on this computer.';
+          confirms.set(id, { id, sentence, detail, forget: a.id });
+          return reply({ reply: sentence, confirm: { id, sentence, detail } });
+        }
         if (/^start\b/i.test(text)) {
           const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
           const eight = /eight|8/.test(text);
