@@ -338,3 +338,16 @@ test('spentText: Codex never reports cost, so it reads "not reported"; under a c
   assert.equal(spentAmount(0.62, false), '$0.62');
   assert.equal(spentAmount(0, false), '$0');
 });
+
+test('extractQuestion: short closing courtesies ending in "?" ask nothing; real questions still do', () => {
+  for (const c of ['Anything else?', 'Anything more?', 'Want me to do anything else?', 'Need anything else?', 'Would you like anything else?',
+    'Do you want anything else?', 'Can I help with anything else?', 'Is there anything else you need?', 'Need anything else from me?', 'What else can I do?']) {
+    assert.equal(extractQuestion(`I fixed the redirect. All tests pass.\n\n${c}`), null, c);
+    assert.equal(extractQuestion(`I fixed the redirect. ${c}`), null, c);
+  }
+  assert.equal(extractQuestion('I fixed it. Want me to also fix the lint errors?'), 'Want me to also fix the lint errors?');
+  assert.equal(extractQuestion('I fixed it. Do you need anything else changed in the config?'), 'Do you need anything else changed in the config?');
+  assert.equal(extractQuestion('I fixed it. Should I delete the old file?'), 'Should I delete the old file?');
+  assert.equal(extractQuestion('I fixed it. Want me to do anything else with the tests?'), 'Want me to do anything else with the tests?');
+  assert.equal(extractQuestion('I fixed it. Which database should I use?\n\nAnything else?'), 'Which database should I use?');
+});

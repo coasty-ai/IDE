@@ -600,6 +600,11 @@ const COURTESY = [
   /^(i['’]m |i am )?happy to help\b/i,
   /^feel free\b/i,
   /^(is there )?anything else\b/i,
+  /^anything (more|further)\b/i,
+  // "Want me to do anything else?", "Need anything else?", "Can I help with anything else?": only when nothing is named.
+  /^(do you |would you )?(want|need|like|wish)( me to( do| help with)?)? (any ?thing|something) (else|more|further)( for you| from me| today| now| right now)?\s*[?.!]*$/i,
+  /^(shall|can|could|may) i (do|help (you )?with|get you) (any ?thing|something) (else|more|further)( for you| today| now)?\s*[?.!]*$/i,
+  /^what else (can|could|shall) i (do|help with)( for you| today| now)?\s*[?.!]*$/i,
   /^do you have any (other |more |further )?questions\b/i,
   /^(just |please )?let me know if\b.*\b(any|anything|something|questions?|issues?|problems?|changes?|adjustments?|tweaks?|feedback|(this|that|it) works)\b/i,
   /^if you (have|run into|hit|see|notice|find|need) any(thing)?\b/i,
