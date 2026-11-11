@@ -247,7 +247,8 @@ async function submit(text) {
       if (S.confirm && !res.confirm) S.confirm = null;
       if (res.confirm) S.confirm = res.confirm;
       if (res.focusId) S.focusId = res.focusId;
-      say(res.reply || '', res.confirm ? 0 : 9000);
+      // The confirm card in the centre already says it; repeating it underneath would only add noise.
+      say(res.confirm ? '' : (res.reply || ''), 9000);
     }
   } catch (err) { say(err.message); }
   render();

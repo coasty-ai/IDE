@@ -49,9 +49,9 @@ export function cardHtml(a, now, pinned) {
   const look = lookOf(a.state);
   const helper = !!a.parentId;
   const sub = [
-    harnessLabel(a.harness),
+    helper ? '' : harnessLabel(a.harness),   // a helper's engine is its parent's; the room is better spent on whose it is
     shortModel(a.model),
-    helper ? (a.helperType ? `${a.helperType} helper of ${S.agents.get(a.parentId)?.name || 'an agent'}` : 'helper') : machineName(a.machineId),
+    helper ? `helper of ${S.agents.get(a.parentId)?.name || 'an agent'}` : machineName(a.machineId),
   ].filter(Boolean).join(' · ');
 
   const lastStep = (a.recent || []).slice(-1).map(s =>
@@ -75,7 +75,7 @@ export function cardHtml(a, now, pinned) {
   if (!helper && u.costUsd != null && a.budgetUsd != null) cost += ` of ${money(a.budgetUsd).replace(/\.00$/, '')}`;
   if (helper) cost = a.harness === 'claude' ? 'in parent' : cost;
   const ap = a.approvals || { auto: 0, byYou: 0, denied: 0 };
-  const approvals = ap.auto || ap.byYou || ap.denied ? `${ap.auto} auto · ${ap.byYou} you` : '–';
+  const approvals = ap.auto || ap.byYou || ap.denied ? `${ap.auto} auto${ap.byYou ? ` · ${ap.byYou} you` : ''}` : '–';
 
   const foot = [];
   if (ap.denied) foot.push(`${ap.denied} denied`);
@@ -105,14 +105,28 @@ export function cardHtml(a, now, pinned) {
   ${foot.length ? `<div class="foot">${esc(foot.join(' · '))}</div>` : ''}`;
 }
 
-/** Place the card beside a node, on the side away from the centre, inside the window. */
+/**
+ * Place the card beside a node. Candidates, in order: the side away from the centre, above or below (away from the
+ * centre first), then the side towards it. The first that fits the window and stays off the centre circle wins.
+ */
 export function placeCardAt(card, p) {
-  const w = card.offsetWidth || 352, h = card.offsetHeight || 300, gap = p.kind === 'moon' ? 22 : 34;
-  let left = p.x >= p.cx ? p.x + gap : p.x - gap - w;
-  if (left + w > innerWidth - 12) left = p.x - gap - w;
-  if (left < 12) left = p.x + gap;
-  const top = Math.max(56, Math.min(p.y - h / 2, innerHeight - h - 12));
-  card.style.transformOrigin = left > p.x ? 'left center' : 'right center';
-  card.style.left = left.toFixed(0) + 'px';
-  card.style.top = top.toFixed(0) + 'px';
+  // A root's name sits under it (about 50 px each side), so leave room for the label too.
+  const w = card.offsetWidth || 352, h = card.offsetHeight || 300, gap = p.kind === 'moon' ? 22 : 62, vgap = p.kind === 'moon' ? 22 : 50;
+  const M = 12, top0 = 56, W = innerWidth, H = innerHeight;
+  const clampX = x => Math.max(M, Math.min(x, W - w - M));
+  const clampY = y => Math.max(top0, Math.min(y, H - h - M));
+  const outerRight = p.x >= p.cx, awayUp = p.y < p.cy;
+  const side = right => ({ left: right ? p.x + gap : p.x - gap - w, top: clampY(p.y - h / 2) });
+  const vert = up => ({ left: clampX(p.x - w / 2), top: up ? p.y - vgap - h : p.y + vgap });
+  const cands = [side(outerRight), vert(awayUp), vert(!awayUp), side(!outerRight)];
+  const fits = c => c.left >= M && c.left + w <= W - M && c.top >= top0 && c.top + h <= H - M;
+  const hitsCore = c => {
+    if (!p.coreR) return false;
+    const nx = Math.max(c.left, Math.min(p.cx, c.left + w)), ny = Math.max(c.top, Math.min(p.cy, c.top + h));
+    return Math.hypot(nx - p.cx, ny - p.cy) < p.coreR;
+  };
+  const best = cands.find(c => fits(c) && !hitsCore(c)) || cands.find(fits) || cands[0];
+  card.style.transformOrigin = best.left > p.x ? 'left center' : 'right center';
+  card.style.left = best.left.toFixed(0) + 'px';
+  card.style.top = best.top.toFixed(0) + 'px';
 }

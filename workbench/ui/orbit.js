@@ -26,8 +26,10 @@ export function shortStatus(a) {
     case 'working': case 'starting': {
       if (a.thinking && (!a.now || a.now === 'Thinking')) return 'thinking';
       const n = (a.now && a.now !== 'Starting' ? a.now : a.state).replace(/^Asking a helper to /, 'asking a helper');
-      const words = n.replace(/[“”"]/g, '').split(' ').slice(0, 3).join(' ');
-      return (words.charAt(0).toLowerCase() + words.slice(1)).replace(/[.,:;]+$/, '').slice(0, 24);
+      // Up to three words; a long one is cut with an ellipsis rather than dropped, so the status stays meaningful.
+      const words = n.replace(/[“”"]/g, '').split(' ').slice(0, 3).join(' ').replace(/[.,:;]+$/, '');
+      const lower = words.charAt(0).toLowerCase() + words.slice(1);
+      return lower.length > 26 ? lower.slice(0, 25) + '…' : lower;
     }
     case 'waiting_helpers': return 'waiting on helpers';
     case 'needs_ok': return 'needs your OK';
@@ -174,7 +176,11 @@ export class Orbit {
         // own label (on the outward side) stays clear; the third and fourth sit further round.
         const side = i % 2 === 0 ? 1 : -1;
         const turn = i < 2 ? 0.42 : 1.02;
-        const ma = angle + side * (Math.PI / 2 + turn);
+        let ma = angle + side * (Math.PI / 2 + turn);
+        // An agent near the top or bottom edge has its name on the inner side; keep moons off the name.
+        const ls = this.labelSide(angle, ty);
+        const mdx = Math.cos(ma), mdy = Math.sin(ma);
+        if (Math.abs(mdx) * rm < 60 && ((ls === 'below' && mdy > 0.1) || (ls === 'above' && mdy < -0.1))) ma = -ma;
         const mt = this.ensure(k, 'moon', root.id, it.x, it.y);
         mt.parentId = root.id;
         mt.offA = ma; mt.offR = rm;
@@ -422,6 +428,6 @@ export class Orbit {
   pos(id) {
     const it = this.items.get(id);
     if (!it) return null;
-    return { x: it.x, y: it.y, kind: it.kind, cx: this.geom.cx, cy: this.geom.cy };
+    return { x: it.x, y: it.y, kind: it.kind, cx: this.geom.cx, cy: this.geom.cy, coreR: this.geom.coreR };
   }
 }
