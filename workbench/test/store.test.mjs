@@ -455,3 +455,33 @@ test('spend not reported yet is kept apart from the reported cost, and counted, 
   assert.equal(s.spendTodayUsd(now), 0.05);
   assert.equal(s.spendTodayEstimated(now), false);
 });
+
+test('a new turn clears the last turn\'s receipt: says, files, rules and checks', () => {
+  const { s } = recording();
+  s.apply(created('r1'));
+  s.apply(act('r1', 'start', 'Editing a.js', T0 + 1000, { toolUseId: 't' }));
+  s.apply({ kind: EV.TURN, ts: T0 + 1500, agentId: 'r1', phase: 'start' });
+  s.apply({ kind: EV.SAYS, ts: T0 + 2000, agentId: 'r1', text: 'All fixed.' });
+  s.apply({ kind: EV.FILES, ts: T0 + 2000, agentId: 'r1', files: { changed: 1, adds: 1, dels: 0, list: [] } });
+  s.apply({ kind: EV.RULES, ts: T0 + 2000, agentId: 'r1', rules: { kept: [], broken: [] } });
+  s.apply({ kind: EV.CHECKS, ts: T0 + 2000, agentId: 'r1', checks: { state: 'passed', results: [] } });
+  s.apply(state('r1', 'done_checked', T0 + 2100));
+  assert.equal(s.get('r1').checks.state, 'passed');
+  s.apply({ kind: EV.TURN, ts: T0 + 3000, agentId: 'r1', phase: 'start' });
+  const v = s.get('r1');
+  assert.equal(v.says, null);
+  assert.equal(v.files, null);
+  assert.equal(v.rules, null);
+  assert.equal(v.checks.state, 'none');
+});
+
+test('a follow-up that brings a stopped agent back also clears the old receipt', () => {
+  const { s } = recording();
+  s.apply(created('r2'));
+  s.apply({ kind: EV.SAYS, ts: T0 + 2000, agentId: 'r2', text: 'All fixed.' });
+  s.apply({ kind: EV.CHECKS, ts: T0 + 2000, agentId: 'r2', checks: { state: 'passed', results: [] } });
+  s.apply(state('r2', 'stopped', T0 + 2100));
+  s.apply(state('r2', 'working', T0 + 3000));
+  assert.equal(s.get('r2').says, null);
+  assert.equal(s.get('r2').checks.state, 'none');
+});

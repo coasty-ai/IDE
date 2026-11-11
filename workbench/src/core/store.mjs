@@ -303,6 +303,7 @@ export class Store extends EventEmitter {
       case EV.TURN: {
         if (ev.phase === 'start') {
           v.turns += 1;
+          if (!v.parentId) this._clearReceipt(v);
           if (!v.parentId && RESUMES_ON_TURN.has(v.state)) {
             const prev = v.state;
             this._setState(v, STATE.WORKING, null, ev.ts, batch, index, changed);
@@ -367,6 +368,14 @@ export class Store extends EventEmitter {
     changed.add(v.id);
   }
 
+  /** A new turn starts: the last turn's result (files, checks, rules, what it said) must not read as current. */
+  _clearReceipt(v) {
+    if (v.checks) v.checks = { state: 'none', results: [] }; // as the engine cancels a receipt
+    v.rules = null;
+    v.says = null;
+    v.files = null;
+  }
+
   _created(ev, changed) {
     const id = ev.agentId;
     if (!id || this._views.has(id)) return; // ignore a duplicate agentId
@@ -412,6 +421,7 @@ export class Store extends EventEmitter {
         // Picked up again after a follow-up: the earlier run's error no longer describes it.
         v.endedAt = null;
         v.error = null;
+        if (!v.parentId) this._clearReceipt(v);
       }
       if (ASK_TYPE_OF_STATE[prev] && v.ask && !this._askSurvives(v, next, batch, index)) v.ask = null;
       if (ENDED.has(next)) {
