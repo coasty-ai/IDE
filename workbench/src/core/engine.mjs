@@ -2198,11 +2198,17 @@ export class Engine extends EventEmitter {
     return w || { branch: null, from: null, folder: false, merged: null, problem: null, thrownAway: null };
   }
 
-  /** A merge that did not go through no longer describes the work (a turn starts, a message is taken): it goes. */
+  /**
+   * A merge that did not go through no longer describes the work (a turn starts, a message is taken, nothing is left to
+   * merge): it goes. An earlier agent's saved record is written back as it was unless it is replaced, so it is, or the
+   * reason would come back at the next start.
+   */
   _clearProblem(agentId) {
     const v = this.store.get(agentId);
     if (!v || v.parentId || !v.work?.problem) return;
     this._apply([{ kind: EV.WORK, agentId, work: { ...v.work, problem: null } }]);
+    const rec = v.earlier ? this.earlierRecs.get(agentId) : null;
+    if (rec) this._replaceEarlier(agentId, rec.workspace ?? null);
   }
 
   /** Its folder turned out to be gone: its view says so. */
@@ -2578,7 +2584,8 @@ export class Engine extends EventEmitter {
     const why = MERGE_WHYS.has(res?.why) ? res.why : 'git';
     // Its branch moved because this agent's own work went in after the card was drawn (from a look git took just
     // before that merge, say): what the card showed is in already, and nothing new is left to merge. Nothing went wrong.
-    if (why === 'moved' && v.work?.merged && !unmergedWork(v)) {
+    // Only when its files are known: when they could not be read, it may hold new work, and the reason stands.
+    if (why === 'moved' && v.work?.merged && v.files && !unmergedWork(v)) {
       this._clearProblem(v.id);
       return { reply: mergeSentence('nothing', { name: v.name, into: v.work.merged.into || c.expect.into }), focusId: v.id };
     }

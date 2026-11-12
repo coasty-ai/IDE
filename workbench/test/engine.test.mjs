@@ -2814,6 +2814,25 @@ test('merge: a card made from a look taken just before the agent was merged says
   await t.engine.shutdown();
 });
 
+test('merge: on merged work whose newer files Workbench could not read, a yes refused as moved keeps the reason: there may be new work', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  assert.equal((await t.engine.confirm((await t.engine.proposeMerge(a.id)).confirm.id, true)).reply, 'Merged Fix cart total into main.');
+  // A follow-up whose receipt cannot read what changed: its files are not known.
+  t.deps.workspace.diffStats = async () => { throw new Error('git could not read it'); };
+  assert.equal((await t.engine.say(a.id, 'Also round the tax')).ok, true);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I rounded the tax.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(a.id).state === 'done_claimed');
+  assert.equal(t.store.get(a.id).files, null);
+  const card = await t.engine.proposeMerge(a.id);
+  assert.ok(card.confirm, card.reply);
+  t.git.head = '12'.repeat(20); // the person commits in their own folder
+  assert.deepEqual(await t.engine.confirm(card.confirm.id, true), { reply: 'main changed since you looked. Have another look.', focusId: a.id });
+  assert.equal(t.store.get(a.id).work.problem.why, 'moved');
+  await t.engine.shutdown();
+});
+
 test('merge: a reason left on work with nothing left to merge goes when the merge is tried again; a throw-away withdraws the merge cards', async (ctx) => {
   const t = liveFolders(ctx);
   const a = await doneAgent(t);

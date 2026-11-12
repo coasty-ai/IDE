@@ -668,6 +668,32 @@ test('an earlier agent can be merged: it stays an earlier agent, and its record 
   assert.equal(third.calls.diffStats.at(-1).base, FAKE_WORK);
 });
 
+test('a reason a merge did not go through, saved on merged work, goes for good once trying again finds nothing left to merge', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  assert.equal((await first.engine.confirm((await first.engine.proposeMerge(id)).confirm.id, true)).reply, 'Merged Fix login redirect into main.');
+  // A reason an older Workbench kept on merged work (another page's stale card), saved with it.
+  const problem = { why: 'moved', sentence: 'main changed since you looked. Have another look.', paths: [], into: 'main', at: 1 };
+  first.store.apply([{ kind: EV.WORK, agentId: id, work: { ...first.store.get(id).work, problem }, ts: Date.now() }]);
+  await first.engine.shutdown();
+  assert.equal(readFile(first).agents[0].work.problem.why, 'moved');
+
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.equal(second.store.get(id).work.problem.why, 'moved', 'it comes back with the record');
+  second.git.work.changed = false;
+  assert.deepEqual(await second.engine.proposeMerge(id), { ok: false, reply: 'Fix login redirect’s work is already in main.' });
+  assert.equal(second.store.get(id).work.problem, null);
+  await second.engine.shutdown();
+  assert.equal(readFile(second).agents.find(r => r.id === id).work.problem, null, 'the record says so too');
+
+  const third = world(t, dir);
+  await third.engine.start();
+  assert.equal(third.store.get(id).work.problem, null, 'and it does not come back');
+  assert.equal(third.store.get(id).work.merged.merge, FAKE_MERGE);
+});
+
 test('an earlier agent merged in this run is tidied at shutdown like one of this run: its folder and branch go when unchanged since', async (t) => {
   const dir = tmp(t);
   const first = world(t, dir);
