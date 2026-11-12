@@ -1069,21 +1069,35 @@ async function personsHead(run, root, since) {
   }
 }
 
-/** The date of the commit merge-tree is given for the work as it is (see reviewTrees): any fixed one. */
-const WORK_AS_IS_DATE = '@1000000000 +0000';
+/**
+ * The date of the commit merge-tree is given for the work as it is (see reviewTrees): its parent's own (the agent's
+ * HEAD's committer date), so the same work on the same HEAD makes the same commit, and it is never older than its
+ * parent. git looks for where two histories met newest first: a commit dated before its parent would have it walk all
+ * of the person's history first, on every card and diff, where there is no commit-graph. A fixed date when git cannot
+ * say.
+ */
+async function workAsIsDate(run, cwd, head) {
+  try {
+    const text = (await run(['cat-file', 'commit', head], { cwd })).stdout;
+    const m = /^committer [^\n]* (\d+) ([+-]\d{4})$/m.exec(text.slice(0, text.indexOf('\n\n')));
+    if (m) return `@${m[1]} ${m[2]}`;
+  } catch {}
+  return '@1000000000 +0000';
+}
 
 /**
  * The two trees the review compares (see "Source control" above), as { from, to }, and `merged`, the tree merge-tree
  * makes, when that is what the review shows (else null): the person's HEAD `into` (null when it does not hold `since`)
  * and that merged tree; on a conflict, where the work's history and HEAD last met and the work; otherwise `since` and
  * the work. merge-tree takes commits, so work not yet committed is given as a commit on top of the agent's HEAD that
- * nothing points at, made by Workbench at a fixed date: the same work makes the same commit each time. Never rejects.
+ * nothing points at, made by Workbench and dated as that HEAD (see workAsIsDate): the same work makes the same commit
+ * each time. Never rejects.
  */
 async function reviewTrees(run, root, { head, headTree, tree, sinceTree }, into) {
   if (!into) return { from: sinceTree, to: tree, merged: null };
   try {
     const work = tree === headTree ? head
-      : await commitTree(run, root, tree, [head], 'The agent’s work as it is\n', WORKBENCH_IDENTITY, WORK_AS_IS_DATE);
+      : await commitTree(run, root, tree, [head], 'The agent’s work as it is\n', WORKBENCH_IDENTITY, await workAsIsDate(run, root, head));
     const merged = await mergeTrees(run, root, into, work);
     if (merged.tree) return { from: await treeOf(root, into, run), to: merged.tree, merged: merged.tree };
     const met = await run(['merge-base', into, head], { cwd: root, okCodes: [1] });

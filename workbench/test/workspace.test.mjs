@@ -882,6 +882,26 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     check(fewer, 'one by one');
   });
 
+  test('the commit the review makes of work not committed yet is dated as its parent, never older, and is the same each time', async () => {
+    // git looks for where two histories met newest first: a commit dated before its own parent would have it walk all of
+    // the person's history for every card and diff.
+    const t = await agentRepo();
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    // Nothing points at it: it is found by its tree and its parent, the agent's HEAD.
+    const made = () => git(t.root, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname) %(objecttype)').split('\n')
+      .filter(l => l.endsWith(' commit')).map(l => l.split(' ')[0])
+      .filter(id => git(t.root, 'log', '-1', '--format=%T %P', id) === `${s.tree} ${s.head}`);
+    const found = made();
+    assert.equal(found.length, 1);
+    const dates = id => git(t.root, 'log', '-1', '--format=%at %ct', id);
+    const parent = git(t.root, 'log', '-1', '--format=%ct', s.head);
+    assert.equal(dates(found[0]), `${parent} ${parent}`);
+    await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    assert.deepEqual(made(), found, 'the same commit each time');
+  });
+
   test('file names that are not UTF-8 each keep their own counts, and get no patch: never another file’s', async () => {
     const t = await agentRepo();
     const blob = text => execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: t.ws.path, input: text, encoding: 'utf8' }).trim();
