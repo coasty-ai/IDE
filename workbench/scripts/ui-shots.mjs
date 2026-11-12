@@ -24,8 +24,8 @@ const SHOTS = [
   { name: 'board-more-detail', scenario: 'demo', detail: 'more' },
   // D1: the git screen, reached by clicking the DRAM (`click`: selectors clicked in turn after the page loads)
   { name: 'git-screen', scenario: 'git', click: ['#dram'] },
-  { name: 'git-detail', scenario: 'git', click: ['#dram', '#gitGraph .gr.work'] },
-  { name: 'git-black-gold', scenario: 'git-many', theme: 'black-gold', click: ['#dram', '#gitGraph .gr.work'] },
+  { name: 'git-detail', scenario: 'git', click: ['#dram', '#gitGraph .gr[data-id="work:g1"]'] },
+  { name: 'git-black-gold', scenario: 'git-many', theme: 'black-gold', click: ['#dram', '#gitGraph .gr[data-id="work:m5"]'] },
   { name: 'git-ivory', scenario: 'git', theme: 'ivory', detail: 'more', click: ['#dram', '#gitGraph .gr:not(.work)'] },
 ];
 
