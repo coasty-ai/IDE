@@ -216,6 +216,30 @@ function mergeSentence(why, { name, into, paths } = {}) {
   }
 }
 
+/** What Workbench cannot do with an agent's work, for "…so it cannot <verb>." */
+const WORK_VERB = Object.freeze({ show: 'show its changes', merge: 'merge its work', 'throw away': 'throw its work away' });
+
+/**
+ * A sentence of the git functions, which say "its" for the agent, made to name it: "Its work changed since you looked."
+ * becomes "Fix login’s work changed since you looked.", and "It started from …" becomes "Fix login started from …".
+ */
+function aboutAgent(name, sentence) {
+  const s = String(sentence ?? '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  if (/^Its\s/.test(s)) return `${name}’s ${s.slice(4)}`;
+  if (/^It\s/.test(s)) return `${name} ${s.slice(3)}`;
+  return s;
+}
+
+/**
+ * What a git function's thrown error means for agent `v`: { gone: true } when its folder is gone (`why: 'gone'`), else
+ * { reply }: the error's own plain sentence (git functions throw plain errors), or `fallback` for anything else.
+ */
+function gitRefusal(v, err, fallback) {
+  if (err && err.why === 'gone') return { gone: true, reply: null };
+  if (err && err.plain && typeof err.message === 'string' && err.message.trim()) return { gone: false, reply: aboutAgent(v.name, err.message) };
+  return { gone: false, reply: fallback };
+}
+
 /** What a throw-away's hidden copy leaves out: files a .gitignore hides, folders that are git repositories of their own. */
 function leftOutWords(left) {
   const list = Array.isArray(left) ? left : [];
@@ -2119,21 +2143,36 @@ export class Engine extends EventEmitter {
 
   /** Its folder turned out to be gone: its view says so. */
   _markFolderGone(v) {
-    const w = this.store.get(v.id)?.work;
+    const w = v ? this.store.get(v.id)?.work : null;
     if (w && w.folder) this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...w, folder: false } }]);
   }
 
   /**
-   * Why a root has no work here to show, merge or throw away, in plain words; null when it has. `verb`: "show",
-   * "merge" or "throw away".
+   * Git says its folder and its branch are both gone: nothing of its work is left here. Its view says so, this run's
+   * agent leaves the folders kept and the tidy, and an earlier agent's record keeps no folder from now on.
+   */
+  _markWorkGone(v, where) {
+    if (where?.run) where.run.folderRemoved = true;
+    const w = this.store.get(v.id)?.work;
+    if (w && (w.folder || w.branch)) this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...w, folder: false, branch: null } }]);
+    if (where?.rec) {
+      this._replaceEarlier(v.id, null);
+      this.store.markContinue(v.id, { ok: false, reason: 'Its folder is gone, so it cannot continue.' });
+    }
+    try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
+  }
+
+  /**
+   * Why a root has no work here to show or merge, in plain words; null when it has. `verb`: 'show' or 'merge'.
    */
   _noWorkReply(v, verb) {
-    if (v.work?.thrownAway) return verb === 'throw away' ? `${v.name}’s work was already thrown away.` : `${v.name}’s work was thrown away, so there is nothing to ${verb}.`;
+    if (v.work?.thrownAway) return `${v.name}’s work was thrown away, so there is nothing to ${verb}.`;
     const where = this._workspaceOf(v);
     if (!where?.ws || where.removed || !folderThere(where.ws.path)) {
       if (where?.ws && !where.removed) this._markFolderGone(v);
       return `Its folder is gone, so there is nothing to ${verb}.`;
     }
+    if (!sinceOf(where.ws)) return `Workbench does not know which commit ${v.name} started from, so it cannot ${WORK_VERB[verb]}.`;
     return null;
   }
 
@@ -2168,8 +2207,7 @@ export class Engine extends EventEmitter {
     const v = this._rootOf(String(agentId ?? ''));
     if (!v) return { ok: false, reply: 'I can’t find that agent.' };
     if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
-    const live = this._isWorking(v);
-    if (this.mode === 'demo') return this._simChanges(v, live);
+    if (this.mode === 'demo') return this._simChanges(v);
     const gone = this._noWorkReply(v, 'show');
     if (gone) return { ok: false, reply: gone };
     if (typeof this.deps.workspace?.workDiff !== 'function' || !this.repoInfo) return { ok: false, reply: 'Workbench cannot show changes right now.' };
@@ -2179,10 +2217,16 @@ export class Engine extends EventEmitter {
       diff = await this.deps.workspace.workDiff({ repoRoot: this.repoInfo.root, path: ws.path, since: sinceOf(ws) });
     } catch (err) {
       this.log.warn(`Could not read the changes of ${v.id}:`, err);
-      diff = null;
+      const t = gitRefusal(v, err, `Workbench could not read ${v.name}’s changes.`);
+      if (t.gone) {
+        this._markFolderGone(v);
+        return { ok: false, reply: 'Its folder is gone, so there is nothing to show.' };
+      }
+      return { ok: false, reply: t.reply };
     }
     if (!diff || diff.ok === false || !Array.isArray(diff.files)) return { ok: false, reply: `Workbench could not read ${v.name}’s changes.` };
-    return { ok: true, agentId: v.id, name: v.name, branch: ws.branch ?? null, into: this.repoInfo.branch ?? null, live, diff };
+    const cur = this.store.get(v.id) || v;
+    return { ok: true, agentId: v.id, name: cur.name, branch: ws.branch ?? null, into: this.repoInfo.branch ?? null, live: this._isWorking(cur), diff };
   }
 
   /** "what did search cleanup change": the page opens the git screen on that agent (`review`). */
@@ -2219,7 +2263,11 @@ export class Engine extends EventEmitter {
       this.log.warn('Could not read the git history:', err);
       g = null;
     }
-    if (!g || g.ok === false || !Array.isArray(g.commits)) return { ok: false, reply: 'Workbench could not read the git history.' };
+    if (!g || g.ok === false || !Array.isArray(g.commits)) {
+      // The git module words its own refusals plainly ("The repository at … has no commits yet."); anything else is ours.
+      const said = g && g.ok === false && typeof g.sentence === 'string' && g.sentence.trim() ? g.sentence.trim() : null;
+      return { ok: false, reply: said || 'Workbench could not read the git history.' };
+    }
     const repo = this._repoView();
     // The head and branch the graph was read at, so the commits and the top band agree.
     if (typeof g.head === 'string' && g.head) repo.head = g.head;
@@ -2248,7 +2296,7 @@ export class Engine extends EventEmitter {
   /**
    * Ask before merging a root's work into the person's branch (POST /api/agents/:id/merge): a confirm card, never a
    * merge by itself. `state`: the state the page drew the button for (null: not checked).
-   * @returns {Promise<{ ok: true, reply: string, confirm: object } | { ok: false, reply: string }>}
+   * @returns {Promise<{ reply: string, confirm: object } | { ok: false, reply: string }>}
    */
   async proposeMerge(agentId, { state = null } = {}) {
     const out = await this._proposeMerge(this.store.get(String(agentId ?? '')), { state });
@@ -2258,7 +2306,7 @@ export class Engine extends EventEmitter {
 
   /**
    * Why a root cannot be merged right now, as a refusal; null when it can, as far as Workbench knows before asking git.
-   * `ownJob`: asked by the merge job itself, which holds the busy flag.
+   * `state`: the state the button or card was drawn for. `ownJob`: asked by the merge job itself, which holds the busy flag.
    */
   _mergeRefusal(v, { state = null, ownJob = false } = {}) {
     if (!v) return { ok: false, reply: 'I can’t find that agent.' };
@@ -2275,7 +2323,7 @@ export class Engine extends EventEmitter {
   async _proposeMerge(v, { state = null, into = null } = {}) {
     const pre = this._mergeRefusal(v, { state });
     if (pre) return pre;
-    if (this.mode === 'demo') return this._simProposeMerge(v);
+    if (this.mode === 'demo') return this._simProposeMerge(v, { state });
     const W = this.deps.workspace;
     if (typeof W?.snapshotWork !== 'function' || typeof W?.mergeWork !== 'function' || !this.repoInfo) {
       return { ok: false, reply: 'Workbench cannot merge work right now.' };
@@ -2294,21 +2342,30 @@ export class Engine extends EventEmitter {
       return { ok: false, reply: `Workbench merges into the branch your folder is on, which is ${repo.branch}. Switch to ${quotable(into, 60)} first to merge there.` };
     }
     if (this.repoIdentity === false) return { ok: false, reply: mergeSentence('identity') };
-    let snap;
+    let snap = null;
+    let trouble = null;
     try {
       snap = await W.snapshotWork({ repoRoot: repo.root, path: ws.path, since: sinceOf(ws) });
     } catch (err) {
       this.log.warn(`Could not read the work of ${v.id}:`, err);
-      snap = null;
+      trouble = gitRefusal(v, err, `Workbench could not read ${v.name}’s work, so it cannot be merged right now.`);
     }
     // It may have moved on while git read it.
     const cur = this.store.get(v.id);
     const again = this._mergeRefusal(cur, { state });
     if (again) return again;
+    if (trouble?.gone) {
+      this._markFolderGone(cur);
+      return { ok: false, reply: mergeSentence('gone') };
+    }
+    if (trouble) return { ok: false, reply: trouble.reply };
     if (!snap || snap.ok === false || typeof snap.workId !== 'string' || !snap.workId) {
       return { ok: false, reply: `Workbench could not read ${v.name}’s work, so it cannot be merged right now.` };
     }
-    if (!snap.changed) return { ok: false, reply: mergeSentence('nothing', { name: v.name, into: repo.branch }) };
+    if (!snap.changed) {
+      // Nothing since its last merge is "already in"; an agent never merged that changed nothing changed nothing.
+      return { ok: false, reply: cur.work?.merged ? mergeSentence('nothing', { name: v.name, into: repo.branch }) : `${v.name} changed nothing, so there is nothing to merge.` };
+    }
     const files = Array.isArray(snap.files) ? snap.files : [];
     const broken = await this._brokenRules(cur, where, files);
     const detail = this._mergeDetail(cur, { files, left: snap.left, broken, into: repo.branch, dirty: repo.dirty });
@@ -2368,7 +2425,7 @@ export class Engine extends EventEmitter {
   async _mergeConfirmed(c) {
     const v = this.store.get(c.agentId);
     if (c.demo) return this._simMerge(v, c);
-    const pre = this._mergeRefusal(v);
+    const pre = this._mergeRefusal(v, { state: c.state });
     if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
     if (typeof this.deps.workspace?.mergeWork !== 'function' || !this.repoInfo) return { reply: 'Workbench cannot merge work right now.', focusId: v.id };
     this._busy.set(v.id, 'merge');
@@ -2381,7 +2438,7 @@ export class Engine extends EventEmitter {
 
   async _runMerge(id, c) {
     let v = this.store.get(id);
-    const pre = this._mergeRefusal(v, { ownJob: true }); // again: it waited for the jobs before it
+    const pre = this._mergeRefusal(v, { state: c.state, ownJob: true }); // again: it waited for the jobs before it
     if (pre) return { reply: pre.reply, focusId: id };
     const where = this._workspaceOf(v);
     const ws = where.ws;
@@ -2392,7 +2449,7 @@ export class Engine extends EventEmitter {
     if (run?.checksDone) await run.checksDone;
     if (run && this._runnerInfo(run)?.alive === true) return { reply: `Workbench could not pause ${v.name}, so nothing was merged.`, focusId: id };
     v = this.store.get(id);
-    const again = this._mergeRefusal(v, { ownJob: true });
+    const again = this._mergeRefusal(v, { state: c.state, ownJob: true });
     if (again) return { reply: again.reply, focusId: id };
     let res;
     try {
@@ -2437,13 +2494,17 @@ export class Engine extends EventEmitter {
   _mergeFailed(v, res, c) {
     const why = MERGE_WHYS.has(res?.why) ? res.why : 'git';
     const paths = (Array.isArray(res?.paths) ? res.paths : []).filter(p => typeof p === 'string' && p);
-    const sentence = res?.unexpected
-      ? 'Something went wrong during the merge. Have a look at your folder before you try again.'
-      : mergeSentence(why, { name: v.name, into: c.expect.into, paths });
-    if (PROBLEM_WHYS.has(why)) {
-      this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), problem: { why, sentence, paths: paths.slice(0, 50), at: this.now() } } }]);
-    } else if (why === 'gone') {
+    const own = typeof res?.sentence === 'string' && res.sentence.trim() ? aboutAgent(v.name, res.sentence) : null;
+    let sentence;
+    if (res?.unexpected) sentence = 'Something went wrong during the merge. Have a look at your folder before you try again.';
+    // For these two the git module's own words say what really happened (a lock held by another git command; a merge
+    // git reported done that the branch does not hold), where the general sentence would not be true.
+    else if ((why === 'git' || why === 'busy') && own) sentence = own;
+    else sentence = mergeSentence(why, { name: v.name, into: c.expect.into, paths });
+    if (why === 'gone') {
       this._markFolderGone(v);
+    } else if (PROBLEM_WHYS.has(why)) {
+      this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), problem: { why, sentence, paths: paths.slice(0, 50), at: this.now() } } }]);
     }
     return { reply: sentence, focusId: v.id };
   }
@@ -2453,7 +2514,7 @@ export class Engine extends EventEmitter {
   /**
    * Ask before throwing a root's work away (POST /api/agents/:id/discard): a confirm card. An agent at work is stopped
    * first, and the card says so. `state`: the state the page drew the button for (null: not checked).
-   * @returns {Promise<{ ok: true, reply: string, confirm: object } | { ok: false, reply: string }>}
+   * @returns {Promise<{ reply: string, confirm: object } | { ok: false, reply: string }>}
    */
   async proposeDiscard(agentId, { state = null } = {}) {
     const out = await this._proposeDiscard(this.store.get(String(agentId ?? '')), { state });
@@ -2461,7 +2522,10 @@ export class Engine extends EventEmitter {
     return out;
   }
 
-  /** Why a root's work cannot be thrown away right now; null when it can. */
+  /**
+   * Why a root's work cannot be thrown away right now; null when it can. A root whose folder is gone can still have its
+   * branch thrown away.
+   */
   _discardRefusal(v, { state = null, ownJob = false } = {}) {
     if (!v) return { ok: false, reply: 'I can’t find that agent.' };
     if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
@@ -2469,50 +2533,67 @@ export class Engine extends EventEmitter {
     if (!ownJob && this._busy.has(v.id)) return { ok: false, reply: this._busyReply(v) };
     if (this._resuming.has(v.id)) return { ok: false, reply: `${v.name} is already being picked up.` };
     if (state && state !== v.state) return { ok: false, reply: 'That changed. Have another look.' };
-    if (this.mode === 'demo') return v.work?.thrownAway ? { ok: false, reply: `${v.name}’s work was already thrown away.` } : null;
-    const gone = this._noWorkReply(v, 'throw away');
-    return gone ? { ok: false, reply: gone } : null;
+    if (v.work?.thrownAway) return { ok: false, reply: `${v.name}’s work was already thrown away.` };
+    if (this.mode === 'demo') return null;
+    const where = this._workspaceOf(v);
+    if (!where?.ws || where.removed) return { ok: false, reply: 'Its folder is gone, so there is nothing to throw away.' };
+    const there = folderThere(where.ws.path);
+    if (!there) this._markFolderGone(v);
+    if (!where.ws.branch) {
+      return { ok: false, reply: there ? `Workbench does not know ${v.name}’s branch, so it cannot throw its work away.` : 'Its folder is gone, so there is nothing to throw away.' };
+    }
+    if (there && !sinceOf(where.ws)) return { ok: false, reply: `Workbench does not know which commit ${v.name} started from, so it cannot ${WORK_VERB['throw away']}.` };
+    return null;
   }
 
   async _proposeDiscard(v, { state = null } = {}) {
     const pre = this._discardRefusal(v, { state });
     if (pre) return pre;
-    if (this.mode === 'demo') return this._simProposeDiscard(v);
+    if (this.mode === 'demo') return this._simProposeDiscard(v, { state });
     const W = this.deps.workspace;
     if (typeof W?.snapshotWork !== 'function' || typeof W?.discardWork !== 'function' || !this.repoInfo) {
       return { ok: false, reply: 'Workbench cannot throw away work right now.' };
     }
     const ws = this._workspaceOf(v).ws;
-    let snap;
+    const card = { kind: 'discard', agentId: v.id, sentence: `Throw away ${v.name}’s work?`, yes: 'Throw it away', no: 'Keep it', danger: true };
+    if (!folderThere(ws.path)) {
+      // Its folder is gone, but its branch may still hold work: the throw-away deletes the branch, keeping a copy.
+      const active = this._isWorking(v);
+      const parts = [`Its folder is already gone. Its branch ${ws.branch} is deleted. Workbench keeps a hidden copy in git.`];
+      if (active) parts.push('It is still working: it will be stopped first.');
+      return this._newConfirm({ ...card, state: v.state, active, folderGone: true, expect: { workId: null }, detail: parts.join(' ') });
+    }
+    let snap = null;
+    let trouble = null;
     try {
       snap = await W.snapshotWork({ repoRoot: this.repoInfo.root, path: ws.path, since: sinceOf(ws) });
     } catch (err) {
       this.log.warn(`Could not read the work of ${v.id}:`, err);
-      snap = null;
+      trouble = gitRefusal(v, err, `Workbench could not read ${v.name}’s work, so nothing was thrown away.`);
     }
     const cur = this.store.get(v.id);
     const again = this._discardRefusal(cur, { state });
     if (again) return again;
+    if (trouble?.gone) return { ok: false, reply: 'Its folder is gone, so there is nothing to throw away.' };
+    if (trouble) return { ok: false, reply: trouble.reply };
     if (!snap || snap.ok === false || typeof snap.workId !== 'string' || !snap.workId) {
       return { ok: false, reply: `Workbench could not read ${v.name}’s work, so nothing was thrown away.` };
     }
     const n = Array.isArray(snap.files) ? snap.files.length : 0;
     const active = this._isWorking(cur);
-    const parts = [`Its folder and ${ws.branch ? `its branch ${ws.branch}` : 'its branch'} are deleted, with ${n ? `${n} changed file${n === 1 ? '' : 's'}` : 'no changed files'}. Workbench keeps a hidden copy in git.`];
+    const parts = [`Its folder and its branch ${ws.branch} are deleted, with ${n ? `${n} changed file${n === 1 ? '' : 's'}` : 'no changed files'}. Workbench keeps a hidden copy in git.`];
     const left = leftOutWords(snap.left);
     if (left) parts.push(left);
     if (active) parts.push('It is still working: it will be stopped first.');
-    return this._newConfirm({
-      kind: 'discard', agentId: v.id, state: cur.state, active, expect: { workId: snap.workId },
-      sentence: `Throw away ${v.name}’s work?`, detail: parts.join(' '), yes: 'Throw it away', no: 'Keep it', danger: true,
-    });
+    return this._newConfirm({ ...card, state: cur.state, active, expect: { workId: snap.workId }, detail: parts.join(' ') });
   }
 
   /** Yes to a throw-away card: everything is checked again; it runs as one git job, the agent busy throughout. */
   async _discardConfirmed(c) {
     const v = this.store.get(c.agentId);
     if (c.demo) return this._simDiscard(v, c);
-    const pre = this._discardRefusal(v);
+    // A card made while it worked said it would be stopped first: its state then is no promise. Otherwise it is.
+    const pre = this._discardRefusal(v, { state: c.active ? null : c.state });
     if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
     // The card said whether it was working. One that went back to work since was not described: look again.
     if (!c.active && this._isWorking(v)) return { reply: 'That changed. Have another look.', focusId: v.id };
@@ -2527,7 +2608,7 @@ export class Engine extends EventEmitter {
 
   async _runDiscard(id, c) {
     let v = this.store.get(id);
-    const pre = this._discardRefusal(v, { ownJob: true });
+    const pre = this._discardRefusal(v, { state: c.active ? null : c.state, ownJob: true });
     if (pre) return { reply: pre.reply, focusId: id };
     const where = this._workspaceOf(v);
     const ws = where.ws;
@@ -2546,9 +2627,12 @@ export class Engine extends EventEmitter {
     v = this.store.get(id) || v;
     const again = this._discardRefusal(v, { ownJob: true });
     if (again) return { reply: again.reply, focusId: id };
+    // The card said whether its folder was there; what goes is what it said.
+    const there = folderThere(ws.path);
+    if (!!c.folderGone === there) return { reply: 'That changed. Have another look.', focusId: id };
     const W = this.deps.workspace;
-    let expect = { workId: c.expect.workId };
-    if (c.active) {
+    let expect = { workId: c.expect.workId ?? null };
+    if (c.active && there) {
       // The card was made while it worked and said it would be stopped first: what it holds once stopped is what goes
       // (into the hidden copy).
       let snap = null;
@@ -2571,13 +2655,15 @@ export class Engine extends EventEmitter {
     }
     v = this.store.get(id) || v;
     if (res?.ok === true) return this._thrownAway(v, where, res);
+    const own = typeof res?.sentence === 'string' && res.sentence.trim() ? aboutAgent(v.name, res.sentence) : null;
     let reply;
     if (res?.unexpected) reply = `Something went wrong while throwing away ${v.name}’s work. The details are in the log.`;
+    else if (own) reply = own; // the git module's own plain words
     else if (res?.why === 'changed') reply = `${v.name}’s work changed since you looked. Have another look.`;
-    else if (res?.why === 'gone') reply = 'Its folder is gone, so there is nothing to throw away.';
-    else if (typeof res?.sentence === 'string' && res.sentence.trim()) reply = res.sentence.trim(); // the workspace's own plain words
-    else reply = `Git could not throw away ${v.name}’s work.`;
-    if (!folderThere(ws.path)) this._markFolderGone(v); // a failure part-way may have taken the folder already
+    else if (res?.why === 'gone') reply = 'Its folder and its branch are already gone.';
+    else reply = `Git could not throw away ${v.name}’s work. Nothing was deleted.`;
+    if (res?.why === 'gone') this._markWorkGone(v, where); // nothing of it is left to throw away
+    else if (!folderThere(ws.path)) this._markFolderGone(v); // a failure part-way may have taken the folder already
     return { reply, focusId: id };
   }
 
@@ -2595,6 +2681,8 @@ export class Engine extends EventEmitter {
   }
 
   // ---------------------------------------------------------------- the demo (the simulator's optional methods)
+  // The simulator answers in its own words and sends the same events as a real merge or throw-away (agent.work,
+  // agent.files). Events for an agent the engine stopped are filtered, so whatever it did not record, the engine does.
 
   /** The demo's branch for an agent's work: where it was merged, where it started, else main. */
   _demoInto(v) {
@@ -2616,7 +2704,14 @@ export class Engine extends EventEmitter {
     return vf ? { files: count(vf.changed), adds: count(vf.adds), dels: count(vf.dels) } : { files: 0, adds: 0, dels: 0 };
   }
 
-  async _simChanges(v, live) {
+  /** A sentence the simulator gave (reply or sentence), else null. */
+  _simSaid(res) {
+    if (typeof res?.reply === 'string' && res.reply.trim()) return res.reply.trim();
+    if (typeof res?.sentence === 'string' && res.sentence.trim()) return res.sentence.trim();
+    return null;
+  }
+
+  async _simChanges(v) {
     const sim = this._simWith('changes');
     if (!sim) return { ok: false, reply: 'This is the demo, so there are no real changes to show.' };
     let res;
@@ -2628,8 +2723,9 @@ export class Engine extends EventEmitter {
     }
     // The simulator answers with a diff (workDiff's shape), or with { diff, branch?, into? }.
     const diff = res && Array.isArray(res.files) ? res : (res?.diff && Array.isArray(res.diff.files) ? res.diff : null);
-    if (!diff) return { ok: false, reply: (typeof res?.reply === 'string' && res.reply) || `The demo has no changes to show for ${v.name}.` };
-    return { ok: true, agentId: v.id, name: v.name, branch: res.branch ?? v.work?.branch ?? null, into: res.into ?? this._demoInto(v), live, diff };
+    if (!diff) return { ok: false, reply: this._simSaid(res) || `The demo has no changes to show for ${v.name}.` };
+    const cur = this.store.get(v.id) || v;
+    return { ok: true, agentId: v.id, name: cur.name, branch: res.branch ?? cur.work?.branch ?? null, into: res.into ?? this._demoInto(cur), live: this._isWorking(cur), diff };
   }
 
   async _simGraph() {
@@ -2637,12 +2733,13 @@ export class Engine extends EventEmitter {
     if (!sim) return { ok: false, reply: 'This is the demo, so there is no git history to show.' };
     let g;
     try {
-      g = await sim.gitGraph();
+      // The views give the state, name and work the person sees.
+      g = await sim.gitGraph({ views: (id) => this.store.get(id) });
     } catch (err) {
       this.log.warn('The simulator could not draw its git history:', err);
       g = null;
     }
-    if (!g || g.ok === false || !Array.isArray(g.commits)) return { ok: false, reply: (typeof g?.reply === 'string' && g.reply) || 'The demo could not show its git history.' };
+    if (!g || g.ok === false || !Array.isArray(g.commits)) return { ok: false, reply: this._simSaid(g) || 'The demo could not show its git history.' };
     // The simulator answers in the engine's shape ({ repo, commits, more, agents }) or in workspace.gitGraph's
     // ({ head, branch, commits, more }).
     const r = g.repo && typeof g.repo === 'object' ? g.repo : {};
@@ -2659,35 +2756,36 @@ export class Engine extends EventEmitter {
     return { ok: true, repo, commits: g.commits, more: !!g.more, agents };
   }
 
-  async _simProposeMerge(v) {
+  async _simProposeMerge(v, { state = null } = {}) {
     const sim = this._simWith('merge');
     if (!sim) return { ok: false, reply: 'This is the demo, so nothing is really merged.' };
     let res = null;
     if (typeof sim.proposeMerge === 'function') {
       try {
-        res = await sim.proposeMerge(v.id);
+        res = await sim.proposeMerge(v.id, { state, view: this.store.get(v.id) });
       } catch (err) {
         this.log.warn('The simulator could not propose a merge:', err);
         return { ok: false, reply: `The demo could not merge ${v.name}.` };
       }
-      if (res && res.ok === false) {
-        return { ok: false, reply: (typeof res.reply === 'string' && res.reply) || (typeof res.sentence === 'string' && res.sentence) || 'This is the demo, so nothing is really merged.' };
-      }
-      const again = this._mergeRefusal(this.store.get(v.id));
+      if (res && res.ok === false) return { ok: false, reply: this._simSaid(res) || 'This is the demo, so nothing is really merged.' };
+      const again = this._mergeRefusal(this.store.get(v.id), { state });
       if (again) return again;
     }
-    const into = (typeof res?.into === 'string' && res.into) || this._demoInto(v);
-    const n = this._demoCounts(res, v);
-    const detail = (typeof res?.detail === 'string' && res.detail)
+    const cur = this.store.get(v.id) || v;
+    const shown = res?.confirm && typeof res.confirm === 'object' ? res.confirm : {};
+    const bound = res?.expect && typeof res.expect === 'object' ? res.expect : null;
+    const into = (typeof bound?.into === 'string' && bound.into) || (typeof res?.into === 'string' && res.into) || this._demoInto(cur);
+    const n = this._demoCounts(res, cur);
+    const detail = (typeof shown.detail === 'string' && shown.detail) || (typeof res?.detail === 'string' && res.detail)
       || `${countsText(n.files, n.adds, n.dels)}. Its work becomes a commit on its branch, joined into ${into} by a merge commit. This is the demo, so nothing is really merged.`;
     return this._newConfirm({
-      kind: 'merge', demo: true, agentId: v.id, state: v.state, expect: { into },
-      sentence: `Merge ${v.name} into ${into}?`, detail, yes: 'Merge', no: 'Cancel', danger: false,
+      kind: 'merge', demo: true, agentId: v.id, state: cur.state, expect: bound ? { ...bound, into } : { into },
+      sentence: `Merge ${cur.name} into ${into}?`, detail, yes: 'Merge', no: 'Cancel', danger: false,
     });
   }
 
   async _simMerge(v, c) {
-    const pre = this._mergeRefusal(v);
+    const pre = this._mergeRefusal(v, { state: c.state });
     if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
     const sim = this._simWith('merge');
     if (!sim) return { reply: 'This is the demo, so nothing is really merged.', focusId: v.id };
@@ -2697,7 +2795,7 @@ export class Engine extends EventEmitter {
       const counts = this._demoCounts(null, v);
       let res;
       try {
-        res = await sim.merge(v.id);
+        res = await sim.merge(v.id, { expect: c.expect || null, view: this.store.get(v.id) });
       } catch (err) {
         this.log.warn('The simulator could not merge:', err);
         return { reply: `The demo could not merge ${v.name}.`, focusId: v.id };
@@ -2707,13 +2805,15 @@ export class Engine extends EventEmitter {
       const workRecorded = cur.work !== before.work;
       const into = (typeof res?.into === 'string' && res.into) || c.expect?.into || this._demoInto(cur);
       if (res && res.ok === false) {
-        const why = MERGE_WHYS.has(res.why) ? res.why : 'git';
+        // A refusal with no reason given (it cannot merge that agent) is only passed on; a merge that did not go
+        // through is kept on the agent, as in live mode.
+        if (!MERGE_WHYS.has(res.why)) return { reply: this._simSaid(res) || `The demo could not merge ${cur.name}.`, focusId: cur.id };
         const paths = (Array.isArray(res.paths) ? res.paths : []).filter(p => typeof p === 'string' && p);
-        const sentence = mergeSentence(why, { name: cur.name, into, paths });
-        if (!workRecorded && PROBLEM_WHYS.has(why)) {
-          this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, into), problem: { why, sentence, paths, at: this.now() } } }]);
+        const sentence = mergeSentence(res.why, { name: cur.name, into, paths });
+        if (!workRecorded && PROBLEM_WHYS.has(res.why)) {
+          this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, into), problem: { why: res.why, sentence, paths, at: this.now() } } }]);
         }
-        return { reply: `${sentence} ${DEMO_MERGED}`, focusId: cur.id };
+        return { reply: (typeof res.reply === 'string' && res.reply.trim()) || `${sentence} ${DEMO_MERGED}`, focusId: cur.id };
       }
       const n = res && (res.files != null) ? this._demoCounts(res, cur) : counts;
       const batch = [];
@@ -2723,27 +2823,46 @@ export class Engine extends EventEmitter {
       }
       if (cur.files === before.files) batch.push({ kind: EV.FILES, agentId: cur.id, files: { ...NO_FILES, list: [] } });
       if (batch.length) this._apply(batch);
-      return { reply: (typeof res?.reply === 'string' && res.reply) || `Merged ${cur.name} into ${into}. ${DEMO_MERGED}`, focusId: cur.id };
+      return { reply: (typeof res?.reply === 'string' && res.reply.trim()) || `Merged ${cur.name} into ${into}. ${DEMO_MERGED}`, focusId: cur.id };
     } finally {
       this._busy.delete(v.id);
     }
   }
 
-  _simProposeDiscard(v) {
-    if (!this._simWith('discard')) return { ok: false, reply: 'This is the demo, so nothing is really thrown away.' };
-    const active = this._isWorking(v);
-    const n = count(v.files?.changed);
-    const branch = v.work?.branch;
-    const parts = [`Its folder and ${branch ? `its branch ${branch}` : 'its branch'} are deleted, with ${n ? `${n} changed file${n === 1 ? '' : 's'}` : 'no changed files'}. Workbench keeps a hidden copy in git. This is the demo, so nothing is really thrown away.`];
-    if (active) parts.push('It is still working: it will be stopped first.');
+  async _simProposeDiscard(v, { state = null } = {}) {
+    const sim = this._simWith('discard');
+    if (!sim) return { ok: false, reply: 'This is the demo, so nothing is really thrown away.' };
+    let res = null;
+    if (typeof sim.proposeDiscard === 'function') {
+      try {
+        res = await sim.proposeDiscard(v.id, { state, view: this.store.get(v.id) });
+      } catch (err) {
+        this.log.warn('The simulator could not propose a throw-away:', err);
+        return { ok: false, reply: `The demo could not throw away ${v.name}’s work.` };
+      }
+      if (res && res.ok === false) return { ok: false, reply: this._simSaid(res) || 'This is the demo, so nothing is really thrown away.' };
+      const again = this._discardRefusal(this.store.get(v.id), { state });
+      if (again) return again;
+    }
+    const cur = this.store.get(v.id) || v;
+    const active = this._isWorking(cur);
+    const shown = res?.confirm && typeof res.confirm === 'object' ? res.confirm : {};
+    let detail = typeof shown.detail === 'string' && shown.detail ? shown.detail : null;
+    if (!detail) {
+      const n = count(cur.files?.changed);
+      const branch = cur.work?.branch;
+      const parts = [`Its folder and ${branch ? `its branch ${branch}` : 'its branch'} are deleted, with ${n ? `${n} changed file${n === 1 ? '' : 's'}` : 'no changed files'}. Workbench keeps a hidden copy in git. This is the demo, so nothing is really thrown away.`];
+      if (active) parts.push('It is still working: it will be stopped first.');
+      detail = parts.join(' ');
+    }
     return this._newConfirm({
-      kind: 'discard', demo: true, agentId: v.id, state: v.state, active, expect: {},
-      sentence: `Throw away ${v.name}’s work?`, detail: parts.join(' '), yes: 'Throw it away', no: 'Keep it', danger: true,
+      kind: 'discard', demo: true, agentId: v.id, state: cur.state, active, expect: res?.expect && typeof res.expect === 'object' ? { ...res.expect } : {},
+      sentence: `Throw away ${cur.name}’s work?`, detail, yes: 'Throw it away', no: 'Keep it', danger: true,
     });
   }
 
   async _simDiscard(v, c) {
-    const pre = this._discardRefusal(v);
+    const pre = this._discardRefusal(v, { state: c.active ? null : c.state });
     if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
     if (!c.active && this._isWorking(v)) return { reply: 'That changed. Have another look.', focusId: v.id };
     const sim = this._simWith('discard');
@@ -2754,20 +2873,19 @@ export class Engine extends EventEmitter {
       const before = this.store.get(v.id)?.work;
       let res;
       try {
-        res = await sim.discard(v.id);
+        // A card made while it worked binds to nothing: what it holds once stopped is what goes.
+        res = await sim.discard(v.id, { expect: c.active ? null : (c.expect || null), view: this.store.get(v.id) });
       } catch (err) {
         this.log.warn('The simulator could not throw work away:', err);
         return { reply: `The demo could not throw away ${v.name}’s work.`, focusId: v.id };
       }
-      if (res && res.ok === false) {
-        return { reply: (typeof res.reply === 'string' && res.reply) || (typeof res.sentence === 'string' && res.sentence) || `The demo could not throw away ${v.name}’s work.`, focusId: v.id };
-      }
+      if (res && res.ok === false) return { reply: this._simSaid(res) || `The demo could not throw away ${v.name}’s work.`, focusId: v.id };
       const cur = this.store.get(v.id) || v;
       if (cur.work === before) {
         const thrownAway = { at: this.now(), saved: typeof res?.saved === 'string' ? res.saved : null };
         this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, this._demoInto(cur)), branch: null, folder: false, problem: null, thrownAway } }]);
       }
-      return { reply: (typeof res?.reply === 'string' && res.reply) || `Threw away ${cur.name}’s work. ${DEMO_THROWN}`, focusId: cur.id };
+      return { reply: (typeof res?.reply === 'string' && res.reply.trim()) || `Threw away ${cur.name}’s work. ${DEMO_THROWN}`, focusId: cur.id };
     } finally {
       this._busy.delete(v.id);
     }

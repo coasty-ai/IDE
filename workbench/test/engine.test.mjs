@@ -8,9 +8,9 @@ import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
 import * as commands from '../src/core/commands.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
-import { FakeSim, FakeMachines, fakeAdapter, fakeDeps, gate, until, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
+import { FakeSim, FakeMachines, fakeAdapter, fakeDeps, gate, until, FAKE_BASE, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
 
-const REPO = { root: '/repos/shop', name: 'shop', head: 'abc1234', branch: 'main', dirty: 2 };
+const REPO = { root: '/repos/shop', name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2 };
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${id}` };
 const subagentPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-subagent.json', import.meta.url), 'utf8'));
 const rootPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-root-bash.json', import.meta.url), 'utf8'));
@@ -99,7 +99,7 @@ test('startAgent (live) creates a workspace, emits created then starting, and st
   assert.deepEqual(runner.opts.hook, { url: HOOK.url, token: `tok-${v.id}` }, 'the agent gets its own hook token');
   assert.equal(typeof runner.opts.emit, 'function');
   assert.deepEqual(t.calls.createWorkspace[0], { repoRoot: REPO.root, agentId: v.id, slug: 'fix-flaky-checkout-test' });
-  assert.deepEqual(t.calls.readRepoConfig[0], { repoRoot: REPO.root, ref: 'abc1234' }, 'config comes from the base commit');
+  assert.deepEqual(t.calls.readRepoConfig[0], { repoRoot: REPO.root, ref: FAKE_BASE }, 'config comes from the base commit');
   assert.ok(t.notices.includes('Started Fix flaky checkout test.'));
   await t.engine.shutdown();
 });
@@ -266,7 +266,7 @@ test('receipt: all checks passed is done_checked, with files, rules, running che
   assert.deepEqual(v.checks.results.map(r => [r.name, r.ok]), [['unit tests', true]]);
   assert.equal(v.says, 'Fixed the redirect after login.');
   assert.ok(checkStates.includes('running'), 'checks show as running first');
-  assert.deepEqual(t.calls.diffStats[0], { path: v.workspace, base: 'abc1234' });
+  assert.deepEqual(t.calls.diffStats[0], { path: v.workspace, base: FAKE_BASE });
   assert.deepEqual(t.calls.checkRules[0].paths, ['src/cart.js']);
   assert.equal(t.calls.runChecks[0].cwd, v.workspace);
   await t.engine.shutdown();
@@ -442,7 +442,7 @@ test('an agent that could not start has its unchanged folder and branch removed'
   const t = live({ adapters: { claude: fakeAdapter('claude', { failStart: new Error('spawn claude ENOENT') }) } });
   const v = await t.engine.startAgent({ task: 'Fix the login' });
   assert.equal(v.state, 'failed');
-  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: v.workspace, base: 'abc1234', onlyIfUnchanged: true, deleteBranch: true }]);
+  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: v.workspace, base: FAKE_BASE, onlyIfUnchanged: true, deleteBranch: true }]);
   const { kept } = await t.engine.shutdown();
   assert.equal(t.calls.removeWorkspace.length, 1, 'not asked again at shutdown');
   assert.deepEqual(kept, []);
@@ -464,8 +464,8 @@ test('shutdown asks to remove each agent folder only if it is unchanged, after i
   const { kept } = await t.engine.shutdown();
   assert.deepEqual(t.engine.keptFolders(), kept);
   assert.deepEqual(t.calls.removeWorkspace.map(o => [o.path, o.onlyIfUnchanged, o.deleteBranch, o.base]).sort(), [
-    [t.store.get(a.id).workspace, true, true, 'abc1234'],
-    [t.store.get(b.id).workspace, true, true, 'abc1234'],
+    [t.store.get(a.id).workspace, true, true, FAKE_BASE],
+    [t.store.get(b.id).workspace, true, true, FAKE_BASE],
   ].sort());
   assert.deepEqual(stopsAtRemove, [2, 2], 'only once both agents have stopped');
   assert.deepEqual(kept, [{ id: b.id, name: 'Fix cart total', path: t.store.get(b.id).workspace, branch: `workbench/fix-cart-total-${b.id}` }]);
@@ -498,7 +498,7 @@ test('a launch still making its folder when Workbench closes starts no agent, an
   await refused;
   assert.equal(t.claude.runners.length, 0, 'no agent was started');
   assert.deepEqual(t.store.list(), []);
-  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: t.ws.path, base: 'abc1234', onlyIfUnchanged: true, deleteBranch: true }]);
+  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: t.ws.path, base: FAKE_BASE, onlyIfUnchanged: true, deleteBranch: true }]);
   assert.deepEqual(kept, []);
   assert.deepEqual(t.engine.keptFolders(), []);
 });
@@ -1413,7 +1413,7 @@ test('command: a start intent asks to confirm first; confirm(go) launches, confi
   assert.deepEqual(Object.keys(ctx).sort(), ['agents', 'focusId', 'harnesses', 'machines', 'pendingConfirm', 'repo']);
   assert.deepEqual(ctx.harnesses, { claude: true, codex: true, sim: false });
   // identity: null, as start() has not read it yet (Workbench cannot tell); true or false once it has.
-  assert.deepEqual(ctx.repo, { name: 'shop', head: 'abc1234', branch: 'main', dirty: 2, identity: null });
+  assert.deepEqual(ctx.repo, { name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2, identity: null });
 
   const go = await t.engine.confirm(out.confirm.id, true);
   assert.equal(go.reply, 'Started Fix flaky checkout test.');
@@ -2309,7 +2309,7 @@ test('snapshot has the contract fields, including repo and harness availability'
   const s = t.engine.snapshot();
   assert.equal(s.mode, 'live');
   // identity: git knows the person's name and email (read at start and on every refresh), so Workbench can merge.
-  assert.deepEqual(s.repo, { name: 'shop', head: 'abc1234', branch: 'main', dirty: 2, identity: true });
+  assert.deepEqual(s.repo, { name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2, identity: true });
   assert.deepEqual(s.harnesses, { claude: true, codex: true, sim: false });
   assert.equal(s.agents.length, 1);
   assert.equal(s.agents[0].id, id);
@@ -2349,10 +2349,10 @@ test('merge: the card asks first, counts first, and binds itself to the work it 
   });
   assert.equal(t.notices.length, before, 'a card is not announced');
   // It read the work as it is now, from where its unmerged work starts.
-  assert.deepEqual(t.calls.snapshotWork.at(-1), { repoRoot: REPO.root, path: a.v.workspace, since: 'abc1234' });
+  assert.deepEqual(t.calls.snapshotWork.at(-1), { repoRoot: REPO.root, path: a.v.workspace, since: FAKE_BASE });
   const stored = t.engine.confirms.get(out.confirm.id);
   assert.equal(stored.agentId, a.id);
-  assert.deepEqual(stored.expect, { workId: 'abc1234:tree0', into: 'main', intoHead: 'abc1234' });
+  assert.deepEqual(stored.expect, { workId: `${FAKE_BASE}:tree0`, into: 'main', intoHead: FAKE_BASE });
   assert.equal(t.calls.mergeWork.length, 0, 'nothing is merged before the yes');
   await t.engine.shutdown();
 });
@@ -2411,9 +2411,9 @@ test('merge: refusals come in plain words, are announced, and leave nothing behi
   await refused(`${a.id}-h1`, {}, 'Helpers work in their agent’s folder. Merge the agent instead.');
   // The page drew its button for another state.
   await refused(a.id, { state: 'done_checked' }, 'That changed. Have another look.');
-  // Nothing new to merge.
+  // Nothing to merge: it never changed anything (after a merge, the words are "already in": see below).
   t.git.work.changed = false;
-  await refused(a.id, {}, 'Fix cart total’s work is already in main.');
+  await refused(a.id, {}, 'Fix cart total changed nothing, so there is nothing to merge.');
   t.git.work.changed = true;
   // The person's folder is not on a branch; git does not know who they are.
   t.git.branch = null;
@@ -2462,8 +2462,8 @@ test('merge: yes merges once, records it, counts its work from the merged commit
   assert.deepEqual(yes, { reply: 'Merged Fix cart total into main.', focusId: a.id });
   assert.equal(t.notices.at(-1), 'Merged Fix cart total into main.');
   assert.deepEqual(t.calls.mergeWork, [{
-    repoRoot: REPO.root, path: a.v.workspace, branch: `workbench/fix-cart-total-${a.id}`, since: 'abc1234',
-    expect: { workId: 'abc1234:tree0', into: 'main', intoHead: 'abc1234' },
+    repoRoot: REPO.root, path: a.v.workspace, branch: `workbench/fix-cart-total-${a.id}`, since: FAKE_BASE,
+    expect: { workId: `${FAKE_BASE}:tree0`, into: 'main', intoHead: FAKE_BASE },
     message: { subject: 'Fix the cart total', body: 'I fixed the cart total.', name: 'Fix cart total' },
     agentId: a.id, harness: 'claude',
   }]);

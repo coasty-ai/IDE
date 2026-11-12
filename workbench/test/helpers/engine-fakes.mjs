@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /** Commit ids the fake git hands out: the merge commit M (the person's new HEAD) and the agent's work commit W. */
+/** The commit agents start from, and the person's HEAD until a merge: a full commit id, as git gives it. */
+export const FAKE_BASE = 'abc1234'.padEnd(40, '0');
 export const FAKE_MERGE = 'aa'.repeat(20);
 export const FAKE_WORK = 'bb'.repeat(20);
 
@@ -112,9 +114,9 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
     prepareRepo: [], snapshotWork: [], workDiff: [], mergeWork: [], discardWork: [], gitGraph: [], gitIdentity: [],
   };
   const git = {
-    branch: 'main', head: 'abc1234', dirty: 2,
+    branch: 'main', head: FAKE_BASE, dirty: 2,
     identity: { name: 'Test Person', email: 'test@example.com' },
-    agentHead: 'abc1234',
+    agentHead: FAKE_BASE,
     work: { changed: true, files: [{ path: 'src/cart.js', status: 'modified', adds: 3, dels: 1 }], left: [] },
     seq: 0,
     commits: [
@@ -156,7 +158,7 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
         fs.mkdirSync(p, { recursive: true });
         fs.writeFileSync(path.join(p, '.git'), 'gitdir: elsewhere\n');
       }
-      return { path: p, branch: `workbench/${o.slug}-${o.agentId}`, base: 'abc1234' };
+      return { path: p, branch: `workbench/${o.slug}-${o.agentId}`, base: FAKE_BASE };
     },
     async gitIdentity(o) {
       calls.gitIdentity.push(o);
