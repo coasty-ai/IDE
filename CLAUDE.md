@@ -14,10 +14,10 @@ Workbench is a local program that runs coding agents (Claude Code, and Codex whe
 - Node 22 or later, ES modules, no third-party packages: only `node:` built-ins. Add no packages and no lock files.
 - `workbench/src/shared/` must not import `node:` modules: the page loads those files as they are.
 - Plain language in anything a person sees: whole sentences built from facts (paths, branch names, counts). Never identifiers, and never git's own error text.
-- Every child process gets an argument array, never a shell string. Every git call goes through `git()` in `workbench/src/core/workspace.mjs`.
+- Every child process gets an argument array, never a shell string. The one exception is the checks in `workbench.json`: commands the repository's owner wrote, run with `/bin/sh -c`. Every git call goes through `git()` in `workbench/src/core/workspace.mjs`.
 - Escape everything an agent controls before it reaches the page (paths, diffs, commit subjects, branch names), and show control, bidirectional and zero-width characters as visible symbols.
 - Buttons carry what they were drawn for (`data-agent`, `data-state`, `data-confirm`, `data-work`); the engine checks everything again when it acts.
-- Tests use `node:test` and `node:assert/strict`, need no network, use temporary folders and a temporary HOME, and never start a real `claude` or `codex` (use the stand-ins). They never depend on the machine's git identity: set `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, or pass `-c user.name=… -c user.email=…`.
+- Tests use `node:test` and `node:assert/strict`, need no network, use temporary folders and a temporary HOME, and never start a real `claude` or `codex` (use the stand-ins). They never depend on the machine's git identity: set `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, or pass `-c user.name=… -c user.email=…`. Workbench's own merge reads `user.name` and `user.email` from git config only, never from `GIT_AUTHOR_*`: a test that merges sets them in its temporary repository, or in a `GIT_CONFIG_GLOBAL` file of its own.
 - Do not change the research and mockups in `docs/`.
 
 ## Running things
