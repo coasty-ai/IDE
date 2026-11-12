@@ -56,13 +56,21 @@ test('argument builders and the scrubbed environment', () => {
   assert.deepEqual(startArgs({ cwd: '/w', task: '-v fix it', model: 'm' }), ['exec', '--json', '-C', '/w', '--sandbox', 'workspace-write', '-m', 'm', '--', '-v fix it']);
   assert.deepEqual(resumeArgs({ threadId: 'T', text: 'hi' }), ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', '--', 'T', 'hi']);
 
+  const NODE_DIR = path.dirname(process.execPath);
   const env = buildEnv({
-    PATH: '/bin', HOME: '/h', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_AGENT_SDK_VERSION: '1',
+    PATH: NODE_DIR, HOME: '/h', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_AGENT_SDK_VERSION: '1',
     CODEX_THREAD_ID: 'parent', CODEX_SANDBOX: 'seatbelt', CODEX_SANDBOX_NETWORK_DISABLED: '1', CODEX_EXEC_SERVER_URL: 'http://x',
     CODEX_NETWORK_PROXY_ACTIVE: '1', CODEX_SHELL_SNAPSHOT_STATE_1: 'x', WORKBENCH_HOOK_URL: 'http://127.0.0.1:1/hook/pretool', WORKBENCH_HOOK_TOKEN: 'secret',
     CODEX_HOME: '/h/.codex', CODEX_API_KEY: 'k', OPENAI_API_KEY: 'k2', WORKBENCH_AGENT_ID: 'old',
+    // The editor Workbench was started from, and Workbench's own choice of programs.
+    VSCODE_IPC_HOOK: '/tmp/code.sock', VSCODE_PID: '1', ELECTRON_RUN_AS_NODE: '1', GIT_EDITOR: 'true',
+    WORKBENCH_CLAUDE_BIN: '/x/claude', WORKBENCH_CODEX_BIN: '/x/codex',
   }, 'a1b2c3');
-  assert.deepEqual(env, { PATH: '/bin', HOME: '/h', CODEX_HOME: '/h/.codex', CODEX_API_KEY: 'k', OPENAI_API_KEY: 'k2', WORKBENCH_AGENT_ID: 'a1b2c3' });
+  assert.deepEqual(env, { PATH: NODE_DIR, HOME: '/h', CODEX_HOME: '/h/.codex', CODEX_API_KEY: 'k', OPENAI_API_KEY: 'k2', WORKBENCH_AGENT_ID: 'a1b2c3' });
+  // No node on the PATH: the folder of the node running Workbench goes first, so the agent's `npm test` works.
+  assert.equal(buildEnv({ PATH: '/no/such/folder' }, 'a1b2c3').PATH, `${NODE_DIR}:/no/such/folder`);
+  assert.equal(buildEnv({}, 'a1b2c3').PATH, `${NODE_DIR}:/usr/bin:/bin`);
+  assert.equal(buildEnv({ PATH: `/no/such/folder:${NODE_DIR}` }, 'a1b2c3').PATH, `/no/such/folder:${NODE_DIR}`);
 });
 
 test('available() reports the version and whether Codex is signed in, never what it printed', async t => {
@@ -99,6 +107,7 @@ test('start() runs codex exec in the workspace with the checked flags, stdin ign
   const s = setup(t, {
     FAKE_CODEX_DELAY_MS: '15', CODEX_HOME: codexHome,
     CLAUDECODE: '1', CODEX_THREAD_ID: 'parent-thread', CODEX_SANDBOX: 'seatbelt', WORKBENCH_HOOK_URL: 'http://127.0.0.1:9/hook/pretool', WORKBENCH_HOOK_TOKEN: 'secret',
+    WORKBENCH_CLAUDE_BIN: '/x/claude', VSCODE_IPC_HOOK: '/tmp/code.sock', ELECTRON_RUN_AS_NODE: '1', GIT_EDITOR: 'true',
   });
   const runner = createRunner({ agentId: 'a1b2c3', name: 'Explain repo', task: 'Explain this repo', cwd: s.ws, model: 'gpt-test', emit: s.emit, hook: { url: 'http://127.0.0.1:9/hook/pretool', token: 'secret' } });
   assert.deepEqual(runner.info(), { pid: null, sessionId: null, alive: false });
@@ -118,6 +127,11 @@ test('start() runs codex exec in the workspace with the checked flags, stdin ign
   assert.deepEqual(
     [call.env.CLAUDECODE, call.env.CODEX_THREAD_ID, call.env.CODEX_SANDBOX, call.env.WORKBENCH_HOOK_URL, call.env.WORKBENCH_HOOK_TOKEN],
     [false, false, false, false, false],
+  );
+  assert.deepEqual(
+    [call.env.WORKBENCH_CLAUDE_BIN, call.env.WORKBENCH_CODEX_BIN, call.env.VSCODE_IPC_HOOK, call.env.ELECTRON_RUN_AS_NODE, call.env.GIT_EDITOR],
+    [false, false, false, false, false],
+    'no handle on the editor, and no program choices for a Workbench the agent might start',
   );
   assert.equal(call.codexHome, codexHome, 'CODEX_HOME survives, so sign-in and resume keep working');
   assert.equal(call.agentId, 'a1b2c3');

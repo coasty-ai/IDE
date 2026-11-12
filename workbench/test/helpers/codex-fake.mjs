@@ -30,7 +30,8 @@ const RESUME = { values: new Set(['-c', '--config', '-m', '--model']), flags: ne
 
 // Variables the tests look for. Only presence is recorded, apart from two harmless values.
 const WATCHED = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_THREAD_ID', 'CODEX_SANDBOX', 'CODEX_EXEC_SERVER_URL',
-  'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'CODEX_HOME', 'CODEX_API_KEY', 'WORKBENCH_AGENT_ID'];
+  'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'CODEX_HOME', 'CODEX_API_KEY', 'WORKBENCH_AGENT_ID',
+  'WORKBENCH_CLAUDE_BIN', 'WORKBENCH_CODEX_BIN', 'VSCODE_IPC_HOOK', 'ELECTRON_RUN_AS_NODE', 'GIT_EDITOR'];
 
 function usageError(message) {
   process.stderr.write(`error: ${message}\n`);
@@ -87,8 +88,7 @@ function fixtureLines(name, threadId) {
   });
 }
 
-function stayAlive(ignoreTerm) {
-  if (ignoreTerm) process.on('SIGTERM', () => {});
+function stayAlive() {
   setInterval(() => {}, 1000);
   setTimeout(() => process.exit(0), SELF_DESTRUCT_MS).unref();
 }
@@ -99,14 +99,23 @@ async function run({ resume, parsed }) {
   const delay = Number(env.FAKE_CODEX_DELAY_MS) || 0;
 
   if (mode === 'hang' || mode === 'stubborn') {
-    // A command that keeps running, in Codex's process group, holding the same stdout.
-    const keep = `${mode === 'stubborn' ? "process.on('SIGTERM', () => {});" : ''} setInterval(() => {}, 1000); setTimeout(() => process.exit(0), ${SELF_DESTRUCT_MS});`;
-    const grandchild = spawn(process.execPath, ['-e', keep], { stdio: ['ignore', 'inherit', 'inherit'] });
+    // Stubborn from the start: a stop that follows the first line at once must still find SIGTERM ignored.
+    if (mode === 'stubborn') process.on('SIGTERM', () => {});
+    // A command that keeps running, in Codex's process group, holding the same stdout. It says on fd 3 when it is
+    // ready (its own SIGTERM handler in place), and only then does the turn begin: on a busy machine a node process
+    // takes a while to start, and a SIGTERM that came first would end it.
+    const keep = `${mode === 'stubborn' ? "process.on('SIGTERM', () => {});" : ''} require('node:fs').writeSync(3, 'ready'); require('node:fs').closeSync(3); setInterval(() => {}, 1000); setTimeout(() => process.exit(0), ${SELF_DESTRUCT_MS});`;
+    const grandchild = spawn(process.execPath, ['-e', keep], { stdio: ['ignore', 'inherit', 'inherit', 'pipe'] });
     record({ grandchild: grandchild.pid });
+    await new Promise((resolve) => {
+      grandchild.stdio[3].once('data', resolve);
+      grandchild.stdio[3].once('close', resolve);
+      grandchild.once('error', resolve);
+    });
     const [started] = fixtureLines('codex-run.jsonl', threadId);
     await write(process.stdout, `${started}\n{"type":"turn.started"}\n`);
     await write(process.stdout, JSON.stringify({ type: 'item.started', item: { id: 'item_1', type: 'command_execution', command: "/bin/zsh -lc 'npm test -- --watch'", aggregated_output: '', exit_code: null, status: 'in_progress' } }) + '\n');
-    return stayAlive(mode === 'stubborn');
+    return stayAlive();
   }
 
   record();
@@ -137,7 +146,7 @@ async function main() {
   // No arguments: a bare `node --test` runs every file under test/, this one included. Do nothing.
   if (args.length === 0) return;
   if (args[0] === '--version' || args[0] === '-V') {
-    if (env.FAKE_CODEX_VERSION === 'hang') return stayAlive(false);
+    if (env.FAKE_CODEX_VERSION === 'hang') return stayAlive();
     return write(process.stdout, 'codex-cli 0.166.0\n');
   }
   if (args[0] === 'login' && args[1] === 'status') {

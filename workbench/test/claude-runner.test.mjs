@@ -1,6 +1,6 @@
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, realpathSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,8 +8,9 @@ import {
   createRunner, createClaudeRunner, available, harness, createLineSplitter, STOP_GRACE_MS, STDERR_TAIL_CHARS,
 } from '../src/adapters/claude/runner.mjs';
 import {
-  buildClaudeLaunch, userMessage, shellQuote, hookCommand, hookSettings, scrubEnv, sessionFolders,
-  WORKBENCH_PROMPT, DISALLOWED_TOOLS, BRIDGE_PATH, DEFAULT_BUDGET_USD,
+  buildClaudeLaunch, userMessage, shellQuote, hookCommand, hookSettings, scrubEnv, sessionFolders, findClaude, claudeBin,
+  newestExtensionClaude, onPath, withNodeOnPath, WORKBENCH_PROMPT, DISALLOWED_TOOLS, BRIDGE_PATH, DEFAULT_BUDGET_USD,
+  CLAUDE_NOT_FOUND, EXTENSION_FOLDERS,
 } from '../src/adapters/claude/args.mjs';
 import { EV } from '../src/shared/events.mjs';
 
@@ -17,6 +18,35 @@ const FAKE = fileURLToPath(new URL('./helpers/claude-fake.mjs', import.meta.url)
 const WORKBENCH = fileURLToPath(new URL('..', import.meta.url)); // the agent's folder in these tests
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', token: 'tok-123' };
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const NODE_DIR = path.dirname(process.execPath);
+/** The tools every launch turns off: the eleven verified with 2.1.221, and five new in 2.1.322. */
+const OFF = 'Workflow CronCreate CronDelete CronList ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger DesignSync SendFile SendToProject PublishPlugin ListAgents WrapUp';
+
+/** A temporary folder for one test, removed afterwards. */
+function scratch(t) {
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'wb-claude-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+/** A program file: a shell script, executable unless `exec` is false. */
+function program(file, body = 'exit 0', { exec = true } = {}) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, `#!/bin/sh\n${body}\n`, { mode: exec ? 0o755 : 0o644 });
+  return file;
+}
+
+/**
+ * A Claude Code extension folder under `home`, in VS Code (`.vscode/extensions`) or another editor's folder, whose
+ * program answers --version with `version` and otherwise runs the stand-in. `log`: each start writes the version there.
+ */
+function extension(home, version, { folder = '.vscode/extensions', suffix = `-${process.platform}-${process.arch}`, log = null, exec = true } = {}) {
+  const dir = path.join(home, folder, `anthropic.claude-code-${version}${suffix}`);
+  const bin = path.join(dir, 'resources', 'native-binary', 'claude');
+  const note = log ? `echo ${shellQuote(version)} >> ${shellQuote(log)}\n` : '';
+  program(bin, `if [ "$1" = "--version" ]; then echo ${shellQuote(`${version} (Claude Code)`)}; exit 0; fi\n${note}FAKE_CLAUDE_VERSION=${shellQuote(version)}\nexport FAKE_CLAUDE_VERSION\nexec ${shellQuote(process.execPath)} ${shellQuote(FAKE)} "$@"`, { exec });
+  return { dir, bin };
+}
 
 before(() => chmodSync(FAKE, 0o755));
 
@@ -99,7 +129,7 @@ test('buildClaudeLaunch builds the verified command line', () => {
   assert.deepEqual(l.args, [
     '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--forward-subagent-text',
     '--setting-sources', 'project', '--permission-mode', 'default', '--strict-mcp-config',
-    '--disallowedTools', 'Workflow CronCreate CronDelete CronList ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger DesignSync',
+    '--disallowedTools', OFF,
     '--settings', settings,
     '--append-system-prompt', WORKBENCH_PROMPT,
     '--max-budget-usd', '2', '--session-id', sid, '--name', 'Fix login', '--model', 'claude-haiku-4-5',
@@ -107,8 +137,14 @@ test('buildClaudeLaunch builds the verified command line', () => {
   assert.equal(l.sessionId, sid);
   assert.equal(l.resume, false);
   assert.equal(WORKBENCH_PROMPT, 'You are running inside Workbench, which shows your progress to a person in plain language. Work only inside the current folder. If you need a decision from the person, end your turn with one short, clear question. When you finish, begin your final message with one plain sentence, understandable by someone who does not write code, saying what you did.');
-  assert.equal(DISALLOWED_TOOLS.split(' ').length, 11);
-  for (const tool of ['DesignSync', 'CronList']) assert.ok(DISALLOWED_TOOLS.split(' ').includes(tool), tool);
+  assert.equal(DISALLOWED_TOOLS, OFF);
+  assert.equal(DISALLOWED_TOOLS.split(' ').length, 16);
+  // Claude Code 2.1.322's new tools reach past the agent: other sessions, claude.ai, the plugin library, the app.
+  for (const tool of ['DesignSync', 'CronList', 'SendFile', 'SendToProject', 'PublishPlugin', 'ListAgents', 'WrapUp']) {
+    assert.ok(DISALLOWED_TOOLS.split(' ').includes(tool), tool);
+  }
+  // The program can be given; then it is used as it is.
+  assert.equal(buildClaudeLaunch({ name: 'A', hook: HOOK, agentId: 'abc123', env: {}, bin: '/opt/claude' }).bin, '/opt/claude');
 });
 
 test('repository settings cannot switch the workbench hook off, or loosen Claude Code\'s own checks', () => {
@@ -160,13 +196,49 @@ test('buildClaudeLaunch: resume, defaults and refusals', () => {
 test('the environment is scrubbed and carries the hook details', () => {
   const l = buildClaudeLaunch({
     name: 'A', hook: HOOK, agentId: 'abc123',
-    env: { PATH: '/bin', HOME: '/h', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_SSE_PORT: '1', CLAUDE_PID: '5', CLAUDE_EFFORT: 'high', CLAUDE_AGENT_SDK_VERSION: '1', CLAUDE_CONFIG_DIR: '/c', ANTHROPIC_API_KEY: 'k' },
+    env: { PATH: NODE_DIR, HOME: '/h', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_SSE_PORT: '1', CLAUDE_PID: '5', CLAUDE_EFFORT: 'high', CLAUDE_AGENT_SDK_VERSION: '1', CLAUDE_CONFIG_DIR: '/c', ANTHROPIC_API_KEY: 'k' },
   });
   assert.deepEqual(l.env, {
-    PATH: '/bin', HOME: '/h', CLAUDE_CONFIG_DIR: '/c', ANTHROPIC_API_KEY: 'k',
+    PATH: NODE_DIR, HOME: '/h', CLAUDE_CONFIG_DIR: '/c', ANTHROPIC_API_KEY: 'k',
     WORKBENCH_HOOK_URL: HOOK.url, WORKBENCH_HOOK_TOKEN: HOOK.token, WORKBENCH_AGENT_ID: 'abc123',
   });
   assert.deepEqual(scrubEnv({ CLAUDECODE: '1', A: 'b', U: undefined }), { A: 'b' });
+});
+
+test('an agent gets no handle on the editor Workbench was started from, and no say in which programs a Workbench it starts would run', () => {
+  // As seen in a Claude Code session inside VS Code, which is where Workbench is often started from.
+  const host = {
+    VSCODE_IPC_HOOK: '/Users/x/Library/Application Support/Code/1.14-main.sock', VSCODE_PID: '3822', VSCODE_CWD: '/',
+    VSCODE_GIT_IPC_HANDLE: '/tmp/vscode-git.sock', VSCODE_NLS_CONFIG: '{}', ELECTRON_RUN_AS_NODE: '1', GIT_EDITOR: 'true',
+    WORKBENCH_CLAUDE_BIN: '/x/claude', WORKBENCH_CODEX_BIN: '/x/codex',
+  };
+  const own = { PATH: NODE_DIR, HOME: '/h', EDITOR: 'vim', GIT_AUTHOR_NAME: 'Ada', VSCODE: 'not the editor’s', MY_VSCODE_THING: '1' };
+  assert.deepEqual(scrubEnv({ ...host, ...own }), own);
+  const l = buildClaudeLaunch({ name: 'A', hook: HOOK, agentId: 'abc123', env: { ...host, ...own } });
+  for (const k of Object.keys(host)) assert.equal(l.env[k], undefined, k);
+  assert.equal(l.bin, '/x/claude', 'the program itself is still the one asked for');
+});
+
+test('agents find node on their PATH, even when the person’s PATH has none', (t) => {
+  const dir = scratch(t);
+  const empty = path.join(dir, 'empty');
+  mkdirSync(empty);
+  const launch = (env) => buildClaudeLaunch({ name: 'A', hook: HOOK, agentId: 'abc123', env }).env.PATH;
+  // No node on it: the folder of the node running Workbench goes first, so `npm test` and `node --test` work.
+  assert.equal(launch({ PATH: empty }), `${NODE_DIR}:${empty}`);
+  assert.equal(launch({ PATH: '/no/such/folder:relative/bin' }), `${NODE_DIR}:/no/such/folder:relative/bin`);
+  assert.equal(launch({}), `${NODE_DIR}:/usr/bin:/bin`, 'no PATH at all: the shell’s own default stays usable');
+  // A node already on it: the PATH is left exactly as it was.
+  assert.equal(launch({ PATH: `${empty}:${NODE_DIR}:/usr/bin` }), `${empty}:${NODE_DIR}:/usr/bin`);
+  // Only a program counts: a folder called node, a file that cannot run, or a relative PATH entry do not.
+  mkdirSync(path.join(dir, 'a', 'node'), { recursive: true });
+  program(path.join(dir, 'b', 'node'), 'exit 0', { exec: false });
+  program(path.join(dir, 'c', 'node'));
+  assert.equal(onPath('node', `${path.join(dir, 'a')}:${path.join(dir, 'b')}`), null);
+  assert.equal(onPath('node', `${path.join(dir, 'a')}:${path.join(dir, 'b')}:${path.join(dir, 'c')}`), path.join(dir, 'c', 'node'));
+  assert.equal(onPath('node', path.relative(process.cwd(), path.join(dir, 'c'))), null, 'relative: it would be looked for in the agent’s folder');
+  const env = { PATH: path.join(dir, 'c'), A: '1' };
+  assert.equal(withNodeOnPath(env), env, 'unchanged, not copied');
 });
 
 test('the person\'s own Claude Code settings and login reach the agent; session markers do not', () => {
@@ -259,13 +331,117 @@ test('available reports the version, a missing binary, and a binary that hangs',
   assert.equal(harness, 'claude');
   assert.equal(createClaudeRunner, createRunner);
   assert.equal(STOP_GRACE_MS, 3000);
-  assert.deepEqual(await available({ env: fakeEnv() }), { ok: true, version: '2.1.221' });
-  const missing = await available({ env: { ...process.env, WORKBENCH_CLAUDE_BIN: '/nonexistent/claude-binary' } });
-  assert.equal(missing.ok, false);
-  assert.match(missing.reason, /not installed/);
+  assert.deepEqual(await available({ env: fakeEnv() }), { ok: true, version: '2.1.221', path: FAKE, from: 'env' });
+  assert.deepEqual(await available({ env: fakeEnv({ FAKE_CLAUDE_VERSION: '2.1.322' }) }), { ok: true, version: '2.1.322', path: FAKE, from: 'env' });
+  // A path that is not there has its own reason, and no other Claude Code is tried instead.
+  assert.deepEqual(await available({ env: { ...process.env, WORKBENCH_CLAUDE_BIN: '/nonexistent/claude-binary' } }), {
+    ok: false, reason: 'Claude Code is not at /nonexistent/claude-binary, the path in WORKBENCH_CLAUDE_BIN.', path: '/nonexistent/claude-binary', from: 'env',
+  });
   const hung = await available({ env: fakeEnv({ FAKE_CLAUDE_VERSION: 'hang' }), timeoutMs: 300 });
   assert.equal(hung.ok, false);
   assert.match(hung.reason, /did not answer/);
+});
+
+test('available says where Claude Code was found: --claude, WORKBENCH_CLAUDE_BIN, the PATH or the VS Code extension', async (t) => {
+  const dir = scratch(t);
+  const home = path.join(dir, 'home');
+  const bin = path.join(dir, 'bin');
+  const { bin: ext } = extension(home, '2.1.322');
+  program(path.join(bin, 'claude'), 'echo "2.1.310 (Claude Code)"');
+  const base = { HOME: home, PATH: path.join(dir, 'empty') };
+  assert.deepEqual(await available({ env: base }), { ok: true, version: '2.1.322', path: ext, from: 'vscode' });
+  assert.deepEqual(await available({ env: { ...base, PATH: bin } }), { ok: true, version: '2.1.310', path: path.join(bin, 'claude'), from: 'path' });
+  assert.deepEqual(await available({ env: { ...base, PATH: bin, WORKBENCH_CLAUDE_BIN: FAKE } }), { ok: true, version: '2.1.221', path: FAKE, from: 'env' });
+  assert.deepEqual(await available({ env: { ...base, WORKBENCH_CLAUDE_BIN: FAKE }, claudePath: ext }), { ok: true, version: '2.1.322', path: ext, from: 'flag' });
+  // Nothing anywhere: the reason names both ways to say where it is.
+  const none = await available({ env: { HOME: path.join(dir, 'nobody'), PATH: path.join(dir, 'empty') } });
+  assert.deepEqual(none, { ok: false, reason: CLAUDE_NOT_FOUND });
+  assert.equal(CLAUDE_NOT_FOUND, 'Claude Code was not found: there is no claude command on the PATH, and no Claude Code extension in VS Code or Cursor. Tell Workbench where it is with --claude <path>, or with WORKBENCH_CLAUDE_BIN.');
+  // A folder given as the program.
+  const folder = await available({ env: base, claudePath: dir });
+  assert.deepEqual(folder, { ok: false, reason: `The path given with --claude, ${dir}, is a folder, not the Claude Code program.`, path: dir, from: 'flag' });
+  // A program that fails says so, and which one it was.
+  program(path.join(dir, 'broken', 'claude'), 'echo "it broke" >&2; exit 4');
+  assert.deepEqual(await available({ env: base, claudePath: path.join(dir, 'broken', 'claude') }), {
+    ok: false, reason: 'Claude Code could not be started. It said: it broke', path: path.join(dir, 'broken', 'claude'), from: 'flag',
+  });
+});
+
+test('findClaude looks in order, takes the newest extension, and never swaps a given path for another Claude Code', (t) => {
+  const dir = scratch(t);
+  const home = path.join(dir, 'home');
+  const bin = path.join(dir, 'bin');
+  const empty = path.join(dir, 'empty');
+  mkdirSync(empty);
+  program(path.join(bin, 'claude'));
+  program(path.join(bin, 'claude-beta'));
+  const plat = `-${process.platform}-${process.arch}`;
+  const other = process.platform === 'linux' ? '-darwin-arm64' : '-linux-x64';
+  extension(home, '2.1.300');
+  const insiders = extension(home, '2.1.322', { folder: '.vscode-insiders/extensions' });
+  extension(home, '2.1.310', { folder: '.cursor/extensions' });
+  extension(home, '2.1.900', { suffix: other }); // for another system
+  extension(home, '2.1.800', { exec: false }); // its program cannot run
+  const gone = extension(home, '2.1.700'); // VS Code marked it to be deleted
+  writeFileSync(path.join(home, '.vscode/extensions/.obsolete'), JSON.stringify({ [path.basename(gone.dir)]: true }));
+  mkdirSync(path.join(home, '.vscode/extensions/anthropic.claude-code-latest/resources/native-binary'), { recursive: true });
+  assert.deepEqual(EXTENSION_FOLDERS, ['.vscode/extensions', '.vscode-insiders/extensions', '.cursor/extensions']);
+
+  const env = { HOME: home, PATH: `${empty}:${bin}`, WORKBENCH_CLAUDE_BIN: FAKE };
+  const extFound = { path: insiders.bin, from: 'vscode' };
+  assert.deepEqual(findClaude({ env, flag: path.join(bin, 'claude-beta') }), { path: path.join(bin, 'claude-beta'), from: 'flag' });
+  assert.deepEqual(findClaude({ env }), { path: FAKE, from: 'env' });
+  assert.deepEqual(findClaude({ env: { ...env, WORKBENCH_CLAUDE_BIN: '' } }), { path: path.join(bin, 'claude'), from: 'path' }, 'an empty variable counts as unset');
+  assert.deepEqual(findClaude({ env: { HOME: home, PATH: empty } }), extFound, 'the newest of VS Code, VS Code Insiders and Cursor');
+  assert.deepEqual(newestExtensionClaude(home), { path: insiders.bin, version: '2.1.322' });
+  assert.deepEqual(findClaude({ env: { HOME: home, PATH: path.relative(process.cwd(), bin) } }), extFound, 'a relative PATH entry is never used');
+
+  // A path read from the folder Workbench runs in, and ~ in the variable.
+  assert.deepEqual(findClaude({ env: { HOME: home }, flag: 'bin/claude', cwd: dir }), { path: path.join(bin, 'claude'), from: 'flag' });
+  assert.deepEqual(findClaude({ env: { HOME: dir, WORKBENCH_CLAUDE_BIN: '~/bin/claude' } }), { path: path.join(bin, 'claude'), from: 'env' });
+  // A bare name is a command on the PATH.
+  assert.deepEqual(findClaude({ env: { HOME: home, PATH: bin }, flag: 'claude-beta' }), { path: path.join(bin, 'claude-beta'), from: 'flag' });
+  assert.deepEqual(findClaude({ env: { HOME: home, PATH: empty }, flag: 'claude-beta' }), { path: null, from: 'flag', reason: 'There is no claude-beta command on the PATH (the name given with --claude).' });
+
+  // Given but not there: said as it is, even with a Claude Code on the PATH and in VS Code.
+  const missing = path.join(dir, 'nope', 'claude');
+  assert.deepEqual(findClaude({ env, flag: missing }), { path: missing, from: 'flag', reason: `Claude Code is not at ${missing}, the path given with --claude.` });
+  assert.deepEqual(findClaude({ env: { ...env, WORKBENCH_CLAUDE_BIN: missing } }), { path: missing, from: 'env', reason: `Claude Code is not at ${missing}, the path in WORKBENCH_CLAUDE_BIN.` });
+  assert.deepEqual(findClaude({ env: { ...env, WORKBENCH_CLAUDE_BIN: home } }), { path: home, from: 'env', reason: `The path in WORKBENCH_CLAUDE_BIN, ${home}, is a folder, not the Claude Code program.` });
+
+  // Nothing: no path, the plain reason. Without HOME in a given environment, no home folder is read at all.
+  assert.deepEqual(findClaude({ env: { PATH: empty } }), { path: null, from: null, reason: CLAUDE_NOT_FOUND });
+  assert.equal(claudeBin({ PATH: empty }), 'claude');
+  assert.equal(claudeBin({ HOME: home, PATH: empty }), insiders.bin);
+});
+
+test('on the same version, a build for this processor is taken', (t) => {
+  const home = path.join(scratch(t), 'home');
+  const otherArch = process.arch === 'arm64' ? 'x64' : 'arm64';
+  extension(home, '2.1.322', { suffix: `-${process.platform}-${otherArch}` });
+  const mine = extension(home, '2.1.322', { folder: '.cursor/extensions' });
+  assert.deepEqual(newestExtensionClaude(home), { path: mine.bin, version: '2.1.322' });
+  // The same, found the other way round: the build for this processor comes first and is kept.
+  const first = path.join(scratch(t), 'home');
+  const mineFirst = extension(first, '2.1.322');
+  extension(first, '2.1.322', { folder: '.cursor/extensions', suffix: `-${process.platform}-${otherArch}` });
+  assert.deepEqual(newestExtensionClaude(first), { path: mineFirst.bin, version: '2.1.322' });
+  // A build for Alpine's Linux is a Linux build, taken only when there is no build for the usual Linux of that
+  // version; on any other system it is skipped like every build for another system.
+  const alpine = path.join(scratch(t), 'home');
+  const musl = extension(alpine, '2.1.322', { suffix: `-alpine-${process.arch}` });
+  if (process.platform === 'linux') {
+    assert.deepEqual(newestExtensionClaude(alpine), { path: musl.bin, version: '2.1.322' });
+    const glibc = extension(alpine, '2.1.322', { folder: '.cursor/extensions' });
+    assert.deepEqual(newestExtensionClaude(alpine), { path: glibc.bin, version: '2.1.322' });
+  } else {
+    assert.equal(newestExtensionClaude(alpine), null);
+  }
+  const universal = path.join(scratch(t), 'home');
+  const plain = extension(universal, '2.1.400', { suffix: '' });
+  assert.deepEqual(newestExtensionClaude(universal), { path: plain.bin, version: '2.1.400' });
+  assert.equal(newestExtensionClaude(''), null);
+  assert.equal(newestExtensionClaude('relative/home'), null);
 });
 
 // ---------- the runner, with the fake binary ----------
@@ -424,15 +600,89 @@ test('helpers still running when the process dies are ended', async () => {
   assert.equal(c.events.filter((e) => e.kind === EV.ENDED && e.agentId === 'abc123-a71ea18c').length, 1);
 });
 
-test('a missing binary fails the start in plain language', async () => {
+test('a missing binary refuses the start in plain language, and starts nothing', async (t) => {
   const c = collector();
   const r = makeRunner(c, { env: { WORKBENCH_CLAUDE_BIN: '/nonexistent/claude-binary' } });
-  await assert.rejects(r.start(), /the claude command was not found/);
-  const failed = await c.until((evs) => evs.find((e) => e.kind === EV.STATE && e.state === 'failed'), 'the failed state');
-  assert.match(failed.reason, /could not be started/);
+  const err = await r.start().then(() => null, (e) => e);
+  assert.equal(err?.message, 'Claude Code is not at /nonexistent/claude-binary, the path in WORKBENCH_CLAUDE_BIN.');
+  assert.equal(err.plain, true, 'meant for the person as it is: the engine shows it as why the agent could not start');
+  assert.deepEqual(c.events, [], 'nothing ran, so the runner reports nothing itself');
   assert.equal(r.info().alive, false);
+  // Nothing found anywhere (no variable, nothing on the PATH, no extension in this home folder).
+  const dir = scratch(t);
+  const none = makeRunner(c, { env: { WORKBENCH_CLAUDE_BIN: '', HOME: dir, PATH: dir } });
+  await assert.rejects(none.start(), (e) => e.message === CLAUDE_NOT_FOUND && e.plain === true);
+  // The folder is checked when the program starts.
   const r2 = makeRunner(c, { cwd: `${WORKBENCH}/no-such-folder-for-claude-tests` });
   await assert.rejects(r2.start(), /folder does not exist/);
+  const failed = await c.until((evs) => evs.find((e) => e.kind === EV.STATE && e.state === 'failed'), 'the failed state');
+  assert.equal(failed.reason, "Claude Code could not be started: the agent's folder does not exist.");
+});
+
+test('every launch looks Claude Code up again, so an update of the VS Code extension is picked up', async (t) => {
+  const dir = scratch(t);
+  const home = path.join(dir, 'home');
+  const started = path.join(dir, 'started.log');
+  const empty = path.join(dir, 'empty');
+  mkdirSync(empty);
+  const before = extension(home, '2.1.300', { log: started });
+  const c = collector();
+  // No variable and nothing on the PATH: the extension is the only Claude Code here.
+  const r = makeRunner(c, { env: { WORKBENCH_CLAUDE_BIN: '', HOME: home, PATH: empty } });
+  await r.start();
+  await c.until(replyIs(/^You said: Say hello$/), 'the first reply');
+  await r.stop();
+  // VS Code updates the extension: the old folder goes, a new one comes.
+  rmSync(before.dir, { recursive: true, force: true });
+  extension(home, '2.1.322', { log: started });
+  await r.send('Please continue');
+  await c.until(replyIs(/^You said \(resumed /), 'the reply from the updated Claude Code');
+  assert.deepEqual(readFileSync(started, 'utf8').trim().split('\n'), ['2.1.300', '2.1.322']);
+  // Each process says which version it is.
+  assert.deepEqual(c.events.filter((e) => e.kind === EV.SESSION).map((e) => e.version), ['2.1.300', '2.1.322']);
+  await r.stop();
+  // And when it is gone altogether, the next message is refused in plain words; the agent is not marked failed.
+  rmSync(path.join(home, '.vscode'), { recursive: true, force: true });
+  await assert.rejects(r.send('One more thing'), (e) => e.message === CLAUDE_NOT_FOUND && e.plain === true);
+  assert.ok(!c.events.some((e) => e.kind === EV.STATE && e.state === 'failed'));
+});
+
+test('the version, permission mode and tools Claude Code offers are logged once per process, with warnings for tools that should be off', async () => {
+  const c = collector();
+  const lines = { info: [], warn: [] };
+  // A logger like the CLI's: a function with a method per level. Warnings go to its warn, so they show without --verbose.
+  const log = Object.assign((l) => lines.info.push(`(plain) ${l}`), { info: (l) => lines.info.push(l), warn: (l) => lines.warn.push(l), debug() {}, error() {} });
+  // Recorded with 2.1.221 before most of today's tools were turned off: it offers several of them.
+  const r = makeRunner(c, { log, env: { FAKE_CLAUDE_FIXTURE: 'claude-subagent-run.jsonl' } });
+  await r.start();
+  await c.until((evs) => evs.filter((e) => e.kind === EV.TURN && e.phase === 'end').length === 3, 'three turn ends');
+  const offers = () => lines.info.filter((l) => / offers \d+ tools/.test(l));
+  assert.equal(offers().length, 1, 'three turns, one process: one line');
+  assert.match(offers()[0], /^claude abc123: Claude Code 2\.1\.221 \(permission mode default\) offers 31 tools: Task Bash CronCreate /);
+  assert.deepEqual(lines.warn, ['claude abc123: Claude Code offers tools Workbench turned off for its agents: CronCreate CronDelete CronList DesignSync EnterWorktree ExitWorktree PushNotification ScheduleWakeup Workflow']);
+  assert.deepEqual([...new Set(c.events.filter((e) => e.kind === EV.SESSION).map((e) => e.version))], ['2.1.221']);
+  await r.stop();
+  // A new process is logged again.
+  await r.send('Carry on');
+  await c.until(replyIs(/^You said \(resumed /), 'the resumed reply');
+  assert.equal(offers().length, 2);
+  assert.match(offers()[1], /^claude abc123: Claude Code 2\.1\.221 \(permission mode default\) offers 5 tools: Task Bash Edit Read Write$/);
+  assert.ok(!lines.info.some((l) => l.startsWith('(plain) ')), 'every line went to the method for its level');
+  await r.stop();
+});
+
+test('a permission mode other than the one asked for is a warning; "manual" is 2.1.322’s name for the default', async () => {
+  const run = async (mode) => {
+    const c = collector();
+    const warn = [];
+    const r = makeRunner(c, { log: { info() {}, warn: (l) => warn.push(l), debug() {}, error() {} }, env: { FAKE_CLAUDE_PERMISSION_MODE: mode } });
+    await r.start();
+    await c.until(replyIs(/^You said: Say hello$/), 'the first reply');
+    await r.stop();
+    return warn;
+  };
+  assert.deepEqual(await run('bypassPermissions'), ['claude abc123: Claude Code runs this agent in permission mode bypassPermissions, not the default mode Workbench asked for.']);
+  assert.deepEqual(await run('manual'), []);
 });
 
 test('very long lines written in small pieces arrive whole', async () => {

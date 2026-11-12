@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { matchGlob, checkRules, runChecks, scrubEnv, killChecksSync } from '../src/core/receipt.mjs';
+import { matchGlob, checkRules, runChecks, scrubEnv, killChecksSync, withNodeOnPath } from '../src/core/receipt.mjs';
 
 let T;
 before(() => { T = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-receipt-')); });
@@ -140,6 +140,28 @@ test('runChecks scrubs the environment', async () => {
     }
   }
   assert.deepEqual(scrubEnv({ CLAUDECODE: '1', CLAUDE_CODE_X: '2', CLAUDE_CONFIG_DIR: 'kept', HOME: '/h' }), { CLAUDE_CONFIG_DIR: 'kept', HOME: '/h' });
+});
+
+test('checks find node even when the PATH has none, and keep a PATH that has one as it is', async () => {
+  const nodeDir = path.dirname(process.execPath);
+  const empty = fs.mkdtempSync(path.join(T, 'no-node-'));
+  // As for a person whose own PATH lacks node: a check such as `npm test` must still find node (and npm beside it).
+  const bare = await runChecks({ cwd: T, env: { PATH: empty, HOME: T }, checks: [{ name: 'node', run: 'node -e "process.stdout.write(process.execPath)"' }, { name: 'path', run: 'echo "$PATH"' }] });
+  assert.deepEqual(bare.results.map(r => r.ok), [true, true], bare.results.map(r => r.tail).join(' | '));
+  assert.equal(bare.results[0].tail, process.execPath);
+  assert.equal(bare.results[1].tail, `${nodeDir}:${empty}`);
+  // A node already on the PATH: nothing is added.
+  const own = `${empty}:${nodeDir}:/usr/bin:/bin`;
+  const kept = await runChecks({ cwd: T, env: { PATH: own, HOME: T }, checks: [{ name: 'path', run: 'echo "$PATH"' }] });
+  assert.equal(kept.results[0].tail, own);
+  // The rule itself.
+  assert.deepEqual(withNodeOnPath({ PATH: '/no/such/folder', A: '1' }), { PATH: `${nodeDir}:/no/such/folder`, A: '1' });
+  assert.deepEqual(withNodeOnPath({}), { PATH: `${nodeDir}:/usr/bin:/bin` });
+  assert.deepEqual(withNodeOnPath({ PATH: 'relative/bin' }, '/opt/node/bin/node'), { PATH: '/opt/node/bin:relative/bin' });
+  const has = { PATH: nodeDir };
+  assert.equal(withNodeOnPath(has), has);
+  // scrubEnv itself does not touch PATH.
+  assert.deepEqual(scrubEnv({ PATH: '/x' }), { PATH: '/x' });
 });
 
 test('a check that runs too long is stopped, with everything it started', async () => {

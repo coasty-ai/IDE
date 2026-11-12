@@ -29,6 +29,9 @@ const MAX_SEEN_IDS = 5000;
 /** Longest tool input kept on activity events, so repeated identical calls can be spotted. */
 const INPUT_KEY_CHARS = 300;
 
+/** A Claude Code version as system/init reports it ("2.1.322"). Anything else is not passed on. */
+const VERSION_RE = /^\d{1,4}\.\d{1,4}\.\d{1,6}(?:[-+][0-9A-Za-z.-]{1,40})?$/;
+
 /** Plain reasons for Claude Code's error results, keyed by result subtype. */
 const ERROR_REASONS = Object.freeze({
   error_max_budget_usd: 'It reached its spending limit.',
@@ -127,6 +130,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
   const s = {
     model: null,              // root model, from system/init
     sessionId: null,          // from system/init
+    version: null,            // the Claude Code version, from system/init (claude_code_version)
     inTurn: false,            // between system/init and result
     rootText: '',             // latest root text block, a fallback for the final text
     rootContext: null,        // context tokens of the latest root message
@@ -471,7 +475,13 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
 
   function onInit(o) {
     if (o.model) { s.model = String(o.model); ev(EV.MODEL, rootId, { model: s.model }); }
-    if (o.session_id) { s.sessionId = String(o.session_id); ev(EV.SESSION, rootId, { sessionId: s.sessionId }); }
+    // The version of the process that is running now: a relaunch may start a newer Claude Code.
+    const version = typeof o.claude_code_version === 'string' && VERSION_RE.test(o.claude_code_version) ? o.claude_code_version : null;
+    if (version) s.version = version;
+    if (o.session_id) {
+      s.sessionId = String(o.session_id);
+      ev(EV.SESSION, rootId, version ? { sessionId: s.sessionId, version } : { sessionId: s.sessionId });
+    }
     s.inTurn = true;
     s.rootText = '';
     ev(EV.TURN, rootId, { phase: 'start' });
@@ -759,6 +769,7 @@ export function createClaudeParser({ rootId, now = Date.now, machineId, workspac
     return {
       sessionId: s.sessionId,
       model: s.model,
+      version: s.version, // the Claude Code version the last system/init reported
       inTurn: s.inTurn,
       backgroundTasks: s.bgSeen ? s.bg.size : openHelpers().length,
       background: backgroundSplit(),
