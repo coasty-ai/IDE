@@ -82,12 +82,27 @@ const plural = (n, one, many = one + 's') => `${count(n)} ${n0(n) === 1 ? one : 
  * can run as a program. Git's headers themselves are never shown.
  */
 export function patchFacts(patch) {
-  const head = typeof patch === 'string' ? patch.split('\n', 12).filter(l => !l.startsWith('@@')) : [];
-  const facts = { link: false, exec: null };
+  // A type change (a file that became a link, or a link that became a file) comes as two parts, each with its own
+  // `diff --git` header: the headers of every part are read, never what is inside a hunk.
+  const lines = typeof patch === 'string' ? patch.split('\n') : [];
+  const head = [];
+  let inHunk = false;
+  for (const l of lines) {
+    if (l.startsWith('diff --git ')) { inHunk = false; head.push(l); continue; }
+    if (l.startsWith('@@')) { inHunk = true; continue; }
+    if (!inHunk) head.push(l);
+  }
+  const facts = { link: false, exec: null, became: null };
   for (const l of head) {
     if (/^(new file|deleted file|old|new) mode 120000\b/.test(l) || /^index [0-9a-f]+\.\.[0-9a-f]+ 120000\b/.test(l)) facts.link = true;
     if (/^new mode 100755\b/.test(l)) facts.exec = 'on';
     if (/^new mode 100644\b/.test(l) && head.some(x => /^old mode 100755\b/.test(x))) facts.exec = 'off';
+  }
+  const gone = head.find(l => /^deleted file mode \d+/.test(l)), made = head.find(l => /^new file mode \d+/.test(l));
+  if (gone && made) {
+    const wasLink = /120000/.test(gone), isLink = /120000/.test(made);
+    if (!wasLink && isLink) facts.became = 'link';
+    else if (wasLink && !isLink) facts.became = 'file';
   }
   return facts;
 }
@@ -96,6 +111,8 @@ export function patchFacts(patch) {
 export function fileWords(f, facts = patchFacts(f && f.patch)) {
   if (f.binary) return 'binary file';
   if (f.large) return 'too large to show here';
+  if (facts.became === 'link') return 'the file became a link';
+  if (facts.became === 'file') return `the link became a file, +${count(f.adds)}`;
   if (facts.link) return f.status === 'added' ? 'new link' : f.status === 'deleted' ? 'deleted link' : 'link changed';
   if (f.status === 'added') return `new file, +${count(f.adds)}`;
   if (f.status === 'deleted') return `deleted, −${count(f.dels)}`;
@@ -116,6 +133,8 @@ export function patchLines(patch) {
   const out = [];
   let inHunk = false;
   for (const l of raw) {
+    // a second part (the other half of a type change) starts with its own header: skip it until its hunk
+    if (l.startsWith('diff --git ')) { inHunk = false; continue; }
     if (l.startsWith('@@')) {
       inHunk = true;
       const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@ ?(.*)$/.exec(l.replace(/\r$/, ''));

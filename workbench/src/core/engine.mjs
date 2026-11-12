@@ -2441,6 +2441,12 @@ export class Engine extends EventEmitter {
       return { ok: false, reply: cur.work?.merged ? mergeSentence('nothing', { name: v.name, into: repo.branch }) : `${v.name} changed nothing, so there is nothing to merge.` };
     }
     const files = Array.isArray(snap.files) ? snap.files : [];
+    if (!files.length) {
+      // Its work differs from where it started, but merging it would bring in nothing new: it is in the branch already
+      // (merged by hand, or brought in some other way). Say so now, rather than ask about a merge of no files.
+      this._clearProblem(v.id);
+      return { ok: false, reply: mergeSentence('nothing', { name: v.name, into: repo.branch }) };
+    }
     const broken = await this._brokenRules(cur, where, files);
     const detail = this._mergeDetail(cur, { files, left: snap.left, broken, into: repo.branch, dirty: repo.dirty });
     return this._newConfirm({

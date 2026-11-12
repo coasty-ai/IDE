@@ -2419,6 +2419,19 @@ test('merge: the card asks first, counts first, and binds itself to the work it 
   await t.engine.shutdown();
 });
 
+test('merge: work that would bring in no files is already in the branch, and no card asks about it', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  t.git.work.files = []; // it differs from where it started, but merging it brings in nothing (merged by hand, say)
+  const out = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
+  assert.equal(out.confirm, undefined);
+  assert.equal(out.ok, false);
+  assert.equal(out.reply, 'Fix cart total’s work is already in main.');
+  assert.equal(t.engine.confirms.size, 0);
+  assert.equal(t.calls.mergeWork.length, 0);
+  await t.engine.shutdown();
+});
+
 test('merge: the card names failed checks, broken rules, files that set later agents, files left out and the person’s own changes', async (ctx) => {
   const t = liveFolders(ctx, { deps: { checks: [{ name: 'unit tests', run: 'npm test' }], checkState: 'failed', rules: [{ say: 'Do not touch migrations/', paths: ['migrations/**'] }] } });
   // Rules are checked again against the files it would merge now, not only the last receipt's.

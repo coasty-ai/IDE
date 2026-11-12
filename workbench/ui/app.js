@@ -683,7 +683,9 @@ async function submit(text) {
     } else {
       const shown = S.confirm && b.confirmId === S.confirm.id ? S.confirm : null;
       const res = await api.command(text, { focusId: shown ? null : (b.agentId || null), confirmId: shown ? shown.id : (b.confirmId || null), askId: shown ? null : (b.askId || null) });
-      if (res.confirm) S.confirm = res.confirm;
+      // the card shown, back again (words not understood, or a look at the work it is about): it stays, still bound to
+      // the agent it was drawn for
+      if (res.confirm) S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
       else if (shown && S.confirm === shown) S.confirm = null;
       lookAt(res.focusId);
       // the reply to the person's own words: a new launch question, or the agent it names, shows at once
@@ -692,7 +694,8 @@ async function submit(text) {
       // a new launch question in the core already says it; anything else is said under the core
       say(res.confirm && (!shown || res.confirm.id !== shown.id) ? '' : (res.reply || ''));
       // "what did search cleanup change": the git screen opens on that agent's branch and its diff
-      if (typeof res.review === 'string' && ID_RE.test(res.review) && !res.confirm) openGitOn(res.review, null);
+      // also with a merge or throw-away card still shown: the person looks at the work first, then answers the card
+      if (typeof res.review === 'string' && ID_RE.test(res.review) && (!res.confirm || (shown && res.confirm.id === shown.id))) openGitOn(res.review, null);
     }
   } catch (err) { say(err.message); }
   render();
@@ -1038,7 +1041,7 @@ async function gitCommand(text, focusId) {
     lookAt(res.focusId);
     // as the core's input does: a new card says itself; anything else is said
     say(res.confirm && !same ? '' : (res.reply || ''));
-    if (typeof res.review === 'string' && ID_RE.test(res.review) && !res.confirm) openGit({ agentId: res.review });
+    if (typeof res.review === 'string' && ID_RE.test(res.review) && (!res.confirm || same)) openGit({ agentId: res.review });
     moved();
   } catch (err) { say(err.message); }
   render();
