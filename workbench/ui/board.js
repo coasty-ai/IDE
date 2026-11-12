@@ -24,7 +24,7 @@ function svgEl(tag, attrs, parent) {
 
 export class Board {
   /**
-   * @param {object} o  { boardSvg, wires, parts, core, machines, tray, said, card, hooks, still, reduced }
+   * @param {object} o  { boardSvg, wires, parts, core, dram, machines, tray, said, card, hooks, still, reduced }
    *   hooks: { enter(id), leave(id), pick(id), more(rootId), machine(id, el), tray(el) }
    */
   constructor(o) {
@@ -59,7 +59,8 @@ export class Board {
   // ------------------------------------------------------------------ the static board
   paintBoard(G) {
     const P = G.P, b = G.board, c = G.core, W = G.W, H = G.H;
-    const sig = [W, H, P.name, c.x, c.y, c.h, G.dense, G.nodes.map(n => `${n.id}${n.side}${n.rowIdx}`).join(',')].join('|');
+    const dr = G.dram;
+    const sig = [W, H, P.name, c.x, c.y, c.h, G.dense, G.nodes.map(n => `${n.id}${n.side}${n.rowIdx}`).join(','), dr ? [dr.x, dr.y, dr.w, dr.wire.x, !!dr.label].join(',') : ''].join('|');
     if (sig === this.boardSig) return;
     this.boardSig = sig;
     let s = `<defs>
@@ -73,6 +74,7 @@ export class Board {
       <filter id="grain" x="0" y="0" width="100%" height="100%"><feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" seed="11" stitchTiles="stitch"/>
         <feColorMatrix values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  .10 0 0 0 -.02"/></filter>
       <pattern id="grainTile" width="96" height="96" patternUnits="userSpaceOnUse"><rect width="96" height="96" fill="#fff" filter="url(#grain)"/></pattern>
+      <linearGradient id="dramBody" x1="0" y1="0" x2="0" y2="1"><stop class="b-chip-1" offset="0"/><stop class="b-chip-2" offset=".55"/></linearGradient>
     </defs>`;
     s += `<rect class="b-bench" width="${W}" height="${H}"/>`;
     s += `<rect class="b-shadow" x="${b.x}" y="${b.y + 4}" width="${b.w}" height="${b.h}" rx="${P.boardR}" fill="#000" filter="url(#blur6)"/>`;
@@ -87,6 +89,7 @@ export class Board {
       const v = n.lane.pts[n.lane.pts.length - 1];
       s += `<circle cx="${v[0]}" cy="${v[1]}" r="3.6" fill="url(#goldR)"/><circle class="via-hole" cx="${v[0]}" cy="${v[1]}" r="1.5"/>`;
     }
+    if (dr) s += this.dramSvg(G);
     // the core: a package with balls (or leads) on all four sides, pin 1, its courtyard and the designator YOU
     s += `<rect class="b-shadow" x="${c.x}" y="${c.y + 3}" width="${c.w}" height="${c.h}" rx="9" fill="#000" filter="url(#blur6)" opacity=".5"/>`;
     s += `<rect class="pkg" x="${c.x}" y="${c.y}" width="${c.w}" height="${c.h}" rx="8"/>`;
@@ -108,6 +111,40 @@ export class Board {
     for (const [x, y] of G.fiducials) s += `<circle class="fid" cx="${r1(x)}" cy="${r1(y)}" r="7"/><circle cx="${r1(x)}" cy="${r1(y)}" r="2.6" fill="url(#goldR)"/>`;
     for (const e of [this.boardSvg, this.wires]) { setAttr(e, 'width', W); setAttr(e, 'height', H); setAttr(e, 'viewBox', `0 0 ${W} ${H}`); }
     this.boardSvg.innerHTML = s;
+  }
+
+  /**
+   * The DRAM (git) under the core: its copper (a bus of thin traces up to the core's bottom edge, and the one wire down
+   * to the board's bottom edge, where a lone gold finger takes it off the board to the git screen), the package with
+   * its notch, pin 1 and a fine row of pins along each long edge, and the designator U2. The #dram button lies over
+   * the package and carries the word git; hovering or focusing it warms this copper (app.css).
+   */
+  dramSvg(G) {
+    const d = G.dram, P = G.P, b = G.board;
+    const top = r1(d.y - d.pin), bot = r1(d.y + d.h), cy = r1(d.y + d.h / 2), n = Math.min(5, d.h * 0.18);
+    let s = '<g class="dram-cu">';
+    for (const x of d.bus) s += `<path class="dram-bus" d="M${x} ${d.busTop}V${top}"/>`;
+    s += `<path class="dram-wire" d="M${d.wire.x} ${d.wire.y0}V${d.wire.y1}"/></g>`;
+    const fw = 6, fh = P.fingerH;
+    s += `<rect class="dram-finger" x="${r1(d.wire.x - fw / 2)}" y="${r1(b.b - fh)}" width="${fw}" height="${fh}" rx="1"/>`;
+    s += `<rect class="b-shadow" x="${d.x}" y="${r1(d.y + 2)}" width="${d.w}" height="${d.h}" rx="3" fill="#000" filter="url(#blur6)" opacity=".45"/>`;
+    s += '<g class="dram-pins">';
+    for (const x of d.pins) s += `<rect x="${r1(x - 0.9)}" y="${top}" width="1.8" height="${d.pin}"/><rect x="${r1(x - 0.9)}" y="${bot}" width="1.8" height="${d.pin}"/>`;
+    s += '</g>';
+    // the package: a long rectangle with a half-round notch in its left end (pin 1's end)
+    const x0 = d.x, x1 = r1(d.x + d.w), y0 = d.y;
+    s += `<path class="dram-body" d="M${x0} ${y0}H${x1}V${bot}H${x0}V${r1(cy + n)}A${r1(n)} ${r1(n)} 0 0 0 ${x0} ${r1(cy - n)}Z"/>`;
+    s += `<path class="dram-shine" d="M${r1(x0 + 1.5)} ${r1(y0 + 1)}H${r1(x1 - 1.5)}"/>`;
+    s += `<circle class="dram-dot" cx="${r1(x0 + 6)}" cy="${r1(bot - 5.5)}" r="1.9"/>`;
+    if (d.label) s += `<text class="dram-u2" x="${d.label.x}" y="${r1(d.label.y + d.label.size * 0.36)}" font-size="${d.label.size}" text-anchor="end">U2</text>`;
+    return s;
+  }
+
+  /** The #dram button over the package (the word git, hover, focus and the click that opens the git screen). */
+  placeDram(G) {
+    const e = this.dram, d = G.dram;
+    if (!e || !d) return;
+    Object.assign(e.style, { left: d.x + 'px', top: d.y + 'px', width: d.w + 'px', height: d.h + 'px', fontSize: d.git + 'px' });
   }
 
   // ------------------------------------------------------------------ chips and helpers
@@ -385,6 +422,7 @@ export class Board {
     for (const [id, rec] of this.nodes) if (!G.byId.has(id)) { rec.el.remove(); this.nodes.delete(id); }
     this.paintWires(G, o.hoverRoot);
     this.placeCore(G);
+    this.placeDram(G);
     this.placeSaid(G);
     this.paintMachines(G, o.machines || [], o.litMachine);
     this.paintTray(G, o.tray);
@@ -502,6 +540,20 @@ export class Board {
     p.animate([{ strokeDasharray: `${dash} ${L + 40}`, strokeDashoffset: 0, opacity: 0 }, { opacity: 0.95, offset: 0.12 }, { opacity: 0.95, offset: 0.8 }, { strokeDasharray: `${dash} ${L + 40}`, strokeDashoffset: -(L - dash), opacity: 0 }],
       { duration: Math.min(1400, 500 + L * 2.2), easing: 'cubic-bezier(.45,.05,.35,1)' })
       .finished.then(() => { p.remove(); this.wiresMap.delete(key); }, () => { p.remove(); this.wiresMap.delete(key); });
+  }
+
+  /**
+   * The way to the git screen: one pulse along the DRAM's wire, down to the board's bottom edge (or back up to the DRAM).
+   * Resolves when it has run; at once when nothing moves (still, reduced motion, a hidden tab).
+   */
+  dramPulse(down = true, ms = 320) {
+    const d = this.G && this.G.dram;
+    if (!d || this.calm) return Promise.resolve();
+    const L = d.wire.y1 - d.wire.y0, dash = Math.min(46, Math.max(14, L * 0.3));
+    const p = svgEl('path', { d: `M${d.wire.x} ${down ? d.wire.y0 : d.wire.y1}V${down ? d.wire.y1 : d.wire.y0}`, class: 'pulse dram-pulse', 'stroke-width': 3 }, this.wires);
+    const a = p.animate([{ strokeDasharray: `${dash} ${L + 80}`, strokeDashoffset: dash, opacity: 0 }, { opacity: 1, offset: 0.12 },
+      { strokeDasharray: `${dash} ${L + 80}`, strokeDashoffset: -L, opacity: 0.9 }], { duration: ms, easing: 'cubic-bezier(.45,.05,.55,.95)' });
+    return a.finished.then(() => p.remove(), () => p.remove());
   }
 
   /** Stop every animation of the board at its end (reduced motion switched on, or the tab hidden). */

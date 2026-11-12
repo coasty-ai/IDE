@@ -18,6 +18,11 @@ import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { buttonRow } from './words.js';
 import { spentAmountWords } from './numbers.js';
+// D1: the git screen below the board, reached by the DRAM (gitscreen.js draws it; this file switches screens)
+import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitFocusId } from './gitscreen.js';
+import { gitScreenWords } from './gitgraph.js';
+import { visibleText } from './diffview.js';
+import { clipToLines } from './layout.js';
 
 // The address is read once, before the key is taken out of it. Switches count only with the key (see address.js).
 const debug = debugSwitches(location.search);
@@ -29,6 +34,7 @@ const el = {
   heard: $('heard'), mic: $('mic'), to: $('to'), toText: $('toText'), toCancel: $('toCancel'), announce: $('announce'), said: $('said'),
   parts: $('parts'), machines: $('machines'), tray: $('tray'), card: $('card'), pop: $('pop'), trayList: $('trayList'), look: $('look'),
   brand: $('brand'), mode: $('mode'), repo: $('repo'), conn: $('conn'), spend: $('spend'), wires: $('wires'), board: $('board'),
+  dram: $('dram'), boardScreen: $('boardScreen'), gitScreen: $('gitScreen'), gitSay: $('gitSay'),
 };
 if (debug.still) el.body.classList.add('still');
 
@@ -67,7 +73,7 @@ whenRefused(() => { if (!link.refused) { link.refused = true; renderSoon(); } })
 const lanes = new Lanes(safeStorage('sessionStorage'));
 let G = null, lastFirst = true, fontsReady = false;
 const board = new Board({
-  boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
+  boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, dram: el.dram, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
   still: () => debug.still, reduced,
   hooks: {
     enter: (id, parentId) => { clearTimeout(leaveTimer); if (S.hoverId !== id) { S.hoverId = id; renderCard(); } },
@@ -91,13 +97,16 @@ function say(text, ms = 9000) {
 }
 function answeredOnce() { try { localStorage.setItem('wb-answered', '1'); } catch { /* fine */ } }
 function paintSaid() {
+  gitSay(notice);   // D1: what Workbench said shows on the git screen too
   if (!G) return;
   const P = G.P;
   const perLine = Math.max(10, Math.floor(G.said.w / measure('M', P.silkSub, 400)));
-  const maxLines = Math.max(1, Math.min(3, Math.floor((G.said.maxY - G.said.y) / (P.silkSub * 1.35))));
+  // under the DRAM (D1): the lines the layout gave it, three at most, more where it is narrow and the board has room
+  const maxLines = Math.max(1, G.said.lines || Math.min(3, Math.floor((G.said.maxY - G.said.y) / (P.silkSub * 1.35))));
   let html = '';
   if (notice) {
-    const shown = clip(notice, perLine * maxLines - 2);
+    // cut by the lines it wraps into, not by a count of characters: under the DRAM the line is narrow (D1)
+    const shown = clipToLines(notice, perLine, maxLines);
     html = `<span aria-hidden="${shown !== notice}">${esc(shown)}</span>${shown !== notice ? `<span class="sr">${esc(notice)}</span>` : ''}`;
   } else if (!hintDone() && needsQueue().length && linkNow() === 'live') {
     html = '<i aria-hidden="true"></i><span>a lit line means it needs you</span>';
@@ -114,6 +123,7 @@ const touch = () => { lastInputAt = performance.now(); };
 
 /** The person is in the middle of something in the core: hold what it shows (for up to 20 s without any input). */
 function engaged() {
+  if (gitShown()) return true;   // D1: the lid keeps what it shows while the git screen is shown
   if (performance.now() - lastInputAt > 20000 && !voice.listening && !el.say.value) return false;
   const ae = document.activeElement;
   return pointer.inCore || (ae && ae !== document.body && el.core.contains(ae) && ae !== el.say) || !!el.say.value || voice.listening || !!S.reply;
@@ -342,13 +352,15 @@ function renderNow(o = {}) {
   paintTop(P, linkS);
   paintSaid();
   paintPlaceholder(P);
-  for (const x of [el.parts, el.wires, el.machines]) x.classList.toggle('dim', linkS === 'stale');
+  for (const x of [el.parts, el.wires, el.machines, el.dram]) x.classList.toggle('dim', linkS === 'stale');
   el.parts.inert = linkS === 'stale' || linkS === 'no-key';
   el.machines.inert = linkS === 'stale' || linkS === 'no-key';
+  paintDram(linkS);
   renderCard(true);
   if (!el.pop.hidden) renderMachinesPop();
   if (!el.trayList.hidden) renderTrayList();
   if (S.loaded && firstSnap) { firstSnap = false; applyDebug(); }
+  gitRender();
 }
 const render = () => renderSoon();
 
@@ -576,18 +588,11 @@ async function actOn(b) {
 }
 
 /**
- * The git screen (builder D1's #gitScreen and ui/gitscreen.js), opened on one agent's branch and its diff: "Review the
- * changes", "See it in git", or a reply that carries `review`. `opener` (the lid's link) should get the keyboard back
- * when the person comes back to the board. Loaded when first asked for; a page without the git screen asks for nothing.
+ * The git screen, opened on one agent's branch and its diff: "Review the changes", "See it in git", or a reply that
+ * carries `review`. `opener` (the lid's link) gets the keyboard back when the person comes back to the board.
  */
-let gitScreen = null;
 function openGitOn(agentId, opener) {
-  if (!document.getElementById('gitScreen')) { say('The git screen is not part of this page yet.', 5000); return; }
-  gitScreen ??= import('./gitscreen.js');
-  gitScreen.then(m => {
-    if (typeof m.openGit !== 'function') throw new Error('no openGit');
-    m.openGit({ agentId, opener: opener || null });
-  }).catch(err => { gitScreen = null; console.warn('The git screen did not open:', err); say('The git screen did not open.', 5000); });
+  openGit({ agentId, opener: opener || null });
 }
 
 el.core.addEventListener('pointerenter', () => { pointer.inCore = true; touch(); });
@@ -642,6 +647,8 @@ async function submit(text) {
   bound = null;
   el.say.value = '';
   el.bar.classList.remove('typed');
+  // D1: "git", "show git", "open git", "source control", "show the graph" open the git screen (never sent to the engine)
+  if (!S.reply && gitScreenWords(text) === 'open') { openGit({ opener: el.dram }); return; }
   // the page's own words: the look, the detail, and stepping through the queue. They never reach the engine.
   const pc = S.reply ? null : pageCommand(text);
   if (pc) {
@@ -689,7 +696,7 @@ async function submit(text) {
 el.bar.addEventListener('submit', e => { e.preventDefault(); submit(el.say.value); });
 
 const voice = setupVoice({
-  mic: el.mic, heard: el.heard, onFinal: submit, onNotice: t => say(t),
+  mic: el.mic, heard: el.heard, onFinal: t => (gitShown() ? gitCommand(t, gitFocusId()) : submit(t)), onNotice: t => say(t),
   onListening: on => { el.bar.classList.toggle('listening', on); if (on) { touch(); if (!bound) bound = bindingNow(); } else render(); },
 });
 
@@ -730,15 +737,17 @@ document.addEventListener('keydown', e => {
     if (!e.repeat && !holding && voice.available) { holding = true; voice.start({ hold: true }); }
     return;
   }
-  if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && !isControl(ae) && !el.look.contains(ae)) {
+  if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && !isControl(ae) && !el.look.contains(ae) && !gitShown()) {
     if (stepQueue(e.key === 'ArrowRight' ? 1 : -1)) { e.preventDefault(); moved(); render(); }
     return;
   }
   if (e.key.length === 1 && !el.look.contains(ae)) {
+    // D1: on the git screen, letters go to its own input on its top band
+    const input = gitShown() ? el.gitSay : el.say;
     e.preventDefault();
-    el.say.focus();
-    el.say.value += e.key;
-    el.say.dispatchEvent(new Event('input'));
+    input.focus();
+    input.value += e.key;
+    input.dispatchEvent(new Event('input'));
   }
 });
 document.addEventListener('keyup', e => { if ((e.key === ' ' || e.code === 'Space') && holding) { holding = false; voice.stop(); } });
@@ -752,6 +761,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 function escape() {
+  if (gitShown() && !voice.listening && gitEscape()) return;   // D1: the detail closes, then back to the board
   if (!el.look.hidden) { closeLook(true); return; }
   if (!el.pop.hidden) { closePop(); return; }
   if (!el.trayList.hidden) { closeTray(); return; }
@@ -975,6 +985,67 @@ setInterval(() => {
   // a held core lets go by itself once the person has been still for 20 s
   if (S.loaded && lidKey && !lidKey.startsWith('link:') && keyOf(currentFocus()) !== lidKey && !engaged()) renderSoon();
 }, 1000);
+
+// ---------------------------------------------------------------- D1: the DRAM and the git screen (screen switching)
+/** The DRAM's name for screen readers (your branch, as the snapshot tells it), and whether it can open anything now. */
+function paintDram(linkS) {
+  const repo = S.meta.repo;
+  const yours = repo ? (repo.branch ? `your branch ${visibleText(repo.branch)}` : 'your folder (not on a branch)') : 'your branch';
+  const label = `Git: ${yours} and your agents’ branches. Opens the git screen.`;
+  if (el.dram.getAttribute('aria-label') !== label) el.dram.setAttribute('aria-label', label);
+  el.dram.inert = linkS === 'stale' || linkS === 'no-key';
+}
+el.dram.addEventListener('click', () => openGit({ opener: el.dram }));
+
+// The git screen's Merge, Throw it away and a card's answers carry the lid's data-* and go through the lid's own handler
+// (builder D2's act()), which checks them against what is current before anything is sent.
+// The git screen's own buttons (Merge into <branch>, Throw it away, and an engine card's answers in its detail) go through
+// the lid's handler, with the same binding checks: what they were drawn for is what is sent.
+const gitAct = b => actOn(b);
+
+/**
+ * Words typed or spoken on the git screen. The page's own words first ("back", "board", the looks, the detail); the rest
+ * goes to POST /api/command as the core's input sends it, with focusId the agent whose detail is open. A card the reply
+ * brings shows in that agent's detail when it names that agent; any other card is shown where it can be answered: in
+ * the lid, back on the board.
+ */
+async function gitCommand(text, focusId) {
+  text = String(text || '').trim();
+  if (!text) return;
+  touch();
+  const words = gitScreenWords(text);
+  if (words === 'back') { closeGit(); return; }
+  if (words === 'open') return;
+  const pc = pageCommand(text);
+  if (pc && (pc.kind === 'theme' || pc.kind === 'detail')) { applyPref(pc.kind, pc[pc.kind]); return; }
+  if (pc && pc.kind === 'next') { say('“Next” steps through what needs you, on the board. Say “back” to go there.', 6000); return; }
+  if (cannotSend(linkNow())) { say('Workbench is not answering, so that was not sent.'); return; }
+  const focused = focusId ? S.agents.get(focusId) : null;
+  const shown = S.confirm && focusId && S.confirm.agentId === focusId ? S.confirm : null;
+  try {
+    const res = await api.command(text, { focusId: shown ? null : focusId || null, confirmId: shown ? shown.id : null, askId: null });
+    // the card shown, back again: the words were not understood (or are not enough for it), so it stays where it is
+    const same = !!(res.confirm && shown && res.confirm.id === shown.id);
+    if (res.confirm) {
+      const about = same || (focused && (res.confirm.kind === 'merge' || res.confirm.kind === 'discard') && String(res.confirm.sentence || '').includes(focused.name));
+      S.confirm = about ? { ...res.confirm, agentId: focusId } : res.confirm;
+      if (!about) closeGit({ toLid: true });
+    } else if (shown && S.confirm === shown) S.confirm = null;
+    lookAt(res.focusId);
+    // as the core's input does: a new card says itself; anything else is said
+    say(res.confirm && !same ? '' : (res.reply || ''));
+    if (typeof res.review === 'string' && ID_RE.test(res.review) && !res.confirm) openGit({ agentId: res.review });
+    moved();
+  } catch (err) { say(err.message); }
+  render();
+}
+
+setupGitScreen({
+  boardScreen: el.boardScreen, board, getG: () => G, measure, still: () => debug.still, reduced,
+  say: t => say(t), act: b => gitAct(b), moved, render: () => renderNow(), command: (t, id) => gitCommand(t, id),
+  // going down: the board's menus and card close (they belong to the board); either way the board renders afresh
+  onShow: shown => { if (shown) { closePop(); closeTray(); closeLook(false); S.pinId = null; S.hoverId = null; board.hideCard(); } renderSoon(); },
+});
 
 RM.addEventListener('change', () => { if (RM.matches) board.settle(); renderNow({ snap: true }); });
 addEventListener('resize', () => { closePop(); closeTray(); renderNow({ snap: true }); });

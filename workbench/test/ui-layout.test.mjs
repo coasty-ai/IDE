@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { layoutBoard, sizeClass, frame, boardProblems, boardBoxes, placeCard, maxDenseRows, wrapWords, clipTo, overlapArea, SIZES } from '../ui/layout.js';
+import { layoutBoard, sizeClass, frame, boardProblems, boardBoxes, placeCard, maxDenseRows, wrapWords, clipTo, overlapArea, SIZES,
+  dramSegments, saidLineH, saidTextLines, SAID_HINT, saidMinLines, bottomRanks, clipToLines } from '../ui/layout.js';
 import { Lanes, denseLanes } from '../ui/lanes.js';
 import { boardModel } from '../ui/boardmodel.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
@@ -129,4 +130,145 @@ test('the board model: a helper that asks lights its agent, and the brackets go 
   const flaky = bm.roots.find(r => r.name === 'Flaky test');
   assert.equal(flaky.lit, 'stuck');
   assert.ok(boardBoxes(board('helper', 1440, 900, 'more').G).length > 10);
+});
+
+// ------------------------------------------------------------------ the DRAM (git) under the core
+
+const DETAILS = ['calm', 'more'];
+const each = fn => { for (const name of SCENARIOS) for (const [W, H] of WINDOWS) for (const detail of DETAILS) for (const lidNeed of [120, 220, 900]) fn(name, W, H, detail, lidNeed); };
+
+test('the DRAM sits centred under the core, joined to its bottom edge by a bus of 6 to 8 traces, its wire running to the board\'s bottom edge', () => {
+  each((name, W, H, detail, lidNeed) => {
+    const { G } = board(name, W, H, detail, { lidNeed });
+    const d = G.dram, c = G.core, tag = `${name} ${W}x${H} ${detail} ${lidNeed}`;
+    assert.ok(d, tag);
+    assert.ok(Math.abs(d.x + d.w / 2 - G.cx) < 0.6, `${tag}: centred under the core`);
+    assert.ok(d.y - d.pin > c.b + 9, `${tag}: below the core's courtyard`);
+    assert.ok(d.bus.length >= 6 && d.bus.length <= 8, `${tag}: a bus of 6 to 8 traces`);
+    for (const [p, q] of dramSegments(G).filter(s => s[2] === 'dram bus')) {
+      assert.equal(p[1], c.b, `${tag}: each trace starts at the core's bottom edge`);
+      assert.equal(q[1], d.y - d.pin, `${tag}: and ends at a pin on the DRAM's top edge`);
+      assert.ok(d.pins.includes(p[0]), `${tag}: on a pin`);
+    }
+    const wire = dramSegments(G).find(s => s[2] === 'dram wire');
+    assert.equal(wire[0][0], wire[1][0], `${tag}: the wire runs straight down`);
+    assert.equal(wire[0][1], d.y + d.h + d.pin, `${tag}: from the DRAM's bottom edge`);
+    assert.equal(wire[1][1], G.board.b, `${tag}: to the board's bottom edge`);
+    assert.ok(d.pins.includes(d.wire.x) && d.wire.x > G.cx && d.wire.x < d.x + d.w, `${tag}: from a pin near its right end`);
+  });
+});
+
+test('the core\'s tallest shrinks by the DRAM\'s room: the DRAM and two lines under it always fit above the edge connector', () => {
+  each((name, W, H, detail, lidNeed) => {
+    const { G } = board(name, W, H, detail, { lidNeed });
+    const tag = `${name} ${W}x${H} ${detail} ${lidNeed}`;
+    assert.ok(G.said.y + saidMinLines(G.P) * saidLineH(G.P) <= G.said.maxY + 0.01, `${tag}: its lines for #said (${G.said.y} to ${G.said.maxY})`);
+    assert.ok(G.said.lines >= saidMinLines(G.P), `${tag}: #said may use the lines kept for it`);
+  });
+  // and the frame the lid fitter reads knows it, at every size
+  for (const [W, H] of WINDOWS) {
+    const P = sizeClass(W, H), f = frame(W, H, P);
+    const tallest = layoutBoard({ W, H, P, roots: [], laneOf: () => null, lidNeed: 2000 });
+    assert.ok(tallest.lidPageH <= f.lidMaxH - P.lid.padT - P.lid.padB - P.lid.inh - P.lid.gap3 + 0.5, `${W}x${H}`);
+    assert.ok(tallest.core.b <= f.coreBottomMax + 0.5, `${W}x${H}: the core stops short of the DRAM's room`);
+  }
+});
+
+test('the edge connector leaves a gap for the wire; with one machine, its section goes left of the wire', () => {
+  each((name, W, H, detail, lidNeed) => {
+    const { G } = board(name, W, H, detail, { lidNeed });
+    const wx = G.dram.wire.x, tag = `${name} ${W}x${H} ${detail}`;
+    for (const m of G.machines) assert.ok(m.x + m.w <= wx - 8 || m.x >= wx + 8, `${tag}: ${m.id} keeps clear of the wire`);
+    if (G.machines.length === 1) assert.ok(G.machines[0].x + G.machines[0].w <= wx - 8, `${tag}: one machine goes left of the wire`);
+    if (G.machines.length > 1) {
+      assert.ok(G.machines.some(m => m.x < wx) && G.machines.some(m => m.x > wx), `${tag}: machines sit either side of the wire`);
+      for (let i = 1; i < G.machines.length; i++) assert.ok(G.machines[i].x >= G.machines[i - 1].x + G.machines[i - 1].w, `${tag}: in order, never on each other`);
+    }
+  });
+  // one machine stays centred under the core when that leaves the wire's gap, and otherwise ends just left of it
+  for (const [W, H] of WINDOWS) {
+    const { G } = board('live', W, H, 'calm');
+    const m = G.machines[0], wx = G.dram.wire.x, gap = G.P.dram.wireGap;
+    assert.equal(G.machines.length, 1);
+    if (G.cx + m.w / 2 <= wx - gap) assert.ok(Math.abs(m.x + m.w / 2 - G.cx) < 1, `${W}x${H}: centred`);
+    else assert.ok(Math.abs(m.x + m.w - (wx - gap)) < 1, `${W}x${H}: just left of the wire`);
+  }
+});
+
+test('dense rows stop where the core\'s bottom edge could not hold their lanes beside the DRAM', () => {
+  for (const [W, H] of WINDOWS) {
+    const P = sizeClass(W, H), n = maxDenseRows(H, P);
+    assert.ok(n >= 12, `${W}x${H}: at least two rows a lane`);
+    for (let k = 2; 6 * k <= n; k++) {
+      const f = frame(W, H, P, { nRows: 6 * k, dense: true });
+      assert.ok(6 * k === 12 || f.rows.filter(y => y > f.cy + f.coreHalfMin).length <= bottomRanks(P), `${W}x${H}: ${6 * k} rows`);
+    }
+  }
+  assert.deepEqual(Object.values(SIZES).map(P => [P.name, bottomRanks(P)]), [['L', 4], ['M', 3], ['S', 3]]);
+});
+
+test('#said moves under the DRAM, left of its wire, and the first-run hint always fits the room it has', () => {
+  each((name, W, H, detail, lidNeed) => {
+    const { G } = board(name, W, H, detail, { lidNeed });
+    const s = G.said, d = G.dram, tag = `${name} ${W}x${H} ${detail} ${lidNeed}`;
+    assert.ok(s.y >= d.y + d.h + d.pin, `${tag}: under the DRAM`);
+    assert.ok(s.x + s.w <= d.wire.x - 8, `${tag}: left of the wire`);
+    const lines = saidTextLines(G, SAID_HINT, { hint: true });
+    assert.ok(lines <= s.lines && s.y + lines * saidLineH(G.P) <= s.maxY + 0.01, `${tag}: the hint takes ${lines} lines of ${s.lines}`);
+  });
+});
+
+test('dense boards with every row taken, at every size the window allows: the DRAM keeps its column and nothing touches it', () => {
+  const bad = [];
+  for (const [W, H] of WINDOWS) {
+    const P = sizeClass(W, H);
+    for (let k = 2; 6 * k <= Math.max(12, maxDenseRows(H, P)); k++) {
+      const n = 6 * k, roots = [], at = new Map();
+      for (const side of ['L', 'R']) for (let row = 0; row < n; row++) {
+        const id = `${side}${row}`;
+        roots.push({ id, name: `Agent ${id}`, status: 'working', stop: 'mid', lit: null, qno: null, kids: [] });
+        at.set(id, { side, row });
+      }
+      for (const lidNeed of [0, 900]) {
+        // every lane that leaves the core's bottom edge needs the person, so all their pads are drawn
+        const probe = layoutBoard({ W, H, P, roots, laneOf: id => at.get(id), nRows: n, dense: true, lidNeed });
+        let q = 0;
+        for (const nd of probe.nodes) if (nd.lane.kind === 'down') Object.assign(roots.find(r => r.id === nd.id), { lit: 'need', qno: ++q, stop: 'inner' });
+        const G = layoutBoard({ W, H, P, roots, laneOf: id => at.get(id), nRows: n, dense: true, lidNeed, machines: [{ id: 'laptop', name: 'Your laptop', awake: true }] });
+        for (const p of boardProblems(G)) if (/dram|U2|said/.test(p)) bad.push(`${W}x${H} ${n} rows ${lidNeed}: ${p}`);
+        for (const r of roots) Object.assign(r, { lit: null, qno: null, stop: 'mid' });
+      }
+    }
+  }
+  assert.deepEqual(bad, []);
+});
+
+test('what #said shows is cut by the lines it wraps into, never by a count of characters alone', () => {
+  const notice = 'Agents start from your last commit. 2 uncommitted changes are not in their copies.';
+  assert.equal(clipToLines(notice, 40, 3), notice, 'whole when it fits');
+  // 21 characters a line: 84 characters would fit 4 lines by count, but the words need 5
+  assert.equal(wrapWords(notice, 21).length, 5);
+  const cut = clipToLines(notice, 21, 4);
+  assert.ok(wrapWords(cut, 21).length <= 4 && cut.endsWith('…'), cut);
+  let seed = 3;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const words = ['a', 'line', 'that', 'wraps', 'uncommitted', 'changes', 'Invoice', 'export', 'merged', 'into', 'workbench/very-long-branch-name-a1b2c3'];
+  for (let i = 0; i < 300; i++) {
+    const text = Array.from({ length: 2 + Math.floor(rnd() * 30) }, () => words[Math.floor(rnd() * words.length)]).join(' ');
+    const per = 10 + Math.floor(rnd() * 30), max = 1 + Math.floor(rnd() * 5);
+    assert.ok(wrapWords(clipToLines(text, per, max), per).length <= max, `${per}×${max}: ${text}`);
+  }
+});
+
+test('the checks catch a DRAM that is in the way: a machine on its wire, a chip on its package', () => {
+  const { G } = board('demo', 1440, 900, 'calm');
+  assert.deepEqual(boardProblems(G), []);
+  const m = G.machines[0], was = m.x;
+  m.x = G.dram.wire.x - 10;
+  assert.ok(boardProblems(G).some(p => /dram wire × machine/.test(p)), boardProblems(G).join('; '));
+  m.x = was;
+  const chip = G.nodes[0];
+  const box = boardBoxes(G).find(b => b.k === 'dram');
+  chip.chip.x = box.x + 4; chip.chip.y = box.y + 2;
+  assert.ok(boardProblems(G).some(p => /dram/.test(p)), boardProblems(G).join('; '));
 });
