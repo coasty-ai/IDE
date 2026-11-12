@@ -373,8 +373,11 @@ function paintBand(z = sizes()) {
     ? `Type what you want. It goes to Workbench, about ${visibleText(agentOf(st.detail.agentId).name)}.` : 'Type what you want. It goes to Workbench.');
 }
 
-/** The band's height, as laid out: the graph starts under it. */
-const bandBottom = z => Math.max(z.bd.y + z.P.topBand, el.left.getBoundingClientRect().bottom + 10, el.right.getBoundingClientRect().bottom + 10);
+/** The band's height, as laid out: the graph starts under it (measured from the screen's top, which moves as it slides). */
+const bandBottom = z => {
+  const top = el.screen.getBoundingClientRect().top;
+  return Math.max(z.bd.y + z.P.topBand, el.left.getBoundingClientRect().bottom - top + 10, el.right.getBoundingClientRect().bottom - top + 10);
+};
 
 /** The graph: the SVG (traces, vias, pads, chips) under one row per commit, each row a listbox option. */
 function paintGraph(z) {

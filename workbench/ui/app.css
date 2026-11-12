@@ -528,7 +528,8 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitScreen { visibility: hidden; transform: translateY(100%); background: var(--bench); }
 :root[data-screen="git"] #gitScreen { visibility: visible; transform: none; }
 :root[data-screen="git"] #boardScreen { visibility: hidden; transform: translateY(-100%); }
-:root[data-screen="to-git"] .screen, :root[data-screen="to-board"] .screen { visibility: visible; }
+:root[data-screen="to-git"] #gitScreen, :root[data-screen="to-board"] #gitScreen,
+:root[data-screen="to-git"] #boardScreen, :root[data-screen="to-board"] #boardScreen { visibility: visible; }
 
 /* ---------- the git screen's top band: where you are, what needs you, the place to type ---------- */
 #gitTop .gleft, #gitTop .gright { position: absolute; display: flex; flex-direction: column; gap: 5px; }
