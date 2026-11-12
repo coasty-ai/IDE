@@ -50,6 +50,9 @@ const NO_FILES = Object.freeze({ changed: 0, adds: 0, dels: 0, list: [] });
 const MERGE_WHYS = new Set(['detached', 'busy', 'identity', 'git-old', 'changed', 'moved', 'nothing', 'ancestry', 'conflict', 'blocked', 'gone', 'git']);
 // Why a merge did not go through, when it is worth keeping on the agent (work.problem) until it clears.
 const PROBLEM_WHYS = new Set(['conflict', 'blocked', 'ancestry', 'moved', 'identity', 'detached', 'busy', 'git']);
+// The demo has no real git: without the simulator's git methods it says so; with them, its replies say nothing real happened.
+const DEMO_NO_MERGE = 'This is the demo, so nothing is really merged.';
+const DEMO_NO_DISCARD = 'This is the demo, so nothing is really thrown away.';
 const DEMO_MERGED = 'This is the demo: nothing was really merged.';
 const DEMO_THROWN = 'This is the demo: nothing was really thrown away.';
 const THROWN_REASON = 'Its work was thrown away, so it cannot continue.';
@@ -2321,6 +2324,8 @@ export class Engine extends EventEmitter {
   }
 
   async _proposeMerge(v, { state = null, into = null } = {}) {
+    // The demo merges only what its simulator can pretend to merge: before anything else, it says so.
+    if (this.mode === 'demo' && !this._simWith('merge')) return { ok: false, reply: DEMO_NO_MERGE };
     const pre = this._mergeRefusal(v, { state });
     if (pre) return pre;
     if (this.mode === 'demo') return this._simProposeMerge(v, { state });
@@ -2547,6 +2552,7 @@ export class Engine extends EventEmitter {
   }
 
   async _proposeDiscard(v, { state = null } = {}) {
+    if (this.mode === 'demo' && !this._simWith('discard')) return { ok: false, reply: DEMO_NO_DISCARD };
     const pre = this._discardRefusal(v, { state });
     if (pre) return pre;
     if (this.mode === 'demo') return this._simProposeDiscard(v, { state });
@@ -2758,7 +2764,7 @@ export class Engine extends EventEmitter {
 
   async _simProposeMerge(v, { state = null } = {}) {
     const sim = this._simWith('merge');
-    if (!sim) return { ok: false, reply: 'This is the demo, so nothing is really merged.' };
+    if (!sim) return { ok: false, reply: DEMO_NO_MERGE };
     let res = null;
     if (typeof sim.proposeMerge === 'function') {
       try {
@@ -2767,7 +2773,7 @@ export class Engine extends EventEmitter {
         this.log.warn('The simulator could not propose a merge:', err);
         return { ok: false, reply: `The demo could not merge ${v.name}.` };
       }
-      if (res && res.ok === false) return { ok: false, reply: this._simSaid(res) || 'This is the demo, so nothing is really merged.' };
+      if (res && res.ok === false) return { ok: false, reply: this._simSaid(res) || DEMO_NO_MERGE };
       const again = this._mergeRefusal(this.store.get(v.id), { state });
       if (again) return again;
     }
@@ -2788,7 +2794,7 @@ export class Engine extends EventEmitter {
     const pre = this._mergeRefusal(v, { state: c.state });
     if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
     const sim = this._simWith('merge');
-    if (!sim) return { reply: 'This is the demo, so nothing is really merged.', focusId: v.id };
+    if (!sim) return { reply: DEMO_NO_MERGE, focusId: v.id };
     this._busy.set(v.id, 'merge');
     try {
       const before = { work: v.work, files: v.files };
@@ -2831,7 +2837,7 @@ export class Engine extends EventEmitter {
 
   async _simProposeDiscard(v, { state = null } = {}) {
     const sim = this._simWith('discard');
-    if (!sim) return { ok: false, reply: 'This is the demo, so nothing is really thrown away.' };
+    if (!sim) return { ok: false, reply: DEMO_NO_DISCARD };
     let res = null;
     if (typeof sim.proposeDiscard === 'function') {
       try {
@@ -2840,7 +2846,7 @@ export class Engine extends EventEmitter {
         this.log.warn('The simulator could not propose a throw-away:', err);
         return { ok: false, reply: `The demo could not throw away ${v.name}’s work.` };
       }
-      if (res && res.ok === false) return { ok: false, reply: this._simSaid(res) || 'This is the demo, so nothing is really thrown away.' };
+      if (res && res.ok === false) return { ok: false, reply: this._simSaid(res) || DEMO_NO_DISCARD };
       const again = this._discardRefusal(this.store.get(v.id), { state });
       if (again) return again;
     }
@@ -2866,7 +2872,7 @@ export class Engine extends EventEmitter {
     if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
     if (!c.active && this._isWorking(v)) return { reply: 'That changed. Have another look.', focusId: v.id };
     const sim = this._simWith('discard');
-    if (!sim) return { reply: 'This is the demo, so nothing is really thrown away.', focusId: v.id };
+    if (!sim) return { reply: DEMO_NO_DISCARD, focusId: v.id };
     this._busy.set(v.id, 'discard');
     try {
       if (this._isWorking(v)) await this._stopRoot(v, 'Stopped by you');
