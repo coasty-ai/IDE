@@ -1250,22 +1250,19 @@ function splitPatches(text) {
   return starts.map((s, n) => text.slice(s, n + 1 < starts.length ? starts[n + 1] : text.length));
 }
 
-/** How git writes a path in a patch's header with core.quotePath=false: as it is, or in quotes with C escapes. */
+/** `p` in git's C-style quotes: control characters, `"` and `\` escaped, everything else as it is. */
 const C_ESCAPES = { 7: 'a', 8: 'b', 9: 't', 10: 'n', 11: 'v', 12: 'f', 13: 'r', 34: '"', 92: '\\' };
-function headerPath(p) {
-  let quoted = false;
+function cQuoted(p) {
   let out = '';
   for (const ch of p) {
     const c = ch.codePointAt(0);
-    if (c < 0x20 || c === 0x7f || c === 34 || c === 92) {
-      quoted = true;
-      out += `\\${C_ESCAPES[c] || c.toString(8).padStart(3, '0')}`;
-    } else {
-      out += ch;
-    }
+    out += c < 0x20 || c === 0x7f || c === 34 || c === 92 ? `\\${C_ESCAPES[c] || c.toString(8).padStart(3, '0')}` : ch;
   }
-  return quoted ? `"${out}"` : out;
+  return `"${out}"`;
 }
+
+/** How git writes a path in a patch's header with core.quotePath=false: as it is, or in quotes with C escapes. */
+const headerPath = p => (/[\u0000-\u001f\u007f"\\]/.test(p) ? cQuoted(p) : p);
 
 /** The first line of the patch of `path`. */
 const patchHeader = p => `diff --git ${headerPath(`a/${p}`)} ${headerPath(`b/${p}`)}\n`;
@@ -1465,7 +1462,7 @@ async function alreadyThere(run, root, paths, brought) {
   const merged = new Map(brought.filter(f => !f.lossy).map(f => [f.path, f])); // git's words name files as UTF-8
   const asked = paths.filter(p => {
     const f = merged.get(p);
-    if (!f || f.status === 'deleted' || !(f.newMode === '100644' || f.newMode === '100755') || p.includes('\n') || !safeParts(p)) return false;
+    if (!f || f.status === 'deleted' || !(f.newMode === '100644' || f.newMode === '100755') || !safeParts(p)) return false;
     try {
       return fs.lstatSync(path.join(root, p)).isFile();
     } catch {
@@ -1474,7 +1471,9 @@ async function alreadyThere(run, root, paths, brought) {
   });
   if (!asked.length) return new Set();
   try {
-    const ids = (await run(['hash-object', '--stdin-paths'], { cwd: root, input: asked.map(p => `${p}\n`).join('') })).stdout.split('\n');
+    // Each name in quotes: git reads a line that starts with a quote as a quoted name, and drops a carriage return at
+    // its end, so a name such as `"x"` would otherwise be read as x.
+    const ids = (await run(['hash-object', '--stdin-paths'], { cwd: root, input: asked.map(p => `${cQuoted(p)}\n`).join('') })).stdout.split('\n');
     return new Set(asked.filter((p, i) => ids[i] === merged.get(p).newId));
   } catch {
     return new Set(); // a filter that fails, a file that went meanwhile: theirs, as far as Workbench can tell

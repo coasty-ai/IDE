@@ -1850,6 +1850,17 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(fs.readFileSync(t.p('b.txt'), 'utf8'), 'b by the agent\n');
   });
 
+  test('a file in the way is judged by its own bytes, whatever its name: one that starts with a quote is never read as another', async () => {
+    const t = await agentRepo();
+    write(t.w('"x"'), 'agent\n');
+    write(t.p('"x"'), 'mine\n'); // the person's own file, in the way
+    write(t.p('x'), 'agent\n'); // and x, which holds what the agent's "x" holds (git reads the line "x" as x)
+    const { expect } = await proposal(t);
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)), {
+      ok: false, why: 'blocked', paths: ['"x"'], sentence: 'Your own changes are in the way: "x". Commit or put them aside, then merge again.',
+    });
+  });
+
   test('when the person’s branch moves while git writes their files, mergeWork says the merge did not finish, never that it moved', async () => {
     const t = await agentRepo();
     write(t.p('c.txt'), 'c by the person\n');
