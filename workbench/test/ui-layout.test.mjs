@@ -272,3 +272,81 @@ test('the checks catch a DRAM that is in the way: a machine on its wire, a chip 
   chip.chip.x = box.x + 4; chip.chip.y = box.y + 2;
   assert.ok(boardProblems(G).some(p => /dram/.test(p)), boardProblems(G).join('; '));
 });
+
+test('a long done tray never puts a machine on the DRAM\'s wire: the sections narrow, the tray\'s words shorten, and only then names are cut', async () => {
+  const { trayWords } = await import('../ui/boardmodel.js');
+  const DEMO = [{ id: 'laptop', name: 'Your laptop', awake: true, note: '2 agents · memory almost full' }, { id: 'cloud-1', name: 'Cloud 1', awake: true, note: '1 agent · $0.40 an hour' },
+    { id: 'cloud-2', name: 'Cloud 2', awake: false, note: 'asleep' }, { id: 'cloud-3', name: 'Cloud 3', awake: true, note: '1 agent · $0.40 an hour' }];
+  const LONG = [{ id: 'laptop', name: 'Your laptop (the one on your desk)', awake: true, note: '' }, { id: 'cloud-1', name: 'Cloud workstation in Frankfurt', awake: false, note: '' },
+    { id: 'cloud-2', name: 'Cloud workstation in Oregon', awake: true, note: '' }, { id: 'cloud-3', name: 'Cloud workstation in Tokyo', awake: true, note: '' }];
+  const bad = [];
+  let cutTray = 0, cutNames = 0;
+  for (const [W, H] of WINDOWS) for (const detail of ['calm', 'more']) for (const counts of [{ done: 12, earlier: 6, over: 1 }, { done: 99, earlier: 99, over: 99 }, { done: 0, earlier: 40, over: 0 }])
+    for (const machines of [DEMO, DEMO.slice(0, 1), LONG]) {
+      const P = sizeClass(W, H), words = trayWords(counts);
+      const tray = { count: counts.done + counts.earlier, ...counts, marks: [], ...words };
+      const G = layoutBoard({ W, H, P, detail, roots: [], laneOf: () => null, nRows: maxDenseRows(H, P), dense: true, lidNeed: 220, machines, tray });
+      const wx = G.dram.wire.x, tag = `${W}x${H} ${detail} ${words.text} ${machines.length} machine(s)${machines === LONG ? ' (long names)' : ''}`;
+      for (const [i, m] of G.machines.entries()) {
+        if (!(m.x + m.w <= wx - 8 || m.x >= wx + 8)) bad.push(`${tag}: ${m.id} on the wire (${m.x}–${m.x + m.w}, wire at ${wx})`);
+        if (i && m.x < G.machines[i - 1].x + G.machines[i - 1].w) bad.push(`${tag}: ${m.id} on the one before it`);
+        if (m.x < G.tray.x + G.tray.w || m.x + m.w > G.board.r - 8) bad.push(`${tag}: ${m.id} outside the connector`);
+        // the name as drawn fits its section: the LED, the moon when asleep, and the words
+        const shown = m.label ?? machines[i].name;
+        const need = G.measure(shown, P.mName) + 8 + 7 + (machines[i].awake ? 0 : 18);
+        if (need > m.w + 0.5) bad.push(`${tag}: ${m.id}'s name needs ${Math.ceil(need)} px of ${m.w}`);
+        if (m.label != null) { cutNames++; if (!m.label.endsWith('…') || m.label.length >= machines[i].name.length) bad.push(`${tag}: ${m.id} cut oddly (${m.label})`); }
+      }
+      // the tray holds the words it draws
+      const drawn = G.tray.lead + G.tray.rest;
+      if (G.measure(drawn, P.silkSub) + 12 > G.tray.w + 0.5) bad.push(`${tag}: the tray is narrower than its words`);
+      if (drawn !== words.text) cutTray++;
+      for (const p of boardProblems(G)) if (/machine|tray|wire/.test(p)) bad.push(`${tag}: ${p}`);
+    }
+  assert.deepEqual(bad, []);
+  assert.ok(cutTray > 0, 'the tray gives way first where it must');
+  assert.ok(cutNames > 0, 'and only past that, names are cut');
+  // at 960×900 with the demo's machines, the full words and whole names fit, the sections only narrowing
+  const P = sizeClass(960, 900), words = trayWords({ done: 12, earlier: 6, over: 1 });
+  const G = layoutBoard({ W: 960, H: 900, P, detail: 'calm', roots: [], laneOf: () => null, nRows: maxDenseRows(900, P), dense: true, lidNeed: 220, machines: DEMO, tray: { count: 18, done: 12, earlier: 6, over: 1, marks: [], ...words } });
+  assert.equal(G.tray.lead + G.tray.rest, '12 done or stopped, 6 from earlier, 1 more working');
+  assert.ok(G.machines.every(m => m.label == null), 'whole names');
+});
+
+test('a name is wrapped and cut between hidden characters\' codes, never through one ("⟦U+20" then "0B⟧")', () => {
+  const half = s => /⟦[^⟧]*$/.test(s) || /^[^⟦]*⟧/.test(s);
+  for (const text of ['Help⟦U+202E⟧pages⟦U+200B⟧', 'Onboarding⟦U+202E⟧⟦U+200B⟧', 'Checkout⟦U+202E⟧fix⟦U+200B⟧ and more words', 'reading welcome.mjml⟦U+202E⟧x⟦U+E0041⟧⟦U+3164⟧']) {
+    for (let max = 10; max <= 30; max++) {
+      for (const line of wrapWords(text, max)) assert.ok(!half(line) && Array.from(line).length <= max, `${max}: "${line}" of ${text}`);
+      const cut = clipTo(text, max);
+      assert.ok(!half(cut) && Array.from(cut).length <= max, `${max}: "${cut}"`);
+    }
+  }
+  // ordinary words are cut as before
+  assert.deepEqual(wrapWords('Investigate intermittent failures', 12), ['Investigate', 'intermittent', 'failures']);
+  assert.equal(clipTo('Investigate intermittent failures', 16), 'Investigate…');
+});
+
+test('names and words on the board show their hidden characters: chips, their status words, helpers and their labels', async () => {
+  const { hasHidden } = await import('../ui/diffview.js');
+  const U = n => String.fromCodePoint(n);
+  const RLO = U(0x202e), TAG = U(0xe0041), ZW = U(0x200b);
+  const roots = [
+    { id: 'a', name: `Fix${RLO}gol`, status: `reading x${TAG}.ts`, label: 'working', stop: 'mid', kids: [{ id: 'k1', name: `Trace${RLO}flow`, status: `reading${ZW} y.ts`, needs: false, ended: false }] },
+    { id: 'b', name: `Help pages${TAG}${TAG}`, status: 'says it’s done', label: 'done', stop: 'inner', lit: 'need', qno: 1, kids: [{ id: 'k2', name: `Ask${RLO}er`, status: 'needs your OK', needs: true, ended: false }] },
+  ];
+  const at = new Map([['a', { side: 'L', row: 1 }], ['b', { side: 'R', row: 2 }]]);
+  const bad = [];
+  for (const [W, H] of [[1440, 900], [960, 900]]) for (const detail of ['calm', 'more']) {
+    const G = layoutBoard({ W, H, P: sizeClass(W, H), detail, roots, laneOf: id => at.get(id), nRows: 6, lidNeed: 200 });
+    for (const n of G.nodes) {
+      const words = [n.r.name, ...n.shape.lines, n.shape.status || '', ...n.helpers.flatMap(p => [p.k.name, p.k.status || '', p.label ? p.label.l1 + p.label.l2 + p.label.full : ''])];
+      for (const w of words) if (hasHidden(w)) bad.push(`${W}x${H} ${detail} ${n.id}: ${w}`);
+    }
+    const a = G.nodes.find(n => n.id === 'a');
+    assert.equal(a.r.name, 'Fix⟦U+202E⟧gol', 'the name a chip is drawn and announced with');
+    assert.ok(a.shape.lines.join(' ').includes('⟦U+202E⟧'), 'and measured with');
+  }
+  assert.deepEqual(bad, []);
+  assert.equal(roots[0].name, `Fix${RLO}gol`, 'what the page was given is left as it is');
+});

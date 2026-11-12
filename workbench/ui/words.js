@@ -1,23 +1,61 @@
 // Shaping text for small spaces. Pure: no DOM, no imports (node:test loads it).
 
+// ---------------------------------------------------------------- characters that hide text
+// The one rule for characters that hide text or change the order it reads in. Wherever an agent's or a repository's
+// words reach the page (the lid, the board, the git screen and its diff), each one is shown, never left raw: control
+// characters as pictures (⏎ ⇥ ␍ ␡, and ␀ to ␟), every other one by its code ("⟦U+202E⟧"). The rule covers
+//   - the C0 and C1 control characters (Unicode's Cc),
+//   - every default-ignorable code point: zero-width spaces and joiners, direction marks, the byte-order mark, soft
+//     hyphens, Hangul fillers, invisible operators, and tag characters (which can spell out words no one sees),
+//   - the bidirectional controls (embeddings, overrides, isolates and marks), and the line and paragraph separators.
+// Variation selectors are default-ignorable too, but an emoji needs one: a single U+FE0E or U+FE0F straight after an
+// emoji stays as it is. Any other selector, and every one after the first, is shown, because a run of them can carry
+// hidden text. Written with Unicode's properties and the u flag, so characters past U+FFFF count too, and so no such
+// character is ever in this file raw. The diff view (ui/diffview.js) reads text with hiddenParts() too.
+const HIDDEN = /[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Bidi_Control}\u{2028}\u{2029}]/u;
+const EMOJI = /\p{Emoji}/u;
+const SELECTORS = new Set(['\u{FE0E}', '\u{FE0F}']);
 const PICTURES = { '\n': '⏎', '\t': '⇥', '\r': '␍', '\x7f': '␡' };
-// Characters that hide text or change the order it reads in, shown by their code: C1 controls, the Arabic letter mark,
-// zero-width characters and direction marks (U+200B to U+200F), the line and paragraph separators, bidirectional
-// embeddings and overrides (U+202A to U+202E), the word joiner and invisible operators, bidirectional isolates (U+2066
-// to U+2069), and the zero-width no-break space (U+FEFF). The git screen's diff (ui/diffview.js) shows the same set the
-// same way. [from, to] as code point numbers, so no such character is ever in this file raw.
-const HIDDEN_RANGES = [[0x80, 0x9f], [0x61c, 0x61c], [0x200b, 0x200f], [0x2028, 0x202e], [0x2060, 0x2069], [0xfeff, 0xfeff]];
-const HIDDEN = new RegExp(`[${HIDDEN_RANGES.map(([a, b]) => String.fromCharCode(a) + (b > a ? '-' + String.fromCharCode(b) : '')).join('')}]`, 'g');
+
+/** How a hidden character is shown: a picture for a control character (⏎, ⇥, ␛, …), else its code ("⟦U+E0041⟧"). */
+export function hiddenPicture(ch) {
+  const n = String(ch).codePointAt(0) || 0;
+  if (PICTURES[ch]) return PICTURES[ch];
+  if (n < 0x20) return String.fromCharCode(0x2400 + n);
+  return `⟦U+${n.toString(16).toUpperCase().padStart(4, '0')}⟧`;
+}
 
 /**
- * Control characters shown as visible symbols, so a command, a path or a branch name can never hide a line break or a
- * tab (⏎, ⇥, ␍, ␛, …). Characters that are invisible or change the direction of the text around them are shown by
- * their code ("⟦U+202E⟧"), so text can never read in an order other than the one it is in.
+ * A text in pieces, in order: runs of ordinary text ({ text }), and each hidden character on its own ({ text, hidden }:
+ * the character itself, and how it is shown). Whole characters only, so nothing past U+FFFF is ever split.
+ * @returns {{ text: string, hidden?: string }[]}
+ */
+export function hiddenParts(s) {
+  const t = String(s ?? '');
+  if (!HIDDEN.test(t)) return t ? [{ text: t }] : [];
+  const out = [];
+  let run = '', prev = '';
+  for (const ch of t) {
+    // an emoji keeps its one selector; a selector anywhere else, or a second one, is shown
+    const kept = SELECTORS.has(ch) && prev !== '' && EMOJI.test(prev) && !HIDDEN.test(prev);
+    if (!kept && HIDDEN.test(ch)) {
+      if (run) { out.push({ text: run }); run = ''; }
+      out.push({ text: ch, hidden: hiddenPicture(ch) });
+    } else run += ch;
+    prev = ch;
+  }
+  if (run) out.push({ text: run });
+  return out;
+}
+
+/**
+ * Text with every character that hides text or turns it shown (the rule above), so a command, a path, a name or a branch
+ * can never hide a line break or a tab (⏎, ⇥, ␍, ␛, …), nor read in an order other than the one it is in ("⟦U+202E⟧").
  */
 export function visibleControls(s) {
-  return String(s ?? '')
-    .replace(/[\x00-\x1f\x7f]/g, c => PICTURES[c] || String.fromCharCode(0x2400 + c.charCodeAt(0)))
-    .replace(HIDDEN, c => `⟦U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}⟧`);
+  const t = String(s ?? '');
+  if (!HIDDEN.test(t)) return t;
+  return hiddenParts(t).map(p => p.hidden ?? p.text).join('');
 }
 
 /**
@@ -51,7 +89,11 @@ export function whoAsks(name, index, total, max = 28) {
   const room = Math.max(4, max - ' asks'.length - 1);
   // a name is cut at a word boundary whenever one is in reach, so "Investigate intermitte…" never happens with room to spare
   const cut = n.slice(0, room), sp = n.charAt(room) === ' ' ? room : cut.lastIndexOf(' ');
-  return (sp > room * 0.3 ? cut.slice(0, sp) : cut).replace(/[,.;:\s]+$/, '') + '… asks';
+  let s = sp > room * 0.3 ? cut.slice(0, sp) : cut;
+  // never through a hidden character's code ("⟦U+20…"): before it
+  const open = s.lastIndexOf('⟦');
+  if (open > 0 && open > s.lastIndexOf('⟧')) s = s.slice(0, open);
+  return s.replace(/[,.;:\s]+$/, '') + '… asks';
 }
 
 /**

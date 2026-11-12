@@ -400,3 +400,62 @@ test('a card\'s words show characters that could hide or turn text', { skip }, a
   assert.match(v.html, /joined into ma⟦U\+202E⟧in by a merge commit\.⟦U\+200B⟧/);
   assert.ok(!v.html.includes(rlo) && !v.html.includes(zw) && !v.say.includes(rlo));
 });
+
+// ---------------------------------------------------------------- what an agent controls, shown as it is
+test('everything an agent controls reaches the lid with its hidden characters shown: names, paths, words, questions, answers, checks', { skip }, async () => {
+  const { lidView, S } = await load();
+  const { hasHidden } = await import('../ui/diffview.js');
+  const U = n => String.fromCodePoint(n);
+  const RLO = U(0x202e), ZW = U(0x200b), TAG = U(0xe0041), HF = U(0x3164), LS = U(0x2028);
+  const taint = s => `${s}${RLO}x${TAG}${HF}${LS}y`;
+  const name = `Fix${RLO}gol${ZW}`;
+  const files = { changed: 2, adds: 3, dels: 1, list: [{ path: `src/payments/refund${RLO}cod.exe`, adds: 2, dels: 1 }, { path: `a${TAG}.js`, adds: 1, dels: 0 }] };
+  const opts = [taint('Keep it'), taint('Remove it')];
+  const parent = agent('P', 'working', { name: taint('Parent') });
+  const base = o => agent('A1', o.state, { name, says: taint('I did it.'), now: taint('Reading x.ts'), files, error: taint('It broke.'), ...o });
+  const cases = [
+    base({ state: 'needs_ok', ask: { id: 'k1', type: 'permission', sentence: taint(`${name} wants to run a command`), detail: taint('npm test'), why: taint('A reason'), options: ['Allow', 'Deny'], createdAt: NOW } }),
+    base({ state: 'question', ask: { id: 'k2', type: 'question', sentence: taint('Keep the old address?'), options: opts, createdAt: NOW } }),
+    base({ state: 'question', parentId: 'P', ask: { id: 'k3', type: 'question', sentence: taint('Which one?'), options: [], createdAt: NOW } }),
+    base({ state: 'maybe_stuck', ask: { id: 'k4', type: 'stuck', sentence: `${name} has hit the same error ${taint('three')} times.`, detail: taint('It failed.'), options: opts, createdAt: NOW } }),
+    base({ state: 'maybe_stuck', ask: { id: 'k5', type: 'stuck', about: 'background', sentence: taint(`${name} has finished`), detail: taint('npm run watch\nnode server.js'), createdAt: NOW } }),
+    base({ state: 'checks_failed', checks: { state: 'failed', results: [{ name: taint('Unit tests'), ok: false }] } }),
+    base({ state: 'done_checked', rules: { kept: [], broken: [{ say: taint('Keep migrations/') }] } }),
+    base({ state: 'done_claimed' }), base({ state: 'failed' }), base({ state: 'stopped' }),
+    base({ state: 'finished', parentId: 'P' }), base({ state: 'waiting_helpers', now: `Waiting for ${taint('a command')}` }), base({ state: 'working' }),
+    base({ state: 'done_checked', earlier: true, canContinue: false, continueReason: taint('Its folder is gone.') }),
+    base({ state: 'done_checked', work: WORK({ branch: taint('workbench/x'), merged: { into: taint('main'), merge: 'e4f1', at: NOW - MIN, files: 2 } }), files: FILES(0) }),
+    base({ state: 'done_checked', work: problem('conflict', taint('It conflicts.'), [taint('src/a.js'), 'b.js']) }),
+    base({ state: 'done_checked', work: problem('blocked', taint('In the way.'), [taint('src/a.js')]) }),
+    base({ state: 'done_checked', work: problem('moved', taint('main changed since you looked. Have another look.')) }),
+    base({ state: 'stopped', work: WORK({ branch: null, folder: false, thrownAway: { at: NOW, saved: 'x' } }) }),
+  ];
+  const bad = [];
+  for (const a of cases) for (const mode of ['live', 'demo']) for (const detail of ['calm', 'more']) for (const fit of [0, 6]) for (const open of [{}, { exact: true, changed: true, all: true }]) {
+    if (mode === 'live') live(S, { branch: taint('main') }); else demo(S);
+    S.agents.clear(); S.agents.set(a.id, a); S.agents.set('P', parent);
+    const v = lidView({ agent: a, index: 0, total: 2, picked: true }, { detail, fit, open });
+    const tag = `${a.state}${a.ask?.about ? ' (background)' : ''}${a.work?.problem ? ' ' + a.work.problem.why : a.work?.merged ? ' merged' : a.work?.thrownAway ? ' thrown' : ''}${a.earlier ? ' earlier' : ''}${a.parentId ? ' helper' : ''} ${mode} ${detail} fit ${fit}${open.all ? ' open' : ''}`;
+    // what is drawn and said; data-* attributes hold what a button sends, which is the agent's own words
+    const shown = v.html.replace(/ data-[\w-]+="[^"]*"/g, '').replace(/\n/g, '');
+    if (hasHidden(shown)) bad.push(`${tag}: html ${[...shown].filter(c => hasHidden(c)).map(c => c.codePointAt(0).toString(16)).join(',')}`);
+    if (hasHidden(v.say)) bad.push(`${tag}: what is said`);
+    if (hasHidden(v.count)) bad.push(`${tag}: the count`);
+  }
+  // nothing waits, one set aside: its name on the way back
+  const aside = lidView({ empty: true, aside: [{ id: 'A9', name }] }, {});
+  if (hasHidden(aside.html.replace(/ data-[\w-]+="[^"]*"/g, ''))) bad.push('empty: the set-aside name');
+  assert.deepEqual(bad, []);
+  // an answer sends the option's own words; only its label is shown with its codes
+  demo(S); S.agents.clear(); S.agents.set('A1', cases[1]);
+  const q = allButtons(lidView({ agent: cases[1], index: 0, total: 1 }, { detail: 'calm' }).html).filter(b => b.act === 'answer');
+  assert.deepEqual(q.map(b => b.answer), opts);
+  assert.deepEqual(q.map(b => b.label), ['Keep it⟦U+202E⟧x⟦U+E0041⟧⟦U+3164⟧⟦U+2028⟧y', 'Remove it⟦U+202E⟧x⟦U+E0041⟧⟦U+3164⟧⟦U+2028⟧y']);
+  // the headline names the agent with its codes, and a path in "What changed?" reads as it is
+  S.agents.set('A1', cases[7]);
+  const done = lidView({ agent: cases[7], index: 0, total: 1 }, { detail: 'more' });
+  assert.match(done.html, /<h1[^>]*>Fix⟦U\+202E⟧gol⟦U\+200B⟧ says it is done\.<\/h1>/);
+  S.agents.set('A1', cases[1]);
+  const changed = lidView({ agent: cases[1], index: 0, total: 1 }, { detail: 'more', open: { changed: true } });
+  assert.match(changed.html, /<li>src\/payments\/refund⟦U\+202E⟧cod\.exe <span>\+2 −1<\/span><\/li>/);
+});

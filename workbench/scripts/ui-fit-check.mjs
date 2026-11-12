@@ -15,10 +15,14 @@ const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
 const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
   // D2: an agent's work in the lid, and the engine's cards for it (the 'merge' scenarios of scripts/ui-mock.mjs)
-  'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids'];
+  'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids',
+  // what an agent controls, with characters that hide text or turn it: shown by their codes on the board and in the lid
+  'taint',
+  // a crowded board with a long done tray: the edge connector's sections keep clear of the DRAM's wire
+  'wire'];
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
-const GIT_VIEWS = ['git', 'git-detail', 'git-empty'];
+const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
 VIEWS.push(...GIT_VIEWS);
 const args = process.argv.slice(2);
 const opt = k => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : null; };
@@ -161,6 +165,16 @@ b.on(m => {
   if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') errors.push('console: ' + m.params.args.map(a => a.value || a.description).join(' ').slice(0, 300));
   if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error' && !/status of 401/.test(m.params.entry.text)) errors.push('log: ' + m.params.entry.text.slice(0, 300) + ' ' + (m.params.entry.url || ''));
 });
+// The git-tangles view serves its own histories as GET /api/git (Chrome holds the request and answers it); every other
+// request goes on to the mock.
+let gitServed = null;
+b.on(m => {
+  if (m.method !== 'Fetch.requestPaused') return;
+  const { requestId, request } = m.params;
+  if (gitServed && new URL(request.url).pathname === '/api/git') {
+    b.send('Fetch.fulfillRequest', { requestId, responseCode: 200, responseHeaders: [{ name: 'content-type', value: 'application/json; charset=utf-8' }], body: Buffer.from(JSON.stringify(gitServed)).toString('base64') }).catch(() => {});
+  } else b.send('Fetch.continueRequest', { requestId }).catch(() => {});
+});
 
 async function setLook(theme, detail) {
   await b.ev(`(() => { const set = (n, v) => { const r = document.querySelector('#look input[name="' + n + '"][value="' + v + '"]'); if (r && !r.checked) r.click(); };
@@ -224,8 +238,118 @@ async function gitView(v, s, d) {
     await pick('#gitGraph .gr[data-id="work:m5"]'); await check(`${tag} (a very long branch name)`);
   } else if (v === 'git-empty') {
     await open('git-empty'); await check(tag);
+  } else if (v === 'git-tangles') {
+    // histories from real git that once drew two merges' lines on top of each other, a line across your trunk, or an old
+    // agent above HEAD: each must fit, share no stretch of copper, cross your trunk only when nothing else would do,
+    // and keep an agent whose branch starts past the commits shown at the end
+    await b.send('Fetch.enable', { patterns: [{ urlPattern: '*/api/git*', requestStage: 'Request' }] });
+    try {
+      for (const [name, data] of Object.entries(TANGLES)) {
+        gitServed = data;
+        await open('git');
+        const t2 = `${tag} (${name})`;
+        await check(t2);
+        const g = await b.ev(GEOM);
+        for (const x of g.shared) failures.push(`${t2}: two lines on top of each other for ${x}`);
+        if (/agentFromAgent|twoOnOne/.test(name)) for (const x of g.overTrunk) failures.push(`${t2}: a line runs across your trunk at ${x}`);
+        const headCut = await b.ev(`(() => { const t = document.querySelector('#gitGraph text.ghead'), box = document.getElementById('gitGraph'); if (!t) return null; const r = t.getBoundingClientRect(), bx = box.getBoundingClientRect(); return r.left < bx.left - 0.5 ? Math.round(bx.left - r.left) : 0; })()`);
+        if (headCut) failures.push(`${t2}: the HEAD silkscreen is cut by ${headCut} px at the graph's left edge`);
+        if (name === 'oldAgent') {
+          const ids = await b.ev(`[...document.querySelectorAll('#gitGraph .gr')].map(r => r.dataset.id)`);
+          if (ids.at(-1) !== 'work:e1') failures.push(`${t2}: the agent whose branch starts further back is not at the end (${ids.slice(0, 3).join(', ')} … ${ids.at(-1)})`);
+          if (ids.indexOf('work:e2') !== 0) failures.push(`${t2}: the newest work is not at the top`);
+        }
+        await scrollEnd('#gitGraph'); await check(`${t2}, scrolled to the end`);
+      }
+    } finally {
+      gitServed = null;
+      await b.send('Fetch.disable');
+    }
   }
 }
+
+// ---------------------------------------------------------------- D1: histories that once tangled (the git-tangles view)
+// From real git: commits as [id, parents, refs, agentId, subject], newest first as git log --topo-order gives them.
+const tangle = (rows, agents, { head = 'c0', more = false } = {}) => {
+  const hex = c => (c.replace(/\D/g, '').padStart(6, '0') + 'ab'.repeat(20)).slice(0, 40);
+  const now = Date.now();
+  const commits = rows.map(([c, ps, refs, agentId, subject], i) => ({ id: hex(c), parents: ps.map(hex), refs, agentId, subject, author: 'Sam Lee', at: now - (i + 1) * 9 * 60000, kind: ps.length > 1 ? 'merge' : 'commit' }));
+  return { ok: true, repo: { name: 'tangles', branch: 'main', head: hex(head).slice(0, 7), dirty: 0, identity: true }, commits, more,
+    agents: agents.map(a => ({ harness: 'claude', earlier: false, from: 'main', ...a, base: a.base && hex(a.base), since: a.since && hex(a.since), work: { branch: a.branch, from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...a.work } })) };
+};
+const TANGLES = {
+  mergedTwice: tangle([
+    ['c0', ['c1'], ['main'], null, 'main 4'], ['c1', ['c2', 'c6'], [], 'm1', 'Merge M: m 2'], ['c2', ['c3'], [], null, 'main 3'],
+    ['c3', ['c4', 'c7'], [], 'm1', 'Merge M: m 1'], ['c4', ['c8'], [], null, 'main 2'], ['c5', ['c6'], ['workbench/m-m1'], 'm1', 'm 3'],
+    ['c6', ['c7'], [], 'm1', 'm 2'], ['c7', ['c8'], [], 'm1', 'm 1'], ['c8', ['c9'], [], null, 'main 1'], ['c9', [], [], null, 'init'],
+  ], [{ id: 'm1', name: 'Mail digest', state: 'done_checked', branch: 'workbench/m-m1', base: 'c8', since: 'c6', files: { changed: 2 } }]),
+  flowTwice: tangle([
+    ['c0', ['c1'], ['main'], null, 'main 6'], ['c1', ['c6', 'c2'], [], 'f1', 'Merge F: second work'], ['c2', ['c3', 'c7'], ['workbench/f-f1'], null, 'Merge main into f again'],
+    ['c3', ['c4'], [], 'f1', 'f: more'], ['c4', ['c5', 'c8'], [], null, 'Merge main into f (bring in main)'], ['c5', ['c10'], [], 'f1', 'f: its own commit'],
+    ['c6', ['c7'], [], null, 'main 5'], ['c7', ['c8'], [], null, 'main 4'], ['c8', ['c9'], [], null, 'main 3'], ['c9', ['c11', 'c10'], [], 'f1', 'Merge F: first work'],
+    ['c10', ['c12'], [], 'f1', 'W1: first work'], ['c11', ['c12'], [], null, 'main 2'], ['c12', ['c13'], [], null, 'main 1'], ['c13', [], [], null, 'init'],
+  ], [{ id: 'f1', name: 'Flow', state: 'done_checked', branch: 'workbench/f-f1', base: 'c12', since: 'c12', files: { changed: 0 }, work: { merged: { into: 'main' } } }]),
+  crissCross: tangle([
+    ['c0', ['c1'], ['workbench/l-l1'], 'l1', 'l 2'], ['c1', ['c3', 'c8'], [], null, 'l merges k 1'], ['c2', ['c4', 'c3'], ['workbench/k-k1'], null, 'k merges l 1'],
+    ['c3', ['c10'], [], 'l1', 'l 1'], ['c4', ['c5'], [], 'k1', 'k 2'], ['c5', ['c8', 'c9'], [], null, 'k merges main 1'], ['c6', ['c7'], ['main'], null, 'main 2'],
+    ['c7', ['c9', 'c8'], [], null, 'main merges k 1'], ['c8', ['c10'], [], 'k1', 'k 1'], ['c9', ['c10'], [], null, 'main 1'], ['c10', ['c11'], [], null, 'base'], ['c11', [], [], null, 'init'],
+  ], [{ id: 'k1', name: 'Keys', state: 'done_checked', branch: 'workbench/k-k1', base: 'c10', since: 'c10', files: { changed: 2 } },
+    { id: 'l1', name: 'Logins', state: 'done_checked', branch: 'workbench/l-l1', base: 'c10', since: 'c10', files: { changed: 2 } }], { head: 'c6' }),
+  agentFromAgent: tangle([
+    ['c0', ['c5'], ['main'], null, 'main 2'], ['c1', ['c3'], ['workbench/a-h1'], 'h1', 'a 3'], ['c2', ['c3'], ['workbench/b-h2'], 'h2', 'b 1'],
+    ['c3', ['c4'], [], 'h1', 'a 2'], ['c4', ['c5'], [], 'h1', 'a 1'], ['c5', ['c6'], [], null, 'main 1'], ['c6', [], [], null, 'init'],
+  ], [{ id: 'h1', name: 'Audit log', state: 'done_checked', branch: 'workbench/a-h1', base: 'c5', since: 'c5', files: { changed: 2 } },
+    { id: 'h2', name: 'Billing', state: 'done_checked', branch: 'workbench/b-h2', base: 'c3', since: 'c3', files: { changed: 2 } }]),
+  twoOnOne: tangle([
+    ['c0', ['c2'], ['main'], null, 'main 2'], ['c1', ['c2'], ['workbench/p-p1', 'workbench/q-q1'], 'p1', 'p 1'], ['c2', ['c3'], [], null, 'main 1'], ['c3', [], [], null, 'init'],
+  ], [{ id: 'p1', name: 'Pricing', state: 'done_checked', branch: 'workbench/p-p1', base: 'c2', since: 'c2', files: { changed: 2 } },
+    { id: 'q1', name: 'Quotes', state: 'done_checked', branch: 'workbench/q-q1', base: 'c1', since: 'c1', files: { changed: 2 } }]),
+  // 200 commits of yours (the limit), work on your latest, and an earlier agent whose branch starts further back
+  oldAgent: tangle([...Array.from({ length: 200 }, (_, i) => [`c${i}`, [`c${i + 1}`], i === 0 ? ['main'] : [], null, `main ${200 - i}`])],
+    [{ id: 'e1', name: 'Old export', state: 'done_checked', earlier: true, branch: 'workbench/old-e1', base: 'c400', since: 'c400', files: null },
+      { id: 'e2', name: 'New work', state: 'working', branch: 'workbench/new-e2', base: 'c0', since: 'c0', files: null }], { more: true }),
+};
+
+// The graph as drawn: copper and trunk paths that share a stretch longer than a bend (other than two lines meeting at one
+// commit), and level runs of copper across the trunk above its last commit.
+const GEOM = String.raw`(() => {
+  const svg = document.querySelector('#gitGraph svg.gsvg');
+  if (!svg) return { shared: ['(no graph drawn)'], overTrunk: [] };
+  const parse = d => d.slice(1).split('L').map(xy => xy.trim().split(/\s+/).map(Number));
+  const nodes = [];
+  for (const c of svg.querySelectorAll('circle.gvia, circle.gwork')) nodes.push({ x: +c.getAttribute('cx'), y: +c.getAttribute('cy'), r: +c.getAttribute('r') });
+  for (const r of svg.querySelectorAll('rect.gpad, rect.gchip')) { const w = +r.getAttribute('width'), h = +r.getAttribute('height'); nodes.push({ x: +r.getAttribute('x') + w / 2, y: +r.getAttribute('y') + h / 2, r: Math.max(w, h) / 2 }); }
+  const nodeAt = p => nodes.findIndex(n => Math.abs(n.x - p[0]) <= n.r + 2.5 && Math.abs(n.y - p[1]) <= n.r + 2.5);
+  const lines = [...svg.querySelectorAll('path.gc, path.gt-bus')].map(e => ({ trunk: e.classList.contains('gt-bus'), pts: parse(e.getAttribute('d')) }));
+  if (svg.querySelector('.gfold')) return { shared: [], overTrunk: [] };   // lines folded into one lane share it on purpose
+  const segs = [];
+  lines.forEach((l, k) => { for (let i = 1; i < l.pts.length; i++) segs.push({ k, a: l.pts[i - 1], b: l.pts[i], first: i === 1, last: i === l.pts.length - 1 }); });
+  const line = s => {
+    const dx = s.b[0] - s.a[0], dy = s.b[1] - s.a[1];
+    if (Math.abs(dx) < 0.15) return ['v', s.a[0], Math.min(s.a[1], s.b[1]), Math.max(s.a[1], s.b[1]), 1];
+    if (Math.abs(dy) < 0.15) return ['h', s.a[1], Math.min(s.a[0], s.b[0]), Math.max(s.a[0], s.b[0]), 1];
+    const down = Math.sign(dx) === Math.sign(dy);
+    return [down ? 'd' : 'u', down ? s.a[1] - s.a[0] : s.a[1] + s.a[0], Math.min(s.a[0], s.b[0]), Math.max(s.a[0], s.b[0]), Math.SQRT2];
+  };
+  const ends = s => [s.first ? nodeAt(s.a) : -1, s.last ? nodeAt(s.b) : -1].filter(i => i >= 0);
+  const shared = [];
+  for (let i = 0; i < segs.length; i++) for (let j = i + 1; j < segs.length; j++) {
+    const s = segs[i], t = segs[j];
+    if (s.k === t.k) continue;
+    const ls = line(s), lt = line(t);
+    if (ls[0] !== lt[0] || Math.abs(ls[1] - lt[1]) > 0.6) continue;
+    const len = (Math.min(ls[3], lt[3]) - Math.max(ls[2], lt[2])) * ls[4];
+    if (len > 13 && !ends(s).some(x => ends(t).includes(x))) shared.push(Math.round(len) + ' px at ' + s.a.join(',') + ' and ' + t.a.join(','));
+  }
+  const trunk = lines.filter(l => l.trunk && !l.pts.some(p => Number.isNaN(p[0])));
+  const tx = trunk.length ? trunk[0].pts[0][0] : null, tBottom = Math.max(...trunk.flatMap(l => l.pts.map(p => p[1])));
+  const overTrunk = [];
+  if (tx != null) for (const l of lines) if (!l.trunk) for (let i = 1; i < l.pts.length; i++) {
+    const [a, b] = [l.pts[i - 1], l.pts[i]];
+    if (Math.abs(a[1] - b[1]) < 0.2 && Math.min(a[0], b[0]) < tx - 0.5 && Math.max(a[0], b[0]) > tx + 0.5 && a[1] < tBottom) overTrunk.push('y ' + a[1]);
+  }
+  return { shared, overTrunk };
+})()`;
 
 try {
   // every scenario, at every size, in both detail levels and all three looks
@@ -247,6 +371,9 @@ try {
   // views: hover cards, menus, opened details, the reply chip, notices, launch questions, and the link states
   for (const v of views) {
     for (const s of sizes) for (const d of details) {
+      // these two do not depend much on the window: two sizes, unless one is asked for
+      if ((v === 'taint' || v === 'git-tangles') && sizes.length > 2 && !['960x900', '1440x789'].includes(s)) continue;
+      if (v === 'wire' && sizes.length > 2 && !['960x900', '1024x700', '1280x680'].includes(s)) continue;   // where the room runs out
       if (GIT_VIEWS.includes(v)) { await gitView(v, s, d); continue; }   // D1
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
@@ -413,6 +540,86 @@ try {
         await load('merge-more', '&focus=n4'); await check(tag + ' (stopped, with Review)');
         await load('merge-detached', '&focus=d1'); await check(tag + ' (not on a branch)');
         await load('merge-noid', '&focus=d2'); await check(tag + ' (no name and email)');
+      } else if (v === 'wire') {
+        // A crowded board whose done tray reads "12 done or stopped, 6 from earlier, 7 more working" (the reviewer's board
+        // at 960×900), with the demo's four machines; then a fuller one whose machines have long names. No section of the
+        // edge connector may lie on the DRAM's wire, and every word must fit its box (the fit check above).
+        const crowd = async ({ working, done, earlier, rename }) => {
+          const st = await (await fetch(base + '/ctl/state')).json();
+          const one = st.agents.find(a => !a.parentId && a.state === 'working');
+          const at = Date.now(), list = [];
+          for (let i = 0; i < working + done + earlier; i++) {
+            const kind = i < working ? 'working' : i < working + done ? 'done' : 'earlier';
+            list.push({ ...one, id: `x${i}`, rootId: `x${i}`, name: `Crowd ${i} fix`, machineId: ['laptop', 'cloud-1', 'cloud-3'][i % 3], ask: null, helpers: { total: 0, working: 0, done: 0 },
+              state: kind === 'working' ? 'working' : i % 2 ? 'done_checked' : 'stopped', startedAt: at - (90 - i) * 60000, stateSince: at - 60000,
+              endedAt: kind === 'working' ? null : at - 30000, earlier: kind === 'earlier', canContinue: kind === 'earlier' ? true : null });
+          }
+          const machines = st.machines.map(mc => (rename ? { ...mc, name: { laptop: 'Your laptop (the one on your desk)', 'cloud-1': 'Cloud workstation in Frankfurt', 'cloud-2': 'Cloud workstation in Oregon', 'cloud-3': 'Cloud workstation in Tokyo' }[mc.id] || mc.name } : mc));
+          await ctl('push', { event: 'snapshot', data: { ...st, agents: list, machines } }); await sleep(500); await settle(120);
+        };
+        const WIRE = String.raw`(() => {
+          const w = document.querySelector('#board path.dram-wire');
+          if (!w) return { on: ['(no wire drawn)'], tray: '' };
+          const r = w.getBoundingClientRect(), x = r.left + r.width / 2, on = [];
+          for (const m of document.querySelectorAll('.mach')) { const b = m.getBoundingClientRect(); if (b.left < x + 6 && b.right > x - 6) on.push(m.getAttribute('aria-label')); }
+          return { on, tray: document.getElementById('tray').textContent.trim(), names: [...document.querySelectorAll('.mach')].map(m => [m.querySelector('.lb b span')?.textContent || '', m.title || '']) };
+        })()`;
+        for (const [what, o, tray] of [['12 done, 6 from earlier, more working', { working: 31, done: 12, earlier: 6 }, /^12 done or stopped, 6 from earlier, \d+ more working$/],
+          ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }, /^60 done(, | or stopped, )40 from earlier, \d+ more/]]) {
+          await load('many'); await crowd(o);
+          const r = await b.ev(WIRE);
+          if (!tray.test(r.tray)) failures.push(`${tag} (${what}): the crowded board did not show (its tray reads "${r.tray}")`);
+          for (const x of r.on) failures.push(`${tag} (${what}): a machine lies on the DRAM's wire: ${x}`);
+          for (const [shown, title] of r.names || []) if (shown.endsWith('…') && !title) failures.push(`${tag} (${what}): "${shown}" is cut with no title holding all of it`);
+          if (verbose) console.log(tag, what, JSON.stringify(r));
+          await check(`${tag} (${what})`);
+        }
+      } else if (v === 'taint') {
+        // Everything an agent controls, with characters in it that hide text or turn it: its name, what it says, asks and
+        // does, the words of its answers, its paths, its checks' and its helpers' names. The board, the lid and what is
+        // announced must show each one by its code, in text and in names for screen readers (the card is card.js's own,
+        // and is left out here).
+        const taint = async () => {
+          const st = await (await fetch(base + '/ctl/state')).json();
+          const U = n => String.fromCodePoint(n), RLO = U(0x202e), ZW = U(0x200b), TAG = U(0xe0041), HF = U(0x3164), LS = U(0x2028), SHY = U(0xad);
+          const t = s => (s ? `${s}${RLO}x${TAG}${HF}` : s);
+          for (const a of st.agents) {
+            const [w0, ...rest] = String(a.name).split(' ');
+            a.name = `${w0}${RLO}${rest.join(' ')}${ZW}`;
+            a.says = t(a.says); a.now = t(a.now); a.error = t(a.error);
+            if (a.files && a.files.list) for (const f of a.files.list) f.path = f.path.replace('/', `/${SHY}`).replace(/\.(\w+)$/, `${RLO}.$1`);
+            if (a.checks && a.checks.results) for (const r of a.checks.results) r.name = t(r.name);
+            if (a.ask) {
+              a.ask.sentence = `${a.ask.sentence}${LS}${TAG}`;
+              if (a.ask.detail) a.ask.detail = t(a.ask.detail);
+              if (a.ask.type !== 'permission' && Array.isArray(a.ask.options)) a.ask.options = a.ask.options.map(t);
+            }
+          }
+          await ctl('push', { event: 'snapshot', data: st }); await sleep(400); await settle(100);
+        };
+        const SCAN = String.raw`(async () => {
+          const { hasHidden } = await import('/ui/diffview.js');
+          const out = [], skip = e => !!e.closest('#card');
+          const label = el => { let s = el.tagName.toLowerCase(); if (el.id) s += '#' + el.id; else if (el.classList && el.classList.length) s += '.' + [...el.classList].slice(0, 2).join('.'); return s; };
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          for (let n; (n = walker.nextNode());) { const p = n.parentElement; if (p && !skip(p) && hasHidden(n.data.replace(/\n/g, ''))) out.push('raw hidden characters in the text of ' + label(p)); }
+          for (const e of document.querySelectorAll('body *')) {
+            if (skip(e)) continue;
+            for (const at of ['aria-label', 'title', 'aria-description', 'placeholder', 'alt']) { const val = e.getAttribute(at); if (val && hasHidden(val.replace(/\n/g, ''))) out.push('raw hidden characters in the ' + at + ' of ' + label(e)); }
+          }
+          return [...new Set(out)];
+        })()`;
+        const scan = async what => { for (const p of await b.ev(SCAN)) failures.push(`${tag} (${what}): ${p}`); };
+        await load('demo'); await taint();
+        await scan('a permission');
+        await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="next"]')?.click(), true`); await sleep(900); await settle(100);
+        await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="changed"]')?.click(), true`); await sleep(300); await settle(80);
+        await scan('a question, and what it changed');
+        await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="next"]')?.click(), true`); await sleep(900); await settle(100);
+        await scan('might be stuck');
+        for (const [id, what] of [['228202', 'done and checked'], ['902d13', 'working, with helpers'], ['399e17-7a7143c0', 'a helper that finished']]) {
+          await load('demo', `&focus=${id}`); await taint(); await scan(what);
+        }
       } else {
         failures.push(`${tag}: no such view`);
       }
