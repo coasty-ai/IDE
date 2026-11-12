@@ -8,7 +8,11 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** Environment keys Claude Code sets for itself; a check must not look like it runs inside an agent. */
+/**
+ * Environment keys Claude Code sets for itself: a check must not look like it runs inside Claude Code. The engine does
+ * give each check its agent's WORKBENCH_AGENT_ID, which is kept, so a Workbench started from a check refuses to run
+ * real agents, as it does in the agent's own shell.
+ */
 const SCRUB = /^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_AGENT_SDK)/;
 /** Also removed: the secret that lets a process answer permission requests. */
 const SECRETS = ['WORKBENCH_HOOK_TOKEN'];

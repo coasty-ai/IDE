@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +8,8 @@ import { Engine } from '../src/core/engine.mjs';
 import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
 import * as commands from '../src/core/commands.mjs';
+import * as receiptMod from '../src/core/receipt.mjs';
+import * as workspaceMod from '../src/core/workspace.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
 import { FakeSim, FakeGitSim, FakeMachines, fakeAdapter, fakeDeps, gate, gitError, until, FAKE_BASE, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
 
@@ -289,6 +292,21 @@ test('receipt: a failed check is checks_failed; no checks is done_claimed', asyn
   await until(() => u.store.get(b.id).state === 'done_claimed');
   assert.equal(u.store.get(b.id).checks, null);
   assert.equal(u.store.get(b.id).says, 'I updated the README.');
+  await u.engine.shutdown();
+});
+
+test('receipt: the checks run with the agent’s own WORKBENCH_AGENT_ID, as its shell does, so a Workbench started from them refuses', async (ctx) => {
+  // What the engine hands the checks: Workbench's own environment, which never has the marker, plus this agent's.
+  const t = live({ deps: { checks: [{ name: 'unit tests', run: 'npm test' }] } });
+  const a = await doneAgent(t);
+  assert.equal(t.calls.runChecks[0].env?.WORKBENCH_AGENT_ID, a.id);
+  await t.engine.shutdown();
+  // What a check really sees: the real checks, a shell in the agent's folder.
+  const u = liveFolders(ctx, { deps: { checks: [{ name: 'marker', run: 'echo "agent id in check: ${WORKBENCH_AGENT_ID-unset}"', timeoutSec: 20 }] } });
+  u.engine.deps.receipt = receiptMod;
+  const b = await doneAgent(u);
+  assert.equal(u.store.get(b.id).state, 'done_checked', u.store.get(b.id).stateReason);
+  assert.equal(u.store.get(b.id).checks.results[0].tail, `agent id in check: ${b.id}`);
   await u.engine.shutdown();
 });
 

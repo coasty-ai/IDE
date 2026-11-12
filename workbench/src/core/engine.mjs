@@ -793,7 +793,10 @@ export class Engine extends EventEmitter {
           };
           let res;
           try {
-            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal }));
+            // The checks run the agent's own code (its package.json, its tests), so they carry its marker as its shell
+            // does: a Workbench or an acceptance run started from a check then refuses, as it would in the agent.
+            const env = { ...process.env, WORKBENCH_AGENT_ID: agentId };
+            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal, env }));
             const done = running.then(() => {}, () => {});
             run.checksDone = done;
             done.then(() => { if (run.checksDone === done) run.checksDone = null; });
