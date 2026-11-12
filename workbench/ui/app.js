@@ -8,7 +8,7 @@ import { linkState, cannotSend } from './link.js';
 import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName } from './model.js';
 import { boardModel, splitEarlier, trayWords, agoText } from './boardmodel.js';
 import { Lanes, denseLanes } from './lanes.js';
-import { sizeClass, frame, layoutBoard, maxDenseRows } from './layout.js';
+import { sizeClass, frame, layoutBoard, maxDenseRows, clipToLines } from './layout.js';
 import { Board } from './board.js';
 import { lidView, tickSince } from './focus.js';
 import { cardHtml } from './card.js';
@@ -104,7 +104,8 @@ function paintSaid() {
   const maxLines = Math.max(1, G.said.lines || Math.min(3, Math.floor((G.said.maxY - G.said.y) / (P.silkSub * 1.35))));
   let html = '';
   if (notice) {
-    const shown = clip(notice, perLine * maxLines - 2);
+    // cut by the lines it wraps into, not by a count of characters: under the DRAM the line is narrow (D1)
+    const shown = clipToLines(notice, perLine, maxLines);
     html = `<span aria-hidden="${shown !== notice}">${esc(shown)}</span>${shown !== notice ? `<span class="sr">${esc(notice)}</span>` : ''}`;
   } else if (!hintDone() && needsQueue().length && linkNow() === 'live') {
     html = '<i aria-hidden="true"></i><span>a lit line means it needs you</span>';

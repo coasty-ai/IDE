@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { layoutBoard, sizeClass, frame, boardProblems, boardBoxes, placeCard, maxDenseRows, wrapWords, clipTo, overlapArea, SIZES,
-  dramSegments, saidLineH, saidTextLines, SAID_HINT, saidMinLines, bottomRanks } from '../ui/layout.js';
+  dramSegments, saidLineH, saidTextLines, SAID_HINT, saidMinLines, bottomRanks, clipToLines } from '../ui/layout.js';
 import { Lanes, denseLanes } from '../ui/lanes.js';
 import { boardModel } from '../ui/boardmodel.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
@@ -241,6 +241,23 @@ test('dense boards with every row taken, at every size the window allows: the DR
     }
   }
   assert.deepEqual(bad, []);
+});
+
+test('what #said shows is cut by the lines it wraps into, never by a count of characters alone', () => {
+  const notice = 'Agents start from your last commit. 2 uncommitted changes are not in their copies.';
+  assert.equal(clipToLines(notice, 40, 3), notice, 'whole when it fits');
+  // 21 characters a line: 84 characters would fit 4 lines by count, but the words need 5
+  assert.equal(wrapWords(notice, 21).length, 5);
+  const cut = clipToLines(notice, 21, 4);
+  assert.ok(wrapWords(cut, 21).length <= 4 && cut.endsWith('…'), cut);
+  let seed = 3;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const words = ['a', 'line', 'that', 'wraps', 'uncommitted', 'changes', 'Invoice', 'export', 'merged', 'into', 'workbench/very-long-branch-name-a1b2c3'];
+  for (let i = 0; i < 300; i++) {
+    const text = Array.from({ length: 2 + Math.floor(rnd() * 30) }, () => words[Math.floor(rnd() * words.length)]).join(' ');
+    const per = 10 + Math.floor(rnd() * 30), max = 1 + Math.floor(rnd() * 5);
+    assert.ok(wrapWords(clipToLines(text, per, max), per).length <= max, `${per}×${max}: ${text}`);
+  }
 });
 
 test('the checks catch a DRAM that is in the way: a machine on its wire, a chip on its package', () => {

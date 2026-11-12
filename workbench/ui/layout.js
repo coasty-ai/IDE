@@ -90,6 +90,19 @@ export function wrapWords(text, max) {
   return lines.length ? lines : [''];
 }
 
+/**
+ * Text that wraps (at spaces, `perLine` characters a line) into at most `maxLines` lines: whole when it fits, else cut at
+ * a word with an ellipsis. A count of characters is not enough: words that do not fit a line's end take room.
+ */
+export function clipToLines(text, perLine, maxLines) {
+  const t = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (wrapWords(t, perLine).length <= maxLines) return t;
+  let n = Math.max(1, perLine * maxLines - 1);
+  let out = clipTo(t, n);
+  while (n > 1 && wrapWords(out, perLine).length > maxLines) out = clipTo(t, --n);
+  return out;
+}
+
 /** Shorten to n characters with an ellipsis, at a word boundary when one is near. */
 export function clipTo(text, n) {
   const t = String(text ?? '').replace(/\s+/g, ' ').trim();
