@@ -15,7 +15,9 @@ const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
 const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
   // D2: an agent's work in the lid, and the engine's cards for it (the 'merge' scenarios of scripts/ui-mock.mjs)
-  'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids'];
+  'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids',
+  // what an agent controls, with characters that hide text or turn it: shown by their codes on the board and in the lid
+  'taint'];
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
 const GIT_VIEWS = ['git', 'git-detail', 'git-empty'];
@@ -248,6 +250,7 @@ try {
   for (const v of views) {
     for (const s of sizes) for (const d of details) {
       if (GIT_VIEWS.includes(v)) { await gitView(v, s, d); continue; }   // D1
+      if (v === 'taint' && sizes.length > 2 && !['960x900', '1440x789'].includes(s)) continue;   // the words do not depend on the size
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
       const load = async (sc, q = '') => { await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, merge: 'ok' }); await ctl('scenario', { name: sc }); await size(s); await b.goto(`${base}/?t=k&still=1${q}`, 1300); await setLook(t, d); await settle(100); };
@@ -413,6 +416,52 @@ try {
         await load('merge-more', '&focus=n4'); await check(tag + ' (stopped, with Review)');
         await load('merge-detached', '&focus=d1'); await check(tag + ' (not on a branch)');
         await load('merge-noid', '&focus=d2'); await check(tag + ' (no name and email)');
+      } else if (v === 'taint') {
+        // Everything an agent controls, with characters in it that hide text or turn it: its name, what it says, asks and
+        // does, the words of its answers, its paths, its checks' and its helpers' names. The board, the lid and what is
+        // announced must show each one by its code, in text and in names for screen readers (the card is card.js's own,
+        // and is left out here).
+        const taint = async () => {
+          const st = await (await fetch(base + '/ctl/state')).json();
+          const U = n => String.fromCodePoint(n), RLO = U(0x202e), ZW = U(0x200b), TAG = U(0xe0041), HF = U(0x3164), LS = U(0x2028), SHY = U(0xad);
+          const t = s => (s ? `${s}${RLO}x${TAG}${HF}` : s);
+          for (const a of st.agents) {
+            const [w0, ...rest] = String(a.name).split(' ');
+            a.name = `${w0}${RLO}${rest.join(' ')}${ZW}`;
+            a.says = t(a.says); a.now = t(a.now); a.error = t(a.error);
+            if (a.files && a.files.list) for (const f of a.files.list) f.path = f.path.replace('/', `/${SHY}`).replace(/\.(\w+)$/, `${RLO}.$1`);
+            if (a.checks && a.checks.results) for (const r of a.checks.results) r.name = t(r.name);
+            if (a.ask) {
+              a.ask.sentence = `${a.ask.sentence}${LS}${TAG}`;
+              if (a.ask.detail) a.ask.detail = t(a.ask.detail);
+              if (a.ask.type !== 'permission' && Array.isArray(a.ask.options)) a.ask.options = a.ask.options.map(t);
+            }
+          }
+          await ctl('push', { event: 'snapshot', data: st }); await sleep(400); await settle(100);
+        };
+        const SCAN = String.raw`(async () => {
+          const { hasHidden } = await import('/ui/diffview.js');
+          const out = [], skip = e => !!e.closest('#card');
+          const label = el => { let s = el.tagName.toLowerCase(); if (el.id) s += '#' + el.id; else if (el.classList && el.classList.length) s += '.' + [...el.classList].slice(0, 2).join('.'); return s; };
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          for (let n; (n = walker.nextNode());) { const p = n.parentElement; if (p && !skip(p) && hasHidden(n.data.replace(/\n/g, ''))) out.push('raw hidden characters in the text of ' + label(p)); }
+          for (const e of document.querySelectorAll('body *')) {
+            if (skip(e)) continue;
+            for (const at of ['aria-label', 'title', 'aria-description', 'placeholder', 'alt']) { const val = e.getAttribute(at); if (val && hasHidden(val.replace(/\n/g, ''))) out.push('raw hidden characters in the ' + at + ' of ' + label(e)); }
+          }
+          return [...new Set(out)];
+        })()`;
+        const scan = async what => { for (const p of await b.ev(SCAN)) failures.push(`${tag} (${what}): ${p}`); };
+        await load('demo'); await taint();
+        await scan('a permission');
+        await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="next"]')?.click(), true`); await sleep(900); await settle(100);
+        await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="changed"]')?.click(), true`); await sleep(300); await settle(80);
+        await scan('a question, and what it changed');
+        await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="next"]')?.click(), true`); await sleep(900); await settle(100);
+        await scan('might be stuck');
+        for (const [id, what] of [['228202', 'done and checked'], ['902d13', 'working, with helpers'], ['399e17-7a7143c0', 'a helper that finished']]) {
+          await load('demo', `&focus=${id}`); await taint(); await scan(what);
+        }
       } else {
         failures.push(`${tag}: no such view`);
       }

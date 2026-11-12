@@ -272,3 +272,27 @@ test('the checks catch a DRAM that is in the way: a machine on its wire, a chip 
   chip.chip.x = box.x + 4; chip.chip.y = box.y + 2;
   assert.ok(boardProblems(G).some(p => /dram/.test(p)), boardProblems(G).join('; '));
 });
+
+test('names and words on the board show their hidden characters: chips, their status words, helpers and their labels', async () => {
+  const { hasHidden } = await import('../ui/diffview.js');
+  const U = n => String.fromCodePoint(n);
+  const RLO = U(0x202e), TAG = U(0xe0041), ZW = U(0x200b);
+  const roots = [
+    { id: 'a', name: `Fix${RLO}gol`, status: `reading x${TAG}.ts`, label: 'working', stop: 'mid', kids: [{ id: 'k1', name: `Trace${RLO}flow`, status: `reading${ZW} y.ts`, needs: false, ended: false }] },
+    { id: 'b', name: `Help pages${TAG}${TAG}`, status: 'says it’s done', label: 'done', stop: 'inner', lit: 'need', qno: 1, kids: [{ id: 'k2', name: `Ask${RLO}er`, status: 'needs your OK', needs: true, ended: false }] },
+  ];
+  const at = new Map([['a', { side: 'L', row: 1 }], ['b', { side: 'R', row: 2 }]]);
+  const bad = [];
+  for (const [W, H] of [[1440, 900], [960, 900]]) for (const detail of ['calm', 'more']) {
+    const G = layoutBoard({ W, H, P: sizeClass(W, H), detail, roots, laneOf: id => at.get(id), nRows: 6, lidNeed: 200 });
+    for (const n of G.nodes) {
+      const words = [n.r.name, ...n.shape.lines, n.shape.status || '', ...n.helpers.flatMap(p => [p.k.name, p.k.status || '', p.label ? p.label.l1 + p.label.l2 + p.label.full : ''])];
+      for (const w of words) if (hasHidden(w)) bad.push(`${W}x${H} ${detail} ${n.id}: ${w}`);
+    }
+    const a = G.nodes.find(n => n.id === 'a');
+    assert.equal(a.r.name, 'Fix⟦U+202E⟧gol', 'the name a chip is drawn and announced with');
+    assert.ok(a.shape.lines.join(' ').includes('⟦U+202E⟧'), 'and measured with');
+  }
+  assert.deepEqual(bad, []);
+  assert.equal(roots[0].name, `Fix${RLO}gol`, 'what the page was given is left as it is');
+});

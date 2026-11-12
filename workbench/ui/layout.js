@@ -1,6 +1,8 @@
 // The board's geometry: where the core, every lane, chip, helper, pad and machine go for a window size.
-// Pure: no DOM and no imports, so node:test can check it at every window size. Text widths come from `measure`
-// (the page passes a canvas measurer; the default uses JetBrains Mono's fixed advance of 0.6 em).
+// Pure: no DOM, and nothing but words.js (pure too), so node:test can check it at every window size. Text widths come
+// from `measure` (the page passes a canvas measurer; the default uses JetBrains Mono's fixed advance of 0.6 em).
+// Names and words an agent controls are laid out as the board shows them, hidden characters shown (visibleControls).
+import { visibleControls } from './words.js';
 //
 // Everything is laid out in CSS pixels from the window size, so text never shrinks with the window. Three size
 // classes (S, M, L) pick the type sizes; positions are then derived from the room there is.
@@ -221,6 +223,14 @@ export function laneTo(lane, near) {
 export const pathD = pts => 'M' + pts.map(p => `${r1(p[0])} ${r1(p[1])}`).join('L');
 export const plen = pts => pts.slice(1).reduce((s, p, i) => s + Math.hypot(p[0] - pts[i][0], p[1] - pts[i][1]), 0);
 
+/**
+ * A root as the board draws, measures and names it: its name, its status words and its helpers' names and words with
+ * every character that hides text or turns it shown (words.js), so a chip's label, its helpers' labels and their
+ * accessible names can never read in another order. What the page was given is left as it is.
+ */
+const shownRoot = r => ({ ...r, name: visibleControls(r.name), status: visibleControls(r.status),
+  kids: (r.kids || []).map(k => ({ ...k, name: visibleControls(k.name), status: visibleControls(k.status) })) });
+
 /** A chip's size and its name split into lines. */
 function chipShape(G, r, maxW) {
   const P = G.P, m = G.measure;
@@ -309,7 +319,7 @@ export function layoutBoard(input) {
   for (const r of roots) {
     const l = laneOf(r.id);
     if (!l || l.row == null || l.row >= G.rows.length) continue;
-    G.nodes.push(nodeGeom(G, r, l));
+    G.nodes.push(nodeGeom(G, shownRoot(r), l));
   }
   G.byId = new Map(G.nodes.map(n => [n.id, n]));
   placeBands(G, { machines, tray });
