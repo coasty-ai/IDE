@@ -22,7 +22,8 @@ Workbench is a local program that runs coding agents (Claude Code, and Codex whe
 
 ## Running things
 
-- Run the tests with `npm test` at the repo root (about 25 seconds), and before you say you are done.
+- Run the tests with `npm test` at the repo root (a minute or so), and before you say you are done.
+- `node` (22 or later) and `npm` must be on the PATH. When it has no node, Workbench puts its own there for its agents and checks; in a shell of your own, put the `bin` folder of a Node install in front of `PATH` first.
 - `npm run demo` starts Workbench with simulated agents; nothing is spent.
 - The page checks need Chrome (set `CHROME_BIN` when it is not in the usual place) and are not part of `npm test`. From `workbench/`: `node scripts/ui-behaviour-check.mjs`, `node scripts/ui-fit-check.mjs`, `node scripts/ui-shots.mjs <folder>`.
 - Never start a live Workbench (`npm run dogfood`, or `workbench/bin/workbench.mjs --repo …`) or `workbench/scripts/accept-real.mjs` from inside an agent: they start real Claude Code agents on the owner's login and spend money. Both refuse when `WORKBENCH_AGENT_ID` is set. Leave them to the owner.
