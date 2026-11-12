@@ -9,6 +9,10 @@ export const MONO = 0.6;
 export const monoMeasure = (text, px) => Array.from(String(text ?? '')).length * MONO * px;
 
 const lid = o => o;
+// The DRAM under the core (git): its package (w, the narrowest it may get, h), its bus to the core, its pins (length and
+// pitch), the gap to #said, the wire's place from its right end and the gap the edge connector leaves for the wire, the
+// designator U2 (type size and room) and the type size of "git" on its body.
+const dram = o => o;
 export const SIZES = Object.freeze({
   L: {
     name: 'L', margin: 12, boardR: 18, topBand: 54, botBand: 80, rowPad: 8, pitchMax: 112,
@@ -20,6 +24,7 @@ export const SIZES = Object.freeze({
     padR: 10.5, padOff: 17, cardW: 500, cardWCalm: 340, cardR: 196, minTravel: 40,
     title: 13.5, silkSub: 12, mName: 12, mNote: 11.5, fingerH: 24, machMin: 120, machGap: 26, holeClear: 64, trayX: 58,
     lid: lid({ padT: 22, padX: 22, padB: 18, count: 12.5, h1: 21, h1m: 18, h1l: 16, h1xl: 14.5, meta: 12.5, small: 11.5, btn: 13.5, btnh: 38, btnmin: 112, quiet: 12.5, input: 13, inh: 40, gap1: 11, gap2: 15, gap3: 14 }),
+    dram: dram({ w: 188, min: 104, h: 32, bus: 19, pin: 4, pitch: 6, gap: 8, wireIn: 16, wireGap: 12, label: 11, labelW: 24, git: 20, lines: 2 }),
   },
   M: {
     name: 'M', margin: 10, boardR: 16, topBand: 46, botBand: 70, rowPad: 6, pitchMax: 98,
@@ -31,6 +36,7 @@ export const SIZES = Object.freeze({
     padR: 10.5, padOff: 15, cardW: 452, cardWCalm: 320, cardR: 180, minTravel: 34,
     title: 13, silkSub: 11.5, mName: 11.5, mNote: 11, fingerH: 20, machMin: 104, machGap: 20, holeClear: 58, trayX: 52,
     lid: lid({ padT: 18, padX: 18, padB: 14, count: 12, h1: 18, h1m: 16, h1l: 15, h1xl: 13.5, meta: 12, small: 11, btn: 13, btnh: 36, btnmin: 104, quiet: 12, input: 12.5, inh: 36, gap1: 9, gap2: 13, gap3: 12 }),
+    dram: dram({ w: 164, min: 96, h: 28, bus: 17, pin: 3.5, pitch: 5, gap: 7, wireIn: 14, wireGap: 12, label: 10.5, labelW: 22, git: 17, lines: 2 }),
   },
   S: {
     name: 'S', margin: 8, boardR: 14, topBand: 44, botBand: 64, rowPad: 6, pitchMax: 96,
@@ -42,8 +48,20 @@ export const SIZES = Object.freeze({
     padR: 9.5, padOff: 14, cardW: 330, cardWCalm: 290, cardR: 0, minTravel: 26,
     title: 12.5, silkSub: 11.5, mName: 11, mNote: 10.5, fingerH: 18, machMin: 88, machGap: 14, holeClear: 50, trayX: 46,
     lid: lid({ padT: 16, padX: 16, padB: 12, count: 11.5, h1: 16.5, h1m: 15, h1l: 14, h1xl: 13, meta: 11.5, small: 11, btn: 12.5, btnh: 34, btnmin: 96, quiet: 11.5, input: 12, inh: 34, gap1: 8, gap2: 11, gap3: 10 }),
+    dram: dram({ w: 144, min: 92, h: 26, bus: 16, pin: 3, pitch: 5, gap: 6, wireIn: 13, wireGap: 10, label: 10.5, labelW: 22, git: 16, lines: 3 }),
   },
 });
+
+/**
+ * The line under the DRAM (#said): its line height, and the lines the layout always keeps room for (three in the small
+ * size, where it is narrowest: the first-run hint can take three lines there).
+ */
+export const saidLineH = P => P.silkSub * 1.35;
+export const saidMinLines = P => P.dram.lines;
+/** The first-run hint #said shows: a lit line (its mark and gap are 27 px), then these words. */
+export const SAID_HINT = 'a lit line means it needs you';
+/** From the core's bottom edge to the top of #said: the DRAM's bus, the package, its lower pins and a gap. */
+const dramStack = P => P.dram.bus + P.dram.h + P.dram.pin + P.dram.gap;
 
 export function sizeClass(W, H) {
   if (W >= 1380 && H >= 840) return SIZES.L;
@@ -91,7 +109,9 @@ export function clipTo(text, n) {
 function coreHalfHeights(G, wantHalf) {
   const P = G.P;
   const top = G.top;
-  const hMax = Math.min(P.coreMaxH / 2, G.cy - top - 6);
+  // the DRAM keeps its room under the core in every size and in dense mode: the core is never so tall that the DRAM and
+  // two lines of #said do not fit between it and the edge connector
+  const hMax = Math.min(P.coreMaxH / 2, G.cy - top - 6, G.coreBottomMax - G.cy);
   const hMin = Math.min(P.coreH / 2, hMax);
   const sideClear = 10, cornerNeed = G.diag + 10;
   const offs = [...new Set(G.rows.map(r => Math.round(Math.abs(r - G.cy) * 10) / 10))];
@@ -112,18 +132,35 @@ export function frame(W, H, P, { nRows = 6, dense = false } = {}) {
   b.r = b.x + b.w; b.b = b.y + b.h;
   G.top = b.y + P.topBand; G.bottom = b.b - P.botBand;
   G.cx = Math.round(W / 2); G.cy = Math.round((G.top + G.bottom) / 2);
+  // the lowest the core's bottom edge may come: the DRAM, its bus and the lines of #said go between it and the connector
+  // (a pixel to spare: the core's height and the DRAM's place are rounded)
+  G.coreBottomMax = G.bottom - 4 - Math.ceil(saidMinLines(P) * saidLineH(P)) - dramStack(P) - 1;
   G.diag = dense ? P.diagDense : P.diag;
   G.pitch = Math.max(1, Math.min(P.pitchMax, Math.floor((G.bottom - G.top - 2 * P.rowPad) / nRows)));
   G.rows = Array.from({ length: nRows }, (_, i) => Math.round(G.cy + (i - (nRows - 1) / 2) * G.pitch));
   const lim = coreHalfHeights(G, P.coreH / 2);
   G.lidMaxH = Math.floor(2 * lim.maxHalf - 2 * P.ring);
+  G.coreHalfMin = lim.half;
   return G;
 }
 
-/** Most rows a side can hold at this height with one-line chips (dense mode). */
+/** How many corner lanes the core's bottom edge holds on each side, beside the DRAM's column at its narrowest. */
+export const bottomRanks = P => 1 + Math.floor((P.coreW / 2 - P.dram.min / 2 - (P.padR + 8) - P.cornerIn) / (2 * P.padR + 3));
+
+/**
+ * Most rows a side can hold at this height with one-line chips (dense mode), and no more than the core's bottom edge
+ * can take under the smallest core: its middle is the DRAM's. The result is never under 12 (two rows a lane).
+ */
 export function maxDenseRows(H, P) {
   const avail = H - 2 * P.margin - P.topBand - P.botBand - 2 * P.rowPad;
-  return Math.max(12, Math.floor(avail / (P.chipHc + 2 * P.lead + 6)));
+  const byHeight = Math.max(12, Math.floor(avail / (P.chipHc + 2 * P.lead + 6)));
+  let most = 12;
+  for (let n = 18; n <= byHeight; n += 6) {
+    const f = frame(1000, H, P, { nRows: n, dense: true });
+    if (f.rows.filter(y => y > f.cy + f.coreHalfMin).length > bottomRanks(P)) break;
+    most = n;
+  }
+  return Math.min(byHeight, Math.max(most, 12));
 }
 
 function laneGeom(G, side, rowIdx) {
@@ -142,7 +179,8 @@ function laneGeom(G, side, rowIdx) {
     const up = y < c.y; kind = up ? 'up' : 'down';
     // nested pins: the corner row nearest the core takes the pin nearest the corner, so no two lanes cross
     const rank = G.rows.filter(r => (up ? r < c.y && r > y : r > c.b && r < y)).length;
-    xp = c.x + P.cornerIn + rank * P.cornerStep;
+    // the bottom edge keeps its middle for the DRAM's bus: its pins may sit closer together (see placeDram)
+    xp = up ? c.x + P.cornerIn + rank * P.cornerStep : c.x + G.downPins.inset + rank * G.downPins.step;
     const ey = up ? c.y + 6 : c.b - 6, s = up ? 1 : -1;
     ptsL = [[xp, ey], [xp, y + s * D], [xp - D, y], [G.viaX, y]];
   }
@@ -247,6 +285,7 @@ export function layoutBoard(input) {
   G.lid = { x: c.x + P.ring, y: c.y + P.ring, w: c.w - 2 * P.ring, h: c.h - 2 * P.ring };
   G.lidPageH = G.lid.h - L.padT - L.padB - L.inh - L.gap3;
   G.lidFits = lidNeed <= G.lidPageH + 0.5;
+  placeDram(G);
   const sideRows = G.rows.filter(y => y >= c.y + 10 && y <= c.b - 10);
   const pinOff = Math.min(P.pinOff, c.h / 2 - 22);
   const maxJog = dense ? 0 : Math.max(0, ...sideRows.map(y => Math.abs(y - G.cy) - pinOff));
@@ -262,6 +301,40 @@ export function layoutBoard(input) {
   G.byId = new Map(G.nodes.map(n => [n.id, n]));
   placeBands(G, { machines, tray });
   return G;
+}
+
+/**
+ * The DRAM (git), centred under the core: its package, a bus of thin traces up to the core's bottom edge, a fine row of
+ * pins along each long edge, the designator U2 at its left when there is room, and one wire from a pin near the right
+ * end of its bottom edge straight down to the board's bottom edge: the way to the git screen.
+ * The corner lanes that leave the core's bottom edge keep out of its column. Their pins move closer together when they
+ * must (never closer than their pads allow), and the DRAM gets narrower, down to its least width, before they do.
+ * Pins sit on a grid of `pitch` centred on the core's middle, so the bus, the pins and the wire line up.
+ */
+function placeDram(G) {
+  const P = G.P, c = G.core, D = P.dram;
+  const below = G.rows.filter(y => y > c.b).length;        // rows whose lanes leave the core's bottom edge
+  const half0 = c.w / 2;
+  const clear = P.padR + 8;                                 // from a corner lane's pin (and its pad) to the DRAM
+  const room = (inset, step) => half0 - (inset + Math.max(0, below - 1) * step) - clear;
+  const inset = P.cornerIn;
+  let step = P.cornerStep;
+  if (room(inset, step) < D.min / 2 && below > 1) step = Math.max(2 * P.padR + 3, Math.min(step, (half0 - clear - D.min / 2 - inset) / (below - 1)));
+  G.downPins = { inset, step };
+  const free = room(inset, step);
+  const label = free - D.labelW >= D.w / 2;
+  const half = Math.max(D.min / 4, Math.min(D.w / 2, free));
+  const p = D.pitch, x = G.cx - half, y = c.b + D.bus, w = 2 * half, h = D.h;
+  // pin k sits at cx + (k + 0.5) * pitch: clear of the notch on the left end and of the right end
+  const kMin = Math.ceil((8 - half) / p - 0.5), kMax = Math.floor((half - 5) / p - 0.5);
+  const pins = [];
+  for (let k = kMin; k <= kMax; k++) pins.push(r1(G.cx + (k + 0.5) * p));
+  const nBus = half >= 4 * p + 10 ? 8 : 6;
+  const bus = Array.from({ length: nBus }, (_, i) => r1(G.cx + (i - (nBus - 1) / 2) * p));
+  const kw = Math.max(kMin, Math.floor((half - D.wireIn) / p - 0.5));
+  const wire = { x: r1(G.cx + (kw + 0.5) * p), y0: r1(y + h + D.pin), y1: G.board.b };
+  const lab = label ? { x: r1(x - 7), y: r1(y + h / 2), size: D.label, box: { x: r1(x - D.labelW), y: r1(y + h / 2 - D.label * 0.75), w: D.labelW - 6, h: r1(D.label * 1.5) } } : null;
+  G.dram = { x: r1(x), y: r1(y), w: r1(w), h, cx: G.cx, pin: D.pin, pitch: p, pins, bus, busTop: c.b, wire, label: lab, git: D.git };
 }
 
 function nodeGeom(G, r, l) {
@@ -422,6 +495,11 @@ export function boardBoxes(G) {
   }
   for (const mc of G.machines || []) out.push({ k: 'machine', id: mc.id, x: mc.x, y: mc.y, w: mc.w, h: mc.h });
   if (G.tray) out.push({ k: 'tray', id: 'tray', ...G.tray });
+  if (G.dram) {
+    const d = G.dram;
+    out.push({ k: 'dram', id: 'dram', x: d.x - 1, y: d.y - d.pin, w: d.w + 2, h: d.h + 2 * d.pin });
+    if (d.label) out.push({ k: 'dram-label', id: 'U2', ...d.label.box });
+  }
   return out;
 }
 
@@ -441,6 +519,44 @@ export function boardSegments(G) {
   return segs;
 }
 
+/** The DRAM's own copper (window coordinates): its bus up to the core, and the wire down to the board's bottom edge. */
+export function dramSegments(G) {
+  const d = G.dram;
+  if (!d) return [];
+  const segs = d.bus.map(x => [[x, d.busTop], [x, d.y - d.pin], 'dram bus']);
+  segs.push([[d.wire.x, d.wire.y0], [d.wire.x, d.wire.y1], 'dram wire']);
+  return segs;
+}
+
+/** Do two segments cross or touch (beyond `tol` px from their ends)? */
+function segsMeet(a, b, tol = 0.5) {
+  const [p, q] = a, [r, s] = b;
+  const d = (q[0] - p[0]) * (s[1] - r[1]) - (q[1] - p[1]) * (s[0] - r[0]);
+  if (Math.abs(d) < 1e-9) {
+    // parallel: they meet only if they lie on one line and overlap
+    const cross = (r[0] - p[0]) * (q[1] - p[1]) - (r[1] - p[1]) * (q[0] - p[0]);
+    if (Math.abs(cross) > 1e-6) return false;
+    const len = Math.hypot(q[0] - p[0], q[1] - p[1]) || 1, ux = (q[0] - p[0]) / len, uy = (q[1] - p[1]) / len;
+    const t0 = (r[0] - p[0]) * ux + (r[1] - p[1]) * uy, t1 = (s[0] - p[0]) * ux + (s[1] - p[1]) * uy;
+    return Math.max(Math.min(t0, t1), 0) < Math.min(Math.max(t0, t1), len) - tol;
+  }
+  const t = ((r[0] - p[0]) * (s[1] - r[1]) - (r[1] - p[1]) * (s[0] - r[0])) / d;
+  const u = ((r[0] - p[0]) * (q[1] - p[1]) - (r[1] - p[1]) * (q[0] - p[0])) / d;
+  const lt = tol / (Math.hypot(q[0] - p[0], q[1] - p[1]) || 1), lu = tol / (Math.hypot(s[0] - r[0], s[1] - r[1]) || 1);
+  return t > -lt && t < 1 + lt && u > -lu && u < 1 + lu;
+}
+
+const ptSeg = (pt, a, b) => {
+  const dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+  const t = L2 ? Math.max(0, Math.min(1, ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / L2)) : 0;
+  return Math.hypot(pt[0] - a[0] - t * dx, pt[1] - a[1] - t * dy);
+};
+/** The least distance between two segments (0 when they meet). */
+function segGap(a, b) {
+  if (segsMeet(a, b, 0)) return 0;
+  return Math.min(ptSeg(a[0], b[0], b[1]), ptSeg(a[1], b[0], b[1]), ptSeg(b[0], a[0], a[1]), ptSeg(b[1], a[0], a[1]));
+}
+
 const segHitsBox = (p, q, t) => {
   const steps = Math.max(1, Math.ceil(Math.hypot(q[0] - p[0], q[1] - p[1]) / 2));
   for (let s = 0; s <= steps; s++) {
@@ -457,12 +573,22 @@ export function boardProblems(G) {
     if (x.x < bd.x - 0.5 || x.y < bd.y - 0.5 || x.x + x.w > bd.r + 0.5 || x.y + x.h > bd.b + 0.5) bad.push(`${x.k} ${x.id} off the board`);
   }
   const segs = boardSegments(G);
-  for (const t of boxes.filter(x => x.k === 'label' || x.k === 'more' || x.k === 'tray' || x.k === 'machine')) {
+  for (const t of boxes.filter(x => x.k === 'label' || x.k === 'more' || x.k === 'tray' || x.k === 'machine' || x.k === 'dram' || x.k === 'dram-label')) {
     for (const [p, q, who] of segs) if (segHitsBox(p, q, t)) { bad.push(`${t.k} ${t.id} on copper of ${who}`); break; }
   }
+  // the DRAM's bus and wire: clear of every box but the DRAM itself (and the core, where the bus starts), and of all
+  // other copper by at least 4 px
+  const dsegs = dramSegments(G);
+  for (const t of boxes) {
+    if (t.k === 'dram' || t.k === 'core') continue;
+    for (const [p, q, who] of dsegs) if (segHitsBox(p, q, t)) { bad.push(`${who} × ${t.k} ${t.id}`); break; }
+  }
+  for (const [p, q, who] of dsegs) {
+    for (const [a, b2, other] of segs) if (segsMeet([p, q], [a, b2]) || segGap([p, q], [a, b2]) < 4) { bad.push(`${who} near copper of ${other}`); break; }
+  }
   if (G.said) {
-    const s = { x: G.said.x, y: G.said.y, w: G.said.w, h: Math.min(48, G.said.maxY - G.said.y) };
-    for (const [p, q, who] of segs) if (segHitsBox(p, q, s)) { bad.push(`said on copper of ${who}`); break; }
+    const s = { x: G.said.x, y: G.said.y, w: G.said.w, h: Math.min(G.said.lines ? G.said.lines * saidLineH(G.P) : 48, G.said.maxY - G.said.y) };
+    for (const [p, q, who] of segs.concat(dsegs)) if (segHitsBox(p, q, s)) { bad.push(`said on copper of ${who}`); break; }
     for (const x of boxes) if (x.k !== 'core' && overlapArea(s, x) > 1) bad.push(`said × ${x.k} ${x.id}`);
   }
   for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
@@ -541,24 +667,78 @@ function placeBands(G, { machines, tray }) {
     const tw = Math.max(m(tray.text, P.silkSub), Math.min(tray.count, 8) * 16) + 12;
     G.tray = { x: bd.x + P.trayX, y: bandY + 10, w: Math.ceil(tw), h: P.botBand - 20 };
   }
-  // machines: sections of the gold edge connector, centred under the core where there is room
+  // machines: sections of the gold edge connector under the core, with a gap where the DRAM's wire leaves the board.
+  // With one machine, its section goes left of the wire; with more, they sit either side of it.
   const more = G.detail === 'more';
   const lo = (G.tray ? G.tray.x + G.tray.w + 18 : bd.x + P.holeClear), hi = bd.r - P.holeClear;
+  const wx = G.dram ? G.dram.wire.x : null, wg = P.dram.wireGap;
   const sec = (mc, note) => {
     const nameW = m(mc.name, P.mName) + 8 + 7 + (mc.awake ? 0 : 18);
     return Math.ceil(Math.max(P.machMin, Math.max(nameW, note ? m(mc.note || '', P.mNote) : 0) + 20));
   };
+  const span = (ws, gap) => ws.reduce((s, w) => s + w, 0) + gap * Math.max(0, ws.length - 1);
+  // left of the wire: the first k sections, packed against its gap; the rest start after it
+  const placeAt = (widths, gap, k) => {
+    const n = widths.length, xs = [];
+    if (wx == null) { let x = Math.max(lo, Math.min(G.cx - span(widths, gap) / 2, hi - span(widths, gap))); for (const w of widths) { xs.push(x); x += w + gap; } }
+    else {
+      const L = widths.slice(0, k), endL = n === 1 ? Math.min(G.cx + widths[0] / 2, wx - wg) : wx - wg;
+      let x = endL - span(L, gap);
+      for (const w of L) { xs.push(x); x += w + gap; }
+      x = wx + wg;
+      for (const w of widths.slice(k)) { xs.push(x); x += w + gap; }
+    }
+    return n && xs[0] >= lo - 0.5 && xs[n - 1] + widths[n - 1] <= hi + 0.5 ? xs : null;
+  };
+  const tryAll = (widths, gap) => {
+    const n = widths.length, k0 = n === 1 ? 1 : Math.ceil(n / 2);
+    // balanced first, then shifted towards the side with room
+    for (const k of [k0, ...Array.from({ length: n + 1 }, (_, i) => i).filter(i => i !== k0 && (n !== 1 || i === 1)).sort((a, b) => Math.abs(a - k0) - Math.abs(b - k0))]) {
+      const xs = placeAt(widths, gap, k);
+      if (xs) return xs;
+    }
+    return null;
+  };
   let notes = more, gap = P.machGap;
   let widths = machines.map(mc => sec(mc, notes));
-  const total = () => widths.reduce((s, w) => s + w, 0) + gap * Math.max(0, widths.length - 1);
-  if (total() > hi - lo) { gap = Math.min(gap, 12); }
-  if (total() > hi - lo && notes) { notes = false; widths = machines.map(mc => sec(mc, false)); }
-  if (total() > hi - lo) { const each = Math.max(64, Math.floor((hi - lo - gap * Math.max(0, widths.length - 1)) / Math.max(1, widths.length))); widths = widths.map(() => each); }
-  let x = Math.max(lo, Math.min(G.cx - total() / 2, hi - total()));
+  let xs = tryAll(widths, gap);
+  if (!xs) { gap = Math.min(gap, 12); xs = tryAll(widths, gap); }
+  if (!xs && notes) { notes = false; widths = machines.map(mc => sec(mc, false)); xs = tryAll(widths, gap); }
+  if (!xs && widths.length) {
+    // the last resort: equal sections, as narrow as they must be (never under 64 px)
+    const room = hi - lo - (wx == null ? 0 : 2 * wg);
+    const each = Math.max(64, Math.floor((room - gap * Math.max(0, widths.length - 1)) / widths.length));
+    widths = widths.map(() => each);
+    xs = tryAll(widths, gap) || placeAt(widths, gap, Math.ceil(widths.length / 2)) || widths.map((w, i) => lo + i * (w + gap));
+  }
   const mh = P.botBand - 8;
-  G.machines = machines.map((mc, i) => { const r = { id: mc.id, x, y: bd.b - mh, w: widths[i], h: mh, note: notes }; x += widths[i] + gap; return r; });
-  // the one line under the core (the hint, or what Workbench just said), kept between the lanes that leave its bottom
-  const bottomRanks = G.nodes.filter(n => n.lane.kind === 'down').map(n => n.lane.xp - c.x);
-  const side = bottomRanks.length ? Math.max(...bottomRanks) + P.padR + 12 : 14;
-  G.said = { x: c.x + side, y: c.b + (P.name === 'L' ? 16 : 13), w: Math.max(120, c.w - 2 * side), maxY: bandY - 4 };
+  G.machines = machines.map((mc, i) => ({ id: mc.id, x: xs[i], y: bd.b - mh, w: widths[i], h: mh, note: notes }));
+  // the one line under the DRAM (the hint, or what Workbench just said): left of the DRAM's wire, and clear of the lanes
+  // that leave the core's bottom edge on the left
+  const lineH = saidLineH(P);
+  if (G.dram) {
+    const d = G.dram;
+    const leftPins = G.nodes.filter(n => n.lane.kind === 'down' && n.side === 'L').map(n => n.lane.xp - c.x);
+    const right = d.wire.x - 12;
+    const w = Math.max(48, right - (c.x + (leftPins.length ? Math.max(...leftPins) + P.padR + 12 : 14)));
+    const x = right - w;
+    const y = r1(d.y + d.h + d.pin + P.dram.gap);
+    // a narrow line may take more lines, where the board has the room
+    const lines = Math.max(1, Math.min(w < 170 ? 5 : 3, Math.floor((bandY - 4 - y) / lineH + 0.01)));
+    G.said = { x: r1(x), y, w: r1(w), maxY: bandY - 4, lines };
+  } else {
+    const bottomRanks = G.nodes.filter(n => n.lane.kind === 'down').map(n => n.lane.xp - c.x);
+    const side = bottomRanks.length ? Math.max(...bottomRanks) + P.padR + 12 : 14;
+    G.said = { x: c.x + side, y: c.b + (P.name === 'L' ? 16 : 13), w: Math.max(120, c.w - 2 * side), maxY: bandY - 4, lines: 3 };
+  }
+}
+
+/**
+ * How many lines a text takes in #said at its width (JetBrains Mono, wrapped at spaces); the first-run hint also has its
+ * lit line before the words. For checks: what #said shows must fit the room the layout gave it.
+ */
+export function saidTextLines(G, text, { hint = false } = {}) {
+  const P = G.P, m = G.measure || monoMeasure;
+  const perLine = Math.max(4, Math.floor((G.said.w - (hint ? 27 : 0)) / m('M', P.silkSub)));
+  return wrapWords(text, perLine).length;
 }
