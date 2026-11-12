@@ -12,11 +12,13 @@
 //   the agent ends "done and checked" with one new file and the rule kept -> its changes show exactly that file ->
 //   Merge asks first, then joins its work into your branch with a merge commit -> Throw it away asks first, then
 //   deletes its folder and branch and keeps a hidden copy in git -> after stopping, nothing is left running.
-// Asks are answered one by one: the touch, and read-only listing commands from a helper, are allowed; anything
-// else is refused and reported. Each run uses its own file name, so the merge it leaves on your branch never gets
-// in the way of the next run. Unless --keep is given, it removes what is left of the agent's folder, its branch and
-// the hidden copy at the end; the merge commit stays on your branch. For the record, it also prints the version,
-// permission mode and tools Claude Code offered the agent (from Workbench's --verbose log).
+// Asks are answered one by one: the touch is allowed, and so is a helper's command that only lists or reads files
+// (helperMayRun: find, ls, cat, head, tail, wc, stat or git ls-files, piped at most into sort, head, tail, wc or uniq,
+// with nothing that writes, deletes, redirects, substitutes or chains); anything else is refused and reported, and
+// fails the step "nothing else needed an answer". Each run uses its own file name, so the merge it leaves on your
+// branch never gets in the way of the next run. Unless --keep is given, it removes what is left of the agent's folder,
+// its branch and the hidden copy at the end; the merge commit stays on your branch. For the record, it also prints the
+// version, permission mode and tools Claude Code offered the agent (from Workbench's --verbose log).
 // Claude Code is found the way Workbench finds it: --claude, WORKBENCH_CLAUDE_BIN, `claude` on the PATH, then the
 // VS Code extension. It refuses to run inside a Workbench agent, as Workbench itself does.
 // Dry run without spending (FAKE_CLAUDE_ROOT_BASH may hold anything: this script puts its own `touch` there):
@@ -28,12 +30,97 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, rmdirSync, realpathSync, wr
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { splitWords } from '../src/core/policy.mjs';
 
 // ---------------------------------------------------------------- the helper rule
-const HELPER_READ_ONLY = /^(find|ls|cat|head|tail|tree|wc|grep|rg|file|stat|git (ls-files|status|log|show))\b[^;&`$<>]*$/;
-/** Whether a helper's held command is answered "Allow". Pure, so a test can check it without starting anything. */
+// An Allow here lets the person's own Claude Code run the command; a refusal only fails one step of the run. So a
+// helper's held command is allowed only when it can do nothing but list or read files, and anything this rule does not
+// know is refused.
+
+/** Refused anywhere, even quoted: chaining, redirection, substitution, grouping, and control characters (tab too). */
+const HELPER_NEVER = /[;&`$(){}<>\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+/** What a helper's command may start with: these only list or read, whatever their options. */
+const HELPER_FIRST = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'stat']);
+/**
+ * find's words that delete, write a file or run another program, in GNU find and in the bfs Claude Code puts in its
+ * place (the policy's FIND_BAD lists them one by one). Refused by family, so a variant (-fprintx, -okdir) is refused too.
+ */
+const FIND_ACTS = /^--?(exec|ok|delete|rm|fprint|fls)/;
+/** git ls-files: the switches that only choose what is listed and how. Nothing may come between git and ls-files. */
+const LS_FILES_SHORT = /^-[cdmoiskutvfz]+$/;
+const LS_FILES_LONG = new Set(['--cached', '--deleted', '--modified', '--others', '--ignored', '--stage', '--unmerged', '--killed',
+  '--directory', '--no-empty-directory', '--exclude-standard', '--full-name', '--deduplicate', '--error-unmatch', '--eol']);
+/** head and tail in a pipe: a count of lines or bytes, and no file of their own. */
+const countOnly = (words) => {
+  for (let k = 0; k < words.length; k++) {
+    const w = words[k];
+    if (/^-\d+$|^-[nc][+-]?\d+$|^--(lines|bytes)=[+-]?\d+$/.test(w)) continue;
+    if ((w === '-n' || w === '-c') && /^[+-]?\d+$/.test(words[k + 1] ?? '')) { k += 1; continue; }
+    return false;
+  }
+  return true;
+};
+/**
+ * What a listing may be piped into, with what: filters that read only the pipe and write only to it. No file names
+ * (uniq writes its second one), and no option that takes a value (sort -o writes it, --compress-program runs it).
+ */
+const HELPER_FILTERS = {
+  sort: (words) => words.every((w) => /^-[bdfghiMnRrsuVz]+$/.test(w)),
+  uniq: (words) => words.every((w) => /^-[cdiu]+$/.test(w)),
+  wc: (words) => words.every((w) => /^-[clmw]+$/.test(w)),
+  head: countOnly,
+  tail: countOnly,
+};
+
+/**
+ * The command cut at each "|" outside quotes. null when it has a backslash anywhere but inside single quotes (an
+ * escape can hide any character), an unquoted "~" (the shell puts a home folder there, after "=" too), a word that
+ * starts with an unquoted "=" (zsh puts a program's path there), a quote left open, or an empty part ("||", a "|" at
+ * either end).
+ */
+function pipeParts(text) {
+  const parts = [];
+  let cur = '', quote = null, wordStart = true;
+  for (const ch of text) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else if (ch === '\\' && quote === '"') return null;
+      cur += ch;
+      continue;
+    }
+    if (ch === '|') { parts.push(cur); cur = ''; wordStart = true; continue; }
+    if (ch === '\\' || ch === '~' || (ch === '=' && wordStart)) return null;
+    if (ch === "'" || ch === '"') quote = ch;
+    cur += ch;
+    wordStart = ch === ' ';
+  }
+  if (quote) return null;
+  parts.push(cur);
+  return parts.every((p) => p.trim()) ? parts : null;
+}
+
+/**
+ * Whether this script answers "Allow" for a helper's held command (the ask's detail): one of HELPER_FIRST (find without
+ * its acting words) or `git ls-files`, piped into nothing or into HELPER_FILTERS only, with no unquoted wildcard (a file
+ * an agent named "-delete" would become a word of the command). Nothing that writes, deletes, redirects, substitutes or
+ * chains. Words are split as the policy splits them, quotes taken off, so '-delete' and -del""ete are -delete. Pure.
+ */
 export function helperMayRun(command) {
-  return HELPER_READ_ONLY.test(String(command ?? '').trim());
+  const text = String(command ?? '').trim();
+  if (!text || HELPER_NEVER.test(text)) return false;
+  const parts = pipeParts(text);
+  if (!parts) return false;
+  const split = parts.map((p) => splitWords(p));
+  if (split.some((s) => s.error || !s.words.length || s.words.some((w) => w.glob))) return false;
+  const [[name, ...words], ...filters] = split.map((s) => s.words.map((w) => w.text));
+  if (name === 'git') {
+    if (words[0] !== 'ls-files') return false;
+    const end = words.indexOf('--'); // after it, only names of files to list
+    if (!words.slice(1, end < 0 ? undefined : end).every((w) => !w.startsWith('-') || LS_FILES_SHORT.test(w) || LS_FILES_LONG.has(w))) return false;
+  } else if (!HELPER_FIRST.has(name) || (name === 'find' && words.some((w) => FIND_ACTS.test(w)))) {
+    return false;
+  }
+  return filters.every(([filter, ...args]) => Object.hasOwn(HELPER_FILTERS, filter) && HELPER_FILTERS[filter](args));
 }
 
 // ---------------------------------------------------------------- the run
