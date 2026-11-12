@@ -99,9 +99,8 @@ test('line breaks and runs of spaces become one space; every other hidden charac
 test('every reply and notice reaches the line under the core and the git screen only through say()', () => {
   // the page itself must have it: here it is handed in, which would hide a missing import
   assert.ok(/^import \{[^}]*\bvisibleControls\b[^}]*\} from '\.\/words\.js';/m.test(APP), 'app.js imports visibleControls');
+  // a second writer of either line would bring raw text back: both are written from `notice`, in this section only
   assert.deepEqual([...APP.matchAll(/\bgitSay\(([^)]*)\)/g)].map(m => m[1]), ['notice'], 'the git screen is given only what say() kept');
-  assert.equal(APP.split('el.said.innerHTML =').length - 1, 1, 'only paintSaid writes the line under the core');
-  const own = section('notices and the hint under the core');
-  assert.equal(own.split('el.said.innerHTML =').length - 1, 1);
-  assert.equal(APP.split(/\bnotice = /).length - 1, own.split(/\bnotice = /).length - 1, 'notice is set only in its own section');
+  assert.equal(APP.split('el.said.innerHTML =').length - 1, 1, 'one writer of the line under the core');
+  assert.equal(section('notices and the hint under the core').split('el.said.innerHTML =').length - 1, 1, 'and it is paintSaid');
 });

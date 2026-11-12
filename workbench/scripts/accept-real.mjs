@@ -13,12 +13,13 @@
 //   Merge asks first, then joins its work into your branch with a merge commit -> Throw it away asks first, then
 //   deletes its folder and branch and keeps a hidden copy in git -> after stopping, nothing is left running.
 // Asks are answered one by one: the touch is allowed, and so is a helper's command that only lists or reads files
-// (helperMayRun: find, ls, cat, head, tail, wc, stat or git ls-files, piped at most into sort, head, tail, wc or uniq,
-// with nothing that writes, deletes, redirects, substitutes or chains); anything else is refused and reported, and
-// fails the step "nothing else needed an answer". Each run uses its own file name, so the merge it leaves on your
-// branch never gets in the way of the next run. Unless --keep is given, it removes what is left of the agent's folder,
-// its branch and the hidden copy at the end; the merge commit stays on your branch. For the record, it also prints the
-// version, permission mode and tools Claude Code offered the agent (from Workbench's --verbose log).
+// (helperAskMayRun: find, ls, cat, head, tail, wc, stat or git ls-files, piped at most into sort, head, tail, wc or
+// uniq, with nothing that writes, deletes, redirects, substitutes or chains, and an ask whose sentence says no more);
+// anything else is refused and reported, and fails the step "nothing else needed an answer". Each run uses its own
+// file name, so the merge it leaves on your branch never gets in the way of the next run. Unless --keep is given, it
+// removes what is left of the agent's folder, its branch and the hidden copy at the end; the merge commit stays on your
+// branch. For the record, it also prints the version, permission mode and tools Claude Code offered the agent (from
+// Workbench's --verbose log).
 // Claude Code is found the way Workbench finds it: --claude, WORKBENCH_CLAUDE_BIN, `claude` on the PATH, then the
 // VS Code extension. It refuses to run inside a Workbench agent, as Workbench itself does.
 // Dry run without spending (FAKE_CLAUDE_ROOT_BASH may hold anything: this script puts its own `touch` there):
@@ -121,6 +122,19 @@ export function helperMayRun(command) {
     return false;
   }
   return filters.every(([filter, ...args]) => Object.hasOwn(HELPER_FILTERS, filter) && HELPER_FILTERS[filter](args));
+}
+
+/**
+ * A held ask carries no tool name, and the detail of a Write, Edit or NotebookEdit ask is only its path, which can read
+ * like a command ("cat a/../../x" creates x two folders up). So an ask whose sentence (Workbench's own words, from the
+ * policy) says the call creates, changes, writes, deletes, sends, opens or uses something is refused, whatever its
+ * detail says. Listing and reading say "look at the files", "read a file", "check what changed" or "run a command".
+ */
+const ASK_DOES_MORE = /\bwants to (create|change|write|delete|move|copy|install|send|connect|download|push|publish|save|open|keep|use|stop|search the web|run another program|run a script)\b/i;
+
+/** Whether this script answers "Allow" for a helper's held permission ask, { sentence, detail }. Pure. */
+export function helperAskMayRun(ask) {
+  return !ASK_DOES_MORE.test(String(ask?.sentence ?? '')) && helperMayRun(ask?.detail);
 }
 
 // ---------------------------------------------------------------- the run
@@ -243,7 +257,7 @@ async function main() {
           touchAbsentWhileHeld = !!workspace && !existsSync(path.join(workspace, MARKER));
           shot('real-needs-ok', '&pin=' + a.id);
           answer = 'Allow';
-        } else if (a.parentId && helperMayRun(detail)) {
+        } else if (a.parentId && helperAskMayRun(a.ask)) {
           answer = 'Allow';
         } else { answer = 'Deny'; refused++; }
       } else if (a.ask.type === 'question') {
