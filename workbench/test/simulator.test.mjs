@@ -718,19 +718,22 @@ function asGitListsIt(g) {
   try {
     const git = gitIn(dir);
     git(['init', '-q', '-b', 'main']);
-    const tree = git(['mktree'], { input: '' }).trim();
-    const real = new Map();
+    // One fast-import stream, oldest first: each commit on a ref of its own, its parents named by their marks.
+    const mark = new Map(g.commits.map((c, i) => [c.id, i + 1]));
+    let stream = '';
     for (const c of [...g.commits].reverse()) {
       const message = c.kind === 'commit' ? `${c.subject}\n` : `${c.subject}\n\nWorkbench-Agent: ${c.agentId}\nWorkbench-Kind: ${c.kind}\n`;
-      const when = `${c.at / 1000} +0000`;
-      const who = {
-        GIT_AUTHOR_NAME: c.author, GIT_AUTHOR_EMAIL: 'demo@example.invalid', GIT_AUTHOR_DATE: when,
-        GIT_COMMITTER_NAME: c.author, GIT_COMMITTER_EMAIL: 'demo@example.invalid', GIT_COMMITTER_DATE: when,
-      };
-      real.set(c.id, git(['commit-tree', tree, ...c.parents.flatMap(p => ['-p', real.get(p)])], { input: message, extra: who }).trim());
+      const who = `${c.author} <demo@example.invalid> ${c.at / 1000} +0000`;
+      stream += `commit refs/sim/${mark.get(c.id)}\nmark :${mark.get(c.id)}\nauthor ${who}\ncommitter ${who}\n`;
+      stream += `data ${Buffer.byteLength(message)}\n${message}\n`;
+      c.parents.forEach((p, k) => { stream += `${k ? 'merge' : 'from'} :${mark.get(p)}\n`; });
+      stream += '\n';
     }
-    for (const c of g.commits) for (const ref of c.refs) git(['update-ref', `refs/heads/${ref}`, real.get(c.id)]);
-    const ours = new Map([...real].map(([ours, theirs]) => [theirs, ours]));
+    for (const c of g.commits) for (const ref of c.refs) stream += `reset refs/heads/${ref}\nfrom :${mark.get(c.id)}\n\n`;
+    const marks = path.join(dir, 'marks');
+    git(['fast-import', '--quiet', `--export-marks=${marks}`], { input: stream });
+    const byMark = new Map([...mark].map(([id, m]) => [`:${m}`, id]));
+    const ours = new Map(fs.readFileSync(marks, 'utf8').split('\n').filter(Boolean).map(l => l.split(' ')).map(([m, oid]) => [oid, byMark.get(m)]));
     const names = new Map();
     for (const line of git(['for-each-ref', '--format=%(objectname) %(refname:short)', 'refs/heads/']).split('\n').filter(Boolean)) {
       const [oid, name] = line.split(' ');
