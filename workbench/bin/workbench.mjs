@@ -115,6 +115,11 @@ function parseArgs(argv) {
 
 // ------------------------------------------------------------------ output
 
+// Output nobody reads any more is let go: the Mac app went away (it crashed), or the program reading a pipe ended.
+// Unheard, each failed write (EPIPE) would be an unexpected error whose report is another failed write, a loop that
+// kept the shutdown from running until the forced exit.
+for (const stream of [process.stdout, process.stderr]) stream.on('error', () => {});
+
 function say(text) {
   process.stdout.write(text + '\n');
 }

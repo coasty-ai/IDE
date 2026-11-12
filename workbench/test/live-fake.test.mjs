@@ -38,7 +38,7 @@ async function until(what, fn, { timeoutMs = 15_000, every = 40 } = {}) {
  * ~/.workbench), and an engine running the fake. Everything is removed afterwards, even when the test fails.
  * `config` is committed as the repository's workbench.json.
  */
-async function setup(t, extraEnv = {}, { config = null, claudeSettings = null } = {}) {
+async function setup(t, extraEnv = {}, { config = null, claudeSettings = null, app = false } = {}) {
   const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'wb-live-')));
   const repo = path.join(dir, 'repo');
   const home = path.join(dir, 'home');
@@ -78,7 +78,9 @@ async function setup(t, extraEnv = {}, { config = null, claudeSettings = null } 
   // Run by an agent (npm test while it works on Workbench itself), this process has the variables every agent gets.
   // Workbench refuses to start real agents with them, so the CLI started here must not inherit them.
   for (const k of ['WORKBENCH_AGENT_ID', 'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN']) if (!(k in extraEnv)) delete env[k];
-  const proc = spawn(process.execPath, [BIN, '--repo', repo, '--no-open', '--port', '0', '--budget', '0.5'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  // `app`: started as the Mac app starts it, with --app and a pipe for its standard input.
+  const args = [BIN, '--repo', repo, '--no-open', '--port', '0', '--budget', '0.5', ...(app ? ['--app'] : [])];
+  const proc = spawn(process.execPath, args, { env, stdio: [app ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
   let log = '';
   proc.stdout.on('data', (d) => { log += d; });
   proc.stderr.on('data', (d) => { log += d; });
@@ -281,6 +283,25 @@ test('stopping Workbench while a command is held ends the agent and its hook', a
   const started = Date.now();
   await stopEngine(w);
   assert.ok(Date.now() - started < 10_000, 'a held request must not delay the stop');
+  await until('the hook to be gone', () => !alive(hookPid), { timeoutMs: 5000 });
+});
+
+test('the Mac app going away without a word (it crashed) ends the agent and its hook as quickly as Ctrl-C', async (t) => {
+  const w = await setup(t, {}, { app: true });
+  await startAgent(w);
+  await helperAsks(w);
+  const fakePid = Number(readFileSync(w.pidfile, 'utf8'));
+  const hookPid = Number(readFileSync(w.pidfile + '.hook', 'utf8'));
+  assert.ok(alive(fakePid) && alive(hookPid), 'the agent works, and its hook waits for the answer');
+  // A crash closes the app's ends of all three pipes: Workbench's input ends, and its writes find no reader.
+  const started = Date.now();
+  w.proc.stdout.destroy();
+  w.proc.stderr.destroy();
+  w.proc.stdin.end();
+  const ex = await Promise.race([w.exited, sleep(15_000).then(() => null)]);
+  assert.ok(ex, 'Workbench did not stop within 15 s of the app going away');
+  assert.ok(Date.now() - started < 10_000, `Workbench took ${Date.now() - started} ms: the stop must not wait for the forced exit`);
+  await until('the fake agent to be gone', () => !alive(fakePid), { timeoutMs: 5000 });
   await until('the hook to be gone', () => !alive(hookPid), { timeoutMs: 5000 });
 });
 

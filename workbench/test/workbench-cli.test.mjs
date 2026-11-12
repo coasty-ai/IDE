@@ -153,11 +153,35 @@ test('--app: one line the Mac app reads, no browser, and Workbench stops when th
   const res = await fetch(`${url.origin}/api/state`, { headers: { 'X-Workbench-Token': url.searchParams.get('t') } });
   assert.equal(res.status, 200);
   assert.equal((await res.json()).mode, 'demo');
-  // The app quits (or crashes): its end of the pipe closes, and Workbench stops as on Ctrl-C.
+  // The app quits: its end of the pipe closes, and Workbench stops as on Ctrl-C.
   proc.stdin.end();
   const code = await Promise.race([exited, sleep(15_000).then(() => 'still running')]);
   assert.equal(code, 0, out);
   assert.match(out, /Stopping the agents and closing Workbench/);
+});
+
+test('--app: when the app crashes, nothing reads what Workbench prints any more, and it still stops at once', async (t) => {
+  const w = setup(t);
+  const proc = spawn(process.execPath, [BIN, '--demo', '--app', '--port', '0'], { env: w.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  proc.stderr.on('data', (d) => { out += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code, signal) => resolve({ code, signal })));
+  t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+  const deadline = Date.now() + 20_000;
+  while (!/^WORKBENCH_APP /m.test(out) && proc.exitCode == null && Date.now() < deadline) await sleep(25);
+  assert.match(out, /^WORKBENCH_APP /m);
+  // A crash closes the app's ends of all three pipes: Workbench's input ends, and its writes find no reader (EPIPE).
+  // Each failed write must not become an unexpected error whose report is another failed write: that loop kept the
+  // shutdown from running until the forced exit, 12 seconds later.
+  const started = Date.now();
+  proc.stdout.destroy();
+  proc.stderr.destroy();
+  proc.stdin.end();
+  const ex = await Promise.race([exited, sleep(15_000).then(() => null)]);
+  assert.ok(ex, 'Workbench did not stop within 15 seconds');
+  assert.deepEqual(ex, { code: 0, signal: null });
+  assert.ok(Date.now() - started < 5000, `Workbench took ${Date.now() - started} ms to stop`);
 });
 
 test('inside an agent, Workbench will not start real agents; the demo still starts', async (t) => {

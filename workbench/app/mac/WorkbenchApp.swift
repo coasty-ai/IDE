@@ -244,12 +244,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
   var launched = false
   var launchFolder: URL?
   var selfTest = false
+  var selfTestStarted = false
+  var selfTestCode: Int32 = 0
 
   func applicationDidFinishLaunching(_ note: Notification) {
     buildMenus()
     NSApp.activate(ignoringOtherApps: true)
     let args = CommandLine.arguments
     selfTest = args.contains("--self-test")
+    if selfTest {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 90) {
+        print("SELF-TEST FAILED: the page did not load in 90 seconds."); fflush(stdout); exit(1)
+      }
+    }
     launched = true
     if let i = args.firstIndex(of: "--repo"), i + 1 < args.count {
       open(folder: URL(fileURLWithPath: args[i + 1]))
@@ -327,7 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     Log.shared.write("Workbench exited (\(status))")
     let wasReady = e.ready != nil
     if engine === e { engine = nil }
-    if quitting { if selfTest { exit(0) }; NSApp.reply(toApplicationShouldTerminate: true); return }
+    if quitting { if selfTest { exit(selfTestCode) }; NSApp.reply(toApplicationShouldTerminate: true); return }
     if let next = next { self.next = nil; next(); return }
     // Port 4317 taken (another Workbench): try once more on a free port.
     if !wasReady, e.port != 0, e.tail.contains(where: { $0.contains("is already in use") }) {
@@ -413,12 +420,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
       w.backgroundColor = NSColor(calibratedRed: 0.06, green: 0.14, blue: 0.10, alpha: 1)
       w.isReleasedWhenClosed = false
       w.delegate = self
-      w.setFrameAutosaveName("WorkbenchBoard")
-      if !w.setFrameUsingName("WorkbenchBoard") { w.center() }
+      if selfTest {
+        w.center()   // a check: not where the person keeps their board, and its place is not saved
+      } else {
+        w.setFrameAutosaveName("WorkbenchBoard")
+        if !w.setFrameUsingName("WorkbenchBoard") { w.center() }
+      }
       boardWindow = w
       webView = wv
     }
-    boardWindow?.title = "Workbench — \(name)"
+    boardWindow?.title = selfTest ? "Workbench self-test — \(name)" : "Workbench — \(name)"
     webView?.load(URLRequest(url: url))
     boardWindow?.makeKeyAndOrderFront(nil)
   }
@@ -470,37 +481,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     Log.shared.write("page loaded")
-    guard selfTest else { return }
-    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-      let js = """
-        JSON.stringify({ title: document.title, core: !!document.querySelector('#core'), dram: !!document.querySelector('#dram'),
-          chips: document.querySelectorAll('#parts button').length, mode: (document.querySelector('#mode') || {}).textContent || '',
-          repo: (document.querySelector('#repo') || {}).textContent || '', lid: ((document.querySelector('#pages h1') || {}).textContent || '').slice(0, 80) })
-        """
-      webView.evaluateJavaScript(js) { result, error in
-        let text = (result as? String) ?? "error: \(error?.localizedDescription ?? "nothing")"
-        Log.shared.write("self-test: \(text)")
-        print("SELF-TEST \(text)")
-        fflush(stdout)
-        let finish = {
-          self?.quitting = true
-          if let e = self?.engine, e.process.isRunning { e.stop(grace: 15) } else { exit(0) }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 25) { exit(0) }
-        }
-        // `--self-test-shot <file.png>`: a picture of the page as WebKit draws it (no screen-recording permission needed)
-        let args = CommandLine.arguments
-        if let i = args.firstIndex(of: "--self-test-shot"), i + 1 < args.count {
-          webView.takeSnapshot(with: nil) { image, _ in
-            if let image = image, let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
-               let png = rep.representation(using: .png, properties: [:]) {
-              try? png.write(to: URL(fileURLWithPath: args[i + 1]))
-              print("SELF-TEST-SHOT \(args[i + 1])"); fflush(stdout)
-            }
-            finish()
+    guard selfTest, !selfTestStarted else { return }
+    selfTestStarted = true
+    // A page that cannot be seen does not draw: its animation frames do not run. Started from a terminal while the
+    // person works in another app, the window opens behind theirs, so it comes in front of them (without taking the
+    // keyboard) before the page is read.
+    webView.evaluateJavaScript("document.hidden") { [weak self] hidden, _ in
+      guard let self = self else { return }
+      Log.shared.write("self-test: the page was \((hidden as? Bool) == true ? "hidden behind other windows" : "in view") when it loaded")
+      self.boardWindow?.orderFrontRegardless()
+      self.selfTestLook(webView, tries: 0)
+    }
+  }
+
+  /** What the page shows, read every half second until its lid has words, for 15 seconds at most. */
+  func selfTestLook(_ webView: WKWebView, tries: Int) {
+    let js = """
+      (() => { const lid = ((document.querySelector('#pages h1') || {}).textContent || '').slice(0, 80);
+        return JSON.stringify({ title: document.title, hidden: document.hidden, drawn: !!lid, core: !!document.querySelector('#core'),
+          dram: !!document.querySelector('#dram'), chips: document.querySelectorAll('#parts button').length,
+          mode: (document.querySelector('#mode') || {}).textContent || '', repo: (document.querySelector('#repo') || {}).textContent || '',
+          lid }); })()
+      """
+    webView.evaluateJavaScript(js) { [weak self] result, error in
+      guard let self = self else { return }
+      let text = (result as? String) ?? "error: \(error?.localizedDescription ?? "nothing")"
+      let drawn = text.contains("\"drawn\":true")
+      if !drawn && tries < 30 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.selfTestLook(webView, tries: tries + 1) }
+        return
+      }
+      self.selfTestCode = drawn ? 0 : 1
+      Log.shared.write("self-test: \(text)")
+      print("SELF-TEST \(text)")
+      if !drawn { print("SELF-TEST FAILED: the page did not draw in 15 seconds.") }
+      fflush(stdout)
+      let finish = {
+        self.quitting = true
+        if let e = self.engine, e.process.isRunning { e.stop(grace: 15) } else { exit(self.selfTestCode) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) { exit(self.selfTestCode) }
+      }
+      // `--self-test-shot <file.png>`: a picture of the page as WebKit draws it (no screen-recording permission needed)
+      let args = CommandLine.arguments
+      if let i = args.firstIndex(of: "--self-test-shot"), i + 1 < args.count {
+        webView.takeSnapshot(with: nil) { image, _ in
+          if let image = image, let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+             let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: args[i + 1]))
+            print("SELF-TEST-SHOT \(args[i + 1])"); fflush(stdout)
           }
-        } else {
           finish()
         }
+      } else {
+        finish()
       }
     }
   }
