@@ -15,6 +15,9 @@ const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
 const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap'];
 
+// D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
+const GIT_VIEWS = ['git', 'git-detail', 'git-empty'];
+VIEWS.push(...GIT_VIEWS);
 const args = process.argv.slice(2);
 const opt = k => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : null; };
 const only = (list, k) => (opt(k) ? list.filter(x => opt(k).split(',').includes(x)) : list);
@@ -62,7 +65,7 @@ const CHECK = String.raw`(() => {
       return { left: r.left, right: r.right, top: mid - lh / 2, bottom: mid + lh / 2, width: r.width, height: lh };
     });
     const scroll = p.closest('[data-scroll]');
-    const layer = p.closest('#card, #pop, #trayList, #look')?.id || 'board';
+    const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail')?.id || 'board';
     for (const r of rects) {
       if (scroll) { const s = scroll.getBoundingClientRect(); if (r.bottom < s.top || r.top > s.bottom) continue; }
       texts.push({ r, p, n, layer });
@@ -103,8 +106,11 @@ const CHECK = String.raw`(() => {
     if (r.width < 0.5 && r.height < 0.5) continue;
     if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) out.push('off-screen: ' + label(e));
   }
-  for (const t of document.querySelectorAll('#board text, #wires text')) {
+  for (const t of document.querySelectorAll('#board text, #wires text, #gitBoard text, #gitGraph text')) {
+    if (!vis(t)) continue;   // the screen not shown (the board above the git screen, or the git screen below the board)
     const r = t.getBoundingClientRect();
+    const sb = t.closest('[data-scroll]')?.getBoundingClientRect();   // scrolled out of its scroll box: not on screen
+    if (sb && (r.bottom < sb.top || r.top > sb.bottom)) continue;
     if (r.width && (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol)) out.push('off-screen: svg text "' + t.textContent + '"');
   }
   // 4. the board's boxes do not overlap
@@ -112,7 +118,7 @@ const CHECK = String.raw`(() => {
   const boxes = [];
   const add = (k, e, r) => boxes.push({ k, e, r: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } });
   for (const e of document.querySelectorAll('.chip')) if (vis(e)) { const r = e.getBoundingClientRect(); add('chip', e, { left: r.left - lead, top: r.top - lead, right: r.right + lead, bottom: r.bottom + lead }); }
-  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
+  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend, #dram')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
   for (const e of document.querySelectorAll('#said > span:not(.sr), #said > i')) if (vis(e)) for (const r of e.getClientRects()) add('said', e, r);
   for (const e of document.querySelectorAll('#wires .pad, #wires .you, #board .you')) add(e.classList.contains('pad') ? 'pad' : 'you', e, e.getBoundingClientRect());
   const pkg = document.querySelector('#board .pkg');
@@ -174,6 +180,51 @@ async function check(tag) {
 }
 const size = async s => { const [w, h] = s.split('x').map(Number); await b.size(w, h); };
 
+/**
+ * D1: the git screen's views. Each opens the git screen the way a person does, by clicking the DRAM, and checks it:
+ *   git         the graph of a repository (and of one with 48 commits and six agents, and of one not on a branch),
+ *               at its top and scrolled to its end
+ *   git-detail  an agent's detail with the stress diff, its diff scrolled to the end, a commit's detail, and the detail of
+ *               an agent with a very long branch name
+ *   git-empty   a repository with only its first commit
+ */
+async function gitView(v, s, d) {
+  const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
+  const tag = `view ${v} ${s} ${d} ${t}`;
+  const open = async sc => {
+    await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false }); await ctl('scenario', { name: sc }); await size(s);
+    await b.goto(`${base}/?t=k&still=1`, 1300); await setLook(t, d); await settle(100);
+    await b.ev(`document.getElementById('dram').click(), true`);
+    await sleep(500); await settle(100);
+    const ok = await b.ev(`document.documentElement.dataset.screen === 'git' && !document.getElementById('gitScreen').inert && document.getElementById('boardScreen').inert`);
+    if (!ok) failures.push(`${tag}: the DRAM did not open the git screen (${sc})`);
+    const rows = await b.ev(`document.querySelectorAll('#gitGraph .gr').length`);
+    if (!rows) failures.push(`${tag}: no rows in the graph (${sc})`);
+    return rows;
+  };
+  const scrollEnd = async sel => { await b.ev(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (e) e.scrollTop = e.scrollHeight; return true; })()`); await sleep(120); };
+  const pick = async sel => { await b.ev(`document.querySelector(${JSON.stringify(sel)})?.click(), true`); await sleep(500); await settle(80); };
+  if (v === 'git') {
+    for (const sc of ['git', 'git-many', 'git-detached']) {
+      await open(sc); await check(`${tag} (${sc})`);
+      await scrollEnd('#gitGraph'); await check(`${tag} (${sc}, scrolled to the end)`);
+    }
+  } else if (v === 'git-detail') {
+    await open('git');
+    await pick('#gitGraph .gr[data-id="work:g1"]');
+    if (await b.ev(`document.getElementById('gitDetail').hidden || !document.querySelector('#gitDetail .gdiff .df')`)) failures.push(`${tag}: the agent's detail did not show its diff`);
+    await check(`${tag} (agent, stress diff)`);
+    await scrollEnd('#gitDetail .gdiff'); await check(`${tag} (agent, diff scrolled to the end)`);
+    await pick('#gitGraph .gr:not(.work)');
+    if (!/Id/.test(await b.ev(`document.getElementById('gitDetail').textContent`))) failures.push(`${tag}: the commit's detail did not show`);
+    await check(`${tag} (commit)`);
+    await open('git-many');
+    await pick('#gitGraph .gr[data-id="work:m5"]'); await check(`${tag} (a very long branch name)`);
+  } else if (v === 'git-empty') {
+    await open('git-empty'); await check(tag);
+  }
+}
+
 try {
   // every scenario, at every size, in both detail levels and all three looks
   for (const sc of scenarios) {
@@ -194,6 +245,7 @@ try {
   // views: hover cards, menus, opened details, the reply chip, notices, launch questions, and the link states
   for (const v of views) {
     for (const s of sizes) for (const d of details) {
+      if (GIT_VIEWS.includes(v)) { await gitView(v, s, d); continue; }   // D1
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
       const load = async (sc, q = '') => { await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false }); await ctl('scenario', { name: sc }); await size(s); await b.goto(`${base}/?t=k&still=1${q}`, 1300); await setLook(t, d); await settle(100); };
