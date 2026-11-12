@@ -539,11 +539,19 @@ function countLines(file, budget) {
 // ---------------------------------------------------------------------------------------------
 // Source control.
 //
-// "The agent's work" is one set of files, used alike by the diff, the counts, a merge and a throw-away: every tracked
-// change in its folder since `since` (committed, staged or not) and every new file no .gitignore hides, the way
-// `git add -A` sees them. It is read in a temporary index (a copy of the agent's own), never in the agent's index.
-// Links are kept as links. Files that a .gitignore the agent added or changed hides, and repositories inside its
-// folder, are left out and named in `left`.
+// "The agent's work" is its folder the way `git add -A` sees it: every tracked file (committed, staged or not) and every
+// new file no .gitignore hides, as one tree. It is read in a temporary index (a copy of the agent's own), never in the
+// agent's index. Links are kept as links. Files that a .gitignore the agent added or changed hides, and repositories
+// inside its folder, are left out and named in `left`. A merge commits that tree on its branch (W) and merges W into the
+// person's branch; a throw-away keeps it as a hidden commit. `since` is where its unmerged work starts.
+//
+// The review (the diff, the files and counts on the merge card, the rules it is checked against) is exactly what that
+// merge would change in the person's branch: their HEAD against the tree merge-tree makes of HEAD and the work, the
+// merge commit's own first-parent diff, which is also what a merge reports. So commits of theirs that the agent brought
+// into its branch are not shown as its work, and what its merge would undo of theirs is shown. When the merge would not
+// be clean, the review is the work against where its history and the person's branch last met (`git merge-base`); when
+// the merge would be refused (their branch does not hold `since`), or git cannot say, the work against `since`. The
+// diffs run in the person's folder: the attributes that decide what is binary are theirs, never the agent's.
 //
 // The person's folder only ever sees `git merge --ff-only` to a merge commit built in the object database (merge-tree
 // and commit-tree), with --no-squash, --no-autostash and --no-overwrite-ignore: never a real merge, never conflict markers, never
@@ -803,9 +811,11 @@ function copyIndex(from, to) {
  * `root`: the person's folder. The files are compared there, never in the agent's folder: git reads the attributes
  * that decide what is binary from the working folder and the index of the folder it runs in, and the agent's are its own
  * to write (a `*.js -diff` it hid with its .gitignore, or kept only in its index, would hide a change to code).
- * @returns {Promise<{ head, headTree, tree, since, sinceTree, workId, changed, files, left }>}
+ * `review` (default true): also the review (see "Source control" above): `files`, and the two trees they are compared
+ * between, `fromTree` and `toTree`. A merge and a throw-away need neither.
+ * @returns {Promise<{ head, headTree, tree, since, sinceTree, workId, changed, left, files?, fromTree?, toTree? }>}
  */
-async function snap(run, root, folder, since) {
+async function snap(run, root, folder, since, { review = true } = {}) {
   const cwd = folder.path;
   const from = String(since ?? '');
   if (!OID.test(from)) throw new Refusal('git', 'Workbench does not know which commit its work started from.');
@@ -840,8 +850,9 @@ async function snap(run, root, folder, since) {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
   };
-  const [{ tree, nested }, hidden, trees] = await Promise.all([
+  const [{ tree, nested }, hidden, trees, into] = await Promise.all([
     work(), hiddenByAgent(cwd, from, run), run(['rev-parse', `${head}^{tree}`, `${from}^{tree}`], { cwd }),
+    review ? headHolding(run, root, from) : null,
   ]);
   const [headTree, sinceTree] = trees.stdout.split('\n');
   if (!OID.test(headTree || '') || !OID.test(sinceTree || '')) throw plainError('Git could not read a commit it was given.');
@@ -853,8 +864,62 @@ async function snap(run, root, folder, since) {
   }
   left.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const files = tree === sinceTree ? [] : await changesBetween(run, root, sinceTree, tree);
-  return { head, headTree, tree, since: from, sinceTree, workId: `${head}:${tree}`, changed: tree !== sinceTree, files, left };
+  const s = { head, headTree, tree, since: from, sinceTree, workId: `${head}:${tree}`, changed: tree !== sinceTree, left };
+  if (!review) return s;
+  // Nothing changed since `since`: nothing to merge, and nothing to show.
+  [s.fromTree, s.toTree] = s.changed ? await reviewTrees(run, root, s, into) : [sinceTree, tree];
+  s.files = s.fromTree === s.toTree ? [] : await changesBetween(run, root, s.fromTree, s.toTree);
+  return s;
+}
+
+/** The person's HEAD when it holds `since` (so a merge would not be refused for where the work started), else null. Never rejects. */
+async function headHolding(run, root, since) {
+  try {
+    const into = await commitOf(root, 'HEAD', run);
+    return into && (await isAncestor(root, since, into, run)) ? into : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The date of the commit merge-tree is given for the work as it is (see reviewTrees): any fixed one. */
+const WORK_AS_IS_DATE = '@1000000000 +0000';
+
+/**
+ * The two trees the review compares (see "Source control" above), as [from, to]: the person's HEAD `into` (null when it
+ * does not hold `since`) and the tree merge-tree makes of it and the work; on a conflict, where the work's history and
+ * HEAD last met and the work; otherwise `since` and the work. merge-tree takes commits, so work not yet committed is
+ * given as a commit on top of the agent's HEAD that nothing points at, made by Workbench at a fixed date: the same work
+ * makes the same commit each time. Never rejects.
+ */
+async function reviewTrees(run, root, { head, headTree, tree, sinceTree }, into) {
+  if (!into) return [sinceTree, tree];
+  try {
+    const work = tree === headTree ? head
+      : await commitTree(run, root, tree, [head], 'The agent’s work as it is\n', WORKBENCH_IDENTITY, WORK_AS_IS_DATE);
+    const merged = await mergeTrees(run, root, into, work);
+    if (merged.tree) return [await treeOf(root, into, run), merged.tree];
+    const met = await run(['merge-base', into, head], { cwd: root, okCodes: [1] });
+    const base = met.code === 0 ? met.stdout.trim() : '';
+    if (OID.test(base)) return [await treeOf(root, base, run), tree];
+  } catch {} // git could not say: the work against `since`, as below
+  return [sinceTree, tree];
+}
+
+/**
+ * merge-tree --write-tree of the commits `into` and `work`, in the person's folder, without --merge-base: git's own
+ * merge base, as `git merge` would take (an agent that merged the person's branch into its own would otherwise get
+ * false conflicts). It writes objects only, never to a folder.
+ * @returns {Promise<{ tree: string } | { conflicts: string[] }>} tree: the merged tree, when it is clean; conflicts:
+ *   the paths that are not, from the -z records. Rejects when git fails (exit 1 without a tree is an error, not a conflict).
+ */
+async function mergeTrees(run, root, into, work) {
+  const r = await run(['merge-tree', '--write-tree', '--name-only', '-z', into, work], { cwd: root, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS });
+  const fields = r.stdout.split('\0');
+  if (!OID.test(fields[0])) throw new Refusal('git', SAY.git);
+  if (r.code === 0) return { tree: fields[0] };
+  const end = fields.indexOf('', 1);
+  return { conflicts: [...new Set(fields.slice(1, end < 0 ? fields.length : end))] };
 }
 
 const isBlobMode = mode => mode === '100644' || mode === '100755' || mode === '120000';
@@ -927,6 +992,8 @@ function publicFile(f) {
  *   files: { path: string, status: 'added'|'modified'|'deleted', adds: number, dels: number, binary?: true, large?: true }[],
  *   left: { path: string, why: 'ignored'|'nested-repo' }[] }>}
  *   head: its folder's HEAD; tree: the work as a tree; workId: `${head}:${tree}`; changed: tree differs from since's.
+ *   files: what merging the work into the person's current HEAD would change there, the merge commit's first-parent
+ *   diff (see "Source control" above for a conflict, and for a HEAD that does not hold `since`); none when !changed.
  *   Rejects with a plain error (with `.why` when it is a refusal) when the folder is not an agent's or git fails.
  */
 export async function snapshotWork({ repoRoot, path: wsPath, since } = {}) {
@@ -974,7 +1041,8 @@ function cutAt(text, maxBytes) {
 }
 
 /**
- * The diff of the agent's work against `since`, for people to read. Never writes the agent's index or files.
+ * The diff of the agent's work, for people to read: the files of snapshotWork (what its merge would change in the
+ * person's branch), with their patches. Never writes the agent's index or files.
  * @param {{ repoRoot: string, path: string, since: string, maxFiles?: number, maxFileBytes?: number, maxTotalBytes?: number }} opts
  * @returns {Promise<{ workId: string, since: string, head: string,
  *   files: { path, status, adds, dels, binary?: true, large?: true, patch: string|null, cut?: true }[],
@@ -1007,7 +1075,7 @@ export async function workDiff({ repoRoot, path: wsPath, since, maxFiles = 300, 
           batch.push(want[i]);
           bytes += guess;
         }
-        const patches = await patchesOf(run, root, s.sinceTree, s.tree, batch.map(k => shown[k].path));
+        const patches = await patchesOf(run, root, s.fromTree, s.toTree, batch.map(k => shown[k].path));
         for (const [n, k] of batch.entries()) {
           if (budget <= 0) break;
           reached.add(k);
@@ -1080,14 +1148,14 @@ function bodyText(text) {
   return t;
 }
 
-/** commit-tree, as `who`, with a UTF-8 message from stdin. It runs no hook and signs nothing. */
-async function commitTree(run, cwd, tree, parents, message, who) {
+/** commit-tree, as `who`, with a UTF-8 message from stdin, dated `at` (git's form) or now. It runs no hook and signs nothing. */
+async function commitTree(run, cwd, tree, parents, message, who, at = undefined) {
   const args = ['-c', 'i18n.commitEncoding=UTF-8', 'commit-tree', '--no-gpg-sign', tree];
   for (const p of parents) args.push('-p', p);
   args.push('-F', '-');
   const env = {
     GIT_AUTHOR_NAME: who.name, GIT_AUTHOR_EMAIL: who.email, GIT_COMMITTER_NAME: who.name, GIT_COMMITTER_EMAIL: who.email,
-    GIT_AUTHOR_DATE: undefined, GIT_COMMITTER_DATE: undefined, // now, whatever Workbench's own environment says
+    GIT_AUTHOR_DATE: at, GIT_COMMITTER_DATE: at, // without `at`, now, whatever Workbench's own environment says
   };
   const id = (await run(args, { cwd, input: message, env })).stdout.trim();
   if (!OID.test(id)) throw plainError('Git could not make the commit.');
@@ -1176,7 +1244,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   const [agentBusy, unmerged, snapped, startIn] = await Promise.all([
     underWay(folder.path, run),
     run(['ls-files', '-u', '-z'], { cwd: folder.path }).then(r => r.stdout !== ''),
-    settle(snap(run, root, folder, since)),
+    settle(snap(run, root, folder, since, { review: false })),
     OID.test(start) ? isAncestor(root, start, intoHead, run).catch(() => false) : false,
   ]);
   if (agentBusy || unmerged) throw new Refusal('git', SAY.agentBusy); // `add -A` would take its conflict markers as work
@@ -1212,25 +1280,22 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   }
 
   // 5. Already in the person's branch (merged by hand, say).
-  // 6. The merge, worked out in the object database. Git's own merge base, not `since`: an agent that merged the
-  //    person's branch into its own would otherwise get false conflicts. Nothing is written to the person's folder.
-  const [already, merged] = await Promise.all([
-    isAncestor(root, work, intoHead, run),
-    settle(run(['merge-tree', '--write-tree', '--name-only', '-z', intoHead, work], { cwd: root, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS })),
+  // 6. The merge, worked out in the object database (see mergeTrees), the way the review worked it out. Nothing is
+  //    written to the person's folder.
+  const [already, merged, intoTree] = await Promise.all([
+    isAncestor(root, work, intoHead, run), settle(mergeTrees(run, root, intoHead, work)), treeOf(root, intoHead, run),
   ]);
   if (already) throw new Refusal('nothing', SAY.nothing(into));
   const mt = unwrap(merged);
-  const fields = mt.stdout.split('\0');
-  if (!OID.test(fields[0])) throw new Refusal('git', SAY.git); // exit 1 without a tree is an error, not a conflict
-  if (mt.code === 1) {
-    const end = fields.indexOf('', 1);
-    const paths = [...new Set(fields.slice(1, end < 0 ? fields.length : end))];
-    throw new Refusal('conflict', SAY.conflict(into), paths);
-  }
+  if (mt.conflicts) throw new Refusal('conflict', SAY.conflict(into), mt.conflicts);
 
-  // 7. The merge commit M: the person's HEAD first, W second.
+  // 7. The merge commit M: the person's HEAD first, W second. What it brings in is its first-parent diff, the files
+  //    and counts the review showed.
   const mergeMessage = `Merge ${agentName}: ${subject}\n\nWorkbench-Agent: ${id}\nWorkbench-Kind: merge\n`;
-  const mergeCommit = await commitTree(run, root, fields[0], [intoHead, work], mergeMessage, who);
+  const [mergeCommit, brought] = await Promise.all([
+    commitTree(run, root, mt.tree, [intoHead, work], mergeMessage, who),
+    mt.tree === intoTree ? [] : changesBetween(run, root, intoTree, mt.tree),
+  ]);
 
   // 8. Check again, then fast-forward the person's folder to M. Git refuses, changing nothing, when their own
   //    changes or files are in the way; ignored files count (--no-overwrite-ignore), and nothing is stashed.
@@ -1241,7 +1306,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
     'merge', '--ff-only', '--no-squash', '--no-autostash', '--no-overwrite-ignore', '--no-verify-signatures', '-q', mergeCommit];
   const done = {
     ok: true, into, merge: mergeCommit, work,
-    files: s.files.length, adds: s.files.reduce((n, f) => n + f.adds, 0), dels: s.files.reduce((n, f) => n + f.dels, 0),
+    files: brought.length, adds: brought.reduce((n, f) => n + f.adds, 0), dels: brought.reduce((n, f) => n + f.dels, 0),
   };
   let r;
   for (let attempt = 1; ; attempt++) {
@@ -1325,7 +1390,7 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
 
   if (entry && isFolder(target)) {
     const folder = await agentFolder(run, root, wsPath, b);
-    const s = await snap(run, root, folder, since);
+    const s = await snap(run, root, folder, since, { review: false });
     if (s.workId !== exp.workId) throw new Refusal('changed', SAY.changed);
     const copy = s.tree === s.headTree ? s.head : await commitTree(run, root, s.tree, [s.head],
       `Thrown away: ${b}\n\nWorkbench-Agent: ${id}\nWorkbench-Kind: discarded\n`, (await identityAt(run, root)) || WORKBENCH_IDENTITY);

@@ -1097,6 +1097,79 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(fs.readFileSync(p('c.txt'), 'utf8'), 'their own edit\n');
   });
 
+  /**
+   * The review, the card's counts and the merge agree with what the merge commit M really changes in the person's branch
+   * (its first-parent diff): the files and counts of snapshotWork, workDiff and mergeWork, and plain git's numstat of M.
+   */
+  async function landsExactly(t, since, want) {
+    const { s, expect } = await proposal(t, since);
+    assert.deepEqual(s.files, want, 'snapshotWork');
+    const d = await workDiff({ repoRoot: t.root, path: t.ws.path, since });
+    assert.equal(d.workId, s.workId);
+    assert.deepEqual(d.files.map(({ patch, ...f }) => f), want, 'workDiff');
+    const m = await mergeWork(mergeOpts(t, expect, since));
+    const sum = key => want.reduce((n, f) => n + f[key], 0);
+    assert.deepEqual(m, { ok: true, into: 'main', merge: m.merge, work: m.work, files: want.length, adds: sum('adds'), dels: sum('dels') });
+    assert.equal(git(t.root, 'diff-tree', '-r', '--numstat', `${m.merge}^1`, m.merge), want.map(f => `${f.adds}\t${f.dels}\t${f.path}`).join('\n'));
+    return { d, m };
+  }
+
+  test('once the agent brings in the person’s branch and settles a conflict, only what its merge brings in is shown, counted and merged', async () => {
+    const t = await agentRepo();
+    const { w, p } = t;
+    write(w('a.txt'), 'one\nAGENT\nthree\n');
+    write(p('a.txt'), 'one\nPERSON\nthree\n');
+    for (const f of ['person/f0.txt', 'person/f1.txt', 'person/f2.txt']) write(p(f), `${f}\n`);
+    write(p('workbench.json'), JSON.stringify({ checks: [{ name: 'x', run: 'true' }] }));
+    git(t.root, 'add', '-A');
+    git(t.root, 'commit', '-q', '-m', 'person');
+    // The first merge is refused as a conflict. Meanwhile the review shows the agent's own change, from where it started.
+    const first = await proposal(t);
+    assert.deepEqual(first.s.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }]);
+    assert.equal((await mergeWork(mergeOpts(t, first.expect))).why, 'conflict');
+    // As the lid advises, the agent brings main in, and settles the conflict by keeping its own line.
+    assert.notEqual(gitTry(t.ws.path, 'merge', '-q', 'main').code, 0);
+    write(w('a.txt'), 'one\nAGENT\nthree\n');
+    git(t.ws.path, 'add', 'a.txt');
+    git(t.ws.path, 'commit', '-q', '--no-edit');
+    // Only a.txt lands, its line over the person's: none of the person's own files, and not workbench.json.
+    const { d } = await landsExactly(t, t.ws.base, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }]);
+    assert.ok(d.files[0].patch.endsWith(' one\n-PERSON\n+AGENT\n three\n'), d.files[0].patch);
+    assert.equal(fs.readFileSync(p('a.txt'), 'utf8'), 'one\nAGENT\nthree\n');
+    assert.equal(fs.readFileSync(p('workbench.json'), 'utf8'), JSON.stringify({ checks: [{ name: 'x', run: 'true' }] }));
+  });
+
+  test('when the agent brings in the person’s branch but keeps its own files, the review shows the person’s changes its merge undoes', async () => {
+    const t = await agentRepo();
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    git(t.ws.path, 'commit', '-q', '-am', 'agent');
+    write(t.p('b.txt'), 'b fixed\n');
+    write(t.p('person.txt'), 'theirs\n');
+    git(t.root, 'add', '-A');
+    git(t.root, 'commit', '-q', '-m', 'person');
+    git(t.ws.path, 'merge', '-q', '-s', 'ours', '--no-edit', 'main');
+    const { d } = await landsExactly(t, t.ws.base, [
+      { path: 'a.txt', status: 'modified', adds: 1, dels: 1 },
+      { path: 'b.txt', status: 'modified', adds: 1, dels: 1 },
+      { path: 'person.txt', status: 'deleted', adds: 0, dels: 1 },
+    ]);
+    assert.ok(d.files[1].patch.endsWith('-b fixed\n+b\n'), d.files[1].patch);
+    assert.equal(fs.existsSync(t.p('person.txt')), false);
+  });
+
+  test('when the agent goes back to before its merged work, the review shows only what lands, never an undo that does not', async () => {
+    const t = await agentRepo();
+    write(t.w('a.txt'), 'one\nTWO\nthree\n');
+    const first = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+    assert.equal(first.ok, true);
+    // It goes back to where it started, and changes something else.
+    git(t.ws.path, 'reset', '-q', '--hard', t.ws.base);
+    write(t.w('b.txt'), 'b2\n');
+    await landsExactly(t, first.work, [{ path: 'b.txt', status: 'modified', adds: 1, dels: 1 }]);
+    assert.equal(fs.readFileSync(t.p('a.txt'), 'utf8'), 'one\nTWO\nthree\n');
+    assert.equal(fs.readFileSync(t.p('b.txt'), 'utf8'), 'b2\n');
+  });
+
   test('mergeWork refuses when the person’s own changes or files are in the way, and merges once they are not', async () => {
     const t = await agentRepo();
     const { w, p } = t;
