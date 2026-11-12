@@ -1617,6 +1617,9 @@ export class Simulator {
       ...a.session, costUsd: a.harness === 'codex' ? null : round4(a.cost), contextTokens: a.context,
       contextWindow: CONTEXT_WINDOW, mode: 'set',
     });
+    // What it changed and has not merged, as the engine's receipt records it when a turn ends in a real run (the store
+    // clears it when a turn starts): without it a demo agent that took a second turn would end with no files.
+    if (a.kind !== 'helper' && a.git) this._emitFiles(a);
     this._ev(a, EV.TURN, { phase: 'end', finalText, backgroundTasks, isError });
     a.lastFinal = finalText;
     if (!isError && !backgroundTasks) a.says = firstSentence(finalText) || a.says;   // what the engine shows it saying

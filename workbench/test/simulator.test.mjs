@@ -17,8 +17,9 @@ const WORK = EV.WORK || 'agent.work';
 const WORK_KEYS = ['branch', 'from', 'folder', 'merged', 'problem', 'thrownAway'];
 
 /**
- * The fake store, plus `agent.work`, which it predates. As in store.mjs, the event replaces a root's `work` as a whole
- * (a helper's is ignored). It is recorded, and its time and shape are checked, like any other event.
+ * The fake store, plus two things store.mjs does that it predates. `agent.work` replaces a root's `work` as a whole (a
+ * helper's is ignored); it is recorded, and its time and shape are checked, like any other event. And a new turn
+ * clears the root's last receipt (ARCHITECTURE.md): `says`, `files` and `rules` become null, `checks` none.
  */
 function createFakeStore(opts) {
   const store = createBaseStore(opts);
@@ -28,6 +29,13 @@ function createFakeStore(opts) {
     if (ev.kind !== WORK) {
       if (prev == null || ev.ts > prev) lastTs.set(ev.agentId, ev.ts);
       store.emit(ev);
+      const v = store.get(ev.agentId);
+      if (ev.kind === EV.TURN && ev.phase === 'start' && v && !v.parentId) {
+        if (v.checks) v.checks = { state: 'none', results: [] };
+        v.rules = null;
+        v.says = null;
+        v.files = null;
+      }
       return;
     }
     store.events.push(ev);
@@ -1307,6 +1315,35 @@ test('git: a task started in the demo works on its own branch from main as it is
   assert.deepEqual(g2.commits[1], { id: res.work, parents: [g.head], subject: 'Fix the flaky checkout test', author: 'Fix flaky checkout test', at: g2.commits[1].at, refs: [branch], agentId: 'a1b2c3', kind: 'work' });
   assert.deepEqual(asGitListsIt(g2), g2.commits);
 });
+
+test('git: when a turn ends, what the agent changed is reported again, as a real run’s receipt does', () => {
+  // A new turn clears the last receipt; a follow-up that changes nothing must still end with the agent's files, or the
+  // page would show no unmerged work and offer no merge.
+  const { sim, store, id, until } = seeded();
+  const hid = id('Help pages');
+  const files = store.get(hid).files;
+  sim.say(hid, 'Get it checked');
+  assert.equal(store.get(hid).files, null, 'the new turn cleared it');
+  until(() => store.get(hid).state !== 'working', 3 * MIN);
+  assert.equal(store.get(hid).state, 'done_checked');
+  assert.deepEqual(store.get(hid).files, files);
+  // Every turn of a task started in the demo ends with its files, just before the end of the turn.
+  for (const seed of [1, 2, 3, 4, 5, 6]) {
+    const p = playRunner({ seed, agentId: `h0000${seed}` });
+    const evs = p.mine.eventsFor(p.agentId);
+    const ends = evs.flatMap((e, i) => (e.kind === EV.TURN && e.phase === 'end' ? [i] : []));
+    assert.ok(ends.length >= 1);
+    for (const i of ends) assert.equal(evs[i - 1].kind, EV.FILES, `seed ${seed}`);
+    const v = p.mine.get(p.agentId);
+    assert.ok(v.files && v.files.changed >= 1, `seed ${seed}: it ends with its files`);
+    assert.deepEqual(v.files, graphFilesOf(p));
+  }
+});
+
+/** The files a played runner's agent has, as the git screen lists them. */
+function graphFilesOf(p) {
+  return p.sim.gitGraph().agents.find(a => a.id === p.agentId).files;
+}
 
 test('git: a work commit’s subject is the task’s first sentence, capitalised, cut at a word to at most 72 characters', () => {
   assert.equal(subjectOf('fix the login redirect. Then add tests for it.'), 'Fix the login redirect');
