@@ -2552,7 +2552,9 @@ test('merge: yes merges once, records it, counts its work from the merged commit
   assert.equal(t.calls.diffStats.at(-1).base, FAKE_WORK);
   assert.equal(t.store.get(a.id).work.merged.merge, FAKE_MERGE, 'the last merge is still known');
   await t.engine.shutdown();
-  assert.equal(t.calls.removeWorkspace.at(-1).base, FAKE_WORK);
+  // The tidy tells git where it started (base) and where its unmerged work starts (since: the merged work commit).
+  const tidy = t.calls.removeWorkspace.at(-1);
+  assert.deepEqual([tidy.path, tidy.base, tidy.since, tidy.onlyIfUnchanged, tidy.deleteBranch], [a.v.workspace, FAKE_BASE, FAKE_WORK, true, true]);
 });
 
 test('merge: a merge that does not go through says why in plain words, and keeps the reason on the agent while it applies', async (ctx) => {
@@ -2935,9 +2937,12 @@ test('shutdown waits for a merge under way, and no new git work starts once it h
   await down;
   assert.equal(t.calls.mergeWork.length, 1);
   assert.equal(t.calls.discardWork.length, 0);
-  // The tidy counts the merged agent's folder as unchanged from its merged work commit.
-  assert.equal(t.calls.removeWorkspace.find(c => c.path === a.v.workspace).base, FAKE_WORK);
-  assert.equal(t.calls.removeWorkspace.find(c => c.path === b.v.workspace).base, FAKE_BASE);
+  // The tidy counts the merged agent's folder as unchanged from its merged work commit (since); the other, never merged,
+  // from where it started, with no since at all.
+  const tidyA = t.calls.removeWorkspace.find(c => c.path === a.v.workspace);
+  const tidyB = t.calls.removeWorkspace.find(c => c.path === b.v.workspace);
+  assert.deepEqual([tidyA.base, tidyA.since], [FAKE_BASE, FAKE_WORK]);
+  assert.deepEqual([tidyB.base, 'since' in tidyB], [FAKE_BASE, false]);
 });
 
 test('merge and throw away by words: the card is for the agent the words named, and a typed yes answers only the card on screen', async (ctx) => {

@@ -56,6 +56,7 @@ const DEMO_NO_DISCARD = 'This is the demo, so nothing is really thrown away.';
 const DEMO_MERGED = 'This is the demo: nothing was really merged.';
 const DEMO_THROWN = 'This is the demo: nothing was really thrown away.';
 const THROWN_REASON = 'Its work was thrown away, so it cannot continue.';
+const NOT_KEPT_REASON = 'Its folder was not kept, so it cannot continue.';
 const WHICH_ONE = 'Which one do you mean? Pick it on the board, then ask again.';
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
@@ -398,6 +399,7 @@ export class Engine extends EventEmitter {
     this._busy = new Map();      // rootId -> 'merge' | 'discard'
     this._gitChain = Promise.resolve();
     this._gitWork = new Set();   // git jobs under way
+    this._mergedEarlier = new Set(); // earlier agents merged in this run: the shutdown tidy looks at their folders too
     this.repoIdentity = null;    // live mode: does git know the person's name and email (true/false); null: not known
     this._repoKey = null;        // the repository as the page last heard of it (see _setRepo)
     this._repoReading = null;    // a periodic refresh of the repository under way
@@ -501,6 +503,7 @@ export class Engine extends EventEmitter {
       // A runner that would not stop may still be writing in its folder: that one stays.
       const tidy = [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved && !this._busy.has(r.id)
         && this._runnerInfo(r)?.alive !== true);
+      tidy.push(...this._earlierToTidy());
       if (tidy.length) {
         await withTimeout(Promise.all(tidy.map(r => this._removeUnchanged(r))), this.options.tidyTimeoutMs)
           .catch(() => this.log.warn('Some agent folders were not tidied up in time.'));
@@ -1519,7 +1522,7 @@ export class Engine extends EventEmitter {
       return { ok: false, reason: `${harnessName(rec.harness)} is not available on this computer.` };
     }
     if (!rec.sessionId) return { ok: false, reason: 'It never saved its conversation, so there is nothing to pick up.' };
-    if (!rec.workspace) return { ok: false, reason: 'Its folder was not kept, so it cannot continue.' };
+    if (!rec.workspace) return { ok: false, reason: NOT_KEPT_REASON };
     let there = false;
     try { there = fs.statSync(rec.workspace.path).isDirectory() && fs.existsSync(path.join(rec.workspace.path, '.git')); } catch { /* gone */ }
     if (!there) return { ok: false, reason: 'Its folder is gone, so it cannot continue.' };
@@ -1974,28 +1977,55 @@ export class Engine extends EventEmitter {
 
   /**
    * Remove an agent's folder and branch when they hold nothing: never while it might hold work (see removeWorkspace's
-   * onlyIfUnchanged). Used when an agent could not start, and at shutdown. Never during the session otherwise:
-   * stopped, failed and done agents all take follow-ups in the same folder.
+   * onlyIfUnchanged). Used when an agent could not start, and at shutdown (this run's agents, and the earlier agents
+   * merged in this run: `run.earlier`). Never during the session otherwise: stopped, failed and done agents all take
+   * follow-ups in the same folder.
    */
   async _removeUnchanged(run) {
     const ws = run && run.workspace;
     if (!ws || run.folderRemoved || !this.repoInfo || typeof this.deps.workspace?.removeWorkspace !== 'function') return false;
     try {
-      // Unchanged since its last merge (or since it started): a merged agent that did nothing more goes too.
-      const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace({
-        repoRoot: this.repoInfo.root, path: ws.path, base: sinceOf(ws), onlyIfUnchanged: true, deleteBranch: true,
-      })), this.options.stopTimeoutMs);
+      // Unchanged since its last merge (or since it started): a merged agent that did nothing more goes too. git hears
+      // where it started (base) and, once it was merged, where its unmerged work starts (since, its merged work
+      // commit): then the folder goes only while that commit is still in another branch, so a merge the person undid
+      // never takes the only copy of the work with it.
+      const args = { repoRoot: this.repoInfo.root, path: ws.path, base: ws.base ?? null, onlyIfUnchanged: true, deleteBranch: true };
+      if (ws.since && ws.since !== ws.base) args.since = ws.since;
+      const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace(args)), this.options.stopTimeoutMs);
       if (out?.removed) {
         run.folderRemoved = true;
         // Its folder and branch went with nothing in them: the view says so too.
         const w = this.store.get(run.id)?.work;
         if (w) this._apply([{ kind: EV.WORK, agentId: run.id, work: { ...w, folder: false, branch: null } }]);
+        if (run.earlier) {
+          // An earlier agent's record keeps no folder from now on, so next time it says it cannot continue.
+          this._replaceEarlier(run.id, null);
+          this.store.markContinue(run.id, { ok: false, reason: NOT_KEPT_REASON });
+        }
       }
       return !!out?.removed;
     } catch (err) {
       this.log.warn(`Could not tidy up the folder of ${run.id}:`, err);
       return false;
     }
+  }
+
+  /**
+   * For the shutdown tidy: the earlier agents merged in this run whose record still keeps a folder, as run-like
+   * { id, earlier, workspace } for _removeUnchanged. Not one that is busy, being picked up, or was picked up (it is
+   * one of this run's then), and not one this run never merged: another Workbench may be running that one.
+   */
+  _earlierToTidy() {
+    const out = [];
+    for (const id of this._mergedEarlier) {
+      const rec = this.earlierRecs.get(id);
+      const v = this.store.get(id);
+      const ws = rec?.workspace;
+      if (!ws || !v?.earlier || v.work?.thrownAway || this.runs.has(id) || this._busy.has(id) || this._resuming.has(id)) continue;
+      if (!folderThere(ws.path)) continue;
+      out.push({ id, earlier: true, workspace: { ...ws } });
+    }
+    return out;
   }
 
   /** This agent's own hook token, or null (Claude Code then refuses to start: fail closed). */
@@ -2524,7 +2554,10 @@ export class Engine extends EventEmitter {
       { kind: EV.FILES, agentId: v.id, files: { ...NO_FILES, list: [] } }, // nothing is left unmerged
     ]);
     this._dropWorkCards(v.id);
-    if (where.rec) this._replaceEarlier(v.id, { ...where.rec.workspace, ...(W ? { since: W } : {}) });
+    if (where.rec) {
+      this._replaceEarlier(v.id, { ...where.rec.workspace, ...(W ? { since: W } : {}) });
+      this._mergedEarlier.add(v.id);
+    }
     try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
     return { reply: `Merged ${v.name} into ${into}.`, focusId: v.id };
   }
