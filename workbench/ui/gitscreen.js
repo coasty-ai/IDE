@@ -52,7 +52,7 @@ const st = {
   needKey: null,      // what needs you, as this screen last saw it (null: not yet, since it opened)
   dx: 0,              // the drawing's shift to the right, so HEAD's label has room left of the trunk
   head: null,         // where HEAD's label goes: { x, y, anchor, halo }
-  times: [],          // the rows' times as drawn, so they move on with the clock
+  times: null,        // the rows' times as drawn, so they move on with the clock: { rows, n2, agentById, branch }
   detailWhen: '',     // the detail's times as drawn
 };
 // the guard after the detail's buttons change: the lid's (the swap and a moment more), or half a second without motion
@@ -483,7 +483,7 @@ function paintGraph(z) {
   if (el.graph.getAttribute('aria-label') !== label) el.graph.setAttribute('aria-label', label);
   if (note) {
     st.g = null;
-    st.times = [];
+    st.times = null;
     const html = `<p class="gnote" aria-hidden="true">${esc(note)}</p>`;
     if (st.keys.graph !== html) { st.keys.graph = html; const had = rowFocus(); el.graph.innerHTML = html; if (had) focusOn(el.title); }
     return;
@@ -564,17 +564,21 @@ function rowFocus() {
 
 // .ghead in app.css: 600 10.5px JetBrains Mono, letter-spacing 1.2px; its box is the font's (ascent 1.02, descent 0.3)
 const HEAD_PX = 10.5, HEAD_TRACK = 1.2;
+const headPlace = g => headLabelPlace(g, ctx.measure('HEAD', HEAD_PX, 600) + 4 * HEAD_TRACK);
 /**
  * Where HEAD's label goes: above the pad on its left, else on its right, else below the pad, left then right: the first
  * place no trace or part runs through, inside the graph (left of the trunk, the drawing moves right by `dx` so the
  * graph's edge never cuts it). When every place is crossed, the first that fits gets a halo, so the copper under it does
  * not cut its letters. Works on the laid-out graph, so it follows whatever room the layout leaves left of the trunk.
- * @returns {{ dx: number, label: { x: number, y: number, anchor: 'start'|'end', halo: boolean } | null }}
+ * Pure (no DOM): `W` is the label's width in CSS pixels.
+ * @param {object} g  graphLayout()'s answer
+ * @returns {{ dx: number, label: { x: number, y: number, anchor: 'start'|'end', halo: boolean, box: { l, r, t, b } } | null }}
+ *   box is the room the label takes (its font box and a margin), in the drawing's own coordinates (before dx)
  */
-function headPlace(g) {
+export function headLabelPlace(g, W) {
   const n = g.nodes.find(x => x.kind === 'head');
   if (!n) return { dx: 0, label: null };
-  const h = n.size, W = ctx.measure('HEAD', HEAD_PX, 600) + 4 * HEAD_TRACK;
+  const h = n.size;
   const asc = HEAD_PX * 1.02, desc = HEAD_PX * 0.3, pad = 1.5;
   const segs = [];
   for (const e of g.edges) for (let i = 1; i < e.pts.length; i++) segs.push([e.pts[i - 1], e.pts[i], e.kind === 'trunk' ? 3 : 1.5]);
@@ -590,7 +594,7 @@ function headPlace(g) {
   const fits = p => p.box.r <= g.w + 6 && p.box.t >= 0 && p.box.b <= g.h;
   const ok = places.find(p => fits(p) && clear(p.box));
   const pick = ok || places.find(fits) || places[0];
-  return { dx: Math.max(0, Math.ceil(1 - pick.box.l)), label: { x: pick.x, y: pick.y, anchor: pick.anchor, halo: !ok } };
+  return { dx: Math.max(0, Math.ceil(1 - pick.box.l)), label: { x: pick.x, y: pick.y, anchor: pick.anchor, halo: !ok, box: pick.box } };
 }
 /** Does the segment a–b cross the box? (Liang–Barsky clipping) */
 function segCuts(a, b, box) {
