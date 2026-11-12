@@ -1707,6 +1707,55 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(statusOf(t.root), '');
   });
 
+  test('when a write fails part-way through the fast-forward, the files git left are never called the person’s own changes', async () => {
+    const t = await agentRepo();
+    const pages = Array.from({ length: 6 }, (_, i) => `page${i}.txt`);
+    for (const f of pages) write(t.w(f), `${f} by the agent\n`);
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    write(t.w('b.txt'), 'b by the agent\n');
+    // The person's own required filter (as Git LFS sets one up), which fails on one file while they are offline.
+    const offline = path.join(T, `offline-${t.id}`);
+    write(offline, '');
+    git(t.root, 'config', 'filter.lfsish.smudge', `sh -c 'if [ "$0" = page3.txt ] && [ -e '"'"'${offline}'"'"' ]; then exit 1; fi; cat' %f`);
+    git(t.root, 'config', 'filter.lfsish.clean', 'cat');
+    git(t.root, 'config', 'filter.lfsish.required', 'true');
+    write(path.join(t.root, '.git', 'info', 'attributes'), 'page*.txt filter=lfsish\n');
+    let { expect } = await proposal(t);
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)),
+      { ok: false, why: 'git', sentence: 'Git could not finish the merge into main. Have a look at your folder before you try again.' });
+    assert.equal(headOf(t.root), t.ws.base);
+    // Git wrote some of the merge's files, then put its index back: they look like the person's own changes.
+    const left = statusOf(t.root).split('\n').filter(Boolean).map(l => l.slice(3));
+    assert.ok(left.includes('a.txt') && left.includes('b.txt') && left.includes('page0.txt') && !left.includes('page3.txt'), statusOf(t.root));
+
+    // Back online. Meanwhile the person changes b.txt: only that one is theirs.
+    fs.rmSync(offline);
+    write(t.p('b.txt'), 'mine\n');
+    ({ expect } = await proposal(t));
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)),
+      { ok: false, why: 'blocked', paths: ['b.txt'], sentence: 'Your own changes are in the way: b.txt. Commit or put them aside, then merge again.' });
+    // Without it, the rest are named for what they are.
+    git(t.root, 'checkout', '--', 'b.txt');
+    ({ expect } = await proposal(t));
+    const again = await mergeWork(mergeOpts(t, expect));
+    const leftovers = left.filter(p => p !== 'b.txt');
+    assert.deepEqual([...(again.paths || [])].sort(), [...leftovers].sort(), JSON.stringify(again));
+    const named = again.paths.length > 3 ? `${again.paths.slice(0, 3).join(', ')} and ${again.paths.length - 3} more` : again.paths.join(', ');
+    assert.deepEqual(again, {
+      ok: false, why: 'git', paths: again.paths,
+      sentence: `Files in your folder already hold what the merge brings in, and git will not write over them: ${named}. Undo those changes, then merge again.`,
+    });
+    // Undone, the merge goes through.
+    git(t.root, 'checkout', '--', 'a.txt');
+    for (const f of leftovers) if (f.startsWith('page')) fs.rmSync(t.p(f));
+    ({ expect } = await proposal(t));
+    const ok = await mergeWork(mergeOpts(t, expect));
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    assert.equal(statusOf(t.root), '');
+    for (const f of pages) assert.equal(fs.readFileSync(t.p(f), 'utf8'), `${f} by the agent\n`);
+    assert.equal(fs.readFileSync(t.p('b.txt'), 'utf8'), 'b by the agent\n');
+  });
+
   test('when the person’s branch moves while git writes their files, mergeWork says the merge did not finish, never that it moved', async () => {
     const t = await agentRepo();
     write(t.p('c.txt'), 'c by the person\n');

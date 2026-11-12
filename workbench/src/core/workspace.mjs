@@ -673,6 +673,9 @@ const SAY = {
   ancestry: into => `It started from a commit that is no longer in ${into}, so merging it would bring in other work.`,
   conflict: into => `Its work does not merge cleanly into ${into}.`,
   blocked: paths => `Your own changes are in the way: ${listOf(paths, 3)}. Commit or put them aside, then merge again.`,
+  alreadyThere: paths => (paths.length === 1
+    ? `A file in your folder already holds what the merge brings in, and git will not write over it: ${paths[0]}. Undo that change, then merge again.`
+    : `Files in your folder already hold what the merge brings in, and git will not write over them: ${listOf(paths, 3)}. Undo those changes, then merge again.`),
   gone: 'Its folder is gone, so there is nothing to merge.',
   agentBusy: 'Its folder is in the middle of a merge or rebase, so its work cannot be merged yet.',
   git: 'Git could not finish the merge. Nothing in your folder changed.',
@@ -1393,6 +1396,32 @@ function inTheWay(stderr) {
 }
 
 /**
+ * Of `paths` (in the way of the fast-forward, in the person's folder `root`), those that already hold exactly what the
+ * merge brings in there: a plain file (not a link or a folder) where M has one (`brought`, M's first-parent diff), whose
+ * bytes, cleaned the way git would store them (`hash-object` with their filters), are M's. Anything that cannot be
+ * shown to be one counts as the person's own. Never rejects.
+ */
+async function alreadyThere(run, root, paths, brought) {
+  const merged = new Map(brought.map(f => [f.path, f]));
+  const asked = paths.filter(p => {
+    const f = merged.get(p);
+    if (!f || f.status === 'deleted' || !(f.newMode === '100644' || f.newMode === '100755') || p.includes('\n') || !safeParts(p)) return false;
+    try {
+      return fs.lstatSync(path.join(root, p)).isFile();
+    } catch {
+      return false;
+    }
+  });
+  if (!asked.length) return new Set();
+  try {
+    const ids = (await run(['hash-object', '--stdin-paths'], { cwd: root, input: asked.map(p => `${p}\n`).join('') })).stdout.split('\n');
+    return new Set(asked.filter((p, i) => ids[i] === merged.get(p).newId));
+  } catch {
+    return new Set(); // a filter that fails, a file that went meanwhile: theirs, as far as Workbench can tell
+  }
+}
+
+/**
  * Commit the agent's work on its own branch, then join it into the person's current branch with a merge commit, in
  * the person's folder, by fast-forward only. Every refusal before the work commit changes nothing at all; `conflict`,
  * `blocked` and the later refusals leave the work commit W on the agent's branch (its index reset to match, its files
@@ -1560,9 +1589,16 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   }
   if (on === into && at === mergeCommit) return done; // it moved the branch, then complained about something after
   if (r.code === 1) {
-    // Their own changes or files are in the way: git checks every path before it writes any, so nothing changed.
+    // Files in the way: git checks every path before it writes any, so nothing changed. Those that already hold what
+    // M brings in there are not the person's own changes: a fast-forward that stopped part-way before (a filter that
+    // failed, a full disk) leaves the files it wrote, and puts its index back.
     const paths = inTheWay(r.stderr);
-    if (paths.length && on === into && at === intoHead) throw new Refusal('blocked', SAY.blocked(paths), paths);
+    if (paths.length && on === into && at === intoHead) {
+      const there = await alreadyThere(run, root, paths, brought);
+      const own = paths.filter(p => !there.has(p));
+      if (own.length) throw new Refusal('blocked', SAY.blocked(own), own);
+      throw new Refusal('git', SAY.alreadyThere(paths), paths);
+    }
   } else if (STOPPED_BEFORE.test(r.stderr)) {
     // Exit 128, and git's own words say it stopped before it began: another operation started, conflicts appeared, or
     // the branch moved before git read it. A fast-forward never leaves unresolved conflicts itself: those came from
