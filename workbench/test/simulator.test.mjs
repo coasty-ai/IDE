@@ -1,12 +1,54 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Simulator, available, harness, topicOf } from '../src/adapters/sim/simulator.mjs';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { Simulator, available, harness, topicOf, subjectOf } from '../src/adapters/sim/simulator.mjs';
 import { EV, SPARK_BUCKET_MS, SPARK_BUCKETS } from '../src/shared/events.mjs';
 import { extractQuestion, nameFromTask } from '../src/shared/narrate.mjs';
-import { createFakeStore } from './helpers/simulator-fake-store.mjs';
+import { createFakeStore as createBaseStore } from './helpers/simulator-fake-store.mjs';
 
 const T0 = Date.UTC(2026, 10, 10, 17, 0, 0);
 const MIN = 60_000;
+
+// What became of a root's work in git: `agent.work` { agentId, work }, which replaces the view's `work` as a whole.
+const WORK = EV.WORK || 'agent.work';
+const WORK_KEYS = ['branch', 'from', 'folder', 'merged', 'problem', 'thrownAway'];
+
+/**
+ * The fake store, plus two things store.mjs does that it predates. `agent.work` replaces a root's `work` as a whole (a
+ * helper's is ignored); it is recorded, and its time and shape are checked, like any other event. And a new turn
+ * clears the root's last receipt (ARCHITECTURE.md): `says`, `files` and `rules` become null, `checks` none.
+ */
+function createFakeStore(opts) {
+  const store = createBaseStore(opts);
+  const lastTs = new Map();
+  const emit = (ev) => {
+    const prev = lastTs.get(ev.agentId);
+    if (ev.kind !== WORK) {
+      if (prev == null || ev.ts > prev) lastTs.set(ev.agentId, ev.ts);
+      store.emit(ev);
+      const v = store.get(ev.agentId);
+      if (ev.kind === EV.TURN && ev.phase === 'start' && v && !v.parentId) {
+        if (v.checks) v.checks = { state: 'none', results: [] };
+        v.rules = null;
+        v.says = null;
+        v.files = null;
+      }
+      return;
+    }
+    store.events.push(ev);
+    if (typeof ev.ts !== 'number' || !Number.isFinite(ev.ts)) store.errors.push(`bad ts on ${ev.kind}`);
+    else if (prev != null && ev.ts < prev) store.errors.push(`${ev.kind} for ${ev.agentId} went back in time`);
+    else lastTs.set(ev.agentId, ev.ts);
+    const v = store.get(ev.agentId);
+    if (!v) store.errors.push(`${ev.kind} for unknown agent ${ev.agentId}`);
+    else if (!ev.work || JSON.stringify(Object.keys(ev.work)) !== JSON.stringify(WORK_KEYS)) store.errors.push(`${ev.kind} for ${ev.agentId} is not shaped like AgentView.work`);
+    else if (!v.parentId) v.work = structuredClone(ev.work);
+  };
+  return { ...store, emit };
+}
 
 /** A simulator wired to a fake store, with a clock the test moves. */
 function world({ seed = 7, speed = 1, engine = true } = {}) {
@@ -640,4 +682,677 @@ test('hints while working are taken into account', () => {
   if (v.state === 'needs_ok') { w.sim.onAnswer('g00001', v.ask, 'Allow'); w.until(() => mine.get('g00001').state !== 'working', 3 * MIN); }
   const text = mine.events.filter(e => e.kind === EV.TURN && e.finalText).map(e => e.finalText).join(' ');
   assert.match(text, /took your note into account/);
+});
+
+// ---- the demo's git repository ----
+
+const HEX40 = /^[0-9a-f]{40}$/;
+const SEEDED = ['Checkout fix', 'Search cleanup', 'Flaky test', 'Invoice export', 'Help pages', 'Onboarding'];
+const SLUGS = {
+  'Checkout fix': 'checkout-fix', 'Search cleanup': 'search-cleanup', 'Flaky test': 'flaky-test',
+  'Invoice export': 'invoice-export', 'Help pages': 'help-pages', Onboarding: 'onboarding',
+};
+const COMMIT_KEYS = ['id', 'parents', 'subject', 'author', 'at', 'refs', 'agentId', 'kind'];
+const AGENT_KEYS = ['id', 'name', 'state', 'earlier', 'harness', 'branch', 'from', 'base', 'since', 'files', 'work'];
+const NO_FILES = { changed: 0, adds: 0, dels: 0, list: [] };
+const MERGED = 'This is the demo: nothing was really merged.';
+const THROWN = 'This is the demo: nothing was really thrown away.';
+const sec = ms => Math.floor(ms / 1000) * 1000;
+const sum = (list, k) => list.reduce((s, f) => s + f[k], 0);
+
+/** Your branch: main's first-parent line from its tip, newest first. */
+function trunkOf(g) {
+  const byId = new Map(g.commits.map(c => [c.id, c]));
+  const out = [];
+  for (let c = byId.get(g.head); c; c = byId.get(c.parents[0])) out.push(c);
+  return out;
+}
+
+/** Git with nothing of this machine's own settings, identity or home folder. */
+function gitIn(dir) {
+  const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', LC_ALL: 'C' };
+  return (args, { input, extra } = {}) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...args],
+    { cwd: dir, env: { ...env, ...extra }, input, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+/**
+ * The graph as git itself lists it. A real repository gets the same commits (each with an empty tree, the same
+ * parents, author and time, and the trailers Workbench writes on work and merge commits) and the same branches; it is
+ * then read back the way workspace.mjs's gitGraph reads one: `git log --topo-order` from HEAD and every workbench/*
+ * branch, with agentId and kind taken from the trailers.
+ */
+function asGitListsIt(g) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-sim-git-'));
+  try {
+    const git = gitIn(dir);
+    git(['init', '-q', '-b', 'main']);
+    // One fast-import stream, oldest first: each commit on a ref of its own, its parents named by their marks.
+    const mark = new Map(g.commits.map((c, i) => [c.id, i + 1]));
+    let stream = '';
+    for (const c of [...g.commits].reverse()) {
+      const message = c.kind === 'commit' ? `${c.subject}\n` : `${c.subject}\n\nWorkbench-Agent: ${c.agentId}\nWorkbench-Kind: ${c.kind}\n`;
+      const who = `${c.author} <demo@example.invalid> ${c.at / 1000} +0000`;
+      stream += `commit refs/sim/${mark.get(c.id)}\nmark :${mark.get(c.id)}\nauthor ${who}\ncommitter ${who}\n`;
+      stream += `data ${Buffer.byteLength(message)}\n${message}\n`;
+      c.parents.forEach((p, k) => { stream += `${k ? 'merge' : 'from'} :${mark.get(p)}\n`; });
+      stream += '\n';
+    }
+    for (const c of g.commits) for (const ref of c.refs) stream += `reset refs/heads/${ref}\nfrom :${mark.get(c.id)}\n\n`;
+    const marks = path.join(dir, 'marks');
+    git(['fast-import', '--quiet', `--export-marks=${marks}`], { input: stream });
+    const byMark = new Map([...mark].map(([id, m]) => [`:${m}`, id]));
+    const ours = new Map(fs.readFileSync(marks, 'utf8').split('\n').filter(Boolean).map(l => l.split(' ')).map(([m, oid]) => [oid, byMark.get(m)]));
+    const names = new Map();
+    for (const line of git(['for-each-ref', '--format=%(objectname) %(refname:short)', 'refs/heads/']).split('\n').filter(Boolean)) {
+      const [oid, name] = line.split(' ');
+      if (!names.has(oid)) names.set(oid, []);
+      names.get(oid).push(name);
+    }
+    const tips = ['HEAD', ...[...names].filter(([, n]) => n.some(x => x.startsWith('workbench/'))).map(([oid]) => oid)];
+    const format = ['%H', '%P', '%an', '%at', '%s', '%(trailers:key=Workbench-Agent,valueonly,unfold,separator=%x2C)',
+      '%(trailers:key=Workbench-Kind,valueonly,unfold,separator=%x2C)'].join('%x00') + '%x00';
+    const out = git(['-c', 'trailer.separators=:', 'log', '--topo-order', `--format=tformat:${format}`, '--stdin'], { input: `${tips.join('\n')}\n` });
+    const last = s => String(s || '').split(',').map(x => x.trim()).filter(Boolean).pop() || '';
+    const fields = out.split('\0');
+    const listed = [];
+    for (let i = 0; i + 7 <= fields.length; i += 7) {
+      const id = fields[i].replace(/^\n/, '');
+      if (!id) break;
+      const parents = fields[i + 1] ? fields[i + 1].split(' ') : [];
+      const agent = last(fields[i + 5]);
+      const word = last(fields[i + 6]);
+      listed.push({
+        id: ours.get(id), parents: parents.map(p => ours.get(p)), subject: fields[i + 4], author: fields[i + 2], at: Number(fields[i + 3]) * 1000,
+        refs: (names.get(id) || []).slice().sort((x, y) => (x === 'main' ? -1 : y === 'main' ? 1 : x < y ? -1 : 1)),
+        agentId: /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/.test(agent) ? agent : null,
+        kind: word === 'merge' && parents.length > 1 ? 'merge' : word === 'work' ? 'work' : 'commit',
+      });
+    }
+    return listed;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * One file's patch, read as git prints one: its header lines, then hunks whose counts and line numbers add up to
+ * exactly the file's adds and dels.
+ */
+function checkPatch(f) {
+  const p = f.patch;
+  assert.equal(typeof p, 'string', f.path);
+  assert.ok(p.endsWith('\n'), `${f.path}: ends with a new line`);
+  assert.doesNotMatch(p, /\r/);
+  const lines = p.slice(0, -1).split('\n');
+  assert.equal(lines[0], `diff --git a/${f.path} b/${f.path}`);
+  const head = {
+    added: ['new file mode 100644', /^index 0000000\.\.[0-9a-f]{7}$/, '--- /dev/null', `+++ b/${f.path}`],
+    deleted: ['deleted file mode 100644', /^index [0-9a-f]{7}\.\.0000000$/, `--- a/${f.path}`, '+++ /dev/null'],
+    modified: [/^index [0-9a-f]{7}\.\.[0-9a-f]{7} 100644$/, `--- a/${f.path}`, `+++ b/${f.path}`],
+  }[f.status];
+  assert.ok(head, `${f.path}: status ${f.status}`);
+  head.forEach((want, k) => (typeof want === 'string' ? assert.equal(lines[1 + k], want) : assert.match(lines[1 + k], want)));
+  let i = 1 + head.length;
+  let adds = 0, dels = 0, shift = 0, oldEnd = 0, hunks = 0;
+  while (i < lines.length) {
+    const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@( .+)?$/.exec(lines[i]);
+    assert.ok(m, `${f.path}: a hunk starts at "${lines[i]}"`);
+    hunks++;
+    const [oldAt, oldLen, newAt, newLen] = [+m[1], m[2] === undefined ? 1 : +m[2], +m[3], m[4] === undefined ? 1 : +m[4]];
+    let o = 0, n = 0;
+    for (i++; i < lines.length && !lines[i].startsWith('@@'); i++) {
+      const c = lines[i].charAt(0);
+      if (c === '+') { n++; adds++; } else if (c === '-') { o++; dels++; } else if (c === ' ') { o++; n++; } else assert.fail(`${f.path}: a hunk line starts with "${c}"`);
+    }
+    assert.equal(o, oldLen, `${f.path}: old lines in "${m[0]}"`);
+    assert.equal(n, newLen, `${f.path}: new lines in "${m[0]}"`);
+    if (f.status === 'added') assert.deepEqual([oldAt, oldLen, newAt], [0, 0, 1]);
+    else if (f.status === 'deleted') assert.deepEqual([oldAt, newAt, newLen], [1, 0, 0]);
+    else {
+      assert.ok(oldAt > oldEnd, `${f.path}: hunks in order, apart`);
+      assert.equal(newAt, oldAt + shift, `${f.path}: where "${m[0]}" lands`);
+      shift += newLen - oldLen;
+      oldEnd = oldAt + oldLen - 1;
+    }
+  }
+  assert.ok(hunks >= 1, `${f.path}: at least one hunk`);
+  assert.equal(adds, f.adds, `${f.path}: added lines`);
+  assert.equal(dels, f.dels, `${f.path}: removed lines`);
+}
+
+/** What `git apply --numstat --summary` reads from the patches: each file's counts, and the files made or deleted. */
+function gitReads(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-sim-apply-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'work.patch'), files.map(f => f.patch).join(''));
+    return gitIn(dir)(['apply', '--numstat', '--summary', 'work.patch']).split('\n').filter(Boolean);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** The lines gitReads() should give for these files. */
+const readAs = files => [
+  ...files.map(f => `${f.adds}\t${f.dels}\t${f.path}`),
+  ...files.filter(f => f.status !== 'modified').map(f => ` ${f.status === 'added' ? 'create' : 'delete'} mode 100644 ${f.path}`),
+];
+
+test('git: every seeded root gets its own branch as it starts, recorded with agent.work as the engine records a real one', () => {
+  const { sim, store } = world();
+  sim.seedWorld();
+  assert.deepEqual(store.errors, []);
+  for (const v of store.roots()) {
+    assert.deepEqual(v.work, { branch: `workbench/${SLUGS[v.name]}-${v.id}`, from: 'main', folder: true, merged: null, problem: null, thrownAway: null }, v.name);
+    const mine = store.eventsFor(v.id);
+    assert.deepEqual(mine.slice(0, 3).map(e => e.kind), [EV.CREATED, EV.STATE, WORK], `${v.name}: its branch is made as it starts`);
+    assert.equal(mine[2].ts, mine[0].ts);
+    assert.equal(mine.filter(e => e.kind === WORK).length, 1);
+  }
+  for (const h of store.list().filter(v => v.parentId)) assert.equal(h.work ?? null, null, 'a helper works in its agent’s folder');
+});
+
+test('git: the graph is shaped like gitGraph(): about 30 commits by you and by agents, newest first in topological order', () => {
+  const { sim, store } = world();
+  sim.seedWorld();
+  const n = store.events.length;
+  const g = sim.gitGraph();
+  assert.equal(store.events.length, n, 'looking emits nothing');
+  assert.deepEqual(Object.keys(g), ['ok', 'head', 'branch', 'repo', 'commits', 'more', 'agents']);
+  assert.equal(g.ok, true);
+  assert.equal(g.branch, 'main');
+  assert.match(g.head, HEX40);
+  assert.deepEqual(g.repo, { name: 'storefront', branch: 'main', head: g.head, dirty: 2, identity: true });
+  assert.equal(g.more, false);
+  assert.ok(g.commits.length >= 25 && g.commits.length <= 35, `${g.commits.length} commits`);
+  const index = new Map(g.commits.map((c, i) => [c.id, i]));
+  assert.equal(index.size, g.commits.length, 'each commit once');
+  for (const [i, c] of g.commits.entries()) {
+    assert.deepEqual(Object.keys(c), COMMIT_KEYS);
+    assert.match(c.id, HEX40);
+    assert.ok(Number.isInteger(c.at) && c.at % 1000 === 0 && c.at < T0, 'author time in ms, in whole seconds, in the past');
+    for (const p of c.parents) {
+      assert.ok(index.get(p) > i, 'every parent is listed, after all of its children');
+      assert.ok(g.commits[index.get(p)].at < c.at, 'and is older');
+    }
+    assert.ok(['commit', 'merge', 'work'].includes(c.kind));
+    assert.ok(c.subject.length > 0 && !/\n/.test(c.subject));
+  }
+  assert.equal(g.commits[0].id, g.head, 'the newest commit is main’s tip');
+  assert.deepEqual(g.commits.filter(c => !c.parents.length).map(c => c.subject), ['Initial commit']);
+
+  // Your own commits: by "you", no agent, subjects in the style of a real project.
+  const yours = g.commits.filter(c => c.kind === 'commit');
+  assert.ok(yours.length >= 20);
+  for (const c of yours) {
+    assert.equal(c.author, 'you');
+    assert.equal(c.agentId, null);
+    assert.ok(c.parents.length <= 1);
+    assert.match(c.subject, /^[A-Z][a-z]+ \S.*[^.\s]$/, 'an imperative sentence without a closing full stop');
+    assert.ok(c.subject.length <= 72);
+  }
+  // Two agents' work merged earlier today: a work commit by the agent on its own branch, joined into main by your merge
+  // commit; both carry the agent's id, as their trailers say.
+  const trunk = new Set(trunkOf(g).map(c => c.id));
+  const merges = g.commits.filter(c => c.kind === 'merge');
+  assert.equal(merges.length, 2);
+  assert.equal(g.commits.filter(c => c.kind === 'work').length, 2);
+  for (const m of merges) {
+    assert.ok(trunk.has(m.id), 'on your branch');
+    assert.equal(m.parents.length, 2);
+    assert.equal(m.author, 'you');
+    const w = g.commits[index.get(m.parents[1])];
+    assert.equal(w.kind, 'work');
+    assert.match(w.agentId, /^[0-9a-f]{6}$/);
+    assert.equal(m.agentId, w.agentId);
+    assert.equal(m.subject, `Merge ${w.author}: ${w.subject}`);
+    assert.ok(!trunk.has(w.id) && trunk.has(w.parents[0]), 'its branch left yours where the agent started');
+    assert.equal(store.get(w.agentId), undefined, 'an agent from earlier, no longer on the board');
+  }
+  assert.deepEqual(merges.map(m => g.commits[index.get(m.parents[1])].author), ['New search page', 'Payment retry']);
+  // Branches: main at its tip, each seeded root's where it started, nothing else; main first, then by name.
+  const refs = g.commits.flatMap(c => c.refs.map(r => [r, c.id]));
+  assert.deepEqual(refs.map(([r]) => r).sort(), ['main', ...store.roots().map(v => v.work.branch)].sort());
+  assert.equal(new Map(refs).get('main'), g.head);
+  for (const c of g.commits) assert.deepEqual(c.refs, [...c.refs].sort((x, y) => (x === 'main' ? -1 : y === 'main' ? 1 : x < y ? -1 : 1)));
+});
+
+test('git: the graph agrees with the seeded agents (names, states, files, work), and each branch leaves main where it started', () => {
+  const { sim, store } = world();
+  sim.seedWorld();
+  const g = sim.gitGraph();
+  const byId = new Map(g.commits.map(c => [c.id, c]));
+  const trunk = trunkOf(g);
+  assert.deepEqual(g.agents.map(a => a.name), SEEDED);
+  for (const a of g.agents) {
+    const v = store.get(a.id);
+    assert.deepEqual(Object.keys(a), AGENT_KEYS);
+    assert.equal(a.state, v.state, `${a.name} is ${v.state}`);
+    assert.equal(a.harness, v.harness);
+    assert.equal(a.earlier, false);
+    assert.equal(a.branch, v.work.branch);
+    assert.equal(a.from, 'main');
+    assert.deepEqual(a.files, v.files, `${a.name}: its unmerged files`);
+    assert.deepEqual(a.work, v.work);
+    assert.equal(a.since, a.base, 'nothing of it is merged yet');
+    // It started from what was newest on main then, and main moved on since.
+    const k = trunk.findIndex(c => c.id === a.base);
+    assert.ok(k > 0, `${a.name} started from a commit on main`);
+    assert.ok(trunk[k].at <= v.startedAt && trunk[k - 1].at > v.startedAt, `${a.name} started from main’s tip at the time`);
+    assert.ok(byId.get(a.base).refs.includes(a.branch));
+  }
+  // You changed the billing help on main after Help pages started: that is what its work clashes with.
+  const help = g.agents.find(a => a.name === 'Help pages');
+  const k = trunk.findIndex(c => c.id === help.base);
+  assert.ok(trunk.slice(0, k).some(c => c.subject === 'Update the billing help for annual plans'));
+  assert.ok(store.get(help.id).files.list.some(f => f.path === 'docs/help/billing.md'));
+  // The engine's views, when it passes them, say what the page shows.
+  const iid = store.byName('Invoice export').id;
+  store.get(iid).state = 'stopped';
+  assert.equal(sim.gitGraph({ views: id => store.get(id) }).agents.find(a => a.id === iid).state, 'stopped');
+  assert.equal(sim.gitGraph({ views: store.list() }).agents.find(a => a.id === iid).state, 'stopped');
+  assert.equal(sim.gitGraph().agents.find(a => a.id === iid).state, 'done_checked', 'else its own record');
+});
+
+test('git: the graph is what git itself lists for the same commits: order, parents, authors, times, branches and trailers', () => {
+  const { sim } = world();
+  sim.seedWorld();
+  const g = sim.gitGraph();
+  assert.deepEqual(asGitListsIt(g), g.commits);
+});
+
+test('git: the same seed and clock give the same graph, another seed other ids; looking changes nothing', () => {
+  const graphOf = seed => {
+    const w = world({ seed });
+    w.sim.seedWorld();
+    return w.sim.gitGraph();
+  };
+  const a = graphOf(7);
+  assert.deepEqual(graphOf(7), a);
+  const c = graphOf(8);
+  assert.notDeepEqual(c.commits.map(x => x.id), a.commits.map(x => x.id));
+  assert.deepEqual(c.commits.map(x => x.subject), a.commits.map(x => x.subject), 'the same history');
+  // At most `limit` commits, and `more` when there are others.
+  const some = (() => { const w = world({ seed: 7 }); w.sim.seedWorld(); return w.sim.gitGraph({ limit: 10 }); })();
+  assert.deepEqual(some.commits, a.commits.slice(0, 10));
+  assert.equal(some.more, true);
+  // Looking at the graph, a diff or a card neither emits anything nor changes how the demo plays out.
+  const play = look => {
+    const w = world({ seed: 11 });
+    w.sim.seedWorld();
+    const ids = w.store.list().map(v => v.id);
+    for (let i = 0; i < 60; i++) {
+      w.clock.t += 1000;
+      w.sim.tick(w.clock.t);
+      if (look) for (const id of ids) { w.sim.gitGraph(); w.sim.changes(id); w.sim.proposeMerge(id); w.sim.proposeDiscard(id); }
+    }
+    return w.store.events;
+  };
+  assert.deepEqual(play(true), play(false));
+});
+
+test('git: changes() is a unified diff of exactly the files the agent changed, in workDiff’s shape, and git reads it', () => {
+  const { sim, store } = world();
+  sim.seedWorld();
+  const g = sim.gitGraph();
+  for (const v of store.roots()) {
+    const d = sim.changes(v.id);
+    const a = g.agents.find(x => x.id === v.id);
+    assert.deepEqual(Object.keys(d), ['workId', 'since', 'head', 'files', 'left', 'omitted']);
+    assert.equal(d.since, a.base);
+    assert.equal(d.head, a.base, 'nothing of it is committed yet');
+    assert.match(d.workId, new RegExp(`^${a.base}:[0-9a-f]{40}$`));
+    assert.deepEqual(d.left, []);
+    assert.equal(d.omitted, 0);
+    assert.deepEqual(d.files.map(f => [f.path, f.adds, f.dels]), v.files.list.map(f => [f.path, f.adds, f.dels]), `${v.name}: the files its card lists`);
+    for (const f of d.files) {
+      assert.deepEqual(Object.keys(f), ['path', 'status', 'adds', 'dels', 'patch']);
+      checkPatch(f);
+    }
+    assert.deepEqual(gitReads(d.files), readAs(d.files), `${v.name}: as git reads it`);
+    assert.deepEqual(sim.changes(v.id), d, 'the same every time');
+  }
+  // Invoice export added three files and changed two; a new file is all new lines.
+  const inv = sim.changes(store.byName('Invoice export').id);
+  assert.deepEqual(inv.files.map(f => [f.path, f.status]), [
+    ['src/invoices/batch.ts', 'added'], ['src/invoices/export.ts', 'modified'], ['src/invoices/query.ts', 'modified'],
+    ['migrations/0042_invoice_lookup_index.sql', 'added'], ['test/invoices/large-account.test.ts', 'added'],
+  ]);
+  for (const f of inv.files.filter(x => x.status === 'added')) assert.equal(f.dels, 0);
+  // A helper's id gives its agent's work, and a shorter list says how many files it left out.
+  const cid = store.byName('Checkout fix').id;
+  assert.deepEqual(sim.changes(store.helpersOf(cid)[0].id), sim.changes(cid));
+  const two = sim.changes(cid, { maxFiles: 2 });
+  assert.deepEqual(two.files, sim.changes(cid).files.slice(0, 2));
+  assert.equal(two.omitted, store.get(cid).files.changed - 2);
+  assert.deepEqual(sim.changes('nope00'), { ok: false, reply: 'That agent is not part of the demo.' });
+});
+
+test('git: the diffs of many seeds are all well formed, and git reads every one with the same counts', () => {
+  for (let seed = 1; seed <= 12; seed++) {
+    const { sim, store } = world({ seed });
+    sim.seedWorld();
+    const files = store.roots().flatMap(v => sim.changes(v.id).files);
+    for (const f of files) checkPatch(f);
+    assert.deepEqual(gitReads(files), readAs(files), `seed ${seed}`);
+  }
+});
+
+test('git: Invoice export merges: its work becomes a commit on its branch, and a merge commit joins it into main', () => {
+  const { sim, store, id, clock, until } = seeded();
+  const iid = id('Invoice export');
+  const v = store.get(iid);
+  const before = sim.gitGraph();
+  const mine = before.agents.find(a => a.id === iid);
+  const adds = sum(v.files.list, 'adds');
+  const dels = sum(v.files.list, 'dels');
+  assert.equal(v.files.changed, 5);
+  const merging = sim.changes(iid);
+  const n = store.events.length;
+  const card = sim.proposeMerge(iid);
+  assert.equal(store.events.length, n, 'a card changes nothing');
+  assert.deepEqual(card, {
+    ok: true, agentId: iid, kind: 'merge', into: 'main', sentence: 'Merge Invoice export into main?',
+    detail: `5 files, +${adds} −${dels}. Its work becomes a commit on its branch, joined into main by a merge commit. It broke a rule you set: Do not touch migrations/. Your 2 uncommitted changes stay as they are. This is the demo, so nothing is really merged.`,
+    yes: 'Merge', no: 'Cancel', danger: false, reply: 'Merge Invoice export into main?', files: 5, adds, dels,
+    expect: { workId: sim.changes(iid).workId, into: 'main', intoHead: before.head },
+  });
+
+  clock.t += 30_000;
+  const res = sim.merge(iid, { expect: card.expect });
+  assert.deepEqual(Object.keys(res), ['ok', 'into', 'merge', 'work', 'files', 'adds', 'dels', 'reply']);
+  assert.equal(res.ok, true);
+  assert.deepEqual([res.into, res.files, res.adds, res.dels], ['main', 5, adds, dels]);
+  assert.match(res.merge, HEX40);
+  assert.match(res.work, HEX40);
+  assert.equal(res.reply, `Merged Invoice export into main. ${MERGED}`);
+  // The same events the engine sends for a real merge: what became of its work, and nothing left unmerged.
+  const fresh = store.events.slice(n).filter(e => e.agentId === iid);
+  assert.deepEqual(fresh.map(e => [e.kind, e.agentId]), [[WORK, iid], [EV.FILES, iid]]);
+  const work = { branch: mine.branch, from: 'main', folder: true, merged: { into: 'main', merge: res.merge, at: clock.t, files: 5, adds, dels }, problem: null, thrownAway: null };
+  assert.deepEqual(fresh[0].work, work);
+  assert.deepEqual(fresh[1].files, NO_FILES);
+  assert.deepEqual(v.work, work);
+  assert.deepEqual(v.files, NO_FILES);
+  assert.equal(v.state, 'done_checked', 'a merge changes no state');
+  assert.deepEqual(store.errors, []);
+
+  // The graph: the merge commit M (your old tip first, then W) is main's tip; W is on its branch, from where it started.
+  const g = sim.gitGraph();
+  assert.equal(g.head, res.merge);
+  assert.equal(g.repo.head, res.merge);
+  assert.equal(g.commits.length, before.commits.length + 2);
+  const subject = 'Make the invoice export work for large accounts by sending invoices in';   // cut at a word, at most 72
+  assert.equal(subjectOf(v.task), subject);
+  assert.deepEqual(g.commits[0], { id: res.merge, parents: [before.head, res.work], subject: `Merge Invoice export: ${subject}`, author: 'you', at: sec(clock.t), refs: ['main'], agentId: iid, kind: 'merge' });
+  assert.deepEqual(g.commits[1], { id: res.work, parents: [mine.base], subject, author: 'Invoice export', at: sec(clock.t), refs: [mine.branch], agentId: iid, kind: 'work' });
+  const after = g.agents.find(a => a.id === iid);
+  assert.deepEqual([after.base, after.since], [mine.base, res.work], 'its unmerged work now starts at W');
+  assert.deepEqual(after.files, NO_FILES);
+  assert.deepEqual(after.work, work);
+  assert.deepEqual(asGitListsIt(g), g.commits);
+
+  // Nothing is left to merge.
+  assert.deepEqual(sim.changes(iid).files, []);
+  assert.deepEqual(sim.proposeMerge(iid), { ok: false, why: 'nothing', reply: 'Invoice export’s work is already in main.' });
+  assert.deepEqual(sim.merge(iid), { ok: false, why: 'nothing', sentence: 'Invoice export’s work is already in main.', into: 'main', reply: `Invoice export’s work is already in main. ${MERGED}` });
+  assert.equal(sim.gitGraph().head, res.merge);
+
+  // It takes a follow-up: taking the database change out again is new work, and the next merge takes only that.
+  sim.say(iid, 'Undo that part');
+  until(() => store.get(iid).state !== 'working', 3 * MIN);
+  assert.equal(v.state, 'done_checked');
+  const final = store.eventsFor(iid).filter(e => e.kind === EV.TURN && e.phase === 'end').at(-1).finalText;
+  assert.match(final, /^I took out the database change\. It is already in main, so merging this takes the migration out of main again\./);
+  const d = sim.changes(iid);
+  assert.equal(d.since, res.work);
+  assert.deepEqual(d.files.map(f => [f.path, f.status]), [['src/invoices/query.ts', 'modified'], ['migrations/0042_invoice_lookup_index.sql', 'deleted']]);
+  const gone = d.files[1];
+  assert.equal(gone.adds, 0);
+  assert.equal(gone.dels, before.agents.find(a => a.id === iid).files.list.find(f => f.path === gone.path).adds, 'all of the merged file goes');
+  // The lines taken out are the ones that were put in, from the same blob.
+  const put = merging.files.find(f => f.path === gone.path).patch.split('\n');
+  const out = gone.patch.split('\n');
+  assert.equal(out[2], `index ${put[2].slice('index 0000000..'.length)}..0000000`);
+  assert.deepEqual(out.slice(6).map(l => l.slice(1)), put.slice(6).map(l => l.slice(1)));
+  for (const f of d.files) checkPatch(f);
+  assert.deepEqual(gitReads(d.files), readAs(d.files));
+  const card2 = sim.proposeMerge(iid);
+  assert.equal(card2.detail, `2 files, +${sum(d.files, 'adds')} −${sum(d.files, 'dels')}. Its work becomes a commit on its branch, joined into main by a merge commit. It broke a rule you set: Do not touch migrations/. Your 2 uncommitted changes stay as they are. This is the demo, so nothing is really merged.`);
+  clock.t += 60_000;
+  const res2 = sim.merge(iid, { expect: card2.expect });
+  assert.equal(res2.ok, true);
+  const g2 = sim.gitGraph();
+  assert.deepEqual(g2.commits[0].parents, [res.merge, res2.work]);
+  assert.deepEqual(g2.commits[1].parents, [res.work], 'the second work commit follows the first');
+  assert.deepEqual([res2.files, res2.adds, res2.dels], [2, sum(d.files, 'adds'), sum(d.files, 'dels')]);
+  assert.deepEqual(v.work.merged, { into: 'main', merge: res2.merge, at: clock.t, files: 2, adds: res2.adds, dels: res2.dels });
+  assert.deepEqual(asGitListsIt(g2), g2.commits);
+  assert.deepEqual(store.errors, []);
+});
+
+test('git: Help pages gives a conflict, keeps it until a turn starts, and merges once it brings in main', () => {
+  const { sim, store, id, clock, until } = seeded();
+  const hid = id('Help pages');
+  const v = store.get(hid);
+  const before = sim.gitGraph();
+  const mine = before.agents.find(a => a.id === hid);
+  const card = sim.proposeMerge(hid);
+  assert.equal(card.detail, `3 files, +${sum(v.files.list, 'adds')} −${sum(v.files.list, 'dels')}. Its work becomes a commit on its branch, joined into main by a merge commit. Nothing checked its work. Your 2 uncommitted changes stay as they are. This is the demo, so nothing is really merged.`);
+
+  clock.t += 10_000;
+  const n = store.events.length;
+  const res = sim.merge(hid, { expect: card.expect });
+  const sentence = 'Help pages’s work does not merge cleanly into main.';
+  assert.deepEqual(res, { ok: false, why: 'conflict', sentence, paths: ['docs/help/billing.md'], into: 'main', reply: `${sentence} ${MERGED}` });
+  const problem = { why: 'conflict', sentence, paths: ['docs/help/billing.md'], at: clock.t };
+  assert.deepEqual(store.events.slice(n).filter(e => e.agentId === hid).map(e => e.kind), [WORK]);
+  assert.deepEqual(v.work, { branch: mine.branch, from: 'main', folder: true, merged: null, problem, thrownAway: null });
+  assert.equal(v.files.changed, 3, 'its work is still unmerged');
+  // Nothing changed on main. Its work is a commit on its own branch now (W stays there), as a real merge leaves it.
+  const g = sim.gitGraph();
+  assert.equal(g.head, before.head);
+  const w = g.commits.find(c => c.refs.includes(mine.branch));
+  assert.deepEqual([w.kind, w.agentId, w.author, w.parents], ['work', hid, 'Help pages', [mine.base]]);
+  assert.equal(w.subject, 'Rewrite the help pages for getting started, billing and exports in plain');
+  assert.equal(g.commits.length, before.commits.length + 1);
+  // Trying again gives the same conflict, and makes nothing new.
+  assert.equal(sim.merge(hid).why, 'conflict');
+  assert.equal(sim.gitGraph().commits.length, g.commits.length);
+
+  // The lid's "Ask it to bring in main": its next turn clears the problem, and it settles the clash on its branch.
+  const ask = 'Your work conflicts with the latest main in: docs/help/billing.md. Please merge main into your branch, resolve the conflicts, and finish.';
+  assert.equal(sim.say(hid, ask).ok, true);
+  assert.equal(v.state, 'working');
+  assert.equal(v.work.problem, null);
+  until(() => store.get(hid).state !== 'working', 3 * MIN);
+  assert.equal(v.state, 'done_claimed');
+  assert.match(v.says, /^I brought in the latest main and resolved the conflict in billing\.md/);
+  const g2 = sim.gitGraph();
+  const tip = g2.commits.find(c => c.refs.includes(mine.branch));
+  assert.deepEqual(tip.parents, [w.id, before.head], 'main merged into its branch');
+  assert.deepEqual([tip.subject, tip.author, tip.agentId, tip.kind], [`Merge branch 'main' into ${mine.branch}`, 'Help pages', null, 'commit'],
+    'an agent’s own merge carries no Workbench trailers');
+
+  clock.t += 10_000;
+  const card2 = sim.proposeMerge(hid);
+  assert.equal(card2.ok, true);
+  const ok = sim.merge(hid, { expect: card2.expect });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.reply, `Merged Help pages into main. ${MERGED}`);
+  assert.equal(ok.work, tip.id, 'everything was committed on its branch already: its tip is what merges');
+  const g3 = sim.gitGraph();
+  assert.deepEqual(g3.commits[0].parents, [before.head, tip.id]);
+  assert.deepEqual(v.work.problem, null);
+  assert.equal(v.work.merged.merge, ok.merge);
+  assert.deepEqual(asGitListsIt(g3), g3.commits);
+  assert.deepEqual(store.errors, []);
+});
+
+test('git: throwing away a finished agent’s work keeps a hidden copy, deletes its branch and closes it quietly', () => {
+  const { sim, store, id, clock } = seeded();
+  const hid = id('Help pages');
+  const v = store.get(hid);
+  const branch = v.work.branch;
+  const card = sim.proposeDiscard(hid);
+  assert.deepEqual(card, {
+    ok: true, agentId: hid, kind: 'discard', sentence: 'Throw away Help pages’s work?',
+    detail: `Its folder and its branch ${branch} are deleted, with 3 changed files. Workbench keeps a hidden copy in git. This is the demo, so nothing is really thrown away.`,
+    yes: 'Throw it away', no: 'Keep it', danger: true, active: false, reply: 'Throw away Help pages’s work?',
+    expect: { workId: sim.changes(hid).workId },
+  });
+  assert.deepEqual(sim.discard(hid, { expect: { workId: 'stale' } }), {
+    ok: false, why: 'changed', sentence: 'Help pages’s work changed since you looked. Have another look.', reply: 'Help pages’s work changed since you looked. Have another look.',
+  });
+
+  clock.t += 5000;
+  const n = store.events.length;
+  const res = sim.discard(hid, { expect: card.expect });
+  assert.deepEqual(res, { ok: true, saved: `refs/workbench/discarded/${hid}`, reply: `Threw away Help pages’s work. Its folder and branch are gone. ${THROWN}` });
+  assert.deepEqual(store.events.slice(n).filter(e => e.agentId === hid).map(e => e.kind), [EV.ENDED, WORK], 'its idle process is closed, then its work goes');
+  assert.deepEqual(v.work, { branch: null, from: 'main', folder: false, merged: null, problem: null, thrownAway: { at: clock.t, saved: res.saved } });
+  assert.equal(v.state, 'done_claimed', 'it still shows the state it finished in');
+  assert.equal(sim.runnerFor(hid).info().alive, false);
+  // Its branch is gone from the graph, and so is the agent.
+  const g = sim.gitGraph();
+  assert.ok(!g.commits.some(c => c.refs.includes(branch)));
+  assert.ok(!g.agents.some(a => a.id === hid));
+  // Nothing more can happen to its work, and it cannot continue.
+  assert.deepEqual(sim.changes(hid), { ok: false, reply: 'Help pages’s work was thrown away, so there is nothing to show.' });
+  assert.deepEqual(sim.proposeMerge(hid), { ok: false, why: 'gone', reply: 'Help pages’s work was thrown away, so there is nothing to merge.' });
+  assert.equal(sim.merge(hid).why, 'gone');
+  assert.deepEqual(sim.proposeDiscard(hid), { ok: false, reply: 'Help pages’s work was already thrown away.' });
+  assert.deepEqual(sim.discard(hid), { ok: false, reply: 'Help pages’s work was already thrown away.' });
+  assert.deepEqual(sim.say(hid, 'Get it checked'), { ok: false, reply: 'Help pages’s work was thrown away, so it cannot continue.' });
+  assert.deepEqual(store.errors, []);
+});
+
+test('git: throwing away a working agent stops it and its helpers first, and the card says so', async () => {
+  const { sim, store, id, run } = seeded();
+  const oid = id('Onboarding');
+  const v = store.get(oid);
+  const card = sim.proposeDiscard(oid);
+  assert.equal(card.active, true);
+  assert.equal(card.detail, `Its folder and its branch ${v.work.branch} are deleted, with ${v.files.changed} changed files. Workbench keeps a hidden copy in git. It is still working: it will be stopped first. This is the demo, so nothing is really thrown away.`);
+  // A card drawn for a state it is no longer in is refused.
+  assert.deepEqual(sim.proposeDiscard(oid, { state: 'done_checked' }), { ok: false, reply: 'That changed. Have another look.' });
+  const res = sim.discard(oid);
+  assert.equal(res.ok, true);
+  assert.equal(v.state, 'stopped');
+  assert.equal(v.stateReason, 'Stopped by you');
+  for (const h of store.helpersOf(oid)) assert.equal(h.state, 'stopped');
+  assert.equal(v.work.thrownAway.saved, `refs/workbench/discarded/${oid}`);
+  const n = store.events.length;
+  run(MIN);
+  assert.equal(store.events.length, n, 'nothing more from it');
+  await assert.rejects(sim.runnerFor(oid).send('carry on'), { message: 'Onboarding’s work was thrown away, so it cannot continue.' });
+  assert.deepEqual(store.errors, []);
+});
+
+test('git: merges and throw-aways are refused in the engine’s words', () => {
+  const { sim, store, id } = seeded();
+  const cid = id('Checkout fix');
+  const iid = id('Invoice export');
+  for (const name of ['Checkout fix', 'Search cleanup', 'Flaky test', 'Onboarding']) {
+    const refusal = { ok: false, reply: `${name} is still working. Merge it when it is done.` };
+    assert.deepEqual(sim.proposeMerge(id(name)), refusal, name);
+    assert.deepEqual(sim.merge(id(name)), refusal, name);
+  }
+  const helper = store.helpersOf(cid)[0].id;
+  assert.deepEqual(sim.proposeMerge(helper), { ok: false, reply: 'Helpers work in their agent’s folder. Merge the agent instead.' });
+  assert.deepEqual(sim.merge(helper), { ok: false, reply: 'Helpers work in their agent’s folder. Merge the agent instead.' });
+  assert.deepEqual(sim.proposeDiscard(helper), { ok: false, reply: 'Helpers work in their agent’s folder. Throw away the agent’s work instead.' });
+  assert.deepEqual(sim.discard(helper), { ok: false, reply: 'Helpers work in their agent’s folder. Throw away the agent’s work instead.' });
+  for (const fn of ['proposeMerge', 'merge', 'proposeDiscard', 'discard']) {
+    assert.deepEqual(sim[fn]('nope00'), { ok: false, reply: 'That agent is not part of the demo.' }, fn);
+  }
+  assert.deepEqual(sim.proposeMerge(iid, { state: 'done_claimed' }), { ok: false, reply: 'That changed. Have another look.' });
+  assert.equal(sim.proposeMerge(iid, { state: 'done_checked' }).ok, true);
+  // A card bound to what it showed: main moved, or the work changed, since.
+  const card = sim.proposeMerge(iid);
+  const n = store.events.length;
+  const moved = sim.merge(iid, { expect: { ...card.expect, intoHead: 'f'.repeat(40) } });
+  assert.deepEqual(moved, {
+    ok: false, why: 'moved', sentence: 'main changed since you looked. Have another look.', paths: [], into: 'main',
+    reply: `main changed since you looked. Have another look. ${MERGED}`,
+  });
+  assert.deepEqual(store.get(iid).work.problem, { why: 'moved', sentence: moved.sentence, paths: [], at: store.events.at(-1).ts });
+  assert.equal(store.events.length, n + 1);
+  assert.deepEqual(sim.merge(iid, { expect: { ...card.expect, workId: 'stale' } }), {
+    ok: false, why: 'changed', sentence: 'Invoice export’s work changed since you looked. Have another look.', into: 'main',
+    reply: `Invoice export’s work changed since you looked. Have another look. ${MERGED}`,
+  });
+  assert.equal(sim.gitGraph().head, card.expect.intoHead, 'nothing was merged');
+  // A later merge goes through, and clears the problem.
+  assert.equal(sim.merge(iid).ok, true);
+  assert.equal(store.get(iid).work.problem, null);
+});
+
+test('git: a task started in the demo works on its own branch from main as it is, and merges once done', () => {
+  const p = playRunner({ seed: 5, agentId: 'a1b2c3' });
+  const { sim, mine, store } = p;
+  const v = mine.get('a1b2c3');
+  assert.match(v.state, /^done_/);
+  assert.deepEqual(mine.errors, []);
+  assert.deepEqual(store.events, [], 'its events go to its own emit');
+  const branch = 'workbench/fix-flaky-checkout-test-a1b2c3';
+  const starts = mine.events.filter(e => e.kind === WORK);
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0].work, { branch, from: 'main', folder: true, merged: null, problem: null, thrownAway: null });
+  const g = sim.gitGraph();
+  const a = g.agents.find(x => x.id === 'a1b2c3');
+  assert.deepEqual([a.name, a.branch, a.base, a.since], ['Fix flaky checkout test', branch, g.head, g.head], 'from main’s tip when it started');
+  assert.deepEqual(a.files, v.files);
+  assert.equal(a.state, v.state);
+  assert.deepEqual(g.commits[0].refs, ['main', branch]);
+  const card = sim.proposeMerge('a1b2c3');
+  assert.equal(card.sentence, 'Merge Fix flaky checkout test into main?');
+  assert.match(card.detail, /^\d+ files?, \+\d+ −\d+\. Its work becomes a commit on its branch, joined into main by a merge commit\. (Nothing checked its work\. )?Your 2 uncommitted changes stay as they are\. This is the demo, so nothing is really merged\.$/);
+  const res = sim.merge('a1b2c3', { expect: card.expect });
+  assert.equal(res.ok, true);
+  assert.deepEqual(mine.events.slice(-2).map(e => e.kind), [WORK, EV.FILES]);
+  assert.deepEqual(v.files, NO_FILES);
+  const g2 = sim.gitGraph();
+  assert.deepEqual(g2.commits[1], { id: res.work, parents: [g.head], subject: 'Fix the flaky checkout test', author: 'Fix flaky checkout test', at: g2.commits[1].at, refs: [branch], agentId: 'a1b2c3', kind: 'work' });
+  assert.deepEqual(asGitListsIt(g2), g2.commits);
+});
+
+test('git: when a turn ends, what the agent changed is reported again, as a real run’s receipt does', () => {
+  // A new turn clears the last receipt; a follow-up that changes nothing must still end with the agent's files, or the
+  // page would show no unmerged work and offer no merge.
+  const { sim, store, id, until } = seeded();
+  const hid = id('Help pages');
+  const files = store.get(hid).files;
+  sim.say(hid, 'Get it checked');
+  assert.equal(store.get(hid).files, null, 'the new turn cleared it');
+  until(() => store.get(hid).state !== 'working', 3 * MIN);
+  assert.equal(store.get(hid).state, 'done_checked');
+  assert.deepEqual(store.get(hid).files, files);
+  // Every turn of a task started in the demo ends with its files, just before the end of the turn.
+  for (const seed of [1, 2, 3, 4, 5, 6]) {
+    const p = playRunner({ seed, agentId: `h0000${seed}` });
+    const evs = p.mine.eventsFor(p.agentId);
+    const ends = evs.flatMap((e, i) => (e.kind === EV.TURN && e.phase === 'end' ? [i] : []));
+    assert.ok(ends.length >= 1);
+    for (const i of ends) assert.equal(evs[i - 1].kind, EV.FILES, `seed ${seed}`);
+    const v = p.mine.get(p.agentId);
+    assert.ok(v.files && v.files.changed >= 1, `seed ${seed}: it ends with its files`);
+    assert.deepEqual(v.files, graphFilesOf(p));
+  }
+});
+
+/** The files a played runner's agent has, as the git screen lists them. */
+function graphFilesOf(p) {
+  return p.sim.gitGraph().agents.find(a => a.id === p.agentId).files;
+}
+
+test('git: a work commit’s subject is the task’s first sentence, capitalised, cut at a word to at most 72 characters', () => {
+  assert.equal(subjectOf('fix the login redirect. Then add tests for it.'), 'Fix the login redirect');
+  assert.equal(subjectOf('make the e.g. field optional'), 'Make the e.g. field optional');
+  assert.equal(subjectOf('Clean up the old search code now that the new search page is live'), 'Clean up the old search code now that the new search page is live');
+  const long = subjectOf('rewrite the help pages for getting started, billing and exports in plain language for everyone');
+  assert.equal(long, 'Rewrite the help pages for getting started, billing and exports in plain');
+  assert.ok(long.length <= 72);
+  assert.equal(subjectOf('   '), 'Work by an agent');
+  assert.equal(subjectOf('', 'Fix login'), 'Work by Fix login');
+  assert.equal(subjectOf('fix\nthe\tlogin'), 'Fix the login', 'one line');
 });
