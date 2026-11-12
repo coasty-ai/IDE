@@ -39,6 +39,19 @@ class FakeEngine {
   async say(id, text) { this.calls.push(['say', id, text]); return { ok: true, reply: 'Sent.' }; }
   async stop(id) { this.calls.push(['stop', id]); return { ok: true, reply: 'Stopped.' }; }
   async setMachineAwake(id, awake) { this.calls.push(['awake', id, awake]); return { ok: true, reply: 'Done.' }; }
+  async gitGraph() {
+    this.calls.push(['gitGraph']);
+    return { ok: true, repo: { name: 'shop', branch: 'main', head: 'ab'.repeat(20), dirty: 0, identity: true }, commits: [], more: false, agents: [] };
+  }
+  async changes(id) { this.calls.push(['changes', id]); return { ok: true, agentId: id, name: 'Fix login', branch: `workbench/fix-login-${id}`, into: 'main', live: false, diff: { files: [], left: [], omitted: 0 } }; }
+  async proposeMerge(id, o) {
+    this.calls.push(['proposeMerge', id, o]);
+    return { reply: 'Merge Fix login into main?', confirm: { id: '0a1b2c3d4e5f', sentence: 'Merge Fix login into main?', detail: '1 file, +3 −1.', kind: 'merge', yes: 'Merge', no: 'Cancel', danger: false } };
+  }
+  async proposeDiscard(id, o) {
+    this.calls.push(['proposeDiscard', id, o]);
+    return { reply: 'Throw away Fix login’s work?', confirm: { id: '0a1b2c3d4e60', sentence: 'Throw away Fix login’s work?', detail: 'Its folder and its branch are deleted.', kind: 'discard', yes: 'Throw it away', no: 'Keep it', danger: true } };
+  }
   hookPreToolUse(agentId, payload, { signal } = {}) {
     this.calls.push(['hook', agentId, payload]);
     this.hookSignal = signal;
@@ -325,6 +338,16 @@ test('API routes call the engine with the right arguments', async () => {
   await post('/api/agents/abc123/say', { text: 'hello' });
   await post('/api/agents/abc123-a71ea18c/stop', {});
   await post('/api/machines/cloud-2/awake', { awake: true });
+  // The git screen, an agent's changes, and the merge and throw-away cards. The state the page drew a button for is
+  // passed on only when it is a state; anything else is as if nothing was sent.
+  await request({ path: '/api/git', headers: auth() });
+  await request({ path: '/api/agents/abc123/changes', headers: auth() });
+  await post('/api/agents/abc123/merge', { state: 'done_claimed' });
+  await post('/api/agents/abc123/merge', { state: 'merged' });
+  await post('/api/agents/abc123/merge', {});
+  await post('/api/agents/abc123/discard', { state: 'needs_ok' });
+  await post('/api/agents/abc123/discard', { state: ['done_claimed'] });
+  await post('/api/agents/abc123/discard', { state: 'toString' });
   assert.deepEqual(engine.calls, [
     ['command', 'what needs me', { focusId: 'abc123', confirmId: null, askId: null }],
     ['command', 'yes', { focusId: 'abc123', confirmId: '0a1b2c3d4e5f', askId: 'ok-1a2b3c4d' }],
@@ -338,6 +361,62 @@ test('API routes call the engine with the right arguments', async () => {
     ['say', 'abc123', 'hello'],
     ['stop', 'abc123-a71ea18c'],
     ['awake', 'cloud-2', true],
+    ['gitGraph'],
+    ['changes', 'abc123'],
+    ['proposeMerge', 'abc123', { state: 'done_claimed' }],
+    ['proposeMerge', 'abc123', { state: null }],
+    ['proposeMerge', 'abc123', { state: null }],
+    ['proposeDiscard', 'abc123', { state: 'needs_ok' }],
+    ['proposeDiscard', 'abc123', { state: null }],
+    ['proposeDiscard', 'abc123', { state: null }],
+  ]);
+});
+
+test('the git screen, changes, merge and throw-away routes: the token, the methods, a hook token refused, and a card answered by its id', async () => {
+  engine.calls.length = 0;
+  // The token: in the header, or in ?t= for the GET routes only.
+  assert.equal((await request({ path: '/api/git' })).status, 401);
+  assert.equal((await request({ path: '/api/agents/abc123/changes' })).status, 401);
+  const git = await request({ path: `/api/git?t=${TOKEN}` });
+  assert.equal(git.status, 200);
+  assert.equal(git.headers['cache-control'], 'no-store');
+  assert.equal(git.json.repo.branch, 'main');
+  assert.equal((await request({ path: `/api/agents/abc123/changes?t=${TOKEN}` })).json.agentId, 'abc123');
+  for (const p of ['/api/agents/abc123/merge', '/api/agents/abc123/discard']) {
+    const r = await request({ method: 'POST', path: `${p}?t=${TOKEN}`, body: {}, headers: { 'Content-Type': 'application/json' } });
+    assert.equal(r.status, 401, `${p}: the query token is for GET routes only`);
+  }
+  // An agent's own hook token opens none of them, for that agent or any other.
+  const mine = hookTokenFor('abc123');
+  assert.equal((await request({ path: '/api/git', headers: { 'X-Workbench-Token': mine } })).status, 401);
+  assert.equal((await request({ path: `/api/git?t=${mine}` })).status, 401);
+  assert.equal((await request({ path: '/api/agents/abc123/changes', headers: { 'X-Workbench-Token': mine } })).status, 401);
+  assert.equal((await post('/api/agents/abc123/merge', { state: 'done_claimed' }, { 'X-Workbench-Token': mine })).status, 401);
+  assert.equal((await post('/api/agents/abc123/discard', {}, { 'X-Workbench-Token': mine })).status, 401);
+  // Wrong methods, with what is allowed.
+  for (const [method, p, allow] of [['POST', '/api/git', 'GET'], ['POST', '/api/agents/abc123/changes', 'GET'], ['GET', '/api/agents/abc123/merge', 'POST'], ['GET', '/api/agents/abc123/discard', 'POST']]) {
+    const r = method === 'GET' ? await request({ path: p, headers: auth() }) : await post(p, {});
+    assert.equal(r.status, 405, p);
+    assert.equal(r.headers.allow, allow, p);
+  }
+  // Bad ids, and POSTs from another site.
+  assert.equal((await request({ path: '/api/agents/a%2Fb/changes', headers: auth() })).status, 404);
+  assert.equal((await post('/api/agents/a:b/merge', {})).status, 404);
+  assert.equal((await post('/api/agents/abc123/merge', {}, { Origin: 'http://evil.example' })).status, 403);
+  assert.equal(engine.calls.filter(c => c[0] === 'proposeMerge' || c[0] === 'proposeDiscard').length, 0, 'none of these reached the engine');
+  // A merge only ever gets a card back; the yes goes to /api/confirm/<its id>.
+  const card = await post('/api/agents/abc123/merge', { state: 'done_claimed' });
+  assert.equal(card.status, 200);
+  assert.deepEqual(card.json, { reply: 'Merge Fix login into main?', confirm: { id: '0a1b2c3d4e5f', sentence: 'Merge Fix login into main?', detail: '1 file, +3 −1.', kind: 'merge', yes: 'Merge', no: 'Cancel', danger: false } });
+  await post(`/api/confirm/${card.json.confirm.id}`, { go: true });
+  const away = await post('/api/agents/abc123/discard', { state: 'stopped' });
+  assert.equal(away.json.confirm.kind, 'discard');
+  await post(`/api/confirm/${away.json.confirm.id}`, { go: false });
+  assert.deepEqual(engine.calls.filter(c => c[0] !== 'gitGraph' && c[0] !== 'changes'), [
+    ['proposeMerge', 'abc123', { state: 'done_claimed' }],
+    ['confirm', '0a1b2c3d4e5f', true],
+    ['proposeDiscard', 'abc123', { state: 'stopped' }],
+    ['confirm', '0a1b2c3d4e60', false],
   ]);
 });
 
@@ -419,6 +498,11 @@ test('SSE: snapshot on connect, coalesced agents, machines, notices, pings', asy
     const notice = await sse.next('notice');
     assert.deepEqual(notice.data, { text: 'Started Fix login.' });
 
+    // The person's repository changed (a merge moved their branch, a refresh found something new): every page hears.
+    store.repoChanged({ name: 'shop', head: 'ab'.repeat(20), branch: 'main', dirty: 0, identity: true });
+    const repo = await sse.next('repo');
+    assert.deepEqual(repo.data, { name: 'shop', head: 'ab'.repeat(20), branch: 'main', dirty: 0, identity: true });
+
     await sse.nextComment('ping');
   } finally {
     sse.close();
@@ -475,9 +559,9 @@ test('close() removes the store listeners', async () => {
   const s = new Store();
   const srv = createServer({ engine: new FakeEngine(s), store: s, token: TOKEN, port: 0, rootDir: ROOT });
   await srv.listen();
-  assert.equal(s.listenerCount('agents'), 1);
+  for (const name of ['agents', 'machines', 'notice', 'removed', 'repo']) assert.equal(s.listenerCount(name), 1, name);
   await srv.close();
-  assert.equal(s.listenerCount('agents'), 0);
+  for (const name of ['agents', 'machines', 'notice', 'removed', 'repo']) assert.equal(s.listenerCount(name), 0, name);
   assert.throws(() => createServer({ engine: new FakeEngine(s), store: s, token: 'short' }), /32 random bytes/);
 });
 
