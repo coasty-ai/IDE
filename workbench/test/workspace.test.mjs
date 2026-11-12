@@ -923,6 +923,23 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
         else write(f, `${t.ws.base}\n`);
       }, 'busy', 'Your folder is in the middle of a merge or rebase. Finish that first.');
     }
+    // Unresolved conflicts in the person's index with none of those markers: a `git stash pop` that did not apply cleanly.
+    cases.push(async () => {
+      const t = await agentRepo();
+      write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+      write(t.p('b.txt'), 'b stashed\n');
+      git(t.root, 'stash', '-q');
+      write(t.p('b.txt'), 'b committed\n');
+      git(t.root, 'commit', '-q', '-am', 'person');
+      assert.notEqual(gitTry(t.root, 'stash', 'pop').code, 0);
+      assert.equal(statusOf(t.root), 'UU b.txt\n');
+      assert.equal(gitTry(t.root, 'rev-parse', '-q', '--verify', 'MERGE_HEAD').code, 1);
+      const { expect } = await proposal(t);
+      const was = await everything(t);
+      assert.deepEqual(await mergeWork(mergeOpts(t, expect)),
+        { ok: false, why: 'busy', sentence: 'Your folder has unresolved conflicts in b.txt. Finish that first.', paths: ['b.txt'] });
+      assert.deepEqual(await everything(t), was);
+    });
 
     // Branch or HEAD changed since the card was drawn.
     refused('a new commit', t => {

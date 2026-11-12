@@ -554,6 +554,7 @@ const CLAUDE_TRAILER = 'Co-authored-by: Claude <noreply@anthropic.com>';
 const SAY = {
   detached: 'Your folder is not on a branch, so there is nowhere to merge it.',
   busy: 'Your folder is in the middle of a merge or rebase. Finish that first.',
+  conflicted: paths => `Your folder has unresolved conflicts in ${listOf(paths, 3)}. Finish that first.`,
   locked: 'Another git command is busy in your folder. Try again in a moment.',
   identity: 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.',
   gitOld: 'Workbench needs git 2.38 or newer to merge.',
@@ -700,6 +701,15 @@ async function gitPathsExist(cwd, names, run = git) {
 
 /** Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder). */
 const underWay = (cwd, run = git) => gitPathsExist(cwd, UNDER_WAY, run);
+
+/**
+ * The paths with unresolved conflicts in this folder's index, each once. A `git stash pop` that did not apply cleanly
+ * leaves them without any of the UNDER_WAY markers, and git then refuses to merge at all.
+ */
+async function unresolved(cwd, run = git) {
+  const out = (await run(['ls-files', '-u', '-z'], { cwd })).stdout;
+  return [...new Set(nulList(out).map(rec => rec.slice(rec.indexOf('\t') + 1)))]; // "<mode> <id> <stage>\t<path>"
+}
 
 /**
  * Whether another git command holds a lock on `branch` (or HEAD). A fast-forward takes that lock only after it has
@@ -1120,12 +1130,13 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
 
   // 1. The person's folder, read afresh. Read together, judged in this order.
   const root = await topFolder(run, repoRoot);
-  const [into, inProgress, who, version, intoHead, worktrees] = await Promise.all([
-    currentBranch(root, run), underWay(root, run), identityAt(run, root), gitVersion(run), commitOf(root, 'HEAD', run),
-    listWorktrees(root, run),
+  const [into, inProgress, conflicted, who, version, intoHead, worktrees] = await Promise.all([
+    currentBranch(root, run), underWay(root, run), unresolved(root, run), identityAt(run, root), gitVersion(run),
+    commitOf(root, 'HEAD', run), listWorktrees(root, run),
   ]);
   if (!into) throw new Refusal('detached', SAY.detached);
   if (inProgress) throw new Refusal('busy', SAY.busy);
+  if (conflicted.length) throw new Refusal('busy', SAY.conflicted(conflicted), conflicted);
   if (!who) throw new Refusal('identity', SAY.identity);
   if (!atLeast(version, MIN_GIT)) throw new Refusal('git-old', SAY.gitOld);
   const seen = typeof exp.into === 'string' && exp.into ? exp.into : into;
@@ -1213,11 +1224,12 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   };
   let r;
   for (let attempt = 1; ; attempt++) {
-    const [on, at, busy, locked] = await Promise.all([
-      currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run), branchLocked(root, into, run),
+    const [on, at, busy, conflicts, locked] = await Promise.all([
+      currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run), unresolved(root, run), branchLocked(root, into, run),
     ]);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
     if (busy) throw new Refusal('busy', SAY.busy);
+    if (conflicts.length) throw new Refusal('busy', SAY.conflicted(conflicts), conflicts);
     if (!locked) {
       progress.started = true;
       r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
@@ -1229,7 +1241,9 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
     if (attempt >= LOCK_TRIES) throw new Refusal('busy', SAY.locked);
     await sleep(200 * attempt);
   }
-  const [on, at, busy] = await Promise.all([currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run)]);
+  const [on, at, busy, conflicts] = await Promise.all([
+    currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run), unresolved(root, run).catch(() => []),
+  ]);
   if (r.code === 0) {
     if (on !== into || (at !== mergeCommit && !(at && (await isAncestor(root, mergeCommit, at, run))))) {
       throw new Refusal('git', SAY.unfinished(into));
@@ -1242,8 +1256,10 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
     const paths = inTheWay(r.stderr);
     if (paths.length && on === into && at === intoHead) throw new Refusal('blocked', SAY.blocked(paths), paths);
   } else {
-    // Exit 128: git stopped before it began (another operation started, or the branch moved meanwhile).
+    // Exit 128: git stopped before it began (another operation started, or the branch moved meanwhile). A fast-forward
+    // never leaves unresolved conflicts itself: those came from something else, and git refuses to merge over them.
     if (busy) throw new Refusal('busy', SAY.busy);
+    if (conflicts.length && on === into && at === intoHead) throw new Refusal('busy', SAY.conflicted(conflicts), conflicts);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
   }
   // Anything else may have stopped part-way through updating their files, so say nothing about them having stayed.
