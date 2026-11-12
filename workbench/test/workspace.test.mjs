@@ -878,12 +878,39 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(third.s.changed, false);
     assert.deepEqual(await mergeWork(mergeOpts(t, third.expect, second.work)), { ok: false, why: 'nothing', sentence: 'Its work is already in main.' });
 
-    // The tidy at shutdown gets `since`: the folder holds nothing beyond W, so it goes, with its branch.
-    assert.deepEqual(await removeWorkspace({ repoRoot: t.root, path: t.ws.path, base: second.work, onlyIfUnchanged: true, deleteBranch: true }),
+    // The tidy at shutdown gets `since`: the folder holds nothing beyond W, and main holds W, so it goes, with its branch.
+    assert.deepEqual(await removeWorkspace({ repoRoot: t.root, path: t.ws.path, base: t.ws.base, since: second.work, onlyIfUnchanged: true, deleteBranch: true }),
       { removed: true, branch: t.ws.branch });
     assert.equal(fs.existsSync(t.ws.path), false);
     assert.equal(git(t.root, 'branch', '--list', t.ws.branch), '');
     assert.equal(git(t.root, 'show', `${second.merge}:d.txt`), 'd');
+  });
+
+  test('the tidy keeps a merged agent’s folder and branch once the person undid the merge: its branch is then the only copy', async () => {
+    const t = await agentRepo();
+    write(t.w('a.txt'), 'one\nTWO\nthree\n');
+    const { expect } = await proposal(t);
+    const m = await mergeWork(mergeOpts(t, expect));
+    assert.equal(m.ok, true);
+    const tidy = () => removeWorkspace({ repoRoot: t.root, path: t.ws.path, base: t.ws.base, since: m.work, onlyIfUnchanged: true, deleteBranch: true });
+    const holding = () => git(t.root, 'for-each-ref', '--contains', m.work, '--format=%(refname)', 'refs/heads/');
+
+    // The person undoes the merge: only the agent's branch holds its work now.
+    git(t.root, 'reset', '-q', '--hard', 'HEAD~1');
+    assert.equal(holding(), `refs/heads/${t.ws.branch}`);
+    assert.deepEqual(await tidy(), { removed: false, kept: true });
+    assert.ok(fs.existsSync(t.ws.path));
+    assert.equal(git(t.root, 'rev-parse', `refs/heads/${t.ws.branch}`), m.work);
+    // Another agent's branch made after the merge holds it too, but the same tidy may take that one away: kept still.
+    git(t.root, 'branch', 'workbench/later-zz0001', m.merge);
+    assert.deepEqual(await tidy(), { removed: false, kept: true });
+    git(t.root, 'branch', '-D', 'workbench/later-zz0001');
+    // Another branch of the person's holds it: the folder and its branch go.
+    git(t.root, 'branch', `kept-${t.id}`, m.merge);
+    assert.deepEqual(await tidy(), { removed: true, branch: t.ws.branch });
+    assert.equal(fs.existsSync(t.ws.path), false);
+    assert.equal(git(t.root, 'branch', '--list', t.ws.branch), '');
+    assert.equal(holding(), `refs/heads/kept-${t.id}`);
   });
 
   test('mergeWork refuses, changing nothing at all, before it makes the work commit', async () => {

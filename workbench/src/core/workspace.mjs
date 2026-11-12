@@ -273,14 +273,19 @@ async function listWorktrees(root, run = git) {
  * goes only while its HEAD is still `base`, `git status` lists nothing at all (not even a file .gitignore hides, such
  * as a .env or a build) and `git worktree remove` without --force agrees; then the branch goes only while it still
  * points at `base` (`update-ref -d`). In that order: update-ref would delete the branch of a folder that was kept.
+ * `since` (with onlyIfUnchanged): the agent's last merged work commit. When given and not `base`, `since` takes the
+ * place of `base` above, and the folder and branch also go only while a branch of the person's holds `since` (any
+ * local branch outside workbench/, which this same tidy may take away): once they undid the merge, the agent's branch
+ * may be the only copy of its work.
  * @returns {Promise<{ removed: boolean, branch?: string|null, kept?: true }>}
  */
-export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = false, onlyIfUnchanged = false, base = null } = {}) {
+export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = false, onlyIfUnchanged = false, base = null, since = null } = {}) {
   const root = realRoot(repoRoot);
   if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath)) throw plainError('No workspace folder was given.');
   const target = canonical(wsPath);
   if (target === root) throw plainError('That is the main folder of the repository, not a workspace.');
-  const start = onlyIfUnchanged ? validRef(base) : null;
+  const merged = onlyIfUnchanged && since != null && since !== '' && since !== base;
+  const start = onlyIfUnchanged ? validRef(merged ? since : base) : null;
   const entry = (await listWorktrees(root)).find(w => w.path === target || canonical(w.path) === target);
   // Not one git lists: nothing of the agent's to take away. Never `git worktree prune`: it would also take away the
   // records of the person's own worktrees whose folders are away right now (on a disk that is not mounted, say).
@@ -290,6 +295,7 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     if (head !== start) return { removed: false, kept: true }; // the agent made commits, or the folder is unreadable
     const status = await git(['status', '--porcelain', '--ignored', '--untracked-files=all'], { cwd: entry.path }).then(r => r.stdout, () => null);
     if (status !== '') return { removed: false, kept: true };
+    if (merged && !(await inPersonsBranch(root, start))) return { removed: false, kept: true }; // the merge was undone
     try {
       await git(['worktree', 'remove', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
     } catch {
@@ -316,6 +322,15 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     fs.rmdirSync(path.dirname(entry.path)); // the per-repository folder, only if now empty
   } catch {}
   return { removed: true, branch: entry.branch };
+}
+
+/**
+ * Whether a local branch outside workbench/ holds `commit` (`for-each-ref --contains`): the branch it was merged into,
+ * or any other of the person's. Workbench's own branches do not count: the tidy that asks may take them away too.
+ */
+async function inPersonsBranch(root, commit) {
+  const r = await git(['for-each-ref', '--contains', commit, '--format=%(refname)', 'refs/heads/'], { cwd: root }).catch(() => null);
+  return !!r && r.stdout.split('\n').some(ref => ref.startsWith('refs/heads/') && !ref.startsWith('refs/heads/workbench/'));
 }
 
 // ---------------------------------------------------------------------------------------------
