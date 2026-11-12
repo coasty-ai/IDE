@@ -691,11 +691,21 @@ function atLeast(v, min) {
   return true;
 }
 
-/** Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder). */
-async function underWay(cwd, run = git) {
-  const out = (await run(['rev-parse', ...UNDER_WAY.flatMap(name => ['--git-path', name])], { cwd })).stdout.split('\n');
-  return UNDER_WAY.some((name, i) => !!out[i] && fs.existsSync(path.resolve(cwd, out[i])));
+/** Whether any of `names` (paths inside this folder's git folder) exists. */
+async function gitPathsExist(cwd, names, run = git) {
+  const out = (await run(['rev-parse', ...names.flatMap(name => ['--git-path', name])], { cwd })).stdout.split('\n');
+  return names.some((name, i) => !!out[i] && fs.existsSync(path.resolve(cwd, out[i])));
 }
+
+/** Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder). */
+const underWay = (cwd, run = git) => gitPathsExist(cwd, UNDER_WAY, run);
+
+/**
+ * Whether another git command holds a lock on `branch` (or HEAD). A fast-forward takes that lock only after it has
+ * updated the files, so it would stop half-way: check first.
+ */
+const branchLocked = (cwd, branch, run = git) =>
+  gitPathsExist(cwd, [`refs/heads/${branch}.lock`, 'HEAD.lock', 'reftable/tables.list.lock'], run);
 
 /** The real path of a checkout's top folder (the person's main folder), checked with git; its config hooks are shielded. */
 async function topFolder(run, repoRoot) {
@@ -1197,14 +1207,19 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   };
   let r;
   for (let attempt = 1; ; attempt++) {
-    const [on, at, busy] = await Promise.all([currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run)]);
+    const [on, at, busy, locked] = await Promise.all([
+      currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run), branchLocked(root, into, run),
+    ]);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
     if (busy) throw new Refusal('busy', SAY.busy);
-    progress.started = true;
-    r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
-    // Another git command holds the index (an editor's git, say): git stopped before it changed anything (exit 1 on
-    // newer git, 128 on older). Wait a little, then try again.
-    if (r.code === 0 || !INDEX_LOCKED.test(r.stderr)) break;
+    if (!locked) {
+      progress.started = true;
+      r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
+      // Another git command holds the index (an editor's git, say): git stopped before it changed anything (exit 1 on
+      // newer git, 128 on older).
+      if (r.code === 0 || !INDEX_LOCKED.test(r.stderr)) break;
+    }
+    // Wait a little, then try again.
     if (attempt >= LOCK_TRIES) throw new Refusal('busy', SAY.locked);
     await sleep(200 * attempt);
   }

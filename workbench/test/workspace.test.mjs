@@ -1205,21 +1205,52 @@ describe('source control', { concurrency: 4 }, () => {
   });
 
   test('mergeWork waits a little for another git command in the person’s folder, then says so', async () => {
+    // The index held (git stops before it changes anything), or the branch held (git would update the files first, and
+    // then fail to move the branch): Workbench waits a little, then says so, and nothing in the folder has changed.
+    for (const held of ['index.lock', 'refs/heads/main.lock']) {
+      const t = await agentRepo();
+      write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+      write(t.w('new.txt'), 'new\n');
+      const lock = path.join(t.root, '.git', held);
+      write(lock, '');
+      let { expect } = await proposal(t);
+      const was = await everything(t);
+      assert.deepEqual(await mergeWork(mergeOpts(t, expect)), { ok: false, why: 'busy', sentence: 'Another git command is busy in your folder. Try again in a moment.' }, held);
+      const now = await everything(t);
+      assert.deepEqual([now.person, now.personStatus, now.head, now.on], [was.person, was.personStatus, was.head, was.on], held);
+      // Let go while it waits: it goes through.
+      ({ expect } = await proposal(t));
+      setTimeout(() => fs.rmSync(lock), 150);
+      const ok = await mergeWork(mergeOpts(t, expect));
+      assert.equal(ok.ok, true, held);
+      assert.equal(fs.readFileSync(t.p('a.txt'), 'utf8'), 'one\nAGENT\nthree\n');
+      assert.equal(statusOf(t.root), '');
+    }
+  });
+
+  test('when git stops half-way through the fast-forward, mergeWork never says nothing changed, and merging again finishes it', async (c) => {
+    if (process.getuid?.() === 0) return c.skip('as root, a folder without write permission does not stop git');
     const t = await agentRepo();
     write(t.w('a.txt'), 'one\nAGENT\nthree\n');
-    const lock = path.join(t.root, '.git', 'index.lock');
-    write(lock, '');
+    write(t.w('new.txt'), 'new\n');
     let { expect } = await proposal(t);
-    const person = folderPrint(t.root);
-    assert.deepEqual(await mergeWork(mergeOpts(t, expect)), { ok: false, why: 'busy', sentence: 'Another git command is busy in your folder. Try again in a moment.' });
-    assert.deepEqual(folderPrint(t.root), person);
+    // Git can write the files but not the branch: it updates the folder, then stops.
+    const heads = path.join(t.root, '.git', 'refs', 'heads');
+    fs.chmodSync(heads, 0o555);
+    let r;
+    try {
+      r = await mergeWork(mergeOpts(t, expect));
+    } finally {
+      fs.chmodSync(heads, 0o755);
+    }
+    assert.deepEqual(r, { ok: false, why: 'git', sentence: 'Git could not finish the merge into main. Have a look at your folder before you try again.' });
     assert.equal(headOf(t.root), t.ws.base);
-    // Let go while it waits: it goes through.
+    assert.equal(statusOf(t.root), 'M  a.txt\nA  new.txt\n', 'the merge’s files are in the folder, staged');
     ({ expect } = await proposal(t));
-    setTimeout(() => fs.rmSync(lock), 150);
     const ok = await mergeWork(mergeOpts(t, expect));
     assert.equal(ok.ok, true);
-    assert.equal(fs.readFileSync(t.p('a.txt'), 'utf8'), 'one\nAGENT\nthree\n');
+    assert.equal(headOf(t.root), ok.merge);
+    assert.equal(statusOf(t.root), '');
   });
 
   test('discardWork keeps a hidden copy of the work, then deletes the folder and the branch; only for the work that was shown', async () => {
