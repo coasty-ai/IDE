@@ -1352,7 +1352,7 @@ export class Simulator {
       sessionId: null, script: null, lastFinal: null,
       checkNames: null,    // checks reported before each final turn end, if the "repo" declares any
       // What the person sees after the engine decides a turn (see _shownState), and what a merge card says about it.
-      checks: 'none', checkResults: [], rules: null, closedFrom: null,
+      checks: 'none', checkResults: [], closedFrom: null,
       // Its pretend git: the branch and where it stands (see "the demo's git repository"); for roots that have one.
       git: null,
       created: new Set(),  // paths its work added as new files since its unmerged work began: their diff is all new lines
@@ -1603,7 +1603,6 @@ export class Simulator {
     // A new turn clears the last receipt (the store does the same), and a merge problem, as the engine does.
     a.checks = 'none';
     a.checkResults = [];
-    a.rules = null;
     if (a.git && a.git.problem) {
       a.git.problem = null;
       this._emitWork(a);
@@ -1780,7 +1779,6 @@ export class Simulator {
         a.phase = 'idle';
         a.checks = checked ? 'passed' : 'none';
         a.checkResults = checked ? spec.checks.map(c => ({ ...c })) : [];
-        a.rules = spec.rules ? structuredClone(spec.rules) : null;
         live.push([a, this._conversation(a, null)]);
         break;
       }
