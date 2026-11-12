@@ -1585,6 +1585,28 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(statusOf(t.root), '');
   });
 
+  test('when the person’s branch moves while git writes their files, mergeWork says the merge did not finish, never that it moved', async () => {
+    const t = await agentRepo();
+    write(t.p('c.txt'), 'c by the person\n');
+    git(t.root, 'commit', '-q', '-am', 'person');
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    write(t.w('page.txt'), 'page\n');
+    // While git writes the agent's page.txt, the person undoes their last commit and keeps its changes (an IDE's "Undo
+    // commit"): a command that moves only the branch, which the index lock git holds does not keep out. The person's
+    // own smudge filter does it here, once, so that it lands in that moment every time.
+    const flag = path.join(T, `undo-${t.id}`);
+    git(t.root, 'config', 'filter.undo.smudge', `if [ ! -e '${flag}' ]; then : > '${flag}'; git reset -q --soft HEAD~1 >/dev/null 2>&1; fi; cat`);
+    git(t.root, 'config', 'filter.undo.clean', 'cat');
+    write(path.join(t.root, '.git', 'info', 'attributes'), 'page.txt filter=undo\n');
+    const { expect } = await proposal(t);
+    const r = await mergeWork(mergeOpts(t, expect));
+    assert.ok(fs.existsSync(flag), 'the filter ran');
+    assert.deepEqual(r, { ok: false, why: 'git', sentence: 'Git could not finish the merge into main. Have a look at your folder before you try again.' });
+    // "main changed since you looked" would not be the whole truth: the agent's files are in the folder, staged.
+    assert.equal(headOf(t.root), t.ws.base);
+    assert.equal(statusOf(t.root), 'M  a.txt\nM  c.txt\nA  page.txt\n');
+  });
+
   test('a Ctrl-C in the terminal while the fast-forward writes the person’s files reaches only Workbench: git finishes the merge', async (c) => {
     if (process.platform === 'win32') return c.skip('a terminal’s process groups are a Unix matter');
     const t = await agentRepo();

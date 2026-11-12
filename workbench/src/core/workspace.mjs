@@ -677,6 +677,15 @@ const SAY = {
 /** git's words when another git command holds the index: "Unable to create '<git dir>/index.lock': File exists." */
 const INDEX_LOCKED = /^(?:fatal|error): Unable to create '[^\n]*index\.lock': File exists/m;
 
+/**
+ * git's words when `merge --ff-only` stopped before it changed anything (exit 128): the branch moved before git read it
+ * ("Not possible to fast-forward, aborting."), an operation started ("You have not concluded your merge (MERGE_HEAD
+ * exists)." or "... your cherry-pick ..."), or conflicts appeared ("Exiting because of an unresolved conflict."). Git
+ * also exits 128 after it wrote the files and the index, when it cannot move the branch ("update_ref failed for ref
+ * 'HEAD'"): those words are not here.
+ */
+const STOPPED_BEFORE = /^fatal: (?:Not possible to fast-forward|You have not concluded your |Exiting because of an unresolved conflict)/m;
+
 /** "a, b, c and 2 more" */
 function listOf(items, max) {
   const shown = items.slice(0, max).join(', ');
@@ -1499,14 +1508,18 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
     // Their own changes or files are in the way: git checks every path before it writes any, so nothing changed.
     const paths = inTheWay(r.stderr);
     if (paths.length && on === into && at === intoHead) throw new Refusal('blocked', SAY.blocked(paths), paths);
-  } else {
-    // Exit 128: git stopped before it began (another operation started, or the branch moved meanwhile). A fast-forward
-    // never leaves unresolved conflicts itself: those came from something else, and git refuses to merge over them.
+  } else if (STOPPED_BEFORE.test(r.stderr)) {
+    // Exit 128, and git's own words say it stopped before it began: another operation started, conflicts appeared, or
+    // the branch moved before git read it. A fast-forward never leaves unresolved conflicts itself: those came from
+    // something else, and git refuses to merge over them.
     if (busy) throw new Refusal('busy', SAY.busy);
     if (conflicts.length && on === into && at === intoHead) throw new Refusal('busy', SAY.conflicted(conflicts), conflicts);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
+    throw new Refusal('git', SAY.git);
   }
-  // Anything else may have stopped part-way through updating their files, so say nothing about them having stayed.
+  // Anything else may have stopped part-way through updating their files, so say nothing about them having stayed. Exit
+  // 128 is one of these when git wrote the files and the index, then could not move the branch: a command that moves
+  // only the branch (`git reset --soft`, say) is not kept out by the index lock git holds while it writes.
   throw new Refusal('git', SAY.unfinished(into));
 }
 
