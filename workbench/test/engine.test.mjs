@@ -1409,8 +1409,11 @@ test('command: a start intent asks to confirm first; confirm(go) launches, confi
   assert.match(out.confirm.detail, /2 uncommitted changes are not included/);
   assert.equal(t.store.list().length, 0, 'nothing starts before the confirm');
   const ctx = t.calls.parse[0].ctx;
-  assert.deepEqual(Object.keys(ctx).sort(), ['agents', 'focusId', 'harnesses', 'machines', 'pendingConfirm']);
+  // Pinned on purpose: `repo` was added with source control, so "merge it into main" is read against the branch.
+  assert.deepEqual(Object.keys(ctx).sort(), ['agents', 'focusId', 'harnesses', 'machines', 'pendingConfirm', 'repo']);
   assert.deepEqual(ctx.harnesses, { claude: true, codex: true, sim: false });
+  // identity: null, as start() has not read it yet (Workbench cannot tell); true or false once it has.
+  assert.deepEqual(ctx.repo, { name: 'shop', head: 'abc1234', branch: 'main', dirty: 2, identity: null });
 
   const go = await t.engine.confirm(out.confirm.id, true);
   assert.equal(go.reply, 'Started Fix flaky checkout test.');

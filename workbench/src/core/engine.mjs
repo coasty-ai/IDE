@@ -2030,11 +2030,15 @@ export class Engine extends EventEmitter {
     try { this.store.repoChanged?.(view); } catch (err) { this.log.warn('Could not pass on the repository:', err); }
   }
 
-  /** The repository as the page sees it: { name, head, branch, dirty, identity }. */
+  /**
+   * The repository as the page sees it: { name, head, branch, dirty, identity }. identity: git knows the person's name
+   * and email (true), or not (false); null only while Workbench cannot tell (not read yet, or no gitIdentity).
+   */
   _repoView() {
     const r = this.repoInfo;
     if (!r) return null;
-    return { name: r.name ?? null, head: r.head ?? null, branch: r.branch ?? null, dirty: r.dirty ?? 0, identity: this.repoIdentity === true };
+    const identity = typeof this.repoIdentity === 'boolean' ? this.repoIdentity : null;
+    return { name: r.name ?? null, head: r.head ?? null, branch: r.branch ?? null, dirty: r.dirty ?? 0, identity };
   }
 
   async _checkHarnesses() {
@@ -2823,6 +2827,9 @@ export class Engine extends EventEmitter {
       machines: this.store.machines(),
       harnesses: this._harnessFlags(),
       pendingConfirm: this._shownConfirm(confirmId),
+      // The person's repository as the page shows it ({ name, head, branch, dirty, identity }; null in the demo), so
+      // "merge it into main" can be read against the branch a merge goes into.
+      repo: this._repoView(),
     };
   }
 
