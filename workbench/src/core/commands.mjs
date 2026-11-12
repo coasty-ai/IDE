@@ -745,9 +745,13 @@ function namedRoot(ws, c) {
 function workRef(toks, c) {
   const ws = toks.map(t => t.w);
   if (!ws.length || ws.length > MAX_WORK_REF) return null;
-  // The words whole first: an agent may be called "Diff viewer" or "Work queue".
+  // The words whole first: an agent may be called "Diff viewer" or "Work queue". "the diff viewer's diff" and "the
+  // work queue's work" are its name and then its work: the last word is no part of the name the rest already says.
   const whole = namedRoot(ws, c);
-  if (whole) return { ...whole, noun: false };
+  if (whole) {
+    const head = ws.length > 1 && WORK_NOUN.has(ws[ws.length - 1]) ? namedRoot(ws.slice(0, -1), c) : null;
+    return { ...whole, noun: !!head && head.id === whole.id };
+  }
   const phrase = ws.join(' ');
   if (PRONOUN_REFS.has(phrase)) return { id: focusRoot(c), form: 'pronoun', noun: false };
   if (GENERIC_WORK.test(phrase)) return { id: focusRoot(c), form: 'generic', noun: true };

@@ -44,6 +44,8 @@ const CTX = {
   // A card with a permission behind it: the card takes the words first, and what it does not take never reaches the permission.
   pendingMergeOnPermission: { agents, machines, harnesses, focusId: 'a1b2c3', pendingConfirm: { id: 'c6', kind: 'merge' } },
   pendingDiscardOnPermission: { agents, machines, harnesses, focusId: 'a1b2c3', pendingConfirm: { id: 'c7', kind: 'discard' } },
+  // A card that ran out while it was on screen (the engine answers a yes to it with "no longer waiting").
+  pendingGone: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c0', gone: true } },
 };
 
 // Dogfooding: Workbench working on its own repository, so agent names share words with the commands themselves.
@@ -738,6 +740,8 @@ test('the new words never take over work, answers or replies to a permission', (
     ['show me the changes', 'question', answer('show me the changes')],
     ['diff it', 'question', answer('diff it')],
     ['what did it change', 'question', { kind: 'status', agentId: 'd4e5f6' }], // as before
+    ['scrap it', 'question', answer('scrap it')],
+    ['trash it', 'question', answer('trash it')],
     ['throw it away', 'stuck', answer('throw it away', '0a0b0c', 'ask-stuck')], // a hint for a stuck agent
     ['merge it', 'stuck', answer('merge it', '0a0b0c', 'ask-stuck')],
     ['merge it', 'dogQuestion', answer('merge it', '220009', 'ask-wq')],
@@ -793,6 +797,12 @@ test('merge and throw-away name the agent: dogfood names, same-named twins, earl
     ['scrap the git screen', 'dogNone', discard('cc0003')],
     ['diff the git screen', 'dogNone', changes('cc0003')],
     ['show the git screen changes', 'dogNone', changes('cc0003')],
+    // Its name, then its work, when the name has the work word in it.
+    ["show the diff viewer's diff", 'dogNone', changes('bb0002')],
+    ["show me the work queue's work", 'dogNone', changes('220009')],
+    ["show the branch picker's branch", 'dogNone', changes('33000a')],
+    ["merge the diff viewer's diff", 'dogNone', merge('bb0002')],
+    ["throw away the work queue's work", 'dogQuestion', discard('220009')], // its own name while it asks: strong
     ['merge the config merge', 'dogNone', merge('dd0004')],
     ['merge config merge', 'dogNone', merge('dd0004')],
     ['merge the work queue', 'dogNone', merge('220009')],
@@ -836,6 +846,8 @@ test('merge and throw-away name the agent: dogfood names, same-named twins, earl
     ['discard it', 'dogHelper', discard('cc0003')],
     ['show me the changes', 'dogHelper', changes('cc0003')],
     ['merge cc0003-33333333', 'dogNone', merge('cc0003')],
+    ['discard cc0003-33333333', 'dogNone', discard('cc0003')],
+    ['what did cc0003-33333333 change', 'dogNone', changes('cc0003')],
     ['merge draw the graph', 'dogNone', task('merge draw the graph')],
     ['what did draw the graph change', 'dogNone', changes('cc0003')], // a question: its helper's words find it
     // Launches stay launches with a "Login fix" there.
@@ -908,6 +920,10 @@ test('cards take their own words: "start it" only for a launch, "merge it" for a
     // The dogfood world's cards.
     ['merge it', 'dogPendingMerge', yes], ['merge the merge command', 'dogPendingMerge', merge('aa0001')],
     ['throw it away', 'dogPendingDiscard', yes], ['yes', 'dogPendingDiscard', unknown('yes')],
+    // A card that ran out: "it" is still the card, so the engine can say it is no longer waiting; a name is a new command.
+    ['merge it', 'pendingGone', unknown('merge it')], ['throw it away', 'pendingGone', unknown('throw it away')],
+    ['yes', 'pendingGone', yes], ['merge invoice export', 'pendingGone', merge('1a2b3c')],
+    ["don't scrap it", 'pendingDiscard', unknown("don't scrap it")], // not its words: the card stays, with its hint
   ]);
 });
 
