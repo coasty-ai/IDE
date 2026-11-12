@@ -968,13 +968,16 @@ async function gitCommand(text, focusId) {
   const shown = S.confirm && focusId && S.confirm.agentId === focusId ? S.confirm : null;
   try {
     const res = await api.command(text, { focusId: shown ? null : focusId || null, confirmId: shown ? shown.id : null, askId: null });
+    // the card shown, back again: the words were not understood (or are not enough for it), so it stays where it is
+    const same = !!(res.confirm && shown && res.confirm.id === shown.id);
     if (res.confirm) {
-      const about = focused && (res.confirm.kind === 'merge' || res.confirm.kind === 'discard') && String(res.confirm.sentence || '').includes(focused.name);
+      const about = same || (focused && (res.confirm.kind === 'merge' || res.confirm.kind === 'discard') && String(res.confirm.sentence || '').includes(focused.name));
       S.confirm = about ? { ...res.confirm, agentId: focusId } : res.confirm;
       if (!about) closeGit({ toLid: true });
     } else if (shown && S.confirm === shown) S.confirm = null;
     lookAt(res.focusId);
-    say(res.confirm ? '' : (res.reply || ''));
+    // as the core's input does: a new card says itself; anything else is said
+    say(res.confirm && !same ? '' : (res.reply || ''));
     if (typeof res.review === 'string' && ID_RE.test(res.review) && !res.confirm) openGit({ agentId: res.review });
     moved();
   } catch (err) { say(err.message); }

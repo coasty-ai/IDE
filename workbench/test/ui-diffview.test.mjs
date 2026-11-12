@@ -70,8 +70,9 @@ test("the spec's whole ranges are never raw: control characters, U+202A to U+202
   for (const s of ['naïve café', 'Привет', 'こんにちは', 'emoji 🙂', 'a-b_c.d']) { assert.equal(visibleText(s), s); assert.equal(hasHidden(s), false); }
 });
 
-test('this module and its test hold no raw hidden characters themselves', () => {
-  for (const f of ['../ui/diffview.js', './ui-diffview.test.mjs']) {
+test('the git screen\'s files hold no raw hidden characters themselves', () => {
+  for (const f of ['../ui/diffview.js', './ui-diffview.test.mjs', '../ui/gitgraph.js', '../ui/gitscreen.js', '../ui/layout.js', '../ui/board.js', '../ui/app.js',
+    '../ui/index.html', '../ui/app.css', './ui-gitgraph.test.mjs', './ui-layout.test.mjs', '../scripts/ui-mock.mjs', '../scripts/ui-fit-check.mjs']) {
     const src = readFileSync(new URL(f, import.meta.url), 'utf8');
     const raw = [...src].filter(ch => ch !== '\n' && hasHidden(ch));
     assert.deepEqual(raw.map(hex), [], f);
