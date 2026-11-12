@@ -243,6 +243,207 @@ test('any history lays out: unique rows, every node inside, lines at 45°, nothi
   }
 });
 
+// ---------------------------------------------------------------- histories from real git (gitGraph()'s own output)
+// Each as git log --topo-order gave it, commits as [id, parents, refs, agentId, subject] and the engine's agents.
+const REAL = {
+  // an agent merged twice, with a commit of its own after the first merge, and one more not merged yet
+  mergedTwice: { head: 'c0', commits: [
+    ['c0', ['c1'], ['main'], null, 'main 4'], ['c1', ['c2', 'c6'], [], 'm1', 'Merge M: m 2'], ['c2', ['c3'], [], null, 'main 3'],
+    ['c3', ['c4', 'c7'], [], 'm1', 'Merge M: m 1'], ['c4', ['c8'], [], null, 'main 2'], ['c5', ['c6'], ['workbench/m-m1'], 'm1', 'm 3'],
+    ['c6', ['c7'], [], 'm1', 'm 2'], ['c7', ['c8'], [], 'm1', 'm 1'], ['c8', ['c9'], [], null, 'main 1'], ['c9', [], [], null, 'init'],
+  ], agents: [{ id: 'm1', name: 'm1', state: 'done_checked', branch: 'workbench/m-m1', base: 'c8', since: 'c6', files: { changed: 2 }, work: { branch: 'workbench/m-m1', folder: true } }] },
+  // merged once, then asked twice to bring in main (a commit, then main merged into its branch), and merged again
+  flowTwice: { head: 'c0', commits: [
+    ['c0', ['c1'], ['main'], null, 'main 6'], ['c1', ['c6', 'c2'], [], 'f1', 'Merge F: second work'], ['c2', ['c3', 'c7'], ['workbench/f-f1'], null, 'Merge main into f again'],
+    ['c3', ['c4'], [], 'f1', 'f: more'], ['c4', ['c5', 'c8'], [], null, 'Merge main into f (bring in main)'], ['c5', ['c10'], [], 'f1', 'f: its own commit'],
+    ['c6', ['c7'], [], null, 'main 5'], ['c7', ['c8'], [], null, 'main 4'], ['c8', ['c9'], [], null, 'main 3'], ['c9', ['c11', 'c10'], [], 'f1', 'Merge F: first work'],
+    ['c10', ['c12'], [], 'f1', 'W1: first work'], ['c11', ['c12'], [], null, 'main 2'], ['c12', ['c13'], [], null, 'main 1'], ['c13', [], [], null, 'init'],
+  ], agents: [{ id: 'f1', name: 'f1', state: 'done_checked', branch: 'workbench/f-f1', base: 'c12', since: 'c12', files: { changed: 0 }, work: { branch: 'workbench/f-f1', folder: true, merged: { into: 'main' } } }] },
+  // no agents at all: a feature branch brought up to date with main twice (GitHub's "Update branch"), then merged
+  plainUpdateTwice: { head: 'c0', commits: [
+    ['c0', ['c1'], ['main'], null, 'main 9'], ['c1', ['c6', 'c2'], [], null, 'Merge feature 8'], ['c2', ['c3', 'c7'], ['feature'], null, 'Merge main into feature 6'],
+    ['c3', ['c4'], [], null, 'feature 5'], ['c4', ['c5', 'c8'], [], null, 'Merge main into feature 3'], ['c5', ['c9'], [], null, 'feature 2'],
+    ['c6', ['c7'], [], null, 'main 7'], ['c7', ['c8'], [], null, 'main 4'], ['c8', ['c9'], [], null, 'main 1b'], ['c9', ['c10'], [], null, 'main 1'], ['c10', [], [], null, 'init'],
+  ], agents: [] },
+  // two agents merging each other's work, and main merged into one of them
+  crissCross: { head: 'c6', commits: [
+    ['c0', ['c1'], ['workbench/l-l1'], 'l1', 'l 2'], ['c1', ['c3', 'c8'], [], null, 'l merges k 1'], ['c2', ['c4', 'c3'], ['workbench/k-k1'], null, 'k merges l 1'],
+    ['c3', ['c10'], [], 'l1', 'l 1'], ['c4', ['c5'], [], 'k1', 'k 2'], ['c5', ['c8', 'c9'], [], null, 'k merges main 1'], ['c6', ['c7'], ['main'], null, 'main 2'],
+    ['c7', ['c9', 'c8'], [], null, 'main merges k 1'], ['c8', ['c10'], [], 'k1', 'k 1'], ['c9', ['c10'], [], null, 'main 1'], ['c10', ['c11'], [], null, 'base'], ['c11', [], [], null, 'init'],
+  ], agents: [{ id: 'k1', name: 'k1', state: 'done_checked', branch: 'workbench/k-k1', base: 'c10', since: 'c10', files: { changed: 2 }, work: { branch: 'workbench/k-k1', folder: true } },
+    { id: 'l1', name: 'l1', state: 'done_checked', branch: 'workbench/l-l1', base: 'c10', since: 'c10', files: { changed: 2 }, work: { branch: 'workbench/l-l1', folder: true } }] },
+  // agent b started from agent a's commit (HEAD was detached there)
+  agentFromAgent: { head: 'c0', commits: [
+    ['c0', ['c5'], ['main'], null, 'main 2'], ['c1', ['c3'], ['workbench/a-h1'], 'h1', 'a 3'], ['c2', ['c3'], ['workbench/b-h2'], 'h2', 'b 1'],
+    ['c3', ['c4'], [], 'h1', 'a 2'], ['c4', ['c5'], [], 'h1', 'a 1'], ['c5', ['c6'], [], null, 'main 1'], ['c6', [], [], null, 'init'],
+  ], agents: [{ id: 'h1', name: 'h1', state: 'done_checked', branch: 'workbench/a-h1', base: 'c5', since: 'c5', files: { changed: 2 }, work: { branch: 'workbench/a-h1', folder: true } },
+    { id: 'h2', name: 'h2', state: 'done_checked', branch: 'workbench/b-h2', base: 'c3', since: 'c3', files: { changed: 2 }, work: { branch: 'workbench/b-h2', folder: true } }] },
+  // two agents whose branches start at the same commit, off your trunk
+  twoOnOne: { head: 'c0', commits: [
+    ['c0', ['c2'], ['main'], null, 'main 2'], ['c1', ['c2'], ['workbench/p-p1', 'workbench/q-q1'], 'p1', 'p 1'], ['c2', ['c3'], [], null, 'main 1'], ['c3', [], [], null, 'init'],
+  ], agents: [{ id: 'p1', name: 'p1', state: 'done_checked', branch: 'workbench/p-p1', base: 'c2', since: 'c2', files: { changed: 2 }, work: { branch: 'workbench/p-p1', folder: true } },
+    { id: 'q1', name: 'q1', state: 'done_checked', branch: 'workbench/q-q1', base: 'c1', since: 'c1', files: { changed: 2 }, work: { branch: 'workbench/q-q1', folder: true } }] },
+  // three agents brought in by one octopus merge: three lines out of one node, three into one node
+  octopus: { head: 'c0', commits: [
+    ['c0', ['c1'], ['main'], null, 'main top'], ['c1', ['c8', 'c6', 'c4', 'c2'], [], null, 'Octopus merge'], ['c2', ['c3'], ['workbench/o3-o3'], 'o3', 'o3 more'],
+    ['c3', ['c9'], [], 'o3', 'o3 work'], ['c4', ['c5'], ['workbench/o2-o2'], 'o2', 'o2 more'], ['c5', ['c9'], [], 'o2', 'o2 work'], ['c6', ['c7'], ['workbench/o1-o1'], 'o1', 'o1 more'],
+    ['c7', ['c9'], [], 'o1', 'o1 work'], ['c8', ['c9'], [], null, 'main after'], ['c9', ['c10'], [], null, 'base'], ['c10', [], [], null, 'init'],
+  ], agents: ['o1', 'o2', 'o3'].map(o => ({ id: o, name: o, state: 'done_checked', branch: `workbench/${o}-${o}`, base: 'c9', since: 'c9', files: { changed: 0 }, work: { branch: `workbench/${o}-${o}`, folder: true, merged: { into: 'main' } } })) },
+};
+const realId = c => id(0x5000 + Number(c.slice(1)));
+function real(name) {
+  const r = REAL[name];
+  return {
+    branch: 'main', head: realId(r.head),
+    commits: r.commits.map(([c, ps, refs, agentId, subject], i) => ({ id: realId(c), parents: ps.map(realId), refs, agentId, subject, author: 'Sam', at: NOW - i * MIN, kind: ps.length > 1 ? 'merge' : 'commit' })),
+    agents: r.agents.map(a => ({ ...a, base: a.base && realId(a.base), since: a.since && realId(a.since), work: { from: 'main', merged: null, problem: null, thrownAway: null, ...a.work } })),
+  };
+}
+const WIDTHS = [567, 300];
+
+/**
+ * Stretches that two edges draw on top of each other, longer than `min` px: the same line (level, upright or at 45°)
+ * and overlapping. Two lines that meet at one node (into it, or out of it, side by side) may share their last stretch.
+ */
+function sharedStretches(g, min) {
+  const segs = [];
+  g.edges.forEach((e, k) => { for (let i = 1; i < e.pts.length; i++) segs.push({ k, e, a: e.pts[i - 1], b: e.pts[i], first: i === 1, last: i === e.pts.length - 1 }); });
+  const line = s => {
+    const dx = s.b[0] - s.a[0], dy = s.b[1] - s.a[1];
+    if (Math.abs(dx) < 0.15) return { dir: 'v', key: s.a[0], lo: Math.min(s.a[1], s.b[1]), hi: Math.max(s.a[1], s.b[1]), f: 1 };
+    if (Math.abs(dy) < 0.15) return { dir: 'h', key: s.a[1], lo: Math.min(s.a[0], s.b[0]), hi: Math.max(s.a[0], s.b[0]), f: 1 };
+    const down = Math.sign(dx) === Math.sign(dy);
+    return { dir: down ? 'd' : 'u', key: down ? s.a[1] - s.a[0] : s.a[1] + s.a[0], lo: Math.min(s.a[0], s.b[0]), hi: Math.max(s.a[0], s.b[0]), f: Math.SQRT2 };
+  };
+  const nodeAt = p => g.nodes.find(n => Math.abs(n.x - p[0]) <= n.size + 2.5 && Math.abs(n.y - p[1]) <= n.size + 2.5);
+  const ends = s => [s.first && nodeAt(s.a), s.last && nodeAt(s.b)].filter(Boolean).map(n => n.id);
+  const out = [];
+  for (let i = 0; i < segs.length; i++) for (let j = i + 1; j < segs.length; j++) {
+    const s = segs[i], t = segs[j];
+    if (s.k === t.k) continue;
+    const ls = line(s), lt = line(t);
+    if (ls.dir !== lt.dir || Math.abs(ls.key - lt.key) > 0.6) continue;
+    const len = (Math.min(ls.hi, lt.hi) - Math.max(ls.lo, lt.lo)) * ls.f;
+    if (len <= min) continue;
+    if (ends(s).some(x => ends(t).includes(x))) continue;
+    out.push(`${Math.round(len)} px: ${s.e.kind} ${JSON.stringify(s.e.pts[0])}→${JSON.stringify(s.e.pts.at(-1))} and ${t.e.kind} ${JSON.stringify(t.e.pts[0])}→${JSON.stringify(t.e.pts.at(-1))}`);
+  }
+  return out;
+}
+/** Level stretches of lines of work that run across your trunk (or the wire above HEAD) between their ends. */
+function overTrunk(g) {
+  const bottom = Math.max(...g.nodes.filter(n => n.trunk).map(n => n.y));
+  const out = [];
+  for (const e of g.edges) {
+    if (e.kind === 'trunk' || e.kind === 'wire') continue;
+    for (let i = 1; i < e.pts.length; i++) {
+      const [a, b] = [e.pts[i - 1], e.pts[i]];
+      if (Math.abs(a[1] - b[1]) < 0.2 && Math.min(a[0], b[0]) < g.trunkX - 0.5 && Math.max(a[0], b[0]) > g.trunkX + 0.5 && a[1] < bottom) out.push(`${e.kind} at y ${a[1]}`);
+    }
+  }
+  return out;
+}
+
+test('two lines never run down one gutter: lines that merge into the same lane each get their own way down', () => {
+  const bad = [];
+  for (const name of Object.keys(REAL)) for (const P of Object.values(GRAPH_SIZES)) for (const width of WIDTHS) {
+    const g = layout(real(name), width, P);
+    assert.ok(bendsOk(g), `${name} ${P.name} ${width}: 45° only`);
+    if (g.folds.length) continue;   // lines folded into the outermost lane share it on purpose ("+N")
+    for (const s of sharedStretches(g, P.bend)) bad.push(`${name} ${P.name} ${width}: ${s}`);
+  }
+  assert.deepEqual(bad, []);
+  // and each merge still reaches the commit it took
+  const g = layout(real('flowTwice'), 567);
+  const node = c => g.nodes.find(n => n.id === realId(c));
+  for (const [from, to] of [['c2', 'c7'], ['c4', 'c8']]) {
+    const e = g.edges.find(x => x.kind === 'cross' && Math.abs(x.pts[0][1] - node(from).y) < 0.2 && Math.abs(x.pts.at(-1)[1] - node(to).y) < 0.2);
+    assert.ok(e, `a line from ${from} to ${to}`);
+  }
+});
+
+test('a line that leaves or joins another agent\'s line keeps to that line\'s side, never across your trunk when a lane is free', () => {
+  for (const name of ['agentFromAgent', 'twoOnOne']) for (const P of Object.values(GRAPH_SIZES)) for (const width of WIDTHS) {
+    const g = layout(real(name), width, P);
+    assert.deepEqual(overTrunk(g), [], `${name} ${P.name} ${width}`);
+    assert.ok(bendsOk(g));
+    // both lines of work on one side of the trunk
+    const sides = new Set(g.nodes.filter(n => !n.trunk).map(n => Math.sign(n.slot)));
+    assert.equal(sides.size, 1, `${name} ${P.name} ${width}: one side`);
+  }
+});
+
+test('an agent whose branch starts past the commits shown sits at the end, above "Older commits are not shown here", its stub pointing down', () => {
+  // 200 commits of yours (the limit), an agent working from your latest, and an earlier agent whose branch and whose
+  // base are further back than that (git listed them past the 200th)
+  const commits = [];
+  for (let i = 0; i < 200; i++) commits.push({ id: id(0x7000 + i), parents: [id(0x7000 + i + 1)], subject: `main ${200 - i}`, author: 'Sam', at: NOW - i * MIN, refs: i === 0 ? ['main'] : [], agentId: null, kind: 'commit' });
+  const agents = [
+    { id: 'e1', name: 'Old export', state: 'done_checked', earlier: true, branch: 'workbench/old-e1', base: id(0x7400), since: id(0x7400), files: null, work: { branch: 'workbench/old-e1', from: 'main', folder: true } },
+    { id: 'e3', name: 'Older still', state: 'stopped', earlier: true, branch: 'workbench/old-e3', base: id(0x7401), since: id(0x7401), files: null, work: { branch: 'workbench/old-e3', from: 'main', folder: true } },
+    { id: 'e2', name: 'New work', state: 'working', branch: 'workbench/new-e2', base: id(0x7000), since: id(0x7000), files: null, work: { branch: 'workbench/new-e2', from: 'main', folder: true } },
+  ];
+  const input = { commits, agents, branch: 'main', head: id(0x7000) };
+  const g = layout(input, 567);
+  const row = a => g.rows.find(r => r.item.id === 'work:' + a);
+  assert.equal(row('e2').row, 0, 'the newest work is at the top');
+  assert.equal(g.headRow, 1, 'HEAD right under it');
+  assert.deepEqual(g.rows.slice(-2).map(r => r.item.id), ['work:e1', 'work:e3'], 'the old ones at the end, in the order given');
+  for (const a of ['e1', 'e3']) {
+    const nd = g.nodes.find(n => n.id === 'work:' + a);
+    const stub = g.edges.find(e => e.stub && e.kind === 'lane' && e.pts[0][0] === nd.x && e.pts[0][1] === nd.y);
+    assert.ok(stub && stub.pts[1][1] > nd.y && stub.pts[1][1] <= g.h, `${a}: its stub points down, inside the graph`);
+  }
+  // they take no lane ahead of the agent working now: its lane is the one it has without them
+  const alone = layout({ ...input, agents: [agents[2]] }, 567);
+  assert.equal(g.nodes.find(n => n.id === 'work:e2').slot, alone.nodes.find(n => n.id === 'work:e2').slot);
+  // your trunk runs on past them, into the history not shown
+  const trunkStub = g.edges.find(e => e.kind === 'trunk' && e.stub);
+  assert.ok(trunkStub && trunkStub.pts[1][1] > g.rows.at(-1).y, 'the trunk goes on down past the last row');
+  assert.ok(bendsOk(g));
+  // newest first by when they started, when the page knows it
+  const dated = layout({ ...input, agents: [{ ...agents[0], startedAt: NOW - 9 * 86400000 }, { ...agents[1], startedAt: NOW - 2 * 86400000 }, agents[2]] }, 567);
+  assert.deepEqual(dated.rows.slice(-2).map(r => r.item.id), ['work:e3', 'work:e1']);
+  // its row says where its branch starts, for a screen reader
+  assert.match(rowWords(row('e1').item, { now: NOW }).aria, /starts in older commits/);
+});
+
+test('HEAD\'s silkscreen has room beside its pad, also when no lane sits left of your trunk', () => {
+  // gitscreen.js sets "HEAD" 5 px left of the pad, in 10.5 px type: 30 px wide (measured in Chrome)
+  for (const name of Object.keys(REAL)) for (const P of Object.values(GRAPH_SIZES)) for (const width of [...WIDTHS, 220]) {
+    const g = layout(real(name), width, P);
+    const head = g.nodes.find(n => n.kind === 'head');
+    assert.ok(head.x - head.size - 5 - 30 >= 1, `${name} ${P.name} ${width}: the label starts at ${head.x - head.size - 35}`);
+    assert.ok(g.w <= width + 1, `${name} ${P.name} ${width}: the graph keeps to its width (${g.w})`);
+  }
+  // with lanes on the left, the trunk stands where they leave it, as before
+  const g = layout(history(), 480);
+  assert.equal(g.trunkX, GRAPH_SIZES.M.margin + GRAPH_SIZES.M.headR + g.pitch);
+});
+
+test('any history from real git or made up lays out with no two lines on top of each other', () => {
+  let seed = 11;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  const bad = [];
+  for (let trial = 0; trial < 80; trial++) {
+    const n = 6 + Math.floor(rnd() * 40), commits = [];
+    for (let i = 0; i < n; i++) {
+      const parents = [];
+      if (i < n - 1) parents.push(id(2000 + i + 1 + Math.floor(rnd() * Math.min(3, n - i - 1))));
+      if (rnd() < 0.25 && i < n - 3) parents.push(id(2000 + i + 2 + Math.floor(rnd() * (n - i - 2))));
+      commits.push({ id: id(2000 + i), parents: [...new Set(parents)], subject: `c${i}`, author: 'Sam', at: NOW - i * MIN, refs: i === 0 ? ['main'] : rnd() < 0.15 ? [`workbench/w-${i}`] : [], agentId: rnd() < 0.2 ? `ag${i}` : null, kind: 'commit' });
+    }
+    const agents = commits.filter(c => c.refs[0]?.startsWith('workbench/')).map(c => ({ id: `ag-${c.id}`, name: `Agent ${c.subject}`, state: rnd() < 0.3 ? 'working' : 'done_checked',
+      branch: c.refs[0], base: c.parents[0] || c.id, since: c.parents[0] || c.id, files: { changed: 1 + Math.floor(rnd() * 4) }, work: { branch: c.refs[0], folder: true } }));
+    for (const width of [400, 900]) {
+      const g = graphLayout({ commits, agents, branch: 'main', head: commits[0].id, width, height: 500, ACTIVE }, GRAPH_SIZES.M);
+      if (g.folds.length) continue;
+      for (const s of sharedStretches(g, GRAPH_SIZES.M.bend)) bad.push(`trial ${trial} width ${width}: ${s}`);
+    }
+  }
+  assert.deepEqual(bad.slice(0, 12), []);
+});
+
 test('the git screen\'s colours, in all three looks: text at 4.5:1, traces and marks at 3:1', () => {
   // its own custom properties sit in D1's section of app.css, a second block per look after the looks' first blocks
   const css = readFileSync(new URL('../ui/app.css', import.meta.url), 'utf8');

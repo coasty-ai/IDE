@@ -20,7 +20,7 @@ const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 't
   'taint'];
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
-const GIT_VIEWS = ['git', 'git-detail', 'git-empty'];
+const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
 VIEWS.push(...GIT_VIEWS);
 const args = process.argv.slice(2);
 const opt = k => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : null; };
@@ -163,6 +163,16 @@ b.on(m => {
   if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') errors.push('console: ' + m.params.args.map(a => a.value || a.description).join(' ').slice(0, 300));
   if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error' && !/status of 401/.test(m.params.entry.text)) errors.push('log: ' + m.params.entry.text.slice(0, 300) + ' ' + (m.params.entry.url || ''));
 });
+// The git-tangles view serves its own histories as GET /api/git (Chrome holds the request and answers it); every other
+// request goes on to the mock.
+let gitServed = null;
+b.on(m => {
+  if (m.method !== 'Fetch.requestPaused') return;
+  const { requestId, request } = m.params;
+  if (gitServed && new URL(request.url).pathname === '/api/git') {
+    b.send('Fetch.fulfillRequest', { requestId, responseCode: 200, responseHeaders: [{ name: 'content-type', value: 'application/json; charset=utf-8' }], body: Buffer.from(JSON.stringify(gitServed)).toString('base64') }).catch(() => {});
+  } else b.send('Fetch.continueRequest', { requestId }).catch(() => {});
+});
 
 async function setLook(theme, detail) {
   await b.ev(`(() => { const set = (n, v) => { const r = document.querySelector('#look input[name="' + n + '"][value="' + v + '"]'); if (r && !r.checked) r.click(); };
@@ -226,8 +236,116 @@ async function gitView(v, s, d) {
     await pick('#gitGraph .gr[data-id="work:m5"]'); await check(`${tag} (a very long branch name)`);
   } else if (v === 'git-empty') {
     await open('git-empty'); await check(tag);
+  } else if (v === 'git-tangles') {
+    // histories from real git that once drew two merges' lines on top of each other, a line across your trunk, or an old
+    // agent above HEAD: each must fit, share no stretch of copper, cross your trunk only when nothing else would do,
+    // and keep an agent whose branch starts past the commits shown at the end
+    await b.send('Fetch.enable', { patterns: [{ urlPattern: '*/api/git*', requestStage: 'Request' }] });
+    try {
+      for (const [name, data] of Object.entries(TANGLES)) {
+        gitServed = data;
+        await open('git');
+        const t2 = `${tag} (${name})`;
+        await check(t2);
+        const g = await b.ev(GEOM);
+        for (const x of g.shared) failures.push(`${t2}: two lines on top of each other for ${x}`);
+        if (/agentFromAgent|twoOnOne/.test(name)) for (const x of g.overTrunk) failures.push(`${t2}: a line runs across your trunk at ${x}`);
+        if (name === 'oldAgent') {
+          const ids = await b.ev(`[...document.querySelectorAll('#gitGraph .gr')].map(r => r.dataset.id)`);
+          if (ids.at(-1) !== 'work:e1') failures.push(`${t2}: the agent whose branch starts further back is not at the end (${ids.slice(0, 3).join(', ')} … ${ids.at(-1)})`);
+          if (ids.indexOf('work:e2') !== 0) failures.push(`${t2}: the newest work is not at the top`);
+        }
+        await scrollEnd('#gitGraph'); await check(`${t2}, scrolled to the end`);
+      }
+    } finally {
+      gitServed = null;
+      await b.send('Fetch.disable');
+    }
   }
 }
+
+// ---------------------------------------------------------------- D1: histories that once tangled (the git-tangles view)
+// From real git: commits as [id, parents, refs, agentId, subject], newest first as git log --topo-order gives them.
+const tangle = (rows, agents, { head = 'c0', more = false } = {}) => {
+  const hex = c => (c.replace(/\D/g, '').padStart(6, '0') + 'ab'.repeat(20)).slice(0, 40);
+  const now = Date.now();
+  const commits = rows.map(([c, ps, refs, agentId, subject], i) => ({ id: hex(c), parents: ps.map(hex), refs, agentId, subject, author: 'Sam Lee', at: now - (i + 1) * 9 * 60000, kind: ps.length > 1 ? 'merge' : 'commit' }));
+  return { ok: true, repo: { name: 'tangles', branch: 'main', head: hex(head).slice(0, 7), dirty: 0, identity: true }, commits, more,
+    agents: agents.map(a => ({ harness: 'claude', earlier: false, from: 'main', ...a, base: a.base && hex(a.base), since: a.since && hex(a.since), work: { branch: a.branch, from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...a.work } })) };
+};
+const TANGLES = {
+  mergedTwice: tangle([
+    ['c0', ['c1'], ['main'], null, 'main 4'], ['c1', ['c2', 'c6'], [], 'm1', 'Merge M: m 2'], ['c2', ['c3'], [], null, 'main 3'],
+    ['c3', ['c4', 'c7'], [], 'm1', 'Merge M: m 1'], ['c4', ['c8'], [], null, 'main 2'], ['c5', ['c6'], ['workbench/m-m1'], 'm1', 'm 3'],
+    ['c6', ['c7'], [], 'm1', 'm 2'], ['c7', ['c8'], [], 'm1', 'm 1'], ['c8', ['c9'], [], null, 'main 1'], ['c9', [], [], null, 'init'],
+  ], [{ id: 'm1', name: 'Mail digest', state: 'done_checked', branch: 'workbench/m-m1', base: 'c8', since: 'c6', files: { changed: 2 } }]),
+  flowTwice: tangle([
+    ['c0', ['c1'], ['main'], null, 'main 6'], ['c1', ['c6', 'c2'], [], 'f1', 'Merge F: second work'], ['c2', ['c3', 'c7'], ['workbench/f-f1'], null, 'Merge main into f again'],
+    ['c3', ['c4'], [], 'f1', 'f: more'], ['c4', ['c5', 'c8'], [], null, 'Merge main into f (bring in main)'], ['c5', ['c10'], [], 'f1', 'f: its own commit'],
+    ['c6', ['c7'], [], null, 'main 5'], ['c7', ['c8'], [], null, 'main 4'], ['c8', ['c9'], [], null, 'main 3'], ['c9', ['c11', 'c10'], [], 'f1', 'Merge F: first work'],
+    ['c10', ['c12'], [], 'f1', 'W1: first work'], ['c11', ['c12'], [], null, 'main 2'], ['c12', ['c13'], [], null, 'main 1'], ['c13', [], [], null, 'init'],
+  ], [{ id: 'f1', name: 'Flow', state: 'done_checked', branch: 'workbench/f-f1', base: 'c12', since: 'c12', files: { changed: 0 }, work: { merged: { into: 'main' } } }]),
+  crissCross: tangle([
+    ['c0', ['c1'], ['workbench/l-l1'], 'l1', 'l 2'], ['c1', ['c3', 'c8'], [], null, 'l merges k 1'], ['c2', ['c4', 'c3'], ['workbench/k-k1'], null, 'k merges l 1'],
+    ['c3', ['c10'], [], 'l1', 'l 1'], ['c4', ['c5'], [], 'k1', 'k 2'], ['c5', ['c8', 'c9'], [], null, 'k merges main 1'], ['c6', ['c7'], ['main'], null, 'main 2'],
+    ['c7', ['c9', 'c8'], [], null, 'main merges k 1'], ['c8', ['c10'], [], 'k1', 'k 1'], ['c9', ['c10'], [], null, 'main 1'], ['c10', ['c11'], [], null, 'base'], ['c11', [], [], null, 'init'],
+  ], [{ id: 'k1', name: 'Keys', state: 'done_checked', branch: 'workbench/k-k1', base: 'c10', since: 'c10', files: { changed: 2 } },
+    { id: 'l1', name: 'Logins', state: 'done_checked', branch: 'workbench/l-l1', base: 'c10', since: 'c10', files: { changed: 2 } }], { head: 'c6' }),
+  agentFromAgent: tangle([
+    ['c0', ['c5'], ['main'], null, 'main 2'], ['c1', ['c3'], ['workbench/a-h1'], 'h1', 'a 3'], ['c2', ['c3'], ['workbench/b-h2'], 'h2', 'b 1'],
+    ['c3', ['c4'], [], 'h1', 'a 2'], ['c4', ['c5'], [], 'h1', 'a 1'], ['c5', ['c6'], [], null, 'main 1'], ['c6', [], [], null, 'init'],
+  ], [{ id: 'h1', name: 'Audit log', state: 'done_checked', branch: 'workbench/a-h1', base: 'c5', since: 'c5', files: { changed: 2 } },
+    { id: 'h2', name: 'Billing', state: 'done_checked', branch: 'workbench/b-h2', base: 'c3', since: 'c3', files: { changed: 2 } }]),
+  twoOnOne: tangle([
+    ['c0', ['c2'], ['main'], null, 'main 2'], ['c1', ['c2'], ['workbench/p-p1', 'workbench/q-q1'], 'p1', 'p 1'], ['c2', ['c3'], [], null, 'main 1'], ['c3', [], [], null, 'init'],
+  ], [{ id: 'p1', name: 'Pricing', state: 'done_checked', branch: 'workbench/p-p1', base: 'c2', since: 'c2', files: { changed: 2 } },
+    { id: 'q1', name: 'Quotes', state: 'done_checked', branch: 'workbench/q-q1', base: 'c1', since: 'c1', files: { changed: 2 } }]),
+  // 200 commits of yours (the limit), work on your latest, and an earlier agent whose branch starts further back
+  oldAgent: tangle([...Array.from({ length: 200 }, (_, i) => [`c${i}`, [`c${i + 1}`], i === 0 ? ['main'] : [], null, `main ${200 - i}`])],
+    [{ id: 'e1', name: 'Old export', state: 'done_checked', earlier: true, branch: 'workbench/old-e1', base: 'c400', since: 'c400', files: null },
+      { id: 'e2', name: 'New work', state: 'working', branch: 'workbench/new-e2', base: 'c0', since: 'c0', files: null }], { more: true }),
+};
+
+// The graph as drawn: copper and trunk paths that share a stretch longer than a bend (other than two lines meeting at one
+// commit), and level runs of copper across the trunk above its last commit.
+const GEOM = String.raw`(() => {
+  const svg = document.querySelector('#gitGraph svg.gsvg');
+  if (!svg) return { shared: ['(no graph drawn)'], overTrunk: [] };
+  const parse = d => d.slice(1).split('L').map(xy => xy.trim().split(/\s+/).map(Number));
+  const nodes = [];
+  for (const c of svg.querySelectorAll('circle.gvia, circle.gwork')) nodes.push({ x: +c.getAttribute('cx'), y: +c.getAttribute('cy'), r: +c.getAttribute('r') });
+  for (const r of svg.querySelectorAll('rect.gpad, rect.gchip')) { const w = +r.getAttribute('width'), h = +r.getAttribute('height'); nodes.push({ x: +r.getAttribute('x') + w / 2, y: +r.getAttribute('y') + h / 2, r: Math.max(w, h) / 2 }); }
+  const nodeAt = p => nodes.findIndex(n => Math.abs(n.x - p[0]) <= n.r + 2.5 && Math.abs(n.y - p[1]) <= n.r + 2.5);
+  const lines = [...svg.querySelectorAll('path.gc, path.gt-bus')].map(e => ({ trunk: e.classList.contains('gt-bus'), pts: parse(e.getAttribute('d')) }));
+  if (svg.querySelector('.gfold')) return { shared: [], overTrunk: [] };   // lines folded into one lane share it on purpose
+  const segs = [];
+  lines.forEach((l, k) => { for (let i = 1; i < l.pts.length; i++) segs.push({ k, a: l.pts[i - 1], b: l.pts[i], first: i === 1, last: i === l.pts.length - 1 }); });
+  const line = s => {
+    const dx = s.b[0] - s.a[0], dy = s.b[1] - s.a[1];
+    if (Math.abs(dx) < 0.15) return ['v', s.a[0], Math.min(s.a[1], s.b[1]), Math.max(s.a[1], s.b[1]), 1];
+    if (Math.abs(dy) < 0.15) return ['h', s.a[1], Math.min(s.a[0], s.b[0]), Math.max(s.a[0], s.b[0]), 1];
+    const down = Math.sign(dx) === Math.sign(dy);
+    return [down ? 'd' : 'u', down ? s.a[1] - s.a[0] : s.a[1] + s.a[0], Math.min(s.a[0], s.b[0]), Math.max(s.a[0], s.b[0]), Math.SQRT2];
+  };
+  const ends = s => [s.first ? nodeAt(s.a) : -1, s.last ? nodeAt(s.b) : -1].filter(i => i >= 0);
+  const shared = [];
+  for (let i = 0; i < segs.length; i++) for (let j = i + 1; j < segs.length; j++) {
+    const s = segs[i], t = segs[j];
+    if (s.k === t.k) continue;
+    const ls = line(s), lt = line(t);
+    if (ls[0] !== lt[0] || Math.abs(ls[1] - lt[1]) > 0.6) continue;
+    const len = (Math.min(ls[3], lt[3]) - Math.max(ls[2], lt[2])) * ls[4];
+    if (len > 13 && !ends(s).some(x => ends(t).includes(x))) shared.push(Math.round(len) + ' px at ' + s.a.join(',') + ' and ' + t.a.join(','));
+  }
+  const trunk = lines.filter(l => l.trunk && !l.pts.some(p => Number.isNaN(p[0])));
+  const tx = trunk.length ? trunk[0].pts[0][0] : null, tBottom = Math.max(...trunk.flatMap(l => l.pts.map(p => p[1])));
+  const overTrunk = [];
+  if (tx != null) for (const l of lines) if (!l.trunk) for (let i = 1; i < l.pts.length; i++) {
+    const [a, b] = [l.pts[i - 1], l.pts[i]];
+    if (Math.abs(a[1] - b[1]) < 0.2 && Math.min(a[0], b[0]) < tx - 0.5 && Math.max(a[0], b[0]) > tx + 0.5 && a[1] < tBottom) overTrunk.push('y ' + a[1]);
+  }
+  return { shared, overTrunk };
+})()`;
 
 try {
   // every scenario, at every size, in both detail levels and all three looks
@@ -249,8 +367,9 @@ try {
   // views: hover cards, menus, opened details, the reply chip, notices, launch questions, and the link states
   for (const v of views) {
     for (const s of sizes) for (const d of details) {
+      // these two do not depend much on the window: two sizes, unless one is asked for
+      if ((v === 'taint' || v === 'git-tangles') && sizes.length > 2 && !['960x900', '1440x789'].includes(s)) continue;
       if (GIT_VIEWS.includes(v)) { await gitView(v, s, d); continue; }   // D1
-      if (v === 'taint' && sizes.length > 2 && !['960x900', '1440x789'].includes(s)) continue;   // the words do not depend on the size
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
       const load = async (sc, q = '') => { await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, merge: 'ok' }); await ctl('scenario', { name: sc }); await size(s); await b.goto(`${base}/?t=k&still=1${q}`, 1300); await setLook(t, d); await settle(100); };

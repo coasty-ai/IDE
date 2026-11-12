@@ -1,6 +1,7 @@
 // The git screen's commit graph, laid out like the board: your branch is the trunk, a thick gold bus, and every other
 // line of work is a copper trace on its own lane, placed outward and alternating right and left, so the tree branches
-// downwards and spreads out. A trace changes lanes with short 45° bends, never at any other angle.
+// downwards and spreads out. A trace changes lanes with short 45° bends, never at any other angle, and no two traces
+// ever run on top of each other, except where they meet at one commit.
 // Pure: no DOM is touched when this module loads, and nothing comes from /shared/ (state sets are passed in), so
 // node:test checks it. Everything an agent or a repository controls (subjects, authors, branch names) comes out as
 // visible text: hidden and direction-changing characters are shown as symbols (diffview.js).
@@ -17,6 +18,10 @@ export const GRAPH_SIZES = Object.freeze({
   M: { name: 'M', rowH: 44, padTop: 24, padBottom: 30, margin: 24, bend: 13, pitchMin: 56, pitchMax: 112, r: 5, headR: 8.5, mergeR: 7, workR: 7.5, chipW: 17, chipH: 11.5 },
   L: { name: 'L', rowH: 48, padTop: 26, padBottom: 32, margin: 26, bend: 14, pitchMin: 56, pitchMax: 112, r: 5.5, headR: 9, mergeR: 7.5, workR: 8, chipW: 18, chipH: 12 },
 });
+
+// The room the HEAD silkscreen takes left of its pad: gitscreen.js sets it 5 px off the pad in 10.5 px type (app.css),
+// 30 px wide in Chrome, and a little more so it never touches the graph's edge.
+const HEAD_SILK = 37;
 
 const ACTIVE_DEFAULT = new Set(['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck']);
 const r1 = n => Math.round(n * 10) / 10;
@@ -100,7 +105,7 @@ export function rowWords(item, { agentById = new Map(), now = Date.now(), branch
   const nameOf = a => visibleText(String(a && a.name || '').trim()) || 'Agent';
   if (item.kind === 'work') {
     const name = nameOf(item.agent);
-    return { line1: name, line2: item.work.label, badges: [], aria: `${name}: ${item.work.label}.` };
+    return { line1: name, line2: item.work.label, badges: [], aria: `${name}: ${item.work.label}.${item.loose ? ' Its branch starts in older commits, not shown here.' : ''}` };
   }
   const c = item.commit || {};
   const agent = c.agentId ? agentById.get(c.agentId) : null;
@@ -162,11 +167,16 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
     const item = { kind: 'work', id: 'work:' + a.id, agentId: a.id, agent: a, work: wn, parents: tip ? [tip] : [] };
     if (tip) { if (!before.has(tip)) before.set(tip, []); before.get(tip).push(item); } else { item.loose = true; loose.push(item); }
   }
-  const items = [...loose];
+  const items = [];
   for (const c of list) {
     items.push(...(before.get(c.id) || []));
     items.push({ kind: 'commit', id: c.id, commit: c, agentId: c.agentId || null, agent: c.agentId ? agentById.get(c.agentId) || null : null, parents: c.parents });
   }
+  // A line of work whose branch starts further back than the commits shown (git listed it past the limit) goes at the
+  // end, just above "Older commits are not shown here", the newest first, with a stub pointing down into the history not
+  // shown. It is never drawn above HEAD as if it were the newest, and takes no lane ahead of the agents working now.
+  const startedAt = it => (Number.isFinite(it.agent.startedAt) ? it.agent.startedAt : -Infinity);
+  items.push(...loose.map((it, i) => [it, i]).sort((a, b) => startedAt(b[0]) - startedAt(a[0]) || a[1] - b[1]).map(([it]) => it));
   items.forEach((it, i) => { it.row = i; });
   const rowOf = new Map(items.map(it => [it.id, it.row]));
 
@@ -200,7 +210,9 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
     ch.bottom = ch.end && ch.end.to ? rowOf.get(ch.end.to) : ch.items[ch.items.length - 1].row + (ch.end && ch.end.dangling ? 1 : 0);
   }
 
-  // 5. lanes: shortest lines of work nearest the trunk, so nested ones never cross; right and left in turn
+  // 5. lanes: shortest lines of work nearest the trunk, so nested ones never cross; right and left in turn. A line that
+  // leaves from or joins another line of work is placed after that line, so it knows which side that line is on: it keeps
+  // to that side rather than cross your trunk, and of the free lanes it takes the one where it crosses the fewest lines.
   const usable = Math.max(1, Math.floor((width - 2 * P.margin - 2 * P.headR) / P.pitchMin));
   const perSide = Math.max(1, Math.floor(usable / 2));
   const order = [];
@@ -215,20 +227,29 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
     if (ch.end && ch.end.to) { const t = chainOf.get(ch.end.to); if (t && (t === TRUNK || t.slot != null)) out.push({ row: rowOf.get(ch.end.to), a: s, b: xOfChain(t) }); }
     return out;
   };
-  const crosses = (ch, s) => {
+  // your trunk runs from the top (the wire comes down to HEAD) to its last commit: a level run over it counts double
+  const trunkEnd = TRUNK.items.length ? TRUNK.items[TRUNK.items.length - 1].row : -1;
+  const crossings = (ch, s) => {
+    let n = 0;
+    for (const run of runsOf(ch, s)) if (Math.min(run.a, run.b) < 0 && 0 < Math.max(run.a, run.b) && run.row < trunkEnd) n += 2;
     for (const [t, list2] of inSlot) for (const o of list2) {
       if (o === ch) continue;
-      for (const run of runsOf(ch, s)) if (Math.min(run.a, run.b) < t && t < Math.max(run.a, run.b) && o.top < run.row && run.row < o.bottom) return true;
-      for (const run of runsOf(o, t)) if (Math.min(run.a, run.b) < s && s < Math.max(run.a, run.b) && ch.top < run.row && run.row < ch.bottom) return true;
+      for (const run of runsOf(ch, s)) if (Math.min(run.a, run.b) < t && t < Math.max(run.a, run.b) && o.top < run.row && run.row < o.bottom) n++;
+      for (const run of runsOf(o, t)) if (Math.min(run.a, run.b) < s && s < Math.max(run.a, run.b) && ch.top < run.row && run.row < ch.bottom) n++;
     }
-    return false;
+    return n;
   };
   const folds = { 1: 0, [-1]: 0 };
-  const sorted = [...chains].sort((a, b) => (a.bottom - a.top) - (b.bottom - b.top) || a.top - b.top);
+  const byLength = [...chains].sort((a, b) => (a.bottom - a.top) - (b.bottom - b.top) || a.top - b.top);
+  // the lines a line of work leaves from or joins (not your trunk), placed before it
+  const needs = ch => [ch.topFrom && chainOf.get(ch.topFrom.id), ch.end && ch.end.to && chainOf.get(ch.end.to)].filter(o => o && o !== TRUNK && o !== ch);
+  const sorted = [], seenCh = new Set();
+  const visit = ch => { if (seenCh.has(ch)) return; seenCh.add(ch); for (const o of needs(ch)) visit(o); sorted.push(ch); };
+  for (const ch of byLength) visit(ch);
   for (const ch of sorted) {
     const free = order.filter(s => !inSlot.get(s).some(o => overlaps(o, ch)));
-    let s = free.find(x => !crosses(ch, x));
-    if (s == null) s = free[0];
+    let s = null, best = Infinity;
+    for (const x of free) { const c = crossings(ch, x); if (c < best) { best = c; s = x; } if (!c) break; }
     if (s == null) {
       // past what the width allows: onto the outermost lane of the side with fewer folded, with a "+N" marker
       const side = folds[1] <= folds[-1] ? 1 : -1;
@@ -240,12 +261,14 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
     inSlot.get(s).push(ch);
   }
 
-  // 6. geometry: the pitch the width allows, the trunk where the left lanes leave room for it
+  // 6. geometry: the pitch the width allows, the trunk where the left lanes leave room for it, or, with no lane on its
+  // left, where the HEAD silkscreen beside its pad still has room
   const kR = Math.max(0, ...chains.map(c => (c.slot > 0 ? c.slot : 0)));
   const kL = Math.max(0, ...chains.map(c => (c.slot < 0 ? -c.slot : 0)));
-  const room = width - 2 * P.margin - 2 * P.headR;
+  const lead = Math.max(P.margin + P.headR, kL || !rowOf.has(head) ? 0 : P.headR + HEAD_SILK);
+  const room = width - lead - P.headR - P.margin;
   const pitch = kR + kL ? Math.max(P.pitchMin, Math.min(P.pitchMax, Math.floor(room / (kR + kL)), Math.round(width / 7))) : P.pitchMax;
-  const trunkX = r1(P.margin + P.headR + kL * pitch);
+  const trunkX = r1(lead + kL * pitch);
   const xOf = slot => r1(trunkX + slot * pitch);
   const n = items.length;
   const rowH = P.rowH;
@@ -277,12 +300,16 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
   const tr = TRUNK.items;
   for (let i = 1; i < tr.length; i++) {
     const a = nodeById.get(tr[i - 1].id), b = nodeById.get(tr[i].id);
-    edges.push({ kind: 'trunk', pts: [[a.x, a.y], [b.x, b.y]] });
+    edges.push({ kind: 'trunk', from: a.id, to: b.id, pts: [[a.x, a.y], [b.x, b.y]] });
   }
   if (tr.length) {
     const last = tr[tr.length - 1];
     const fp = last.parents[0];
-    if (fp && !rowOf.has(fp)) { const a = nodeById.get(last.id); edges.push({ kind: 'trunk', stub: true, pts: [[a.x, a.y], [a.x, r1(a.y + rowH * 0.7)]] }); }
+    if (fp && !rowOf.has(fp)) {
+      // on into the history not shown, past any line of work that starts back there
+      const a = nodeById.get(last.id), endRow = Math.max(last.row, ...loose.map(it => it.row));
+      edges.push({ kind: 'trunk', stub: true, from: a.id, pts: [[a.x, a.y], [a.x, r1(yOf(endRow) + rowH * 0.7)]] });
+    }
   }
   // in to a node from a lane: down the lane, a 45° bend, then level into the node's side
   const joinPts = (from, to) => {
@@ -296,19 +323,55 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
     const s = Math.sign(to.x - from.x), d = Math.max(2, Math.min(B, to.y - from.y - to.size - 2));
     return [[r1(from.x + s * half(from)), from.y], [r1(to.x - s * d), from.y], [to.x, r1(from.y + d)], [to.x, to.y]];
   };
-  // anything else between two lanes runs down the gutter beside the target's lane
-  const gutterPts = (from, to) => {
-    const s = Math.sign(to.x - from.x) || 1, xg = r1(to.x - s * pitch / 2), d = Math.max(2, Math.min(B, Math.abs(to.y - from.y) / 3));
-    return [[r1(from.x + s * half(from)), from.y], [r1(xg - s * d), from.y], [xg, r1(from.y + d)], [xg, r1(to.y - d)], [r1(xg + s * d), to.y], [r1(to.x - s * half(to)), to.y]];
+  // Anything else between two lanes (a merge's second parent) runs down the gutter beside the target's lane: in its middle,
+  // or a few px to one side where another such line already runs down that gutter at the same height, so two merges'
+  // lines never share a stretch and each can be followed to the commit it took. Of the places that are free, the one
+  // that crosses the fewest of those lines; the bends get shorter where the gutter is narrow, and stay at 45°.
+  // (between two commits on one lane, with others in between, it steps out to the gutter beside it and back)
+  const gutterPts = (from, to, xg) => {
+    const s = Math.sign(xg - from.x) || 1, back = from.x === to.x ? -1 : 1;
+    const room = Math.min(s * (xg - from.x) - half(from), back * s * (to.x - xg) - half(to)) - 1;
+    const d = Math.max(2, Math.min(B, Math.abs(to.y - from.y) / 3, room));
+    return [[r1(from.x + s * half(from)), from.y], [r1(xg - s * d), from.y], [xg, r1(from.y + d)], [xg, r1(to.y - d)], [r1(xg + back * s * d), to.y], [r1(to.x - back * s * half(to)), to.y]];
+  };
+  const gutters = [];   // the cross lines placed so far, with their upright stretch in a gutter
+  const crossCount = pts => {
+    let c = 0;
+    for (const g2 of gutters) for (let i = 1; i < pts.length; i++) for (let j = 1; j < g2.pts.length; j++) if (segsCross(pts[i - 1], pts[i], g2.pts[j - 1], g2.pts[j])) c++;
+    return c;
+  };
+  const crossRoute = (from, to) => {
+    // towards the target's lane; between two commits on one lane, into the gutter on the trunk's side of it
+    const slot = Math.round((to.x - trunkX) / pitch);
+    const s = Math.sign(to.x - from.x) || (slot > 0 ? -1 : 1), mid = from.x === to.x ? to.x + s * pitch / 2 : to.x - s * pitch / 2;
+    // the gutter's usable width: clear of the target's lane and of the next lane's nodes, with room for a short bend
+    const nearT = P.headR + 4, nearF = pitch - P.headR - 4;
+    let best = null;
+    for (const step of [6, 3]) {
+      const offs = [0];
+      for (let k = 1; k * step <= pitch / 2; k++) offs.push(k * step, -k * step);
+      for (const o of offs) {
+        const xg = r1(mid - s * o), fromT = Math.abs(to.x - xg);
+        if (fromT < nearT || fromT > nearF || s * (xg - from.x) < half(from) + 3 || xg < 1 || xg > w - 1) continue;
+        const pts = gutterPts(from, to, xg), y0 = pts[2][1], y1 = pts[3][1];
+        const clash = gutters.some(g2 => Math.abs(g2.x - xg) < 2.5 && Math.min(y1, g2.y1) - Math.max(y0, g2.y0) > 0.5);
+        const cost = (clash ? 1e6 : 0) + crossCount(pts) * 100 + Math.abs(o);
+        if (!best || cost < best.cost) best = { cost, pts, xg, y0, y1 };
+      }
+      if (best && best.cost < 1e6) break;
+    }
+    if (!best) { const pts = gutterPts(from, to, r1(mid)); best = { pts, xg: r1(mid), y0: pts[2][1], y1: pts[3][1] }; }
+    gutters.push({ x: best.xg, y0: best.y0, y1: best.y1, pts: best.pts });
+    return best.pts;
   };
   for (const ch of chains) {
-    const agentId = ch.agentId || null;
+    const agentId = ch.agentId || null, folded = ch.folded ? { folded: true } : {};
     const its = ch.items.map(it => nodeById.get(it.id));
-    if (ch.topFrom) edges.push({ kind: 'out', agentId, pts: outPts(nodeById.get(ch.topFrom.id), its[0]) });
-    for (let i = 1; i < its.length; i++) edges.push({ kind: 'lane', agentId, pts: [[its[i - 1].x, its[i - 1].y], [its[i].x, its[i].y]] });
+    if (ch.topFrom) edges.push({ kind: 'out', agentId, from: ch.topFrom.id, to: its[0].id, ...folded, pts: outPts(nodeById.get(ch.topFrom.id), its[0]) });
+    for (let i = 1; i < its.length; i++) edges.push({ kind: 'lane', agentId, from: its[i - 1].id, to: its[i].id, ...folded, pts: [[its[i - 1].x, its[i - 1].y], [its[i].x, its[i].y]] });
     const last = its[its.length - 1];
-    if (ch.end && ch.end.to) edges.push({ kind: 'join', agentId, pts: joinPts(last, nodeById.get(ch.end.to)) });
-    else if (ch.end && ch.end.dangling) edges.push({ kind: 'lane', agentId, stub: true, pts: [[last.x, last.y], [last.x, r1(last.y + rowH * 0.7)]] });
+    if (ch.end && ch.end.to) edges.push({ kind: 'join', agentId, from: last.id, to: ch.end.to, ...folded, pts: joinPts(last, nodeById.get(ch.end.to)) });
+    else if (ch.end && ch.end.dangling) edges.push({ kind: 'lane', agentId, stub: true, from: last.id, ...folded, pts: [[last.x, last.y], [last.x, r1(last.y + rowH * 0.7)]] });
   }
   for (const it of items) {
     for (const p of it.parents.slice(1)) {
@@ -316,7 +379,10 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
       const ch = chainOf.get(p);
       if (ch !== TRUNK && ch.topFrom === it && ch.items[0].id === p) continue;   // drawn as that chain's way out
       const from = nodeById.get(it.id), to = nodeById.get(p);
-      edges.push({ kind: 'cross', agentId: ch === TRUNK ? null : ch.agentId, pts: from.x === to.x ? [[from.x, from.y], [to.x, to.y]] : gutterPts(from, to) });
+      // straight down its own lane only when no other commit sits on that lane in between
+      const straight = from.x === to.x && !nodes.some(nd => nd.x === from.x && nd.row > from.row && nd.row < to.row);
+      edges.push({ kind: 'cross', agentId: ch === TRUNK ? null : ch.agentId, from: it.id, to: p, ...(ch !== TRUNK && ch.folded ? { folded: true } : {}),
+        pts: straight ? [[from.x, from.y], [to.x, to.y]] : crossRoute(from, to) });
     }
   }
   // the wire from the board arrives at HEAD from above, down the trunk's line
@@ -349,6 +415,40 @@ function flip(g) {
   for (const e of g.edges) e.pts = e.pts.map(([x, y]) => [x, fy(y)]);
   for (const f of g.folds) f.y = fy(f.y) - 14;
   return g;
+}
+
+/** Do two segments cross at a point inside both (not where they meet end to end, and not along a shared stretch)? */
+function segsCross(a, b, c, d) {
+  const o = (p, q, r) => Math.sign((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]));
+  const o1 = o(a, b, c), o2 = o(a, b, d), o3 = o(c, d, a), o4 = o(c, d, b);
+  return o1 * o2 < 0 && o3 * o4 < 0;
+}
+
+/**
+ * Stretches two edges draw on top of each other for longer than `min` px (the same level, upright or 45° line), other
+ * than two lines meeting at one commit side by side (into it, or out of it), and lines folded into one lane on purpose
+ * ("+N"): for checks. Each is { a, b, len } with the two edges.
+ */
+export function sharedRuns(g, min = 13) {
+  const segs = [];
+  g.edges.forEach((e, k) => {
+    if (e.folded) return;
+    for (let i = 1; i < e.pts.length; i++) {
+      const [p, q] = [e.pts[i - 1], e.pts[i]], dx = q[0] - p[0], dy = q[1] - p[1];
+      const base = { k, e, at: [i === 1 ? e.from : null, i === e.pts.length - 1 ? e.to : null].filter(Boolean) };
+      if (Math.abs(dx) < 0.15) segs.push({ ...base, dir: 'v', key: p[0], lo: Math.min(p[1], q[1]), hi: Math.max(p[1], q[1]), f: 1 });
+      else if (Math.abs(dy) < 0.15) segs.push({ ...base, dir: 'h', key: p[1], lo: Math.min(p[0], q[0]), hi: Math.max(p[0], q[0]), f: 1 });
+      else { const down = Math.sign(dx) === Math.sign(dy); segs.push({ ...base, dir: down ? 'd' : 'u', key: down ? p[1] - p[0] : p[1] + p[0], lo: Math.min(p[0], q[0]), hi: Math.max(p[0], q[0]), f: Math.SQRT2 }); }
+    }
+  });
+  const out = [];
+  for (let i = 0; i < segs.length; i++) for (let j = i + 1; j < segs.length; j++) {
+    const s = segs[i], t = segs[j];
+    if (s.k === t.k || s.dir !== t.dir || Math.abs(s.key - t.key) > 0.6) continue;
+    const len = (Math.min(s.hi, t.hi) - Math.max(s.lo, t.lo)) * s.f;
+    if (len > min && !s.at.some(x => t.at.includes(x))) out.push({ a: s.e, b: t.e, len: Math.round(len) });
+  }
+  return out;
 }
 
 /** Every segment of every edge is level, upright or at 45°: for checks. */
