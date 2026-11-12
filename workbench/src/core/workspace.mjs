@@ -877,7 +877,7 @@ async function keptForNextCommit(cwd, run = git) {
     try {
       kept.push({ file, bytes: fs.readFileSync(file) });
     } catch (e) {
-      if (e.code !== 'ENOENT') throw plainError('Workbench could not read what git keeps for your next commit.', e);
+      if (e.code !== 'ENOENT') throw plainError('Workbench could not read what git keeps for your next commit, so nothing was merged.', e);
     }
   });
   return kept;
