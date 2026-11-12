@@ -293,11 +293,17 @@ test('your own changes in the way: Try again proposes the merge again, and Not n
   const again = labelled(v.html, 'Try again'), notNow = labelled(v.html, 'Not now');
   assert.deepEqual([again.cls, again.act, again.agent, again.state, again.into], ['big pri', 'merge', 'W1', 'done_checked', 'main']);
   assert.deepEqual([notNow.cls, notNow.act], ['big', 'later']);
-  // any other refusal: the engine's sentence, with the same two answers
+  // any other refusal: the engine's words, its first sentence as the headline and the rest under it, with the same two
+  // answers; a screen reader hears all of it
   const moved = show(lidView, S, finished({ work: problem('moved', 'main changed since you looked. Have another look.') }));
-  assert.match(moved.html, /<h1[^>]*>main changed since you looked\. Have another look\.<\/h1>/);
+  assert.match(moved.html, /<h1[^>]*>main changed since you looked\.<\/h1><p class="meta">Have another look\.<\/p>/);
+  assert.equal(moved.say, 'Ready for you to look at. main changed since you looked. Have another look.');
   assert.equal(labelled(moved.html, 'Try again').act, 'merge');
   assert.equal(labelled(moved.html, 'Not now').act, 'later');
+  const id = show(lidView, S, finished({ work: problem('identity', 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.') }));
+  assert.match(id.html, /<h1[^>]*>Git does not know your name and email yet, so Workbench cannot make the merge commit\.<\/h1><p class="meta">Set user\.name and user\.email with git config, then try again\.<\/p>/);
+  const one = show(lidView, S, finished({ work: problem('ancestry', 'Invoice export started from a commit that is no longer in main, so merging it would bring in other work.') }));
+  assert.match(one.html, /<h1[^>]*>Invoice export started from a commit that is no longer in main, so merging it would bring in other work\.<\/h1>/);
 });
 
 test('thrown away: "<Name>’s work was thrown away." and Dismiss', { skip }, async () => {

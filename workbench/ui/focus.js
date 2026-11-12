@@ -250,9 +250,12 @@ export function lidView(f, o = {}) {
         if (fs.meta) msg += metaP(esc(`Commit or put them aside, then merge ${a.name} again.`));
         acts = big('Try again', { act: 'merge', ...st, work: wk, into }, true) + big('Not now', { act: 'later', ...st, work: wk });
       } else {
-        // the engine's own sentence ("main changed since you looked. Have another look.", …)
+        // the engine's own words: the first sentence as the headline, what to do under it ("main changed since you
+        // looked." / "Have another look."); a screen reader gets all of it
         spoken = visibleControls(String(p.sentence || `${a.name}’s work could not be merged.`));
-        sentence = long(spoken);
+        const two = /^(.+?[.!?])\s+(?=[A-Z])(.+)$/s.exec(spoken);
+        sentence = long(two ? two[1] : spoken);
+        if (two) msg += metaP(esc(two[2]));
         if (paths.length) msg += metaP(esc(listed));
         acts = big('Try again', { act: 'merge', ...st, work: wk, into }, true) + big('Not now', { act: 'later', ...st, work: wk });
       }
