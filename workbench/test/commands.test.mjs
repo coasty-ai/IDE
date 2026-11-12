@@ -995,6 +995,15 @@ test('"into main" and "into my branch": a branch named is carried, so the engine
     ['merge add tests to parser', 'none', merge('9f9f9f')],
     ['merge add tests to parser into main', 'none', merge('9f9f9f', 'main')],
   ]);
+  // A branch with a word for a name: on it, "into the wizard" names it after an agent's name or "it"; work stays work.
+  const onWizard = { ...CTX.invoice, repo: { branch: 'wizard' } };
+  assert.deepEqual(parseCommand('merge it into the wizard', onWizard), merge('1a2b3c', 'wizard'));
+  assert.deepEqual(parseCommand('merge help pages into wizard', onWizard), merge('4d5e6f', 'wizard'));
+  assert.deepEqual(parseCommand('merge the onboarding flow into the wizard', onWizard), task('merge the onboarding flow into the wizard'));
+  assert.deepEqual(parseCommand('merge main into wizard', onWizard), task('merge main into wizard'));
+  assert.deepEqual(parseCommand('merge it into the wizard', CTX.invoice), task('merge it into the wizard')); // not its branch
+  // On a merge card a branch named is not a yes, even the one it merges into: "do it" is.
+  assert.deepEqual(parseCommand('merge it into the wizard', { ...CTX.pendingMerge, repo: { branch: 'wizard' } }), unknown('merge it into the wizard'));
 });
 
 test('describeIntent words changes, merge and throw-away', () => {
