@@ -609,7 +609,9 @@ function topoOrder(commits, tips) {
 // ---------------------------------------------------------------------------
 // Synthetic diffs. One unified diff per file, shaped like `git diff --no-ext-diff --no-textconv --no-color
 // --no-renames` with core.quotePath=false, with exactly the added and removed line counts the agent's `files` list
-// reports. The lines are made up, in the style of each kind of file, from the file's own name and folder.
+// reports. The lines are made up, in the style of each kind of file, from the file's own name and folder. A new file is
+// whole declarations (functions, tests, sections) in a sensible order; a changed file has one to three hunks, each a
+// change inside one function, test or section, with the three unchanged lines above and below it as they would stand.
 
 /** Names for made-up code, from a path: src/invoices/large-account.ts gives invoice, Invoice, largeAccount, ... */
 function diffWords(path) {
@@ -635,21 +637,32 @@ function diffWords(path) {
   };
 }
 
+// Placeholders that stand for a number: within one block (or one changed line) each keeps its value, so a test that
+// makes 12 invoices expects 12 back.
+const NUMBERS = new Set(['n', 'm']);
+
 /**
- * Fill {{name}} placeholders. A word may be a function (a deck: the next card each time), and a card may hold
- * placeholders of its own.
+ * Fill the {{name}} placeholders of some lines that belong together. A word may be a function: the next card of a
+ * deck, or a number (kept for all of these lines). A card may hold placeholders of its own.
  */
-function fillLine(line, words) {
-  let out = String(line);
-  for (let pass = 0; pass < 2 && out.includes('{{'); pass++) {
-    out = out.replace(/\{\{(\w+)\}\}/g, (m, k) => {
-      const v = words[k];
-      if (typeof v === 'function') return String(v());
-      return v == null ? m : String(v);
-    });
-  }
-  return out;
+function fillLines(lines, words) {
+  const kept = {};
+  return lines.map(line => {
+    let out = String(line);
+    for (let pass = 0; pass < 2 && out.includes('{{'); pass++) {
+      out = out.replace(/\{\{(\w+)\}\}/g, (m, k) => {
+        const v = words[k];
+        if (typeof v !== 'function') return v == null ? m : String(v);
+        if (!NUMBERS.has(k)) return String(v());
+        if (!(k in kept)) kept[k] = v();
+        return String(kept[k]);
+      });
+    }
+    return out;
+  });
 }
+
+const fillLine = (line, words) => fillLines([line], words)[0];
 
 /** Cards from a list in a shuffled order, all of them before any comes again, never the same one twice in a row. */
 function deck(list, rng) {
@@ -665,7 +678,7 @@ function deck(list, rng) {
   };
 }
 
-const VERBS = ['load', 'send', 'retry', 'group', 'count', 'sort', 'find', 'mark', 'split', 'check', 'build', 'save', 'queue', 'merge'];
+const VERBS = ['load', 'send', 'retry', 'group', 'count', 'sort', 'find', 'mark', 'split', 'check', 'build', 'save', 'queue', 'export'];
 const BEHAVIOURS = ['handles an empty list', 'keeps the order it was given', 'sends them in small batches', 'gives up after one retry',
   'works for a large account', 'rounds the total to the cent', 'picks up a half-finished one', 'skips the ones already done',
   'stops when it is cancelled', 'counts each one once', 'leaves the others alone', 'says what went wrong'];
@@ -715,167 +728,287 @@ const OLD_COPY_CONTEXT = ['"nav.home": "Home",', '"nav.products": "Products",', 
   '"nav.help": "Help",', '"account.title": "Your account",', '"account.signOut": "Sign out",', '"footer.contact": "Contact us",',
   '"footer.terms": "Terms",', '"footer.privacy": "Privacy",'];
 
-// Each kind of file. A new file is `head`, then `blocks` (and one-line `notes` where a block does not fit), then
-// `foot`. A changed file has hunks of `context` lines around changed lines: `pairs` [before, after] where a line was
-// changed, `adds` where one was only added. `func` is what git puts after a hunk's @@ (the last line above it that
-// starts with a letter; none where git usually finds nothing).
+// A migration, step by step: what it adds, in order, and how each is taken back out. The first step is what the file
+// is named for (an index to look rows up by account and date); the rest come in any order.
+const SQL_STEPS = [
+  { up: ['CREATE INDEX CONCURRENTLY IF NOT EXISTS {{table}}_account_id_created_at_idx', '  ON {{table}} (account_id, created_at);'],
+    down: ['DROP INDEX CONCURRENTLY IF EXISTS {{table}}_account_id_created_at_idx;'] },
+  { up: ['ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS batch_id uuid;'], down: ['ALTER TABLE {{table}} DROP COLUMN IF EXISTS batch_id;'] },
+  { up: ['CREATE INDEX CONCURRENTLY IF NOT EXISTS {{table}}_batch_id_idx', '  ON {{table}} (batch_id) WHERE batch_id IS NOT NULL;'],
+    down: ['DROP INDEX CONCURRENTLY IF EXISTS {{table}}_batch_id_idx;'] },
+  { up: ['ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS sent_at timestamptz;'], down: ['ALTER TABLE {{table}} DROP COLUMN IF EXISTS sent_at;'] },
+  { up: ['CREATE INDEX CONCURRENTLY IF NOT EXISTS {{table}}_status_idx', "  ON {{table}} (status) WHERE status <> 'sent';"],
+    down: ['DROP INDEX CONCURRENTLY IF EXISTS {{table}}_status_idx;'] },
+];
+const SQL_NOTES = ['-- Large accounts look up {{table}} by account and date when they export.',
+  '-- CONCURRENTLY keeps the table usable while each index is built.', '-- Safe to run again: every step checks first.',
+  '-- Reviewed with the on-call engineer.'];
+
+/** Exactly `n` lines of a migration: "-- Up", its steps, then "-- Down" undoing them in reverse order. */
+function migrationLines(n, words, rng) {
+  const steps = [SQL_STEPS[0], ...rng.shuffle(SQL_STEPS.slice(1))];
+  const cost = list => 3 + list.reduce((s, x) => s + x.up.length + x.down.length, 0);   // with "-- Up", "" and "-- Down"
+  const pick = [];
+  for (const s of steps) if (cost([...pick, s]) <= n) pick.push(s);
+  if (!pick.length) return fillLines(['-- Up', ...SQL_NOTES, ...SQL_NOTES].slice(0, n), words);
+  let spare = n - cost(pick);
+  const notes = rng.shuffle(SQL_NOTES);
+  const lead = [];
+  while (spare > 0 && notes.length && lead.length < 2) { lead.push(notes.pop()); spare--; }
+  const up = [];
+  pick.forEach((s, i) => {
+    if (i && spare > 0) { up.push(''); spare--; }
+    up.push(...s.up);
+  });
+  const rest = [...notes, ...SQL_NOTES];
+  while (spare > 0) { lead.push(rest[(spare - 1) % rest.length]); spare--; }
+  return fillLines(['-- Up', ...lead, ...up, '', '-- Down', ...pick.slice().reverse().flatMap(s => s.down)], words);
+}
+
+// Test names that fit what each kind of test checks. A test block is used at most once per name it has, so no two
+// tests in a file share a name.
+const TEST_NAMES = {
+  testTotal: ['adds up the total', 'rounds the total to the cent', 'counts each one once'],
+  testEmpty: ['handles an empty list', 'does nothing when there is nothing to do'],
+  testStatus: ['marks each one done', 'picks up a half-finished one', 'skips the ones already done'],
+  testBatch: ['works for a large account', 'sends them in small batches', 'keeps the order it was given'],
+  testAbort: ['stops when it is cancelled', 'stops cleanly half-way'],
+};
+/** A block named from the list `name` (a deck of TEST_NAMES): it can come as often as that list has names. */
+const named = (lines, name) => Object.assign(lines, { max: TEST_NAMES[name].length });
+
+// Each kind of file.
+// A new file: `head`, then whole `blocks` (and one-line `notes` where no block fits), then `foot`; `make`, when there,
+// writes the whole file instead. `renames`: a block may come again under a new name (another test, another section).
+// A changed file: in each hunk, three unchanged lines from `before` (or a run of `context`) above the change, the
+// changed lines (`pairs` [old, new]), lines only added (`adds`, and `inner`: a few lines that go together), then three
+// unchanged lines from `after`. `func` is what git puts after a hunk's @@: the line that opens the function, test or
+// section the change is in (none where git usually finds nothing).
 const KITS = {
   code: {
     head: ["import { db } from '../db/pool';", "import { log } from '../log';", "import type { {{Noun}} } from './types';", '',
       'export const {{THING}}_LIMIT = {{n}};', ''],
     foot: [],
     blocks: [
+      ['export type {{Thing}}Options = {', '  limit?: number;', '  retries?: number;', '  signal?: AbortSignal;', '};'],
       ['export function is{{Thing}}Ready({{noun}}: {{Noun}}): boolean {', "  return {{noun}}.status === 'ready' && {{noun}}.total > 0;", '}'],
-      ['export type {{Thing}}Options = {', '  limit?: number;', '  signal?: AbortSignal;', '};'],
-      ['export async function {{verb}}{{Thing}}(accountId: string) {', '  const rows = await db.{{table}}.findMany({ where: { accountId } });',
+      ['export async function load{{Thing}}(accountId: string) {', '  const rows = await db.{{table}}.findMany({ where: { accountId } });',
         "  log.debug('{{topic}}: {{table}} loaded', { accountId, count: rows.length });", '  return rows;', '}'],
       ['export function to{{Noun}}Row({{noun}}: {{Noun}}) {', '  return {', '    id: {{noun}}.id,', '    total: {{noun}}.total,', '  };', '}'],
-      ['export async function {{verb}}{{Thing}}({{table}}: {{Noun}}[], size = {{THING}}_LIMIT) {', '  const done = [];',
-        '  for (let i = 0; i < {{table}}.length; i += size) {', '    done.push(...(await save{{Noun}}Batch({{table}}.slice(i, i + size))));', '  }',
-        '  return done;', '}'],
-      ['export async function {{verb}}{{Thing}}ForAccount(account: Account, options: {{Thing}}Options = {}) {',
+      ['export async function send{{Thing}}({{table}}: {{Noun}}[], size = {{THING}}_LIMIT) {', '  const sent = [];',
+        '  for (let i = 0; i < {{table}}.length; i += size) {', '    sent.push(...(await save{{Noun}}Batch({{table}}.slice(i, i + size))));', '  }',
+        '  return sent;', '}'],
+      ['export async function list{{Thing}}ForAccount(account: Account, options: {{Thing}}Options = {}) {',
         '  if (options.signal?.aborted) return [];', '  const rows = await db.{{table}}.findMany({ where: { accountId: account.id }, take: options.limit });',
         '  return rows.map(to{{Noun}}Row);', '}'],
       ['function totalOf(rows: {{Noun}}[]): number {', '  return rows.reduce((sum, row) => sum + row.total, 0);', '}'],
+      ['export class {{Thing}}Error extends Error {', '  constructor(message: string, readonly accountId: string) {', '    super(message);',
+        "    this.name = '{{Thing}}Error';", '  }', '}'],
+      ['export function chunk<T>(items: T[], size: number): T[][] {', '  const out: T[][] = [];',
+        '  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));', '  return out;', '}'],
+      ['async function withRetry<T>(work: () => Promise<T>, retries = 1): Promise<T> {', '  try {', '    return await work();', '  } catch (err) {',
+        '    if (retries <= 0) throw err;', "    log.warn('{{topic}}: trying again', { err });", '    return withRetry(work, retries - 1);', '  }', '}'],
+      ['export function sortByDate(rows: {{Noun}}[]): {{Noun}}[] {', '  return [...rows].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());', '}'],
+      ['export async function count{{Thing}}(accountId: string): Promise<number> {', '  return db.{{table}}.count({ where: { accountId } });', '}'],
+      ['const DEFAULTS: {{Thing}}Options = {', '  limit: {{THING}}_LIMIT,', '  retries: 1,', '};'],
     ],
     notes: ['// Keep each batch small, so one slow {{noun}} cannot hold up the rest.', '// Safe to run twice: it skips the {{table}} that are already done.',
       '// Large accounts can have thousands of {{table}}.', '// Amounts are in cents, never in floats.', '// Times are in UTC everywhere in this file.',
-      '// Each step is logged, so support can follow what happened.', '// Returns early when there is nothing to do.'],
-    context: ['export async function {{verb}}{{Thing}}(account: Account) {', '  if (!account) return null;', '  const accountId = account.id;',
-      "  log.debug('{{topic}} started', { accountId });", '  const now = new Date();', '  try {', '    await lock(accountId);', '  } finally {',
-      '    release(accountId);', '  }', '  return { {{table}}: rows, total };', '}', ''],
+      '// Each step is logged, so support can follow what happened.'],
+    func: 'export async function {{verb}}{{Thing}}(accountId: string, options: {{Thing}}Options = {}) {',
+    before: [
+      ['  const started = Date.now();', "  log.debug('{{topic}} started', { accountId });", '  const rows = await db.{{table}}.findMany({ where: { accountId } });'],
+      ['  if (!accountId) return [];', '  const limit = options.limit ?? 100;', ''],
+      ['  const rows = await load{{Thing}}(accountId);', '  if (rows.length === 0) return [];', '  const total = totalOf(rows);'],
+      ['  const account = await db.accounts.findUnique({ where: { id: accountId } });', "  if (!account) throw new {{Thing}}Error('No such account', accountId);", ''],
+    ],
+    after: [
+      ['', "  log.info('{{topic}} done', { accountId, ms: Date.now() - started });", '  return rows;'],
+      ['  await saveProgress(accountId, rows.length);', '  return rows.map(to{{Noun}}Row);', '}'],
+      ['', '  return { sent, total };', '}'],
+      ["  metrics.timing('{{topic}}', Date.now() - started);", '  return sent;', '}'],
+    ],
     pairs: [
-      ['  const rows = await db.{{table}}.findMany({ where: { accountId } });', '  const rows = await db.{{table}}.findMany({ where: { accountId }, take: {{THING}}_LIMIT });'],
-      ['  if (rows.length === 0) return [];', '  if (rows.length === 0) return { {{table}}: [], total: 0 };'],
+      ['  const rows = await db.{{table}}.findMany({ where: { accountId } });', '  const rows = await db.{{table}}.findMany({ where: { accountId }, take: limit });'],
+      ['  if (rows.length === 0) return [];', '  if (rows.length === 0) return { sent: [], total: 0 };'],
       ["  log.info('{{topic}} done', { accountId });", "  log.info('{{topic}} done', { accountId, count: rows.length });"],
       ['  const total = rows.reduce((sum, row) => sum + row.amount, 0);', '  const total = roundToCents(rows.reduce((sum, row) => sum + row.amount, 0));'],
       ['  await save{{Noun}}(row);', '  await save{{Noun}}(row, { retry: 1 });'],
       ['  const started = Date.now();', '  const started = performance.now();'],
-      ["  if (!{{noun}}) throw new Error('{{Noun}} not found');", "  if (!{{noun}}) throw new NotFoundError('{{Noun}}', id);"],
-      ['  return rows.map(to{{Noun}}Row);', '  return rows.filter(isReady).map(to{{Noun}}Row);'],
-      ['  const options = { limit: 100, ...overrides };', '  const options = { limit: {{THING}}_LIMIT, ...overrides };'],
-      ['  for (const row of rows) {', '  for (const row of rows.slice(0, {{THING}}_LIMIT)) {'],
-      ['  }, 30_000);', '  }, 60_000);'],
+      ["  if (!{{noun}}) throw new Error('{{Noun}} not found');", "  if (!{{noun}}) throw new {{Thing}}Error('{{Noun}} not found', accountId);"],
+      ['  return rows.map(to{{Noun}}Row);', '  return rows.filter(is{{Thing}}Ready).map(to{{Noun}}Row);'],
+      ['  const limit = options.limit ?? 100;', '  const limit = options.limit ?? {{THING}}_LIMIT;'],
+      ['  const sent = await send{{Thing}}(rows);', '  const sent = await send{{Thing}}(rows, limit);'],
+      ['  const timeout = 30_000;', '  const timeout = 60_000;'],
+      ["  log.debug('{{topic}} started', { accountId });", "  log.debug('{{topic}} started', { accountId, limit });"],
+      ['  await sleep(1000);', '  await sleep(BATCH_PAUSE_MS);'],
     ],
-    adds: ['  const batches = chunk(rows, {{THING}}_LIMIT);', "  log.info('{{topic}}: sending in batches', { accountId, batches: batches.length });",
-      '  for (const batch of batches) await send{{Noun}}Batch(batch);', '  if (options.signal?.aborted) return { sent, stopped: true };',
-      '  const sent = [];', '  await sleep(250);', '  sent.push(...batch);', '  return { sent, stopped: false };',
-      "  metrics.increment('{{topic}}.batches');", '  const retries = options.retries ?? 1;', '  if (!rows.length) return { sent: [], stopped: false };',
-      '  // One slow {{noun}} no longer holds up the rest.'],
-    func: 'export async function {{verb}}{{Thing}}(accountId: string, overrides = {}) {',
+    adds: ['  const batches = chunk(rows, limit);', "  log.info('{{topic}}: sending in batches', { accountId, batches: batches.length });",
+      '  if (options.signal?.aborted) return { sent, stopped: true };', "  metrics.increment('{{topic}}.batches');",
+      '  const retries = options.retries ?? 1;', '  // One slow {{noun}} no longer holds up the rest.', '  await sleep(BATCH_PAUSE_MS);',
+      '  options.onProgress?.(sent.length, rows.length);', '  const startedAt = new Date();', '  const pending = rows.filter(row => !row.sentAt);',
+      "  log.debug('{{topic}}: {{table}} loaded', { accountId, count: rows.length });", '  const sent = [];'],
+    inner: [
+      ['  for (const batch of batches) {', '    sent.push(...(await send{{Noun}}Batch(batch)));', '  }'],
+      ['  if (options.signal?.aborted) {', "    log.info('{{topic}} stopped', { accountId, sent: sent.length });", '    return { sent, stopped: true };', '  }'],
+      ['  try {', '    await save{{Noun}}Batch(pending);', '  } catch (err) {', "    log.warn('{{topic}}: a batch failed, trying once more', { accountId, err });",
+        '    await save{{Noun}}Batch(pending);', '  }'],
+      ['  const page = await db.{{table}}.findMany({', '    where: { accountId, createdAt: { gte: startedAt } },', "    orderBy: { createdAt: 'asc' },",
+        '    take: limit,', '  });'],
+      ['  if (rows.length > limit) {', "    log.info('{{topic}}: a large account', { accountId, count: rows.length });", '  }'],
+    ],
   },
   test: {
     head: ["import { describe, it, expect, vi } from 'vitest';", "import { {{thing}}, make{{Noun}} } from './helpers/{{noun}}';", '', "describe('{{topic}}', () => {"],
     foot: ['});'],
+    renames: true,
     blocks: [
-      ["  it('{{behaviour}}', async () => {", '    const result = await {{thing}}(make{{Noun}}({ total: {{n}} }));', '    expect(result).toHaveLength({{m}});', '  });'],
-      ["  it('{{behaviour}}', () => {", '    expect({{thing}}([])).toEqual([]);', '  });'],
-      ["  it('{{behaviour}}', async () => {", "    const {{noun}} = make{{Noun}}({ status: 'pending' });", '    await {{thing}}([{{noun}}]);',
-        "    expect({{noun}}.status).toBe('done');", '  });'],
-      ["  it('{{behaviour}}', async () => {", '    const account = makeAccount({ {{table}}: {{n}} });', '    const result = await {{thing}}(account);',
-        '    expect(result.sent).toHaveLength({{m}});', '    expect(log.warn).not.toHaveBeenCalled();', '  });'],
+      named(["  it('{{testTotal}}', async () => {", '    const result = await {{thing}}(make{{Noun}}({ total: {{n}} }));', '    expect(result.total).toBe({{n}});', '  });'], 'testTotal'),
+      named(["  it('{{testEmpty}}', () => {", '    expect({{thing}}([])).toEqual([]);', '  });'], 'testEmpty'),
+      named(["  it('{{testStatus}}', async () => {", "    const {{noun}} = make{{Noun}}({ status: 'pending' });", '    await {{thing}}([{{noun}}]);',
+        "    expect({{noun}}.status).toBe('done');", '  });'], 'testStatus'),
+      named(["  it('{{testBatch}}', async () => {", '    const account = makeAccount({ {{table}}: {{n}} });', '    const result = await {{thing}}(account);',
+        '    expect(result.sent).toHaveLength({{n}});', '    expect(log.warn).not.toHaveBeenCalled();', '  });'], 'testBatch'),
+      named(["  it('{{testAbort}}', async () => {", '    const result = await {{thing}}(makeAccount(), { signal: AbortSignal.abort() });',
+        '    expect(result.stopped).toBe(true);', '  });'], 'testAbort'),
     ],
     notes: ['  // These run against an account with forty {{table}}.', '  // Uses the fake clock, so no test waits for real.',
       '  // Kept small, so a failure points at one thing.', '  // Slow on purpose: it checks the retry.'],
-    context: ['  beforeEach(() => vi.useRealTimers());', '', "  it('{{behaviour}}', async () => {", '    const account = makeAccount();',
-      '    const result = await {{thing}}([]);', '    expect(result).toEqual([]);', '  });', ''],
+    func: "describe('{{topic}}', () => {",
+    before: [
+      ["  it('{{behaviour}}', async () => {", '    const account = makeAccount({ {{table}}: {{n}} });', '    const result = await {{thing}}(account);'],
+      ["  it('{{behaviour}}', async () => {", "    const {{noun}} = make{{Noun}}({ status: 'pending' });", '    await {{thing}}([{{noun}}]);'],
+      ["  it('{{behaviour}}', async () => {", '    vi.useFakeTimers();', '    const result = await {{thing}}(make{{Noun}}({ total: {{n}} }));'],
+    ],
+    after: [
+      ['    expect(log.warn).not.toHaveBeenCalled();', '  });', ''],
+      ['  });', '', "  it('{{behaviour}}', async () => {"],
+      ["    expect({{noun}}.status).toBe('done');", '  });', ''],
+    ],
     pairs: [
       ['    expect(result).toHaveLength({{n}});', '    expect(result).toHaveLength({{m}});'],
-      ['    const result = await {{thing}}(make{{Noun}}({ total: {{n}} }));', '    const result = await {{thing}}(make{{Noun}}({ total: {{m}} }), { limit: 50 });'],
       ['    expect(result.total).toBe({{n}});', '    expect(result.total).toBeCloseTo({{m}}.1, 2);'],
-      ["  it('{{behaviour}}', async () => {", "  it('{{behaviour}}', async () => {"],
       ["    const {{noun}} = make{{Noun}}({ status: 'pending' });", "    const {{noun}} = make{{Noun}}({ status: 'paid', paidAt: new Date() });"],
       ['    vi.useFakeTimers();', "    vi.useFakeTimers({ now: new Date('2026-01-01') });"],
       ['    await {{thing}}([{{noun}}]);', '    await {{thing}}([{{noun}}], { retries: 1 });'],
+      ['    expect(result.sent).toHaveLength({{n}});', '    expect(result.sent).toHaveLength({{m}});'],
+      ["    expect({{noun}}.status).toBe('done');", "    expect({{noun}}.status).toBe('sent');"],
     ],
-    adds: ['    expect(result.sent).toHaveLength({{n}});', '    expect(log.warn).not.toHaveBeenCalled();', '    const account = makeAccount({ {{table}}: {{n}} });',
-      '    await vi.runAllTimersAsync();', '    expect(result.stopped).toBe(false);', '    controller.abort();', "  it('{{behaviour}}', async () => {", '  });', ''],
-    func: "describe('{{topic}}', () => {",
+    adds: ['    expect(log.warn).not.toHaveBeenCalled();', '    await vi.runAllTimersAsync();', '    expect(result.stopped).toBe(false);',
+      '    expect(result.batches).toBeGreaterThan(1);', "    expect(log.info).toHaveBeenCalledWith('{{topic}} done', expect.anything());",
+      '    expect(result.sent.every(x => x.sentAt)).toBe(true);'],
+    inner: [
+      ['    for (const batch of result.batches) {', '      expect(batch.length).toBeLessThanOrEqual({{n}});', '    }'],
+      ['    await expect({{thing}}(account, { signal: AbortSignal.abort() }))', '      .resolves.toMatchObject({ stopped: true });'],
+    ],
   },
   sql: {
-    head: ['-- Up', ''],
-    foot: [],
-    blocks: [
-      ['CREATE INDEX CONCURRENTLY IF NOT EXISTS {{table}}_account_id_created_at_idx', '  ON {{table}} (account_id, created_at);'],
-      ['CREATE INDEX CONCURRENTLY IF NOT EXISTS {{table}}_status_idx', "  ON {{table}} (status) WHERE status <> 'sent';"],
-      ['UPDATE {{table}}', '   SET batch_id = NULL', ' WHERE batch_id IS NOT NULL;'],
-      ['-- Down', 'DROP INDEX CONCURRENTLY IF EXISTS {{table}}_account_id_created_at_idx;', 'DROP INDEX CONCURRENTLY IF EXISTS {{table}}_status_idx;'],
-    ],
-    notes: ['-- Large accounts look up {{table}} by account and date when they export.', '-- CONCURRENTLY keeps the table usable while the index is built.',
-      '-- Safe to run again: every step checks first.', 'ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS batch_id uuid;',
-      'ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS sent_at timestamptz;', '-- Reviewed with the on-call engineer.'],
+    make: migrationLines,
+    func: null,
     context: ['BEGIN;', '', '-- Up', '', 'COMMIT;', '', '-- Down', ''],
     pairs: [
       ['CREATE INDEX {{table}}_account_id_idx ON {{table}} (account_id);', 'CREATE INDEX {{table}}_account_id_idx ON {{table}} (account_id, created_at);'],
       ['ALTER TABLE {{table}} ADD COLUMN status text;', "ALTER TABLE {{table}} ADD COLUMN status text NOT NULL DEFAULT 'open';"],
       ['DROP INDEX {{table}}_account_id_idx;', 'DROP INDEX IF EXISTS {{table}}_account_id_idx;'],
     ],
-    adds: ['ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS batch_id uuid;', '-- CONCURRENTLY keeps the table usable while the index is built.', ''],
-    func: null,
+    adds: ['ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS batch_id uuid;', '-- CONCURRENTLY keeps the table usable while each index is built.',
+      'ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS sent_at timestamptz;'],
   },
   prose: {
     head: ['# {{Title}}', ''],
     foot: [],
-    blocks: [['{{heading}}', '', '{{more}}', '{{more}}'], ['1. Open Settings.', '2. Choose Billing.', '3. Pick a plan and press Save.'],
-      ['- {{more}}', '- {{more}}', '- {{more}}']],
+    renames: true,
+    blocks: [Object.assign(['{{heading}}', '', '{{more}}', '{{more}}'], { max: HEADINGS.length }),
+      Object.assign(['1. Open Settings.', '2. Choose Billing.', '3. Pick a plan and press Save.'], { max: 1 }), ['- {{more}}', '- {{more}}', '- {{more}}']],
     notes: ['{{more}}'],
-    context: ['## Before you start', '', 'This page is for shop owners.', '', '## Getting help', '', 'Questions? Write to help@storefront.example.', ''],
-    pairs: PROSE,
-    adds: [...MORE_PROSE, ''],
     func: '{{more}}',
+    before: [
+      ['## Before you start', '', 'This page is for shop owners.'],
+      ['## Changing your plan', '', 'Your plan renews on the same day each month.'],
+      ['## Downloading your invoices', '', 'Each invoice shows what you paid for, line by line.'],
+      ['## If something goes wrong', '', 'Most problems clear up if you sign out and back in.'],
+    ],
+    after: [
+      ['', '## Getting help', ''],
+      ['', 'Questions? Write to help@storefront.example.', ''],
+      ['', '## Your invoices', ''],
+      ['', '## Your team', ''],
+    ],
+    pairs: PROSE,
+    adds: MORE_PROSE,
+    inner: [['', '{{heading}}', '', '{{more}}'], ['1. Open Settings.', '2. Choose Billing.', '3. Pick a plan and press Save.'],
+      ['- {{more}}', '- {{more}}']],
   },
   json: {
     head: ['{'],
     foot: ['}'],
     blocks: [],
     notes: NEW_COPY.map(l => `  ${l}`),
+    func: null,
     context: OLD_COPY_CONTEXT.map(l => `  ${l}`),
     pairs: COPY.map(p => p.map(l => `  ${l}`)),
     adds: NEW_COPY.map(l => `  ${l}`),
-    func: null,
   },
   ui: {
     head: ["import { useState } from 'react';", "import { Button } from '../components/Button';", "import { t } from '../i18n';", '', 'export function {{Thing}}() {'],
     foot: ['}'],
     blocks: [
-      ['  return (', '    <section className="{{thing}}">', "      <h1>{t('{{noun}}.title')}</h1>", "      <p className=\"lead\">{t('{{noun}}.intro')}</p>", '    </section>', '  );'],
+      ['  const [step, setStep] = useState(0);', '  const lastStep = steps.length - 1;'],
       ['  function next() {', '    setStep(Math.min(step + 1, lastStep));', '  }'],
+      ['  return (', '    <section className="{{thing}}">', "      <h1>{t('{{noun}}.title')}</h1>", "      <p className=\"lead\">{t('{{noun}}.intro')}</p>",
+        '    </section>', '  );'],
     ],
-    notes: ['  const [step, setStep] = useState(0);', '  const [open, setOpen] = useState(false);', '  const lastStep = steps.length - 1;',
-      '  // {{Title}} reads its words from the {{noun}} copy file.'],
-    context: ['  return (', '    <section className="{{thing}}">', "      <p>{t('{{noun}}.help')}</p>", '    </section>', '  );', '}', ''],
+    notes: ['  // {{Title}} reads its words from the {{noun}} copy file.'],
+    func: 'export function {{Thing}}() {',
+    before: [
+      ['  return (', '    <section className="{{thing}}">', "      <h1>{t('{{noun}}.title')}</h1>"],
+      ['    <section className="{{thing}}">', "      <h1>{t('{{noun}}.title')}</h1>", "      <p className=\"lead\">{t('{{noun}}.intro')}</p>"],
+      ["      <p className=\"lead\">{t('{{noun}}.intro')}</p>", '      <Progress step={step} />', "      <p>{t('{{noun}}.help')}</p>"],
+    ],
+    after: [
+      ['    </section>', '  );', '}'],
+      ["      <p>{t('{{noun}}.help')}</p>", '    </section>', '  );'],
+      ["      <Button onClick={next}>{t('button.next')}</Button>", '    </section>', '  );'],
+    ],
     pairs: [
       ["      <p className=\"lead\">{t('{{noun}}.intro')}</p>", "      <p className=\"lead muted\">{t('{{noun}}.intro')}</p>"],
-      ["      <Link to=\"/search/v1\">{t('nav.search')}</Link>", "      <Link to=\"/search\">{t('nav.search')}</Link>"],
-      ['  const [step, setStep] = useState(0);', '  const [step, setStep] = useState(() => savedStep() ?? 0);'],
-      ["      <h1>{t('{{noun}}.title')}</h1>", "      <h1 className=\"title\">{t('{{noun}}.title')}</h1>"],
-      ["      <Button onClick={() => setStep(step + 1)}>{t('button.next')}</Button>", "      <Button onClick={() => setStep(Math.min(step + 1, lastStep))}>{t('button.next')}</Button>"],
+      ["      <h1>{t('{{noun}}.title')}</h1>", "      <h1 id=\"{{thing}}-title\">{t('{{noun}}.title')}</h1>"],
+      ["      <Button onClick={() => setStep(step + 1)}>{t('button.next')}</Button>", "      <Button onClick={next}>{t('button.next')}</Button>"],
       ["      <Button variant=\"link\" onClick={skip}>{t('button.skip')}</Button>", "      <Button variant=\"secondary\" onClick={skip}>{t('button.skip')}</Button>"],
-      ['    <section className="{{thing}}">', '    <section className="{{thing}}" aria-labelledby="{{thing}}-title">'],
+      ["      <Link to=\"/search/v1\">{t('nav.search')}</Link>", "      <Link to=\"/search\">{t('nav.search')}</Link>"],
+      ["      <p>{t('{{noun}}.help')}</p>", "      <p className=\"help\">{t('{{noun}}.help')}</p>"],
+      ['      <Progress step={step} />', '      <Progress step={step} of={lastStep} />'],
+      ['      <img src={hero} />', '      <img src={hero} alt="" />'],
     ],
-    adds: ['      <Progress step={step} of={lastStep} />', '      {error && <p role="alert">{error}</p>}', '  const lastStep = steps.length - 1;',
-      '  useEffect(() => saveStep(step), [step]);', "      <Button variant=\"secondary\" onClick={skip}>{t('button.skip')}</Button>", ''],
-    func: 'export function {{Thing}}() {',
+    adds: ['      <Progress step={step} of={lastStep} />', '      {error && <p role="alert">{error}</p>}',
+      "      <Button variant=\"secondary\" onClick={skip}>{t('button.skip')}</Button>", "      <p className=\"hint\">{t('{{noun}}.hint')}</p>",
+      '      <Checklist items={checklist} />', "      <a href=\"/help/getting-started\">{t('{{noun}}.learnMore')}</a>"],
+    inner: [
+      ['      {step > 0 && (', "        <Button variant=\"link\" onClick={back}>{t('button.back')}</Button>", '      )}'],
+      ['      <ol className="{{thing}}-steps">', '        {steps.map(s => <li key={s.id}>{t(s.title)}</li>)}', '      </ol>'],
+    ],
   },
   css: {
     head: [],
     foot: [],
     blocks: [['.{{thing}} {', '  display: flex;', '  gap: 8px;', '}'], ['@media (max-width: 480px) {', '  .{{thing}} {', '    flex-direction: column;', '  }', '}']],
     notes: ['/* {{Title}} on small screens */', '/* Keep tap targets at least 44px tall. */', ''],
-    context: ['.{{thing}} {', '  padding: 12px 16px;', '  font-size: 14px;', '}', ''],
-    pairs: [['  gap: 8px;', '  gap: 12px;'], ['  display: grid;', '  display: flex;'], ['  padding: 12px;', '  padding: 8px 12px;']],
-    adds: ['  flex-wrap: wrap;', '  min-height: 44px;', '  align-items: center;'],
     func: null,
+    before: [['.{{thing}} {', '  display: flex;', '  padding: 12px 16px;'], ['.{{thing}}-actions {', '  display: grid;', '  gap: 8px;']],
+    after: [['  font-size: 14px;', '}', ''], ['  border-radius: 6px;', '}', '']],
+    pairs: [['  gap: 8px;', '  gap: 12px;'], ['  display: grid;', '  display: flex;'], ['  padding: 12px;', '  padding: 8px 12px;'],
+      ['  font-size: 13px;', '  font-size: 14px;']],
+    adds: ['  flex-wrap: wrap;', '  min-height: 44px;', '  align-items: center;', '  justify-content: space-between;'],
   },
   text: {
     head: [],
     foot: [],
     blocks: [],
     notes: ['{{more}}'],
+    func: null,
     context: ['', '{{Title}} notes'],
     pairs: PROSE,
     adds: MORE_PROSE,
-    func: null,
   },
 };
 
@@ -892,35 +1025,61 @@ function kitFor(path) {
 }
 
 /**
- * Exactly `n` lines made of whole blocks (a function, a test), a blank line after each, and single lines from `one()`
- * where no block fits. Blocks not used yet in this file (`used`) come first; a block is used again only when its name
- * changes each time (a fresh verb or test name), so nothing is declared twice.
+ * Exactly `n` lines of whole blocks (a function, a test), a blank line after each, and single lines from `one()` where
+ * no block fits. Each block comes once, unless the kit lets a block come again under a new name: then up to its `max`.
  */
-function blockLines(n, kit, words, rng, one, used) {
+function blockLines(n, kit, words, rng, one) {
   const out = [];
+  const uses = new Map();
   let room = n;
   let last = null;
   while (room > 0) {
-    const fits = room >= 3 ? kit.blocks.filter(b => b.length <= room && b !== last) : [];
-    const fresh = fits.filter(b => !used.has(b));
-    const renamed = fits.filter(b => /\{\{(verb|behaviour|more|heading)\}\}/.test(b[0]));
-    const choice = fresh.length ? fresh : renamed;
-    const block = choice.length ? rng.pick(choice) : [one()];
-    if (block.length > 1) { used.add(block); last = block; }
-    out.push(...block);
+    const fits = room >= 3 ? (kit.blocks || []).filter(b => b.length <= room && b !== last) : [];
+    const fresh = fits.filter(b => !uses.has(b));
+    const again = kit.renames ? fits.filter(b => (uses.get(b) || 0) < (b.max ?? Infinity)) : [];
+    const choice = fresh.length ? fresh : again;
+    const block = choice.length ? rng.pick(choice) : null;
+    if (!block) {
+      out.push(fillLine(one(), words));
+      room -= 1;
+      continue;
+    }
+    uses.set(block, (uses.get(block) || 0) + 1);
+    last = block;
+    out.push(...fillLines(block, words));
     room -= block.length;
-    if (room > 1 && block.length > 1) { out.push(''); room -= 1; }
+    if (room > 1) { out.push(''); room -= 1; }
   }
-  return out.map(l => fillLine(l, words));
+  return out;
+}
+
+/** Exactly `n` lines added inside a function, test or section: single lines, and a few lines that go together. */
+function innerLines(n, kit, words, rng, one, used) {
+  const out = [];
+  let room = n;
+  while (room > 0) {
+    const fits = (kit.inner || []).filter(b => b.length <= room && !used.has(b));
+    if (fits.length && room >= 2 && rng.chance(0.6)) {
+      const block = rng.pick(fits);
+      used.add(block);
+      out.push(...fillLines(block, words));
+      room -= block.length;
+    } else {
+      out.push(fillLine(one(), words));
+      room -= 1;
+    }
+  }
+  return out;
 }
 
 /** Exactly `n` lines of a new file of this kind. */
 function newFileLines(n, kit, words, rng) {
+  if (kit.make) return kit.make(n, words, rng);
   const framed = n >= kit.head.length + kit.foot.length + 2;
   const head = framed ? kit.head : [];
   const foot = framed ? kit.foot : [];
-  const body = blockLines(n - head.length - foot.length, kit, words, rng, deck(kit.notes, rng), new Set());
-  return [...head.map(l => fillLine(l, words)), ...body, ...foot.map(l => fillLine(l, words))];
+  const body = blockLines(n - head.length - foot.length, kit, words, rng, deck(kit.notes, rng));
+  return [...fillLines(head, words), ...body, ...fillLines(foot, words)];
 }
 
 /** `@@` ranges leave out a count of 1, as git does. */
@@ -929,16 +1088,19 @@ const hunkRange = (start, len) => (len === 1 ? `${start}` : `${start},${len}`);
 /**
  * A unified diff of one file, for `workDiff`'s `patch`. status 'added' is a new file of `adds` lines, 'deleted' a file
  * of `dels` lines taken out; 'modified' has one to three hunks with three lines of context around them, `dels` lines
- * taken out and `adds` put in.
+ * taken out and `adds` put in. `origin` ({ key, lines }), for a file deleted after it was added and merged: the key its
+ * diff had then, so that the lines (and the blob) taken out are the ones that were put in.
  */
-function syntheticPatch({ path, status, adds, dels, key }) {
-  const rng = new Rng(`diff:${key}:${path}:${status}:${adds}:${dels}`);
+function syntheticPatch({ path, status, adds, dels, key, origin = null }) {
+  const [k, s, a, d] = status === 'deleted' && origin && origin.lines === dels ? [origin.key, 'added', dels, 0] : [key, status, adds, dels];
+  const rng = new Rng(`diff:${k}:${path}:${s}:${a}:${d}`);
   const kit = kitFor(path);
   const words = {
-    ...diffWords(path), n: () => rng.int(2, 50), m: () => rng.int(2, 50),
+    ...diffWords(path), n: () => rng.int(3, 48), m: () => rng.int(3, 48),
     verb: deck(VERBS, rng), behaviour: deck(BEHAVIOURS, rng), more: deck(MORE_PROSE, rng), heading: deck(HEADINGS, rng),
+    ...Object.fromEntries(Object.entries(TEST_NAMES).map(([name, list]) => [name, deck(list, rng)])),
   };
-  const blob = (side) => hex40(`blob:${key}:${path}:${adds}:${dels}:${side}`).slice(0, 7);
+  const blob = (side) => hex40(`blob:${k}:${path}:${a}:${d}:${side}`).slice(0, 7);
   const out = [`diff --git a/${path} b/${path}`];
   if (status === 'added') {
     const lines = newFileLines(adds, kit, words, rng);
@@ -948,7 +1110,7 @@ function syntheticPatch({ path, status, adds, dels, key }) {
   }
   if (status === 'deleted') {
     const lines = newFileLines(dels, kit, words, rng);
-    out.push('deleted file mode 100644', `index ${blob('old')}..0000000`, `--- a/${path}`, '+++ /dev/null');
+    out.push('deleted file mode 100644', `index ${blob(s === 'added' ? 'new' : 'old')}..0000000`, `--- a/${path}`, '+++ /dev/null');
     if (lines.length) out.push(`@@ -${hunkRange(1, lines.length)} +0,0 @@`, ...lines.map(l => `-${l}`));
     return `${out.join('\n')}\n`;
   }
@@ -958,16 +1120,25 @@ function syntheticPatch({ path, status, adds, dels, key }) {
   // Spread the changes over the hunks so that each one changes something: added lines from the first hunk on,
   // removed lines from the last hunk back.
   const share = (n, i, fromEnd) => Math.floor(n / count) + ((fromEnd ? i >= count - (n % count) : i < n % count) ? 1 : 0);
-  // Unchanged lines come in runs from the kit's context, in its order, as they would stand in the file.
-  let at = rng.int(0, kit.context.length - 1);
-  const context = () => kit.context[at++ % kit.context.length];
+  // The unchanged lines above and below each change: three as they stand around a change in a function (`before`,
+  // `after`), or else the next run of the kit's `context`, in its order.
+  let at = rng.int(0, (kit.context || ['']).length - 1);
+  const run = () => fillLines([0, 1, 2].map(() => kit.context[at++ % kit.context.length]), words);
+  const above = kit.before ? (d => () => fillLines(d(), words))(deck(kit.before, rng)) : run;
+  const below = kit.after ? (d => () => fillLines(d(), words))(deck(kit.after, rng)) : run;
   const pair = deck(kit.pairs, rng);
   const added = deck(kit.adds, rng);
-  const used = new Set();   // blocks this file already added, so no hunk declares the same thing again
+  const used = new Set();   // what this file already added, so no hunk adds the same lines again
+  let near = [];            // the unchanged lines of the hunk being written
+  const gone = new Set();   // the lines this file already changed
   const changed = () => {
     for (let k = 0; ; k++) {
-      const [before, after] = pair().map(l => fillLine(l, words));
-      if (before !== after || k >= 4) return [before, after];
+      const [before, after] = fillLines(pair(), words);
+      const fresh = before !== after && !near.includes(before) && !near.includes(after) && !gone.has(before);
+      if (fresh || k >= 2 * kit.pairs.length) {
+        gone.add(before);
+        return [before, after];
+      }
     }
   };
   let oldAt = rng.int(4, 28);
@@ -975,19 +1146,23 @@ function syntheticPatch({ path, status, adds, dels, key }) {
   for (let i = 0; i < count && total > 0; i++) {
     const a = share(adds, i, false);
     const d = share(dels, i, true);
+    const top = above();
+    const bottom = below();
+    near = [...top, ...bottom];
     const pairs = Array.from({ length: Math.min(a, d) }, changed);
     const removed = [...pairs.map(p => p[0]), ...Array.from({ length: d - pairs.length }, () => changed()[0])];
-    // Lines only added come as whole blocks where they fit (a new test, a new function), else as single new lines.
-    const put = [...pairs.map(p => p[1]), ...blockLines(a - pairs.length, kit, words, rng, added, used)];
+    const put = [...pairs.map(p => p[1]), ...innerLines(a - pairs.length, kit, words, rng, added, used)];
     const func = kit.func ? ` ${fillLine(kit.func, words)}` : '';
-    out.push(`@@ -${hunkRange(oldAt, 6 + d)} +${hunkRange(oldAt + shift, 6 + a)} @@${func}`);
-    for (let k = 0; k < 3; k++) out.push(` ${fillLine(context(), words)}`);
+    const oldLen = top.length + d + bottom.length;
+    const newLen = top.length + a + bottom.length;
+    out.push(`@@ -${hunkRange(oldAt, oldLen)} +${hunkRange(oldAt + shift, newLen)} @@${func}`);
+    for (const l of top) out.push(` ${l}`);
     for (const l of removed) out.push(`-${l}`);
     for (const l of put) out.push(`+${l}`);
-    for (let k = 0; k < 3; k++) out.push(` ${fillLine(context(), words)}`);
+    for (const l of bottom) out.push(` ${l}`);
     shift += a - d;
-    oldAt += 6 + d + rng.int(6, 40);
-    at += rng.int(1, 4);   // the next hunk is further down the file
+    oldAt += oldLen + rng.int(6, 40);   // the next hunk is further down the file
+    at += rng.int(1, 4);
   }
   return `${out.join('\n')}\n`;
 }
@@ -1183,7 +1358,7 @@ export class Simulator {
       created: new Set(),  // paths its work added as new files since its unmerged work began: their diff is all new lines
       deleted: new Set(),  // paths its work took out that were there when its unmerged work began
       paths: new Set(),    // every path it has changed, kept after a merge empties `files`
-      lines: new Map(),    // path -> lines, for the files it added and merged: what taking one out again removes
+      lines: new Map(),    // path -> { lines, key }: the files it added and merged, and what taking one out again removes
       says: null,          // the last thing it said to the person: the body of its work commit
     };
     this._agents.set(id, a);
@@ -1861,7 +2036,7 @@ export class Simulator {
         } else if (a.paths.has(p)) {
           // It was there when its unmerged work began (merged earlier, say): taking it out deletes it.
           const f = a.files.get(p);
-          a.files.set(p, { path: p, adds: 0, dels: a.lines.get(p) ?? Math.max(12, f ? f.dels : 0) });
+          a.files.set(p, { path: p, adds: 0, dels: a.lines.get(p)?.lines ?? Math.max(12, f ? f.dels : 0) });
           a.deleted.add(p);
         } else {
           a.files.delete(p);
@@ -2368,6 +2543,11 @@ export class Simulator {
     return { head: w.head, tree, since: w.since, workId: `${w.head}:${tree}`, changed: tree !== sinceTree, files, left };
   }
 
+  /** What an agent's diffs are made from: the same work since the same commit always reads the same. */
+  _diffKey(a) {
+    return `${this.seed}:${a.id}:${a.git.since}`;
+  }
+
   /** The root a git method is about, or the plain reason it cannot be. `use`: 'show' takes a helper to its agent. */
   _gitTarget(agentId, use) {
     const a = this._agents.get(String(agentId ?? ''));
@@ -2450,7 +2630,7 @@ export class Simulator {
     const files = snap.files.slice(0, max).map(f => ({
       ...f,
       patch: f.binary || f.large ? null
-        : syntheticPatch({ path: f.path, status: f.status, adds: f.adds, dels: f.dels, key: `${this.seed}:${a.id}:${a.git.since}` }),
+        : syntheticPatch({ path: f.path, status: f.status, adds: f.adds, dels: f.dels, key: this._diffKey(a), origin: a.lines.get(f.path) || null }),
     }));
     return { workId: snap.workId, since: snap.since, head: snap.head, files, left: snap.left, omitted: snap.files.length - files.length };
   }
@@ -2580,13 +2760,14 @@ export class Simulator {
     const files = snap.files.length;
     const adds = snap.files.reduce((s, f) => s + f.adds, 0);
     const dels = snap.files.reduce((s, f) => s + f.dels, 0);
+    // What is in main now, so that taking a file out later removes all of it: its lines, and the key its diff had.
+    for (const f of snap.files) {
+      if (f.status === 'added') a.lines.set(f.path, { lines: f.adds, key: this._diffKey(a) });
+      else if (f.status === 'deleted') a.lines.delete(f.path);
+    }
     w.since = work;
     w.merged = { into, merge: m.id, at, files, adds, dels };
     w.problem = null;
-    for (const f of snap.files) {   // what is in main now, so that taking a file out later removes all of it
-      if (f.status === 'added') a.lines.set(f.path, f.adds);
-      else if (f.status === 'deleted') a.lines.delete(f.path);
-    }
     a.files.clear();
     a.created.clear();
     a.deleted.clear();
