@@ -336,8 +336,10 @@ export class Board {
       have.delete(m.id);
       const icon = m.awake ? '' : glyph('sleep', 'sleep');
       const note = box.note && m.noteText ? `<small>${esc(m.noteText)}</small>` : '';
-      const html = `<span class="lb"><b><i class="led" aria-hidden="true"></i>${icon}<span>${esc(m.name)}</span></b>${note}</span><span class="fingers" aria-hidden="true"></span>`;
+      // the name as the layout sized it: whole, or cut with "…" where the connector is short of room (all of it in the title)
+      const html = `<span class="lb"><b><i class="led" aria-hidden="true"></i>${icon}<span>${esc(box.label ?? m.name)}</span></b>${note}</span><span class="fingers" aria-hidden="true"></span>`;
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+      if (box.label != null) el.title = m.name; else el.removeAttribute('title');
       el.classList.toggle('off', !m.awake);
       el.classList.toggle('lit', litId === m.id);
       el.setAttribute('aria-label', `${m.name}, ${m.noteText || (m.awake ? 'awake' : 'asleep')}. Open machines.`);
@@ -354,7 +356,8 @@ export class Board {
     const t = this.tray;
     if (!G.tray || !tray || !tray.count) { t.hidden = true; delete t.dataset.box; return; }
     t.hidden = false;
-    const html = `<span class="bank" aria-hidden="true">${tray.marks.slice(0, 8).map(m => `<i>${glyph(m.shape, m.tone)}</i>`).join('')}</span><span><b>${esc(tray.lead)}</b>${esc(tray.rest)}</span>`;
+    // its words as the layout sized them (shorter where the machines need the room; its accessible name keeps all of them)
+    const html = `<span class="bank" aria-hidden="true">${tray.marks.slice(0, 8).map(m => `<i>${glyph(m.shape, m.tone)}</i>`).join('')}</span><span><b>${esc(G.tray.lead ?? tray.lead)}</b>${esc(G.tray.rest ?? tray.rest)}</span>`;
     if (t.dataset.html !== html) { t.innerHTML = html; t.dataset.html = html; }
     t.setAttribute('aria-label', tray.aria);
     Object.assign(t.style, { left: G.tray.x + 'px', top: G.tray.y + 'px', maxWidth: G.tray.w + 40 + 'px' });

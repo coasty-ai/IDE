@@ -683,25 +683,28 @@ function placeBands(G, { machines, tray }) {
   G.holes = [[P.margin + 22, P.margin + 22], [G.W - P.margin - 22, P.margin + 22], [P.margin + 22, G.H - P.margin - 22], [G.W - P.margin - 22, G.H - P.margin - 22]];
   G.fiducials = [[G.cx - P.coreW / 2 - 70, bd.y + P.topBand / 2 + 1], [G.cx + P.coreW / 2 + 70, bd.y + P.topBand / 2 + 1]];
   G.you = { x: c.x - 9 + 10, y: c.y - 9 - 6, dotX: c.x - 9 + 2.5, dotY: c.y - 9 - 10 };
-  // the done tray sits in the bottom band at the left, beside the mounting hole
+  // the done tray sits in the bottom band at the left, beside the mounting hole, as wide as the words it draws (lead in
+  // bold, then the rest); board.js draws exactly these words
   const bandY = bd.b - P.botBand;
   G.tray = null;
-  if (tray && tray.count > 0) {
-    const tw = Math.max(m(tray.text, P.silkSub), Math.min(tray.count, 8) * 16) + 12;
-    G.tray = { x: bd.x + P.trayX, y: bandY + 10, w: Math.ceil(tw), h: P.botBand - 20 };
-  }
-  // machines: sections of the gold edge connector under the core, with a gap where the DRAM's wire leaves the board.
-  // With one machine, its section goes left of the wire; with more, they sit either side of it.
-  const more = G.detail === 'more';
-  const lo = (G.tray ? G.tray.x + G.tray.w + 18 : bd.x + P.holeClear), hi = bd.r - P.holeClear;
-  const wx = G.dram ? G.dram.wire.x : null, wg = P.dram.wireGap;
-  const sec = (mc, note) => {
-    const nameW = m(mc.name, P.mName) + 8 + 7 + (mc.awake ? 0 : 18);
-    return Math.ceil(Math.max(P.machMin, Math.max(nameW, note ? m(mc.note || '', P.mNote) : 0) + 20));
+  const trayBox = (lead, rest) => {
+    const tw = Math.max(m(lead + rest, P.silkSub), Math.min(tray.count, 8) * 16) + 12;
+    return { x: bd.x + P.trayX, y: bandY + 10, w: Math.ceil(tw), h: P.botBand - 20, lead, rest };
   };
+  if (tray && tray.count > 0) G.tray = tray.lead != null ? trayBox(tray.lead, tray.rest || '') : trayBox(String(tray.text || ''), '');
+  // machines: sections of the gold edge connector under the core, with a gap where the DRAM's wire leaves the board.
+  // With one machine, its section goes left of the wire; with more, they sit either side of it. No section ever lies
+  // across the wire: where the room runs out they narrow to their names, then the tray's words shorten, and only then
+  // are names cut (all of each name stays in its section's title and accessible name).
+  const more = G.detail === 'more';
+  let lo = (G.tray ? G.tray.x + G.tray.w + 18 : bd.x + P.holeClear);
+  const hi = bd.r - P.holeClear;
+  const wx = G.dram ? G.dram.wire.x : null, wg = P.dram.wireGap;
+  const nameNeed = (mc, name = mc.name) => m(name, P.mName) + 8 + 7 + (mc.awake ? 0 : 18);
+  const sec = (mc, note) => Math.ceil(Math.max(P.machMin, Math.max(nameNeed(mc), note ? m(mc.note || '', P.mNote) : 0) + 20));
   const span = (ws, gap) => ws.reduce((s, w) => s + w, 0) + gap * Math.max(0, ws.length - 1);
   // left of the wire: the first k sections, packed against its gap; the rest start after it
-  const placeAt = (widths, gap, k) => {
+  const placeAt = (widths, gap, k, anyway = false) => {
     const n = widths.length, xs = [];
     if (wx == null) { let x = Math.max(lo, Math.min(G.cx - span(widths, gap) / 2, hi - span(widths, gap))); for (const w of widths) { xs.push(x); x += w + gap; } }
     else {
@@ -711,7 +714,7 @@ function placeBands(G, { machines, tray }) {
       x = wx + wg;
       for (const w of widths.slice(k)) { xs.push(x); x += w + gap; }
     }
-    return n && xs[0] >= lo - 0.5 && xs[n - 1] + widths[n - 1] <= hi + 0.5 ? xs : null;
+    return n && (anyway || (xs[0] >= lo - 0.5 && xs[n - 1] + widths[n - 1] <= hi + 0.5)) ? xs : null;
   };
   const tryAll = (widths, gap) => {
     const n = widths.length, k0 = n === 1 ? 1 : Math.ceil(n / 2);
@@ -727,15 +730,42 @@ function placeBands(G, { machines, tray }) {
   let xs = tryAll(widths, gap);
   if (!xs) { gap = Math.min(gap, 12); xs = tryAll(widths, gap); }
   if (!xs && notes) { notes = false; widths = machines.map(mc => sec(mc, false)); xs = tryAll(widths, gap); }
+  // sections as narrow as their names
+  const narrow = () => machines.map(mc => Math.ceil(nameNeed(mc) + 6));
+  if (!xs && widths.length) { widths = narrow(); xs = tryAll(widths, gap); }
+  // the tray's words shorten ("12 done, 6 from earlier, 1 more"; its list and its accessible name keep all of them)
+  if (!xs && widths.length && G.tray && tray.lead != null) {
+    const { done = 0, earlier = 0, over = 0 } = tray;
+    const lead = done ? `${done} done` : `${earlier} from earlier`;
+    const rest = (done && earlier ? `, ${earlier} from earlier` : '') + (over ? `, ${over} more` : '');
+    if (lead + rest !== G.tray.lead + G.tray.rest) {
+      G.tray = trayBox(lead, rest);
+      lo = G.tray.x + G.tray.w + 18;
+      widths = machines.map(mc => sec(mc, false)); xs = tryAll(widths, gap);
+      if (!xs) { widths = narrow(); xs = tryAll(widths, gap); }
+    }
+  }
+  let labels = null;
   if (!xs && widths.length) {
-    // the last resort: equal sections, as narrow as they must be (never under 64 px)
-    const room = hi - lo - (wx == null ? 0 : 2 * wg);
-    const each = Math.max(64, Math.floor((room - gap * Math.max(0, widths.length - 1)) / widths.length));
+    // The last resort: equal sections on each side of the wire, as wide as the room there allows, with as many on its
+    // left as gives the widest; a name that does not fit is cut, with "…". Never across the wire.
+    const n = widths.length;
+    let best = null;
+    for (let k = 0; k <= n; k++) {
+      if (wx == null && k) break;
+      const left = k ? (wx - wg - lo - (k - 1) * gap) / k : Infinity;
+      const right = n - k ? ((wx == null ? hi - lo : hi - wx - wg) - (n - k - 1) * gap) / (n - k) : Infinity;
+      const each = Math.floor(Math.min(left, right));
+      if (!best || each > best.each) best = { k, each };
+    }
+    const each = Math.max(32, best.each);
     widths = widths.map(() => each);
-    xs = tryAll(widths, gap) || placeAt(widths, gap, Math.ceil(widths.length / 2)) || widths.map((w, i) => lo + i * (w + gap));
+    xs = placeAt(widths, gap, best.k) || placeAt(widths, gap, best.k, true);
+    const charW = m('M', P.mName);
+    labels = machines.map(mc => (nameNeed(mc) <= each ? null : clipTo(mc.name, Math.max(2, Math.floor((each - nameNeed(mc, '')) / charW)))));
   }
   const mh = P.botBand - 8;
-  G.machines = machines.map((mc, i) => ({ id: mc.id, x: xs[i], y: bd.b - mh, w: widths[i], h: mh, note: notes }));
+  G.machines = machines.map((mc, i) => ({ id: mc.id, x: xs[i], y: bd.b - mh, w: widths[i], h: mh, note: notes, ...(labels && labels[i] != null ? { label: labels[i] } : {}) }));
   // the one line under the DRAM (the hint, or what Workbench just said): left of the DRAM's wire, and clear of the lanes
   // that leave the core's bottom edge on the left
   const lineH = saidLineH(P);

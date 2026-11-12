@@ -17,7 +17,9 @@ const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 't
   // D2: an agent's work in the lid, and the engine's cards for it (the 'merge' scenarios of scripts/ui-mock.mjs)
   'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids',
   // what an agent controls, with characters that hide text or turn it: shown by their codes on the board and in the lid
-  'taint'];
+  'taint',
+  // a crowded board with a long done tray: the edge connector's sections keep clear of the DRAM's wire
+  'wire'];
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
 const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
@@ -369,6 +371,7 @@ try {
     for (const s of sizes) for (const d of details) {
       // these two do not depend much on the window: two sizes, unless one is asked for
       if ((v === 'taint' || v === 'git-tangles') && sizes.length > 2 && !['960x900', '1440x789'].includes(s)) continue;
+      if (v === 'wire' && sizes.length > 2 && !['960x900', '1024x700', '1280x680'].includes(s)) continue;   // where the room runs out
       if (GIT_VIEWS.includes(v)) { await gitView(v, s, d); continue; }   // D1
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
@@ -535,6 +538,38 @@ try {
         await load('merge-more', '&focus=n4'); await check(tag + ' (stopped, with Review)');
         await load('merge-detached', '&focus=d1'); await check(tag + ' (not on a branch)');
         await load('merge-noid', '&focus=d2'); await check(tag + ' (no name and email)');
+      } else if (v === 'wire') {
+        // A crowded board whose done tray reads "12 done or stopped, 6 from earlier, 1 more working", with the demo's
+        // four machines; then a fuller one whose machines have long names. No section of the edge connector may lie on
+        // the DRAM's wire, and every word must fit its box (the fit check above).
+        const crowd = async ({ working, done, earlier, rename }) => {
+          const st = await (await fetch(base + '/ctl/state')).json();
+          const one = st.agents.find(a => !a.parentId && a.state === 'working');
+          const at = Date.now(), list = [];
+          for (let i = 0; i < working + done + earlier; i++) {
+            const kind = i < working ? 'working' : i < working + done ? 'done' : 'earlier';
+            list.push({ ...one, id: `x${i}`, rootId: `x${i}`, name: `Crowd ${i} fix`, machineId: ['laptop', 'cloud-1', 'cloud-3'][i % 3], ask: null, helpers: { total: 0, working: 0, done: 0 },
+              state: kind === 'working' ? 'working' : i % 2 ? 'done_checked' : 'stopped', startedAt: at - (90 - i) * 60000, stateSince: at - 60000,
+              endedAt: kind === 'working' ? null : at - 30000, earlier: kind === 'earlier', canContinue: kind === 'earlier' ? true : null });
+          }
+          const machines = st.machines.map(mc => (rename ? { ...mc, name: { laptop: 'Your laptop (the one on your desk)', 'cloud-1': 'Cloud workstation in Frankfurt', 'cloud-2': 'Cloud workstation in Oregon', 'cloud-3': 'Cloud workstation in Tokyo' }[mc.id] || mc.name } : mc));
+          await ctl('push', { event: 'snapshot', data: { ...st, agents: list, machines } }); await sleep(500); await settle(120);
+        };
+        const WIRE = String.raw`(() => {
+          const w = document.querySelector('#board path.dram-wire');
+          if (!w) return { on: ['(no wire drawn)'], tray: '' };
+          const r = w.getBoundingClientRect(), x = r.left + r.width / 2, on = [];
+          for (const m of document.querySelectorAll('.mach')) { const b = m.getBoundingClientRect(); if (b.left < x + 6 && b.right > x - 6) on.push(m.getAttribute('aria-label')); }
+          return { on, tray: document.getElementById('tray').textContent.trim(), names: [...document.querySelectorAll('.mach')].map(m => [m.querySelector('.lb b span')?.textContent || '', m.title || '']) };
+        })()`;
+        for (const [what, o] of [['12 done, 6 from earlier, 1 more working', { working: 31, done: 12, earlier: 6 }], ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }]]) {
+          await load('many'); await crowd(o);
+          const r = await b.ev(WIRE);
+          for (const x of r.on) failures.push(`${tag} (${what}): a machine lies on the DRAM's wire: ${x}`);
+          for (const [shown, title] of r.names || []) if (shown.endsWith('…') && !title) failures.push(`${tag} (${what}): "${shown}" is cut with no title holding all of it`);
+          if (verbose) console.log(tag, what, JSON.stringify(r));
+          await check(`${tag} (${what})`);
+        }
       } else if (v === 'taint') {
         // Everything an agent controls, with characters in it that hide text or turn it: its name, what it says, asks and
         // does, the words of its answers, its paths, its checks' and its helpers' names. The board, the lid and what is
