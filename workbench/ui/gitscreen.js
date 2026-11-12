@@ -190,6 +190,8 @@ function read() {
     if (seq !== st.seq) return;
     st.data = clean(r); st.error = null; st.loading = false;
     if (st.sel && !st.data.commits.some(c => c.id === st.sel) && !st.sel.startsWith('work:')) st.sel = null;
+    // something changed while it was being read (a merge's events can come in pairs): read once more
+    if (st.shown && st.readSig !== readSig()) { read(); return; }
     paint();
     if (st.detail && st.detail.kind === 'agent') loadChanges(false);
   }, err => {
@@ -396,16 +398,13 @@ function paintGraph(z) {
   const detailLevel = el.html.dataset.detail || 'calm';
   const key = [st.seq, d ? 1 : 0, st.error || '', st.loading, z.W, z.H, graphW, st.sel, detailLevel, d && JSON.stringify(d.agents.map(a => { const x = agentOf(a.id); return x && [x.state, workSig(x), x.files && x.files.changed]; }))].join('|');
   st.geo = { band, top, left, right, bottom, graphW, textX: 0, wire: st.geo && st.geo.wire };
-  if (!d) {
+  // with no rows, the list says why in its own name (a list holds only its rows)
+  const note = !d ? (st.error || 'Reading the history…') : !d.commits.length ? 'This repository has no commits yet.' : null;
+  const label = note ? `Commits: ${note}` : `Commits, newest first${d.more ? '. Older commits are not shown here.' : ''}`;
+  if (el.graph.getAttribute('aria-label') !== label) el.graph.setAttribute('aria-label', label);
+  if (note) {
     st.g = null;
-    const words = st.error ? esc(st.error) : 'Reading the history…';
-    const html = `<p class="gnote" role="presentation">${words}</p>`;
-    if (st.keys.graph !== html) { st.keys.graph = html; el.graph.innerHTML = html; }
-    return;
-  }
-  if (!d.commits.length) {
-    st.g = null;
-    const html = '<p class="gnote" role="presentation">This repository has no commits yet.</p>';
+    const html = `<p class="gnote" aria-hidden="true">${esc(note)}</p>`;
     if (st.keys.graph !== html) { st.keys.graph = html; el.graph.innerHTML = html; }
     return;
   }
@@ -451,7 +450,7 @@ function paintGraph(z) {
       + ` aria-label="${esc(w.aria)}" title="${esc(title)}" style="top:${r1(r.y - g.rowH / 2)}px;height:${g.rowH}px;padding-left:${st.geo.textX}px">`
       + `<span class="l1">${glyph}${badges}<span class="sub">${esc(t1)}</span></span><span class="l2">${esc(t2)}</span></div>`;
   }
-  const more = d.more ? `<p class="gmore" style="top:${g.h - 8}px;padding-left:${st.geo.textX}px">Older commits are not shown here.</p>` : '';
+  const more = d.more ? `<p class="gmore" aria-hidden="true" style="top:${g.h - 8}px;padding-left:${st.geo.textX}px">Older commits are not shown here.</p>` : '';
   const html = `<div class="gin" style="height:${g.h + (d.more ? 22 : 0)}px"><svg class="gsvg" width="${g.w}" height="${g.h}" viewBox="0 0 ${g.w} ${g.h}" aria-hidden="true">${graphSvg(g)}</svg>${rows}${more}</div>`;
   const hadFocus = el.graph.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   el.graph.innerHTML = html;
@@ -650,12 +649,15 @@ function paintDetail(z = sizes()) {
   el.detail.hidden = false;
   if (st.keys.detail === html) return;
   st.keys.detail = html;
+  // the same detail, updated, keeps its place in the diff and the keyboard; another one starts at its top
+  const target = d.kind + ':' + (d.agentId || d.id), same = st.keys.target === target;
+  st.keys.target = target;
   const focusKey = el.detail.contains(document.activeElement) ? document.activeElement.dataset.key : null;
-  const scroll = el.detail.querySelector('.gdiff')?.scrollTop || 0;
+  const scroll = same ? el.detail.querySelector('.gdiff')?.scrollTop || 0 : 0;
   patchChildren(el.detail, html);
   const box = el.detail.querySelector('.gdiff');
-  if (box && scroll) box.scrollTop = scroll;
-  if (focusKey) el.detail.querySelector(`[data-key="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
+  if (box) box.scrollTop = scroll;
+  if (focusKey && same) el.detail.querySelector(`[data-key="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
 }
 
 const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
@@ -669,12 +671,12 @@ const btnAttrs = o => Object.entries(o).filter(([, v]) => v != null && v !== fal
 function agentDetail(agentId, z) {
   const a = agentOf(agentId);
   const close = '<button type="button" class="gx" data-git-act="close" data-key="close" aria-label="Close the detail">×</button>';
-  if (!a) return `<header class="dhd"><h2 id="gitDetailTitle" tabindex="-1">That agent is no longer here.</h2>${close}</header>`;
+  if (!a) return `<header class="dhd"><h2 id="gitDetailTitle" tabindex="-1" data-key="title">That agent is no longer here.</h2>${close}</header>`;
   const mark = markOfAgent(a, STATES.LOOK), name = visibleText(a.name || 'Agent');
   const w = a.work || {};
   const repo = st.data ? st.data.repo : (S.meta && S.meta.repo) || {};
   const into = repo.branch || null;
-  let h = `<header class="dhd"><svg class="g c-${mark.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${mark.shape}"/></svg><h2 id="gitDetailTitle" tabindex="-1">${esc(name)}</h2><span class="dst">${esc(a.earlier ? `from an earlier run · ${mark.label}` : mark.label)}</span>${close}</header>`;
+  let h = `<header class="dhd"><svg class="g c-${mark.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${mark.shape}"/></svg><h2 id="gitDetailTitle" tabindex="-1" data-key="title">${esc(name)}</h2><span class="dst">${esc(a.earlier ? `from an earlier run · ${mark.label}` : mark.label)}</span>${close}</header>`;
   // where its work is
   const lines = [];
   if (w.branch) {
@@ -741,7 +743,7 @@ function agentDetail(agentId, z) {
 function commitDetail(id) {
   const close = '<button type="button" class="gx" data-git-act="close" data-key="close" aria-label="Close the detail">×</button>';
   const c = st.data && st.data.commits.find(x => x.id === id);
-  if (!c) return `<header class="dhd"><h2 id="gitDetailTitle" tabindex="-1">That commit is no longer shown.</h2>${close}</header>`;
+  if (!c) return `<header class="dhd"><h2 id="gitDetailTitle" tabindex="-1" data-key="title">That commit is no longer shown.</h2>${close}</header>`;
   const subject = visibleText(c.subject.trim()) || '(no description)';
   const when = c.at == null ? '' : (() => { const ms = c.at < 1e12 ? c.at * 1000 : c.at; return `${agoText(Date.now() - ms)} (${new Date(ms).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })})`; })();
   const agent = c.agentId ? agentOf(c.agentId) : null;
@@ -764,7 +766,7 @@ function commitDetail(id) {
   }
   if (c.agentId) rows.push(['Made by', agent ? `<button type="button" class="glink" data-git-act="agent" data-agent="${esc(agent.id)}" data-key="a:${esc(agent.id)}">${esc(visibleText(agent.name))}</button>` : 'an agent that is no longer here']);
   const kind = c.kind === 'merge' || c.parents.length > 1 ? 'A merge commit' : c.kind === 'work' ? 'An agent’s work, as a commit' : '';
-  return `<header class="dhd"><svg class="gmark" aria-hidden="true"><use href="#g-git"/></svg><h2 id="gitDetailTitle" tabindex="-1">${esc(subject)}</h2>${close}</header>`
+  return `<header class="dhd"><svg class="gmark" aria-hidden="true"><use href="#g-git"/></svg><h2 id="gitDetailTitle" tabindex="-1" data-key="title">${esc(subject)}</h2>${close}</header>`
     + (kind ? `<p class="dkind">${esc(kind)}</p>` : '')
     + `<dl class="dl2">${rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join('')}</dl>`;
 }
