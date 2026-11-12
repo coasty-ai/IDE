@@ -853,6 +853,11 @@ describe('source control', { concurrency: 4 }, () => {
     assert.equal(fs.readFileSync(p('mine.txt'), 'utf8'), 'mine\n');
     assert.equal(fs.readFileSync(p('.env'), 'utf8'), 'SECRET=person\n');
     assert.equal(statusOf(t.root), ' M c.txt\n?? mine.txt\n');
+    // The danger avoided: moving a checked-out branch with update-ref leaves its folder behind, as a staged undo of the merge.
+    const demo = cloneOf(t.root);
+    git(demo, 'reset', '-q', '--hard', p1);
+    git(demo, 'update-ref', 'refs/heads/main', r.merge);
+    assert.equal(statusOf(demo), 'M  a.txt\nA  b.txt\nD  new.txt\n');
     // The messages, and who made them: the person's configured identity, not the environment's.
     assert.equal(messageOf(t.root, r.work),
       'Fix the search box\n\nIt trims spaces now.\n\nWorkbench-Agent: sc0003\nWorkbench-Kind: work\nCo-authored-by: Claude <noreply@anthropic.com>\n'.replace('sc0003', t.id));
