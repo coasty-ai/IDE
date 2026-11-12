@@ -29,9 +29,9 @@ final class Log {
       try? FileManager.default.removeItem(at: old)
       try? FileManager.default.moveItem(at: url, to: old)
     }
-    if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
-    handle = try? FileHandle(forWritingTo: url)
-    _ = try? handle?.seekToEnd()
+    // appended to, line by line, so two copies of the app never write over each other's lines
+    let fd = Darwin.open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    handle = fd >= 0 ? FileHandle(fileDescriptor: fd, closeOnDealloc: true) : nil
   }
   func write(_ line: String) {
     let stamp = ISO8601DateFormatter().string(from: Date())
@@ -403,7 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
       let wv = WKWebView(frame: .zero, configuration: config)
       wv.navigationDelegate = self
       wv.uiDelegate = self
-      if #available(macOS 13.3, *) { wv.isInspectable = true }
+      wv.isInspectable = true
       let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900),
                        styleMask: [.titled, .closable, .miniaturizable, .resizable],
                        backing: .buffered, defer: false)

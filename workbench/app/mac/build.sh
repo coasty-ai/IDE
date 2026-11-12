@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds Workbench.app and Workbench-<version>-arm64.dmg for macOS on Apple silicon, into workbench/dist/:
+# Builds Workbench.app and Workbench-<version>-arm64.dmg for macOS 13.5 or later on Apple silicon, into workbench/dist/:
 # the native window (WorkbenchApp.swift), its icon, Node with npm, and Workbench itself. Needs the Xcode command line
 # tools (swiftc, iconutil, hdiutil, codesign). The app is ad-hoc signed: on another Mac, macOS asks once before it
 # opens it (System Settings → Privacy & Security → Open Anyway).
@@ -8,7 +8,8 @@
 #
 #   --node <folder>  use this Node (darwin-arm64) instead of downloading the pinned one from nodejs.org
 #   --no-dmg         build the app only
-#   --install        also put the app in /Applications (or ~/Applications when that is not writable)
+#   --install        also put the app in /Applications (or ~/Applications when that is not writable); refused while
+#                    that copy is open, and inside an agent
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -32,6 +33,13 @@ done
 if [ "$INSTALL" = 1 ] && [ -n "${WORKBENCH_AGENT_ID+set}" ]; then
   echo "This is running inside an agent, so it will not replace the Workbench app in Applications: build without --install." >&2; exit 2
 fi
+if [ "$INSTALL" = 1 ]; then
+  DEST="/Applications"
+  [ -w "$DEST" ] || DEST="$HOME/Applications"
+  if pgrep -f "$DEST/Workbench.app/Contents/MacOS/Workbench" >/dev/null 2>&1; then
+    echo "Workbench is open. Quit it first (its agents stop), then install again." >&2; exit 2
+  fi
+fi
 command -v swiftc >/dev/null || { echo "swiftc was not found: install the Xcode command line tools (xcode-select --install)." >&2; exit 2; }
 
 VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$WB/package.json" | head -1)"
@@ -46,7 +54,7 @@ if [ -z "$NODE_DIR" ]; then
   NODE_DIR="$CACHE/node-$NODE_VERSION-darwin-arm64"
   if [ ! -x "$NODE_DIR/bin/node" ]; then
     TGZ="node-$NODE_VERSION-darwin-arm64.tar.gz"
-    echo "Downloading Node $NODE_VERSION…"
+    echo "Downloading Node ${NODE_VERSION}…"
     curl -fsSL -o "$CACHE/$TGZ" "https://nodejs.org/dist/$NODE_VERSION/$TGZ"
     curl -fsSL -o "$CACHE/SHASUMS256-$NODE_VERSION.txt" "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt"
     WANT="$(grep " $TGZ\$" "$CACHE/SHASUMS256-$NODE_VERSION.txt" | awk '{print $1}')"
@@ -63,9 +71,9 @@ NPM_DIR="$(cd "$NODE_DIR" && pwd)/lib/node_modules/npm"
 
 # --- the native window and the icon
 echo "Compiling the app…"
-swiftc -O -swift-version 5 -target arm64-apple-macos13.0 -framework AppKit -framework WebKit \
+swiftc -O -swift-version 5 -target arm64-apple-macos13.5 -framework AppKit -framework WebKit \
   "$HERE/WorkbenchApp.swift" -o "$BUILD/Workbench"
-swiftc -O -swift-version 5 -target arm64-apple-macos13.0 -framework AppKit "$HERE/MakeIcon.swift" -o "$BUILD/make-icon"
+swiftc -O -swift-version 5 -target arm64-apple-macos13.5 -framework AppKit "$HERE/MakeIcon.swift" -o "$BUILD/make-icon"
 "$BUILD/make-icon" "$BUILD/AppIcon.iconset"
 iconutil -c icns "$BUILD/AppIcon.iconset" -o "$BUILD/AppIcon.icns"
 
@@ -93,7 +101,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>13.5</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -132,8 +140,7 @@ if [ "$DMG" = 1 ]; then
 fi
 
 if [ "$INSTALL" = 1 ]; then
-  DEST="/Applications"
-  [ -w "$DEST" ] || { DEST="$HOME/Applications"; mkdir -p "$DEST"; }
+  mkdir -p "$DEST"
   rm -rf "$DEST/Workbench.app"
   cp -R "$APP" "$DEST/"
   echo "Installed $DEST/Workbench.app"

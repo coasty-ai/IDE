@@ -782,7 +782,7 @@ The repository root's `npm run demo` and `npm run dogfood` (Workbench on its own
 
 ## The Mac app (`app/mac/`)
 
-A native window around the page, for macOS 13 or later on Apple silicon. Workbench does not depend on it, and it is not part of `npm test`: it is Swift, and needs a Mac to build.
+A native window around the page, for macOS 13.5 or later (as the bundled Node) on Apple silicon. Workbench does not depend on it, and it is not part of `npm test`: it is Swift, and needs a Mac to build.
 
 - **`build.sh`** (the repository root's `npm run app` runs it with `--install`) compiles `WorkbenchApp.swift` and `MakeIcon.swift` with `swiftc`, draws the icon, and assembles `dist/Workbench.app`:
   - `Contents/MacOS/Workbench`, the window.
@@ -790,7 +790,7 @@ A native window around the page, for macOS 13 or later on Apple silicon. Workben
   - `Contents/Resources/workbench/`: `bin/`, `src/`, `ui/`, `package.json`, `README.md` and `ARCHITECTURE.md`, as they are in this folder.
   - `Info.plist`: bundle id `ai.coasty.workbench`; local networking allowed; the microphone and speech recognition, for talking to Workbench; folders as documents it opens.
 
-  It signs the app ad hoc (there is no Apple Developer ID), writes `dist/Workbench-<version>-arm64.dmg` unless `--no-dmg`, and with `--install` copies the app to `/Applications` (or `~/Applications` when that is not writable). `--install` is refused when `WORKBENCH_AGENT_ID` is set, even to an empty string: an agent must not replace the app the person may be running it in. `dist/` is ignored by git.
+  It signs the app ad hoc (there is no Apple Developer ID), writes `dist/Workbench-<version>-arm64.dmg` unless `--no-dmg`, and with `--install` copies the app to `/Applications` (or `~/Applications` when that is not writable). `--install` is refused, before anything is built, while that copy of the app is open ("Workbench is open. Quit it first (its agents stop), then install again."), and when `WORKBENCH_AGENT_ID` is set, even to an empty string: an agent must not replace the app the person may be running it in. `dist/` is ignored by git.
 - **Running Workbench.** The app runs `Resources/node/bin/node Resources/workbench/bin/workbench.mjs --repo <folder> --app --port 4317` in the person's home folder: `--demo` instead of `--repo` for the demo, and `--claude <path>` when the person chose a Claude Code program. When Workbench says the port is already in use, the app tries once more with `--port 0`. It shows the page at the address in the `WORKBENCH_APP` line. Everything Workbench prints goes to `~/Library/Logs/Workbench/workbench.log`, with the page's key replaced by `<key>`. One folder at a time: opening another stops the first.
 - **The environment** is the app's own (launchd's, when it was opened from the Finder or the Dock), with:
   - PATH extended as a terminal would have it. The folders Claude Code's installer and Homebrew use (`~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`), where they exist, go first when the PATH holds only system folders, and after it otherwise. Then come the folders in `/etc/paths` and `/etc/paths.d`.
