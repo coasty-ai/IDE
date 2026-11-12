@@ -260,6 +260,12 @@ const QUESTIONS = [
 // The checks the demo repository declares; simulated agents report them before their turn ends,
 // and in the demo the engine takes the result from there.
 const REPO_CHECKS = ['Unit tests', 'Type check'];
+// The rules the demo repository sets (workbench.json). A merge card checks them against the work it would merge, as the
+// engine does: a path breaks a rule when it starts with one of the rule's paths.
+const REPO_RULES = [
+  { say: 'Do not touch migrations/', paths: ['migrations/'] },
+  { say: 'Keep the public invoice API the same', paths: ['src/api/invoices'] },
+];
 
 const SEED_WORLD = [
   {
@@ -1880,10 +1886,15 @@ export class Simulator {
       };
     }
     if (a.name === 'Invoice export' && /\b(undo|revert|remove|take (it |that )?out|back out)\b/i.test(text)) {
+      const migration = 'migrations/0042_invoice_lookup_index.sql';
+      // Once its work is merged, the migration is in main: taking it out is a change of its own, to merge again.
+      const merged = !a.created.has(migration) && a.paths.has(migration) && !a.deleted.has(migration);
       return {
-        steps: [['Bash', 'git rm migrations/0042_invoice_lookup_index.sql', true, 'Take out the database change'], ['Edit', 'src/invoices/query.ts'], ['Bash', 'npm test']],
-        forget: ['migrations/0042_invoice_lookup_index.sql'],
-        done: 'I took out the database change, so nothing under migrations/ is touched any more. Invoices still go out in small batches, and the tests pass.',
+        steps: [['Bash', `git rm ${migration}`, true, 'Take out the database change'], ['Edit', 'src/invoices/query.ts'], ['Bash', 'npm test']],
+        forget: [migration],
+        done: merged
+          ? 'I took out the database change. It is already in main, so merging this takes the migration out of main again. Invoices still go out in small batches, and the tests pass.'
+          : 'I took out the database change, so nothing under migrations/ is touched any more. Invoices still go out in small batches, and the tests pass.',
       };
     }
     if (a.name === 'Help pages' && /\bcheck/i.test(text)) {
@@ -2466,7 +2477,8 @@ export class Simulator {
     } else if (a.checks !== 'passed') {
       parts.push('Nothing checked its work.');
     }
-    const broken = ((a.rules && a.rules.broken) || []).map(r => String(r.say || '').trim().replace(/[.!?]+$/, '')).filter(Boolean);
+    const broken = REPO_RULES.filter(r => snap.files.some(f => r.paths.some(p => f.path.startsWith(p))))
+      .map(r => r.say.trim().replace(/[.!?]+$/, ''));
     if (broken.length === 1) parts.push(`It broke a rule you set: ${broken[0]}.`);
     else if (broken.length > 1) parts.push(`It broke ${broken.length} rules you set: ${joinAnd(broken)}.`);
     const paths = snap.files.map(f => f.path);
