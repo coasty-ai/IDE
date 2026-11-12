@@ -2578,7 +2578,7 @@ export class Engine extends EventEmitter {
     const why = MERGE_WHYS.has(res?.why) ? res.why : 'git';
     // Its branch moved because this agent's own work went in after the card was drawn (from a look git took just
     // before that merge, say): what the card showed is in already, and nothing new is left to merge. Nothing went wrong.
-    if (why === 'moved' && !res?.unexpected && v.work?.merged && !unmergedWork(v)) {
+    if (why === 'moved' && v.work?.merged && !unmergedWork(v)) {
       this._clearProblem(v.id);
       return { reply: mergeSentence('nothing', { name: v.name, into: v.work.merged.into || c.expect.into }), focusId: v.id };
     }
