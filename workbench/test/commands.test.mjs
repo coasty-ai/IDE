@@ -37,6 +37,45 @@ const CTX = {
   pendingStop: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c2', kind: 'stop' } },
   pendingStart: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c3', kind: 'start' } },
   pendingSay: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c4', kind: 'say' } },
+  helper: { agents, machines, harnesses, focusId: 'a1b2c3-11111111' },
+  pendingForget: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c5', kind: 'forget' } },
+  pendingMerge: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c6', kind: 'merge' } },
+  pendingDiscard: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c7', kind: 'discard' } },
+  // A card with a permission behind it: the card takes the words first, and what it does not take never reaches the permission.
+  pendingMergeOnPermission: { agents, machines, harnesses, focusId: 'a1b2c3', pendingConfirm: { id: 'c6', kind: 'merge' } },
+  pendingDiscardOnPermission: { agents, machines, harnesses, focusId: 'a1b2c3', pendingConfirm: { id: 'c7', kind: 'discard' } },
+  // A card that ran out while it was on screen (the engine answers a yes to it with "no longer waiting").
+  pendingGone: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c0', gone: true } },
+};
+
+// Dogfooding: Workbench working on its own repository, so agent names share words with the commands themselves.
+const dogAgents = [
+  { id: 'aa0001', name: 'Merge command', task: 'Add a merge command to the words', state: 'done_checked', kind: 'agent' },
+  { id: 'bb0002', name: 'Diff viewer', task: 'Build the diff viewer for the git screen', state: 'done_claimed', kind: 'agent' },
+  { id: 'cc0003', name: 'Git screen', task: 'Draw the git screen with circuit traces', state: 'working', kind: 'agent' },
+  { id: 'cc0003-33333333', name: 'Draw the graph', task: 'Draw the commit graph', state: 'working', kind: 'helper', parentId: 'cc0003', rootId: 'cc0003' },
+  { id: 'dd0004', name: 'Config merge', task: 'Merge the two config files', state: 'done_claimed', kind: 'agent' },
+  { id: 'ee0005', name: 'Login fix', task: 'Fix the login page error', state: 'done_checked', kind: 'agent' },
+  // Same-named twins ("start two agents on …" names both alike); one is from an earlier run, one was stopped.
+  { id: 'ff0006', name: 'Search cleanup', task: 'Clean up the search route handlers', state: 'done_checked', kind: 'agent', earlier: true },
+  { id: 'ff0007', name: 'Search cleanup', task: 'Clean up the search tests', state: 'stopped', kind: 'agent' },
+  { id: '110008', name: 'Invoice export', task: 'Stream rows in the invoice export', state: 'done_checked', kind: 'agent', earlier: true },
+  { id: '220009', name: 'Work queue', task: 'Add a work queue for agents', state: 'question', kind: 'agent',
+    ask: { id: 'ask-wq', type: 'question', sentence: 'Should the queue be first in, first out?', options: [] } },
+  { id: '33000a', name: 'Branch picker', task: 'Let people pick a branch', state: 'needs_ok', kind: 'agent',
+    ask: { id: 'ask-bp', type: 'permission', sentence: 'Branch picker wants to run a command', options: ['Allow', 'Deny'], primary: 'Allow' } },
+];
+const DOG = {
+  dogNone: { agents: dogAgents, machines, harnesses, focusId: null },
+  dogDone: { agents: dogAgents, machines, harnesses, focusId: 'aa0001' },
+  dogHelper: { agents: dogAgents, machines, harnesses, focusId: 'cc0003-33333333' },
+  dogEarlier: { agents: dogAgents, machines, harnesses, focusId: '110008' },
+  dogTwin: { agents: dogAgents, machines, harnesses, focusId: 'ff0007' },
+  dogQuestion: { agents: dogAgents, machines, harnesses, focusId: '220009' },
+  dogPermission: { agents: dogAgents, machines, harnesses, focusId: '33000a' },
+  dogPendingMerge: { agents: dogAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c8', kind: 'merge' } },
+  dogPendingDiscard: { agents: dogAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c9', kind: 'discard' } },
+  dogBranch: { agents: dogAgents, machines, harnesses, focusId: 'aa0001', repo: { branch: 'feature/login-v2' } },
 };
 
 const start = (...tasks) => ({ kind: 'start', tasks: tasks.map(([task, harness = 'claude', machine = 'laptop']) => ({ task, harness, machine })) });
@@ -466,7 +505,8 @@ test('describeIntent writes plain confirm sentences', () => {
   assert.equal(describeIntent({ kind: 'confirm', go: false }), 'Cancel?');
   // Long tasks are shortened, and nothing odd ever throws.
   assert.ok(describeIntent(start(['word '.repeat(100)])).length < 120);
-  for (const odd of [null, undefined, 5, {}, { kind: 'start' }, { kind: 'start', tasks: [null, { task: 3 }] }, { kind: 'stop' }, { kind: 'nope' }]) {
+  for (const odd of [null, undefined, 5, {}, { kind: 'start' }, { kind: 'start', tasks: [null, { task: 3 }] }, { kind: 'stop' }, { kind: 'nope' },
+    { kind: 'changes' }, { kind: 'merge' }, { kind: 'discard' }, { kind: 'merge', agentId: 7, into: {} }, { kind: 'discard', agentId: ['x'] }]) {
     assert.equal(typeof describeIntent(odd, null), 'string');
   }
 });
@@ -480,4 +520,521 @@ test('a stop verb that matches no agent is a work request; a name still stops at
   assert.deepEqual(parseCommand('stop the onboarding agent', CTX.none), { kind: 'stop', agentIds: ['7a8b9c'] });
   // While a question waits, the words answer it.
   assert.deepEqual(parseCommand('stop the frobnicator', CTX.question), answer('stop the frobnicator'));
+});
+
+// ------------------------------------------------------------------ source control: changes, merge, throw away
+
+const ctxOf = name => CTX[name] || DOG[name];
+const changes = agentId => ({ kind: 'changes', agentId });
+const merge = (agentId, into) => (into ? { kind: 'merge', agentId, into } : { kind: 'merge', agentId });
+const discard = agentId => ({ kind: 'discard', agentId });
+const task = t => ({ kind: 'task', task: t });
+const unknown = t => ({ kind: 'unknown', text: t });
+const yes = { kind: 'confirm', go: true };
+const no = { kind: 'confirm', go: false };
+
+function checkRows(rows) {
+  const failures = [];
+  for (const [text, ctxName, expected] of rows) {
+    const got = parseCommand(text, ctxOf(ctxName));
+    try { assert.deepEqual(got, expected); } catch {
+      failures.push(`${JSON.stringify(text)} [${ctxName}]\n    expected ${JSON.stringify(expected)}\n    got      ${JSON.stringify(got)}`);
+    }
+  }
+  assert.equal(failures.length, 0, '\n' + failures.join('\n'));
+}
+
+// [what the person typed or said, context, expected intent]
+const SOURCE_CONTROL = [
+  // --- The spec's own words
+  ['what did search cleanup change', 'none', changes('d4e5f6')],
+  ['what changed', 'invoice', changes('1a2b3c')],
+  ['show me the changes', 'invoice', changes('1a2b3c')],
+  ["show search cleanup's changes", 'none', changes('d4e5f6')],
+  ['diff it', 'invoice', changes('1a2b3c')],
+  ['merge search cleanup', 'none', merge('d4e5f6')],
+  ['merge it', 'invoice', merge('1a2b3c')],
+  ['land it', 'invoice', merge('1a2b3c')],
+  ['bring its changes in', 'invoice', merge('1a2b3c')],
+  ['merge search cleanup into main', 'none', merge('d4e5f6', 'main')],
+  ['merge it into my branch', 'invoice', merge('1a2b3c')],
+  ["throw away search cleanup's changes", 'none', discard('d4e5f6')],
+  ['discard it', 'invoice', discard('1a2b3c')],
+  ['throw it away', 'invoice', discard('1a2b3c')],
+  ['scrap it', 'invoice', discard('1a2b3c')],
+
+  // --- Seeing what an agent changed: read-only, so a question may also find the agent by its task words
+  ['what did invoice export change', 'none', changes('1a2b3c')],
+  ['What did Invoice export change?', 'none', changes('1a2b3c')],
+  ["what's changed", 'invoice', changes('1a2b3c')],
+  ['what has changed', 'invoice', changes('1a2b3c')],
+  ['what changed so far', 'invoice', changes('1a2b3c')],
+  ['what changed?', 'invoice', changes('1a2b3c')],
+  ['what did it change', 'invoice', changes('1a2b3c')],
+  ['what has it changed', 'invoice', changes('1a2b3c')],
+  ['what changes did invoice export make', 'none', changes('1a2b3c')],
+  ['what are its changes', 'invoice', changes('1a2b3c')],
+  ['what are the changes from invoice export', 'none', changes('1a2b3c')],
+  ['what changed in invoice export', 'none', changes('1a2b3c')],
+  ['what files did invoice export change', 'none', changes('1a2b3c')],
+  ['which files changed', 'invoice', changes('1a2b3c')],
+  ['show me what changed', 'invoice', changes('1a2b3c')],
+  ['show me what invoice export changed', 'none', changes('1a2b3c')],
+  ['tell me what changed', 'invoice', changes('1a2b3c')],
+  ['show the changes', 'invoice', changes('1a2b3c')],
+  ['show me its changes', 'invoice', changes('1a2b3c')],
+  ["show me invoice export's diff", 'none', changes('1a2b3c')],
+  ['let me see the changes', 'invoice', changes('1a2b3c')],
+  ['can i see the changes', 'invoice', changes('1a2b3c')],
+  ['can you show me the changes', 'invoice', changes('1a2b3c')],
+  ['show me the diff', 'invoice', changes('1a2b3c')],
+  ['open the diff', 'invoice', changes('1a2b3c')],
+  ['diff', 'invoice', changes('1a2b3c')],
+  ['diff invoice export', 'none', changes('1a2b3c')],
+  ['what did the rounding bug one change', 'none', changes('a1b2c3')], // a question: its task words find it, as for status
+  ['what did read cart code change', 'none', changes('a1b2c3')], // a helper's words: its agent's folder
+  ['what changed', 'helper', changes('a1b2c3')], // a helper in the centre stands for its agent
+  ['what changed', 'onboarding', changes('7a8b9c')], // still working: the engine says it may still change
+  // Nothing focused: which agent is not clear, and the engine asks.
+  ['what changed', 'none', changes(null)],
+  ['show me the changes', 'none', changes(null)],
+  ['diff it', 'none', changes(null)],
+
+  // --- Merging: the words name the agent, or "it" means the one in the centre
+  ['merge invoice export', 'none', merge('1a2b3c')],
+  ['Merge Invoice export.', 'none', merge('1a2b3c')],
+  ['please merge invoice export', 'none', merge('1a2b3c')],
+  ['can you merge invoice export', 'none', merge('1a2b3c')],
+  ['um merge invoice export please', 'none', merge('1a2b3c')],
+  ['land invoice export', 'none', merge('1a2b3c')],
+  ['land the invoice export', 'none', merge('1a2b3c')],
+  ['merge the invoice export agent', 'none', merge('1a2b3c')],
+  ["merge invoice export's changes", 'none', merge('1a2b3c')],
+  ['merge the changes from invoice export', 'none', merge('1a2b3c')],
+  ['merge 1a2b3c', 'none', merge('1a2b3c')],
+  ['merge help pages', 'none', merge('4d5e6f')],
+  ['merge onboarding', 'none', merge('7a8b9c')], // still working: the engine refuses, in plain words
+  ['merge', 'invoice', merge('1a2b3c')],
+  ['land', 'invoice', merge('1a2b3c')],
+  ['merge this one', 'invoice', merge('1a2b3c')],
+  ['merge its work', 'invoice', merge('1a2b3c')],
+  ['merge the changes', 'invoice', merge('1a2b3c')],
+  ['merge its branch', 'invoice', merge('1a2b3c')],
+  ['merge it in', 'invoice', merge('1a2b3c')],
+  ['merge it now', 'invoice', merge('1a2b3c')],
+  ['merge it right away', 'invoice', merge('1a2b3c')],
+  ['merge it please', 'invoice', merge('1a2b3c')],
+  ['go ahead and merge it', 'invoice', merge('1a2b3c')],
+  ["let's merge it", 'invoice', merge('1a2b3c')],
+  ['okay merge it', 'invoice', merge('1a2b3c')],
+  ['bring it in', 'invoice', merge('1a2b3c')],
+  ['bring in its changes', 'invoice', merge('1a2b3c')],
+  ['bring the changes in', 'invoice', merge('1a2b3c')],
+  ['bring over the changes', 'invoice', merge('1a2b3c')],
+  ["bring invoice export's changes in", 'none', merge('1a2b3c')],
+  ["bring in invoice export's changes", 'none', merge('1a2b3c')],
+  ['merge it', 'none', merge(null)], // nothing focused: the engine asks which one
+  ['merge', 'none', merge(null)],
+  ['merge it', 'helper', merge('a1b2c3')], // a helper works in its agent's folder
+  ['merge a1b2c3-11111111', 'none', merge('a1b2c3')], // a helper's id stands for its agent
+
+  // --- Throwing work away: the same rule
+  ['discard invoice export', 'none', discard('1a2b3c')],
+  ["discard invoice export's work", 'none', discard('1a2b3c')],
+  ['throw away invoice export', 'none', discard('1a2b3c')],
+  ['throw invoice export away', 'none', discard('1a2b3c')],
+  ["throw out invoice export's changes", 'none', discard('1a2b3c')],
+  ["uh throw away invoice export's changes", 'none', discard('1a2b3c')],
+  ['scrap invoice export', 'none', discard('1a2b3c')],
+  ['discard 1a2b3c', 'none', discard('1a2b3c')],
+  ['trash it', 'invoice', discard('1a2b3c')],
+  ['throw that away', 'invoice', discard('1a2b3c')],
+  ['throw it out', 'invoice', discard('1a2b3c')],
+  ['Throw it away!', 'invoice', discard('1a2b3c')],
+  ['throw it away right away', 'invoice', discard('1a2b3c')],
+  ['discard it now please', 'invoice', discard('1a2b3c')],
+  ['discard the changes', 'invoice', discard('1a2b3c')],
+  ['discard its changes', 'invoice', discard('1a2b3c')],
+  ['throw away its work', 'invoice', discard('1a2b3c')],
+  ['throw away the work', 'invoice', discard('1a2b3c')],
+  ['throw away all of its changes', 'invoice', discard('1a2b3c')],
+  ["throw away it's changes", 'invoice', discard('1a2b3c')], // "it's" typed for "its"
+  ['discard it', 'onboarding', discard('7a8b9c')], // still working: the engine says it will be stopped first
+  ['discard it', 'none', discard(null)],
+  ['discard it', 'helper', discard('a1b2c3')],
+];
+
+test(`parseCommand reads changes, merge and throw-away (${SOURCE_CONTROL.length} phrasings)`, () => {
+  checkRows(SOURCE_CONTROL);
+});
+
+test('the new words never take over work, answers or replies to a permission', () => {
+  checkRows([
+    // Work stays work: the words name no agent, so they keep their old meaning.
+    ['merge the two config files', 'none', task('merge the two config files')],
+    ['merge the two config files', 'invoice', task('merge the two config files')],
+    ['merge the two config files', 'dogNone', task('merge the two config files')], // "Config merge" has that as its task
+    ['merge the two config files', 'dogDone', task('merge the two config files')],
+    ['merge branch main into feature', 'none', task('merge branch main into feature')],
+    ['merge the onboarding flow into the wizard', 'none', task('merge the onboarding flow into the wizard')],
+    ['merge main into search cleanup', 'none', task('merge main into search cleanup')], // the other way round
+    ['merge main into it', 'invoice', task('merge main into it')],
+    ['merge it with main', 'invoice', task('merge it with main')],
+    ['merge it into the wizard', 'invoice', task('merge it into the wizard')],
+    ['merge it into develop', 'invoice', task('merge it into develop')], // a branch it cannot check: see the "into" test
+    ['merge everything', 'none', task('merge everything')],
+    ['merge the done one', 'none', task('merge the done one')], // state words find, never name
+    ['merge the flaky checkout test', 'none', task('merge the flaky checkout test')], // task words, not its name
+    ['merge search', 'none', task('merge search')], // one word of a two-word name
+    ['merge read cart code', 'none', task('merge read cart code')], // a helper's name is not its agent's
+    ['merge my branch', 'invoice', task('merge my branch')],
+    ['merge my changes', 'invoice', task('merge my changes')],
+    ['merge invoice export and help pages', 'none', task('merge invoice export and help pages')], // one at a time
+    ['merge them', 'invoice', unknown('merge them')],
+    ['discard unused imports', 'none', unknown('discard unused imports')],
+    ['discard unused imports', 'invoice', unknown('discard unused imports')],
+    ['discard my changes', 'invoice', unknown('discard my changes')], // the person's own, never an agent's
+    ['throw away my work', 'invoice', unknown('throw away my work')],
+    ['throw away your changes', 'invoice', unknown('throw away your changes')],
+    ['discard all changes', 'invoice', unknown('discard all changes')],
+    ['discard changes', 'invoice', unknown('discard changes')],
+    ['discard read cart code', 'none', unknown('discard read cart code')],
+    ['discard', 'invoice', unknown('discard')], // throwing away needs an object
+    ['throw away', 'invoice', unknown('throw away')],
+    ['throw away the old logs', 'none', unknown('throw away the old logs')],
+    ['throw an error when the token expires', 'none', unknown('throw an error when the token expires')],
+    ['scrap the old parser', 'none', unknown('scrap the old parser')],
+    // "scrap that" is never mind ("scratch that"), even with an agent in the centre; "scrap it" asks to throw its work away.
+    ['scrap that', 'invoice', unknown('scrap that')],
+    ['trash this', 'invoice', unknown('trash this')],
+    ['scrap that', 'none', unknown('scrap that')],
+    ['scrap that now', 'invoice', unknown('scrap that now')],
+    ['scrap that idea', 'invoice', unknown('scrap that idea')],
+    ['land the plane', 'none', unknown('land the plane')],
+    ['show the error on the login page', 'none', task('show the error on the login page')],
+    ['show the error on the login page', 'invoice', task('show the error on the login page')],
+    // With an agent whose task is about the login page this was a status before these words existed, and it still is.
+    ['show the error on the login page', 'dogNone', { kind: 'status', agentId: 'ee0005' }],
+    ['show the changes to the login page', 'none', task('show the changes to the login page')],
+    ['review the changes', 'none', task('review the changes')],
+    ['diff the two config files', 'none', unknown('diff the two config files')],
+    ['diff the two config files', 'dogNone', unknown('diff the two config files')],
+    ['what does it change', 'invoice', unknown('what does it change')],
+    ['what will it change', 'invoice', unknown('what will it change')],
+    ['what is changing', 'invoice', unknown('what is changing')],
+    ['what did you change', 'invoice', { kind: 'status' }],
+    ['the changes', 'invoice', unknown('the changes')],
+    // Starting an agent stays a start.
+    ['bring in an agent to fix the login', 'none', start(['fix the login'])],
+    ['bring in an agent to fix the login', 'dogNone', start(['fix the login'])], // "Login fix" is there
+    ['bring in codex to write tests', 'none', start(['write tests', 'codex'])],
+    ['bring invoice export in', 'none', task('bring invoice export in')], // "bring" needs its work or "it"
+    // A question that waits takes "it": a pronoun is weak.
+    ['merge it', 'question', answer('merge it')],
+    ['land it', 'question', answer('land it')],
+    ['merge', 'question', answer('merge')],
+    ['bring its changes in', 'question', answer('bring its changes in')],
+    ['discard it', 'question', answer('discard it')],
+    ['throw it away', 'question', answer('throw it away')],
+    ['what changed', 'question', answer('what changed')],
+    ['show me the changes', 'question', answer('show me the changes')],
+    ['diff it', 'question', answer('diff it')],
+    ['what did it change', 'question', { kind: 'status', agentId: 'd4e5f6' }], // as before
+    ['scrap it', 'question', answer('scrap it')],
+    ['trash it', 'question', answer('trash it')],
+    ['throw it away', 'stuck', answer('throw it away', '0a0b0c', 'ask-stuck')], // a hint for a stuck agent
+    ['merge it', 'stuck', answer('merge it', '0a0b0c', 'ask-stuck')],
+    ['merge it', 'dogQuestion', answer('merge it', '220009', 'ask-wq')],
+    // ...but a name is strong.
+    ['merge search cleanup', 'question', merge('d4e5f6')],
+    ['merge invoice export', 'question', merge('1a2b3c')],
+    ["throw away invoice export's changes", 'question', discard('1a2b3c')],
+    ['what did invoice export change', 'question', changes('1a2b3c')],
+    ["show invoice export's changes", 'question', changes('1a2b3c')],
+    ['merge invoice export', 'stuck', merge('1a2b3c')],
+    ['merge the work queue', 'dogQuestion', merge('220009')], // its own name, said while it asks
+    // A permission keeps its replies exactly as they were.
+    ['sure, land it', 'permission', { ...deny, text: 'sure, land it', conditional: true }],
+    ['yes merge it', 'permission', { ...deny, text: 'yes merge it', conditional: true }],
+    ['okay merge it', 'permission', { ...deny, text: 'okay merge it', conditional: true }],
+    ['go ahead and merge it', 'permission', { ...deny, text: 'go ahead and merge it', conditional: true }],
+    ['accept its changes', 'permission', { ...deny, text: 'accept its changes', conditional: true }],
+    ['no, throw it away', 'permission', { ...deny, text: 'throw it away' }],
+    ['accept it', 'permission', allow],
+    ['merge it', 'permission', unknown('merge it')],
+    ['land it', 'permission', unknown('land it')],
+    ['discard it', 'permission', unknown('discard it')],
+    ['throw it away', 'permission', unknown('throw it away')],
+    ['what changed', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
+    ['what did it change', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
+    ['okay merge it', 'dogPermission', { kind: 'deny', agentId: '33000a', askId: 'ask-bp', text: 'okay merge it', conditional: true }],
+    ['throw it away', 'dogPermission', unknown('throw it away')],
+    // ...and a name still acts there.
+    ['merge invoice export', 'permission', merge('1a2b3c')],
+    ['what did invoice export change', 'permission', changes('1a2b3c')],
+  ]);
+});
+
+test('merge and throw-away name the agent: dogfood names, same-named twins, earlier agents, helpers', () => {
+  checkRows([
+    // Agent names that are also command words.
+    ['merge the merge command', 'dogNone', merge('aa0001')],
+    ['merge merge command', 'dogNone', merge('aa0001')],
+    ['merge the merge command into main', 'dogNone', merge('aa0001', 'main')],
+    ['merge merge command into my branch', 'dogNone', merge('aa0001')],
+    ['discard the merge command please', 'dogNone', discard('aa0001')],
+    ['what did the merge command change', 'dogNone', changes('aa0001')],
+    ['merge diff viewer', 'dogNone', merge('bb0002')],
+    ['merge the diff viewer', 'dogNone', merge('bb0002')],
+    ["throw away the diff viewer's changes", 'dogNone', discard('bb0002')],
+    ['throw away the diff viewer', 'dogNone', discard('bb0002')],
+    ['what did diff viewer change', 'dogNone', changes('bb0002')],
+    ['diff the diff viewer', 'dogNone', changes('bb0002')],
+    ['diff diff viewer', 'dogNone', changes('bb0002')],
+    ["show the diff viewer's changes", 'dogNone', changes('bb0002')],
+    ['merge git screen', 'dogNone', merge('cc0003')], // still working: the engine refuses
+    ['merge the git screen', 'dogNone', merge('cc0003')],
+    ['scrap the git screen', 'dogNone', discard('cc0003')],
+    ['diff the git screen', 'dogNone', changes('cc0003')],
+    ['show the git screen changes', 'dogNone', changes('cc0003')],
+    // Its name, then its work, when the name has the work word in it.
+    ["show the diff viewer's diff", 'dogNone', changes('bb0002')],
+    ["show me the work queue's work", 'dogNone', changes('220009')],
+    ["show the branch picker's branch", 'dogNone', changes('33000a')],
+    ["merge the diff viewer's diff", 'dogNone', merge('bb0002')],
+    ["throw away the work queue's work", 'dogQuestion', discard('220009')], // its own name while it asks: strong
+    ['merge the config merge', 'dogNone', merge('dd0004')],
+    ['merge config merge', 'dogNone', merge('dd0004')],
+    ['merge the work queue', 'dogNone', merge('220009')],
+    ['merge work queue', 'dogNone', merge('220009')],
+    ["throw away the work queue's work", 'dogNone', discard('220009')],
+    ['merge the branch picker', 'dogNone', merge('33000a')],
+    ['merge login fix', 'dogNone', merge('ee0005')],
+    // A name said alone is a name, not a command: its words keep their old meaning.
+    ['merge command', 'dogNone', task('merge command')],
+    ['merge config', 'dogNone', task('merge config')],
+    ['diff viewer', 'dogNone', unknown('diff viewer')],
+    ['git screen', 'dogNone', unknown('git screen')],
+    ['show diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }],
+    ['open the diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }],
+    ['show the git screen', 'dogNone', { kind: 'status', agentId: 'cc0003' }],
+    ['show me the merge command', 'dogNone', { kind: 'status', agentId: 'aa0001' }],
+    // "its changes", "the diff" and "the branch" mean the agent in the centre, whatever names share those words.
+    ['merge its branch', 'dogDone', merge('aa0001')],
+    ['merge the branch', 'dogDone', merge('aa0001')],
+    ['discard the work', 'dogDone', discard('aa0001')],
+    ['show me the diff', 'dogDone', changes('aa0001')],
+    ['show me the diff', 'dogNone', changes(null)],
+    // Same-named twins (one from an earlier run): never a guess. The engine asks which one.
+    ['merge search cleanup', 'dogNone', merge(null)],
+    ['merge the search cleanup agent', 'dogNone', merge(null)],
+    ["throw away search cleanup's changes", 'dogNone', discard(null)],
+    ['throw away search cleanup', 'dogNone', discard(null)],
+    ['what did search cleanup change', 'dogNone', changes(null)],
+    ['merge search cleanup', 'dogQuestion', merge(null)], // a name, so strong even while a question waits
+    // ...an id or "it" still names one of them.
+    ['merge ff0006', 'dogNone', merge('ff0006')],
+    ['discard ff0007', 'dogNone', discard('ff0007')],
+    ['merge it', 'dogTwin', merge('ff0007')],
+    // Agents from an earlier run are merged and thrown away like any other.
+    ['merge invoice export', 'dogNone', merge('110008')],
+    ['merge it', 'dogEarlier', merge('110008')],
+    ['throw it away', 'dogEarlier', discard('110008')],
+    ['what changed', 'dogEarlier', changes('110008')],
+    // A helper stands for its agent: by its id, or as the one in the centre. Its name is not its agent's name.
+    ['merge it', 'dogHelper', merge('cc0003')],
+    ['discard it', 'dogHelper', discard('cc0003')],
+    ['show me the changes', 'dogHelper', changes('cc0003')],
+    ['merge cc0003-33333333', 'dogNone', merge('cc0003')],
+    ['discard cc0003-33333333', 'dogNone', discard('cc0003')],
+    ['what did cc0003-33333333 change', 'dogNone', changes('cc0003')],
+    ['merge draw the graph', 'dogNone', task('merge draw the graph')],
+    ['what did draw the graph change', 'dogNone', changes('cc0003')], // a question: its helper's words find it
+    // Launches stay launches with a "Login fix" there.
+    ['stop an agent to fix the login', 'dogNone', task('stop an agent to fix the login')],
+    ['forget an agent to fix the login', 'dogNone', unknown('forget an agent to fix the login')],
+  ]);
+  // A name made only of words for work ("Changes") is named by its id or "it", never by "the changes".
+  const withChanges = { agents: [...dogAgents, { id: '55000c', name: 'Changes', task: 'Track changes', state: 'done_claimed', kind: 'agent' }], focusId: 'aa0001' };
+  assert.deepEqual(parseCommand('discard the changes', withChanges), discard('aa0001'));
+  assert.deepEqual(parseCommand('bring in the changes', withChanges), merge('aa0001'));
+  assert.deepEqual(parseCommand('merge the changes from it', withChanges), merge('aa0001'));
+  assert.deepEqual(parseCommand('throw away your changes', withChanges), unknown('throw away your changes'));
+  assert.deepEqual(parseCommand('merge 55000c', withChanges), merge('55000c'));
+  // The whole name of one agent names it, even when a longer name has the same words; a shorter part names neither.
+  const v2 = { agents: [{ id: 'aa0001', name: 'Search cleanup', task: 'x', state: 'done_checked', kind: 'agent' },
+    { id: 'bb0002', name: 'Search cleanup v2', task: 'y', state: 'done_checked', kind: 'agent' }] };
+  assert.deepEqual(parseCommand('merge search cleanup', v2), merge('aa0001'));
+  assert.deepEqual(parseCommand('merge search cleanup v2', v2), merge('bb0002'));
+  assert.deepEqual(parseCommand('merge search clean', v2), merge(null));
+  // A helper whose agent is not in the list stands for nothing.
+  assert.deepEqual(parseCommand('discard it', { agents: [{ id: 'q-1', name: 'Lost helper', kind: 'helper', parentId: 'gone' }], focusId: 'q-1' }), discard(null));
+});
+
+test('cards take their own words: "start it" only for a launch, "merge it" for a merge, "throw it away" for a throw-away', () => {
+  checkRows([
+    // A merge card.
+    ['merge it', 'pendingMerge', yes], ['merge', 'pendingMerge', yes], ['land it', 'pendingMerge', yes], ['yes merge it', 'pendingMerge', yes],
+    ['sure, land it', 'pendingMerge', yes], ['bring it in', 'pendingMerge', yes], ['merge its changes', 'pendingMerge', yes],
+    ['merge it into my branch', 'pendingMerge', yes], ['do it', 'pendingMerge', yes], ['yes', 'pendingMerge', yes], ['okay', 'pendingMerge', yes],
+    ['merge it into main', 'pendingMerge', unknown('merge it into main')], // the card says where it merges: say "do it" to that
+    ['merge it is that right', 'pendingMerge', unknown('merge it is that right')],
+    ['merge it?', 'pendingMerge', unknown('merge it?')],
+    ['start it', 'pendingMerge', unknown('start it')], ['launch it', 'pendingMerge', unknown('launch it')],
+    ['yes start it', 'pendingMerge', unknown('yes start it')],
+    ['forget it', 'pendingMerge', no], ['cancel', 'pendingMerge', no], ['no', 'pendingMerge', no], ['not now', 'pendingMerge', no],
+    ["don't merge it", 'pendingMerge', no], ['do not merge it', 'pendingMerge', no],
+    ['discard it', 'pendingMerge', unknown('discard it')], // "it" is the card: the card stays, with its hint
+    ['throw it away', 'pendingMerge', unknown('throw it away')],
+    ['merge help pages', 'pendingMerge', merge('4d5e6f')], // a name is another command: the engine withdraws the card
+    // A throw-away card: its own words or "do it". A bare yes keeps the card.
+    ['throw it away', 'pendingDiscard', yes], ['discard it', 'pendingDiscard', yes], ['do it', 'pendingDiscard', yes],
+    ['yes do it', 'pendingDiscard', yes], ['yes throw it away', 'pendingDiscard', yes], ['okay throw it away', 'pendingDiscard', yes],
+    ['yes discard it', 'pendingDiscard', yes], ['just do it', 'pendingDiscard', yes], ['please do it', 'pendingDiscard', yes],
+    ['discard', 'pendingDiscard', yes], ['throw away', 'pendingDiscard', yes],
+    ['throw away its work', 'pendingDiscard', yes], ['discard that', 'pendingDiscard', yes], ['throw it out', 'pendingDiscard', yes],
+    // "scrap it" and "trash it" ask for this card but do not answer it; "scrap that" is one sound from "scratch that".
+    ['scrap it', 'pendingDiscard', unknown('scrap it')], ['trash it', 'pendingDiscard', unknown('trash it')],
+    ['scrap that', 'pendingDiscard', unknown('scrap that')], ['trash that', 'pendingDiscard', unknown('trash that')],
+    ['yes scrap it', 'pendingDiscard', unknown('yes scrap it')], ['scratch that', 'pendingDiscard', no],
+    ['keep it', 'pendingDiscard', no], ['keep its work', 'pendingDiscard', no], ['cancel', 'pendingDiscard', no], ['no', 'pendingDiscard', no],
+    ['forget it', 'pendingDiscard', no], ["don't throw it away", 'pendingDiscard', no], ['do not discard it', 'pendingDiscard', no],
+    ['throw it away is that right', 'pendingDiscard', unknown('throw it away is that right')],
+    ['discard it?', 'pendingDiscard', unknown('discard it?')],
+    ['throw', 'pendingDiscard', unknown('throw')], ['throw it', 'pendingDiscard', unknown('throw it')], // cut short: no answer
+    ['yes throw it', 'pendingDiscard', unknown('yes throw it')],
+    ['start it', 'pendingDiscard', unknown('start it')], ['launch it', 'pendingDiscard', unknown('launch it')],
+    ['merge it', 'pendingDiscard', unknown('merge it')],
+    // A forget card: "forget it" is never mind there too, and "start it" is no yes.
+    ['yes', 'pendingForget', yes], ['do it', 'pendingForget', yes], ['forget it', 'pendingForget', no], ['cancel', 'pendingForget', no],
+    ['start it', 'pendingForget', unknown('start it')], ['launch it', 'pendingForget', unknown('launch it')],
+    ['yes start it', 'pendingForget', unknown('yes start it')], ['start it is that right', 'pendingForget', unknown('start it is that right')],
+    ['merge it', 'pendingForget', unknown('merge it')], ['discard it', 'pendingForget', unknown('discard it')],
+    // A launch card: the merge and throw-away words are not its words.
+    ['merge it', 'pendingStart', unknown('merge it')], ['throw it away', 'pendingStart', unknown('throw it away')],
+    ['start it', 'pendingStart', yes], ['start it', 'pending', yes],
+    // Launch words said to a stop or message card keep it too, rather than starting "it is that right".
+    ['start it is that right', 'pendingStop', unknown('start it is that right')],
+    ['start it is that right', 'pendingSay', unknown('start it is that right')],
+    ["don't stop it", 'pendingStop', no], ["don't send it", 'pendingSay', no],
+    // The dogfood world's cards.
+    ['merge it', 'dogPendingMerge', yes], ['merge the merge command', 'dogPendingMerge', merge('aa0001')],
+    ['throw it away', 'dogPendingDiscard', yes], ['yes', 'dogPendingDiscard', unknown('yes')],
+    // A card that ran out: "it" is still the card, so the engine can say it is no longer waiting; a name is a new command.
+    ['merge it', 'pendingGone', unknown('merge it')], ['throw it away', 'pendingGone', unknown('throw it away')],
+    ['yes', 'pendingGone', yes], ['merge invoice export', 'pendingGone', merge('1a2b3c')],
+    ["don't scrap it", 'pendingDiscard', unknown("don't scrap it")], // not its words: the card stays, with its hint
+  ]);
+});
+
+test('a bare yes is not enough to throw work away, and it never falls through to a permission behind the card', () => {
+  for (const text of ['yes', 'yeah', 'yep', 'sure', 'okay', 'ok', 'alright', 'right', 'go ahead', 'go for it', 'yes please', 'sounds good',
+    'make it so', 'confirm', 'that is right', 'perfect', 'fine', 'the right one', 'yes go for it', 'sure thing']) {
+    assert.deepEqual(parseCommand(text, CTX.pendingDiscard), unknown(text), text);
+    assert.deepEqual(parseCommand(text, CTX.pendingDiscardOnPermission), unknown(text), `${text} (permission behind the card)`);
+    // On every other card the same words are a yes.
+    for (const ctxName of ['pending', 'pendingStart', 'pendingForget', 'pendingMerge']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), yes, `${text} [${ctxName}]`);
+    }
+  }
+  assert.deepEqual(parseCommand('throw it away', CTX.pendingDiscardOnPermission), yes);
+  assert.deepEqual(parseCommand('keep it', CTX.pendingDiscardOnPermission), no);
+  assert.deepEqual(parseCommand('okay merge it', CTX.pendingMergeOnPermission), yes);
+  assert.deepEqual(parseCommand('yes start it', CTX.pendingMergeOnPermission), unknown('yes start it'));
+  // Asked rather than said, on any card: it settles nothing.
+  for (const ctxName of ['pendingForget', 'pendingMerge', 'pendingDiscard']) {
+    for (const text of ['is that right?', 'right?', 'is that okay', 'yes?', 'do it?', 'that right', 'you sure']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), unknown(text), `${text} [${ctxName}]`);
+    }
+  }
+});
+
+test('"stop an agent to fix the login" is a launch, not a stop of "Login fix"; "forget an agent …" forgets nothing', () => {
+  const world = { agents: [
+    { id: 'aa1111', name: 'Login fix', task: 'Fix the login page error', state: 'working', kind: 'agent' },
+    { id: 'c0dec0', name: 'Codex adapter', task: 'Fix the codex adapter', state: 'working', kind: 'agent' },
+  ] };
+  assert.deepEqual(parseCommand('stop an agent to fix the login', world), task('stop an agent to fix the login'));
+  assert.equal(describeIntent(parseCommand('stop an agent to fix the login', world), world), 'Start Claude on “stop an agent to fix the login”?');
+  assert.deepEqual(parseCommand('stop someone to fix the login', world), task('stop someone to fix the login'));
+  assert.deepEqual(parseCommand('stop codex to fix the login', world), task('stop codex to fix the login'));
+  assert.notEqual(parseCommand('forget an agent to fix the login', world).kind, 'forget');
+  assert.notEqual(parseCommand('forget a new agent that fixes the login', world).kind, 'forget');
+  // A name that starts with a harness word, or "the agent", still names one.
+  assert.deepEqual(parseCommand('stop codex adapter', world), { kind: 'stop', agentIds: ['c0dec0'] });
+  assert.deepEqual(parseCommand('stop the codex adapter', world), { kind: 'stop', agentIds: ['c0dec0'] });
+  assert.deepEqual(parseCommand('forget codex adapter', world), { kind: 'forget', agentIds: ['c0dec0'] });
+  assert.deepEqual(parseCommand('stop the login fix', world), { kind: 'stop', agentIds: ['aa1111'] });
+  // While a question waits, the launch-shaped words are the answer, as any work is.
+  const asking = { agents: world.agents.map(a => (a.id === 'aa1111' ? { ...a, state: 'question', ask: { id: 'q1', type: 'question', sentence: 'Which page?', options: [] } } : a)), focusId: 'aa1111' };
+  assert.deepEqual(parseCommand('stop an agent to fix the login', asking), { kind: 'answer', agentId: 'aa1111', askId: 'q1', text: 'stop an agent to fix the login' });
+});
+
+test('"into main" and "into my branch": a branch named is carried, so the engine can refuse one it is not on', () => {
+  checkRows([
+    ['merge it into main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it onto main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it to the main branch', 'invoice', merge('1a2b3c', 'main')],
+    ['land it on main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge invoice export into master', 'none', merge('1a2b3c', 'master')],
+    ['merge invoice export into main please', 'none', merge('1a2b3c', 'main')],
+    ['merge 1a2b3c into main', 'none', merge('1a2b3c', 'main')],
+    ['merge into main', 'invoice', merge('1a2b3c', 'main')],
+    ['bring its changes into main', 'invoice', merge('1a2b3c', 'main')],
+    ['bring it into my branch', 'invoice', merge('1a2b3c')],
+    ['merge it into my own branch', 'invoice', merge('1a2b3c')],
+    ['merge it here', 'invoice', merge('1a2b3c')],
+    // The person's current branch by name, when the engine gives it (ctx.repo.branch).
+    ['merge it into feature/login-v2', 'dogBranch', merge('aa0001', 'feature/login-v2')],
+    ['merge it into Feature/Login-V2', 'dogBranch', merge('aa0001', 'feature/login-v2')],
+    ['merge invoice export into the feature/login-v2 branch', 'dogBranch', merge('110008', 'feature/login-v2')],
+    ['merge it into main', 'dogBranch', merge('aa0001', 'main')], // not its branch: the engine refuses, never retargets
+    ['merge it into develop', 'dogBranch', task('merge it into develop')], // a branch it cannot check keeps the old meaning
+    ['merge it into feature/login-v2', 'dogDone', task('merge it into feature/login-v2')],
+    // An agent whose name has "to" in it is not a target.
+    ['merge add tests to parser', 'none', merge('9f9f9f')],
+    ['merge add tests to parser into main', 'none', merge('9f9f9f', 'main')],
+  ]);
+  // A branch with a word for a name: on it, "into the wizard" names it after an agent's name or "it"; work stays work.
+  const onWizard = { ...CTX.invoice, repo: { branch: 'wizard' } };
+  assert.deepEqual(parseCommand('merge it into the wizard', onWizard), merge('1a2b3c', 'wizard'));
+  assert.deepEqual(parseCommand('merge help pages into wizard', onWizard), merge('4d5e6f', 'wizard'));
+  assert.deepEqual(parseCommand('merge the onboarding flow into the wizard', onWizard), task('merge the onboarding flow into the wizard'));
+  assert.deepEqual(parseCommand('merge main into wizard', onWizard), task('merge main into wizard'));
+  assert.deepEqual(parseCommand('merge it into the wizard', CTX.invoice), task('merge it into the wizard')); // not its branch
+  // On a merge card a branch named is not a yes, even the one it merges into: "do it" is.
+  assert.deepEqual(parseCommand('merge it into the wizard', { ...CTX.pendingMerge, repo: { branch: 'wizard' } }), unknown('merge it into the wizard'));
+});
+
+test('describeIntent words changes, merge and throw-away', () => {
+  assert.equal(describeIntent(changes('1a2b3c'), CTX.none), 'Show what Invoice export changed?');
+  assert.equal(describeIntent(changes(null), CTX.none), 'Show what an agent changed? It is not clear which one.');
+  assert.equal(describeIntent(merge('1a2b3c'), CTX.none), 'Merge Invoice export into your branch?');
+  assert.equal(describeIntent(merge('1a2b3c', 'main'), CTX.none), 'Merge Invoice export into main?');
+  assert.equal(describeIntent(merge(null), CTX.none), 'Merge an agent? It is not clear which one.');
+  assert.equal(describeIntent(discard('1a2b3c'), CTX.none), 'Throw away Invoice export’s work?');
+  assert.equal(describeIntent(discard(null), CTX.none), 'Throw away an agent’s work? It is not clear which one.');
+  assert.equal(describeIntent(parseCommand('merge the merge command', DOG.dogNone), DOG.dogNone), 'Merge Merge command into your branch?');
+  assert.equal(describeIntent(parseCommand("throw away the diff viewer's changes", DOG.dogNone), DOG.dogNone), 'Throw away Diff viewer’s work?');
+  assert.equal(describeIntent(parseCommand('what did the git screen change', DOG.dogNone), DOG.dogNone), 'Show what Git screen changed?');
+  assert.ok(describeIntent(merge('1a2b3c', 'x'.repeat(300)), CTX.none).length < 120);
+});
+
+test('the source-control words stay fast on long dictation and never throw', () => {
+  const t0 = Date.now();
+  for (const verb of ['merge ', 'land ', 'bring in ', 'discard ', 'throw away ', 'throw ', 'diff ', 'show me ', 'what did ', 'what changed in ']) {
+    parseCommand(verb + 'word '.repeat(3000) + 'away', CTX.invoice);
+  }
+  parseCommand('merge ' + 'search cleanup and '.repeat(500), CTX.none);
+  parseCommand('throw away ' + 'the changes from '.repeat(500) + 'it', CTX.invoice);
+  parseCommand('merge it into ' + 'main '.repeat(2000), CTX.invoice);
+  assert.ok(Date.now() - t0 < 2000, 'took ' + (Date.now() - t0) + ' ms');
+  for (const [text, ctx] of [['merge it', { focusId: 'zz' }], ['discard it', { agents: [{ id: 'h', parentId: 'h', kind: 'helper' }], focusId: 'h' }],
+    ['merge it into main', { repo: 'x' }], ['merge it into x', { repo: { branch: 5 } }], ['yes', { pendingConfirm: { id: 'c', kind: 'toString' } }],
+    ['start it', { pendingConfirm: { id: 'c', kind: '__proto__' } }], ['merge it', { pendingConfirm: { id: 'c', kind: 'merge' }, repo: { branch: null } }],
+    ['what changed', { agents: [{ id: 'a', rootId: 'b', parentId: 'b', kind: 'helper' }, { id: 'b', rootId: 'a', parentId: 'a', kind: 'helper' }], focusId: 'a' }]]) {
+    assert.equal(typeof parseCommand(text, ctx).kind, 'string', text);
+  }
+  // A focus the list does not have is passed on as it is (the engine says it cannot find it), as "stop it" does.
+  assert.deepEqual(parseCommand('merge it', { focusId: 'zz' }), merge('zz'));
 });

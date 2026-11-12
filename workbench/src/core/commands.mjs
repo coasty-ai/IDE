@@ -8,11 +8,16 @@
 //   start { tasks: [{ task, harness, machine }] }   task { task }        answer { agentId, text }
 //   allow { agentId } / deny { agentId }            stop { agentIds }    stop_all
 //   say { agentId, text }   status { agentId? }     spend                sleep / wake { machineIds }
-//   sleep_idle              confirm { go }          unknown { text }
+//   sleep_idle              forget { agentIds }     continue { agentId }
+//   changes { agentId }     merge { agentId, into? }                     discard { agentId }
+//   confirm { go }          unknown { text }
 // Extra fields some intents carry: askId (allow, deny, answer), text (deny: the person's words, such as
 // "no, use the staging database"), conditional (deny: a yes that came with conditions, "yes but only in the
 // tests folder"; text is the whole reply), sure: false (stop, say: the words found the agent but did not name
-// it, so the engine asks first), needsMe (status: "what needs me"). An allow never carries words.
+// it, so the engine asks first), needsMe (status: "what needs me"), into (merge: the branch the person named,
+// "main" or "master" or their current branch by name; left out for "my branch"). An allow never carries words.
+// changes, merge and discard always name a root agent (a helper stands for its agent); agentId is null when the
+// words did not make clear which one. Merge and discard are always asked first (the engine shows a card).
 import { clip } from '../shared/format.mjs';
 import { ENDED, LOOK } from '../shared/states.mjs';
 
@@ -193,7 +198,10 @@ function context(ctx) {
   const machines = Array.isArray(x.machines) ? x.machines.filter(m => m && typeof m === 'object' && typeof m.id === 'string') : [];
   const focusId = typeof x.focusId === 'string' && x.focusId ? x.focusId : null;
   const focus = focusId ? agents.find(a => a.id === focusId) || null : null;
-  return { agents, machines, focusId, focus, asker: askHolder(focus, agents), pendingConfirm: x.pendingConfirm || null };
+  // The person's current branch, when the engine knows it: "merge it into <branch>" may then name it.
+  const repo = x.repo && typeof x.repo === 'object' ? x.repo : null;
+  const branch = repo && typeof repo.branch === 'string' && repo.branch.trim() ? repo.branch.trim() : null;
+  return { agents, machines, focusId, focus, asker: askHolder(focus, agents), pendingConfirm: x.pendingConfirm || null, branch };
 }
 
 const hasAsk = a => !!(a && a.ask && typeof a.ask === 'object');
@@ -390,26 +398,70 @@ const CONFIRM_NO = new Set(['no', 'nope', 'nah', 'cancel', 'never', 'abort', 'st
 const CONFIRM_NO_FILL = new Set(['mind', 'it', 'that', 'this', 'please', 'thanks', 'thank', 'you', 'on', 'off', 'now', 'yet',
   'the', 'idea', 'way', 'actually', 'maybe', 'later', 'do', 'about', 'sorry', 'a', 'second', 'sec', 'minute', 'one']);
 
-/** Yes words that say what a launch does: "start it" is no yes to "Stop Flaky test?" or to "Tell Flaky test …?". */
+/** Yes words that say what a launch does: "start it" is a yes only to a launch, never to a stop, a forget or a merge. */
 const START_YES = new Set(['start', 'launch']);
 
 /**
- * A reply to the confirm card on screen: true (yes), false (no), 'asks' (a yes asked rather than said, such as
- * "is that right?": it answers nothing, so the card stays), or null (not a reply).
+ * Each card's own words: "stop it" while "Stop Flaky test?" waits, "send it" for a message, "merge it" or "land it"
+ * for a merge, "throw it away" or "discard it" for a throw-away. A forget card has none: "forget it" means never mind.
+ * "scrap it" and "trash it" ask for a throw-away card, but they do not answer one: that card takes only its button,
+ * "throw it away", "discard it" or "do it", and "scrap that" is one sound from "scratch that", which means never mind.
  */
-function confirmReply(toks, kind) {
+const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw'] };
+/** Words that may come with a card's own yes: "bring it in", "throw it away", "merge its changes". */
+const CARD_YES_FILL = { merge: ['in', 'its', 'work', 'changes', 'branch'], discard: ['away', 'out', 'its', 'work', 'changes', 'branch'] };
+/** A card's own no: the throw-away card's "Keep it" button, said. */
+const CARD_NO = { discard: ['keep'] };
+const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'] };
+
+/**
+ * A reply to the confirm card on screen: true (yes), false (no), 'asks' (a yes asked rather than said, such as
+ * "is that right?": it answers nothing, so the card stays), 'keep' (a yes that is not enough for this card, such as
+ * a bare "yes" to throwing work away: the card stays), or null (not a reply).
+ */
+function confirmReply(toks, kind, c) {
   // While "Stop Flaky test?" waits, "stop" and "stop it" mean yes; while "Tell Flaky test …?" waits, "send it" does.
-  const launch = kind !== 'stop' && kind !== 'say';
-  const isYes = w => (CONFIRM_YES.has(w) && (launch || !START_YES.has(w))) || (kind === 'stop' && w === 'stop') || (kind === 'say' && w === 'send');
-  const isNo = w => CONFIRM_NO.has(w) && !(kind === 'stop' && w === 'stop');
-  // Before the fillers go: "so" is one.
-  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : true;
-  const ws = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w) || isYes(w));
+  // A card without a kind is a launch.
+  const launch = kind == null || kind === 'start';
+  const own = (typeof kind === 'string' && Object.hasOwn(CARD_YES, kind)) ? CARD_YES[kind] : [];
+  const ownFill = (typeof kind === 'string' && Object.hasOwn(CARD_YES_FILL, kind)) ? CARD_YES_FILL[kind] : [];
+  const ownNo = (typeof kind === 'string' && Object.hasOwn(CARD_NO, kind)) ? CARD_NO[kind] : [];
+  const ownNoFill = (typeof kind === 'string' && Object.hasOwn(CARD_NO_FILL, kind)) ? CARD_NO_FILL[kind] : [];
+  const isYes = w => (CONFIRM_YES.has(w) && (launch || !START_YES.has(w))) || own.includes(w);
+  const isNo = w => (CONFIRM_NO.has(w) && !own.includes(w)) || ownNo.includes(w);
+  // Before the fillers go: "so" is one. Throwing work away takes its own words, so "make it so" keeps that card.
+  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : kind === 'discard' ? 'keep' : true;
+  // "don't merge it", "do not throw it away": a no, though the card's own word is in it.
+  const first = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w));
+  const negated = first[0] === "don't" ? 1 : first[0] === 'do' && first[1] === 'not' ? 2 : first[0] === 'never' ? 1 : 0;
+  if (negated && own.includes(first[negated]) && first.slice(negated + 1).every(w => CONFIRM_YES_FILL.has(w) || ownFill.includes(w))) return false;
+  // A merge card says where it merges: "merge it into my branch" agrees with it, but a branch named here may not.
+  let words = toks;
+  let named = false;
+  if (kind === 'merge') {
+    const t = takeTarget(toks, c);
+    if (t.said && t.toks.length) { words = t.toks; named = t.into !== undefined; }
+  }
+  const ws = words.map(t => t.w).filter(w => !SOFT_LEAD.has(w) || isYes(w));
   if (!ws.length) return null;
   const no = ws.some(isNo);
   const yes = ws.some(isYes);
-  if (no && !yes && ws.every(w => isNo(w) || CONFIRM_NO_FILL.has(w))) return false;
-  if (yes && !no && ws.every(w => isYes(w) || CONFIRM_YES_FILL.has(w))) return yesAsked(toks) ? 'asks' : true;
+  if (no && !yes && ws.every(w => isNo(w) || CONFIRM_NO_FILL.has(w) || ownNoFill.includes(w))) return false;
+  if (yes && !no && ws.every(w => isYes(w) || CONFIRM_YES_FILL.has(w) || ownFill.includes(w))) {
+    if (yesAsked(words)) return 'asks';
+    if (named) return 'keep';
+    // On a throw-away card a bare "yes" is not enough: only its own words ("throw it away", "discard it") or "do it".
+    // "throw" counts only with its "away" or "out": a "throw" cut short is no answer.
+    if (kind === 'discard') {
+      const explicit = ws.some(w => w === 'do' || (own.includes(w) && w !== 'throw')) || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
+      if (!explicit) return 'keep';
+    }
+    return true;
+  }
+  // "start it", "yes launch it", "start it is that right" to a card that is no launch: not its yes, and no new launch
+  // either ("Start Claude on “it is that right”?"). The card stays.
+  if (!launch && !no && ws.some(w => START_YES.has(w)) && ws.every(w => isYes(w) || START_YES.has(w) || CONFIRM_YES_FILL.has(w)
+    || ownFill.includes(w) || QUESTION_START.has(w))) return 'keep';
   return null;
 }
 
@@ -439,10 +491,15 @@ function asksSomething(toks) {
   return QUESTION_START.has(ws[0]) || (ws[0] === 'do' && ['i', 'we', 'you', 'they'].includes(ws[1]));
 }
 
-/** Words a reply can open with before it says, or asks, anything: "yes", "okay", "go ahead", "so", "stop" on a stop card. */
-const OPENERS = new Set([...SOFT_LEAD, ...YES_STRONG, ...CONFIRM_YES, 'ahead', 'please', 'thanks', 'for', 'stop', 'send', 'run', 'let', 'make']);
+/**
+ * Words a reply can open with before it says, or asks, anything: "yes", "okay", "go ahead", "so", "stop" on a stop card,
+ * "merge it" on a merge card, "throw it away" on a throw-away card.
+ */
+const OPENERS = new Set([...SOFT_LEAD, ...YES_STRONG, ...CONFIRM_YES, 'ahead', 'please', 'thanks', 'for', 'stop', 'send', 'run', 'let', 'make',
+  'merge', 'land', 'bring', 'in', 'discard', 'throw', 'away', 'out']);
 /** Words whose "it" is the thing said yes to: "do it", "allow it", "go for it", "stop it". In "yes it is", "it" is no such word. */
-const YES_VERB = new Set(['do', 'allow', 'approve', 'accept', 'permit', 'grant', 'confirm', 'start', 'launch', 'run', 'send', 'stop', 'let', 'make', 'for']);
+const YES_VERB = new Set(['do', 'allow', 'approve', 'accept', 'permit', 'grant', 'confirm', 'start', 'launch', 'run', 'send', 'stop', 'let', 'make', 'for',
+  'merge', 'land', 'bring', 'discard', 'throw']);
 
 /** Words a left-out "is" or "are" leaves next to what is asked about: "that okay", "you sure", "that the right one". */
 const STATE_YES = new Set(['okay', 'alright', 'fine', 'good', 'great', 'sure', 'right', 'correct', 'allowed', 'approved', 'accepted',
@@ -552,6 +609,9 @@ function matchStop(core, c) {
   }
   const refWords = rest.map(t => t.w).join(' ');
   if (ws[0] === 'cancel' && PRONOUN_REFS.has(refWords)) return null; // "cancel that" is not about an agent
+  // "stop an agent to fix the login" says what a new agent should do: work that gets the start confirm, never a stop
+  // of "Login fix" (the reference words would skip "an agent to" and find it).
+  if (launchPhrase(rest.map(t => t.w))) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
   const r = resolveList(stripTrailing(rest, STOP_TAIL), c);
   // Words that match nothing beside the agent's words say what to do, not which agent:
   // "stop the flaky test from timing out" is work, so it gets the start confirm like other work.
@@ -573,6 +633,7 @@ function matchForget(core, c) {
   let rest = core.slice(1);
   if (rest[0] && rest[0].w === 'about') rest = rest.slice(1);
   if (!rest.length) return null;
+  if (launchPhrase(rest.map(t => t.w))) return null; // "forget an agent to fix the login" names no agent
   const r = resolveList(stripTrailing(rest, STOP_TAIL), c);
   if (!r.ids.length || !r.full) return null; // "forget the old plan, use the new one" is work or an answer
   return { intent: { kind: 'forget', agentIds: r.ids }, strong: r.named };
@@ -589,6 +650,307 @@ function matchContinue(core, c) {
   const a = r.ids.length === 1 && r.full ? c.agents.find(x => x.id === r.ids[0]) : null;
   if (!a || !a.earlier) return null;
   return { intent: { kind: 'continue', agentId: a.id }, strong: r.named };
+}
+
+// Source control: an agent's changes, merging them, throwing them away -----------------------
+
+/** Words for what an agent did in its folder: "its changes", "search cleanup's diff", "the work from it". */
+const WORK_NOUN = new Set(['changes', 'change', 'work', 'diff', 'diffs', 'edits', 'edit', 'commits', 'commit', 'branch']);
+/**
+ * The focused agent's work, said without its name: "its changes", "the diff", "all of its work", and "it's changes"
+ * typed for "its". Only these determiners: "my changes" and "all changes" are not an agent's.
+ */
+const GENERIC_WORK = /^(?:all (?:of )?)?(?:its|their|the|this|that|his|her|it is) (?:changes|change|work|diff|diffs|edits|edit|commits|commit|branch)$/;
+const WORK_HEAD = /^(?:all (?:of )?)?(?:(?:its|their|the|this|that) )?(?:changes|change|work|diff|diffs|edits|edit|commits|commit|branch)$/;
+/** "the changes from search cleanup", "the work of 1a2b3c". */
+const WORK_OF = new Set(['from', 'of', 'by', 'in', 'for']);
+/** Agent names are short (four words at most from a task): a longer reference names nothing. Keeps dictation fast. */
+const MAX_WORK_REF = 12;
+/** How soon, not whose work: "merge it right away", "throw it away now". */
+const WORK_TAIL = [['right', 'away'], ['at', 'once'], ['immediately'], ['again'], ['too'], ['as', 'well'], ['now'], ['please'], ['for', 'me']];
+/** Words that start a new agent and give it work: "bring in an agent to fix the login", "stop an agent to fix the login". */
+const LAUNCH_JOIN = new Set(['to', 'that', 'which', 'who', 'for', 'on', 'and']);
+
+function launchPhrase(ws) {
+  if (!launchNoun(ws)) return false;
+  const n = parseNoun(ws, 0);
+  return n.end < ws.length && LAUNCH_JOIN.has(ws[n.end]);
+}
+
+const isRoot = a => !a.parentId && a.kind !== 'helper';
+
+/** The root agent an agent belongs to: itself, or a helper's agent (helpers work in their agent's folder). */
+function rootOf(a, c) {
+  let cur = a;
+  for (let i = 0; cur && !isRoot(cur) && i < 16; i++) {
+    const up = (typeof cur.rootId === 'string' && cur.rootId && cur.rootId !== cur.id) ? cur.rootId : cur.parentId;
+    cur = typeof up === 'string' ? c.agents.find(x => x.id === up) || null : null;
+  }
+  return cur && isRoot(cur) ? cur : null;
+}
+
+/** The focused agent, as a root: a helper in the centre stands for its agent. */
+function focusRoot(c) {
+  if (!c.focusId) return null;
+  if (!c.focus) return c.focusId; // not in the list: the engine looks it up and says so
+  const r = rootOf(c.focus, c);
+  return r ? r.id : null;
+}
+
+/** The words are nothing but an agent's whole name ("diff viewer", "merge command"): a name, not a command. */
+function bareName(ws, c) {
+  const meaningful = ws.filter(w => !REF_STOP.has(w));
+  if (!meaningful.length || meaningful.length > MAX_WORK_REF) return false;
+  const key = refKey(ws);
+  return key.split(' ').length === meaningful.length && c.agents.some(a => agentWords(a).nameKey === key);
+}
+
+/**
+ * The root agent these words name by themselves: its id (a helper's id stands for its agent), or words of its name
+ * and nothing else, two or more of them (all of a one-word name), that no other root agent's name also has. Agents
+ * that ended, and agents from an earlier run, count: theirs is the work that is merged or thrown away. When several
+ * root agents have the words, the one whose whole name they are is named; two with that name give id null, so the
+ * engine asks which one. Task words, state words and helpers' names never name a root agent here, and neither do
+ * words for work alone: "the changes" and "your changes" are no agent's name, even when an agent is called "Changes"
+ * (its id or "it" still name it).
+ * @returns {{ id: string|null, form: 'id'|'name' } | null}
+ */
+function namedRoot(ws, c) {
+  const meaningful = ws.filter(w => !REF_STOP.has(w));
+  if (!meaningful.length || meaningful.length > MAX_WORK_REF) return null;
+  if (meaningful.length === 1) {
+    const a = c.agents.find(x => x.id.toLowerCase() === meaningful[0]);
+    if (a) {
+      const r = rootOf(a, c);
+      return r ? { id: r.id, form: 'id' } : null;
+    }
+  }
+  if (meaningful.every(w => WORK_NOUN.has(w))) return null;
+  const having = c.agents.filter(a => isRoot(a) && nameWords(ws, a) > 0);
+  if (!having.some(a => names(ws, a))) return null;
+  if (having.length === 1) return { id: having[0].id, form: 'name' };
+  const key = refKey(ws);
+  const whole = having.filter(a => agentWords(a).nameKey === key);
+  return { id: whole.length === 1 ? whole[0].id : null, form: 'name' };
+}
+
+/**
+ * Whose work the words mean, for merging, throwing away and showing changes. Strict: the words must name the agent
+ * (see namedRoot), or point at the focused one ("it", "this one", "its changes", "the diff").
+ * `form`: 'id' and 'name' name it; 'pronoun' ("it") and 'generic' ("its changes") mean the focused agent.
+ * `noun`: the words said "changes", "work", "diff" or the like. `id` is null when nothing is focused, or when two
+ * root agents share the name. Null when the words name no agent, so they keep their old meaning.
+ * @returns {{ id: string|null, form: 'id'|'name'|'pronoun'|'generic', noun: boolean } | null}
+ */
+function workRef(toks, c) {
+  const ws = toks.map(t => t.w);
+  if (!ws.length || ws.length > MAX_WORK_REF) return null;
+  // The words whole first: an agent may be called "Diff viewer" or "Work queue". "the diff viewer's diff" and "the
+  // work queue's work" are its name and then its work: the last word is no part of the name the rest already says.
+  const whole = namedRoot(ws, c);
+  if (whole) {
+    const head = ws.length > 1 && WORK_NOUN.has(ws[ws.length - 1]) ? namedRoot(ws.slice(0, -1), c) : null;
+    return { ...whole, noun: !!head && head.id === whole.id };
+  }
+  const phrase = ws.join(' ');
+  if (PRONOUN_REFS.has(phrase)) return { id: focusRoot(c), form: 'pronoun', noun: false };
+  if (GENERIC_WORK.test(phrase)) return { id: focusRoot(c), form: 'generic', noun: true };
+  // "search cleanup's changes" (lexed without its "'s"), "this agent's work".
+  if (ws.length > 1 && WORK_NOUN.has(ws[ws.length - 1])) {
+    const head = ws.slice(0, -1);
+    const named = namedRoot(head, c);
+    if (named) return { ...named, noun: true };
+    if (PRONOUN_REFS.has(head.join(' '))) return { id: focusRoot(c), form: 'pronoun', noun: true };
+  }
+  // "the changes from search cleanup", "all the work of 1a2b3c".
+  const n = ws.findIndex(w => WORK_NOUN.has(w));
+  if (n >= 0 && n + 2 < ws.length && WORK_OF.has(ws[n + 1]) && WORK_HEAD.test(ws.slice(0, n + 1).join(' '))) {
+    const of = ws.slice(n + 2);
+    const named = namedRoot(of, c);
+    if (named) return { ...named, noun: true };
+    if (PRONOUN_REFS.has(of.join(' '))) return { id: focusRoot(c), form: 'pronoun', noun: true };
+  }
+  return null;
+}
+
+/**
+ * Something else on screen that "it" or "the changes" may be about: a confirm card, or a request (a question, a
+ * stuck ask, a permission) from the focused agent or its one waiting helper. Words that do not name an agent then
+ * keep their old meaning (the card's words, the answer, the permission's reply), never these commands.
+ */
+function screenBusy(c) {
+  return !!c.pendingConfirm || hasAsk(c.asker);
+}
+
+/** A form that does not name the agent: "it", "its changes", a bare "merge". */
+const weakForm = ref => ref.form === 'pronoun' || ref.form === 'generic' || ref.form === 'bare';
+
+const INTO = new Set(['into', 'onto', 'to', 'in', 'on']);
+/** The person's current branch, said without its name. */
+const MINE = new Set(['my branch', 'my own branch', 'my current branch', 'the current branch', 'this branch', 'mine', 'my code',
+  'my copy', 'my checkout', 'my folder', 'my repo', 'my repository', 'the repo', 'the repository', 'here']);
+
+/** "main", "the master branch", "my branch", or the current branch by name (when ctx gives it). Null for anything else. */
+function targetOf(ws, c) {
+  const s = ws.join(' ');
+  if (!s) return null;
+  if (MINE.has(s)) return { into: undefined };
+  const m = /^(?:the )?(main|master)(?: branch)?$/.exec(s);
+  if (m) return { into: m[1] };
+  if (c && c.branch) {
+    const b = c.branch.toLowerCase();
+    if (s === b || s === `the ${b} branch` || s === `${b} branch` || s === `the ${b}`) return { into: c.branch };
+  }
+  return null;
+}
+
+/**
+ * Where to merge, said at the end: "into main", "onto my branch", "to master". `said`: a target was there;
+ * `into`: the branch it names, or undefined for the current branch ("my branch", "here"). Anything else is no target.
+ */
+function takeTarget(toks, c) {
+  const ws = toks.map(t => t.w);
+  if (ws.length > 1 && ws[ws.length - 1] === 'here') return { toks: toks.slice(0, -1), into: undefined, said: true }; // "merge it here"
+  for (let i = Math.max(0, ws.length - 5); i < ws.length; i++) {
+    if (!INTO.has(ws[i])) continue;
+    const t = targetOf(ws.slice(i + 1), c);
+    if (t) return { toks: toks.slice(0, i), into: t.into, said: true };
+  }
+  return { toks, into: undefined, said: false };
+}
+
+/**
+ * "merge search cleanup", "merge it", "land it", "bring its changes in", "merge it into main": always asked first (the
+ * engine shows a merge card). The words must name the agent; "merge the two config files" stays work. A name is strong;
+ * "it", "its changes" and a bare "merge" are weak, and they keep their old meaning while anything else waits on screen.
+ */
+function matchMerge(core, c) {
+  const ws = core.map(t => t.w);
+  const bring = ws[0] === 'bring';
+  if (!bring && ws[0] !== 'merge' && ws[0] !== 'land') return null;
+  if (bareName(ws, c)) return null; // "merge command" is the name of the agent "Merge command"
+  let rest = stripTrailing(core.slice(1), WORK_TAIL);
+  let particle = false; // "bring" needs one: "bring its changes in", "bring in its changes", "bring it into main"
+  if (bring && rest[0] && (rest[0].w === 'in' || rest[0].w === 'over')) { rest = rest.slice(1); particle = true; }
+  if (launchPhrase(rest.map(t => t.w))) return null; // "bring in an agent to fix the login" starts one
+  let into;
+  let ref = null;
+  if (!rest.length) {
+    if (bring || particle) return null;
+    ref = { id: focusRoot(c), form: 'bare', noun: false }; // "merge", "land"
+  } else {
+    ref = workRef(rest, c); // the words whole: "merge add tests to parser"
+    if (!ref) {
+      const t = takeTarget(rest, c);
+      if (t.said) {
+        into = t.into;
+        particle = true;
+        ref = t.toks.length ? workRef(t.toks, c) : bring ? null : { id: focusRoot(c), form: 'bare', noun: false };
+      }
+    }
+    if (!ref && ['in', 'over'].includes(rest[rest.length - 1].w)) { // "merge it in", "bring its changes in"
+      particle = true;
+      ref = rest.length > 1 ? workRef(rest.slice(0, -1), c) : null;
+    }
+  }
+  if (!ref) return null;
+  // "bring" means a merge only with its work or "it": "bring search cleanup in" is no merge.
+  if (bring && (!particle || !(ref.form === 'pronoun' || ref.noun))) return null;
+  if (weakForm(ref) && screenBusy(c)) return null;
+  const intent = { kind: 'merge', agentId: ref.id };
+  if (into) intent.into = into;
+  return { intent, strong: !weakForm(ref) };
+}
+
+const DISCARD_VERBS = new Set(['discard', 'scrap', 'trash']);
+
+/**
+ * "throw away search cleanup's changes", "discard it", "throw it away", "scrap it": always asked first (the engine
+ * shows a throw-away card). The words must name the agent, as for a merge; "discard unused imports" is no throw-away.
+ */
+function matchDiscard(core, c) {
+  const ws = core.map(t => t.w);
+  let rest;
+  let particle = true;
+  if (DISCARD_VERBS.has(ws[0])) rest = core.slice(1);
+  else if (ws[0] === 'throw' && (ws[1] === 'away' || ws[1] === 'out')) rest = core.slice(2);
+  else if (ws[0] === 'throw') { rest = core.slice(1); particle = false; } // "throw it away"
+  else return null;
+  if (bareName(ws, c)) return null;
+  rest = stripTrailing(rest, WORK_TAIL);
+  if (!particle) {
+    const last = rest[rest.length - 1];
+    if (!last || (last.w !== 'away' && last.w !== 'out')) return null;
+    rest = rest.slice(0, -1);
+  }
+  if (!rest.length) return null; // "discard" alone throws nothing away
+  // "scrap that" and "trash this" say never mind ("scratch that"), not which work to throw away. "scrap it" does.
+  if ((ws[0] === 'scrap' || ws[0] === 'trash') && rest.length === 1 && (rest[0].w === 'that' || rest[0].w === 'this')) return null;
+  if (launchPhrase(rest.map(t => t.w))) return null;
+  const ref = workRef(rest, c);
+  if (!ref) return null;
+  if (weakForm(ref) && screenBusy(c)) return null;
+  return { intent: { kind: 'discard', agentId: ref.id }, strong: !weakForm(ref) };
+}
+
+/** Questions about what an agent changed. They may find the agent by its task words too, as status questions do. */
+const CHANGES_ASK = [
+  /^what (?:did|has|have) (?<ref>.+?) (?:change|changed)(?: so far)?$/d,
+  /^what (?:is |has |have )?(?:been )?changed(?: so far)?(?: (?:in|for|with|from|by|on) (?<ref>.+?))?(?: so far)?$/d,
+  /^what changes (?:did|has|have) (?<ref>.+?) (?:make|made)(?: so far)?$/d,
+  /^what (?:are|were) (?:the |its |their )?changes(?: (?:in|from|of|by|for) (?<ref>.+))?$/d,
+  /^what (?:are|were) (?<ref>.+?) changes$/d,
+  /^(?:what|which) files (?:did|has|have) (?<ref>.+?) (?:change|changed|touch|touched|edit|edited)$/d,
+  /^(?:what|which) files (?:have |were |got )?changed(?: so far)?$/d,
+  /^(?:show me|show us|show|tell me|let me see|let us see) what (?:(?<ref>.+?) )?(?:has |have )?changed(?: so far)?$/d,
+];
+/** "show me the changes", "show search cleanup's diff": it needs a word for the work, or it is a status ("show search cleanup"). */
+const CHANGES_SHOW = /^(?:show me|show us|show|let me see|let us see|can i see|could i see|may i see|see|look at|open|pull up|bring up|give me) (?<ref>.+)$/d;
+const CHANGES_DIFF = /^diff(?: (?<ref>.+))?$/d;
+
+/**
+ * "what did search cleanup change", "what changed" (the focused agent), "show me the changes", "show search cleanup's
+ * changes", "diff it": read-only, so the engine shows them at once (the page opens the git screen on that agent).
+ */
+function matchChanges(core, c) {
+  const ws = core.map(t => t.w);
+  if (bareName(ws, c)) return null; // "diff viewer" is the name of the agent "Diff viewer"
+  const s = ws.join(' ');
+  // "what changed", a bare "diff": the focused agent, said without its name.
+  const focused = () => (screenBusy(c) ? null : { intent: { kind: 'changes', agentId: focusRoot(c) }, strong: false });
+  for (const re of CHANGES_ASK) {
+    const m = re.exec(s);
+    if (!m) continue;
+    const refToks = refTokens(m, s, core);
+    if (!refToks.length) return focused();
+    const ref = workRef(refToks, c);
+    if (ref) {
+      if (weakForm(ref) && screenBusy(c)) return null;
+      return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
+    }
+    // A question may find the agent by its task words, as "what is the rounding bug one doing" does.
+    const r = resolveRef(refToks, c);
+    const a = r.ids.length && r.full ? c.agents.find(x => x.id === r.ids[0]) : null;
+    const root = a ? rootOf(a, c) : null;
+    return root ? { intent: { kind: 'changes', agentId: root.id }, strong: r.sure } : null;
+  }
+  let m = CHANGES_SHOW.exec(s);
+  if (m) {
+    const ref = workRef(refTokens(m, s, core), c);
+    if (!ref || !ref.noun) return null; // "show search cleanup" is a status; "show the error on the login page" is work
+    if (weakForm(ref) && screenBusy(c)) return null;
+    return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
+  }
+  m = CHANGES_DIFF.exec(s);
+  if (m) {
+    const refToks = refTokens(m, s, core);
+    if (!refToks.length) return focused();
+    const ref = workRef(refToks, c);
+    if (!ref) return null; // "diff the two config files" is not about an agent
+    if (weakForm(ref) && screenBusy(c)) return null;
+    return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
+  }
+  return null;
 }
 
 // Machines -----------------------------------------------------------------------------------
@@ -1089,7 +1451,9 @@ function answerIntent(base, focus, ask) {
 /**
  * Parse what the person typed or said.
  * @param {string} text
- * @param {{ agents?: object[], focusId?: string|null, machines?: object[], harnesses?: object, pendingConfirm?: any }} [ctx]
+ * @param {{ agents?: object[], focusId?: string|null, machines?: object[], harnesses?: object, pendingConfirm?: any,
+ *   repo?: { branch?: string|null } }} [ctx] `repo.branch`: the person's current branch, so "merge it into <that branch>"
+ *   can name it; without it only "main", "master" and "my branch" are understood as where to merge.
  * @returns {object} an intent; never throws
  */
 export function parseCommand(text, ctx) {
@@ -1108,10 +1472,11 @@ function parse(said, c) {
   const ask = holder ? holder.ask : null;
 
   // 1. A confirm on screen is waiting for "yes" or "cancel" (only the one the page shows: see the engine).
-  // "is that right?" asks about the card rather than answering it: it settles nothing, and the card stays.
+  // "is that right?" asks about the card rather than answering it: it settles nothing, and the card stays. So does a
+  // yes that is not enough for that card (a bare "yes" to throwing work away): it never falls through to an answer.
   if (c.pendingConfirm) {
-    const go = confirmReply(base, c.pendingConfirm.kind);
-    if (go === 'asks') return { kind: 'unknown', text: said };
+    const go = confirmReply(base, c.pendingConfirm.kind, c);
+    if (go === 'asks' || go === 'keep') return { kind: 'unknown', text: said };
     if (go !== null) return { kind: 'confirm', go };
   }
   // 2. The focused agent is waiting for permission.
@@ -1152,10 +1517,15 @@ function matchCommand(core, c) {
   if (!core.length) return null;
   const ws = core.map(t => t.w);
   if (matchStopAll(ws)) return { intent: { kind: 'stop_all' }, strong: true };
+  // Changes, merge and throw-away come before status: "what did search cleanup change" and "show search cleanup's
+  // changes" were status questions, and still are when they name no agent.
   return matchMachines(core, c)
     || matchStop(core, c)
     || matchForget(core, c)
     || matchContinue(core, c)
+    || matchChanges(core, c)
+    || matchMerge(core, c)
+    || matchDiscard(core, c)
     || matchStatusOrSpend(core, c)
     || matchSay(core, c)
     || matchStart(core, c);
@@ -1232,6 +1602,12 @@ export function describeIntent(intent, ctx) {
     case 'stop_all': return 'Stop every agent?';
     case 'forget': return Array.isArray(it.agentIds) && it.agentIds.length ? `Forget ${names(it.agentIds)}?` : 'Forget an agent? It is not clear which one.';
     case 'continue': return `Continue ${agentName(it.agentId, c)} where it left off?`;
+    case 'changes': return it.agentId ? `Show what ${agentName(it.agentId, c)} changed?` : 'Show what an agent changed? It is not clear which one.';
+    case 'merge': {
+      const into = typeof it.into === 'string' && it.into.trim() ? clip(it.into.trim(), 60) : 'your branch';
+      return it.agentId ? `Merge ${agentName(it.agentId, c)} into ${into}?` : 'Merge an agent? It is not clear which one.';
+    }
+    case 'discard': return it.agentId ? `Throw away ${agentName(it.agentId, c)}’s work?` : 'Throw away an agent’s work? It is not clear which one.';
     case 'say': return it.agentId ? `Tell ${agentName(it.agentId, c)} ${quote(it.text)}?` : `Send ${quote(it.text)}? It is not clear to which agent.`;
     case 'answer': return `Answer ${agentName(it.agentId, c)} with ${quote(it.text)}?`;
     case 'allow': return `Allow the request from ${agentName(it.agentId, c)}?`;
