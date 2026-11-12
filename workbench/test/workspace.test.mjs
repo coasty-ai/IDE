@@ -1370,6 +1370,50 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     git(t.root, 'worktree', 'remove', '--force', elsewhere);
   });
 
+  test('throwing away or removing an agent’s folder that is gone never touches the person’s own worktrees, even one whose folder is away', async () => {
+    const t = await agentRepo();
+    // The person's own worktree, with a staged change, on a disk that is not there right now.
+    const mine = path.join(fs.realpathSync.native(T), `mine-${t.id}`);
+    git(t.root, 'worktree', 'add', '-q', '-b', `mine-${t.id}`, mine);
+    write(path.join(mine, 'staged.txt'), 'staged\n');
+    git(mine, 'add', 'staged.txt');
+    fs.renameSync(mine, `${mine}-away`);
+    const listed = () => git(t.root, 'worktree', 'list', '--porcelain').split('\n').filter(l => l.startsWith('worktree ')).map(l => l.slice(9));
+    assert.ok(listed().includes(mine));
+    // The danger is real: `git worktree prune` would take its records away, for good.
+    const pruned = gitTry(t.root, 'worktree', 'prune', '--dry-run', '--verbose');
+    assert.match(pruned.out + pruned.err, new RegExp(`mine-${t.id}`));
+
+    // An agent's folder deleted by hand, then thrown away; then a locked one.
+    write(t.w('a.txt'), 'agent\n');
+    git(t.ws.path, 'commit', '-q', '-am', 'agent');
+    fs.rmSync(t.ws.path, { recursive: true, force: true });
+    const discard = (ws, id) => discardWork({ repoRoot: t.root, path: ws.path, branch: ws.branch, since: ws.base, expect: { workId: null }, agentId: id });
+    assert.deepEqual(await discard(t.ws, t.id), { ok: true, saved: `refs/workbench/discarded/${t.id}` });
+    assert.ok(!listed().includes(t.ws.path));
+    assert.ok(listed().includes(mine), 'the person’s worktree is still there');
+    const locked = await createWorkspace({ repoRoot: t.root, agentId: 'pr0002', slug: 'Locked away', baseDir });
+    git(t.root, 'worktree', 'lock', locked.path);
+    fs.rmSync(locked.path, { recursive: true, force: true });
+    assert.deepEqual(await discard(locked, 'pr0002'), { ok: true, saved: 'refs/workbench/discarded/pr0002' });
+    assert.ok(!listed().includes(locked.path));
+    assert.equal(git(t.root, 'branch', '--list', locked.branch), '');
+    assert.ok(listed().includes(mine), 'the person’s worktree is still there');
+
+    // The tidy asked about a folder git does not list, and a removal git refuses (a locked folder that is gone).
+    assert.deepEqual(await removeWorkspace({ repoRoot: t.root, path: path.join(T, 'never-a-worktree'), base: t.ws.base, onlyIfUnchanged: true, deleteBranch: true }),
+      { removed: false });
+    const other = await createWorkspace({ repoRoot: t.root, agentId: 'pr0003', slug: 'Locked too', baseDir });
+    git(t.root, 'worktree', 'lock', other.path);
+    fs.rmSync(other.path, { recursive: true, force: true });
+    await removeWorkspace({ repoRoot: t.root, path: other.path, deleteBranch: true });
+    assert.ok(listed().includes(mine), 'the person’s worktree is still there');
+
+    // Back from the disk: it is still a worktree of theirs, with its staged change.
+    fs.renameSync(`${mine}-away`, mine);
+    assert.equal(statusOf(mine), 'A  staged.txt\n');
+  });
+
   test('gitGraph lists HEAD and the agents’ branches newest first, with agentId and kind from the trailers only', async () => {
     const t = await agentRepo();
     write(t.w('a.txt'), 'one\nTWO\nthree\n');

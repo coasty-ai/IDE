@@ -282,10 +282,9 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
   if (target === root) throw plainError('That is the main folder of the repository, not a workspace.');
   const start = onlyIfUnchanged ? validRef(base) : null;
   const entry = (await listWorktrees(root)).find(w => w.path === target || canonical(w.path) === target);
-  if (!entry || canonical(entry.path) === root) {
-    await git(['worktree', 'prune'], { cwd: root }).catch(() => {});
-    return { removed: false };
-  }
+  // Not one git lists: nothing of the agent's to take away. Never `git worktree prune`: it would also take away the
+  // records of the person's own worktrees whose folders are away right now (on a disk that is not mounted, say).
+  if (!entry || canonical(entry.path) === root) return { removed: false };
   if (onlyIfUnchanged) {
     const head = await git(['rev-parse', 'HEAD'], { cwd: entry.path }).then(r => r.stdout.trim(), () => null);
     if (head !== start) return { removed: false, kept: true }; // the agent made commits, or the folder is unreadable
@@ -306,7 +305,9 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     await git(['worktree', 'remove', '--force', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
   } catch (e) {
     if (fs.existsSync(entry.path)) throw gitTrouble(e) || plainError(`Git could not remove the workspace: ${firstLine(e.stderr)}`, e);
-    await git(['worktree', 'prune'], { cwd: root }).catch(() => {}); // the folder was already gone
+    // The folder is gone (it may have gone part-way through): once more, for this one record only. Git takes away the
+    // record of a worktree whose folder is missing; a locked one it keeps, and so do we.
+    await git(['worktree', 'remove', '--force', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS }).catch(() => {});
   }
   if (deleteBranch && entry.branch && entry.branch.startsWith('workbench/')) {
     await git(['branch', '-D', entry.branch], { cwd: root }).catch(() => {});
@@ -1310,11 +1311,13 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
       `Thrown away: ${b}\n\nWorkbench-Agent: ${id}\nWorkbench-Kind: discarded\n`, (await identityAt(run, root)) || WORKBENCH_IDENTITY);
     await run(['update-ref', '--create-reflog', '-m', note, saved, copy], { cwd: root });
     progress.saved = saved;
+    const remove = ['worktree', 'remove', '--force', ...(folder.locked ? ['--force'] : []), folder.path];
     try {
-      await run(['worktree', 'remove', '--force', ...(folder.locked ? ['--force'] : []), folder.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
+      await run(remove, { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
     } catch {
       if (fs.existsSync(folder.path)) throw new Refusal('git', `Git could not delete its folder ${folder.path}. A copy of its work is kept in git as ${saved}.`);
-      await run(['worktree', 'prune'], { cwd: root }).catch(() => {});
+      // The folder went, then git stopped: once more, for its record only (never `worktree prune`, see removeWorkspace).
+      await run(remove, { cwd: root, timeout: WORKTREE_TIMEOUT_MS }).catch(() => {});
     }
     const gone = await run(['update-ref', '-m', note, '-d', `refs/heads/${b}`, s.head], { cwd: root, okCodes: [1, 128] });
     if (gone.code !== 0) throw new Refusal('git', `Its folder is gone, but its branch ${b} changed meanwhile, so it was kept. A copy of its work is kept in git as ${saved}.`);
@@ -1322,10 +1325,11 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
     return { ok: true, saved };
   }
 
-  // The folder is already gone: still delete the branch, keeping its last commit.
+  // The folder is already gone: still delete the branch, keeping its last commit. Its worktree record goes by itself
+  // (`worktree remove` of a missing folder takes away only that record; never `worktree prune`, which would also take
+  // away the records of the person's own worktrees whose folders are away right now).
   if (entry) {
-    if (entry.locked) await run(['worktree', 'unlock', entry.path], { cwd: root }).catch(() => {});
-    await run(['worktree', 'prune'], { cwd: root }).catch(() => {});
+    await run(['worktree', 'remove', '--force', ...(entry.locked ? ['--force'] : []), entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS }).catch(() => {});
   }
   const tip = await commitOf(root, `refs/heads/${b}`, run);
   if (!tip) throw new Refusal('gone', 'Its folder and its branch are already gone.');
