@@ -94,8 +94,9 @@ export const SPARK_BUCKETS = 20;
  * @property {boolean} folder           its folder is still there
  * @property {{ into: string|null, merge: string|null, at: number, files: number, adds: number, dels: number }|null} merged
  *           the last successful merge (merge: the merge commit's id)
- * @property {{ why: 'conflict'|'blocked'|'ancestry'|'moved'|'identity'|'detached'|'busy'|'git', sentence: string, paths: string[], at: number }|null} problem
- *           set by a failed merge; cleared by the next merge, any turn start, a message it takes, and a throw-away
+ * @property {{ why: 'conflict'|'blocked'|'ancestry'|'moved'|'identity'|'detached'|'busy'|'git', sentence: string, paths: string[], into: string|null, at: number }|null} problem
+ *           set by a failed merge (into: the branch it was going into); cleared by the next merge, any turn start, a
+ *           message it takes, a throw-away, and when nothing is left to merge
  * @property {{ at: number, saved: string|null }|null} thrownAway  saved: the hidden ref that keeps a copy of the work
  */
 

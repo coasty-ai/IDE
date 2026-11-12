@@ -125,7 +125,7 @@ function execFileDetached(file, args, { cwd, timeout, maxBuffer, encoding, env, 
   return child;
 }
 
-/** An error whose message a person can read; git's own words go in `.detail`. */
+/** An error whose message a person can read; git's own words go only in `.detail` (for the log), never in the message. */
 function plainError(message, cause) {
   const e = new Error(message);
   e.plain = true;
@@ -142,10 +142,6 @@ function gitTrouble(e) {
   if (e && e.killed) return plainError('Git took too long and was stopped.', e);
   if (e && e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return plainError('Git gave back more than Workbench can read at once.', e);
   return null;
-}
-
-function firstLine(s) {
-  return String(s || '').trim().split('\n')[0].replace(/^(fatal|error): /, '');
 }
 
 function expandHome(p) {
@@ -282,7 +278,7 @@ export async function createWorkspace({ repoRoot, agentId, slug, baseDir } = {})
     // Stopped part-way (a Ctrl-C in the terminal reaches git too, or a post-checkout hook failed): git takes a half-made
     // folder away itself, but not the branch it made first, nor a folder it finished.
     if (fresh) await takeBack(root, wsPath, branch);
-    throw gitTrouble(e) || plainError(`Git could not make a workspace for this agent: ${firstLine(e.stderr)}`, e);
+    throw gitTrouble(e) || plainError('Git could not make a workspace for this agent.', e);
   }
   try {
     const real = fs.realpathSync.native(wsPath);
@@ -290,7 +286,7 @@ export async function createWorkspace({ repoRoot, agentId, slug, baseDir } = {})
     return { path: real, branch, base };
   } catch (e) {
     await takeBack(root, wsPath, branch);
-    throw gitTrouble(e) || plainError(`Git could not make a workspace for this agent: ${firstLine(e.stderr || e.message)}`, e);
+    throw gitTrouble(e) || plainError('Git could not make a workspace for this agent.', e);
   }
 }
 
@@ -365,7 +361,7 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
   try {
     await git(['worktree', 'remove', '--force', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
   } catch (e) {
-    if (fs.existsSync(entry.path)) throw gitTrouble(e) || plainError(`Git could not remove the workspace: ${firstLine(e.stderr)}`, e);
+    if (fs.existsSync(entry.path)) throw gitTrouble(e) || plainError('Git could not remove the workspace.', e);
     // The folder is gone (it may have gone part-way through): once more, for this one record only. Git takes away the
     // record of a worktree whose folder is missing; a locked one it keeps, and so do we.
     await git(['worktree', 'remove', '--force', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS }).catch(() => {});
@@ -525,7 +521,7 @@ export async function diffStats({ path: wsPath, base } = {}) {
   try {
     out = (await git(['diff', '--numstat', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', ref, '--'], { cwd: wsPath })).stdout;
   } catch (e) {
-    throw gitTrouble(e) || plainError(`Git could not compare the workspace with its starting point: ${firstLine(e.stderr)}`, e);
+    throw gitTrouble(e) || plainError('Git could not compare the workspace with its starting point.', e);
   }
   for (const rec of out.split('\0')) {
     const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(rec);
@@ -541,7 +537,7 @@ export async function diffStats({ path: wsPath, base } = {}) {
   try {
     hidden = (await hiddenByAgent(wsPath, ref)).filter(p => !seen.has(p));
   } catch (e) {
-    throw gitTrouble(e) || plainError(`Git could not list the files hidden by the agent's own ignore rules: ${firstLine(e.stderr || e.message)}`, e);
+    throw gitTrouble(e) || plainError('Git could not list the files hidden by the agent’s own ignore rules.', e);
   }
   let budget = COUNT_TOTAL_MAX_BYTES;
   for (const [rel, ignored] of [...others.map(p => [p, false]), ...hidden.map(p => [p, true])]) {
@@ -1633,7 +1629,7 @@ export async function readRepoConfig({ repoRoot, ref = 'HEAD', onProblem } = {})
   } catch (e) {
     const missing = /does not exist in|exists on disk, but not in|path '.*' does not exist/i.test(e.stderr || '');
     if (missing) return defaults();
-    throw gitTrouble(e) || plainError(`Could not read workbench.json from the commit: ${firstLine(e.stderr)}`, e);
+    throw gitTrouble(e) || plainError('Could not read workbench.json from the commit.', e);
   }
   if (Buffer.byteLength(text) > MAX_CONFIG_BYTES) {
     note('workbench.json is too large, so it was ignored.');

@@ -7,7 +7,7 @@ export const finishKey = a => `${a.id}@${a.endedAt ?? a.stateSince ?? 0}`;
 
 // ---------------------------------------------------------------- an agent's work (AgentView.work)
 // work: { branch, from, folder, merged: { into, merge, at, files, adds, dels } | null,
-//         problem: { why, sentence, paths, at } | null, thrownAway: { at, saved } | null } | null (helpers, no git)
+//         problem: { why, sentence, paths, into, at } | null, thrownAway: { at, saved } | null } | null (helpers, no git)
 
 /** Roots that have finished, failed or stopped: nothing runs until the person sends something. */
 const AT_REST = new Set(['done_checked', 'done_claimed', 'checks_failed', 'failed', 'stopped']);
