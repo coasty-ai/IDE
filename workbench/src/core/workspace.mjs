@@ -668,6 +668,7 @@ const SAY = {
   identity: 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.',
   gitOld: 'Workbench needs git 2.38 or newer to merge.',
   changed: 'Its work changed since you looked. Have another look.',
+  reviewChanged: into => `What merging it would change in ${into} is no longer what you saw. Have another look.`,
   moved: into => `${into} changed since you looked. Have another look.`,
   nothing: into => `Its work is already in ${into}.`,
   ancestry: into => `It started from a commit that is no longer in ${into}, so merging it would bring in other work.`,
@@ -1014,9 +1015,9 @@ async function snap(run, root, folder, since, { review = true } = {}) {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
   };
-  const [{ tree, nested }, hidden, trees, into] = await Promise.all([
+  const [{ tree, nested }, hidden, trees, person] = await Promise.all([
     work(), hiddenByAgent(cwd, from, run), run(['rev-parse', `${head}^{tree}`, `${from}^{tree}`], { cwd }),
-    review ? headHolding(run, root, from) : null,
+    review ? personsHead(run, root, from) : null,
   ]);
   const [headTree, sinceTree] = trees.stdout.split('\n');
   if (!OID.test(headTree || '') || !OID.test(sinceTree || '')) throw plainError('Git could not read a commit it was given.');
@@ -1031,18 +1032,39 @@ async function snap(run, root, folder, since, { review = true } = {}) {
   const s = { head, headTree, tree, since: from, sinceTree, workId: `${head}:${tree}`, changed: tree !== sinceTree, left };
   if (!review) return s;
   // Nothing changed since `since`: nothing to merge, and nothing to show.
-  [s.fromTree, s.toTree] = s.changed ? await reviewTrees(run, root, s, into) : [sinceTree, tree];
+  const r = s.changed ? await reviewTrees(run, root, s, person.holds ? person.head : null) : { from: sinceTree, to: tree, merged: null };
+  [s.fromTree, s.toTree] = [r.from, r.to];
+  s.workId = cardId(s, person.head, r.merged);
   s.files = s.fromTree === s.toTree ? [] : await changesBetween(run, root, s.fromTree, s.toTree);
   return s;
 }
 
-/** The person's HEAD when it holds `since` (so a merge would not be refused for where the work started), else null. Never rejects. */
-async function headHolding(run, root, since) {
+/**
+ * A card's workId: `<head>:<tree>`, the agent folder's HEAD and the tree of its work set, then `:<into>:<merged>`, the
+ * review it was shown with: the person's HEAD when the review was made, and the tree that merging the work into it
+ * makes (empty when the review was not that merge: a conflict, a HEAD that does not hold `since`, or git could not
+ * say). A merge then lands exactly what the card showed, or is refused.
+ */
+const cardId = ({ head, tree }, into, merged) => `${head}:${tree}:${into || ''}:${merged || ''}`;
+
+/** What a workId says: { work: `<head>:<tree>`, into, merged } (into and merged '' when the review had none), or null. */
+function cardOf(workId) {
+  const parts = String(workId ?? '').split(':');
+  if (parts.length !== 2 && parts.length !== 4) return null;
+  if (!OID.test(parts[0]) || !OID.test(parts[1]) || parts.slice(2).some(p => p !== '' && !OID.test(p))) return null;
+  return { work: `${parts[0]}:${parts[1]}`, into: parts[2] ?? null, merged: parts[3] ?? null };
+}
+
+/**
+ * The person's HEAD (null when git cannot say), and whether it holds `since` (so a merge would not be refused for where
+ * the work started). Never rejects.
+ */
+async function personsHead(run, root, since) {
   try {
-    const into = await commitOf(root, 'HEAD', run);
-    return into && (await isAncestor(root, since, into, run)) ? into : null;
+    const head = await commitOf(root, 'HEAD', run);
+    return { head, holds: !!head && (await isAncestor(root, since, head, run)) };
   } catch {
-    return null;
+    return { head: null, holds: false };
   }
 }
 
@@ -1050,24 +1072,24 @@ async function headHolding(run, root, since) {
 const WORK_AS_IS_DATE = '@1000000000 +0000';
 
 /**
- * The two trees the review compares (see "Source control" above), as [from, to]: the person's HEAD `into` (null when it
- * does not hold `since`) and the tree merge-tree makes of it and the work; on a conflict, where the work's history and
- * HEAD last met and the work; otherwise `since` and the work. merge-tree takes commits, so work not yet committed is
- * given as a commit on top of the agent's HEAD that nothing points at, made by Workbench at a fixed date: the same work
- * makes the same commit each time. Never rejects.
+ * The two trees the review compares (see "Source control" above), as { from, to }, and `merged`, the tree merge-tree
+ * makes, when that is what the review shows (else null): the person's HEAD `into` (null when it does not hold `since`)
+ * and that merged tree; on a conflict, where the work's history and HEAD last met and the work; otherwise `since` and
+ * the work. merge-tree takes commits, so work not yet committed is given as a commit on top of the agent's HEAD that
+ * nothing points at, made by Workbench at a fixed date: the same work makes the same commit each time. Never rejects.
  */
 async function reviewTrees(run, root, { head, headTree, tree, sinceTree }, into) {
-  if (!into) return [sinceTree, tree];
+  if (!into) return { from: sinceTree, to: tree, merged: null };
   try {
     const work = tree === headTree ? head
       : await commitTree(run, root, tree, [head], 'The agent’s work as it is\n', WORKBENCH_IDENTITY, WORK_AS_IS_DATE);
     const merged = await mergeTrees(run, root, into, work);
-    if (merged.tree) return [await treeOf(root, into, run), merged.tree];
+    if (merged.tree) return { from: await treeOf(root, into, run), to: merged.tree, merged: merged.tree };
     const met = await run(['merge-base', into, head], { cwd: root, okCodes: [1] });
     const base = met.code === 0 ? met.stdout.trim() : '';
-    if (OID.test(base)) return [await treeOf(root, base, run), tree];
+    if (OID.test(base)) return { from: await treeOf(root, base, run), to: tree, merged: null };
   } catch {} // git could not say: the work against `since`, as below
-  return [sinceTree, tree];
+  return { from: sinceTree, to: tree, merged: null };
 }
 
 /**
@@ -1470,6 +1492,10 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   if (!atLeast(version, MIN_GIT)) throw new Refusal('git-old', SAY.gitOld);
   const seen = typeof exp.into === 'string' && exp.into ? exp.into : into;
   if (into !== exp.into || !intoHead || intoHead !== exp.intoHead) throw new Refusal('moved', SAY.moved(seen));
+  // The card's review was made against the person's HEAD as it was then (see cardId), read apart from intoHead: a
+  // folder that was on another branch then, and is back now, would land what the card did not show.
+  const card = cardOf(exp.workId);
+  if (card?.into && card.into !== intoHead) throw new Refusal('moved', SAY.moved(into));
   progress.into = into;
 
   // 2. The agent's work, read afresh (and, meanwhile, step 3's question).
@@ -1489,7 +1515,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   ]);
   if (agentBusy || unmerged) throw new Refusal('git', SAY.agentBusy); // `add -A` would take its conflict markers as work
   const s = unwrap(snapped);
-  if (s.workId !== exp.workId) throw new Refusal('changed', SAY.changed);
+  if (!card || card.into === null || card.work !== s.workId) throw new Refusal('changed', SAY.changed); // no review: none shown
   if (!s.changed) throw new Refusal('nothing', SAY.nothing(into));
 
   // 3. Its start must be in the person's branch, or the merge would bring in another branch's commits.
@@ -1528,6 +1554,10 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   if (already) throw new Refusal('nothing', SAY.nothing(into));
   const mt = unwrap(merged);
   if (mt.conflicts) throw new Refusal('conflict', SAY.conflict(into), mt.conflicts);
+  // The review made this same merge (W has the tree and the parent of the commit the review gave merge-tree), so it
+  // made this same tree, unless something it reads changed since: the person's attributes (a merge driver, merge=union)
+  // or merge settings. Or the review showed no merge at all (a conflict then, a HEAD that did not hold `since`).
+  if (mt.tree !== card.merged) throw new Refusal('changed', SAY.reviewChanged(into));
 
   // 7. The merge commit M: the person's HEAD first, W second. What it brings in is its first-parent diff, the files
   //    and counts the review showed.
@@ -1653,7 +1683,8 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
   if (entry && isFolder(target)) {
     const folder = await agentFolder(run, root, wsPath, b);
     const s = await snap(run, root, folder, since, { review: false });
-    if (s.workId !== exp.workId) throw new Refusal('changed', SAY.changed);
+    // The work the card showed. A workId from snapshotWork names the review of a merge too, which is not about what goes.
+    if (cardOf(exp.workId)?.work !== s.workId) throw new Refusal('changed', SAY.changed);
     const copy = s.tree === s.headTree ? s.head : await commitTree(run, root, s.tree, [s.head],
       `Thrown away: ${b}\n\nWorkbench-Agent: ${id}\nWorkbench-Kind: discarded\n`, (await identityAt(run, root)) || WORKBENCH_IDENTITY);
     await run(['update-ref', '--create-reflog', '-m', note, saved, copy], { cwd: root });
@@ -1685,7 +1716,7 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
   if ((await listWorktrees(root, run)).some(w => w.branch === b)) {
     throw new Refusal('git', `Its branch ${b} is checked out in another folder, so Workbench left it alone.`);
   }
-  if (exp.workId != null && exp.workId !== `${tip}:${await treeOf(root, tip, run)}`) throw new Refusal('changed', SAY.changed);
+  if (exp.workId != null && cardOf(exp.workId)?.work !== `${tip}:${await treeOf(root, tip, run)}`) throw new Refusal('changed', SAY.changed);
   await run(['update-ref', '--create-reflog', '-m', note, saved, tip], { cwd: root });
   progress.saved = saved;
   const gone = await run(['update-ref', '-m', note, '-d', `refs/heads/${b}`, tip], { cwd: root, okCodes: [1, 128] });

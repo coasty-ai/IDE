@@ -730,7 +730,8 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(s.head, head);
     assert.equal(s.since, t.ws.base);
     assert.match(s.tree, /^[0-9a-f]{40}$/);
-    assert.equal(s.workId, `${head}:${s.tree}`);
+    // The work, then the review: the person's HEAD (where the agent started, so the merge makes the work's own tree).
+    assert.equal(s.workId, `${head}:${s.tree}:${t.ws.base}:${s.tree}`);
     assert.equal(s.changed, true);
     assert.deepEqual(s.files, [
       { path: '.gitignore', status: 'modified', adds: 1, dels: 0 },
@@ -1300,6 +1301,53 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(git(t.root, 'log', '-1', '--format=%s'), 'Port the fix');
     const cache = path.join(t.root, '.git', 'rr-cache');
     assert.ok(fs.readdirSync(cache).some(id => fs.existsSync(path.join(cache, id, 'postimage'))), 'rerere recorded the settled file');
+  });
+
+  test('a merge card is bound to the review it showed: the person’s HEAD it was made against, and the tree that merge makes', async () => {
+    await inParallel([
+      async () => {
+        // The person's folder is on another branch while the review is made, and back on main when they say yes.
+        const t = await agentRepo();
+        write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+        write(t.w('b.txt'), 'b by the agent\n');
+        git(t.root, 'checkout', '-q', '-b', 'feature');
+        write(t.p('b.txt'), 'b by the agent\n'); // feature already holds the agent's change to b.txt
+        git(t.root, 'commit', '-q', '-am', 'feature');
+        git(t.root, 'checkout', '-q', 'main');
+        const info = await prepareRepo(t.root); // what the engine binds the card to: main, and its HEAD
+        git(t.root, 'checkout', '-q', 'feature');
+        const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+        git(t.root, 'checkout', '-q', 'main');
+        assert.deepEqual(s.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }], 'the card shows a.txt only');
+        const was = await everything(t);
+        assert.deepEqual(await mergeWork(mergeOpts(t, { workId: s.workId, into: info.branch, intoHead: info.head })),
+          { ok: false, why: 'moved', sentence: 'main changed since you looked. Have another look.' });
+        assert.deepEqual(await everything(t), was, 'nothing changed');
+      },
+      async () => {
+        // The person's own attributes change what the merge makes after the card was drawn: here a conflict, which the
+        // card showed as the agent's change from where the two last met, becomes a merge of both lines.
+        const t = await agentRepo();
+        write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+        write(t.p('a.txt'), 'one\nPERSON\nthree\n');
+        git(t.root, 'commit', '-q', '-am', 'person');
+        const head = headOf(t.root);
+        const { s, expect } = await proposal(t);
+        assert.deepEqual(s.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }]);
+        write(t.p('.gitattributes'), 'a.txt merge=union\n');
+        const person = folderPrint(t.root);
+        assert.deepEqual(await mergeWork(mergeOpts(t, expect)),
+          { ok: false, why: 'changed', sentence: 'What merging it would change in main is no longer what you saw. Have another look.' });
+        assert.deepEqual(folderPrint(t.root), person);
+        assert.equal(headOf(t.root), head);
+        // A new look shows what it would bring in now, and that is what lands.
+        const again = await proposal(t);
+        assert.deepEqual(again.s.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 0 }]);
+        const ok = await mergeWork(mergeOpts(t, again.expect));
+        assert.deepEqual(ok, { ok: true, into: 'main', merge: ok.merge, work: ok.work, files: 1, adds: 1, dels: 0 });
+        assert.equal(fs.readFileSync(t.p('a.txt'), 'utf8'), 'one\nPERSON\nAGENT\nthree\n');
+      },
+    ]);
   });
 
   test('mergeWork refuses a conflict and writes nothing into the person’s folder; the agent can then bring the branch in', async () => {
