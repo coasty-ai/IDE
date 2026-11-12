@@ -462,19 +462,19 @@ el.pages.addEventListener('click', e => {
  * with the caller.
  */
 async function act(b) {
-  const act = b.dataset.act;
+  const what = b.dataset.act;
   touch();
-  if (act === 'next') { stepQueue(1); moved(); render(); return; }
-  if (act === 'exact' || act === 'changed' || act === 'all' || act === 'readall') {
-    const k = act === 'readall' ? 'all' : act;
+  if (what === 'next') { stepQueue(1); moved(); render(); return; }
+  if (what === 'exact' || what === 'changed' || what === 'all' || what === 'readall') {
+    const k = what === 'readall' ? 'all' : what;
     open[k] = !open[k];
     renderNow();
-    el.pages.querySelector(`.page:not(.old) [data-act="${act}"]`)?.focus({ preventScroll: true });
+    el.pages.querySelector(`.page:not(.old) [data-act="${what}"]`)?.focus({ preventScroll: true });
     return;
   }
-  if (act === 'unpick') { S.focusId = null; S.pinId = null; moved(); render(); return; }
-  if (act === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
-  if (act === 'confirm') {
+  if (what === 'unpick') { S.focusId = null; S.pinId = null; moved(); render(); return; }
+  if (what === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
+  if (what === 'confirm') {
     const id = b.dataset.confirm;
     const c = S.confirm;
     if (!c || c.id !== id) { changed(); return; }
@@ -507,40 +507,40 @@ async function act(b) {
   if (b.dataset.state && a.state !== b.dataset.state) { changed(); return; }
   if (b.dataset.work != null && workKey(a) !== b.dataset.work) { changed(); return; }
   if (b.dataset.into != null && (S.meta.repo?.branch || '') !== b.dataset.into) { changed(); return; }
-  if (act === 'review') {
+  if (what === 'review') {
     // read-only: the git screen, on this agent's branch, with its diff. Nothing is sent.
     openGitOn(a.id, b);
     return;
   }
   try {
-    if (act === 'answer') {
+    if (what === 'answer') {
       busy(b);
       const r = await api.answer(a.id, b.dataset.ask, b.dataset.answer);
       answeredOnce();
       say(r.reply || `Told ${a.name}: ${b.dataset.answer}.`);
       if (S.focusId === a.id) S.focusId = null;
-    } else if (act === 'reply') {
+    } else if (what === 'reply') {
       startReply(a, b.dataset.mode || 'say', b.dataset.ask || null, b.dataset.state || a.state);
       render();
       return;
-    } else if (act === 'fix') {
+    } else if (what === 'fix') {
       busy(b);
       const r = await api.say(a.id, b.dataset.text);
       say(r.reply || `Sent to ${a.name}.`);
       if (S.focusId === a.id) S.focusId = null;
-    } else if (act === 'forget') {
+    } else if (what === 'forget') {
       // an agent from an earlier run: the engine asks first, with a card like a launch's
       busy(b);
       const r = await api.command('forget it', { focusId: a.id });
       if (r.confirm) S.confirm = r.confirm; else say(r.reply || '');
-    } else if (act === 'merge' || act === 'discard') {
+    } else if (what === 'merge' || what === 'discard') {
       // Merge (also "Merge anyway" and "Try again") and Throw it away never act by themselves: the engine answers with a
       // card in its own words, bound by id, and the person answers that. Its outcome then shows on this agent.
       busy(b);
-      const r = await (act === 'merge' ? api.merge(a.id, { state: b.dataset.state }) : api.discard(a.id, { state: b.dataset.state }));
+      const r = await (what === 'merge' ? api.merge(a.id, { state: b.dataset.state }) : api.discard(a.id, { state: b.dataset.state }));
       S.focusId = a.id;
       if (r.confirm) S.confirm = { ...r.confirm, agentId: a.id }; else say(r.reply || '');
-    } else if (act === 'looksgood') {
+    } else if (what === 'looksgood') {
       // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is
       busy(b);
       const r = await api.answer(a.id, null, 'Looks good');
@@ -549,19 +549,19 @@ async function act(b) {
       say(r.reply || '', 4000);
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
-    } else if (act === 'reviewed') {
+    } else if (what === 'reviewed') {
       markReviewed(a);
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
-    } else if (act === 'later') {
+    } else if (what === 'later') {
       setAside(a);
       if (S.focusId === a.id) S.focusId = null;
       say(`OK, ${a.name} can wait.`);
-    } else if (act === 'stop') {
+    } else if (what === 'stop') {
       busy(b);
       const r = await api.stop(a.id);
       say(r.reply || `Stopped ${a.name}.`);
-    } else if (act === 'parent') {
+    } else if (what === 'parent') {
       S.focusId = a.parentId;
     }
     // the person's own move: what it leads to shows at once, even with the pointer or the keyboard still in the core
@@ -576,17 +576,18 @@ async function act(b) {
 }
 
 /**
- * The git screen (builder D1's ui/gitscreen.js), opened on one agent's branch and its diff: "Review the changes", "See it
- * in git", or a reply that carries `review`. `opener` gets the keyboard back when the person comes back to the board.
- * Loaded when first asked for, so the board works without it.
+ * The git screen (builder D1's #gitScreen and ui/gitscreen.js), opened on one agent's branch and its diff: "Review the
+ * changes", "See it in git", or a reply that carries `review`. `opener` (the lid's link) should get the keyboard back
+ * when the person comes back to the board. Loaded when first asked for; a page without the git screen asks for nothing.
  */
 let gitScreen = null;
 function openGitOn(agentId, opener) {
+  if (!document.getElementById('gitScreen')) { say('The git screen is not part of this page yet.', 5000); return; }
   gitScreen ??= import('./gitscreen.js');
   gitScreen.then(m => {
     if (typeof m.openGit !== 'function') throw new Error('no openGit');
     m.openGit({ agentId, opener: opener || null });
-  }).catch(() => { gitScreen = null; say('The git screen is not available here.'); });
+  }).catch(err => { gitScreen = null; console.warn('The git screen did not open:', err); say('The git screen did not open.', 5000); });
 }
 
 el.core.addEventListener('pointerenter', () => { pointer.inCore = true; touch(); });

@@ -338,10 +338,13 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const changed = list => send('agents', list);
 
   // ---------------------------------------------------------------- D2: merge and throw-away
-  // POST /api/agents/:id/merge|discard { state } answer with the engine's card, or its refusal ({ ok: false, reply });
-  // /api/confirm/:id and a typed yes or no settle a card by its kind. mode.merge is what the next merge does: 'ok', or it
-  // fails and the agent keeps the problem ('conflict' | 'blocked' | 'moved' | 'identity' | 'detached' | 'busy' |
-  // 'ancestry' | 'git'), or 'changed' (refused when answered), or 'refuse' (the card itself is refused).
+  // As the engine does them (SPEC-source-control.md section 2; replies and words as src/core/engine.mjs gives them):
+  //   POST /api/agents/:id/merge|discard { state }  the engine's card ({ reply, confirm }), or a refusal ({ ok: false, reply })
+  //   POST /api/confirm/:id { go }                    settles a card by its kind; a merge or throw-away replies { reply, focusId }
+  //   POST /api/command                               "merge it", "throw it away" and the cards' own yes and no words
+  // mode.merge is what the next merge does: 'ok'; or it fails and the agent keeps the problem ('conflict' | 'blocked' |
+  // 'moved' | 'identity' | 'detached' | 'busy' | 'ancestry' | 'git'); or it fails without one ('changed' | 'nothing' |
+  // 'git-old' | 'gone'); or 'refuse': the card itself is refused, as while another merge runs.
   const AT_WORK = new Set(['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck']);
   let mergeSeq = 0;
   const newConfirm = (card, extra = {}) => {
@@ -349,51 +352,66 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     confirms.set(id, { id, ...card, ...extra });
     return { id, ...card };
   };
-  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, yes: c.yes, no: c.no, danger: c.danger });
+  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}) });
   const rootOf = a => (a && a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a);
-  const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
+  const joinAnd = xs => (xs.length <= 1 ? xs.join('') : xs.length === 2 ? `${xs[0]} and ${xs[1]}` : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
+  const unend = s => String(s || '').replace(/[.\s]+$/, '');
+  /** Why there is no work here to show, merge or throw away (the engine's _noWorkReply). */
+  const noWork = (a, verb) => {
+    const w = a.work;
+    if (w && w.thrownAway) return verb === 'throw away' ? `${a.name}’s work was already thrown away.` : `${a.name}’s work was thrown away, so there is nothing to ${verb}.`;
+    if (!w || !w.folder) return `Its folder is gone, so there is nothing to ${verb}.`;
+    return null;
+  };
   const mergeRefusal = a => {
-    const w = a.work, into = state.repo && state.repo.branch;
-    if (state.mode !== 'live') return 'This is the demo, so nothing is really merged.';
     if (a.parentId) return 'Helpers work in their agent’s folder. Merge the agent instead.';
     if (AT_WORK.has(a.state)) return `${a.name} is still working. Merge it when it is done.`;
-    if (!w || !w.folder || w.thrownAway) return 'Its folder is gone, so there is nothing to merge.';
+    if (state.mode !== 'live') return 'This is the demo, so nothing is really merged.';
+    const gone = noWork(a, 'merge');
+    if (gone) return gone;
+    const into = state.repo && state.repo.branch;
     if (!into) return 'Your folder is not on a branch, so there is nowhere to merge it.';
     if (state.repo.identity === false) return NO_IDENTITY;
     if (a.files && !a.files.changed) return `${a.name}’s work is already in ${into}.`;
     return null;
   };
   const discardRefusal = a => {
-    const w = a.work;
-    if (state.mode !== 'live') return 'This is the demo, so nothing is really thrown away.';
     if (a.parentId) return 'Helpers work in their agent’s folder. Throw away the agent’s work instead.';
-    if (!w || !w.folder || w.thrownAway) return 'Its folder is gone, so there is nothing to throw away.';
-    return null;
+    if (state.mode !== 'live') return 'This is the demo, so nothing is really thrown away.';
+    return noWork(a, 'throw away');
   };
-  // the engine's cards, in its words (section 2 of SPEC-source-control.md)
+  // what the engine counts with snapshotWork; the mock's stand-in when nothing counted the files (a stopped or failed agent)
+  const workSet = a => a.files || { changed: 2, adds: 9, dels: 3, list: [] };
+  /** The engine's merge card: the counts first, then what to know before it merges. */
   const mergeCard = a => {
-    const into = state.repo.branch, f = a.files || { changed: 0, adds: 0, dels: 0, list: [] }, list = f.list || [];
-    const parts = [];
-    if (f.changed) parts.push(`${plural(f.changed, 'file')}, +${f.adds} −${f.dels}.`);
-    parts.push(`Its work becomes a commit on its branch, joined into ${into} by a merge commit.`);
-    const failed = (a.checks?.results || []).filter(r => !r.ok).map(r => r.name);
-    if (failed.length) parts.push(`A check failed: ${failed.join(', ')}.`);
-    else if (!a.checks || a.checks.state === 'none') parts.push('Nothing checked its work.');
-    for (const r of a.rules?.broken || []) parts.push(`It broke a rule you set: ${r.say.replace(/[.\s]+$/, '')}.`);
-    const settings = list.map(x => x.path).find(p => p === 'workbench.json' || p === '.mcp.json' || p.startsWith('.claude/'));
-    if (settings) parts.push(`It changes ${settings}, which sets the checks for later agents.`);
-    const left = list.filter(x => x.ignored).length;
-    if (left) parts.push(`${plural(left, 'file')} ${left === 1 ? 'stays' : 'stay'} out: hidden by a .gitignore.`);
-    if (state.repo.dirty) parts.push(`Your ${plural(state.repo.dirty, 'uncommitted change')} ${state.repo.dirty === 1 ? 'stays' : 'stay'} as ${state.repo.dirty === 1 ? 'it is' : 'they are'}.`);
+    const into = state.repo.branch, f = workSet(a), list = f.list || [];
+    const parts = [`${f.changed} file${f.changed === 1 ? '' : 's'}, +${f.adds} −${f.dels}. Its work becomes a commit on its branch, joined into ${into} by a merge commit.`];
+    if (a.checks?.state === 'failed') {
+      const failed = (a.checks.results || []).filter(r => !r.ok).map(r => String(r.name));
+      parts.push(failed.length > 1 ? `${failed.length} checks failed: ${joinAnd(failed)}.` : `A check failed: ${failed[0] || 'one of its checks'}.`);
+    } else if (a.checks?.state !== 'passed') parts.push('Nothing checked its work.');
+    const says = (a.rules?.broken || []).map(r => unend(r.say)).filter(Boolean);
+    if (says.length === 1) parts.push(`It broke a rule you set: ${says[0]}.`);
+    else if (says.length > 1) parts.push(`It broke ${says.length} rules you set: ${joinAnd(says)}.`);
+    const paths = list.map(x => String(x.path || ''));
+    if (paths.includes('workbench.json')) parts.push('It changes workbench.json, which sets the checks for later agents.');
+    if (paths.some(p => /(^|\/)\.claude(\/|$)/i.test(p))) parts.push('It changes .claude/, which holds Claude Code’s settings for this repository.');
+    if (paths.some(p => /(^|\/)\.mcp\.json$/i.test(p))) parts.push('It changes .mcp.json, which can give Claude Code new tools here.');
+    const ignored = list.filter(x => x.ignored).length;
+    if (ignored) parts.push(`${ignored} file${ignored === 1 ? ' stays' : 's stay'} out: hidden by a .gitignore.`);
+    const d = state.repo.dirty || 0;
+    if (d) parts.push(`Your ${d} uncommitted change${d === 1 ? ' stays as it is' : 's stay as they are'}.`);
     return { kind: 'merge', sentence: `Merge ${a.name} into ${into}?`, detail: parts.join(' '), yes: 'Merge', no: 'Cancel', danger: false };
   };
+  /** The engine's throw-away card: what is deleted, and that a hidden copy is kept. It never has a default answer. */
   const discardCard = a => {
-    const n = a.files?.changed || 0;
-    const detail = `Its folder and its branch ${a.work.branch} are deleted${n ? `, with ${plural(n, 'changed file')}` : ''}. Workbench keeps a hidden copy in git.`
-      + (AT_WORK.has(a.state) ? ' It is still working: it will be stopped first.' : '');
-    return { kind: 'discard', sentence: `Throw away ${a.name}’s work?`, detail, yes: 'Throw it away', no: 'Keep it', danger: true };
+    const n = workSet(a).changed, w = a.work;
+    const parts = [`Its folder and ${w.branch ? `its branch ${w.branch}` : 'its branch'} are deleted, with ${n ? `${n} changed file${n === 1 ? '' : 's'}` : 'no changed files'}. Workbench keeps a hidden copy in git.`];
+    if (AT_WORK.has(a.state)) parts.push('It is still working: it will be stopped first.');
+    return { kind: 'discard', sentence: `Throw away ${a.name}’s work?`, detail: parts.join(' '), yes: 'Throw it away', no: 'Keep it', danger: true };
   };
-  const PROBLEM = {
+  // a merge git refused: the engine's sentence for each `why` (mergeSentence); PROBLEM ones stay on the agent
+  const WHY = {
     conflict: (a, into) => `${a.name}’s work does not merge cleanly into ${into}.`,
     blocked: (a, into, paths) => `Your own changes are in the way: ${paths.slice(0, 3).join(', ')}. Commit or put them aside, then merge again.`,
     moved: (a, into) => `${into} changed since you looked. Have another look.`,
@@ -402,7 +420,12 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     busy: () => 'Your folder is in the middle of a merge or rebase. Finish that first.',
     ancestry: (a, into) => `${a.name} started from a commit that is no longer in ${into}, so merging it would bring in other work.`,
     git: () => 'Git could not finish the merge. Nothing in your folder changed.',
+    changed: a => `${a.name}’s work changed since you looked. Have another look.`,
+    nothing: (a, into) => `${a.name}’s work is already in ${into}.`,
+    'git-old': () => 'Workbench needs git 2.38 or newer to merge.',
+    gone: () => 'Its folder is gone, so there is nothing to merge.',
   };
+  const PROBLEM = new Set(['conflict', 'blocked', 'moved', 'identity', 'detached', 'busy', 'ancestry', 'git']);
   /** Settle a card: a launch starts, a forget forgets, a merge merges (or fails as mode.merge says), a throw-away throws away. */
   const settle = (c, go) => {
     if (c.kind === 'forget') {
@@ -414,30 +437,33 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     if (c.kind !== 'merge' && c.kind !== 'discard') return go ? started(c) : { reply: 'OK, I won’t start it.' };
     if (!go) return { reply: c.kind === 'merge' ? 'OK, I won’t merge it.' : 'OK, I won’t throw it away.' };
     const a = state.agents.find(x => x.id === c.agentId);
-    if (!a || !a.work) return { ok: false, reply: 'That agent is no longer here.' };
+    if (!a) return { reply: 'I can’t find that agent.' };
+    // everything is checked again at the moment of acting
+    const no = c.kind === 'merge' ? mergeRefusal(a) : discardRefusal(a);
+    if (no) return { reply: no, focusId: a.id };
     const now = Date.now();
     if (c.kind === 'discard') {
       if (AT_WORK.has(a.state)) Object.assign(a, { state: 'stopped', endedAt: now, stateSince: now, ask: null });
       a.work = { ...a.work, branch: null, folder: false, problem: null, thrownAway: { at: now, saved: `refs/workbench/discarded/${a.id}` } };
       setTimeout(() => send('agents', [a]), 60);
-      return { ok: true, reply: `Threw away ${a.name}’s work. Its folder and branch are gone.` };
+      return { reply: `Threw away ${a.name}’s work. Its folder and branch are gone.`, focusId: a.id };
     }
     const into = state.repo.branch, how = mode.merge || 'ok';
-    if (how === 'changed') return { ok: false, reply: `${a.name}’s work changed since you looked. Have another look.` };
-    if (PROBLEM[how]) {
+    if (WHY[how]) {
       const paths = how === 'blocked' ? ['src/cart/total.ts', 'README.md'] : how === 'conflict' ? (a.files?.list || []).map(x => x.path).slice(0, 4) : [];
-      const sentence = PROBLEM[how](a, into, paths);
-      a.work = { ...a.work, problem: { why: how, sentence, paths, at: now } };
-      setTimeout(() => send('agents', [a]), 60);
-      return { ok: false, reply: sentence };
+      const sentence = WHY[how](a, into, paths);
+      if (PROBLEM.has(how)) a.work = { ...a.work, problem: { why: how, sentence, paths, at: now } };
+      else if (how === 'gone') a.work = { ...a.work, folder: false };
+      if (PROBLEM.has(how) || how === 'gone') setTimeout(() => send('agents', [a]), 60);
+      return { reply: sentence, focusId: a.id };
     }
-    const f = a.files || { changed: 0, adds: 0, dels: 0 };
+    const f = workSet(a);
     const merge = ((++mergeSeq).toString(16) + 'c0ffee5eed'.repeat(4)).slice(0, 40);
     a.work = { ...a.work, merged: { into, merge, at: now, files: f.changed || 0, adds: f.adds || 0, dels: f.dels || 0 }, problem: null };
     a.files = { changed: 0, adds: 0, dels: 0, list: [] };
     state.repo = { ...state.repo, head: merge.slice(0, 7) };
     setTimeout(() => { send('agents', [a]); send('repo', state.repo); }, 60);
-    return { ok: true, reply: `Merged ${a.name} into ${into}.`, focusId: a.id };
+    return { reply: `Merged ${a.name} into ${into}.`, focusId: a.id };
   };
 
   let stepTimer = null;
@@ -533,16 +559,19 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         setTimeout(() => changed([a]), 60);
         return reply({ ok: true, reply: `Stopped ${a.name}.` });
       }
-      // D2: merge and throw-away always ask first, with the engine's card
+      // D2: merge and throw-away always ask first, with the engine's card; refusals are { ok: false, reply }
       const wm = /^\/api\/agents\/([^/]+)\/(merge|discard)$/.exec(p);
       if (wm && req.method === 'POST') {
         const a = state.agents.find(x => x.id === decodeURIComponent(wm[1]));
-        if (!a) return reply({ ok: false, reply: 'There is no such agent.' });
+        if (!a) return reply({ ok: false, reply: 'I can’t find that agent.' });
+        const merge = wm[2] === 'merge', refusal = merge ? mergeRefusal : discardRefusal;
         if (mode.merge === 'refuse') return reply({ ok: false, reply: `${a.name} is being merged now.` });
+        const first = a.parentId || (merge && AT_WORK.has(a.state)) ? refusal(a) : null;
+        if (first) return reply({ ok: false, reply: first });
         if (json && json.state && json.state !== a.state) return reply({ ok: false, reply: 'That changed. Have another look.' });
-        const no = wm[2] === 'merge' ? mergeRefusal(a) : discardRefusal(a);
+        const no = refusal(a);
         if (no) return reply({ ok: false, reply: no });
-        const card = wm[2] === 'merge' ? mergeCard(a) : discardCard(a);
+        const card = merge ? mergeCard(a) : discardCard(a);
         return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }) });
       }
       const cm = /^\/api\/confirm\/([^/]+)$/.exec(p);
@@ -556,12 +585,18 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         const text = String(json?.text || '').trim();
         const shown = json?.confirmId ? confirms.get(json.confirmId) : null;
         if (shown) {
-          // a card's own words: "merge it" is a yes to a merge; a throw-away needs its own words, a bare "yes" is not enough
+          // a card's own words (src/core/commands.mjs): "merge it" is a yes to a merge; a throw-away needs its own words or
+          // "do it", and a bare "yes" is not enough; "forget it" cancels everywhere. Words not understood keep the card.
           const yes = shown.kind === 'discard' ? /^(throw it away|discard it|do it)$/i
-            : shown.kind === 'merge' ? /^(yes|ok|do it|go ahead|sure|merge it|merge|land it)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
+            : shown.kind === 'merge' ? /^(yes|ok|do it|go ahead|sure|merge it|merge|land it)$/i
+            : shown.kind === 'start' ? /^(yes|ok|do it|go ahead|sure|start it|launch it)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
           if (yes.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
-          if (/^(no|cancel|never mind|stop|forget it|keep it)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
-          if (shown.kind === 'discard' && /^(yes|yeah|yep|ok|okay|sure|go ahead)$/i.test(text)) return reply({ reply: 'To throw its work away, press “Throw it away” or say “throw it away”.', confirm: cardOf(shown) });
+          if (/^(no|cancel|never mind|stop|forget it|keep it|don.t)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', start: 'start it' }[shown.kind] || 'go ahead';
+          if (/^(yes|yeah|yep|ok|okay|sure|go ahead|merge it|land it|start it)$/i.test(text) || !/^(merge|land|throw|discard|scrap|forget|start|what)\b/i.test(text)) {
+            return reply({ reply: `I did not catch that. Say “do it” to ${verb}, or “cancel”.`, confirm: cardOf(shown) });
+          }
+          confirms.delete(shown.id);   // any other command withdraws the card on screen
         }
         if (/^(merge|land)\b|^bring its changes in\b/i.test(text) || /^(throw (it|its work|its changes) away|throw away|discard|scrap)\b/i.test(text)) {
           const merge = /^(merge|land|bring)/i.test(text);
