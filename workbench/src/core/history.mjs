@@ -127,6 +127,7 @@ function cleanWork(w) {
       why: p.why,
       sentence: str(p.sentence, 600) || '',
       paths: (Array.isArray(p.paths) ? p.paths : []).filter(x => typeof x === 'string' && x).slice(0, PATHS_MAX).map(x => x.slice(0, 500)),
+      into: branchName(p.into),
       at: num(p.at),
     }
     : null;

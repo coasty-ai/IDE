@@ -75,6 +75,9 @@ async function setup(t, extraEnv = {}, { config = null, claudeSettings = null } 
     CLAUDE_CONFIG_DIR: '', // Claude Code's own folders are then under this home, for the engine and the fake alike
     ...extraEnv,
   };
+  // Run by an agent (npm test while it works on Workbench itself), this process has the variables every agent gets.
+  // Workbench refuses to start real agents with them, so the CLI started here must not inherit them.
+  for (const k of ['WORKBENCH_AGENT_ID', 'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN']) if (!(k in extraEnv)) delete env[k];
   const proc = spawn(process.execPath, [BIN, '--repo', repo, '--no-open', '--port', '0', '--budget', '0.5'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
   proc.stdout.on('data', (d) => { log += d; });
@@ -536,4 +539,111 @@ test('history: an earlier agent whose folder was removed is shown, and refuses t
   assert.equal(said.body.ok, false);
   assert.match(said.body.reply, /cannot continue\. Its folder is gone/);
   await w2.stop();
+});
+
+// ---- Source control, live: merge an agent's work into the person's branch, and throw an agent's work away ----
+
+/** A person's git identity for the engine (it never uses git's guessed one): a global config file of its own. */
+function withIdentity(t) {
+  const d = realpathSync(mkdtempSync(path.join(tmpdir(), 'wb-gitid-')));
+  const file = path.join(d, 'gitconfig');
+  writeFileSync(file, '[user]\n\tname = Person Testing\n\temail = person@example.invalid\n');
+  t.after(() => rmSync(d, { recursive: true, force: true }));
+  return { GIT_CONFIG_GLOBAL: file };
+}
+
+/** The recorded run, start to finish: the helper's and the agent's commands allowed; it ends "done" with one new file. */
+async function runToDone(w) {
+  const id = await startAgent(w);
+  const { helper } = await helperAsks(w);
+  assert.equal((await w.post(`/api/agents/${helper.id}/answer`, { askId: helper.ask.id, answer: 'Allow' })).status, 200);
+  const asking = await until('the agent to ask for an OK', async () => (await w.agents()).find((a) => a.id === id && a.state === 'needs_ok' && a.ask));
+  assert.equal((await w.post(`/api/agents/${id}/answer`, { askId: asking.ask.id, answer: 'Allow' })).status, 200);
+  const done = await until('the agent to finish', async () => (await w.agents()).find((a) => a.id === id && a.state === 'done_claimed'));
+  return { id, done, workspace: done.workspace };
+}
+
+const gitOut = (repo, ...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' }).trim();
+
+test('merge, live: a finished agent’s work joins the person’s branch with a merge commit; their own changes stay', async (t) => {
+  const w = await setup(t, withIdentity(t));
+  const { id, done, workspace } = await runToDone(w);
+  const branch = gitOut(w.repo, 'symbolic-ref', '--short', 'HEAD');
+  const before = gitOut(w.repo, 'rev-parse', 'HEAD');
+  // The person's own work in progress: an edit to a tracked file and a file git does not know yet.
+  writeFileSync(path.join(w.repo, 'README.md'), '# greet\n\nNotes the person is writing.\n');
+  writeFileSync(path.join(w.repo, 'my-notes.txt'), 'mine, not committed\n');
+  assert.equal(done.work?.branch?.startsWith('workbench/'), true, JSON.stringify(done.work));
+
+  // 1. Merge asks first, with the branch it would go into.
+  const asked = await w.post(`/api/agents/${id}/merge`, { state: done.state });
+  assert.equal(asked.status, 200, JSON.stringify(asked.body));
+  assert.equal(asked.body.confirm?.kind, 'merge', JSON.stringify(asked.body));
+  assert.equal(asked.body.confirm.yes, 'Merge');
+  assert.equal(asked.body.confirm.sentence, `Merge ${done.name} into ${branch}?`);
+  assert.equal(gitOut(w.repo, 'rev-parse', 'HEAD'), before, 'nothing is merged before the yes');
+
+  // 2. Yes merges it.
+  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  assert.equal(go.status, 200, JSON.stringify(go.body));
+  assert.match(go.body.reply, new RegExp(`^Merged ${done.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} into ${branch}\\.`));
+
+  // The person's HEAD is a merge commit: first parent their old HEAD, second the agent's work commit.
+  const parents = gitOut(w.repo, 'rev-list', '--parents', '-n', '1', 'HEAD').split(' ').slice(1);
+  assert.equal(parents.length, 2, 'a merge commit has two parents');
+  assert.equal(parents[0], before);
+  assert.match(gitOut(w.repo, 'log', '-1', '--format=%B', parents[1]), new RegExp(`Workbench-Agent: ${id}`));
+  assert.match(gitOut(w.repo, 'log', '-1', '--format=%B', 'HEAD'), /Workbench-Kind: merge/);
+  assert.equal(gitOut(w.repo, 'log', '-1', '--format=%an <%ae>', 'HEAD'), 'Person Testing <person@example.invalid>');
+  assert.equal(readFileSync(path.join(w.repo, MARKER), 'utf8'), '', 'the agent’s new file is in the person’s folder');
+  // Their own changes are exactly as they were.
+  assert.equal(readFileSync(path.join(w.repo, 'README.md'), 'utf8'), '# greet\n\nNotes the person is writing.\n');
+  assert.equal(readFileSync(path.join(w.repo, 'my-notes.txt'), 'utf8'), 'mine, not committed\n');
+  assert.equal(gitOut(w.repo, 'diff', '--name-only'), 'README.md', 'their edit is still an uncommitted change');
+
+  const after = await until('the view to say it is merged', async () => (await w.agents()).find((a) => a.id === id && a.work?.merged));
+  assert.equal(after.work.merged.into, branch);
+  assert.equal(after.work.problem, null);
+  assert.equal(after.files?.changed, 0, 'nothing is left unmerged');
+
+  // 3. A second merge has nothing new to take.
+  const again = await w.post(`/api/agents/${id}/merge`, { state: after.state });
+  assert.equal(again.body.confirm, undefined, JSON.stringify(again.body));
+  assert.equal(again.body.ok, false);
+
+  // 4. At shutdown the folder holds nothing that is not merged, so it goes, with its branch.
+  await stopEngine(w);
+  assert.equal(existsSync(workspace), false, `the merged agent’s folder is tidied away\n${w.log()}`);
+  assert.equal(gitOut(w.repo, 'branch', '--list', done.work.branch), '', 'and its branch');
+});
+
+test('throw away, live: the agent’s folder and branch go, a hidden copy stays, the person’s branch is untouched', async (t) => {
+  const w = await setup(t, withIdentity(t));
+  const { id, done, workspace } = await runToDone(w);
+  const before = gitOut(w.repo, 'rev-parse', 'HEAD');
+  const agentBranch = done.work.branch;
+  assert.equal(gitOut(w.repo, 'branch', '--list', agentBranch).replace(/^[*+ ]+/, ''), agentBranch);
+
+  const asked = await w.post(`/api/agents/${id}/discard`, { state: done.state });
+  assert.equal(asked.status, 200, JSON.stringify(asked.body));
+  assert.equal(asked.body.confirm?.kind, 'discard', JSON.stringify(asked.body));
+  assert.equal(asked.body.confirm.danger, true);
+  assert.equal(asked.body.confirm.yes, 'Throw it away');
+  assert.equal(existsSync(workspace), true, 'nothing goes before the yes');
+
+  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  assert.equal(go.status, 200, JSON.stringify(go.body));
+  assert.match(go.body.reply, /Its folder and branch are gone\./);
+  assert.equal(existsSync(workspace), false, 'the folder is gone');
+  assert.equal(gitOut(w.repo, 'branch', '--list', agentBranch), '', 'the branch is gone');
+  assert.equal(gitOut(w.repo, 'rev-parse', 'HEAD'), before, 'the person’s branch is untouched');
+  assert.equal(existsSync(path.join(w.repo, MARKER)), false);
+  // The hidden copy keeps what the agent made.
+  assert.match(gitOut(w.repo, 'ls-tree', '--name-only', `refs/workbench/discarded/${id}`), new RegExp(`^${MARKER.replace('.', '\\.')}$`, 'm'));
+
+  const view = await until('the view to say it was thrown away', async () => (await w.agents()).find((a) => a.id === id && a.work?.thrownAway));
+  assert.equal(view.work.folder, false);
+  const follow = await w.post(`/api/agents/${id}/say`, { text: 'one more thing' });
+  assert.equal(follow.body.ok, false, 'a thrown-away agent takes no more messages');
+  await stopEngine(w);
 });

@@ -2518,7 +2518,7 @@ export class Engine extends EventEmitter {
     if (why === 'gone') {
       this._markFolderGone(v);
     } else if (PROBLEM_WHYS.has(why)) {
-      this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), problem: { why, sentence, paths: paths.slice(0, 50), at: this.now() } } }]);
+      this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), problem: { why, sentence, paths: paths.slice(0, 50), into: c.expect.into || null, at: this.now() } } }]);
     }
     return { reply: sentence, focusId: v.id };
   }
@@ -2826,7 +2826,7 @@ export class Engine extends EventEmitter {
         const paths = (Array.isArray(res.paths) ? res.paths : []).filter(p => typeof p === 'string' && p);
         const sentence = mergeSentence(res.why, { name: cur.name, into, paths });
         if (!workRecorded && PROBLEM_WHYS.has(res.why)) {
-          this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, into), problem: { why: res.why, sentence, paths, at: this.now() } } }]);
+          this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, into), problem: { why: res.why, sentence, paths, into: into || null, at: this.now() } } }]);
         }
         return { reply: (typeof res.reply === 'string' && res.reply.trim()) || `${sentence} ${DEMO_MERGED}`, focusId: cur.id };
       }

@@ -68,6 +68,9 @@ async function setup(t, extraEnv = {}, { config = null } = {}) {
     CLAUDE_CONFIG_DIR: '', // Claude Code's own folders are then under this home, for the engine and the fake alike
     ...extraEnv,
   };
+  // Run by an agent (npm test while it works on Workbench itself), this process has the variables every agent gets.
+  // Workbench refuses to start real agents with them, so the CLI started here must not inherit them.
+  for (const k of ['WORKBENCH_AGENT_ID', 'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN']) if (!(k in extraEnv)) delete env[k];
   const proc = spawn(process.execPath, [BIN, '--repo', repo, '--no-open', '--port', '0', '--budget', '0.5'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
   proc.stdout.on('data', (d) => { log += d; });
@@ -228,7 +231,7 @@ test('"start Claude and Codex on …" gives two agents, one of each', async (t) 
 test('a Codex that fails to sign in shows a plain error', async (t) => {
   const w = await setup(t, { FAKE_CODEX_MODE: 'fail-first' });
   const { ids } = await launch(w, 'start Codex on the checkout bug');
-  const failed = await until('the agent to fail', async () => { const a = await view(w, ids[0]); return a?.state === 'failed' ? a : null; });
+  const failed = await until('the agent to fail', async () => { const a = await view(w, ids[0]); return a?.state === 'failed' && a.error ? a : null; }); // the error comes with agent.ended, a moment after the state
   assert.ok(failed.error && failed.error.length < 400, failed.error);
   assert.doesNotMatch(String(failed.stateReason || failed.error), /\{"error"|bearer/i);
   await stopEngine(w);
