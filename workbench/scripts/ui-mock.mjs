@@ -12,7 +12,8 @@
 //                                  auth: "ok" | "bad"; holdMs: hold each new stream's snapshot; down: refuse streams;
 //                                  steps: true to make working agents take steps; merge: what the next merge does,
 //                                  "ok" | "conflict" | "blocked" | "moved" | "identity" | "detached" | "busy" |
-//                                  "ancestry" | "git" | "changed" | "refuse" (see the D2 block in startMock)
+//                                  "ancestry" | "git" | "changed" | "nothing" | "git-old" | "gone" | "refuse"
+//                                  (see the D2 block in startMock)
 //   GET  /ctl/log                  every request the page sent to /api, with its body
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 import http from 'node:http';

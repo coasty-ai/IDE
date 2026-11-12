@@ -224,7 +224,7 @@ export function lidView(f, o = {}) {
       // the person threw its work away (a hidden copy stays in git): nothing more to do with it here
       sentence = `${a.name}’s work was thrown away.`;
       if (fs.meta) msg += metaP(esc('Workbench keeps a hidden copy in git.'));
-      acts = big('Dismiss', { act: 'reviewed', ...st, work: wk }, true) + (earlierRoot ? big('Forget', { act: 'forget', ...st }) : '');
+      acts = big('Dismiss', { act: 'reviewed', ...st, work: wk }, true);
       leaves = true;
       break;
     }
