@@ -949,6 +949,29 @@ test('a bare yes is not enough to throw work away, and it never falls through to
   }
 });
 
+test('on a throw-away card "do" counts only as "do it" or "do that": a "do" cut short is no answer', () => {
+  // A "do" on its own is a yes word, and the first word of "do not throw it away": said alone, or cut short by
+  // speech-to-text, it keeps the card, as a "throw" cut short does.
+  for (const text of ['do', 'Do.', 'sure do', 'yes do', 'yes, do.', 'you do', 'okay do', 'go do', 'do please', 'do so', 'well do']) {
+    assert.deepEqual(parseCommand(text, CTX.pendingDiscard), unknown(text), text);
+    assert.deepEqual(parseCommand(text, CTX.pendingDiscardOnPermission), unknown(text), `${text} (permission behind the card)`);
+    assert.deepEqual(parseCommand(text, DOG.dogPendingDiscard), unknown(text), `${text} [dogPendingDiscard]`);
+    // On every other card it is a yes, as before.
+    for (const ctxName of ['pending', 'pendingStart', 'pendingForget', 'pendingMerge']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), yes, `${text} [${ctxName}]`);
+    }
+  }
+  checkRows([
+    ['do it', 'pendingDiscard', yes], ['Do it.', 'pendingDiscard', yes], ['do that', 'pendingDiscard', yes], ['DO IT', 'pendingDiscard', yes],
+    ['yes do it', 'pendingDiscard', yes], ['yes, do it', 'pendingDiscard', yes], ['just do it', 'pendingDiscard', yes],
+    ['please do it', 'pendingDiscard', yes], ['do it please', 'pendingDiscard', yes], ['do it now', 'pendingDiscard', yes],
+    ['go ahead and do it', 'pendingDiscard', yes], ['okay do it', 'pendingDiscard', yes], ['do it', 'pendingDiscardOnPermission', yes],
+    ['do not throw it away', 'pendingDiscard', no],
+    ['do it?', 'pendingDiscard', unknown('do it?')], ['do it is that right', 'pendingDiscard', unknown('do it is that right')],
+  ]);
+  for (const text of ['do not', 'do not do it', "don't do it"]) assert.notDeepEqual(parseCommand(text, CTX.pendingDiscard), yes, text);
+});
+
 test('"stop an agent to fix the login" is a launch, not a stop of "Login fix"; "forget an agent …" forgets nothing', () => {
   const world = { agents: [
     { id: 'aa1111', name: 'Login fix', task: 'Fix the login page error', state: 'working', kind: 'agent' },

@@ -451,9 +451,11 @@ function confirmReply(toks, kind, c) {
     if (yesAsked(words)) return 'asks';
     if (named) return 'keep';
     // On a throw-away card a bare "yes" is not enough: only its own words ("throw it away", "discard it") or "do it".
-    // "throw" counts only with its "away" or "out": a "throw" cut short is no answer.
+    // "throw" counts only with its "away" or "out", and "do" only with its "it" or "that": a "throw" or a "do" cut short
+    // ("do", "sure do", "yes do") is no answer.
     if (kind === 'discard') {
-      const explicit = ws.some(w => w === 'do' || (own.includes(w) && w !== 'throw')) || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
+      const explicit = ws.some((w, i) => (w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || (own.includes(w) && w !== 'throw'))
+        || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
       if (!explicit) return 'keep';
     }
     return true;
