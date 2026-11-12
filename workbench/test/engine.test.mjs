@@ -2998,6 +2998,53 @@ test('merge and throw away by words: the card is for the agent the words named, 
   await t.engine.shutdown();
 });
 
+test('command: a look at an agent’s changes is read-only, so the merge or throw-away card on screen stays, and its yes still answers it', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  const b = await doneAgent(t, { task: 'Fix the tax rounding' }, 'I fixed the rounding.');
+  t.deps.commands.intent = (text, c) => ({
+    'merge it': { kind: 'merge', agentId: c.focusId },
+    'throw it away': { kind: 'discard', agentId: c.focusId },
+    'show me the changes': { kind: 'changes', agentId: c.pendingConfirm?.agentId ?? c.focusId },
+    'what did fix tax rounding change': { kind: 'changes', agentId: b.id },
+    'what did the twins change': { kind: 'changes', agentId: null },
+    yes: { kind: 'confirm', go: true },
+  })[text] || null;
+  const card = await t.engine.command('merge it', { focusId: a.id });
+  assert.equal(card.confirm.kind, 'merge');
+  const before = t.notices.length;
+  // The changes of the agent on the card: the page opens them, and the card is still the one on screen.
+  assert.deepEqual(await t.engine.command('show me the changes', { confirmId: card.confirm.id }),
+    { reply: 'Here is what Fix cart total changed.', review: a.id, focusId: a.id, confirm: card.confirm });
+  // Another agent's changes, or words that name no one, leave it too.
+  assert.deepEqual(await t.engine.command('what did fix tax rounding change', { confirmId: card.confirm.id }),
+    { reply: 'Here is what Fix tax rounding changed.', review: b.id, focusId: b.id, confirm: card.confirm });
+  assert.deepEqual(await t.engine.command('what did the twins change', { confirmId: card.confirm.id }),
+    { reply: 'Which one do you mean? Pick it on the board, then ask again.', confirm: card.confirm });
+  assert.equal(t.notices.length, before, 'a card that stays is not talked over');
+  assert.equal(t.calls.mergeWork.length, 0);
+  assert.deepEqual(await t.engine.command('yes', { confirmId: card.confirm.id }), { reply: 'Merged Fix cart total into main.', focusId: a.id });
+  // A throw-away card stays the same way.
+  const away = await t.engine.command('throw it away', { focusId: b.id });
+  assert.equal(away.confirm.kind, 'discard');
+  const look = await t.engine.command('show me the changes', { confirmId: away.confirm.id });
+  assert.deepEqual([look.review, look.confirm], [b.id, away.confirm]);
+  assert.match((await t.engine.confirm(away.confirm.id, true)).reply, /^Threw away Fix tax rounding’s work\./);
+  await t.engine.shutdown();
+});
+
+test('command (real parser): asking what an agent changed while its merge card shows keeps the card, and "yes" then merges', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.engine.deps.commands = commands;
+  const a = await doneAgent(t);
+  const card = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
+  assert.deepEqual(await t.engine.command('what did fix cart total change', { confirmId: card.confirm.id }),
+    { reply: 'Here is what Fix cart total changed.', review: a.id, focusId: a.id, confirm: card.confirm });
+  assert.equal(t.claude.runners.length, 1, 'nothing was launched');
+  assert.deepEqual(await t.engine.command('yes', { confirmId: card.confirm.id }), { reply: 'Merged Fix cart total into main.', focusId: a.id });
+  await t.engine.shutdown();
+});
+
 test('confirm: a card of a kind the engine does not know is never taken for a launch', async () => {
   const t = live();
   const at = Date.now();

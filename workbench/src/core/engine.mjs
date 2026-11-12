@@ -2985,8 +2985,11 @@ export class Engine extends EventEmitter {
           ? { reply: GONE }
           : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
       } else {
-        // Any other command withdraws the card on screen, without a notice: the page lets go of it.
-        if (shown && !shown.gone && intent.kind !== 'confirm') this.confirms.delete(shown.id);
+        // Any other command withdraws the card on screen, without a notice: the page lets go of it. A look at an
+        // agent's changes does not: it is read-only, so the card keeps waiting, and the reply carries it, as for words
+        // not caught, so the page keeps it too ("show me the changes" before saying yes to a merge).
+        const keep = intent.kind === 'changes' && shown && !shown.gone;
+        if (shown && !shown.gone && intent.kind !== 'confirm' && !keep) this.confirms.delete(shown.id);
         try {
           // With a card on screen, no ask was: the centre shows one thing at a time.
           out = await this._runIntent(intent, { focusId, askId: shown ? null : askId, shown });
@@ -2994,6 +2997,8 @@ export class Engine extends EventEmitter {
           this.log.error('A command failed:', err);
           out = { reply: err?.plain ? err.message : 'Something went wrong while doing that. The details are in the log.' };
         }
+        const kept = keep ? this.confirms.get(shown.id) : null;
+        if (kept) out = { ...out, confirm: this._card(kept) };
       }
     }
     if (out.reply && !out.confirm) this._notice(out.reply, out.focusId || null);
