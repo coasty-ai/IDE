@@ -2,9 +2,26 @@
 
 const PICTURES = { '\n': '⏎', '\t': '⇥', '\r': '␍', '\x7f': '␡' };
 
-/** Control characters shown as visible symbols, so a command can never hide a line break or a tab. */
+/**
+ * Control characters shown as visible symbols, so a command, a path or a branch name can never hide a line break or a
+ * tab. Bidirectional overrides (U+202A to U+202E, U+2066 to U+2069) and zero-width characters (U+200B to U+200F,
+ * U+FEFF) are shown by their code ("[U+202E]"), so text can never read in an order other than the one it is in.
+ */
 export function visibleControls(s) {
-  return String(s ?? '').replace(/[\x00-\x1f\x7f]/g, c => PICTURES[c] || String.fromCharCode(0x2400 + c.charCodeAt(0)));
+  return String(s ?? '')
+    .replace(/[\x00-\x1f\x7f]/g, c => PICTURES[c] || String.fromCharCode(0x2400 + c.charCodeAt(0)))
+    .replace(/[​-‏‪-‮⁦-⁩﻿]/g, c => `[U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}]`);
+}
+
+/**
+ * A name cut in the middle to at most `max` characters, with "…" where it was cut, so both ends stay readable
+ * ("workbenc…-a1b2c3"). Used for branch names on buttons; the whole name goes in the button's title.
+ */
+export function cutMiddle(s, max = 16) {
+  const t = Array.from(String(s ?? ''));
+  if (t.length <= max) return t.join('');
+  const keep = Math.max(1, max - 1), head = Math.ceil(keep / 2);
+  return t.slice(0, head).join('') + '…' + t.slice(t.length - (keep - head)).join('');
 }
 
 /**

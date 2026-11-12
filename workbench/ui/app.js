@@ -5,12 +5,12 @@ import { debugSwitches } from './address.js';
 import { money, clip } from '/shared/format.mjs';
 import { initToken, hasToken, whenRefused, api, connect } from './api.js';
 import { linkState, cannotSend } from './link.js';
-import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName } from './model.js';
+import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName, workKey } from './model.js';
 import { boardModel, splitEarlier, trayWords, agoText } from './boardmodel.js';
 import { Lanes, denseLanes } from './lanes.js';
 import { sizeClass, frame, layoutBoard, maxDenseRows } from './layout.js';
 import { Board } from './board.js';
-import { lidView, tickSince } from './focus.js';
+import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
 import { THEME_NAMES, DETAIL_NAMES, loadPrefs, savePref, pageCommand } from './prefs.js';
@@ -119,7 +119,8 @@ function engaged() {
   return pointer.inCore || (ae && ae !== document.body && el.core.contains(ae) && ae !== el.say) || !!el.say.value || voice.listening || !!S.reply;
 }
 
-const keyOf = f => (f.confirm ? 'confirm:' + f.confirm.id : f.empty ? 'empty' : `${f.agent.id}|${f.agent.state}|${f.agent.ask ? f.agent.ask.id : ''}`);
+// the lid's key (focus.js): a confirm card, nothing, or an agent in a state with an ask and, for its work, where that went
+const keyOf = f => focusKey(f);
 
 // The hold resists only what arrives on the stream. The person's own moves (a lid button, → and ←, a typed "next", picking
 // a chip or a row, the reply to their own command) show what they asked for at once: the next render lets go once.
@@ -138,7 +139,8 @@ function shownFocus() {
   if (held.confirm) return S.confirm && S.confirm.id === held.confirm.id ? { f: { confirm: S.confirm }, also: also(null) } : { f: want, also: false };
   if (held.empty) return { f: want, also: false };
   const a = S.agents.get(held.agent.id);
-  if (!a || a.state !== held.agent.state || (a.ask?.id || '') !== (held.agent.ask?.id || '')) return { f: want, also: false };
+  // the held item itself changed (its state, its ask, where its work went): show it as it is now
+  if (!a || keyOf({ agent: a }) !== keyOf({ agent: held.agent })) return { f: want, also: false };
   const q = needsQueue(), i = q.findIndex(x => x.id === a.id);
   const f = i >= 0 ? { agent: a, index: i, total: q.length, picked: held.picked } : { ...held, agent: a };
   return { f, also: also(a.id) };
@@ -420,7 +422,7 @@ function renderCard(quiet = false) {
 
 // ---------------------------------------------------------------- answering what the core shows
 const changed = () => { say('That changed. Have another look.', 5000); render(); };
-const GUARDED = new Set(['answer', 'looksgood', 'fix', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick', 'forget']);
+const GUARDED = new Set(['answer', 'looksgood', 'fix', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick', 'forget', 'merge', 'discard', 'review']);
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 /**
  * The engine says where to look next (the asker after a refused answer, a stopped agent, a new one): follow it. An agent
@@ -444,12 +446,23 @@ function retry(b) {
   if (gaveFocus.has(b)) { gaveFocus.delete(b); if (b.isConnected) b.focus({ preventScroll: true }); }
 }
 
-el.pages.addEventListener('click', async e => {
+el.pages.addEventListener('click', e => {
   const b = e.target.closest('[data-act]');
   if (!b || b.disabled || b.closest('.page.old, .page[data-hidden]')) return;
-  const act = b.dataset.act;
   // clicks are ignored while the core swaps and for a moment after, so they cannot land on something new
-  if (GUARDED.has(act) && performance.now() < armedUntil) return;
+  if (GUARDED.has(b.dataset.act) && performance.now() < armedUntil) return;
+  act(b);
+});
+
+/**
+ * What a lid button does. It acts only on what it was drawn for: the agent (data-agent), its ask (data-ask), the state it
+ * was in (data-state), where its work was (data-work) and the branch a merge was offered into (data-into); anything
+ * else says "That changed. Have another look." and sends nothing. Buttons outside the lid that carry the same data-*
+ * (the git screen's detail: Merge, Throw it away, a card's yes and no) can be handed to this too; the swap guard stays
+ * with the caller.
+ */
+async function act(b) {
+  const act = b.dataset.act;
   touch();
   if (act === 'next') { stepQueue(1); moved(); render(); return; }
   if (act === 'exact' || act === 'changed' || act === 'all' || act === 'readall') {
@@ -463,15 +476,28 @@ el.pages.addEventListener('click', async e => {
   if (act === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
   if (act === 'confirm') {
     const id = b.dataset.confirm;
-    if (!S.confirm || S.confirm.id !== id) { changed(); return; }
+    const c = S.confirm;
+    if (!c || c.id !== id) { changed(); return; }
+    const go = b.dataset.go === '1';
     busy(b);
+    // the outcome of a merge or a throw-away shows on that agent: the engine's reply names it (focusId), or the page
+    // remembers which agent's button asked for the card
+    const after = r => { lookAt(r && r.focusId); if (go && !(r && r.focusId) && (c.kind === 'merge' || c.kind === 'discard')) lookAt(c.agentId); };
     try {
-      const r = await api.confirm(id, b.dataset.go === '1');
+      const r = await api.confirm(id, go);
       if (S.confirm && S.confirm.id === id) S.confirm = null;
       say(r.reply || '');
-      lookAt(r.focusId);
+      after(r);
       moved();
-    } catch (err) { retry(b); say(err.message); }
+    } catch (err) {
+      if (err.refused && (c.kind === 'merge' || c.kind === 'discard')) {
+        // the engine took the card and said no (a merge git refused: the reason stays on the agent until it clears)
+        if (S.confirm && S.confirm.id === id) S.confirm = null;
+        say(err.message);
+        after(null);
+        moved();
+      } else { retry(b); say(err.message); }
+    }
     render();
     return;
   }
@@ -479,6 +505,13 @@ el.pages.addEventListener('click', async e => {
   if (!a) { changed(); return; }
   if (b.dataset.ask && (!a.ask || a.ask.id !== b.dataset.ask)) { changed(); return; }
   if (b.dataset.state && a.state !== b.dataset.state) { changed(); return; }
+  if (b.dataset.work != null && workKey(a) !== b.dataset.work) { changed(); return; }
+  if (b.dataset.into != null && (S.meta.repo?.branch || '') !== b.dataset.into) { changed(); return; }
+  if (act === 'review') {
+    // read-only: the git screen, on this agent's branch, with its diff. Nothing is sent.
+    openGitOn(a.id, b);
+    return;
+  }
   try {
     if (act === 'answer') {
       busy(b);
@@ -500,6 +533,13 @@ el.pages.addEventListener('click', async e => {
       busy(b);
       const r = await api.command('forget it', { focusId: a.id });
       if (r.confirm) S.confirm = r.confirm; else say(r.reply || '');
+    } else if (act === 'merge' || act === 'discard') {
+      // Merge (also "Merge anyway" and "Try again") and Throw it away never act by themselves: the engine answers with a
+      // card in its own words, bound by id, and the person answers that. Its outcome then shows on this agent.
+      busy(b);
+      const r = await (act === 'merge' ? api.merge(a.id, { state: b.dataset.state }) : api.discard(a.id, { state: b.dataset.state }));
+      S.focusId = a.id;
+      if (r.confirm) S.confirm = { ...r.confirm, agentId: a.id }; else say(r.reply || '');
     } else if (act === 'looksgood') {
       // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is
       busy(b);
@@ -533,7 +573,21 @@ el.pages.addEventListener('click', async e => {
     say(err.message);
   }
   render();
-});
+}
+
+/**
+ * The git screen (builder D1's ui/gitscreen.js), opened on one agent's branch and its diff: "Review the changes", "See it
+ * in git", or a reply that carries `review`. `opener` gets the keyboard back when the person comes back to the board.
+ * Loaded when first asked for, so the board works without it.
+ */
+let gitScreen = null;
+function openGitOn(agentId, opener) {
+  gitScreen ??= import('./gitscreen.js');
+  gitScreen.then(m => {
+    if (typeof m.openGit !== 'function') throw new Error('no openGit');
+    m.openGit({ agentId, opener: opener || null });
+  }).catch(() => { gitScreen = null; say('The git screen is not available here.'); });
+}
 
 el.core.addEventListener('pointerenter', () => { pointer.inCore = true; touch(); });
 el.core.addEventListener('pointermove', touch);
@@ -625,6 +679,8 @@ async function submit(text) {
       if (b.askId && !res.confirm) answeredOnce();
       // a new launch question in the core already says it; anything else is said under the core
       say(res.confirm && (!shown || res.confirm.id !== shown.id) ? '' : (res.reply || ''));
+      // "what did search cleanup change": the git screen opens on that agent's branch and its diff
+      if (typeof res.review === 'string' && ID_RE.test(res.review) && !res.confirm) openGitOn(res.review, null);
     }
   } catch (err) { say(err.message); }
   render();
@@ -899,6 +955,8 @@ function startLive() {
     snapshot: onSnapshot, agents: onAgents,
     machines: list => { const byId = new Map(S.machines.map(m => [m.id, m])); for (const m of list) byId.set(m.id, m); S.machines = [...byId.values()]; render(); },
     notice: text => say(text),
+    // the person's repository changed (a merge, a branch switch seen on a refresh): "Merge into <branch>" follows it
+    repo: r => { S.meta.repo = r; render(); },
     state: s => { link.stream = s; if (s === 'open') link.downSince = 0; else if (!link.downSince) link.downSince = performance.now(); render(); },
     refused: () => { link.refused = true; render(); },
   });

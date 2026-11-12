@@ -11,12 +11,14 @@ export const S = {
   meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null },
   loaded: false,         // a snapshot has arrived
   focusId: null,         // set when the person picks an agent or steps the queue; null = follow the queue
-  confirm: null,         // a launch question on screen: { id, sentence, detail }
+  // an engine card on screen: { id, sentence, detail, kind: 'start'|'stop'|'say'|'forget'|'merge'|'discard', yes?, no?,
+  // danger? }, plus agentId (the page's own note) when a lid button for that agent asked for it
+  confirm: null,
   hoverId: null,         // chip or helper under the pointer or keyboard
   pinId: null,           // card pinned by a click
   reply: null,           // { agentId, mode: 'answer'|'say', askId }
-  reviewed: load('wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Dismiss")
-  later: load('wb-later'),         // finishKeys of failed checks set aside ("Look later")
+  reviewed: load('wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Not now", "Dismiss")
+  later: load('wb-later'),         // finishKeys set aside: a failed check, or a merge that did not go through ("Look later")
 };
 
 function load(key) {
@@ -28,9 +30,9 @@ function keep(key, set) {
 
 export const finishKey = Q.finishKey;
 
-/** "Looks good" / "Dismiss": this finish has been looked at. */
+/** "Looks good" / "Not now" / "Dismiss": this finish has been looked at. */
 export function markReviewed(a) { S.reviewed.add(finishKey(a)); keep('wb-reviewed', S.reviewed); }
-/** "Look later" on a failed check: not now, for this finish. */
+/** "Look later" on a failed check, or on a merge that did not go through: not now, for this finish. */
 export function setAside(a) { S.later.add(finishKey(a)); keep('wb-later', S.later); }
 
 export function upsert(list) {
@@ -40,8 +42,19 @@ export function upsert(list) {
 const ctx = () => ({ NEEDS_YOU, PRIORITY, later: S.later });
 export const needsPerson = a => Q.needsPerson(a, ctx());
 export const needsQueue = () => Q.needsQueue(S.agents.values(), ctx());
-export const reviewQueue = () => Q.reviewQueue(S.agents.values(), { reviewed: S.reviewed });
+export const reviewQueue = () => Q.reviewQueue(S.agents.values(), { reviewed: S.reviewed, later: S.later });
 export const setAsideList = () => Q.setAsideList(S.agents.values(), { later: S.later });
+
+// An agent's work (AgentView.work), against the person's repository as the last snapshot or `repo` event told it. The
+// git screen's detail (ui/gitscreen.js) uses the same rules for its Merge and Throw it away.
+const workCtx = () => ({ ACTIVE, meta: S.meta });
+export const { unmergedWork, workSettled, workKey, canReview } = Q;
+/** Merge into the person's branch is offered: live mode, a root at rest, its folder there, a branch and an identity, unmerged work. */
+export const mergeApplies = a => Q.mergeApplies(a, workCtx());
+/** Throw it away is offered: live mode, a root with its folder and branch. */
+export const discardApplies = a => Q.discardApplies(a, workCtx());
+/** The engine's words for why there is no Merge, when it is about git (not on a branch, no name and email); else null. */
+export const gitReason = a => Q.gitReason(a, workCtx());
 
 export function childrenOf(id) {
   return [...S.agents.values()].filter(a => a.parentId === id).sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));

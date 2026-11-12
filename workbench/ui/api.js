@@ -64,12 +64,22 @@ export const api = {
   say: (agentId, text) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/say`, { text }),
   stop: (agentId) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/stop`, {}),
   awake: (machineId, awake) => call('POST', `/api/machines/${encodeURIComponent(machineId)}/awake`, { awake }),
+  /**
+   * Merge or throw away an agent's work. Neither acts by itself: the engine answers with a card ({ reply, confirm }) the
+   * person answers by id. `state` is the state the button was drawn in; the engine refuses when it has changed.
+   */
+  merge: (agentId, { state = null } = {}) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/merge`, { state: state || null }),
+  discard: (agentId, { state = null } = {}) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/discard`, { state: state || null }),
+  /** Read-only, for the git screen: the commit graph, and one agent's diff. */
+  git: () => call('GET', '/api/git'),
+  changes: (agentId) => call('GET', `/api/agents/${encodeURIComponent(agentId)}/changes`),
 };
 
 /**
- * Open the live stream. Handlers: snapshot, agents, machines, notice, state(stream) with stream one of
- * 'open' | 'connecting' | 'closed', and refused() when Workbench turns the key away. After the browser gives up on a
- * stream (closed), the page asks /api/state once: a 401 means the key is stale; anything else, try again in 2 s.
+ * Open the live stream. Handlers: snapshot, agents, machines, notice, repo (the person's repository changed: a merge, a
+ * refresh; { name, branch, head, dirty, identity }), state(stream) with stream one of 'open' | 'connecting' | 'closed',
+ * and refused() when Workbench turns the key away. After the browser gives up on a stream (closed), the page asks
+ * /api/state once: a 401 means the key is stale; anything else, try again in 2 s.
  */
 export function connect(handlers) {
   let es = null, retry = null, stopped = false;
@@ -85,6 +95,7 @@ export function connect(handlers) {
     on('agents', d => handlers.agents?.(Array.isArray(d) ? d : (d.agents || [])));
     on('machines', d => handlers.machines?.(Array.isArray(d) ? d : (d.machines || [])));
     on('notice', d => handlers.notice?.(d && d.text ? d.text : String(d || '')));
+    on('repo', d => { const r = d && typeof d === 'object' && d.repo && typeof d.repo === 'object' ? d.repo : d; if (r && typeof r === 'object') handlers.repo?.(r); });
     es.onopen = () => handlers.state?.('open');
     es.onerror = async () => {
       if (es.readyState !== EventSource.CLOSED) { handlers.state?.('connecting'); return; }

@@ -4,11 +4,24 @@ import { duration, tokens, money, percent, clip, shortModel } from '/shared/form
 import { pastTense } from '/shared/narrate.mjs';
 import { LOOK, NEEDS_YOU } from '/shared/states.mjs';
 import { SPARK_BUCKET_MS, SPARK_BUCKETS } from '/shared/events.mjs';
-import { S, machineName, harnessLabel, helpersOf, helpersAtWork } from './model.js';
+import { S, machineName, harnessLabel, helpersOf, helpersAtWork, unmergedWork, workSettled } from './model.js';
 import { markOf, markOfAgent } from './look.js';
 import { newTokens, stepsInWindow, windowMinutes, spentWords, calmDuration } from './numbers.js';
 import { esc } from './util.js';
+import { visibleControls } from './words.js';
 import { agoText } from './boardmodel.js';
+
+/**
+ * Where a root's work is: "Merged into main · 2 min ago" (nothing new since), "Not merged yet", or "Its work was thrown
+ * away · 5 min ago". Empty for helpers and agents without git, and while nothing is known.
+ */
+export function workWords(a, now) {
+  const w = a && a.work;
+  if (!w || a.parentId) return '';
+  if (w.thrownAway) return `Its work was thrown away · ${agoText(now - (w.thrownAway.at || now))}`;
+  if (w.merged && workSettled(a)) return `Merged into ${visibleControls(w.merged.into || 'your branch')} · ${agoText(now - (w.merged.at || now))}`;
+  return unmergedWork(a) ? 'Not merged yet' : '';
+}
 
 const mark = (shape, tone) => `<svg class="g c-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
 
@@ -55,6 +68,7 @@ function summary(a, now) {
   }
   parts.push(calmDuration((a.endedAt || now) - a.startedAt, duration, 'under 1 min'));
   if (!a.parentId) parts.push(spentWords(a.usage, money, a.harness) + (a.usage?.costUsd != null && a.budgetUsd != null ? ` of ${money(a.budgetUsd)}` : ''));
+  parts.push(workWords(a, now).replace(' · ', ', '));
   return parts.filter(Boolean).join('. ') + '.';
 }
 
@@ -85,7 +99,9 @@ export function cardHtml(a, o) {
     const nb = Math.min(a.plan.total, 8), on = Math.round(a.plan.done / a.plan.total * nb);
     return `<span class="bar" aria-hidden="true">${Array.from({ length: nb }, (_, i) => `<i class="${i < on ? 'on' : ''}"></i>`).join('')}</span>${a.plan.done} of ${a.plan.total} steps`;
   })() : '';
-  const lines = [`<div class="ln"><span>Now</span><span>${nowLine(a, now)}</span></div>`];
+  // "more": where its work is, on the Now line's second row
+  const wk = more ? workWords(a, now) : '';
+  const lines = [`<div class="ln"><span>Now</span><span>${nowLine(a, now)}${wk ? `<span class="wk">${esc(wk)}</span>` : ''}</span></div>`];
   if (more) {
     const last = (a.recent || []).slice(-1).map(s => `<span class="${s.ok === false ? 'x' : ''}">${s.ok === false ? '✗' : '✓'} ${esc(clip(pastTense(s.sentence), 60))}</span>`).join('');
     if (last) lines.push(`<div class="ln"><span>Last</span><span>${last}</span></div>`);

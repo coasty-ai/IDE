@@ -475,3 +475,13 @@ svg.g { width: 10px; height: 10px; flex: none; }
 }
 body.still *, body.still *::before, body.still *::after { animation: none !important; transition: none !important; }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: .42s; animation-timing-function: ease; }
+
+/* ---------- D2: an agent's work in the lid and the card (merge, review, throw away), and the engine's cards ---------- */
+/* the links about its work sit in one row under the answers, and wrap rather than squeeze */
+#core .links { display: flex; flex-wrap: wrap; justify-content: center; align-items: baseline; gap: 2px 14px; margin-top: 8px; max-width: 100%; }
+#core .links .quiet { margin-top: 0; }
+/* why git cannot merge it (not on a branch, no name and email): the engine's words, a step darker than the meta line */
+#core .meta.git { color: var(--lid-ink-2); }
+#core.idle .meta.git { color: var(--idle-ink-2); }
+/* the card: where its work is, on the Now line's second row */
+#card .wk { display: block; margin-top: 2px; font-weight: 400; color: var(--card-sub); }

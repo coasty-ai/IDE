@@ -10,7 +10,9 @@
 //   POST /ctl/push {"event","data"} send one stream event to every open page
 //   POST /ctl/mode {...}           answer: "ok" | "refuse" ({ok:false}) | "500" | "drop" (no answer);
 //                                  auth: "ok" | "bad"; holdMs: hold each new stream's snapshot; down: refuse streams;
-//                                  steps: true to make working agents take steps
+//                                  steps: true to make working agents take steps; merge: what the next merge does,
+//                                  "ok" | "conflict" | "blocked" | "moved" | "identity" | "detached" | "busy" |
+//                                  "ancestry" | "git" | "changed" | "refuse" (see the D2 block in startMock)
 //   GET  /ctl/log                  every request the page sent to /api, with its body
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 import http from 'node:http';
@@ -65,6 +67,7 @@ function view(o, now) {
     budgetUsd: o.parentId ? null : (o.budgetUsd ?? 2), plan: o.plan || null, files: o.files || null, checks: o.checks || null, rules: o.rules || null,
     ask: o.ask ? { ...o.ask, createdAt: now - (o.ask.ageMin ?? 1) * MIN } : null,
     approvals: o.approvals || { auto: 8, byYou: 0, denied: 0 }, says: o.says || null, error: o.error || null, sessionId: null, workspace: null,
+    work: o.work ? JSON.parse(JSON.stringify(o.work)) : null,
     earlier: !!o.earlier, canContinue: o.earlier ? o.canContinue !== false : null,
     continueReason: o.earlier && o.canContinue === false ? (o.continueReason || 'Its folder is gone, so it cannot continue.') : null,
   };
@@ -109,6 +112,7 @@ export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy'
 
 export function scenario(name, now = Date.now()) {
   let raw = [];
+  if (MERGE_SCENARIOS.includes(name)) return mergeWorld(name, now);
   if (name === 'demo' || name === 'helper' || name === 'longq' || name === 'busy' || name === 'idle') {
     raw = demo();
     if (name === 'helper' || name === 'longq' || name === 'idle') backToWork(by(raw, '399e17'), 'Running checkout tests');
@@ -253,11 +257,69 @@ function world(raw, now) {
     spendTodayEstimated: agents.some(a => !a.parentId && a.usage.unreportedUsd > 0), defaultBudgetUsd: 2 };
 }
 
+// ---------------------------------------------------------------- D2: merge and throw-away (the lid, its cards, the checks)
+// Live repositories whose finished agents have work (AgentView.work) in every state it can be in.
+//   merge           on main: unmerged, merged, a merge that conflicts, one your own changes block, thrown away, and an
+//                   earlier agent whose folder is still there
+//   merge-more      on a long branch: a failed check (Merge anyway), failed and stopped agents with folders, a merge git
+//                   refused for want of a name and email, an unmerged one, and one still working
+//   merge-detached  not on a branch, and merge-noid with no name and email for git: no Merge, and the lid says why
+const MERGE_SCENARIOS = ['merge', 'merge-more', 'merge-detached', 'merge-noid'];
+SCENARIOS.push(...MERGE_SCENARIOS);
+const NO_IDENTITY = 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.';
+function mergeWorld(name, now) {
+  const raw = [];
+  const work = (slug, id, o = {}) => ({ branch: `workbench/${slug}-${id}`, from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...o });
+  const files = list => ({ changed: list.length, adds: list.reduce((s, x) => s + x.adds, 0), dels: list.reduce((s, x) => s + x.dels, 0), list });
+  const invoice = id => ({ id, name: 'Invoice export', state: 'done_checked', endedMin: 2, says: 'Invoices now go out in small batches, so large accounts can export without timing out.',
+    files: files([{ path: 'src/invoices/batch.ts', adds: 22, dels: 0 }, { path: 'src/invoices/export.ts', adds: 8, dels: 2 }, { path: 'test/invoices/large-account.test.ts', adds: 10, dels: 0 }]),
+    checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 48200 }] }, work: work('invoice-export', id) });
+  let repo = { name: 'invoices-api', head: 'abc1234', branch: 'main', dirty: 2, identity: true };
+  if (name === 'merge') {
+    raw.push(invoice('m1a2b3'));
+    raw.push({ id: 'm4c5d6', name: 'Help pages', harness: 'codex', model: 'gpt-5-codex', state: 'done_claimed', endedMin: 30, says: 'I rewrote the three help pages in plain language.',
+      files: files([]), work: work('help-pages', 'm4c5d6', { merged: { into: 'main', merge: 'e4f1c3a9b8d7e4f1c3a9b8d7e4f1c3a9b8d7e4f1', at: now - 4 * MIN, files: 3, adds: 36, dels: 6 } }) });
+    raw.push({ id: 'm7e8f9', name: 'Search cleanup', state: 'done_checked', endedMin: 6, says: 'The old search code is gone, and its links point at the new page.',
+      files: files([{ path: 'src/search/index.ts', adds: 4, dels: 22 }, { path: 'src/search/redirects.ts', adds: 10, dels: 8 }]),
+      work: work('search-cleanup', 'm7e8f9', { problem: { why: 'conflict', sentence: 'Search cleanup’s work does not merge cleanly into main.', paths: ['src/search/index.ts', 'src/search/redirects.ts'], at: now - 3 * MIN } }) });
+    raw.push({ id: 'mab0c1', name: 'Price rounding', state: 'done_claimed', endedMin: 9, says: 'Totals now round once, at the end.',
+      files: files([{ path: 'src/cart/total.ts', adds: 17, dels: 3 }]),
+      work: work('price-rounding', 'mab0c1', { problem: { why: 'blocked', sentence: 'Your own changes are in the way: src/cart/total.ts. Commit or put them aside, then merge again.', paths: ['src/cart/total.ts'], at: now - 2 * MIN } }) });
+    raw.push({ id: 'md2e3f', name: 'Dark mode', state: 'stopped', endedMin: 15,
+      work: work('dark-mode', 'md2e3f', { branch: null, folder: false, thrownAway: { at: now - 10 * MIN, saved: 'refs/workbench/discarded/md2e3f' } }) });
+    raw.push({ id: 'mf4a5b', name: 'Email digest', state: 'done_checked', earlier: true, ageMin: 27 * 60, sinceMin: 26 * 60, endedMin: 26 * 60,
+      says: 'The weekly digest now groups orders by customer.', files: files([{ path: 'src/email/digest.ts', adds: 30, dels: 4 }]), work: work('email-digest', 'mf4a5b') });
+  } else if (name === 'merge-more') {
+    repo = { ...repo, branch: 'release/2026-11-payments-and-refunds' };
+    const from = { from: repo.branch };
+    raw.push({ id: 'n1', name: 'Release notes', state: 'checks_failed', endedMin: 3, checks: { state: 'failed', results: [{ name: 'Unit tests', ok: false, ms: 4100 }, { name: 'Lint', ok: true, ms: 900 }] },
+      files: files([{ path: 'CHANGELOG.md', adds: 40, dels: 0 }, { path: 'docs/releases/2026-11.md', adds: 22, dels: 1 }]), work: work('release-notes', 'n1', from) });
+    raw.push({ ...invoice('n2'), endedMin: 1, work: work('invoice-export', 'n2', from) });
+    raw.push({ id: 'n3', name: 'Order history', state: 'failed', endedMin: 12, error: 'The tests ran out of memory.', work: work('order-history', 'n3', from) });
+    raw.push({ id: 'n4', name: 'Price rounding', state: 'stopped', endedMin: 20, work: work('price-rounding', 'n4', from) });
+    raw.push({ id: 'n5', name: 'Billing page', state: 'done_checked', endedMin: 5, files: files([{ path: 'src/billing/Page.tsx', adds: 12, dels: 9 }]),
+      work: work('billing-page', 'n5', { ...from, problem: { why: 'identity', sentence: NO_IDENTITY, paths: [], at: now - MIN } }) });
+    raw.push({ id: 'n6', name: 'Onboarding', state: 'working', now: 'Running the tests', work: work('onboarding', 'n6', from) });
+  } else {
+    if (name === 'merge-detached') repo = { ...repo, head: '9f8e7d6', branch: null, dirty: 0 };
+    else repo = { ...repo, identity: false };
+    raw.push(invoice('d1'));
+    raw.push({ id: 'd2', name: 'Help pages', harness: 'codex', model: 'gpt-5-codex', state: 'done_claimed', endedMin: 7, says: 'I rewrote the three help pages in plain language.',
+      files: files([{ path: 'docs/help/billing.md', adds: 17, dels: 2 }]), work: work('help-pages', 'd2') });
+  }
+  const st = world(raw, now);
+  st.mode = 'live';
+  st.repo = repo;
+  const n = st.agents.filter(a => !a.parentId && !a.earlier && ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(a.state)).length;
+  st.machines = [{ ...LAPTOP, agents: n, note: n ? `${n} agent${n === 1 ? '' : 's'}` : 'idle' }];
+  return st;
+}
+
 /** Start the mock. Resolves to { port, close() }. */
 export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) {
   const clients = new Set();
   const posted = [];
-  const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false };
+  const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok' };
   let name = 'demo';
   let state = scenario(name);
   let confirmSeq = 0;
@@ -274,6 +336,110 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     return { reply: 'Started it. It will show on the board in a moment.', agentIds: [id], focusId: id };
   };
   const changed = list => send('agents', list);
+
+  // ---------------------------------------------------------------- D2: merge and throw-away
+  // POST /api/agents/:id/merge|discard { state } answer with the engine's card, or its refusal ({ ok: false, reply });
+  // /api/confirm/:id and a typed yes or no settle a card by its kind. mode.merge is what the next merge does: 'ok', or it
+  // fails and the agent keeps the problem ('conflict' | 'blocked' | 'moved' | 'identity' | 'detached' | 'busy' |
+  // 'ancestry' | 'git'), or 'changed' (refused when answered), or 'refuse' (the card itself is refused).
+  const AT_WORK = new Set(['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck']);
+  let mergeSeq = 0;
+  const newConfirm = (card, extra = {}) => {
+    const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
+    confirms.set(id, { id, ...card, ...extra });
+    return { id, ...card };
+  };
+  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, yes: c.yes, no: c.no, danger: c.danger });
+  const rootOf = a => (a && a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a);
+  const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
+  const mergeRefusal = a => {
+    const w = a.work, into = state.repo && state.repo.branch;
+    if (state.mode !== 'live') return 'This is the demo, so nothing is really merged.';
+    if (a.parentId) return 'Helpers work in their agent’s folder. Merge the agent instead.';
+    if (AT_WORK.has(a.state)) return `${a.name} is still working. Merge it when it is done.`;
+    if (!w || !w.folder || w.thrownAway) return 'Its folder is gone, so there is nothing to merge.';
+    if (!into) return 'Your folder is not on a branch, so there is nowhere to merge it.';
+    if (state.repo.identity === false) return NO_IDENTITY;
+    if (a.files && !a.files.changed) return `${a.name}’s work is already in ${into}.`;
+    return null;
+  };
+  const discardRefusal = a => {
+    const w = a.work;
+    if (state.mode !== 'live') return 'This is the demo, so nothing is really thrown away.';
+    if (a.parentId) return 'Helpers work in their agent’s folder. Throw away the agent’s work instead.';
+    if (!w || !w.folder || w.thrownAway) return 'Its folder is gone, so there is nothing to throw away.';
+    return null;
+  };
+  // the engine's cards, in its words (section 2 of SPEC-source-control.md)
+  const mergeCard = a => {
+    const into = state.repo.branch, f = a.files || { changed: 0, adds: 0, dels: 0, list: [] }, list = f.list || [];
+    const parts = [];
+    if (f.changed) parts.push(`${plural(f.changed, 'file')}, +${f.adds} −${f.dels}.`);
+    parts.push(`Its work becomes a commit on its branch, joined into ${into} by a merge commit.`);
+    const failed = (a.checks?.results || []).filter(r => !r.ok).map(r => r.name);
+    if (failed.length) parts.push(`A check failed: ${failed.join(', ')}.`);
+    else if (!a.checks || a.checks.state === 'none') parts.push('Nothing checked its work.');
+    for (const r of a.rules?.broken || []) parts.push(`It broke a rule you set: ${r.say.replace(/[.\s]+$/, '')}.`);
+    const settings = list.map(x => x.path).find(p => p === 'workbench.json' || p === '.mcp.json' || p.startsWith('.claude/'));
+    if (settings) parts.push(`It changes ${settings}, which sets the checks for later agents.`);
+    const left = list.filter(x => x.ignored).length;
+    if (left) parts.push(`${plural(left, 'file')} ${left === 1 ? 'stays' : 'stay'} out: hidden by a .gitignore.`);
+    if (state.repo.dirty) parts.push(`Your ${plural(state.repo.dirty, 'uncommitted change')} ${state.repo.dirty === 1 ? 'stays' : 'stay'} as ${state.repo.dirty === 1 ? 'it is' : 'they are'}.`);
+    return { kind: 'merge', sentence: `Merge ${a.name} into ${into}?`, detail: parts.join(' '), yes: 'Merge', no: 'Cancel', danger: false };
+  };
+  const discardCard = a => {
+    const n = a.files?.changed || 0;
+    const detail = `Its folder and its branch ${a.work.branch} are deleted${n ? `, with ${plural(n, 'changed file')}` : ''}. Workbench keeps a hidden copy in git.`
+      + (AT_WORK.has(a.state) ? ' It is still working: it will be stopped first.' : '');
+    return { kind: 'discard', sentence: `Throw away ${a.name}’s work?`, detail, yes: 'Throw it away', no: 'Keep it', danger: true };
+  };
+  const PROBLEM = {
+    conflict: (a, into) => `${a.name}’s work does not merge cleanly into ${into}.`,
+    blocked: (a, into, paths) => `Your own changes are in the way: ${paths.slice(0, 3).join(', ')}. Commit or put them aside, then merge again.`,
+    moved: (a, into) => `${into} changed since you looked. Have another look.`,
+    identity: () => NO_IDENTITY,
+    detached: () => 'Your folder is not on a branch, so there is nowhere to merge it.',
+    busy: () => 'Your folder is in the middle of a merge or rebase. Finish that first.',
+    ancestry: (a, into) => `${a.name} started from a commit that is no longer in ${into}, so merging it would bring in other work.`,
+    git: () => 'Git could not finish the merge. Nothing in your folder changed.',
+  };
+  /** Settle a card: a launch starts, a forget forgets, a merge merges (or fails as mode.merge says), a throw-away throws away. */
+  const settle = (c, go) => {
+    if (c.kind === 'forget') {
+      if (!go) return { reply: 'OK, I won’t forget it.' };
+      state.agents = state.agents.filter(x => x.id !== c.forget);
+      setTimeout(() => send('snapshot', state), 60);
+      return { reply: 'Forgot it. Its folder and branch are still on this computer.' };
+    }
+    if (c.kind !== 'merge' && c.kind !== 'discard') return go ? started(c) : { reply: 'OK, I won’t start it.' };
+    if (!go) return { reply: c.kind === 'merge' ? 'OK, I won’t merge it.' : 'OK, I won’t throw it away.' };
+    const a = state.agents.find(x => x.id === c.agentId);
+    if (!a || !a.work) return { ok: false, reply: 'That agent is no longer here.' };
+    const now = Date.now();
+    if (c.kind === 'discard') {
+      if (AT_WORK.has(a.state)) Object.assign(a, { state: 'stopped', endedAt: now, stateSince: now, ask: null });
+      a.work = { ...a.work, branch: null, folder: false, problem: null, thrownAway: { at: now, saved: `refs/workbench/discarded/${a.id}` } };
+      setTimeout(() => send('agents', [a]), 60);
+      return { ok: true, reply: `Threw away ${a.name}’s work. Its folder and branch are gone.` };
+    }
+    const into = state.repo.branch, how = mode.merge || 'ok';
+    if (how === 'changed') return { ok: false, reply: `${a.name}’s work changed since you looked. Have another look.` };
+    if (PROBLEM[how]) {
+      const paths = how === 'blocked' ? ['src/cart/total.ts', 'README.md'] : how === 'conflict' ? (a.files?.list || []).map(x => x.path).slice(0, 4) : [];
+      const sentence = PROBLEM[how](a, into, paths);
+      a.work = { ...a.work, problem: { why: how, sentence, paths, at: now } };
+      setTimeout(() => send('agents', [a]), 60);
+      return { ok: false, reply: sentence };
+    }
+    const f = a.files || { changed: 0, adds: 0, dels: 0 };
+    const merge = ((++mergeSeq).toString(16) + 'c0ffee5eed'.repeat(4)).slice(0, 40);
+    a.work = { ...a.work, merged: { into, merge, at: now, files: f.changed || 0, adds: f.adds || 0, dels: f.dels || 0 }, problem: null };
+    a.files = { changed: 0, adds: 0, dels: 0, list: [] };
+    state.repo = { ...state.repo, head: merge.slice(0, 7) };
+    setTimeout(() => { send('agents', [a]); send('repo', state.repo); }, 60);
+    return { ok: true, reply: `Merged ${a.name} into ${into}.`, focusId: a.id };
+  };
+
   let stepTimer = null;
   const stepTick = () => {
     const working = state.agents.filter(a => a.state === 'working' || a.state === 'starting');
@@ -355,37 +521,62 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           setTimeout(() => changed([a]), 60);
           return reply({ ok: true, reply: `${a.name} is continuing in its own folder. It has a new spending limit of $2.00 for this run.` });
         }
+        if (m[2] === 'say' && a.work && !a.parentId && !AT_WORK.has(a.state)) {
+          // D2: a message to a root at rest starts a turn, as the engine's does: it works again, and a merge problem clears
+          Object.assign(a, { state: 'working', endedAt: null, stateSince: Date.now(), now: 'Working on your message', files: null, checks: null });
+          a.work = { ...a.work, problem: null };
+          setTimeout(() => changed([a]), 60);
+          return reply({ ok: true, reply: `Sent to ${a.name}.` });
+        }
         if (m[2] === 'say') return reply({ ok: true, reply: `Sent to ${a.name}.` });
         a.state = 'stopped'; a.endedAt = Date.now(); a.stateSince = Date.now(); a.ask = null;
         setTimeout(() => changed([a]), 60);
         return reply({ ok: true, reply: `Stopped ${a.name}.` });
+      }
+      // D2: merge and throw-away always ask first, with the engine's card
+      const wm = /^\/api\/agents\/([^/]+)\/(merge|discard)$/.exec(p);
+      if (wm && req.method === 'POST') {
+        const a = state.agents.find(x => x.id === decodeURIComponent(wm[1]));
+        if (!a) return reply({ ok: false, reply: 'There is no such agent.' });
+        if (mode.merge === 'refuse') return reply({ ok: false, reply: `${a.name} is being merged now.` });
+        if (json && json.state && json.state !== a.state) return reply({ ok: false, reply: 'That changed. Have another look.' });
+        const no = wm[2] === 'merge' ? mergeRefusal(a) : discardRefusal(a);
+        if (no) return reply({ ok: false, reply: no });
+        const card = wm[2] === 'merge' ? mergeCard(a) : discardCard(a);
+        return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }) });
       }
       const cm = /^\/api\/confirm\/([^/]+)$/.exec(p);
       if (cm) {
         const c = confirms.get(decodeURIComponent(cm[1]));
         if (!c) return reply({ reply: 'That request is no longer waiting. Ask again if you still want it.' });
         confirms.delete(c.id);
-        if (c.forget) {
-          if (json && json.go === true) {
-            state.agents = state.agents.filter(x => x.id !== c.forget);
-            setTimeout(() => send('snapshot', state), 60);
-            return reply({ reply: 'Forgot it. Its folder and branch are still on this computer.' });
-          }
-          return reply({ reply: 'OK, I won’t forget it.' });
-        }
-        return reply(json && json.go === true ? started(c) : { reply: 'OK, I won’t start it.' });
+        return reply(settle(c, !!json && json.go === true));
       }
       if (p === '/api/command') {
         const text = String(json?.text || '').trim();
-        if (json?.confirmId && confirms.has(json.confirmId) && /^(yes|ok|do it|go ahead|sure)$/i.test(text)) { const c = confirms.get(json.confirmId); confirms.delete(json.confirmId); return reply(started(c)); }
-        if (json?.confirmId && confirms.has(json.confirmId) && /^(no|cancel|never mind|stop)$/i.test(text)) { confirms.delete(json.confirmId); return reply({ reply: 'OK, I won’t start it.' }); }
+        const shown = json?.confirmId ? confirms.get(json.confirmId) : null;
+        if (shown) {
+          // a card's own words: "merge it" is a yes to a merge; a throw-away needs its own words, a bare "yes" is not enough
+          const yes = shown.kind === 'discard' ? /^(throw it away|discard it|do it)$/i
+            : shown.kind === 'merge' ? /^(yes|ok|do it|go ahead|sure|merge it|merge|land it)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
+          if (yes.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
+          if (/^(no|cancel|never mind|stop|forget it|keep it)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if (shown.kind === 'discard' && /^(yes|yeah|yep|ok|okay|sure|go ahead)$/i.test(text)) return reply({ reply: 'To throw its work away, press “Throw it away” or say “throw it away”.', confirm: cardOf(shown) });
+        }
+        if (/^(merge|land)\b|^bring its changes in\b/i.test(text) || /^(throw (it|its work|its changes) away|throw away|discard|scrap)\b/i.test(text)) {
+          const merge = /^(merge|land|bring)/i.test(text);
+          const a = rootOf(state.agents.find(x => x.id === json?.focusId));
+          if (!a) return reply({ reply: `I couldn’t tell which agent to ${merge ? 'merge' : 'throw away'}.` });
+          const no = merge ? mergeRefusal(a) : discardRefusal(a);
+          if (no) return reply({ reply: no, focusId: a.id });
+          const card = merge ? mergeCard(a) : discardCard(a);
+          return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }), focusId: a.id });
+        }
         if (/^forget\b/i.test(text)) {
           const a = state.agents.find(x => x.id === json?.focusId && x.earlier);
           if (!a) return reply({ reply: 'I couldn’t tell which agent to forget.' });
-          const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
           const sentence = `Forget ${a.name}?`, detail = 'It will not show here again. Its folder and branch stay on this computer.';
-          confirms.set(id, { id, sentence, detail, forget: a.id });
-          return reply({ reply: sentence, confirm: { id, sentence, detail } });
+          return reply({ reply: sentence, confirm: newConfirm({ kind: 'forget', sentence, detail }, { forget: a.id }) });
         }
         if (/^start\b/i.test(text)) {
           const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
@@ -394,8 +585,8 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
             ? 'Start 8 agents: a simulated Claude on “fix the flaky checkout test”, a simulated Codex on “write tests for the parser”, a simulated Claude on “tidy up the invoice export”, a simulated Claude on “make the login page remember the last email”, a simulated Codex on “add a dark mode to the settings page”, a simulated Claude on “speed up the monthly report”, a simulated Claude on “translate the help pages into French” and a simulated Codex on “find and remove dead code in the search service”?'
             : `Start a simulated Claude on “${text.replace(/^start (an agent|a helper|claude|codex)? ?(to |on )?/i, '').slice(0, 90)}”?`;
           const detail = eight ? 'This is the demo: the agents are simulated and nothing is spent. Each one gets its own cloud machine, and each one can spend up to $2.' : 'This is the demo: the agents are simulated and nothing is spent. It runs on your laptop.';
-          confirms.set(id, { id, sentence, detail });
-          return reply({ reply: sentence, confirm: { id, sentence, detail } });
+          confirms.set(id, { id, kind: 'start', sentence, detail });
+          return reply({ reply: sentence, confirm: { id, kind: 'start', sentence, detail } });
         }
         if (/what needs me/i.test(text)) {
           const need = state.agents.filter(a => ['needs_ok', 'question', 'maybe_stuck', 'checks_failed'].includes(a.state));
