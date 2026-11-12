@@ -3,8 +3,10 @@
 //
 // Dependencies are injected so the engine can be tested with fakes:
 //   adapters: { claude?, codex?, sim? }   claude/codex are runner modules, sim is a Simulator instance
-//   deps:     { policy, commands, workspace, receipt }
-// This file must not import those modules directly.
+//   deps:     { policy, commands, workspace, receipt, history? }
+// This file must not import those modules directly. Each git function it uses (snapshotWork, workDiff, mergeWork,
+// discardWork, gitGraph, gitIdentity, ...) is checked with typeof first, so an older workspace module gives a plain
+// refusal instead of a crash.
 import { EventEmitter } from 'node:events';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -38,8 +40,20 @@ const AFTER_STOP_OK = new Set([EV.USAGE, EV.ENDED, EV.SESSION, EV.MODEL]);
 const FINAL = new Set([STATE.FINISHED, STATE.FAILED, STATE.STOPPED]);
 // What the history file follows: a change to one of these is worth writing (debounced).
 const HISTORY_KINDS = new Set([EV.CREATED, EV.STATE, EV.SAYS, EV.FILES, EV.CHECKS, EV.RULES, EV.MODEL, EV.SESSION,
-  EV.APPROVAL, EV.USAGE, EV.ENDED, EV.RESUMED]);
+  EV.APPROVAL, EV.USAGE, EV.ENDED, EV.RESUMED, EV.WORK]);
 const CONTINUE_TEXT = 'Please continue where you left off.';
+// From this version on, Claude Code restores a resumed session's totals itself (see _withEarlierSpend).
+const RESTORES_SPEND_FROM = Object.freeze([2, 1, 277]);
+// What a merged agent has left to merge: nothing.
+const NO_FILES = Object.freeze({ changed: 0, adds: 0, dels: 0, list: [] });
+// Every reason mergeWork gives for not merging. Any other is read as 'git'.
+const MERGE_WHYS = new Set(['detached', 'busy', 'identity', 'git-old', 'changed', 'moved', 'nothing', 'ancestry', 'conflict', 'blocked', 'gone', 'git']);
+// Why a merge did not go through, when it is worth keeping on the agent (work.problem) until it clears.
+const PROBLEM_WHYS = new Set(['conflict', 'blocked', 'ancestry', 'moved', 'identity', 'detached', 'busy', 'git']);
+const DEMO_MERGED = 'This is the demo: nothing was really merged.';
+const DEMO_THROWN = 'This is the demo: nothing was really thrown away.';
+const THROWN_REASON = 'Its work was thrown away, so it cannot continue.';
+const WHICH_ONE = 'Which one do you mean? Pick it on the board, then ask again.';
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
 const ALLOW_LABEL_RE = /^allow$/i;
@@ -99,12 +113,132 @@ function harnessName(h) {
   return HARNESS_NAMES[h] || 'That kind of agent';
 }
 
-/** What "do it" does to a confirm card: "start it", "stop them", "send it". */
+/** What "do it" does to a confirm card: "start it", "stop them", "send it", "merge it", "throw it away". */
 function confirmVerb(c) {
-  if (c.kind === 'say') return 'send it';
-  if (c.kind === 'forget') return 'forget it';
-  const many = (c.kind === 'stop' ? c.agentIds?.length : c.tasks?.length) > 1;
-  return `${c.kind === 'stop' ? 'stop' : 'start'} ${many ? 'them' : 'it'}`;
+  switch (c.kind) {
+    case 'say': return 'send it';
+    case 'forget': return 'forget it';
+    case 'merge': return 'merge it';
+    case 'discard': return 'throw it away';
+    case 'stop': return `stop ${c.agentIds?.length > 1 ? 'them' : 'it'}`;
+    case 'start': return `start ${c.tasks?.length > 1 ? 'them' : 'it'}`;
+    default: return 'go ahead';
+  }
+}
+
+/** "2.1.322" -> [2, 1, 322]; null when it does not start like a version. */
+function versionParts(v) {
+  const m = /^\s*v?(\d+)\.(\d+)\.(\d+)/.exec(typeof v === 'string' ? v : '');
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/** Is version v at least min ([major, minor, patch])? null when v is not a version. */
+function versionAtLeast(v, min) {
+  const p = versionParts(v);
+  if (!p) return null;
+  for (let i = 0; i < 3; i++) if (p[i] !== min[i]) return p[i] > min[i];
+  return true;
+}
+
+const count = (x) => (Number.isFinite(Number(x)) && Number(x) > 0 ? Number(x) : 0);
+
+/** "3 files, +40 −2" */
+function countsText(files, adds, dels) {
+  return `${files} file${files === 1 ? '' : 's'}, +${adds} −${dels}`;
+}
+
+/** The counts of a list of changed files: { files, adds, dels }. */
+function countFiles(list) {
+  const a = Array.isArray(list) ? list : [];
+  let adds = 0;
+  let dels = 0;
+  for (const f of a) { adds += count(f?.adds); dels += count(f?.dels); }
+  return { files: a.length, adds, dels };
+}
+
+/** Where an agent's unmerged work starts: its last merged work commit, else the commit it started from. */
+function sinceOf(ws) {
+  return (ws && (ws.since || ws.base)) || null;
+}
+
+/** "a.js, b.js and c.js", or "a.js, b.js, c.js and 2 more": paths as words fit for a sentence. */
+function pathWords(paths, max = 3) {
+  const list = (Array.isArray(paths) ? paths : []).filter(p => typeof p === 'string' && p).map(p => quotable(p, 80));
+  if (list.length <= max) return joinAnd(list);
+  return `${list.slice(0, max).join(', ')} and ${list.length - max} more`;
+}
+
+/**
+ * A commit subject made from the task: its first sentence, its first letter capitalised, cut at a word boundary to at
+ * most 72 characters. Hidden characters become spaces; a single full stop at the end goes, as git subjects have none.
+ */
+function commitSubject(task, fallback) {
+  let t = quotable(String(task ?? '').replace(/[​-‍⁠﻿]/g, ''), 100_000);
+  const m = /^(.+?[.!?])(?=\s+[A-Z0-9“"'(]|$)/.exec(t); // a sentence ends before a capital, not at "e.g. the" or "U.S. date"
+  if (m) t = m[1];
+  t = t.replace(/(?<!\.)\.$/, '').trim();
+  if (t.length > 72) {
+    const cut = t.slice(0, 73);
+    const sp = cut.lastIndexOf(' ');
+    t = (sp >= 24 ? cut.slice(0, sp) : t.slice(0, 72)).replace(/[\s,;:–—-]+$/, '');
+  }
+  t = t.charAt(0).toUpperCase() + t.slice(1);
+  return t || fallback;
+}
+
+/** The agent's own summary for a commit's body: one plain paragraph, or '' when it could pass for a git trailer. */
+function commitBody(text) {
+  const t = quotable(String(text ?? '').replace(/[​-‍⁠﻿]/g, ''), 2000);
+  return /^[A-Za-z0-9-]+\s*:/.test(t) ? '' : t;
+}
+
+/** A merge that did not go through, in plain words, from mergeWork's `why`. */
+function mergeSentence(why, { name, into, paths } = {}) {
+  const branch = into || 'your branch';
+  switch (why) {
+    case 'detached': return 'Your folder is not on a branch, so there is nowhere to merge it.';
+    case 'busy': return 'Your folder is in the middle of a merge or rebase. Finish that first.';
+    case 'identity': return 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.';
+    case 'git-old': return 'Workbench needs git 2.38 or newer to merge.';
+    case 'changed': return `${name}’s work changed since you looked. Have another look.`;
+    case 'moved': return `${branch} changed since you looked. Have another look.`;
+    case 'nothing': return `${name}’s work is already in ${branch}.`;
+    case 'ancestry': return `${name} started from a commit that is no longer in ${branch}, so merging it would bring in other work.`;
+    case 'conflict': return `${name}’s work does not merge cleanly into ${branch}.`;
+    case 'blocked': {
+      const words = pathWords(paths);
+      return words
+        ? `Your own changes are in the way: ${words}. Commit or put them aside, then merge again.`
+        : 'Your own changes are in the way. Commit or put them aside, then merge again.';
+    }
+    case 'gone': return 'Its folder is gone, so there is nothing to merge.';
+    default: return 'Git could not finish the merge. Nothing in your folder changed.';
+  }
+}
+
+/** What a throw-away's hidden copy leaves out: files a .gitignore hides, folders that are git repositories of their own. */
+function leftOutWords(left) {
+  const list = Array.isArray(left) ? left : [];
+  const ignored = list.filter(l => l?.why === 'ignored').length;
+  const nested = list.filter(l => l?.why === 'nested-repo').length;
+  const parts = [];
+  if (ignored) parts.push(`${ignored} file${ignored === 1 ? ' that a .gitignore hides' : 's that a .gitignore hides'}`);
+  if (nested) parts.push(`${nested} folder${nested === 1 ? ' that is a git repository of its own' : 's that are git repositories of their own'}`);
+  return parts.length ? `The hidden copy leaves out ${joinAnd(parts)}.` : '';
+}
+
+/** A folder Workbench made for an agent, still there: a directory with a .git entry. */
+function folderThere(p) {
+  try {
+    return typeof p === 'string' && fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, '.git'));
+  } catch {
+    return false;
+  }
+}
+
+/** Strip a sentence's own end mark, so it can go inside another sentence. */
+function unend(s) {
+  return String(s ?? '').trim().replace(/[.!?]+$/, '');
 }
 
 function slugify(name) {
@@ -210,6 +344,15 @@ export class Engine extends EventEmitter {
     this._shuttingDown = false;
     this._shutdownPromise = null;
     this._launching = new Set(); // launches under way (_startAgent): shutdown lets them finish first
+    // Merging and throwing away. Every job touches the same repository (the person's own folder, for a merge), so
+    // they run one at a time, engine-wide (_gitJob). While an agent's job waits or runs, the agent is busy: nothing
+    // else may wake, stop, continue or forget it. Shutdown waits for the jobs under way.
+    this._busy = new Map();      // rootId -> 'merge' | 'discard'
+    this._gitChain = Promise.resolve();
+    this._gitWork = new Set();   // git jobs under way
+    this.repoIdentity = null;    // live mode: does git know the person's name and email (true/false); null: not known
+    this._repoKey = null;        // the repository as the page last heard of it (see _setRepo)
+    this._repoReading = null;    // a periodic refresh of the repository under way
     this._machineKeys = new Map();
     this._lastMachinesAt = 0;
     this._lastRepoAt = 0;
@@ -225,6 +368,8 @@ export class Engine extends EventEmitter {
     if (this._started) return;
     if (this.mode === 'live') {
       await this._loadRepo();
+      this.repoIdentity = await this._readIdentity(this.repoInfo.root);
+      this._repoKey = JSON.stringify(this._repoView());
       await this._checkHarnesses();
       this._openHistory();
     } else {
@@ -273,6 +418,9 @@ export class Engine extends EventEmitter {
         await withTimeout(Promise.allSettled([...this._launching]), this.options.stopTimeoutMs)
           .catch(() => this.log.warn('A launch did not finish in time.'));
       }
+      // A merge or a throw-away under way finishes first: it may be moving the person's own branch, and stopping it
+      // half-way helps nobody. Each git call it makes has its own time limit, and no new one starts from now on.
+      if (this._gitWork.size) await Promise.allSettled([...this._gitWork]);
       const runs = [...this.runs.values()].filter(r => r.runner);
       for (const r of runs) {
         r.stopped = true;
@@ -301,7 +449,8 @@ export class Engine extends EventEmitter {
       if (batch.length) this._apply(batch);
       // Folders where nothing changed go; the others stay, so the person can look at the work afterwards.
       // A runner that would not stop may still be writing in its folder: that one stays.
-      const tidy = [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved && this._runnerInfo(r)?.alive !== true);
+      const tidy = [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved && !this._busy.has(r.id)
+        && this._runnerInfo(r)?.alive !== true);
       if (tidy.length) {
         await withTimeout(Promise.all(tidy.map(r => this._removeUnchanged(r))), this.options.tidyTimeoutMs)
           .catch(() => this.log.warn('Some agent folders were not tidied up in time.'));
@@ -365,6 +514,7 @@ export class Engine extends EventEmitter {
     if (!ev || typeof ev !== 'object' || typeof ev.kind !== 'string') return;
     let e = { ...ev, ts: Number.isFinite(ev.ts) ? ev.ts : this.now() };
     if (e.kind === EV.SAYS && e.text != null) e.text = plain(e.text);
+    if (e.kind === EV.SESSION) this._noteVersion(e);
     if (e.kind === EV.USAGE && e.mode === 'set') e = this._withEarlierSpend(e);
     if (this._isStopped(e)) {
       if (!AFTER_STOP_OK.has(e.kind)) return;
@@ -503,6 +653,7 @@ export class Engine extends EventEmitter {
           }
           this._dropLater(e.agentId); // what the last turn decided while a request was held is out of date
           this._clearBackgroundAsk(e.agentId, null); // it works again, so "is it done?" is moot
+          this._clearProblem(e.agentId); // and a merge that did not go through no longer describes its work
         } else if (e.phase === 'end') {
           this._onTurnEnd(e);
         }
@@ -582,7 +733,8 @@ export class Engine extends EventEmitter {
     try {
       const ws = run && run.workspace;
       if (ws && typeof this.deps.workspace?.diffStats === 'function') {
-        const files = await this.deps.workspace.diffStats({ path: ws.path, base: ws.base });
+        // What is not merged yet: since its last merge, else since the commit it started from.
+        const files = await this.deps.workspace.diffStats({ path: ws.path, base: sinceOf(ws) });
         if (stale()) return;
         if (files) this._apply([{ kind: EV.FILES, agentId, files }]);
         const config = (await run.config) || DEFAULT_CONFIG;
@@ -1251,7 +1403,7 @@ export class Engine extends EventEmitter {
         repoRoot: this.repoInfo.root, dir: this.options.historyDir || null, debounceMs: this.options.historyDebounceMs, log: this.log,
       });
       for (const rec of h.load()) {
-        if (this.store.restore(rec, this._canContinue(rec))) this.earlierRecs.set(rec.id, rec);
+        if (this.store.restore({ ...rec, work: this._restoredWork(rec) }, this._canContinue(rec))) this.earlierRecs.set(rec.id, rec);
       }
       h.source(() => this._historyRecords());
       this.history = h;
@@ -1280,8 +1432,35 @@ export class Engine extends EventEmitter {
     return out;
   }
 
+  /**
+   * An earlier agent's work as its view shows it: the saved one, with `folder` as it is on disk now. A record from
+   * before Workbench kept `work` gets one made from its workspace, so its branch can still be shown, merged or thrown
+   * away. None when it never had a branch to speak of.
+   */
+  _restoredWork(rec) {
+    const ws = rec.workspace;
+    const there = !!ws && folderThere(ws.path);
+    const w = rec.work && typeof rec.work === 'object' ? rec.work : null;
+    if (w) return { ...w, folder: there && !w.thrownAway };
+    if (ws && ws.branch) return { branch: ws.branch, from: ws.from ?? null, folder: there, merged: null, problem: null, thrownAway: null };
+    return null;
+  }
+
+  /**
+   * The saved record of an earlier agent is written back unchanged unless it is replaced: after a merge or a
+   * throw-away, rebuild it field by field from its view as it is now (`workspace`: its places now, or null).
+   */
+  _replaceEarlier(id, workspace) {
+    const rec = this.earlierRecs.get(id);
+    const v = this.store.get(id);
+    if (!rec || !v || typeof this.history?.recordOf !== 'function') return;
+    const next = this.history.recordOf(v, workspace, this.now());
+    if (next) this.earlierRecs.set(id, next);
+  }
+
   /** Can an earlier agent be picked up: its program is here, and its folder and conversation are still there? */
   _canContinue(rec) {
+    if (rec.work?.thrownAway) return { ok: false, reason: THROWN_REASON };
     const mod = this.adapters[rec.harness];
     if (typeof mod?.createRunner !== 'function' || this.harnessInfo[rec.harness]?.ok === false) {
       return { ok: false, reason: `${harnessName(rec.harness)} is not available on this computer.` };
@@ -1304,6 +1483,7 @@ export class Engine extends EventEmitter {
    */
   async _continueEarlier(v, text) {
     if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    if (this._busy.has(v.id)) return { ok: false, reply: this._busyReply(v) };
     const rec = this.earlierRecs.get(v.id);
     if (!rec) return { ok: false, reply: `${v.name} cannot continue. Its notes from the earlier run are gone.` };
     if (this._resuming.has(v.id)) return { ok: false, reply: `${v.name} is already being picked up.` };
@@ -1314,7 +1494,9 @@ export class Engine extends EventEmitter {
     }
     this._resuming.add(v.id);
     const budget = this.defaultBudgetUsd;
-    const workspace = { ...rec.workspace };
+    const w = rec.workspace;
+    // A record from before Workbench kept `since` starts its unmerged work where the agent started.
+    const workspace = { path: w.path, branch: w.branch ?? null, base: w.base ?? null, since: w.since ?? w.base ?? null, from: w.from ?? null };
     const run = {
       id: v.id, harness: rec.harness, runner: null, workspace,
       config: this._loadConfig(workspace),
@@ -1348,17 +1530,22 @@ export class Engine extends EventEmitter {
       { kind: EV.RESUMED, agentId: v.id, budgetUsd: budget },
       { kind: EV.STATE, agentId: v.id, state: STATE.WORKING, reason: null },
     ]);
+    this._clearProblem(v.id); // it took a message
     this._refreshMachines();
     return { ok: true, reply: `${v.name} is continuing in its own folder. It has a new spending limit of ${money(budget)} for this run.` };
   }
 
   /**
    * A continued agent's new process counts its spend from zero, so its totals (`set`, at the end of a turn) start
-   * again. Add what the earlier run spent, so the card does not forget it.
+   * again. Add what the earlier run spent, so the card does not forget it. Claude Code 2.1.277 and newer restore a
+   * resumed session's totals themselves (its own session line says which version runs): then nothing is added, or the
+   * earlier spend would count twice. When the version is not known, it is added, as before.
    */
   _withEarlierSpend(e) {
-    const base = this.runs.get(e.agentId)?.earlierSpend;
+    const run = this.runs.get(e.agentId);
+    const base = run?.earlierSpend;
     if (!base) return e;
+    if (run.harness === 'claude' && versionAtLeast(run.harnessVersion, RESTORES_SPEND_FROM) === true) return e;
     const out = { ...e };
     for (const f of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']) {
       if (Number.isFinite(out[f])) out[f] += base[f] || 0;
@@ -1367,26 +1554,53 @@ export class Engine extends EventEmitter {
     return out;
   }
 
+  /** A root's session line says which version of its harness runs (Claude Code's claude_code_version): keep it. */
+  _noteVersion(e) {
+    const run = this.runs.get(e.agentId);
+    const version = typeof e.version === 'string' && versionParts(e.version) ? e.version.trim().slice(0, 40) : null;
+    if (!run || !version) return;
+    run.harnessVersion = version;
+    const info = this.harnessInfo[run.harness];
+    if (this.mode === 'live' && info && typeof info === 'object') this.harnessInfo[run.harness] = { ...info, version };
+  }
+
+  /** Does an agent's folder stay on this computer: kept when it was saved (earlier agents) or not removed (this run)? */
+  _folderKept(v) {
+    if (v.work?.thrownAway) return false;
+    const run = this.runs.get(v.id);
+    if (run) return !!run.workspace && !run.folderRemoved;
+    const rec = this.earlierRecs.get(v.id);
+    return !!rec?.workspace;
+  }
+
   _proposeForget(views) {
     const names = joinAnd(views.map(v => v.name));
     const sentence = `Forget ${names}?`;
-    const detail = views.length === 1 ? 'It will not show here again. Its folder and branch stay on this computer.' : 'They will not show here again. Their folders and branches stay on this computer.';
-    const id = hex(6);
-    this.confirms.set(id, { id, kind: 'forget', agentIds: views.map(v => v.id), sentence, detail, createdAt: this.now() });
-    return { reply: sentence, confirm: { id, sentence, detail } };
+    const kept = views.filter(v => this._folderKept(v)).length;
+    let detail;
+    if (views.length === 1) detail = kept ? 'It will not show here again. Its folder and branch stay on this computer.' : 'It will not show here again.';
+    else if (kept === views.length) detail = 'They will not show here again. Their folders and branches stay on this computer.';
+    else detail = kept ? 'They will not show here again. The folders still on this computer stay there.' : 'They will not show here again.';
+    return this._newConfirm({ kind: 'forget', agentIds: views.map(v => v.id), sentence, detail });
   }
 
   /** Take earlier agents out of history, and off the board. Their folders and branches are not touched. */
   _forgetEarlier(ids) {
     const gone = [];
     const refused = [];
+    let kept = 0;
     for (const id of ids) {
       const v = this.store.get(id);
       if (!v) continue;
+      if (this._busy.has(id)) {
+        refused.push(this._busyReply(v));
+        continue;
+      }
       if (!v.earlier || !this.earlierRecs.has(id)) {
         refused.push(`${v.name} is from this run, so it stays. It is kept for next time.`);
         continue;
       }
+      if (this._folderKept(v)) kept += 1;
       this.earlierRecs.delete(id);
       this.history?.forget(id);
       this.store.remove(id);
@@ -1394,7 +1608,13 @@ export class Engine extends EventEmitter {
     }
     if (gone.length) { try { this.history?.save(); } catch { /* logged by history */ } }
     const parts = [];
-    if (gone.length) parts.push(`Forgot ${joinAnd(gone)}. ${gone.length === 1 ? 'Its folder and branch are' : 'Their folders and branches are'} still on this computer.`);
+    if (gone.length) {
+      // Only what is true: a folder thrown away, or not kept, is not "still on this computer".
+      let tail = '';
+      if (kept === gone.length) tail = ` ${gone.length === 1 ? 'Its folder and branch are' : 'Their folders and branches are'} still on this computer.`;
+      else if (kept) tail = ' The folders still on this computer stay there.';
+      parts.push(`Forgot ${joinAnd(gone)}.${tail}`);
+    }
     parts.push(...refused);
     return { reply: parts.join(' ') || 'There was nothing to forget.', agentIds: [] };
   }
@@ -1427,9 +1647,14 @@ export class Engine extends EventEmitter {
     const root = v.parentId ? this.store.get(v.rootId) : v;
     if (!root) return { ok: false, reply: `I can’t reach ${v.name}.` };
     if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    // Its work is being merged or thrown away: nothing may wake it until that is done.
+    if (this._busy.has(root.id)) return { ok: false, reply: this._busyReply(root) };
+    // Its folder was thrown away, or removed: a message would wake it where nothing is left.
+    if (root.work?.thrownAway) return { ok: false, reply: `${root.name} cannot continue. ${THROWN_REASON}` };
     const message = v.parentId ? `About your helper “${v.name}”: ${text}` : text;
     if (root.earlier && !v.parentId) return this._continueEarlier(root, message);
     const run = this.runs.get(root.id);
+    if (run && run.folderRemoved) return { ok: false, reply: `${root.name} cannot continue. Its folder is gone, so it cannot continue.` };
     if (!run || !run.runner) {
       // An agent the simulator seeded: let the simulator take the message. A message answers a question, but never
       // settles a permission or a stuck ask: as in live mode, where a held request stays held.
@@ -1468,6 +1693,7 @@ export class Engine extends EventEmitter {
     // A turn start resumes done and failed roots by itself, but not stopped ones, and it may come much later (a
     // relaunch): do it now for all.
     if (cur && ENDED.has(cur.state)) this._apply([{ kind: EV.STATE, agentId: root.id, state: STATE.WORKING, reason: null }]);
+    this._clearProblem(root.id); // a merge that did not go through no longer describes work it changes again
     return { ok: true };
   }
 
@@ -1481,6 +1707,9 @@ export class Engine extends EventEmitter {
   }
 
   async _stop(v) {
+    // Its work is being merged or thrown away: that job decides what runs (a throw-away stops it first).
+    const root = v.parentId ? this.store.get(v.rootId) : v;
+    if (root && this._busy.has(root.id)) return { ok: false, reply: this._busyReply(root) };
     if (v.parentId) return this._stopHelper(v);
     if (v.earlier) return { ok: true, reply: `${v.name} is from an earlier run, so nothing is running.` };
     if (!ACTIVE.has(v.state)) {
@@ -1629,7 +1858,16 @@ export class Engine extends EventEmitter {
       factory = (o) => mod.createRunner(o);
       const repo = await this._loadRepo();
       if (typeof this.deps.workspace?.createWorkspace !== 'function') throw plainError('Workbench cannot make workspaces right now.');
-      workspace = await this.deps.workspace.createWorkspace({ repoRoot: repo.root, agentId: id, slug: slugify(agentName) });
+      // The person's branch now: the agent starts from it (null when the folder is not on a branch).
+      let from = repo.branch ?? null;
+      try {
+        from = (await this._freshRepo())?.branch ?? null;
+      } catch (err) {
+        this.log.debug('Could not read the repository before a launch:', err);
+      }
+      const made = await this.deps.workspace.createWorkspace({ repoRoot: repo.root, agentId: id, slug: slugify(agentName) });
+      // `since`: where its unmerged work starts. It is the commit it started from until its first merge.
+      workspace = { path: made.path, branch: made.branch ?? null, base: made.base ?? null, since: made.base ?? null, from };
       if (this._shuttingDown) {
         // Workbench began to close while git made the folder: nothing starts in it, so it goes again. One that cannot
         // go is listed with the other folders that stay (keptFolders), never left unmentioned.
@@ -1649,6 +1887,7 @@ export class Engine extends EventEmitter {
     this.runs.set(id, run);
     this._apply([
       { kind: EV.CREATED, agentId: id, parentId: null, name: agentName, task: text, harness: h, model: mdl, machineId: mach, budgetUsd: budget, workspace: workspace?.path ?? null },
+      ...(workspace ? [{ kind: EV.WORK, agentId: id, work: { branch: workspace.branch, from: workspace.from, folder: true, merged: null, problem: null, thrownAway: null } }] : []),
       { kind: EV.STATE, agentId: id, state: STATE.STARTING, reason: null },
     ]);
     try {
@@ -1689,10 +1928,16 @@ export class Engine extends EventEmitter {
     const ws = run && run.workspace;
     if (!ws || run.folderRemoved || !this.repoInfo || typeof this.deps.workspace?.removeWorkspace !== 'function') return false;
     try {
+      // Unchanged since its last merge (or since it started): a merged agent that did nothing more goes too.
       const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace({
-        repoRoot: this.repoInfo.root, path: ws.path, base: ws.base, onlyIfUnchanged: true, deleteBranch: true,
+        repoRoot: this.repoInfo.root, path: ws.path, base: sinceOf(ws), onlyIfUnchanged: true, deleteBranch: true,
       })), this.options.stopTimeoutMs);
-      if (out?.removed) run.folderRemoved = true;
+      if (out?.removed) {
+        run.folderRemoved = true;
+        // Its folder and branch went with nothing in them: the view says so too.
+        const w = this.store.get(run.id)?.work;
+        if (w) this._apply([{ kind: EV.WORK, agentId: run.id, work: { ...w, folder: false, branch: null } }]);
+      }
       return !!out?.removed;
     } catch (err) {
       this.log.warn(`Could not tidy up the folder of ${run.id}:`, err);
@@ -1739,13 +1984,57 @@ export class Engine extends EventEmitter {
     return this.repoInfo;
   }
 
+  /** Every 15 s: the repository as it is now (fire and forget, one at a time). */
   _refreshRepo() {
+    if (!this.repoInfo?.root || typeof this.deps.workspace?.prepareRepo !== 'function' || this._repoReading) return;
+    const reading = this._freshRepo()
+      .catch(err => this.log.debug('Could not refresh the repo status:', err))
+      .finally(() => { if (this._repoReading === reading) this._repoReading = null; });
+    this._repoReading = reading;
+  }
+
+  /**
+   * Read the repository as it is now (its branch, head and uncommitted changes, and whether git knows the person's
+   * name and email), keep it, and tell the page when that changed. Rejects when git cannot read it.
+   */
+  async _freshRepo() {
     const root = this.repoInfo?.root;
-    if (!root || typeof this.deps.workspace?.prepareRepo !== 'function') return;
-    Promise.resolve()
-      .then(() => this.deps.workspace.prepareRepo(root))
-      .then((info) => { if (info && info.root) this.repoInfo = info; })
-      .catch(err => this.log.debug('Could not refresh the repo status:', err));
+    if (!root || typeof this.deps.workspace?.prepareRepo !== 'function') return this.repoInfo;
+    const info = await this.deps.workspace.prepareRepo(root);
+    if (!info || !info.root) return this.repoInfo;
+    const identity = await this._readIdentity(info.root);
+    this._setRepo(info, identity);
+    return this.repoInfo;
+  }
+
+  /** Does git know the person's name and email (gitIdentity)? null when this cannot be told. */
+  async _readIdentity(root) {
+    if (typeof this.deps.workspace?.gitIdentity !== 'function') return null;
+    try {
+      const id = await this.deps.workspace.gitIdentity({ repoRoot: root });
+      return !!(id && typeof id === 'object' && id.name && id.email);
+    } catch (err) {
+      this.log.debug('Could not read the git identity:', err);
+      return this.repoIdentity; // keep what was known
+    }
+  }
+
+  /** Keep the repository's facts; the store tells the page ('repo') when what it shows has changed. */
+  _setRepo(info, identity = this.repoIdentity) {
+    this.repoInfo = info;
+    this.repoIdentity = identity ?? null;
+    const view = this._repoView();
+    const key = JSON.stringify(view);
+    if (key === this._repoKey) return;
+    this._repoKey = key;
+    try { this.store.repoChanged?.(view); } catch (err) { this.log.warn('Could not pass on the repository:', err); }
+  }
+
+  /** The repository as the page sees it: { name, head, branch, dirty, identity }. */
+  _repoView() {
+    const r = this.repoInfo;
+    if (!r) return null;
+    return { name: r.name ?? null, head: r.head ?? null, branch: r.branch ?? null, dirty: r.dirty ?? 0, identity: this.repoIdentity === true };
   }
 
   async _checkHarnesses() {
@@ -1772,6 +2061,712 @@ export class Engine extends EventEmitter {
     }
     const ok = (h) => !!this.adapters[h] && this.harnessInfo[h]?.ok !== false;
     return { claude: ok('claude'), codex: ok('codex'), sim: false };
+  }
+
+  // ================================================================ source control: changes, the graph, merge, throw away
+
+  /** A root, from its own id or a helper's (a helper works in its agent's folder). */
+  _rootOf(agentId) {
+    const v = typeof agentId === 'string' && agentId ? this.store.get(agentId) : null;
+    if (!v) return null;
+    return v.parentId ? this.store.get(v.rootId) : v;
+  }
+
+  /**
+   * Where a root's work is: this run's run.workspace ({ path, branch, base, since, from }), or an earlier agent's saved
+   * one. `removed`: Workbench removed its folder (thrown away, or tidied with nothing in it). null when it has none
+   * (the demo, a launch that never got a folder).
+   */
+  _workspaceOf(v) {
+    const run = this.runs.get(v.id);
+    if (run && run.workspace) return { ws: run.workspace, run, rec: null, removed: !!run.folderRemoved };
+    const rec = v.earlier ? this.earlierRecs.get(v.id) : null;
+    if (rec) return { ws: rec.workspace || null, run: null, rec, removed: !rec.workspace };
+    return null;
+  }
+
+  /**
+   * At work now: an active state, its receipt being built (it stays working meanwhile), or being picked up again.
+   * A stopped or finished root is not, even if its last turn never reported its end.
+   */
+  _isWorking(v) {
+    if (ACTIVE.has(v.state) || this._resuming.has(v.id)) return true;
+    const run = this.runs.get(v.id);
+    return !!(run && (run.deciding || run.receipt));
+  }
+
+  /** Why nothing else can happen to a root while its work is merged or thrown away. */
+  _busyReply(v) {
+    return this._busy.get(v.id) === 'discard' ? `${v.name}’s work is being thrown away now.` : `${v.name} is being merged now.`;
+  }
+
+  /** The view's work, or a blank one to build on. */
+  _workNow(v) {
+    const w = v?.work && typeof v.work === 'object' ? v.work : null;
+    return w || { branch: null, from: null, folder: false, merged: null, problem: null, thrownAway: null };
+  }
+
+  /** A merge that did not go through no longer describes the work (a turn starts, a message is taken): it goes. */
+  _clearProblem(agentId) {
+    const v = this.store.get(agentId);
+    if (!v || v.parentId || !v.work?.problem) return;
+    this._apply([{ kind: EV.WORK, agentId, work: { ...v.work, problem: null } }]);
+  }
+
+  /** Its folder turned out to be gone: its view says so. */
+  _markFolderGone(v) {
+    const w = this.store.get(v.id)?.work;
+    if (w && w.folder) this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...w, folder: false } }]);
+  }
+
+  /**
+   * Why a root has no work here to show, merge or throw away, in plain words; null when it has. `verb`: "show",
+   * "merge" or "throw away".
+   */
+  _noWorkReply(v, verb) {
+    if (v.work?.thrownAway) return verb === 'throw away' ? `${v.name}’s work was already thrown away.` : `${v.name}’s work was thrown away, so there is nothing to ${verb}.`;
+    const where = this._workspaceOf(v);
+    if (!where?.ws || where.removed || !folderThere(where.ws.path)) {
+      if (where?.ws && !where.removed) this._markFolderGone(v);
+      return `Its folder is gone, so there is nothing to ${verb}.`;
+    }
+    return null;
+  }
+
+  /**
+   * One git job at a time, engine-wide, whatever became of the one before: every merge touches the person's own folder,
+   * and two at once would race for it. Shutdown waits for the jobs under way (_gitWork).
+   */
+  _gitJob(fn) {
+    const job = this._gitChain.then(() => fn());
+    this._gitChain = job.then(() => {}, () => {});
+    this._gitWork.add(job);
+    const done = () => this._gitWork.delete(job);
+    job.then(done, done);
+    return job;
+  }
+
+  /** The simulator, when it has this optional method (demo mode only). */
+  _simWith(name) {
+    const sim = this.mode === 'demo' ? this.adapters.sim : null;
+    return sim && typeof sim[name] === 'function' ? sim : null;
+  }
+
+  // ---------------------------------------------------------------- what an agent changed
+
+  /**
+   * What a root changed that is not merged yet, as a diff for people to read (GET /api/agents/:id/changes). Read-only:
+   * it takes no lock, posts no notice and works in any state. `live`: the agent is at work, so its work may still
+   * change. A helper's id gives its agent's changes.
+   * @returns {Promise<{ ok: true, agentId: string, name: string, branch: string|null, into: string|null, live: boolean, diff: object } | { ok: false, reply: string }>}
+   */
+  async changes(agentId) {
+    const v = this._rootOf(String(agentId ?? ''));
+    if (!v) return { ok: false, reply: 'I can’t find that agent.' };
+    if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    const live = this._isWorking(v);
+    if (this.mode === 'demo') return this._simChanges(v, live);
+    const gone = this._noWorkReply(v, 'show');
+    if (gone) return { ok: false, reply: gone };
+    if (typeof this.deps.workspace?.workDiff !== 'function' || !this.repoInfo) return { ok: false, reply: 'Workbench cannot show changes right now.' };
+    const ws = this._workspaceOf(v).ws;
+    let diff;
+    try {
+      diff = await this.deps.workspace.workDiff({ repoRoot: this.repoInfo.root, path: ws.path, since: sinceOf(ws) });
+    } catch (err) {
+      this.log.warn(`Could not read the changes of ${v.id}:`, err);
+      diff = null;
+    }
+    if (!diff || diff.ok === false || !Array.isArray(diff.files)) return { ok: false, reply: `Workbench could not read ${v.name}’s changes.` };
+    return { ok: true, agentId: v.id, name: v.name, branch: ws.branch ?? null, into: this.repoInfo.branch ?? null, live, diff };
+  }
+
+  /** "what did search cleanup change": the page opens the git screen on that agent (`review`). */
+  _reviewReply(v) {
+    if (this.mode === 'demo') {
+      if (!this._simWith('changes')) return { reply: 'This is the demo, so there are no real changes to show.', focusId: v.id };
+    } else {
+      const gone = this._noWorkReply(v, 'show');
+      if (gone) return { reply: gone, focusId: v.id };
+    }
+    return { reply: `Here is what ${v.name} changed.`, review: v.id, focusId: v.id };
+  }
+
+  // ---------------------------------------------------------------- the git screen
+
+  /**
+   * The git screen's data (GET /api/git): the repository as it is now, its commits newest first (workspace.gitGraph),
+   * and every root with a branch, this run's and earlier ones. Read-only. The demo shows the simulator's graph.
+   * @returns {Promise<{ ok: true, repo: object, commits: object[], more: boolean, agents: object[] } | { ok: false, reply: string }>}
+   */
+  async gitGraph() {
+    if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    if (this.mode === 'demo') return this._simGraph();
+    if (typeof this.deps.workspace?.gitGraph !== 'function' || !this.repoInfo) return { ok: false, reply: 'Workbench cannot show the git history right now.' };
+    try {
+      await this._freshRepo(); // the uncommitted changes and the identity, as they are now
+    } catch (err) {
+      this.log.debug('Could not refresh the repo status:', err);
+    }
+    let g;
+    try {
+      g = await this.deps.workspace.gitGraph({ repoRoot: this.repoInfo.root });
+    } catch (err) {
+      this.log.warn('Could not read the git history:', err);
+      g = null;
+    }
+    if (!g || g.ok === false || !Array.isArray(g.commits)) return { ok: false, reply: 'Workbench could not read the git history.' };
+    const repo = this._repoView();
+    // The head and branch the graph was read at, so the commits and the top band agree.
+    if (typeof g.head === 'string' && g.head) repo.head = g.head;
+    if (Object.hasOwn(g, 'branch')) repo.branch = typeof g.branch === 'string' && g.branch ? g.branch : null;
+    return { ok: true, repo, commits: g.commits, more: !!g.more, agents: this._graphAgents() };
+  }
+
+  /** Every root with a branch, this run's and earlier ones: { id, name, state, earlier, harness, branch, from, base, since, files, work }. */
+  _graphAgents() {
+    const out = [];
+    for (const v of this.store.list()) {
+      if (v.parentId || v.work?.thrownAway) continue;
+      const ws = this._workspaceOf(v)?.ws;
+      const branch = v.work ? v.work.branch : ws?.branch;
+      if (!ws || !branch) continue;
+      out.push({
+        id: v.id, name: v.name, state: v.state, earlier: !!v.earlier, harness: v.harness, branch,
+        from: ws.from ?? v.work?.from ?? null, base: ws.base ?? null, since: sinceOf(ws), files: v.files ?? null, work: v.work ?? null,
+      });
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------- merge
+
+  /**
+   * Ask before merging a root's work into the person's branch (POST /api/agents/:id/merge): a confirm card, never a
+   * merge by itself. `state`: the state the page drew the button for (null: not checked).
+   * @returns {Promise<{ ok: true, reply: string, confirm: object } | { ok: false, reply: string }>}
+   */
+  async proposeMerge(agentId, { state = null } = {}) {
+    const out = await this._proposeMerge(this.store.get(String(agentId ?? '')), { state });
+    if (!out.confirm) this._notice(out.reply, typeof agentId === 'string' ? agentId : null);
+    return out;
+  }
+
+  /**
+   * Why a root cannot be merged right now, as a refusal; null when it can, as far as Workbench knows before asking git.
+   * `ownJob`: asked by the merge job itself, which holds the busy flag.
+   */
+  _mergeRefusal(v, { state = null, ownJob = false } = {}) {
+    if (!v) return { ok: false, reply: 'I can’t find that agent.' };
+    if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    if (v.parentId) return { ok: false, reply: 'Helpers work in their agent’s folder. Merge the agent instead.' };
+    if (!ownJob && this._busy.has(v.id)) return { ok: false, reply: this._busyReply(v) };
+    if (this._isWorking(v)) return { ok: false, reply: `${v.name} is still working. Merge it when it is done.` };
+    if (state && state !== v.state) return { ok: false, reply: 'That changed. Have another look.' };
+    if (this.mode === 'demo') return v.work?.thrownAway ? { ok: false, reply: `${v.name}’s work was thrown away, so there is nothing to merge.` } : null;
+    const gone = this._noWorkReply(v, 'merge');
+    return gone ? { ok: false, reply: gone } : null;
+  }
+
+  async _proposeMerge(v, { state = null, into = null } = {}) {
+    const pre = this._mergeRefusal(v, { state });
+    if (pre) return pre;
+    if (this.mode === 'demo') return this._simProposeMerge(v);
+    const W = this.deps.workspace;
+    if (typeof W?.snapshotWork !== 'function' || typeof W?.mergeWork !== 'function' || !this.repoInfo) {
+      return { ok: false, reply: 'Workbench cannot merge work right now.' };
+    }
+    const where = this._workspaceOf(v);
+    const ws = where.ws;
+    let repo;
+    try {
+      repo = await this._freshRepo(); // the branch, head and uncommitted changes as they are now, never 15 s old
+    } catch (err) {
+      this.log.warn('Could not read the repository:', err);
+      return { ok: false, reply: 'Workbench could not read your folder, so it cannot merge right now.' };
+    }
+    if (!repo?.branch) return { ok: false, reply: mergeSentence('detached') };
+    if (into && into !== repo.branch) {
+      return { ok: false, reply: `Workbench merges into the branch your folder is on, which is ${repo.branch}. Switch to ${quotable(into, 60)} first to merge there.` };
+    }
+    if (this.repoIdentity === false) return { ok: false, reply: mergeSentence('identity') };
+    let snap;
+    try {
+      snap = await W.snapshotWork({ repoRoot: repo.root, path: ws.path, since: sinceOf(ws) });
+    } catch (err) {
+      this.log.warn(`Could not read the work of ${v.id}:`, err);
+      snap = null;
+    }
+    // It may have moved on while git read it.
+    const cur = this.store.get(v.id);
+    const again = this._mergeRefusal(cur, { state });
+    if (again) return again;
+    if (!snap || snap.ok === false || typeof snap.workId !== 'string' || !snap.workId) {
+      return { ok: false, reply: `Workbench could not read ${v.name}’s work, so it cannot be merged right now.` };
+    }
+    if (!snap.changed) return { ok: false, reply: mergeSentence('nothing', { name: v.name, into: repo.branch }) };
+    const files = Array.isArray(snap.files) ? snap.files : [];
+    const broken = await this._brokenRules(cur, where, files);
+    const detail = this._mergeDetail(cur, { files, left: snap.left, broken, into: repo.branch, dirty: repo.dirty });
+    return this._newConfirm({
+      kind: 'merge', agentId: v.id, state: cur.state,
+      expect: { workId: snap.workId, into: repo.branch, intoHead: repo.head },
+      sentence: `Merge ${v.name} into ${repo.branch}?`, detail, yes: 'Merge', no: 'Cancel', danger: false,
+    });
+  }
+
+  /** The rules its work breaks now: workbench.json from the commit it started from, against the files it would merge. */
+  async _brokenRules(v, where, files) {
+    const paths = files.map(f => f?.path).filter(p => typeof p === 'string');
+    try {
+      const config = (where.run ? await where.run.config : await this._loadConfig(where.ws)) || DEFAULT_CONFIG;
+      if (!Array.isArray(config.rules) || !config.rules.length) return [];
+      if (typeof this.deps.receipt?.checkRules === 'function') {
+        const r = await this.deps.receipt.checkRules(config.rules, paths);
+        return Array.isArray(r?.broken) ? r.broken : [];
+      }
+    } catch (err) {
+      this.log.warn('Could not check the rules:', err);
+    }
+    return Array.isArray(v.rules?.broken) ? v.rules.broken : [];
+  }
+
+  /** The merge card's detail: the counts first, then what the person should know before it merges. */
+  _mergeDetail(v, { files, left, broken, into, dirty }) {
+    const n = countFiles(files);
+    const parts = [`${countsText(n.files, n.adds, n.dels)}. Its work becomes a commit on its branch, joined into ${into} by a merge commit.`];
+    const checks = v.checks;
+    if (checks?.state === 'failed') {
+      const failed = (Array.isArray(checks.results) ? checks.results : []).filter(r => r && !r.ok).map(r => String(r.name));
+      parts.push(failed.length > 1 ? `${failed.length} checks failed: ${joinAnd(failed)}.` : `A check failed: ${failed[0] || 'one of its checks'}.`);
+    } else if (checks?.state !== 'passed') {
+      parts.push('Nothing checked its work.');
+    }
+    const says = (Array.isArray(broken) ? broken : []).map(b => unend(b?.say)).filter(Boolean);
+    if (says.length === 1) parts.push(`It broke a rule you set: ${says[0]}.`);
+    else if (says.length > 1) parts.push(`It broke ${says.length} rules you set: ${joinAnd(says)}.`);
+    // Files that change what later agents and Claude Code itself may do, once they are in the person's branch.
+    const paths = files.map(f => String(f?.path ?? ''));
+    if (paths.includes('workbench.json')) parts.push('It changes workbench.json, which sets the checks for later agents.');
+    if (paths.some(p => /(^|\/)\.claude(\/|$)/i.test(p))) parts.push('It changes .claude/, which holds Claude Code’s settings for this repository.');
+    if (paths.some(p => /(^|\/)\.mcp\.json$/i.test(p))) parts.push('It changes .mcp.json, which can give Claude Code new tools here.');
+    const list = Array.isArray(left) ? left : [];
+    const ignored = list.filter(l => l?.why === 'ignored').length;
+    const nested = list.filter(l => l?.why === 'nested-repo').length;
+    if (ignored) parts.push(`${ignored} file${ignored === 1 ? ' stays' : 's stay'} out: hidden by a .gitignore.`);
+    if (nested) parts.push(nested === 1 ? '1 folder stays out: it is a git repository of its own.' : `${nested} folders stay out: each is a git repository of its own.`);
+    const d = count(dirty);
+    if (d) parts.push(`Your ${d} uncommitted change${d === 1 ? ' stays as it is' : 's stay as they are'}.`);
+    return parts.join(' ');
+  }
+
+  /** Yes to a merge card: everything is checked again, then the merge runs as one git job, the agent busy throughout. */
+  async _mergeConfirmed(c) {
+    const v = this.store.get(c.agentId);
+    if (c.demo) return this._simMerge(v, c);
+    const pre = this._mergeRefusal(v);
+    if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
+    if (typeof this.deps.workspace?.mergeWork !== 'function' || !this.repoInfo) return { reply: 'Workbench cannot merge work right now.', focusId: v.id };
+    this._busy.set(v.id, 'merge');
+    try {
+      return await this._gitJob(() => this._runMerge(v.id, c));
+    } finally {
+      this._busy.delete(v.id);
+    }
+  }
+
+  async _runMerge(id, c) {
+    let v = this.store.get(id);
+    const pre = this._mergeRefusal(v, { ownJob: true }); // again: it waited for the jobs before it
+    if (pre) return { reply: pre.reply, focusId: id };
+    const where = this._workspaceOf(v);
+    const ws = where.ws;
+    const run = where.run;
+    // Nothing may write in its folder while git takes its work: close its idle process (and what it left running), and
+    // let stopped checks end. It cannot start a turn by itself after this: _closeIdle marks it stopped first.
+    await this._closeIdle(v);
+    if (run?.checksDone) await run.checksDone;
+    if (run && this._runnerInfo(run)?.alive === true) return { reply: `Workbench could not pause ${v.name}, so nothing was merged.`, focusId: id };
+    v = this.store.get(id);
+    const again = this._mergeRefusal(v, { ownJob: true });
+    if (again) return { reply: again.reply, focusId: id };
+    let res;
+    try {
+      res = await this.deps.workspace.mergeWork({
+        repoRoot: this.repoInfo.root, path: ws.path, branch: ws.branch, since: sinceOf(ws),
+        expect: { workId: c.expect.workId, into: c.expect.into, intoHead: c.expect.intoHead },
+        message: { subject: commitSubject(v.task, `Work by ${v.name}`), body: commitBody(v.says), name: v.name },
+        agentId: v.id, harness: v.harness,
+      });
+    } catch (err) {
+      this.log.error(`The merge of ${id} failed:`, err);
+      res = { ok: false, why: 'git', unexpected: true };
+    }
+    // Whatever happened, read the person's folder again: its branch may have moved, and the page should hear of it.
+    try {
+      await this._freshRepo();
+    } catch (err) {
+      this.log.debug('Could not refresh the repo status:', err);
+    }
+    v = this.store.get(id) || v;
+    return res?.ok === true ? this._merged(v, where, res, c) : this._mergeFailed(v, res, c);
+  }
+
+  /** The merge went through: record it, and count its work from the merged work commit (W) from now on. */
+  _merged(v, where, res, c) {
+    const into = (typeof res.into === 'string' && res.into) || c.expect.into;
+    const W = typeof res.work === 'string' && res.work ? res.work : null;
+    const files = Array.isArray(res.files) ? res.files.length : count(res.files);
+    const merged = { into, merge: typeof res.merge === 'string' ? res.merge : null, at: this.now(), files, adds: count(res.adds), dels: count(res.dels) };
+    if (W && where.run) where.run.workspace.since = W;
+    if (!W) this.log.warn(`The merge of ${v.id} did not say which work commit it merged; its changes are still counted from before.`);
+    this._apply([
+      { kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), merged, problem: null } },
+      { kind: EV.FILES, agentId: v.id, files: { ...NO_FILES, list: [] } }, // nothing is left unmerged
+    ]);
+    if (where.rec) this._replaceEarlier(v.id, { ...where.rec.workspace, ...(W ? { since: W } : {}) });
+    try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
+    return { reply: `Merged ${v.name} into ${into}.`, focusId: v.id };
+  }
+
+  /** The merge did not go through: say why, and keep the reason on the agent when it is worth acting on. */
+  _mergeFailed(v, res, c) {
+    const why = MERGE_WHYS.has(res?.why) ? res.why : 'git';
+    const paths = (Array.isArray(res?.paths) ? res.paths : []).filter(p => typeof p === 'string' && p);
+    const sentence = res?.unexpected
+      ? 'Something went wrong during the merge. Have a look at your folder before you try again.'
+      : mergeSentence(why, { name: v.name, into: c.expect.into, paths });
+    if (PROBLEM_WHYS.has(why)) {
+      this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), problem: { why, sentence, paths: paths.slice(0, 50), at: this.now() } } }]);
+    } else if (why === 'gone') {
+      this._markFolderGone(v);
+    }
+    return { reply: sentence, focusId: v.id };
+  }
+
+  // ---------------------------------------------------------------- throw away
+
+  /**
+   * Ask before throwing a root's work away (POST /api/agents/:id/discard): a confirm card. An agent at work is stopped
+   * first, and the card says so. `state`: the state the page drew the button for (null: not checked).
+   * @returns {Promise<{ ok: true, reply: string, confirm: object } | { ok: false, reply: string }>}
+   */
+  async proposeDiscard(agentId, { state = null } = {}) {
+    const out = await this._proposeDiscard(this.store.get(String(agentId ?? '')), { state });
+    if (!out.confirm) this._notice(out.reply, typeof agentId === 'string' ? agentId : null);
+    return out;
+  }
+
+  /** Why a root's work cannot be thrown away right now; null when it can. */
+  _discardRefusal(v, { state = null, ownJob = false } = {}) {
+    if (!v) return { ok: false, reply: 'I can’t find that agent.' };
+    if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    if (v.parentId) return { ok: false, reply: 'Helpers work in their agent’s folder. Throw away the agent’s work instead.' };
+    if (!ownJob && this._busy.has(v.id)) return { ok: false, reply: this._busyReply(v) };
+    if (this._resuming.has(v.id)) return { ok: false, reply: `${v.name} is already being picked up.` };
+    if (state && state !== v.state) return { ok: false, reply: 'That changed. Have another look.' };
+    if (this.mode === 'demo') return v.work?.thrownAway ? { ok: false, reply: `${v.name}’s work was already thrown away.` } : null;
+    const gone = this._noWorkReply(v, 'throw away');
+    return gone ? { ok: false, reply: gone } : null;
+  }
+
+  async _proposeDiscard(v, { state = null } = {}) {
+    const pre = this._discardRefusal(v, { state });
+    if (pre) return pre;
+    if (this.mode === 'demo') return this._simProposeDiscard(v);
+    const W = this.deps.workspace;
+    if (typeof W?.snapshotWork !== 'function' || typeof W?.discardWork !== 'function' || !this.repoInfo) {
+      return { ok: false, reply: 'Workbench cannot throw away work right now.' };
+    }
+    const ws = this._workspaceOf(v).ws;
+    let snap;
+    try {
+      snap = await W.snapshotWork({ repoRoot: this.repoInfo.root, path: ws.path, since: sinceOf(ws) });
+    } catch (err) {
+      this.log.warn(`Could not read the work of ${v.id}:`, err);
+      snap = null;
+    }
+    const cur = this.store.get(v.id);
+    const again = this._discardRefusal(cur, { state });
+    if (again) return again;
+    if (!snap || snap.ok === false || typeof snap.workId !== 'string' || !snap.workId) {
+      return { ok: false, reply: `Workbench could not read ${v.name}’s work, so nothing was thrown away.` };
+    }
+    const n = Array.isArray(snap.files) ? snap.files.length : 0;
+    const active = this._isWorking(cur);
+    const parts = [`Its folder and ${ws.branch ? `its branch ${ws.branch}` : 'its branch'} are deleted, with ${n ? `${n} changed file${n === 1 ? '' : 's'}` : 'no changed files'}. Workbench keeps a hidden copy in git.`];
+    const left = leftOutWords(snap.left);
+    if (left) parts.push(left);
+    if (active) parts.push('It is still working: it will be stopped first.');
+    return this._newConfirm({
+      kind: 'discard', agentId: v.id, state: cur.state, active, expect: { workId: snap.workId },
+      sentence: `Throw away ${v.name}’s work?`, detail: parts.join(' '), yes: 'Throw it away', no: 'Keep it', danger: true,
+    });
+  }
+
+  /** Yes to a throw-away card: everything is checked again; it runs as one git job, the agent busy throughout. */
+  async _discardConfirmed(c) {
+    const v = this.store.get(c.agentId);
+    if (c.demo) return this._simDiscard(v, c);
+    const pre = this._discardRefusal(v);
+    if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
+    // The card said whether it was working. One that went back to work since was not described: look again.
+    if (!c.active && this._isWorking(v)) return { reply: 'That changed. Have another look.', focusId: v.id };
+    if (typeof this.deps.workspace?.discardWork !== 'function' || !this.repoInfo) return { reply: 'Workbench cannot throw away work right now.', focusId: v.id };
+    this._busy.set(v.id, 'discard');
+    try {
+      return await this._gitJob(() => this._runDiscard(v.id, c));
+    } finally {
+      this._busy.delete(v.id);
+    }
+  }
+
+  async _runDiscard(id, c) {
+    let v = this.store.get(id);
+    const pre = this._discardRefusal(v, { ownJob: true });
+    if (pre) return { reply: pre.reply, focusId: id };
+    const where = this._workspaceOf(v);
+    const ws = where.ws;
+    const run = where.run;
+    // Nothing may write in its folder while it goes: stop it (as the card said) or close its idle process, and let
+    // stopped checks end. Stopping it says no to its held requests, its helpers' too.
+    if (this._isWorking(v)) {
+      if (!c.active) return { reply: 'That changed. Have another look.', focusId: id };
+      await this._stopRoot(v, 'Stopped by you');
+    } else {
+      await this._closeIdle(v);
+    }
+    if (run?.checksDone) await run.checksDone;
+    // A process that will not stop may still be writing there: its folder stays.
+    if (run && this._runnerInfo(run)?.alive === true) return { reply: `Workbench could not stop ${v.name}, so its work was not thrown away.`, focusId: id };
+    v = this.store.get(id) || v;
+    const again = this._discardRefusal(v, { ownJob: true });
+    if (again) return { reply: again.reply, focusId: id };
+    const W = this.deps.workspace;
+    let expect = { workId: c.expect.workId };
+    if (c.active) {
+      // The card was made while it worked and said it would be stopped first: what it holds once stopped is what goes
+      // (into the hidden copy).
+      let snap = null;
+      try {
+        snap = await W.snapshotWork({ repoRoot: this.repoInfo.root, path: ws.path, since: sinceOf(ws) });
+      } catch (err) {
+        this.log.warn(`Could not read the work of ${id}:`, err);
+      }
+      if (!snap || snap.ok === false || typeof snap.workId !== 'string' || !snap.workId) {
+        return { reply: `Workbench could not read ${v.name}’s work, so nothing was thrown away.`, focusId: id };
+      }
+      expect = { workId: snap.workId };
+    }
+    let res;
+    try {
+      res = await W.discardWork({ repoRoot: this.repoInfo.root, path: ws.path, branch: ws.branch, since: sinceOf(ws), expect, agentId: id });
+    } catch (err) {
+      this.log.error(`Throwing away the work of ${id} failed:`, err);
+      res = { ok: false, why: 'git', unexpected: true };
+    }
+    v = this.store.get(id) || v;
+    if (res?.ok === true) return this._thrownAway(v, where, res);
+    let reply;
+    if (res?.unexpected) reply = `Something went wrong while throwing away ${v.name}’s work. The details are in the log.`;
+    else if (res?.why === 'changed') reply = `${v.name}’s work changed since you looked. Have another look.`;
+    else if (res?.why === 'gone') reply = 'Its folder is gone, so there is nothing to throw away.';
+    else if (typeof res?.sentence === 'string' && res.sentence.trim()) reply = res.sentence.trim(); // the workspace's own plain words
+    else reply = `Git could not throw away ${v.name}’s work.`;
+    if (!folderThere(ws.path)) this._markFolderGone(v); // a failure part-way may have taken the folder already
+    return { reply, focusId: id };
+  }
+
+  /** Its work is thrown away: its folder and branch are gone, and a hidden ref keeps a copy. */
+  _thrownAway(v, where, res) {
+    const saved = typeof res.saved === 'string' && res.saved ? res.saved : null;
+    if (where.run) where.run.folderRemoved = true; // out of keptFolders and the tidy; follow-ups are refused
+    this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), branch: null, folder: false, problem: null, thrownAway: { at: this.now(), saved } } }]);
+    if (where.rec) {
+      this._replaceEarlier(v.id, null); // its record keeps no folder from now on
+      this.store.markContinue(v.id, { ok: false, reason: THROWN_REASON });
+    }
+    try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
+    return { reply: `Threw away ${v.name}’s work. Its folder and branch are gone.`, focusId: v.id };
+  }
+
+  // ---------------------------------------------------------------- the demo (the simulator's optional methods)
+
+  /** The demo's branch for an agent's work: where it was merged, where it started, else main. */
+  _demoInto(v) {
+    return v.work?.merged?.into || v.work?.from || 'main';
+  }
+
+  /** A demo agent's work, or one to build on (a seeded agent the simulator gave none). */
+  _demoWork(v, into) {
+    return v.work && typeof v.work === 'object' ? v.work : { branch: null, from: into, folder: true, merged: null, problem: null, thrownAway: null };
+  }
+
+  /** The counts a demo card shows: from the simulator's answer, else from the agent's own card. */
+  _demoCounts(res, v) {
+    const f = res?.files;
+    if (Array.isArray(f)) return countFiles(f);
+    if (f && typeof f === 'object') return { files: count(f.changed ?? f.files), adds: count(f.adds), dels: count(f.dels) };
+    if (f != null && Number.isFinite(Number(f))) return { files: count(f), adds: count(res.adds), dels: count(res.dels) };
+    const vf = v.files;
+    return vf ? { files: count(vf.changed), adds: count(vf.adds), dels: count(vf.dels) } : { files: 0, adds: 0, dels: 0 };
+  }
+
+  async _simChanges(v, live) {
+    const sim = this._simWith('changes');
+    if (!sim) return { ok: false, reply: 'This is the demo, so there are no real changes to show.' };
+    let res;
+    try {
+      res = await sim.changes(v.id);
+    } catch (err) {
+      this.log.warn('The simulator could not show changes:', err);
+      res = null;
+    }
+    // The simulator answers with a diff (workDiff's shape), or with { diff, branch?, into? }.
+    const diff = res && Array.isArray(res.files) ? res : (res?.diff && Array.isArray(res.diff.files) ? res.diff : null);
+    if (!diff) return { ok: false, reply: (typeof res?.reply === 'string' && res.reply) || `The demo has no changes to show for ${v.name}.` };
+    return { ok: true, agentId: v.id, name: v.name, branch: res.branch ?? v.work?.branch ?? null, into: res.into ?? this._demoInto(v), live, diff };
+  }
+
+  async _simGraph() {
+    const sim = this._simWith('gitGraph');
+    if (!sim) return { ok: false, reply: 'This is the demo, so there is no git history to show.' };
+    let g;
+    try {
+      g = await sim.gitGraph();
+    } catch (err) {
+      this.log.warn('The simulator could not draw its git history:', err);
+      g = null;
+    }
+    if (!g || g.ok === false || !Array.isArray(g.commits)) return { ok: false, reply: (typeof g?.reply === 'string' && g.reply) || 'The demo could not show its git history.' };
+    // The simulator answers in the engine's shape ({ repo, commits, more, agents }) or in workspace.gitGraph's
+    // ({ head, branch, commits, more }).
+    const r = g.repo && typeof g.repo === 'object' ? g.repo : {};
+    const repo = {
+      name: r.name ?? g.name ?? 'demo',
+      branch: r.branch !== undefined ? r.branch : (g.branch !== undefined ? g.branch : 'main'),
+      head: r.head ?? g.head ?? g.commits[0]?.id ?? null,
+      dirty: count(r.dirty),
+      identity: r.identity !== false,
+    };
+    const agents = Array.isArray(g.agents) ? g.agents : this.store.list()
+      .filter(v => !v.parentId && v.work?.branch && !v.work.thrownAway)
+      .map(v => ({ id: v.id, name: v.name, state: v.state, earlier: !!v.earlier, harness: v.harness, branch: v.work.branch, from: v.work.from ?? null, base: null, since: null, files: v.files ?? null, work: v.work }));
+    return { ok: true, repo, commits: g.commits, more: !!g.more, agents };
+  }
+
+  async _simProposeMerge(v) {
+    const sim = this._simWith('merge');
+    if (!sim) return { ok: false, reply: 'This is the demo, so nothing is really merged.' };
+    let res = null;
+    if (typeof sim.proposeMerge === 'function') {
+      try {
+        res = await sim.proposeMerge(v.id);
+      } catch (err) {
+        this.log.warn('The simulator could not propose a merge:', err);
+        return { ok: false, reply: `The demo could not merge ${v.name}.` };
+      }
+      if (res && res.ok === false) {
+        return { ok: false, reply: (typeof res.reply === 'string' && res.reply) || (typeof res.sentence === 'string' && res.sentence) || 'This is the demo, so nothing is really merged.' };
+      }
+      const again = this._mergeRefusal(this.store.get(v.id));
+      if (again) return again;
+    }
+    const into = (typeof res?.into === 'string' && res.into) || this._demoInto(v);
+    const n = this._demoCounts(res, v);
+    const detail = (typeof res?.detail === 'string' && res.detail)
+      || `${countsText(n.files, n.adds, n.dels)}. Its work becomes a commit on its branch, joined into ${into} by a merge commit. This is the demo, so nothing is really merged.`;
+    return this._newConfirm({
+      kind: 'merge', demo: true, agentId: v.id, state: v.state, expect: { into },
+      sentence: `Merge ${v.name} into ${into}?`, detail, yes: 'Merge', no: 'Cancel', danger: false,
+    });
+  }
+
+  async _simMerge(v, c) {
+    const pre = this._mergeRefusal(v);
+    if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
+    const sim = this._simWith('merge');
+    if (!sim) return { reply: 'This is the demo, so nothing is really merged.', focusId: v.id };
+    this._busy.set(v.id, 'merge');
+    try {
+      const before = { work: v.work, files: v.files };
+      const counts = this._demoCounts(null, v);
+      let res;
+      try {
+        res = await sim.merge(v.id);
+      } catch (err) {
+        this.log.warn('The simulator could not merge:', err);
+        return { reply: `The demo could not merge ${v.name}.`, focusId: v.id };
+      }
+      const cur = this.store.get(v.id) || v;
+      // The simulator may record the outcome itself, with the same events: then it is not recorded twice.
+      const workRecorded = cur.work !== before.work;
+      const into = (typeof res?.into === 'string' && res.into) || c.expect?.into || this._demoInto(cur);
+      if (res && res.ok === false) {
+        const why = MERGE_WHYS.has(res.why) ? res.why : 'git';
+        const paths = (Array.isArray(res.paths) ? res.paths : []).filter(p => typeof p === 'string' && p);
+        const sentence = mergeSentence(why, { name: cur.name, into, paths });
+        if (!workRecorded && PROBLEM_WHYS.has(why)) {
+          this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, into), problem: { why, sentence, paths, at: this.now() } } }]);
+        }
+        return { reply: `${sentence} ${DEMO_MERGED}`, focusId: cur.id };
+      }
+      const n = res && (res.files != null) ? this._demoCounts(res, cur) : counts;
+      const batch = [];
+      if (!workRecorded) {
+        const merged = { into, merge: typeof res?.merge === 'string' ? res.merge : null, at: this.now(), files: n.files, adds: n.adds, dels: n.dels };
+        batch.push({ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, into), merged, problem: null } });
+      }
+      if (cur.files === before.files) batch.push({ kind: EV.FILES, agentId: cur.id, files: { ...NO_FILES, list: [] } });
+      if (batch.length) this._apply(batch);
+      return { reply: (typeof res?.reply === 'string' && res.reply) || `Merged ${cur.name} into ${into}. ${DEMO_MERGED}`, focusId: cur.id };
+    } finally {
+      this._busy.delete(v.id);
+    }
+  }
+
+  _simProposeDiscard(v) {
+    if (!this._simWith('discard')) return { ok: false, reply: 'This is the demo, so nothing is really thrown away.' };
+    const active = this._isWorking(v);
+    const n = count(v.files?.changed);
+    const branch = v.work?.branch;
+    const parts = [`Its folder and ${branch ? `its branch ${branch}` : 'its branch'} are deleted, with ${n ? `${n} changed file${n === 1 ? '' : 's'}` : 'no changed files'}. Workbench keeps a hidden copy in git. This is the demo, so nothing is really thrown away.`];
+    if (active) parts.push('It is still working: it will be stopped first.');
+    return this._newConfirm({
+      kind: 'discard', demo: true, agentId: v.id, state: v.state, active, expect: {},
+      sentence: `Throw away ${v.name}’s work?`, detail: parts.join(' '), yes: 'Throw it away', no: 'Keep it', danger: true,
+    });
+  }
+
+  async _simDiscard(v, c) {
+    const pre = this._discardRefusal(v);
+    if (pre) return { reply: pre.reply, ...(v ? { focusId: v.id } : {}) };
+    if (!c.active && this._isWorking(v)) return { reply: 'That changed. Have another look.', focusId: v.id };
+    const sim = this._simWith('discard');
+    if (!sim) return { reply: 'This is the demo, so nothing is really thrown away.', focusId: v.id };
+    this._busy.set(v.id, 'discard');
+    try {
+      if (this._isWorking(v)) await this._stopRoot(v, 'Stopped by you');
+      const before = this.store.get(v.id)?.work;
+      let res;
+      try {
+        res = await sim.discard(v.id);
+      } catch (err) {
+        this.log.warn('The simulator could not throw work away:', err);
+        return { reply: `The demo could not throw away ${v.name}’s work.`, focusId: v.id };
+      }
+      if (res && res.ok === false) {
+        return { reply: (typeof res.reply === 'string' && res.reply) || (typeof res.sentence === 'string' && res.sentence) || `The demo could not throw away ${v.name}’s work.`, focusId: v.id };
+      }
+      const cur = this.store.get(v.id) || v;
+      if (cur.work === before) {
+        const thrownAway = { at: this.now(), saved: typeof res?.saved === 'string' ? res.saved : null };
+        this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, this._demoInto(cur)), branch: null, folder: false, problem: null, thrownAway } }]);
+      }
+      return { reply: (typeof res?.reply === 'string' && res.reply) || `Threw away ${cur.name}’s work. ${DEMO_THROWN}`, focusId: cur.id };
+    } finally {
+      this._busy.delete(v.id);
+    }
   }
 
   // ================================================================ commands and confirms
@@ -1804,7 +2799,7 @@ export class Engine extends EventEmitter {
         // and not whatever would have taken its place.
         out = shown.gone
           ? { reply: GONE }
-          : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: { id: shown.id, sentence: shown.sentence, detail: shown.detail } };
+          : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
       } else {
         // Any other command withdraws the card on screen, without a notice: the page lets go of it.
         if (shown && !shown.gone && intent.kind !== 'confirm') this.confirms.delete(shown.id);
@@ -1841,7 +2836,32 @@ export class Engine extends EventEmitter {
     if (!id) return null;
     const c = this.confirms.get(id);
     if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) return { id, gone: true };
-    return { id: c.id, kind: c.kind, sentence: c.sentence, detail: c.detail, tasks: c.tasks, agentIds: c.intent?.agentIds };
+    const agentIds = c.agentIds ?? c.intent?.agentIds ?? (c.agentId ? [c.agentId] : undefined);
+    return {
+      id: c.id, kind: c.kind, sentence: c.sentence, detail: c.detail, tasks: c.tasks, agentIds,
+      ...(c.agentId ? { agentId: c.agentId } : {}),
+      ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}),
+    };
+  }
+
+  /**
+   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger? }. `kind` is always there (start,
+   * stop, say, forget, merge or discard); yes and no are the buttons' own words when they are not "Do it" and "Cancel".
+   */
+  _card(c) {
+    const out = { id: c.id, sentence: c.sentence, detail: c.detail ?? null, kind: c.kind };
+    if (c.yes) out.yes = c.yes;
+    if (c.no) out.no = c.no;
+    if (typeof c.danger === 'boolean') out.danger = c.danger;
+    return out;
+  }
+
+  /** Keep a confirm card for its yes or no, and the reply that shows it. */
+  _newConfirm(fields) {
+    const id = hex(6);
+    const c = { ...fields, id, createdAt: this.now() };
+    this.confirms.set(id, c);
+    return { reply: c.sentence, confirm: this._card(c) };
   }
 
   async _runIntent(intent, { focusId = null, askId = null, shown = null } = {}) {
@@ -1897,8 +2917,28 @@ export class Engine extends EventEmitter {
         const r = await this._say(v, CONTINUE_TEXT);
         return { reply: r.reply, focusId: v.id };
       }
+      // Merge, throw away and "what changed" act only on the agent the words named (the parser maps a pronoun to the
+      // agent in the centre, and a helper to its agent). No agent: two have that name, or none was named. Ask.
+      case 'changes': {
+        const v = this._rootOf(intent.agentId);
+        if (!v) return { reply: WHICH_ONE };
+        return this._reviewReply(v);
+      }
+      case 'merge': {
+        const v = this._rootOf(intent.agentId);
+        if (!v) return { reply: WHICH_ONE };
+        const r = await this._proposeMerge(v, { into: typeof intent.into === 'string' && intent.into.trim() ? intent.into.trim() : null });
+        return r.confirm ? r : { reply: r.reply, focusId: v.id };
+      }
+      case 'discard': {
+        const v = this._rootOf(intent.agentId);
+        if (!v) return { reply: WHICH_ONE };
+        const r = await this._proposeDiscard(v);
+        return r.confirm ? r : { reply: r.reply, focusId: v.id };
+      }
       case 'stop_all': {
-        const active = this.store.list().filter(v => !v.parentId && ACTIVE.has(v.state));
+        // An agent whose work is being merged or thrown away is left to that job (a throw-away stops it itself).
+        const active = this.store.list().filter(v => !v.parentId && ACTIVE.has(v.state) && !this._busy.has(v.id));
         if (!active.length) return { reply: 'Nothing is running.' };
         await Promise.all(active.map(v => this._stopRoot(v, 'Stopped by you')));
         return { reply: active.length === 1 ? `Stopped ${active[0].name}.` : `Stopped all ${active.length} agents.` };
@@ -1980,9 +3020,7 @@ export class Engine extends EventEmitter {
         ? `Start ${label(list[0])} on “${clip(list[0].task, 90)}”?`
         : `Start ${list.length} agents: ${joinAnd(list.map(t => `${label(t)} on “${clip(t.task, 50)}”`))}?`;
     }
-    const id = hex(6);
-    this.confirms.set(id, { id, kind: 'start', tasks: list, sentence, detail, createdAt: this.now() });
-    return { reply: sentence, confirm: { id, sentence, detail } };
+    return this._newConfirm({ kind: 'start', tasks: list, sentence, detail });
   }
 
   _startDetail(list) {
@@ -2022,9 +3060,7 @@ export class Engine extends EventEmitter {
     }
     // Which one, in the person's own words: two agents can have the same name.
     const detail = views.length === 1 && views[0].task ? `Its task: “${clip(views[0].task, 90)}”` : null;
-    const id = hex(6);
-    this.confirms.set(id, { id, kind: intent.kind, intent, sentence, detail, createdAt: this.now() });
-    return { reply: sentence, confirm: { id, sentence, detail } };
+    return this._newConfirm({ kind: intent.kind, intent, sentence, detail });
   }
 
   /** Execute (go = true) or cancel a launch, stop or message proposed by command(). */
@@ -2041,16 +3077,30 @@ export class Engine extends EventEmitter {
       return { reply: GONE };
     }
     this.confirms.delete(c.id);
-    if (c.kind === 'forget') {
-      if (!go) return { reply: c.agentIds.length === 1 ? 'OK, I won’t forget it.' : 'OK, I won’t forget them.' };
-      return this._forgetEarlier(c.agentIds);
-    }
-    if (c.kind === 'stop' || c.kind === 'say') {
-      if (!go) {
-        if (c.kind === 'say') return { reply: 'OK, I won’t send it.' };
-        return { reply: c.intent.agentIds.length === 1 ? 'OK, I won’t stop it.' : 'OK, I won’t stop them.' };
-      }
-      return this._runIntent({ ...c.intent, sure: true });
+    // Each kind is handled here by name. A kind nobody knows never reaches the launch below.
+    switch (c.kind) {
+      case 'forget':
+        if (!go) return { reply: c.agentIds.length === 1 ? 'OK, I won’t forget it.' : 'OK, I won’t forget them.' };
+        return this._forgetEarlier(c.agentIds);
+      case 'stop':
+      case 'say':
+        if (!go) {
+          if (c.kind === 'say') return { reply: 'OK, I won’t send it.' };
+          return { reply: c.intent.agentIds.length === 1 ? 'OK, I won’t stop it.' : 'OK, I won’t stop them.' };
+        }
+        return this._runIntent({ ...c.intent, sure: true });
+      case 'merge':
+        if (!go) return { reply: 'OK, I won’t merge it.' };
+        return this._mergeConfirmed(c);
+      case 'discard':
+        if (!go) return { reply: 'OK, I won’t throw it away.' };
+        return this._discardConfirmed(c);
+      case 'start':
+        if (Array.isArray(c.tasks)) break;
+      // falls through: a launch card without its tasks cannot be one
+      default:
+        this.log.warn(`A confirm card of an unknown kind (${String(c.kind)}) was answered; nothing was done.`);
+        return { reply: GONE };
     }
     if (!go) return { reply: c.tasks.length === 1 ? 'OK, I won’t start it.' : 'OK, I won’t start them.' };
     const used = new Set();
@@ -2122,7 +3172,7 @@ export class Engine extends EventEmitter {
     if (v.earlier) {
       let s = `${v.name} is from an earlier run. ${v.canContinue ? 'Send it a message to continue where it left off.' : v.continueReason || ''}`.trim();
       if (v.says) s += ` Its last message: ${v.says}`;
-      return s;
+      return s + this._workWords(v);
     }
     const ask = v.ask;
     if (ask && v.state === STATE.NEEDS_OK) {
@@ -2142,9 +3192,20 @@ export class Engine extends EventEmitter {
     else s = `${v.name} ${PHRASE[v.state] || 'is working'}.`;
     if (v.stateReason && (v.state === STATE.FAILED || v.state === STATE.CHECKS_FAILED)) s += ` ${v.stateReason}`;
     if (v.says && ENDED.has(v.state)) s += ` It says: ${v.says}`;
+    if (ENDED.has(v.state)) s += this._workWords(v);
     const n = v.helpers?.working || 0;
     if (n && ACTIVE.has(v.state)) s += ` ${n === 1 ? 'One helper is' : `${n} helpers are`} working.`;
     return s;
+  }
+
+  /** What became of a root's work, for its status: thrown away, a merge that did not go through, or merged. */
+  _workWords(v) {
+    const w = v.parentId ? null : v.work;
+    if (!w) return '';
+    if (w.thrownAway) return ' Its work was thrown away.';
+    if (w.problem?.sentence) return ` The last merge did not go through: ${w.problem.sentence}`;
+    if (w.merged) return w.merged.into ? ` Its work was merged into ${w.merged.into}.` : ' Its work was merged.';
+    return '';
   }
 
   _spendSentence() {
@@ -2258,10 +3319,9 @@ export class Engine extends EventEmitter {
 
   snapshot() {
     const s = this.store.snapshot(this.now());
-    const r = this.repoInfo;
     return {
       mode: this.mode,
-      repo: r ? { name: r.name ?? null, head: r.head ?? null, branch: r.branch ?? null, dirty: r.dirty ?? 0 } : null,
+      repo: this._repoView(),
       harnesses: this._harnessFlags(),
       harnessInfo: { ...this.harnessInfo },
       agents: s.agents,

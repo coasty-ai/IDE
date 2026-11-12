@@ -13,6 +13,8 @@ import { FakeMachines, fakeAdapter, fakeDeps, until } from './helpers/engine-fak
 
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${id}` };
 const SESSION = '0f8fad5b-d9cb-469f-a165-70867728950e';
+// The commit an agent starts from. A record keeps only real commit ids (40 or 64 hex characters).
+const BASE = 'c0ffee'.repeat(6) + 'c0ff';
 
 function tmp(t, label = 'wb-history-') {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), label)));
@@ -27,23 +29,31 @@ function world(t, dir, { adapters = null, options = {}, workspaceKept = true } =
   const store = new Store();
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
-  const { deps, calls } = fakeDeps();
+  const { deps, calls, git } = fakeDeps();
+  git.head = BASE;
+  git.dirty = 0;
   deps.history = historyMod;
   deps.commands = commands;
   deps.workspace.createWorkspace = async (o) => {
+    calls.createWorkspace.push(o);
     const p = path.join(dir, 'wt', `${o.slug}-${o.agentId}`);
     fs.mkdirSync(p, { recursive: true });
     fs.writeFileSync(path.join(p, '.git'), 'gitdir: elsewhere\n');
-    return { path: p, branch: `workbench/${o.slug}-${o.agentId}`, base: 'abc1234' };
+    return { path: p, branch: `workbench/${o.slug}-${o.agentId}`, base: BASE };
   };
-  deps.workspace.removeWorkspace = async () => ({ removed: !workspaceKept });
+  deps.workspace.removeWorkspace = async (o) => { calls.removeWorkspace.push(o); return { removed: !workspaceKept }; };
+  deps.workspace.discardWork = async (o) => {
+    calls.discardWork.push(o);
+    fs.rmSync(o.path, { recursive: true, force: true });
+    return { ok: true, saved: `refs/workbench/discarded/${o.agentId}` };
+  };
   const engine = new Engine({
-    store, mode: 'live', repo: { root: repoRoot, name: 'shop', head: 'abc1234', branch: 'main', dirty: 0 }, hook: HOOK,
+    store, mode: 'live', repo: { root: repoRoot, name: 'shop', head: BASE, branch: 'main', dirty: 0 }, hook: HOOK,
     defaultBudgetUsd: 2, adapters: adapters || { claude, codex }, machines: new FakeMachines(), deps,
     options: { tickMs: 10_000_000, permissionTimeoutMs: 5000, historyDir: path.join(dir, 'history'), historyDebounceMs: 15, exitGraceMs: 20, ...options },
   });
   t.after(() => engine.shutdown());
-  return { store, engine, claude, codex, calls, deps, repoRoot, historyDir: path.join(dir, 'history') };
+  return { store, engine, claude, codex, calls, deps, git, repoRoot, historyDir: path.join(dir, 'history') };
 }
 
 /** Run one agent to "says it is done", with a session id. */
@@ -91,12 +101,14 @@ test('a record is built field by field: nothing outside the list gets in, and no
     hookToken: 'SECRET-HOOK', token: 'SECRET-PAGE', env: { WORKBENCH_HOOK_TOKEN: 'SECRET-ENV' },
     checks: { state: 'failed', results: [{ name: 'tests', ok: false, ms: 5, tail: 'SECRET-IN-CHECK-OUTPUT' }] },
   };
-  const rec = historyMod.recordOf(view, { path: '/w/x', branch: 'workbench/fix-abc123', base: 'deadbeef', token: 'SECRET-WS' }, 5000);
+  const rec = historyMod.recordOf(view, { path: '/w/x', branch: 'workbench/fix-abc123', base: BASE, since: BASE, from: 'main', token: 'SECRET-WS' }, 5000);
   const text = JSON.stringify(rec);
   assert.ok(!text.includes('SECRET'), text);
+  // Pinned on purpose: `work` was added with source control. A new field must be added here, and to cleanRecord.
   assert.deepEqual(Object.keys(rec).sort(), ['approvals', 'budgetUsd', 'checks', 'endedAt', 'files', 'harness', 'id', 'machineId', 'model',
-    'name', 'rules', 'savedAt', 'says', 'sessionId', 'startedAt', 'state', 'stateReason', 'task', 'toolCalls', 'turns', 'usage', 'workspace']);
-  assert.deepEqual(rec.workspace, { path: '/w/x', branch: 'workbench/fix-abc123', base: 'deadbeef' });
+    'name', 'rules', 'savedAt', 'says', 'sessionId', 'startedAt', 'state', 'stateReason', 'task', 'toolCalls', 'turns', 'usage', 'work', 'workspace']);
+  assert.deepEqual(rec.workspace, { path: '/w/x', branch: 'workbench/fix-abc123', base: BASE, since: BASE, from: 'main' });
+  assert.equal(rec.work, null, 'a view without work keeps none');
   assert.deepEqual(rec.checks.results, [{ name: 'tests', ok: false, ms: 5 }]);
 });
 
@@ -357,7 +369,7 @@ test('a message to an earlier agent resumes its session in the same folder, with
   runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Both are fixed.', backgroundTasks: 0 });
   await until(() => second.store.get(id).state === 'done_claimed');
   assert.equal(second.calls.diffStats.at(-1).path, rec.workspace.path);
-  assert.equal(second.calls.diffStats.at(-1).base, 'abc1234');
+  assert.equal(second.calls.diffStats.at(-1).base, BASE, 'what is not merged yet: since the commit it started from (it was never merged)');
 });
 
 test('the Continue button’s message, and the words "continue <name>", pick it up', async (t) => {

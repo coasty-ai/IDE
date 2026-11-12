@@ -1,6 +1,12 @@
 // Fakes for the engine tests: runners, adapters, the simulator, machines and the injected deps.
 // They follow the contract's shapes without importing any other module.
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import path from 'node:path';
+
+/** Commit ids the fake git hands out: the merge commit M (the person's new HEAD) and the agent's work commit W. */
+export const FAKE_MERGE = 'aa'.repeat(20);
+export const FAKE_WORK = 'bb'.repeat(20);
 
 export class FakeRunner {
   constructor(opts) {
@@ -93,9 +99,32 @@ export function gate() {
  * The engine's injected deps, with every call recorded.
  * checksGate holds every runChecks call until it opens; checksGates holds call i on gate i. An aborted signal ends a
  * held call at once with its checks stopped, as the real runChecks does.
+ * folders: a folder to make each agent's workspace in for real (a directory with a .git file), so the engine finds it
+ * there; without it workspaces are made-up paths under /wt.
+ * The returned `git` is the fake repository's state, which a test may change: the person's branch, head, uncommitted
+ * changes and identity; the agent's work (files, left-out files, `seq`, bumped to change its workId); and what
+ * mergeWork and discardWork answer (`mergeResult`, `discardResult`: an object, or a function of the call; `mergeGate`,
+ * `discardGate`: hold the call until the gate opens; `mergeError`, `discardError`: throw).
  */
-export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'passed', checksGate = null, checksGates = null, intent = null } = {}) {
-  const calls = { decide: [], parse: [], createWorkspace: [], diffStats: [], readRepoConfig: [], checkRules: [], runChecks: [], removeWorkspace: [], killChecksSync: 0 };
+export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'passed', checksGate = null, checksGates = null, intent = null, folders = null } = {}) {
+  const calls = {
+    decide: [], parse: [], createWorkspace: [], diffStats: [], readRepoConfig: [], checkRules: [], runChecks: [], removeWorkspace: [], killChecksSync: 0,
+    prepareRepo: [], snapshotWork: [], workDiff: [], mergeWork: [], discardWork: [], gitGraph: [], gitIdentity: [],
+  };
+  const git = {
+    branch: 'main', head: 'abc1234', dirty: 2,
+    identity: { name: 'Test Person', email: 'test@example.com' },
+    agentHead: 'abc1234',
+    work: { changed: true, files: [{ path: 'src/cart.js', status: 'modified', adds: 3, dels: 1 }], left: [] },
+    seq: 0,
+    commits: [
+      { id: '12'.repeat(20), parents: ['34'.repeat(20)], subject: 'Make the cart total right', author: 'Test Person', at: 1_700_000_000_000, refs: ['main'], agentId: null, kind: 'commit' },
+      { id: '34'.repeat(20), parents: [], subject: 'First commit', author: 'Test Person', at: 1_699_000_000_000, refs: [], agentId: null, kind: 'commit' },
+    ],
+    mergeResult: null, mergeGate: null, mergeError: null,
+    discardResult: null, discardGate: null, discardError: null,
+  };
+  const workId = () => `${git.agentHead}:tree${git.seq}`;
   const policy = {
     decide(req) {
       calls.decide.push(req);
@@ -115,10 +144,60 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
     },
   };
   const workspace = {
-    async prepareRepo(p) { return { root: p, name: 'shop', head: 'abc1234', branch: 'main', dirty: 2 }; },
+    async prepareRepo(p) {
+      calls.prepareRepo.push(p);
+      return { root: p, name: 'shop', head: git.head, branch: git.branch, dirty: git.dirty };
+    },
     async createWorkspace(o) {
       calls.createWorkspace.push(o);
-      return { path: `/wt/shop/${o.slug}-${o.agentId}`, branch: `workbench/${o.slug}-${o.agentId}`, base: 'abc1234' };
+      let p = `/wt/shop/${o.slug}-${o.agentId}`;
+      if (folders) {
+        p = path.join(folders, `${o.slug}-${o.agentId}`);
+        fs.mkdirSync(p, { recursive: true });
+        fs.writeFileSync(path.join(p, '.git'), 'gitdir: elsewhere\n');
+      }
+      return { path: p, branch: `workbench/${o.slug}-${o.agentId}`, base: 'abc1234' };
+    },
+    async gitIdentity(o) {
+      calls.gitIdentity.push(o);
+      return git.identity;
+    },
+    async snapshotWork(o) {
+      calls.snapshotWork.push(o);
+      return {
+        head: git.agentHead, tree: `tree${git.seq}`, since: o.since, workId: workId(), changed: git.work.changed,
+        files: git.work.files.map(f => ({ ...f })), left: git.work.left.map(l => ({ ...l })),
+      };
+    },
+    async workDiff(o) {
+      calls.workDiff.push(o);
+      return {
+        workId: workId(), since: o.since, head: git.agentHead,
+        files: git.work.files.map(f => ({ ...f, patch: `diff --git a/${f.path} b/${f.path}\n--- a/${f.path}\n+++ b/${f.path}\n@@ -1 +1 @@\n-old\n+new\n` })),
+        left: git.work.left.map(l => ({ ...l })), omitted: 0,
+      };
+    },
+    async mergeWork(o) {
+      calls.mergeWork.push(o);
+      if (git.mergeGate) await git.mergeGate.wait;
+      if (git.mergeError) throw git.mergeError;
+      if (git.mergeResult) return typeof git.mergeResult === 'function' ? git.mergeResult(o) : git.mergeResult;
+      git.head = FAKE_MERGE; // the person's branch moved to the merge commit
+      const adds = git.work.files.reduce((s, f) => s + f.adds, 0);
+      const dels = git.work.files.reduce((s, f) => s + f.dels, 0);
+      return { ok: true, into: git.branch, merge: FAKE_MERGE, work: FAKE_WORK, files: git.work.files.length, adds, dels };
+    },
+    async discardWork(o) {
+      calls.discardWork.push(o);
+      if (git.discardGate) await git.discardGate.wait;
+      if (git.discardError) throw git.discardError;
+      if (git.discardResult) return typeof git.discardResult === 'function' ? git.discardResult(o) : git.discardResult;
+      if (folders && o.path.startsWith(folders)) fs.rmSync(o.path, { recursive: true, force: true });
+      return { ok: true, saved: `refs/workbench/discarded/${o.agentId}` };
+    },
+    async gitGraph(o) {
+      calls.gitGraph.push(o);
+      return { ok: true, head: git.head, branch: git.branch, commits: git.commits.map(c => ({ ...c })), more: false };
     },
     async diffStats(o) {
       calls.diffStats.push(o);
@@ -155,7 +234,7 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
     },
     killChecksSync() { calls.killChecksSync += 1; },
   };
-  return { deps: { policy, commands, workspace, receipt }, calls };
+  return { deps: { policy, commands, workspace, receipt }, calls, git };
 }
 
 /** Poll until fn() is truthy. */

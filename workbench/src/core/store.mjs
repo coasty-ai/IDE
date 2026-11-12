@@ -5,6 +5,8 @@
 //   'agents'   (ids: string[])     views that changed, deduped per apply() or tick()
 //   'machines' (machines: Machine[]) machines that changed in one apply()
 //   'notice'   ({ text })          a short reply from the workbench to the person
+//   'removed'  (ids: string[])     roots taken out of the store (an earlier agent the person forgot)
+//   'repo'     (repo)              the person's repository changed: { name, head, branch, dirty, identity } (repoChanged)
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -354,6 +356,11 @@ export class Store extends EventEmitter {
         v.sessionId = ev.sessionId ?? null;
         this._started(v, ev.ts, batch, index, changed);
         break;
+      case EV.WORK:
+        // A helper works in its agent's folder: what becomes of the work is the agent's.
+        if (v.parentId) return;
+        v.work = ev.work && typeof ev.work === 'object' ? copy(ev.work) : null;
+        break;
       case EV.RESUMED:
         v.earlier = false;
         v.canContinue = null;
@@ -424,6 +431,7 @@ export class Store extends EventEmitter {
     v.earlier = true;
     v.canContinue = !!can?.ok;
     v.continueReason = can?.ok ? null : (can?.reason || null);
+    v.work = rec.work && typeof rec.work === 'object' ? copy(rec.work) : null;
     this._views.set(v.id, v);
     this._meta.set(v.id, { seq: ++this._seq, openTools: new Map(), backgroundTasks: 0, background: null, waitedForHelpers: false });
     this.emit('agents', [v.id]);
@@ -437,6 +445,14 @@ export class Store extends EventEmitter {
     v.canContinue = !!can?.ok;
     v.continueReason = can?.ok ? null : (can?.reason || null);
     this.emit('agents', [id]);
+  }
+
+  /**
+   * The person's repository changed (a merge moved their branch, or a refresh found a new head, branch, number of
+   * uncommitted changes or git identity): tell listeners. The server sends it to every page as `event: repo`.
+   */
+  repoChanged(repo) {
+    this.emit('repo', repo && typeof repo === 'object' ? copy(repo) : null);
   }
 
   /** Take a root, and any helpers, out of the store (an earlier agent the person forgot). */

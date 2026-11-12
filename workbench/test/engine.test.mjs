@@ -2285,7 +2285,8 @@ test('snapshot has the contract fields, including repo and harness availability'
   t.engine.ingest({ kind: EV.USAGE, agentId: id, mode: 'set', costUsd: 0.1 });
   const s = t.engine.snapshot();
   assert.equal(s.mode, 'live');
-  assert.deepEqual(s.repo, { name: 'shop', head: 'abc1234', branch: 'main', dirty: 2 });
+  // identity: git knows the person's name and email (read at start and on every refresh), so Workbench can merge.
+  assert.deepEqual(s.repo, { name: 'shop', head: 'abc1234', branch: 'main', dirty: 2, identity: true });
   assert.deepEqual(s.harnesses, { claude: true, codex: true, sim: false });
   assert.equal(s.agents.length, 1);
   assert.equal(s.agents[0].id, id);

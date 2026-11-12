@@ -19,9 +19,11 @@ export const EV = Object.freeze({
   CHECKS: 'agent.checks',         // { agentId, checks: { state: 'none'|'running'|'passed'|'failed', results: [{ name, ok, ms }] } }
   RULES: 'agent.rules',           // { agentId, rules: { kept: [{ say }], broken: [{ say, paths: string[] }] } }
   MODEL: 'agent.model',           // { agentId, model }
-  SESSION: 'agent.session',       // { agentId, sessionId }  harness session or thread id, for resume
+  SESSION: 'agent.session',       // { agentId, sessionId, version? }  harness session or thread id, for resume; version: the harness's own
+                                  //   version when it says (Claude Code's claude_code_version from system/init)
   APPROVAL: 'agent.approval',     // { agentId, how: 'auto'|'person'|'timeout', decision: 'allow'|'deny', sentence }
   RESUMED: 'agent.resumed',       // { agentId }  an earlier agent (from history) is being picked up: it is no longer "earlier"
+  WORK: 'agent.work',             // { agentId, work }  what became of a root's work in git (AgentView.work); replaces work as a whole
   ENDED: 'agent.ended',           // { agentId, outcome: 'ok'|'error'|'stopped', error? }
   MACHINE: 'machine.update',      // { machine: Machine }
   NOTICE: 'notice',               // { text }  a short reply from the workbench to the person
@@ -80,6 +82,21 @@ export const SPARK_BUCKETS = 20;
  *           process now. Cleared by `agent.resumed` when the person continues it
  * @property {boolean|null} canContinue earlier agents only (else null): its folder and session are still there
  * @property {string|null} continueReason  when canContinue is false, why, in plain words
+ * @property {AgentWork|null} work      a root's work in git; null for helpers, for demo agents without git, and before a
+ *           root has a folder
+ */
+
+/**
+ * What became of a root's work in git. Set by `agent.work`, which replaces it as a whole.
+ * @typedef {object} AgentWork
+ * @property {string|null} branch       its branch ("workbench/search-cleanup-a1b2c3"); null once thrown away
+ * @property {string|null} from         the person's branch when it started (null if detached or unknown)
+ * @property {boolean} folder           its folder is still there
+ * @property {{ into: string|null, merge: string|null, at: number, files: number, adds: number, dels: number }|null} merged
+ *           the last successful merge (merge: the merge commit's id)
+ * @property {{ why: 'conflict'|'blocked'|'ancestry'|'moved'|'identity'|'detached'|'busy'|'git', sentence: string, paths: string[], at: number }|null} problem
+ *           set by a failed merge; cleared by the next merge, any turn start, a message it takes, and a throw-away
+ * @property {{ at: number, saved: string|null }|null} thrownAway  saved: the hidden ref that keeps a copy of the work
  */
 
 /** A machine that agents run on. */
@@ -144,5 +161,6 @@ export function newAgentView(ev, now = Date.now()) {
     earlier: false,
     canContinue: null,
     continueReason: null,
+    work: null,
   };
 }
