@@ -1020,15 +1020,56 @@ function splitPatches(text) {
   return starts.map((s, n) => text.slice(s, n + 1 < starts.length ? starts[n + 1] : text.length));
 }
 
-/** The patches of `paths` (in git's order), asked for together, or one by one when the answer does not line up. */
+/** How git writes a path in a patch's header with core.quotePath=false: as it is, or in quotes with C escapes. */
+const C_ESCAPES = { 7: 'a', 8: 'b', 9: 't', 10: 'n', 11: 'v', 12: 'f', 13: 'r', 34: '"', 92: '\\' };
+function headerPath(p) {
+  let quoted = false;
+  let out = '';
+  for (const ch of p) {
+    const c = ch.codePointAt(0);
+    if (c < 0x20 || c === 0x7f || c === 34 || c === 92) {
+      quoted = true;
+      out += `\\${C_ESCAPES[c] || c.toString(8).padStart(3, '0')}`;
+    } else {
+      out += ch;
+    }
+  }
+  return quoted ? `"${out}"` : out;
+}
+
+/** The first line of the patch of `path`. */
+const patchHeader = p => `diff --git ${headerPath(`a/${p}`)} ${headerPath(`b/${p}`)}\n`;
+
+/**
+ * A diff split into one patch per path: [{ head, text }] in git's order. Git prints a path whose type changed (a file
+ * that became a link, or the other way) as two parts, the old one deleted and the new one added, one after the other
+ * under the same header line: they are one patch.
+ */
+function patchesByPath(diff) {
+  const out = [];
+  for (const part of splitPatches(diff)) {
+    const head = part.slice(0, part.indexOf('\n') + 1);
+    const last = out[out.length - 1];
+    if (last && head && last.head === head) last.text += part;
+    else out.push({ head, text: part });
+  }
+  return out;
+}
+
+/**
+ * The patches of `paths` (in git's order), asked for together, or one by one when the answer does not line up (a path
+ * also matches what is inside a folder of that name: a file that became a folder brings in the folder's files).
+ */
 async function patchesOf(run, cwd, from, to, paths) {
   if (!paths.length) return [];
-  const parts = splitPatches((await run([...PATCH, from, to, '--', ...paths], { cwd })).stdout);
-  const lineUp = parts.length === paths.length &&
-    parts.every((p, k) => p.startsWith(`diff --git a/${paths[k]} b/${paths[k]}\n`) || p.startsWith('diff --git "'));
-  if (lineUp) return parts;
+  const heads = paths.map(patchHeader);
+  const together = patchesByPath((await run([...PATCH, from, to, '--', ...paths], { cwd })).stdout);
+  if (together.length === paths.length && together.every((x, k) => x.head === heads[k])) return together.map(x => x.text);
   const out = [];
-  for (const p of paths) out.push(splitPatches((await run([...PATCH, from, to, '--', p], { cwd })).stdout)[0] || '');
+  for (const [k, p] of paths.entries()) {
+    const alone = patchesByPath((await run([...PATCH, from, to, '--', p], { cwd })).stdout);
+    out.push((alone.find(x => x.head === heads[k]) || alone[0])?.text || '');
+  }
   return out;
 }
 
@@ -1047,7 +1088,8 @@ function cutAt(text, maxBytes) {
  * @returns {Promise<{ workId: string, since: string, head: string,
  *   files: { path, status, adds, dels, binary?: true, large?: true, patch: string|null, cut?: true }[],
  *   left: { path: string, why: 'ignored'|'nested-repo' }[], cut?: true, omitted: number }>}
- *   patch: that file's unified diff, `diff --git` header included; null for a binary or large file, and for a file
+ *   patch: that file's unified diff, `diff --git` header included (for a file that became a link, or a link that became
+ *   a file, git's two parts one after the other: the old one deleted, the new one added); null for a binary or large file, and for a file
  *   past maxTotalBytes (then with cut: true). cut on a file: its patch was cut (at a line end) at maxFileBytes or at what
  *   was left of maxTotalBytes; cut on the whole: maxTotalBytes was reached. omitted: files past maxFiles, not listed.
  */

