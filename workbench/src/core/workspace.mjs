@@ -1258,14 +1258,18 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
  * @returns {Promise<{ ok: true, saved: string } | { ok: false, why: 'changed'|'gone'|'git', sentence: string }>} never rejects
  */
 export async function discardWork(opts = {}) {
+  const progress = { saved: null }; // once deleting began, never say nothing was deleted
   try {
-    return await withoutHooks(run => discard(run, opts));
+    return await withoutHooks(run => discard(run, opts, progress));
   } catch (e) {
+    if (progress.saved && !(e instanceof Refusal)) {
+      return { ok: false, why: 'git', sentence: `Git could not finish throwing its work away. A copy of its work is kept in git as ${progress.saved}.` };
+    }
     return failure(e, 'Git could not throw its work away. Nothing was deleted.');
   }
 }
 
-async function discard(run, { repoRoot, path: wsPath, branch, since, expect, agentId } = {}) {
+async function discard(run, { repoRoot, path: wsPath, branch, since, expect, agentId } = {}, progress = {}) {
   const id = String(agentId ?? '');
   if (!AGENT_ID.test(id)) throw new Refusal('git', 'Workbench could not tell which agent this is, so nothing was thrown away.');
   const b = String(branch ?? '');
@@ -1287,6 +1291,7 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
     const copy = s.tree === s.headTree ? s.head : await commitTree(run, root, s.tree, [s.head],
       `Thrown away: ${b}\n\nWorkbench-Agent: ${id}\nWorkbench-Kind: discarded\n`, (await identityAt(run, root)) || WORKBENCH_IDENTITY);
     await run(['update-ref', '--create-reflog', '-m', note, saved, copy], { cwd: root });
+    progress.saved = saved;
     try {
       await run(['worktree', 'remove', '--force', ...(folder.locked ? ['--force'] : []), folder.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
     } catch {
@@ -1311,6 +1316,7 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
   }
   if (exp.workId != null && exp.workId !== `${tip}:${await treeOf(root, tip, run)}`) throw new Refusal('changed', SAY.changed);
   await run(['update-ref', '--create-reflog', '-m', note, saved, tip], { cwd: root });
+  progress.saved = saved;
   const gone = await run(['update-ref', '-m', note, '-d', `refs/heads/${b}`, tip], { cwd: root, okCodes: [1, 128] });
   if (gone.code !== 0) throw new Refusal('changed', SAY.changed);
   return { ok: true, saved };
