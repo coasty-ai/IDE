@@ -2526,7 +2526,7 @@ test('merge: a merge that does not go through says why in plain words, and keeps
     assert.equal(t.notices.at(-1), sentence);
     if (kept) {
       const p = work().problem;
-      assert.deepEqual({ ...p, at: 0 }, { why: why === 'something new' ? 'git' : why, sentence, paths, at: 0 }, why);
+      assert.deepEqual({ ...p, at: 0 }, { why: why === 'something new' ? 'git' : why, sentence, paths, into: 'main', at: 0 }, why); // into: the branch it was going into, for the conflict lid
       assert.ok(Number.isFinite(p.at));
     } else {
       assert.deepEqual(work().problem, before, `${why} leaves the last reason as it was`);

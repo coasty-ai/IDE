@@ -547,9 +547,10 @@ test('a record keeps where the work starts (since), the branch it came from and 
     merged: { into: 'main', merge: 'ab'.repeat(20), at: 5, files: 3, adds: 40, dels: 2 }, problem: null, thrownAway: null,
   });
   // A merge that did not go through keeps its words and paths; a thrown-away agent has no branch and no folder.
-  const problem = { why: 'blocked', sentence: 'Your own changes are in the way: a.js. Commit or put them aside, then merge again.', paths: ['a.js', 42, ''], at: 7 };
+  const problem = { why: 'blocked', sentence: 'Your own changes are in the way: a.js. Commit or put them aside, then merge again.', paths: ['a.js', 42, ''], into: 'main', at: 7 };
   assert.deepEqual(historyMod.recordOf({ ...view, work: { ...view.work, merged: null, problem } }, null, 9).work.problem,
-    { why: 'blocked', sentence: problem.sentence, paths: ['a.js'], at: 7 });
+    { why: 'blocked', sentence: problem.sentence, paths: ['a.js'], into: 'main', at: 7 });
+  assert.equal(historyMod.recordOf({ ...view, work: { ...view.work, merged: null, problem: { ...problem, into: 'not a branch;' } } }, null, 9).work.problem.into, null, 'a bad branch name is dropped');
   const thrown = historyMod.recordOf({ ...view, work: { ...view.work, folder: true, thrownAway: { at: 8, saved: 'refs/workbench/discarded/w1' } } }, null, 9);
   assert.equal(thrown.workspace, null);
   assert.deepEqual(thrown.work, { branch: null, from: 'main', folder: false, merged: { into: 'main', merge: 'ab'.repeat(20), at: 5, files: 3, adds: 40, dels: 2 }, problem: null, thrownAway: { at: 8, saved: 'refs/workbench/discarded/w1' } });
