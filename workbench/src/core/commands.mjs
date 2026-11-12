@@ -750,7 +750,10 @@ function namedRoot(ws, c) {
   if (meaningful.every(w => WORK_NOUN.has(w))) return null;
   const having = c.agents.filter(a => isRoot(a) && nameWords(ws, a) > 0);
   if (!having.some(a => names(ws, a))) return null;
-  if (having.length === 1) return saysWhole(ws, having[0]) ? { id: having[0].id, form: 'name' } : { id: having[0].id, form: 'name', partial: true };
+  if (having.length === 1) {
+    const a = having[0];
+    return saysWhole(ws, a) ? { id: a.id, form: 'name' } : { id: a.id, form: 'name', partial: true };
+  }
   const whole = having.filter(a => saysWhole(ws, a));
   if (!whole.length) return null;
   return { id: whole.length === 1 ? whole[0].id : null, form: 'name' };
@@ -974,8 +977,9 @@ function matchChanges(core, c) {
   const ws = core.map(t => t.w);
   if (bareName(ws, c)) return null; // "diff viewer" is the name of the agent "Diff viewer"
   const s = ws.join(' ');
-  // "what changed", a bare "diff": the focused agent, said without its name.
+  // "what changed", a bare "diff": the focused agent, said without its name (on a merge or throw-away card, its agent).
   const focused = () => (screenBusy(c) ? cardReview(c) : { intent: { kind: 'changes', agentId: focusRoot(c) }, strong: false });
+  // The work of the agent the words found. Words too loose for now (see tooLoose) are about what waits on screen.
   const show = ref => (!tooLoose(ref, c) ? { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) }
     : weakForm(ref) ? cardReview(c) : null);
   for (const re of CHANGES_ASK) {
