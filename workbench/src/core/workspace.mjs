@@ -39,22 +39,28 @@ const GIT_SAFE_CONFIG = ['-c', 'core.fsmonitor=false'];
 
 /**
  * Run git with an argument array.
- * @param {{ cwd?: string, timeout?: number, input?: string, okCodes?: number[], env?: Record<string, string> }} [o]
+ * @param {{ cwd?: string, timeout?: number, input?: string, okCodes?: number[], env?: Record<string, string|undefined>,
+ *   encoding?: 'utf8'|'buffer' }} [o]
  *   input goes to git's stdin; okCodes are exit codes that still count as success (check-ignore exits 1 when
- *   nothing matches); env adds variables after the scrub (a temporary GIT_INDEX_FILE, who a commit is by)
- * @returns {Promise<{ stdout: string, stderr: string, code: number }>} code is 0 or one of okCodes; rejects with the
- *   execFile error (plus .stdout and .stderr)
+ *   nothing matches); env adds variables after the scrub (a temporary GIT_INDEX_FILE, who a commit is by), and an
+ *   undefined value takes one away; encoding 'buffer' gives stdout as bytes
+ * @returns {Promise<{ stdout: string|Buffer, stderr: string, code: number }>} code is 0 or one of okCodes; rejects with
+ *   the execFile error (plus .stdout and .stderr)
  */
-export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [], env } = {}) {
+export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [], env, encoding = 'utf8' } = {}) {
   return new Promise((resolve, reject) => {
-    const childEnv = env ? { ...gitEnv(), ...env } : gitEnv();
-    const child = execFile('git', [...GIT_SAFE_CONFIG, ...args], { cwd, timeout, maxBuffer: MAX_BUFFER, encoding: 'utf8', env: childEnv, windowsHide: true }, (err, stdout, stderr) => {
+    const childEnv = gitEnv();
+    for (const [k, v] of Object.entries(env || {})) {
+      if (v === undefined) delete childEnv[k];
+      else childEnv[k] = v;
+    }
+    const child = execFile('git', [...GIT_SAFE_CONFIG, ...args], { cwd, timeout, maxBuffer: MAX_BUFFER, encoding, env: childEnv, windowsHide: true }, (err, stdout, stderr) => {
       if (err && !(typeof err.code === 'number' && okCodes.includes(err.code) && !err.killed)) {
         err.stdout = stdout;
         err.stderr = String(stderr || '');
         reject(err);
       } else {
-        resolve({ stdout, stderr, code: err ? err.code : 0 });
+        resolve({ stdout, stderr: String(stderr || ''), code: err ? err.code : 0 });
       }
     });
     if (input != null) {
@@ -318,6 +324,24 @@ const nulList = (out) => String(out).split('\0').filter(Boolean);
 /** Paths handed to git on its command line, a few hundred at a time, so thousands of them still fit. */
 const ARG_BATCH = 500;
 
+/** The bytes of the blobs `ids` (object ids), in that order, read with one `cat-file --batch`. */
+async function blobs(run, cwd, ids) {
+  if (!ids.length) return [];
+  const out = (await run(['cat-file', '--batch'], { cwd, input: ids.join('\n') + '\n', encoding: 'buffer' })).stdout;
+  const found = [];
+  let at = 0;
+  for (let k = 0; k < ids.length; k++) {
+    const nl = out.indexOf(10, at);
+    const m = nl < 0 ? null : /^([0-9a-f]+) blob (\d+)$/.exec(out.subarray(at, nl).toString('latin1')); // or "<id> missing"
+    if (!m || m[1] !== ids[k]) throw plainError('Git could not read a file it was asked for.');
+    const end = nl + 1 + Number(m[2]);
+    if (end > out.length) throw plainError('Git could not read a file it was asked for.');
+    found.push(out.subarray(nl + 1, end));
+    at = end + 1; // each one ends with a newline of its own
+  }
+  return found;
+}
+
 /** The parts of a relative path, or null for one that could leave the folder it is relative to. */
 function safeParts(rel) {
   const parts = rel.split('/');
@@ -343,25 +367,27 @@ async function ignoredAt(wsPath, ref, paths, run = git) {
     for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
   }
   const wanted = [...dirs].map(d => (d ? `${d}/.gitignore` : '.gitignore'));
+  const batches = [];
+  for (let i = 0; i < wanted.length; i += ARG_BATCH) batches.push(wanted.slice(i, i + ARG_BATCH));
+  const [listed, gitDir] = await Promise.all([
+    Promise.all(batches.map(b => run(['--literal-pathspecs', 'ls-tree', '-z', ref, '--', ...b], { cwd: wsPath }))),
+    run(['rev-parse', '--absolute-git-dir'], { cwd: wsPath }).then(r => r.stdout.trim()),
+  ]);
   const found = new Map(); // path -> blob id
-  for (let i = 0; i < wanted.length; i += ARG_BATCH) {
-    const out = (await run(['--literal-pathspecs', 'ls-tree', '-z', ref, '--', ...wanted.slice(i, i + ARG_BATCH)], { cwd: wsPath })).stdout;
-    for (const rec of nulList(out)) {
+  for (const { stdout } of listed) {
+    for (const rec of nulList(stdout)) {
       const m = /^100(644|755) blob ([0-9a-f]+)\t([\s\S]+)$/.exec(rec); // a plain file: git does not follow linked ones
-      if (m) found.set(m[3], m[2]);
+      if (m && safeParts(m[3])) found.set(m[3], m[2]);
     }
   }
-  const gitDir = (await run(['rev-parse', '--absolute-git-dir'], { cwd: wsPath })).stdout.trim();
+  const texts = await blobs(run, wsPath, [...found.values()]);
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-ignore-'));
   try {
-    for (const [file, oid] of found) {
-      const parts = safeParts(file);
-      if (!parts) continue;
-      const text = (await run(['cat-file', 'blob', oid], { cwd: wsPath })).stdout;
-      const dest = path.join(scratch, ...parts);
+    [...found.keys()].forEach((file, k) => {
+      const dest = path.join(scratch, ...safeParts(file));
       fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, text, { flag: 'wx' });
-    }
+      fs.writeFileSync(dest, texts[k], { flag: 'wx' });
+    });
     const asked = paths.map(p => p.replace(/\/+$/, ''));
     paths.forEach((p, i) => {
       const parts = p.endsWith('/') && safeParts(asked[i]);
@@ -686,14 +712,14 @@ async function topFolder(run, repoRoot) {
 
 /**
  * The agent's folder, checked: another worktree that git lists for the checkout at `root`, still on disk, on a
- * workbench/ branch (on `branch` itself, when given). Throws a refusal otherwise.
+ * workbench/ branch (on `branch` itself, when given). Throws a refusal otherwise. `worktrees`: git's list, if just read.
  * @returns {Promise<{ path: string, branch: string, locked: boolean }>}
  */
-async function agentFolder(run, root, wsPath, branch) {
+async function agentFolder(run, root, wsPath, branch, worktrees = null) {
   if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath)) throw new Refusal('gone', 'No agent folder was given.');
   const target = canonical(wsPath);
   if (target === root) throw new Refusal('gone', 'That is your own folder, not an agent’s folder.');
-  const entry = (await listWorktrees(root, run)).find(w => canonical(w.path) === target);
+  const entry = (worktrees || await listWorktrees(root, run)).find(w => canonical(w.path) === target);
   if (!entry || !isFolder(target)) throw new Refusal('gone', 'Its folder is gone.');
   if (!entry.branch || !entry.branch.startsWith('workbench/')) {
     throw new Refusal('changed', 'Its folder is no longer on a workbench/ branch, so Workbench leaves it alone.');
@@ -743,44 +769,50 @@ async function snap(run, folder, since) {
   const cwd = folder.path;
   const from = String(since ?? '');
   if (!OID.test(from)) throw new Refusal('git', 'Workbench does not know which commit its work started from.');
-  if (!(await commitOf(cwd, from, run))) throw new Refusal('git', 'The commit its work started from is no longer in this repository.');
-  const head = await commitOf(cwd, 'HEAD', run);
+  const [start, head, own] = await Promise.all([
+    commitOf(cwd, from, run), commitOf(cwd, 'HEAD', run),
+    run(['rev-parse', '--git-path', 'index'], { cwd }).then(r => path.resolve(cwd, r.stdout.replace(/\r?\n$/, ''))),
+  ]);
+  if (!start) throw new Refusal('git', 'The commit its work started from is no longer in this repository.');
   if (!head) throw new Refusal('git', 'Its folder has no commit checked out.');
 
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
-  let tree, others;
-  try {
-    const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
-    const own = path.resolve(cwd, (await run(['rev-parse', '--git-path', 'index'], { cwd })).stdout.replace(/\r?\n$/, ''));
-    if (!copyIndex(own, env.GIT_INDEX_FILE)) await run(['read-tree', head], { cwd, env });
-    // A repository inside the folder shows as "name/". `add -A` would fail on one with no commit yet (and then the
-    // tree would look unchanged) or record one with commits as a link to that commit: leave them out, and say so.
-    others = nulList((await run(['ls-files', '--others', '--exclude-standard', '-z'], { cwd, env })).stdout);
-    const nested = others.filter(p => p.endsWith('/'));
-    const add = ['-c', 'core.splitIndex=false', 'add', '-A'];
-    if (nested.length) {
-      await run([...add, '--pathspec-from-file=-', '--pathspec-file-nul'],
-        { cwd, env, timeout: WORKTREE_TIMEOUT_MS, input: ['.', ...nested.map(p => `:(exclude,literal)${p}`)].map(s => `${s}\0`).join('') });
-    } else {
-      await run(add, { cwd, env, timeout: WORKTREE_TIMEOUT_MS });
+  // The work as a tree, in a temporary index; meanwhile, what its own ignore rules hide, and the trees it is compared with.
+  const work = async () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
+    try {
+      const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
+      if (!copyIndex(own, env.GIT_INDEX_FILE)) await run(['read-tree', head], { cwd, env });
+      // A repository inside the folder shows as "name/". `add -A` would fail on one with no commit yet (and then the
+      // tree would look unchanged) or record one with commits as a link to that commit: leave them out, and say so.
+      const others = nulList((await run(['ls-files', '--others', '--exclude-standard', '-z'], { cwd, env })).stdout);
+      const nested = others.filter(p => p.endsWith('/'));
+      const add = ['-c', 'core.splitIndex=false', 'add', '-A'];
+      if (nested.length) {
+        await run([...add, '--pathspec-from-file=-', '--pathspec-file-nul'],
+          { cwd, env, timeout: WORKTREE_TIMEOUT_MS, input: ['.', ...nested.map(p => `:(exclude,literal)${p}`)].map(s => `${s}\0`).join('') });
+      } else {
+        await run(add, { cwd, env, timeout: WORKTREE_TIMEOUT_MS });
+      }
+      const tree = (await run(['write-tree'], { cwd, env })).stdout.trim();
+      if (!OID.test(tree)) throw plainError('Git could not record the agent’s work.');
+      return { tree, nested };
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
     }
-    tree = (await run(['write-tree'], { cwd, env })).stdout.trim();
-  } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
-  }
-  if (!OID.test(tree)) throw plainError('Git could not record the agent’s work.');
+  };
+  const [{ tree, nested }, hidden, trees] = await Promise.all([
+    work(), hiddenByAgent(cwd, from, run), run(['rev-parse', `${head}^{tree}`, `${from}^{tree}`], { cwd }),
+  ]);
+  const [headTree, sinceTree] = trees.stdout.split('\n');
+  if (!OID.test(headTree || '') || !OID.test(sinceTree || '')) throw plainError('Git could not read a commit it was given.');
 
-  const left = [];
-  const named = new Set();
-  for (const p of others) {
-    if (p.endsWith('/')) { left.push({ path: p, why: 'nested-repo' }); named.add(p); }
-  }
-  for (const p of await hiddenByAgent(cwd, from, run)) {
+  const left = nested.map(p => ({ path: p, why: 'nested-repo' }));
+  const named = new Set(nested);
+  for (const p of hidden) {
     if (!named.has(p)) { left.push({ path: p, why: p.endsWith('/') ? 'nested-repo' : 'ignored' }); named.add(p); }
   }
   left.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const [headTree, sinceTree] = await Promise.all([treeOf(cwd, head, run), treeOf(cwd, from, run)]);
   const files = tree === sinceTree ? [] : await changesBetween(run, cwd, sinceTree, tree);
   return { head, headTree, tree, since: from, sinceTree, workId: `${head}:${tree}`, changed: tree !== sinceTree, files, left };
 }
@@ -793,7 +825,10 @@ const isBlobMode = mode => mode === '100644' || mode === '100755' || mode === '1
  */
 async function changesBetween(run, cwd, from, to) {
   const common = ['-c', `core.bigFileThreshold=${LARGE_FILE_BYTES}`, 'diff-tree', '-r', '-z', '--no-renames', '--no-ext-diff', '--no-textconv'];
-  const raw = (await run([...common, '--raw', '--no-abbrev', from, to], { cwd })).stdout.split('\0');
+  const [rawOut, numstat] = await Promise.all([
+    run([...common, '--raw', '--no-abbrev', from, to], { cwd }), run([...common, '--numstat', from, to], { cwd }),
+  ]);
+  const raw = rawOut.stdout.split('\0');
   const files = [];
   for (let i = 0; i + 1 < raw.length; i += 2) {
     const m = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])/.exec(raw[i]);
@@ -806,7 +841,7 @@ async function changesBetween(run, cwd, from, to) {
   if (!files.length) return files;
 
   const counts = new Map();
-  for (const rec of (await run([...common, '--numstat', from, to], { cwd })).stdout.split('\0')) {
+  for (const rec of numstat.stdout.split('\0')) {
     const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(rec);
     if (m) counts.set(m[3], m);
   }
@@ -963,8 +998,7 @@ async function identityAt(run, cwd) {
     const r = await run(['config', '--get', key], { cwd, okCodes: [1] });
     return r.code === 0 ? r.stdout.replace(/\r?\n$/, '').trim() : '';
   };
-  const name = await read('user.name');
-  const email = await read('user.email');
+  const [name, email] = await Promise.all([read('user.name'), read('user.email')]);
   if (!name || !email || /[\u0000-\u001f\u007f<>]/.test(name + email)) return null;
   return { name, email };
 }
@@ -1049,47 +1083,63 @@ function inTheWay(stderr) {
  *   'blocked' | 'gone' | 'git'. Never rejects.
  */
 export async function mergeWork(opts = {}) {
+  const progress = { into: null, started: false }; // once git began on the person's folder, never say it did not
   try {
-    return await withoutHooks(run => merge(run, opts));
+    return await withoutHooks(run => merge(run, opts, progress));
   } catch (e) {
+    if (progress.started && !(e instanceof Refusal)) return { ok: false, why: 'git', sentence: SAY.unfinished(progress.into) };
     return failure(e, SAY.git);
   }
 }
 
-async function merge(run, { repoRoot, path: wsPath, branch, since, expect, message, agentId, harness, name } = {}) {
+/** A promise's outcome as a value, so it can wait while other checks speak first: { value } or { error }. */
+const settle = p => p.then(value => ({ value }), error => ({ error }));
+const unwrap = r => {
+  if (r.error) throw r.error;
+  return r.value;
+};
+
+async function merge(run, { repoRoot, path: wsPath, branch, since, expect, message, agentId, harness, name } = {}, progress = {}) {
   const id = String(agentId ?? '');
   if (!AGENT_ID.test(id)) throw new Refusal('git', 'Workbench could not tell which agent this is, so nothing was merged.');
   const exp = expect && typeof expect === 'object' ? expect : {};
 
-  // 1. The person's folder, read afresh.
+  // 1. The person's folder, read afresh. Read together, judged in this order.
   const root = await topFolder(run, repoRoot);
-  const into = await currentBranch(root, run);
+  const [into, inProgress, who, version, intoHead, worktrees] = await Promise.all([
+    currentBranch(root, run), underWay(root, run), identityAt(run, root), gitVersion(run), commitOf(root, 'HEAD', run),
+    listWorktrees(root, run),
+  ]);
   if (!into) throw new Refusal('detached', SAY.detached);
-  if (await underWay(root, run)) throw new Refusal('busy', SAY.busy);
-  const who = await identityAt(run, root);
+  if (inProgress) throw new Refusal('busy', SAY.busy);
   if (!who) throw new Refusal('identity', SAY.identity);
-  if (!atLeast(await gitVersion(run), MIN_GIT)) throw new Refusal('git-old', SAY.gitOld);
-  const intoHead = await commitOf(root, 'HEAD', run);
+  if (!atLeast(version, MIN_GIT)) throw new Refusal('git-old', SAY.gitOld);
   const seen = typeof exp.into === 'string' && exp.into ? exp.into : into;
   if (into !== exp.into || !intoHead || intoHead !== exp.intoHead) throw new Refusal('moved', SAY.moved(seen));
+  progress.into = into;
 
-  // 2. The agent's work, read afresh.
+  // 2. The agent's work, read afresh (and, meanwhile, step 3's question).
   let folder;
   try {
-    folder = await agentFolder(run, root, wsPath, branch);
+    folder = await agentFolder(run, root, wsPath, branch, worktrees);
   } catch (e) {
     if (e instanceof Refusal && e.why === 'gone') throw new Refusal('gone', SAY.gone);
     throw e;
   }
-  if (await underWay(folder.path, run) || (await run(['ls-files', '-u', '-z'], { cwd: folder.path })).stdout) {
-    throw new Refusal('git', SAY.agentBusy);
-  }
-  const s = await snap(run, folder, since);
+  const start = String(since ?? '');
+  const [agentBusy, unmerged, snapped, startIn] = await Promise.all([
+    underWay(folder.path, run),
+    run(['ls-files', '-u', '-z'], { cwd: folder.path }).then(r => r.stdout !== ''),
+    settle(snap(run, folder, since)),
+    OID.test(start) ? isAncestor(root, start, intoHead, run).catch(() => false) : false,
+  ]);
+  if (agentBusy || unmerged) throw new Refusal('git', SAY.agentBusy); // `add -A` would take its conflict markers as work
+  const s = unwrap(snapped);
   if (s.workId !== exp.workId) throw new Refusal('changed', SAY.changed);
   if (!s.changed) throw new Refusal('nothing', SAY.nothing(into));
 
   // 3. Its start must be in the person's branch, or the merge would bring in another branch's commits.
-  if (!(await isAncestor(root, s.since, intoHead, run))) throw new Refusal('ancestry', SAY.ancestry(into));
+  if (!startIn) throw new Refusal('ancestry', SAY.ancestry(into));
 
   // 4. The work commit W, on the agent's branch.
   const agentName = oneLine(name ?? message?.name, NAME_MAX) || folder.branch;
@@ -1116,11 +1166,14 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   }
 
   // 5. Already in the person's branch (merged by hand, say).
-  if (await isAncestor(root, work, intoHead, run)) throw new Refusal('nothing', SAY.nothing(into));
-
   // 6. The merge, worked out in the object database. Git's own merge base, not `since`: an agent that merged the
   //    person's branch into its own would otherwise get false conflicts. Nothing is written to the person's folder.
-  const mt = await run(['merge-tree', '--write-tree', '--name-only', '-z', intoHead, work], { cwd: root, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS });
+  const [already, merged] = await Promise.all([
+    isAncestor(root, work, intoHead, run),
+    settle(run(['merge-tree', '--write-tree', '--name-only', '-z', intoHead, work], { cwd: root, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS })),
+  ]);
+  if (already) throw new Refusal('nothing', SAY.nothing(into));
+  const mt = unwrap(merged);
   const fields = mt.stdout.split('\0');
   if (!OID.test(fields[0])) throw new Refusal('git', SAY.git); // exit 1 without a tree is an error, not a conflict
   if (mt.code === 1) {
@@ -1147,6 +1200,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
     const [on, at, busy] = await Promise.all([currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run)]);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
     if (busy) throw new Refusal('busy', SAY.busy);
+    progress.started = true;
     r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
     // Another git command holds the index (an editor's git, say): git stopped before it changed anything (exit 1 on
     // newer git, 128 on older). Wait a little, then try again.
@@ -1264,12 +1318,14 @@ export async function gitGraph({ repoRoot, limit = 200 } = {}) {
     return await withoutHooks(async run => {
       const root = await topFolder(run, repoRoot);
       const n = Math.max(1, Math.min(5000, Math.floor(Number(limit)) || 200));
-      const head = await commitOf(root, 'HEAD', run);
+      const [head, branch, refs] = await Promise.all([
+        commitOf(root, 'HEAD', run), currentBranch(root, run),
+        run(['for-each-ref', '--format=%(objectname)%00%(refname)', 'refs/heads/'], { cwd: root }),
+      ]);
       if (!head) throw new Refusal('git', `The repository at ${root} has no commits yet.`);
-      const branch = await currentBranch(root, run);
       const names = new Map(); // commit -> short branch names
       const tips = [head];
-      for (const line of (await run(['for-each-ref', '--format=%(objectname)%00%(refname)', 'refs/heads/'], { cwd: root })).stdout.split('\n')) {
+      for (const line of refs.stdout.split('\n')) {
         const [oid, ref] = line.split('\0');
         if (!OID.test(oid || '') || !ref || !ref.startsWith('refs/heads/')) continue;
         const short = ref.slice('refs/heads/'.length);
