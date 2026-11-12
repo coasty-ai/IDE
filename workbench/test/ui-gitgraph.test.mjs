@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { graphLayout, GRAPH_SIZES, NEWEST_AT_TOP, bendsOk, rowWords, workNodeOf, workActions, mergeLabel, gitScreenWords, cutMiddle, shortId, slotOf } from '../ui/gitgraph.js';
+import { graphLayout, GRAPH_SIZES, NEWEST_AT_TOP, bendsOk, rowWords, workNodeOf, workActions, mergeLabel, gitScreenWords, cutMiddle, shortId, slotOf, sharedRuns } from '../ui/gitgraph.js';
 import { palettes, ratio, THEMES } from '../scripts/ui-contrast.mjs';
 
 const U = n => String.fromCodePoint(n);
@@ -351,6 +351,7 @@ test('two lines never run down one gutter: lines that merge into the same lane e
     assert.ok(bendsOk(g), `${name} ${P.name} ${width}: 45° only`);
     if (g.folds.length) continue;   // lines folded into the outermost lane share it on purpose ("+N")
     for (const s of sharedStretches(g, P.bend)) bad.push(`${name} ${P.name} ${width}: ${s}`);
+    for (const s of sharedRuns(g, P.bend)) bad.push(`${name} ${P.name} ${width}: sharedRuns ${s.len} px, ${s.a.kind} and ${s.b.kind}`);
   }
   assert.deepEqual(bad, []);
   // and each merge still reaches the commit it took
@@ -439,6 +440,7 @@ test('any history from real git or made up lays out with no two lines on top of 
       const g = graphLayout({ commits, agents, branch: 'main', head: commits[0].id, width, height: 500, ACTIVE }, GRAPH_SIZES.M);
       if (g.folds.length) continue;
       for (const s of sharedStretches(g, GRAPH_SIZES.M.bend)) bad.push(`trial ${trial} width ${width}: ${s}`);
+      for (const s of sharedRuns(g, GRAPH_SIZES.M.bend)) bad.push(`trial ${trial} width ${width}: sharedRuns ${s.len} px, ${s.a.kind} and ${s.b.kind}`);
     }
   }
   assert.deepEqual(bad.slice(0, 12), []);

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { diffHtml, visibleHtml, visibleText, hasHidden, fileWords, leftWords, patchLines, patchFacts } from '../ui/diffview.js';
+import { hiddenParts } from '../ui/words.js';
 
 // Hidden characters are built from their code points: written raw, they would hide in this very file.
 const U = n => String.fromCodePoint(n);
@@ -117,9 +118,10 @@ test('the git screen\'s files hold no raw hidden characters themselves', () => {
   for (const f of ['../ui/diffview.js', './ui-diffview.test.mjs', '../ui/gitgraph.js', '../ui/gitscreen.js', '../ui/layout.js', '../ui/board.js', '../ui/app.js',
     '../ui/index.html', '../ui/app.css', './ui-gitgraph.test.mjs', './ui-layout.test.mjs', '../scripts/ui-mock.mjs', '../scripts/ui-fit-check.mjs',
     '../ui/words.js', './ui-words.test.mjs', '../ui/focus.js', './ui-focus.test.mjs', '../scripts/ui-contrast.mjs']) {
-    const src = readFileSync(new URL(f, import.meta.url), 'utf8');
-    const raw = [...src].filter(ch => ch !== '\n' && hasHidden(ch));
-    assert.deepEqual(raw.map(hex), [], f);
+    // read in context, with line breaks and tabs (a file's own layout) left out: an emoji keeps its one selector
+    const src = readFileSync(new URL(f, import.meta.url), 'utf8').replace(/[\n\t]/g, ' ');
+    const raw = hiddenParts(src).filter(p => p.hidden).map(p => hex(p.text));
+    assert.deepEqual(raw, [], f);
   }
 });
 

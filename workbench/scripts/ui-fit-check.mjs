@@ -252,6 +252,8 @@ async function gitView(v, s, d) {
         const g = await b.ev(GEOM);
         for (const x of g.shared) failures.push(`${t2}: two lines on top of each other for ${x}`);
         if (/agentFromAgent|twoOnOne/.test(name)) for (const x of g.overTrunk) failures.push(`${t2}: a line runs across your trunk at ${x}`);
+        const headCut = await b.ev(`(() => { const t = document.querySelector('#gitGraph text.ghead'), box = document.getElementById('gitGraph'); if (!t) return null; const r = t.getBoundingClientRect(), bx = box.getBoundingClientRect(); return r.left < bx.left - 0.5 ? Math.round(bx.left - r.left) : 0; })()`);
+        if (headCut) failures.push(`${t2}: the HEAD silkscreen is cut by ${headCut} px at the graph's left edge`);
         if (name === 'oldAgent') {
           const ids = await b.ev(`[...document.querySelectorAll('#gitGraph .gr')].map(r => r.dataset.id)`);
           if (ids.at(-1) !== 'work:e1') failures.push(`${t2}: the agent whose branch starts further back is not at the end (${ids.slice(0, 3).join(', ')} … ${ids.at(-1)})`);
@@ -539,9 +541,9 @@ try {
         await load('merge-detached', '&focus=d1'); await check(tag + ' (not on a branch)');
         await load('merge-noid', '&focus=d2'); await check(tag + ' (no name and email)');
       } else if (v === 'wire') {
-        // A crowded board whose done tray reads "12 done or stopped, 6 from earlier, 1 more working", with the demo's
-        // four machines; then a fuller one whose machines have long names. No section of the edge connector may lie on
-        // the DRAM's wire, and every word must fit its box (the fit check above).
+        // A crowded board whose done tray reads "12 done or stopped, 6 from earlier, 7 more working" (the reviewer's board
+        // at 960×900), with the demo's four machines; then a fuller one whose machines have long names. No section of the
+        // edge connector may lie on the DRAM's wire, and every word must fit its box (the fit check above).
         const crowd = async ({ working, done, earlier, rename }) => {
           const st = await (await fetch(base + '/ctl/state')).json();
           const one = st.agents.find(a => !a.parentId && a.state === 'working');
@@ -562,9 +564,11 @@ try {
           for (const m of document.querySelectorAll('.mach')) { const b = m.getBoundingClientRect(); if (b.left < x + 6 && b.right > x - 6) on.push(m.getAttribute('aria-label')); }
           return { on, tray: document.getElementById('tray').textContent.trim(), names: [...document.querySelectorAll('.mach')].map(m => [m.querySelector('.lb b span')?.textContent || '', m.title || '']) };
         })()`;
-        for (const [what, o] of [['12 done, 6 from earlier, 1 more working', { working: 31, done: 12, earlier: 6 }], ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }]]) {
+        for (const [what, o, tray] of [['12 done, 6 from earlier, more working', { working: 31, done: 12, earlier: 6 }, /^12 done or stopped, 6 from earlier, \d+ more working$/],
+          ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }, /^60 done(, | or stopped, )40 from earlier, \d+ more/]]) {
           await load('many'); await crowd(o);
           const r = await b.ev(WIRE);
+          if (!tray.test(r.tray)) failures.push(`${tag} (${what}): the crowded board did not show (its tray reads "${r.tray}")`);
           for (const x of r.on) failures.push(`${tag} (${what}): a machine lies on the DRAM's wire: ${x}`);
           for (const [shown, title] of r.names || []) if (shown.endsWith('…') && !title) failures.push(`${tag} (${what}): "${shown}" is cut with no title holding all of it`);
           if (verbose) console.log(tag, what, JSON.stringify(r));
