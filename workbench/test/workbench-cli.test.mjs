@@ -257,6 +257,9 @@ test('scripts/accept-real.mjs, dry-run with the stand-in: every step passes, mer
   assert.equal(w.git('for-each-ref', 'refs/heads/workbench', 'refs/workbench'), '', 'no branch or hidden copy is left');
   assert.equal(w.git('worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length, 1, 'no agent folder is left');
   assert.match(out, /The merge commit [0-9a-f]{7} stays on main in /);
+  // For the record: what Claude Code offered the agent (the recorded 2.1.221 run offered tools that are now turned off).
+  assert.match(out, /What Claude Code offered the agent: \n.* {2}Claude Code 2\.1\.221 \(permission mode default\) offers 31 tools: Task Bash /);
+  assert.match(out, / {2}Claude Code offers tools Workbench turned off for its agents: CronCreate /);
 });
 
 test('the repository runs its own tests, demo and dogfood, and checks the work of agents that work on it', () => {

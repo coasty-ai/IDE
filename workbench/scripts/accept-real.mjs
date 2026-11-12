@@ -15,7 +15,8 @@
 // Asks are answered one by one: the touch, and read-only listing commands from a helper, are allowed; anything
 // else is refused and reported. Each run uses its own file name, so the merge it leaves on your branch never gets
 // in the way of the next run. Unless --keep is given, it removes what is left of the agent's folder, its branch and
-// the hidden copy at the end; the merge commit stays on your branch.
+// the hidden copy at the end; the merge commit stays on your branch. For the record, it also prints the version,
+// permission mode and tools Claude Code offered the agent (from Workbench's --verbose log).
 // Claude Code is found the way Workbench finds it: --claude, WORKBENCH_CLAUDE_BIN, `claude` on the PATH, then the
 // VS Code extension. It refuses to run inside a Workbench agent, as Workbench itself does.
 // Dry run without spending (FAKE_CLAUDE_ROOT_BASH may hold anything: this script puts its own `touch` there):
@@ -82,7 +83,8 @@ if (!into) log(`${repo} is not on a branch: the merge step will be refused.`);
 
 const childEnv = { ...process.env };
 if (childEnv.FAKE_CLAUDE_ROOT_BASH !== undefined) childEnv.FAKE_CLAUDE_ROOT_BASH = `touch ${MARKER}`; // a dry run
-const eng = spawn(process.execPath, [BIN, '--repo', repo, '--no-open', '--port', '0', '--budget', String(BUDGET), '--model', 'haiku', ...(claudePath ? ['--claude', claudePath] : [])], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+// --verbose: Workbench then logs the version, permission mode and tools Claude Code offers the agent (printed at the end).
+const eng = spawn(process.execPath, [BIN, '--repo', repo, '--no-open', '--port', '0', '--budget', String(BUDGET), '--model', 'haiku', '--verbose', ...(claudePath ? ['--claude', claudePath] : [])], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
 let out = '';
 let url = null;
 eng.stdout.on('data', (d) => { out += d; const m = /(http:\/\/127\.0\.0\.1:\d+)\/\?t=([0-9a-f]+)/.exec(out); if (m && !url) url = { base: m[1], t: m[2] }; });
@@ -90,7 +92,7 @@ eng.stderr.on('data', (d) => { out += d; });
 const engExit = new Promise((r) => eng.on('exit', (code, signal) => r({ code, signal })));
 for (let i = 0; i < 100 && !url; i++) await sleep(200);
 if (!url) { console.error('Workbench did not start:\n' + out); eng.kill('SIGINT'); process.exit(1); }
-log('Workbench is running.', out.split('\n').filter((l) => /ready|spend|Git does not know/.test(l)).join(' | '));
+log('Workbench is running.', out.split('\n').filter((l) => !l.startsWith('[workbench ') && /ready|spend|Git does not know/.test(l)).join(' | '));
 
 const H = { 'Content-Type': 'application/json', 'X-Workbench-Token': url.t };
 const post = async (p, b) => { const r = await fetch(url.base + p, { method: 'POST', headers: H, body: JSON.stringify(b ?? {}) }); return { status: r.status, body: await r.json().catch(() => null) }; };
@@ -258,6 +260,11 @@ if (!keep) {
     }
   }
 }
+// For the record (not a check): what Claude Code offered the agent, from Workbench's log.
+console.log('');
+const offered = out.split('\n').filter((l) => / offers \d+ tools: |turned off for its agents|runs this agent in permission mode/.test(l));
+log('What Claude Code offered the agent:', offered.length ? '' : 'Workbench logged nothing about it.');
+for (const l of offered) log(`  ${l.replace(/^\[workbench \w+\] claude [0-9a-f]+: /, '')}`);
 if (merged) log(`The merge commit ${merged.slice(0, 7)} stays on ${into} in ${repo}.`);
 rmSync(userData, { recursive: true, force: true });
 const failed = results.filter((r) => !r.ok).length;

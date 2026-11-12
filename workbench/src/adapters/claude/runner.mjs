@@ -115,12 +115,13 @@ export function createLineSplitter(onLine, { maxLineChars = MAX_LINE_CHARS, onTo
   };
 }
 
+/** Log through `log[level]` when the logger has it (the CLI's shows warnings even without --verbose), else `log()`. */
 function makeLog(log, agentId) {
   return (level, msg) => {
     const line = `claude ${agentId}: ${msg}`;
     try {
-      if (typeof log === 'function') log(line);
-      else if (log && typeof log[level] === 'function') log[level](line);
+      if (log && typeof log[level] === 'function') log[level](line);
+      else if (typeof log === 'function') log(line);
       else if (log && typeof log.log === 'function') log.log(line);
     } catch { /* logging must never break the runner */ }
   };
@@ -179,15 +180,21 @@ export function createRunner(opts = {}) {
     try { emitFn(ev); } catch (err) { log('error', `an event handler failed: ${err.message}`); }
   }
 
-  /** Log, once per process, which Claude Code started and the tools it offers the agent. */
+  /**
+   * Log, once per process, which Claude Code started, its permission mode and the tools it offers the agent; warn
+   * when it offers a tool the launch turned off, or runs in another permission mode than the launch asked for.
+   */
   function tellTools(o) {
     if (toldTools) return;
     toldTools = true;
     const tools = Array.isArray(o.tools) ? o.tools.filter((t) => typeof t === 'string').map(logWord) : [];
     const version = typeof o.claude_code_version === 'string' ? logWord(o.claude_code_version) : 'of an unknown version';
-    log('info', `Claude Code ${version} offers ${tools.length} tools: ${tools.join(' ') || 'none'}`);
+    const mode = typeof o.permissionMode === 'string' && o.permissionMode ? logWord(o.permissionMode) : null;
+    log('info', `Claude Code ${version}${mode ? ` (permission mode ${mode})` : ''} offers ${tools.length} tools: ${tools.join(' ') || 'none'}`);
     const off = tools.filter((t) => DISALLOWED.has(t));
     if (off.length) log('warn', `Claude Code offers tools Workbench turned off for its agents: ${off.join(' ')}`);
+    // "manual" is the name 2.1.322's --help gives the default mode.
+    if (mode && mode !== 'default' && mode !== 'manual') log('warn', `Claude Code runs this agent in permission mode ${mode}, not the default mode Workbench asked for.`);
   }
 
   function onLine(line) {

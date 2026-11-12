@@ -4,7 +4,8 @@
 //
 // - With no arguments it exits 0 at once (the test runner may load every file under test/).
 // - `--version` prints a version: FAKE_CLAUDE_VERSION when set (it hangs with FAKE_CLAUDE_VERSION=hang), else 2.1.221.
-//   Its system/init lines report the same version, with a short list of tools.
+//   Its system/init lines report the same version, the --permission-mode it was given (or FAKE_CLAUDE_PERMISSION_MODE)
+//   and a short list of tools.
 // - Otherwise it checks the launch flags and environment the workbench must pass, and exits 3 with a reason
 //   on stderr when one is wrong. Then it reads stream-json user messages on stdin, one per line:
 //     * the first message replays FAKE_CLAUDE_FIXTURE (a file in test/fixtures/) with its session id,
@@ -128,7 +129,10 @@ function main() {
   function reply(text) {
     n++;
     cost += 0.01;
-    out({ type: 'system', subtype: 'init', session_id: session, model: 'claude-fake-1', cwd: process.cwd(), claude_code_version: VERSION, tools: ['Task', 'Bash', 'Edit', 'Read', 'Write'] });
+    out({
+      type: 'system', subtype: 'init', session_id: session, model: 'claude-fake-1', cwd: process.cwd(), claude_code_version: VERSION,
+      permissionMode: env.FAKE_CLAUDE_PERMISSION_MODE || value('--permission-mode'), tools: ['Task', 'Bash', 'Edit', 'Read', 'Write'],
+    });
     out({
       type: 'assistant', parent_tool_use_id: null, session_id: session,
       message: { id: `msg_fake_${n}`, model: 'claude-fake-1', role: 'assistant', content: [{ type: 'text', text }], usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },

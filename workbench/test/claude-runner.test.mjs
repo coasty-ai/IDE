@@ -647,26 +647,42 @@ test('every launch looks Claude Code up again, so an update of the VS Code exten
   assert.ok(!c.events.some((e) => e.kind === EV.STATE && e.state === 'failed'));
 });
 
-test('the version and the tools Claude Code offers are logged once per process, with a warning for tools that should be off', async () => {
+test('the version, permission mode and tools Claude Code offers are logged once per process, with warnings for tools that should be off', async () => {
   const c = collector();
   const lines = { info: [], warn: [] };
-  const log = { info: (l) => lines.info.push(l), warn: (l) => lines.warn.push(l), debug() {}, error() {} };
+  // A logger like the CLI's: a function with a method per level. Warnings go to its warn, so they show without --verbose.
+  const log = Object.assign((l) => lines.info.push(`(plain) ${l}`), { info: (l) => lines.info.push(l), warn: (l) => lines.warn.push(l), debug() {}, error() {} });
   // Recorded with 2.1.221 before most of today's tools were turned off: it offers several of them.
   const r = makeRunner(c, { log, env: { FAKE_CLAUDE_FIXTURE: 'claude-subagent-run.jsonl' } });
   await r.start();
   await c.until((evs) => evs.filter((e) => e.kind === EV.TURN && e.phase === 'end').length === 3, 'three turn ends');
-  const offers = lines.info.filter((l) => / offers \d+ tools/.test(l));
-  assert.equal(offers.length, 1, 'three turns, one process: one line');
-  assert.match(offers[0], /^claude abc123: Claude Code 2\.1\.221 offers 31 tools: Task Bash CronCreate /);
+  const offers = () => lines.info.filter((l) => / offers \d+ tools/.test(l));
+  assert.equal(offers().length, 1, 'three turns, one process: one line');
+  assert.match(offers()[0], /^claude abc123: Claude Code 2\.1\.221 \(permission mode default\) offers 31 tools: Task Bash CronCreate /);
   assert.deepEqual(lines.warn, ['claude abc123: Claude Code offers tools Workbench turned off for its agents: CronCreate CronDelete CronList DesignSync EnterWorktree ExitWorktree PushNotification ScheduleWakeup Workflow']);
   assert.deepEqual([...new Set(c.events.filter((e) => e.kind === EV.SESSION).map((e) => e.version))], ['2.1.221']);
   await r.stop();
   // A new process is logged again.
   await r.send('Carry on');
   await c.until(replyIs(/^You said \(resumed /), 'the resumed reply');
-  assert.equal(lines.info.filter((l) => / offers \d+ tools/.test(l)).length, 2);
-  assert.match(lines.info.filter((l) => / offers \d+ tools/.test(l))[1], /offers 5 tools: Task Bash Edit Read Write$/);
+  assert.equal(offers().length, 2);
+  assert.match(offers()[1], /^claude abc123: Claude Code 2\.1\.221 \(permission mode default\) offers 5 tools: Task Bash Edit Read Write$/);
+  assert.ok(!lines.info.some((l) => l.startsWith('(plain) ')), 'every line went to the method for its level');
   await r.stop();
+});
+
+test('a permission mode other than the one asked for is a warning; "manual" is 2.1.322’s name for the default', async () => {
+  const run = async (mode) => {
+    const c = collector();
+    const warn = [];
+    const r = makeRunner(c, { log: { info() {}, warn: (l) => warn.push(l), debug() {}, error() {} }, env: { FAKE_CLAUDE_PERMISSION_MODE: mode } });
+    await r.start();
+    await c.until(replyIs(/^You said: Say hello$/), 'the first reply');
+    await r.stop();
+    return warn;
+  };
+  assert.deepEqual(await run('bypassPermissions'), ['claude abc123: Claude Code runs this agent in permission mode bypassPermissions, not the default mode Workbench asked for.']);
+  assert.deepEqual(await run('manual'), []);
 });
 
 test('very long lines written in small pieces arrive whole', async () => {
