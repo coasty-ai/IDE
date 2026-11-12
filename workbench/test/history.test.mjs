@@ -737,6 +737,34 @@ test('a record written before source control (no since, from or work) still load
   assert.equal(second.calls.snapshotWork.at(-1).since, BASE);
 });
 
+test('a record that does not say where its work started, or which branch is its own, is refused plainly rather than guessed', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const file = historyMod.historyFile(first.repoRoot, { dir: first.historyDir });
+  const rewrite = (fn) => {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const r of data.agents) fn(r);
+    fs.writeFileSync(file, JSON.stringify(data));
+  };
+  // A commit id that is not a full one is dropped when loaded: where its work starts is not known.
+  rewrite((r) => { r.workspace.base = 'abc1234'; r.workspace.since = 'abc1234'; });
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.deepEqual(await second.engine.changes(id), { ok: false, reply: 'Workbench does not know which commit Fix login redirect started from, so it cannot show its changes.' });
+  assert.deepEqual(await second.engine.proposeMerge(id), { ok: false, reply: 'Workbench does not know which commit Fix login redirect started from, so it cannot merge its work.' });
+  assert.deepEqual(await second.engine.proposeDiscard(id), { ok: false, reply: 'Workbench does not know which commit Fix login redirect started from, so it cannot throw its work away.' });
+  assert.equal(second.calls.snapshotWork.length + second.calls.workDiff.length, 0, 'git was not asked to guess');
+  await second.engine.shutdown();
+  // A branch that is not one Workbench makes is dropped too: its work is not thrown away by guesswork.
+  rewrite((r) => { r.workspace.base = BASE; r.workspace.since = BASE; r.workspace.branch = 'feature/login'; });
+  const third = world(t, dir);
+  await third.engine.start();
+  assert.deepEqual(await third.engine.proposeDiscard(id), { ok: false, reply: 'Workbench does not know Fix login redirect’s branch, so it cannot throw its work away.' });
+  assert.equal(third.calls.discardWork.length, 0);
+});
+
 test('the earlier spend is added only when the resumed Claude Code does not restore it itself: 2.1.277 and newer do', async (t) => {
   // [the version its session line reports, harness, is the earlier spend added?]
   const cases = [

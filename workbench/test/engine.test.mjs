@@ -3265,4 +3265,52 @@ test('demo: an agent the engine stopped has the simulator’s events filtered, s
   await t.engine.shutdown();
 });
 
+test('demo: a simulator that merges and throws away but makes no cards of its own gets the engine’s cards', async () => {
+  const t = gitDemo();
+  t.sim.proposeMerge = undefined;
+  t.sim.proposeDiscard = undefined;
+  await t.engine.start();
+  const v = await t.engine.startAgent({ task: 'Export the invoices' });
+  const runner = t.sim.runners.at(-1);
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.FILES, files: { changed: 2, adds: 5, dels: 1, list: [{ path: 'a.js', adds: 4, dels: 1 }, { path: 'b.js', adds: 1, dels: 0 }] } });
+  runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Done.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(v.id).state === 'done_claimed');
+  const card = await t.engine.proposeMerge(v.id);
+  assert.deepEqual({ ...card.confirm, id: null }, {
+    id: null, kind: 'merge', sentence: 'Merge Export invoices into main?', yes: 'Merge', no: 'Cancel', danger: false,
+    detail: '2 files, +5 −1. Its work becomes a commit on its branch, joined into main by a merge commit. This is the demo, so nothing is really merged.',
+  });
+  assert.equal((await t.engine.confirm(card.confirm.id, true)).reply, 'Merged Export invoices into main. This is the demo: nothing was really merged.');
+  assert.deepEqual(t.sim.git.find(c => c[0] === 'merge')[2].expect, { into: 'main' });
+  const b = await t.engine.startAgent({ task: 'Write the help pages' });
+  const rb = t.sim.runners.at(-1);
+  rb.emit({ kind: EV.TURN, phase: 'start' });
+  rb.emit({ kind: EV.FILES, files: { changed: 1, adds: 3, dels: 0, list: [{ path: 'help.md', adds: 3, dels: 0 }] } });
+  rb.emit({ kind: EV.TURN, phase: 'end', finalText: 'Done.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(b.id).state === 'done_claimed');
+  const away = await t.engine.proposeDiscard(b.id);
+  assert.deepEqual({ ...away.confirm, id: null }, {
+    id: null, kind: 'discard', sentence: 'Throw away Write help pages’s work?', yes: 'Throw it away', no: 'Keep it', danger: true,
+    detail: `Its folder and its branch workbench/write-help-pages-${b.id} are deleted, with 1 changed file. Workbench keeps a hidden copy in git. This is the demo, so nothing is really thrown away.`,
+  });
+  assert.match((await t.engine.confirm(away.confirm.id, true)).reply, /^Threw away Write help pages’s work\./);
+  assert.equal(t.store.get(b.id).work.thrownAway.saved, `refs/workbench/discarded/${b.id}`);
+  await t.engine.shutdown();
+});
+
+test('repository: a workspace module that cannot tell who commits leaves identity unknown, and a merge card is still made', async (ctx) => {
+  const t = liveFolders(ctx);
+  delete t.deps.workspace.gitIdentity;
+  await t.engine.start();
+  assert.equal(t.engine.snapshot().repo.identity, null, 'not known: neither yes nor no');
+  const a = await doneAgent(t);
+  const card = await t.engine.proposeMerge(a.id);
+  assert.ok(card.confirm, card.reply);
+  // git itself says no at the yes, in the engine's words.
+  t.git.mergeResult = { ok: false, why: 'identity', sentence: 'Git does not know your name and email yet.' };
+  assert.equal((await t.engine.confirm(card.confirm.id, true)).reply, 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.');
+  await t.engine.shutdown();
+});
+
 // ------------------------------------------------------------------ end of the source-control tests

@@ -22,6 +22,14 @@ function state(agentId, s, ts = T0 + 1000, extra = {}) {
 function act(agentId, phase, sentence, ts = T0 + 1000, extra = {}) {
   return { kind: EV.ACTIVITY, ts, agentId, phase, sentence, toolKind: 'read', ...extra };
 }
+/** Wait until fn() is true, for at most `ms`. */
+async function eventually(fn, ms = 5000) {
+  const end = Date.now() + ms;
+  while (!fn()) {
+    if (Date.now() > end) throw new Error('Timed out waiting for a condition');
+    await new Promise(r => setTimeout(r, 10));
+  }
+}
 /** A store that records every 'agents' emission. */
 function recording() {
   const s = new Store();
@@ -389,15 +397,17 @@ test('the event log appends JSONL and never throws on write errors', async () =>
   const s = new Store({ logPath: file });
   s.apply([created('r1'), state('r1', 'working')]);
   s.close();
-  await new Promise(r => setTimeout(r, 50));
-  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  // The stream writes in the background: wait for it (a fixed pause was too short while the whole suite runs).
+  const written = () => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+  await eventually(() => written().endsWith('\n') && written().trim().split('\n').length >= 2);
+  const lines = written().trim().split('\n').map(l => JSON.parse(l));
   assert.deepEqual(lines.map(l => l.kind), ['agent.created', 'agent.state']);
 
   // A path that cannot be written: a directory where the file should be.
   const warnings = [];
   const bad = new Store({ logPath: TMP, log: { warn: (m) => warnings.push(m) } });
   bad.apply(created('r2'));
-  await new Promise(r => setTimeout(r, 50));
+  await eventually(() => warnings.length >= 1);
   bad.apply(state('r2', 'working'));
   assert.equal(bad.get('r2').state, 'working', 'the store keeps working');
   assert.ok(warnings.length >= 1);
