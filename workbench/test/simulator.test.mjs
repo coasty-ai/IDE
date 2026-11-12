@@ -1,12 +1,46 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Simulator, available, harness, topicOf } from '../src/adapters/sim/simulator.mjs';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { Simulator, available, harness, topicOf, subjectOf } from '../src/adapters/sim/simulator.mjs';
 import { EV, SPARK_BUCKET_MS, SPARK_BUCKETS } from '../src/shared/events.mjs';
 import { extractQuestion, nameFromTask } from '../src/shared/narrate.mjs';
-import { createFakeStore } from './helpers/simulator-fake-store.mjs';
+import { createFakeStore as createBaseStore } from './helpers/simulator-fake-store.mjs';
 
 const T0 = Date.UTC(2026, 10, 10, 17, 0, 0);
 const MIN = 60_000;
+
+// What became of a root's work in git: `agent.work` { agentId, work }, which replaces the view's `work` as a whole.
+const WORK = EV.WORK || 'agent.work';
+const WORK_KEYS = ['branch', 'from', 'folder', 'merged', 'problem', 'thrownAway'];
+
+/**
+ * The fake store, plus `agent.work`, which it predates. As in store.mjs, the event replaces a root's `work` as a whole
+ * (a helper's is ignored). It is recorded, and its time and shape are checked, like any other event.
+ */
+function createFakeStore(opts) {
+  const store = createBaseStore(opts);
+  const lastTs = new Map();
+  const emit = (ev) => {
+    const prev = lastTs.get(ev.agentId);
+    if (ev.kind !== WORK) {
+      if (prev == null || ev.ts > prev) lastTs.set(ev.agentId, ev.ts);
+      store.emit(ev);
+      return;
+    }
+    store.events.push(ev);
+    if (typeof ev.ts !== 'number' || !Number.isFinite(ev.ts)) store.errors.push(`bad ts on ${ev.kind}`);
+    else if (prev != null && ev.ts < prev) store.errors.push(`${ev.kind} for ${ev.agentId} went back in time`);
+    else lastTs.set(ev.agentId, ev.ts);
+    const v = store.get(ev.agentId);
+    if (!v) store.errors.push(`${ev.kind} for unknown agent ${ev.agentId}`);
+    else if (!ev.work || JSON.stringify(Object.keys(ev.work)) !== JSON.stringify(WORK_KEYS)) store.errors.push(`${ev.kind} for ${ev.agentId} is not shaped like AgentView.work`);
+    else if (!v.parentId) v.work = structuredClone(ev.work);
+  };
+  return { ...store, emit };
+}
 
 /** A simulator wired to a fake store, with a clock the test moves. */
 function world({ seed = 7, speed = 1, engine = true } = {}) {
