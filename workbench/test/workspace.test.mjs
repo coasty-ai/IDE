@@ -1113,6 +1113,12 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     const untouched = await another();
     assert.deepEqual(await tidy(untouched), { removed: true, branch: untouched.branch });
     assert.equal(fs.existsSync(untouched.path), false);
+    // Judging the files again writes an index of Workbench's own: no hook of the repository's runs for it.
+    const log = path.join(T, `hooks-tidy-${t.id}.log`);
+    plantHooks(path.join(t.root, '.git'), log);
+    plantConfigHooks(path.join(t.root, '.git', 'config'), log);
+    await kept(quiet, null, 'core.ignoreStat, with hooks planted');
+    assert.deepEqual(ranHooks(log), [], 'no hook ran');
   });
 
   test('mergeWork refuses, changing nothing at all, before it makes the work commit', async () => {

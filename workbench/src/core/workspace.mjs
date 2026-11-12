@@ -383,22 +383,26 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
  * set), or the assume-unchanged bit that the person's core.ignoreStat gives every file git writes. git status, and
  * `git worktree remove` without --force, then miss an edit to such a file. When any file is marked, the files are
  * judged again in a new index that only `read-tree` has written, which marks nothing, so every file is read
- * (`update-index --refresh` exits 1 when one differs or is missing). Never rejects: false when git cannot say.
+ * (`update-index --refresh` exits 1 when one differs or is missing). Writing that index runs no hook (see
+ * withoutHooks). Never rejects: false when git cannot say.
  */
 async function filesAsCommitted(cwd, head) {
   try {
     const marked = nulList((await git(['ls-files', '-v', '-z'], { cwd })).stdout).some(rec => rec[0] !== 'H');
     if (!marked) return true;
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
-    try {
-      const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
-      await git(['-c', 'core.splitIndex=false', 'read-tree', head], { cwd, env });
-      const r = await git(['-c', 'core.splitIndex=false', '-c', 'core.ignoreStat=false', 'update-index', '--refresh'],
-        { cwd, env, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS });
-      return r.code === 0;
-    } finally {
-      fs.rmSync(scratch, { recursive: true, force: true });
-    }
+    return await withoutHooks(async run => {
+      await run.shield(cwd);
+      const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
+      try {
+        const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
+        await run(['-c', 'core.splitIndex=false', 'read-tree', head], { cwd, env });
+        const r = await run(['-c', 'core.splitIndex=false', '-c', 'core.ignoreStat=false', 'update-index', '--refresh'],
+          { cwd, env, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS });
+        return r.code === 0;
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    });
   } catch {
     return false;
   }
