@@ -11,12 +11,16 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as workspace from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
+import { Engine } from '../src/core/engine.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const BIN = fileURLToPath(new URL('../bin/workbench.mjs', import.meta.url));
 const ACCEPT = fileURLToPath(new URL('../scripts/accept-real.mjs', import.meta.url));
 const FAKE = fileURLToPath(new URL('./helpers/claude-fake.mjs', import.meta.url));
 const INSIDE_AGENT = 'Workbench is running inside an agent. It will not start real agents from there.';
+/** Merge and throw-away are there: the git work (builder A) and the engine's cards (builder B). */
+const MERGE_READY = typeof workspace.mergeWork === 'function' && typeof workspace.discardWork === 'function'
+  && typeof Engine?.prototype?.proposeMerge === 'function' && typeof Engine?.prototype?.proposeDiscard === 'function';
 const NO_IDENTITY = 'Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: git config --global user.name "Your Name" and git config --global user.email you@example.com';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -39,10 +43,11 @@ function realGit() {
 }
 
 /**
- * A throwaway repository with one commit, a home folder with no git name or email, and an environment for the CLI:
- * no inherited agent id or program choices, the real Codex never reachable, and a PATH that holds git only.
+ * A throwaway repository with one commit of `files` on the branch main, a home folder with no git name or email, and
+ * an environment for the CLI: no inherited agent id or program choices, the real Codex never reachable, and a PATH
+ * that holds git only (no node: Workbench must put its own in front for the agents and checks that need it).
  */
-function setup(t) {
+function setup(t, { files = { 'README.md': '# test\n' } } = {}) {
   const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'wb-cli-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const repo = path.join(dir, 'repo');
@@ -51,18 +56,20 @@ function setup(t) {
   mkdirSync(repo);
   mkdirSync(home);
   mkdirSync(bin);
+  mkdirSync(path.join(dir, 'tmp'));
   symlinkSync(realGit(), path.join(bin, 'git'));
-  writeFileSync(path.join(repo, 'README.md'), '# test\n');
-  const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.name=Workbench test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', ...a], { stdio: 'pipe' });
-  git('init', '-q');
+  for (const [name, text] of Object.entries(files)) writeFileSync(path.join(repo, name), text);
+  const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.name=Workbench test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', ...a], { stdio: 'pipe' }).toString().trim();
+  git('init', '-q', '-b', 'main');
   git('add', '-A');
   git('commit', '-q', '-m', 'First commit');
   const env = {
-    ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1',
+    ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1', TMPDIR: path.join(dir, 'tmp'),
     PATH: `${bin}:/usr/bin:/bin`, WORKBENCH_CODEX_BIN: path.join(dir, 'no-codex-here'),
   };
-  for (const k of ['WORKBENCH_AGENT_ID', 'WORKBENCH_CLAUDE_BIN', 'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS']) delete env[k];
-  return { dir, repo, home, env };
+  for (const k of ['WORKBENCH_AGENT_ID', 'WORKBENCH_CLAUDE_BIN', 'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+    'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'CLAUDE_CONFIG_DIR']) delete env[k];
+  return { dir, repo, home, env, git };
 }
 
 /**
@@ -209,6 +216,47 @@ test('without a git name and email, the start says merging must wait for them', 
   const known = await start(t, args, w.env);
   assert.equal(known.code, 0, known.err);
   assert.ok(!known.out.includes('Git does not know your name'), known.out);
+});
+
+test('scripts/accept-real.mjs, dry-run with the stand-in: every step passes, merge and throw-away included, and it leaves no branch behind', {
+  skip: !MERGE_READY && 'needs mergeWork and discardWork in src/core/workspace.mjs (builder A), and proposeMerge and proposeDiscard in src/core/engine.mjs (builder B)',
+  timeout: 150_000,
+}, async (t) => {
+  const w = setup(t, {
+    files: {
+      'greet.js': 'export const greet = (name) => `Hello, ${name}!`;\n',
+      'README.md': '# greet\n',
+      'test.mjs': "import { greet } from './greet.js';\nif (greet('Ada') !== 'Hello, Ada!') process.exit(1);\n",
+      'workbench.json': JSON.stringify({ checks: [{ name: 'tests', run: 'node test.mjs' }], rules: [{ say: 'Do not change greet.js', paths: ['greet.js'] }] }),
+    },
+  });
+  // The person's own uncommitted file, which the merge leaves as it is, and a git name and email (not by git config).
+  writeFileSync(path.join(w.repo, 'notes.txt'), 'My own work, not committed.\n');
+  writeFileSync(path.join(w.home, '.gitconfig'), '[user]\n\tname = Ada Lovelace\n\temail = ada@example.invalid\n');
+  const first = w.git('rev-parse', 'HEAD');
+  // The script's own documented dry run. The stand-in is named twice over, so no real Claude Code can be reached.
+  const env = { ...w.env, WORKBENCH_CLAUDE_BIN: FAKE, FAKE_CLAUDE_FIXTURE: 'claude-subagent-run.jsonl', FAKE_CLAUDE_HOOKS: '1', FAKE_CLAUDE_ROOT_BASH: '1' };
+  const r = await new Promise((resolve) => {
+    execFile(process.execPath, [ACCEPT, w.repo, '--claude', FAKE], { timeout: 140_000, env },
+      (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr }));
+  });
+  const out = r.stdout + r.stderr;
+  assert.equal(r.code, 0, out);
+  assert.doesNotMatch(out, /\bFAIL\b/, out);
+  for (const step of [
+    'Merge asks first', 'its work was joined into main with a merge commit', 'both commits say which agent made them',
+    'nothing else in your folder changed', 'Workbench shows it as merged', 'the git screen has the merge at the top',
+    'Throw it away asks first', 'its folder and branch are gone', 'a hidden copy of its work is kept in git',
+    'Workbench shows it as thrown away', 'Workbench stopped cleanly', 'no Claude Code process was left running',
+  ]) assert.ok(out.includes(`PASS ${step}`), `${step}\n${out}`);
+  // What it leaves: the merge commit on main, the person's own file as it was, and nothing of the agent's.
+  const parents = w.git('rev-list', '--parents', '-n', '1', 'HEAD').split(' ').slice(1);
+  assert.equal(parents.length, 2, 'a merge commit');
+  assert.equal(parents[0], first);
+  assert.equal(readFileSync(path.join(w.repo, 'notes.txt'), 'utf8'), 'My own work, not committed.\n');
+  assert.equal(w.git('for-each-ref', 'refs/heads/workbench', 'refs/workbench'), '', 'no branch or hidden copy is left');
+  assert.equal(w.git('worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree ')).length, 1, 'no agent folder is left');
+  assert.match(out, /The merge commit [0-9a-f]{7} stays on main in /);
 });
 
 test('the repository runs its own tests, demo and dogfood, and checks the work of agents that work on it', () => {
