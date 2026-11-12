@@ -51,7 +51,7 @@ const workCtx = () => ({ ACTIVE, meta: S.meta });
 export const { unmergedWork, workSettled, workKey, canReview } = Q;
 /** Merge into the person's branch is offered: live mode, a root at rest, its folder there, a branch and an identity, unmerged work. */
 export const mergeApplies = a => Q.mergeApplies(a, workCtx());
-/** Throw it away is offered: live mode, a root with its folder and branch. */
+/** Throw it away is offered: live mode, a root whose work was not thrown away, with its branch or its folder still there. */
 export const discardApplies = a => Q.discardApplies(a, workCtx());
 /** The engine's words for why there is no Merge, when it is about git (not on a branch, no name and email); else null. */
 export const gitReason = a => Q.gitReason(a, workCtx());

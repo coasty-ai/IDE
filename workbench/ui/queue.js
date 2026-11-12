@@ -31,17 +31,19 @@ export function workSettled(a) {
 }
 
 /**
- * The work's signature: merged, problem, thrown away, folder gone. It is part of the lid's key, so an outcome swaps the
- * page (and arms the click guard), and buttons carry it (data-work), so one drawn before an outcome cannot act after it.
+ * The work's signature: merged, a problem, thrown away, its folder gone, and whether it holds unmerged work. It is part
+ * of the lid's key, so an outcome swaps the page (and arms the click guard), and buttons carry it (data-work), so one
+ * drawn before an outcome cannot act after it. How many files changed is not part of it: the engine's card says that.
  */
 export function workKey(a) {
   const w = a && a.work;
-  if (!w) return '';
+  if (!w || a.parentId) return '';
   const k = [];
   if (w.thrownAway) k.push('t');
   if (w.merged) k.push('m' + (w.merged.merge || w.merged.at || ''));
   if (w.problem) k.push('p' + (w.problem.why || '') + (w.problem.at || ''));
   if (w.folder === false && !w.thrownAway) k.push('g');
+  if (unmergedWork(a)) k.push('u');
   return k.join(',');
 }
 
@@ -63,9 +65,13 @@ export function mergeApplies(a, { ACTIVE, meta }) {
   return !!(meta && meta.mode === 'live' && canReview(a) && !ACTIVE.has(a.state) && repo && repo.branch && repo.identity !== false && unmergedWork(a));
 }
 
-/** Can its work be thrown away now? Live mode and a root with a folder and a branch (an active one is stopped first). */
+/**
+ * Can its work be thrown away now? Live mode, a root whose work was not thrown away, with its branch or its folder still
+ * there (a branch whose folder is gone is still deleted; an active agent is stopped first, and the engine's card says so).
+ */
 export function discardApplies(a, { meta }) {
-  return !!(meta && meta.mode === 'live' && canReview(a));
+  const w = a && a.work;
+  return !!(meta && meta.mode === 'live' && w && !a.parentId && !w.thrownAway && (w.branch || w.folder));
 }
 
 const DETACHED = 'Your folder is not on a branch, so there is nowhere to merge it.';
