@@ -2,9 +2,11 @@
 // line of work is a copper trace on its own lane, placed outward and alternating right and left, so the tree branches
 // downwards and spreads out. A trace changes lanes with short 45° bends, never at any other angle.
 // Pure: no DOM is touched when this module loads, and nothing comes from /shared/ (state sets are passed in), so
-// node:test checks it.
+// node:test checks it. Everything an agent or a repository controls (subjects, authors, branch names) comes out as
+// visible text: hidden and direction-changing characters are shown as symbols (diffview.js).
 import { agoText } from './boardmodel.js';
 import { plainWords } from './prefs.js';
+import { visibleText } from './diffview.js';
 
 /** Newest commits at the top, where the wire from the board arrives at your branch's tip. Flip it here. */
 export const NEWEST_AT_TOP = true;
@@ -22,12 +24,15 @@ const r1 = n => Math.round(n * 10) / 10;
 /** The first 7 characters of a commit id. */
 export const shortId = id => (typeof id === 'string' ? id.slice(0, 7) : '');
 
-/** A long name cut in the middle ("workbench/sea…nup-a1b2c3"), so both ends stay readable; the whole goes in a title. */
+/**
+ * A long name cut in the middle to at most `max` characters ("release/…refunds"), so both ends stay readable; the whole
+ * goes in a title. The same cut as the lid's (words.js), so a branch reads the same on both screens.
+ */
 export function cutMiddle(s, max = 24) {
   const t = Array.from(String(s ?? ''));
   if (t.length <= max) return t.join('');
-  const head = Math.ceil((max - 1) * 0.55), tail = max - 1 - head;
-  return t.slice(0, head).join('') + '…' + t.slice(t.length - tail).join('');
+  const keep = Math.max(1, max - 1), head = Math.ceil(keep / 2);
+  return t.slice(0, head).join('') + '…' + t.slice(t.length - (keep - head)).join('');
 }
 
 /** A lane's place: 0 is the trunk, then right 1, left 1, right 2, left 2, … */
@@ -35,12 +40,13 @@ export const slotOf = i => (i === 0 ? 0 : i % 2 ? (i + 1) / 2 : -(i / 2));
 
 /**
  * The words the page answers itself on the way to or from the git screen. Whole utterances only, like the looks:
- * "git", "show git", "open git", "source control", "show the graph" open it; "board" and "back" come back.
+ * "git", "show git", "open git", "source control", "show the graph" open it; "board" and "back" come back (the page
+ * acts on those only while the git screen shows). Never sent to the engine.
  * @returns {'open'|'back'|null}
  */
 const OPEN_WORDS = new Set(['git', 'show git', 'open git', 'source control', 'show source control', 'open source control', 'show the graph',
-  'the graph', 'show the git screen', 'open the git screen', 'the git screen', 'git screen']);
-const BACK_WORDS = new Set(['board', 'back', 'the board', 'go back', 'back to the board', 'show the board']);
+  'the graph', 'show git graph', 'show the git graph', 'the git graph', 'show the git screen', 'open the git screen', 'the git screen', 'git screen']);
+const BACK_WORDS = new Set(['board', 'back', 'the board', 'go back', 'back to the board', 'show the board', 'go to the board']);
 export function gitScreenWords(text) {
   const t = plainWords(text);
   if (!t || t.length > 40) return null;
@@ -52,10 +58,11 @@ export function gitScreenWords(text) {
 /**
  * An agent's unmerged work, as its work node says it: "working" while it is active, else "not merged yet · 3 files"
  * (no count when nothing recorded one: a stopped, failed or earlier agent). Null when there is nothing to show: no
- * branch, thrown away, or merged with nothing new.
+ * branch, its folder gone, thrown away, or merged with nothing new.
  */
 export function workNodeOf(a, ACTIVE = ACTIVE_DEFAULT) {
-  if (!a || !a.work || a.work.thrownAway || !(a.work.branch || a.branch)) return null;
+  const w = a && a.work;
+  if (!w || w.thrownAway || !w.branch || w.folder === false) return null;
   if (ACTIVE.has(a.state)) return { label: 'working', count: null, active: true };
   const n = a.files && Number.isFinite(a.files.changed) ? a.files.changed : null;
   if (n === 0) return null;
@@ -64,22 +71,24 @@ export function workNodeOf(a, ACTIVE = ACTIVE_DEFAULT) {
 }
 
 /**
- * Which of the detail's two actions apply to an agent now. Merge (the same rule as the lid's): live mode, a root that
- * is not active, its folder still there, not thrown away, your folder on a branch, and work not merged yet (files
- * changed, or files unknown for a stopped, failed or earlier agent). Throw away: live mode, a root whose branch or
- * folder is still there (an active one is stopped first; the engine says so in its card).
+ * Which of the detail's two actions apply to an agent now, by the lid's own rules (builder D2's mergeApplies and
+ * discardApplies in model.js; the git screen uses those when they are there, and this only when they are not):
+ * Merge: live mode, a root at rest with its branch and folder, not thrown away, your folder on a branch with a name and
+ * email git knows (unknown counts as known: the engine checks again), and work not merged yet (files changed, or files
+ * unknown for a stopped, failed or earlier agent). Throw it away: live mode and a root with its branch and folder (an
+ * active one is stopped first; the engine says so in its card).
  */
-export function workActions(a, { mode = null, branch = null, ACTIVE = ACTIVE_DEFAULT } = {}) {
+export function workActions(a, { mode = null, repo = null, ACTIVE = ACTIVE_DEFAULT } = {}) {
   const w = a && a.work;
-  if (!a || a.parentId || !w || mode !== 'live') return { merge: false, discard: false };
-  const unmerged = a.files ? a.files.changed > 0 : !!(a.earlier || a.state === 'stopped' || a.state === 'failed');
-  const merge = !ACTIVE.has(a.state) && !!w.folder && !w.thrownAway && !!branch && unmerged;
-  const discard = !w.thrownAway && !!(w.branch || w.folder);
-  return { merge, discard };
+  const reviewable = !!(w && !a.parentId && w.branch && w.folder && !w.thrownAway);
+  if (mode !== 'live' || !reviewable) return { merge: false, discard: false };
+  const unmerged = a.files ? (Number(a.files.changed) || 0) > 0 : (a.state === 'stopped' || a.state === 'failed' || !!a.earlier);
+  const merge = !ACTIVE.has(a.state) && !!(repo && repo.branch) && repo.identity !== false && unmerged;
+  return { merge, discard: true };
 }
 
-/** "Merge into main", with a long branch cut in the middle (the whole name goes in the button's title). */
-export const mergeLabel = branch => `Merge into ${cutMiddle(branch, 24)}`;
+/** "Merge into main", with a branch past 16 characters cut in the middle, as the lid does (all of it in the title). */
+export const mergeLabel = branch => `Merge into ${cutMiddle(visibleText(branch), 16)}`;
 
 const msOf = at => (Number.isFinite(at) ? (at < 1e12 ? at * 1000 : at) : null);
 
@@ -88,26 +97,28 @@ const msOf = at => (Number.isFinite(at) ? (at < 1e12 ? at * 1000 : at) : null);
  * @returns {{ line1: string, line2: string, badges: { text: string, kind: 'yours'|'agent'|'other', agentId?: string, title: string }[], aria: string }}
  */
 export function rowWords(item, { agentById = new Map(), now = Date.now(), branch = null } = {}) {
+  const nameOf = a => visibleText(String(a && a.name || '').trim()) || 'Agent';
   if (item.kind === 'work') {
-    const a = item.agent || {};
-    const name = a.name || 'Agent';
+    const name = nameOf(item.agent);
     return { line1: name, line2: item.work.label, badges: [], aria: `${name}: ${item.work.label}.` };
   }
   const c = item.commit || {};
   const agent = c.agentId ? agentById.get(c.agentId) : null;
-  const who = agent ? agent.name : (c.author || 'someone');
+  const who = agent ? nameOf(agent) : (visibleText(String(c.author || '').trim()) || 'someone');
   const at = msOf(c.at);
   const when = at == null ? '' : agoText(now - at);
-  const subject = String(c.subject || '').trim() || '(no description)';
+  const subject = visibleText(String(c.subject || '').trim()) || '(no description)';
   const badges = [];
   for (const ref of c.refs || []) {
-    const ag = [...agentById.values()].find(x => (x.branch || x.work?.branch) === ref);
-    if (ref === branch) badges.push({ text: ref, kind: 'yours', title: `Your branch ${ref}` });
-    else if (ag) badges.push({ text: ag.name || ref, kind: 'agent', agentId: ag.id, title: `${ag.name || 'An agent'}’s branch ${ref}` });
-    else badges.push({ text: ref, kind: 'other', title: `The branch ${ref}` });
+    const ag = [...agentById.values()].find(x => (x.work?.branch || x.branch) === ref);
+    const shown = visibleText(ref);
+    if (ref === branch) badges.push({ text: shown, kind: 'yours', title: `Your branch ${shown}` });
+    else if (ag) badges.push({ text: nameOf(ag), kind: 'agent', agentId: ag.id, title: `${nameOf(ag)}’s branch ${shown}` });
+    else badges.push({ text: shown, kind: 'other', title: `The branch ${shown}` });
   }
   const line2 = [who, when, shortId(c.id)].filter(Boolean).join(' · ');
-  return { line1: subject, line2, badges, aria: `${subject}. ${[who, when].filter(Boolean).join(', ')}${c.id ? `, ${shortId(c.id)}` : ''}.` };
+  const refs = badges.length ? ` On ${badges.map(b => (b.kind === 'yours' ? `your branch ${b.text}` : b.kind === 'agent' ? `${b.text}’s branch` : `the branch ${b.text}`)).join(' and ')}.` : '';
+  return { line1: subject, line2, badges, aria: `${subject}. ${[who, when].filter(Boolean).join(', ')}${c.id ? `, ${shortId(c.id)}` : ''}.${refs}` };
 }
 
 /**
@@ -149,7 +160,7 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
     if (!wn) continue;
     const tip = tipOf.get(a.id) || [a.since, a.base].find(x => typeof x === 'string' && byId.has(x)) || null;
     const item = { kind: 'work', id: 'work:' + a.id, agentId: a.id, agent: a, work: wn, parents: tip ? [tip] : [] };
-    if (tip) { if (!before.has(tip)) before.set(tip, []); before.get(tip).push(item); } else loose.push(item);
+    if (tip) { if (!before.has(tip)) before.set(tip, []); before.get(tip).push(item); } else { item.loose = true; loose.push(item); }
   }
   const items = [...loose];
   for (const c of list) {
@@ -180,7 +191,7 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
     if (ch !== TRUNK) {
       const below = fp && rowOf.has(fp) && rowOf.get(fp) > it.row;
       if (below && !trunk.has(fp) && !pending.has(fp) && !chainOf.has(fp)) pending.set(fp, ch);
-      else ch.end = { from: it, to: below ? fp : null, dangling: !!fp && !below };
+      else ch.end = { from: it, to: below ? fp : null, dangling: (!!fp && !below) || !!it.loose };
     }
     for (const p of more) if (rowOf.has(p) && rowOf.get(p) > it.row && !mergeFrom.has(p)) mergeFrom.set(p, it);
   }

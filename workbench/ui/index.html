@@ -31,8 +31,12 @@
   <symbol id="g-mic" viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></symbol>
   <symbol id="g-laptop" viewBox="0 0 24 24"><rect x="5" y="5.5" width="14" height="9.5" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 18.5h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="g-cloud" viewBox="0 0 24 24"><path d="M7.5 18.5h9.2a3.8 3.8 0 0 0 .5-7.57A5.4 5.4 0 0 0 6.9 9.9 4.3 4.3 0 0 0 7.5 18.5z" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+  <!-- The git mark: a line of work leaving a trunk and joining it again. -->
+  <symbol id="g-git" viewBox="0 0 16 16"><path d="M4.5 1.5v13M4.5 10.5 10 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="4.5" cy="3" r="1.9" fill="currentColor"/><circle cx="4.5" cy="13" r="1.9" fill="currentColor"/><circle cx="11.5" cy="4" r="1.9" fill="currentColor"/></symbol>
 </svg>
 
+<!-- Two screens stacked: the board, and below it the git screen. The one not shown is inert and hidden. -->
+<div id="boardScreen" class="screen">
 <!-- The board itself, drawn once per size: decoration only. -->
 <svg id="board" class="layer" aria-hidden="true"></svg>
 <!-- Copper that changes with state: connections, lit lines, queue pads, brackets, pulses. -->
@@ -55,6 +59,9 @@
 
   <!-- Agents and helpers: buttons over the board, one tab stop, arrow keys move between them. -->
   <div id="parts" role="toolbar" aria-orientation="vertical" aria-label="Your agents and their helpers"></div>
+
+  <!-- The DRAM under the core, wired to it: it opens the git screen. -->
+  <button id="dram" type="button" aria-controls="gitScreen" data-box="dram" aria-label="Git: your branch and your agents’ branches. Opens the git screen."><span class="git" aria-hidden="true">git</span></button>
 
   <div id="machines" role="group" aria-label="Machines"></div>
   <button id="tray" type="button" hidden aria-haspopup="dialog" aria-controls="trayList" aria-expanded="false"></button>
@@ -86,5 +93,23 @@
 <div id="card" role="tooltip" hidden data-box="card"></div>
 <div id="pop" class="pop" role="dialog" aria-label="Machines" hidden data-box="pop"></div>
 <div id="trayList" class="pop" role="dialog" aria-label="Done or stopped" hidden data-box="traylist"></div>
+</div>
+
+<!-- The git screen: your branch as a gold trunk, each agent's branch a copper trace, newest at the top, where the wire
+     from the DRAM arrives. Drawn by gitscreen.js when it opens. -->
+<section id="gitScreen" class="screen" aria-labelledby="gitTitle" inert aria-hidden="true">
+  <svg id="gitBoard" class="layer" aria-hidden="true"></svg>
+  <header id="gitTop">
+    <button id="gitBack" type="button" data-box="gitback"><span aria-hidden="true">↑</span> Back to the board</button>
+    <div class="gtitle" data-box="gittitle"><svg class="gmark" aria-hidden="true"><use href="#g-git"/></svg><h1 id="gitTitle" tabindex="-1">git</h1></div>
+    <p id="gitState" data-box="gitstate"></p>
+    <button id="gitNeeds" type="button" hidden data-box="gitneeds"></button>
+    <form id="gitBar" autocomplete="off" data-box="gitbar"><input id="gitSay" aria-label="Type what you want: it goes to Workbench, about the agent shown here"><span class="ph" id="gitPh" aria-hidden="true">type here</span></form>
+  </header>
+  <p id="gitSaid" role="status" aria-live="polite" data-box="gitsaid"></p>
+  <div id="gitGraph" role="listbox" aria-label="Commits, newest first" data-scroll="1"></div>
+  <section id="gitDetail" aria-labelledby="gitDetailTitle" hidden data-box="gitdetail"></section>
+  <button id="gitWireEnd" type="button" tabindex="-1" aria-label="Back to the board"></button>
+</section>
 </body>
 </html>
