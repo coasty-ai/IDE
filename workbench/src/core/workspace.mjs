@@ -653,6 +653,7 @@ const PATCH_BATCH_BYTES = 8 * 1024 * 1024; // ...as long as their blobs are not 
 const LOCK_TRIES = 4; // another git command holding your folder's index.lock (an editor's git, say): wait, then try again
 // A merge, rebase, cherry-pick or revert (one commit, or a sequence of them waiting between two: `sequencer`) or bisect.
 const UNDER_WAY = ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'sequencer'];
+const UNDER_WAY_REFS = ['CHERRY_PICK_HEAD', 'REVERT_HEAD']; // asked of the ref store as well (see underWay)
 // What git keeps in a folder's git folder for the person's next commit, which a fast-forward deletes as if it had ended
 // a merge: the message it prepared (`git cherry-pick --no-commit`, say) and rerere's record of the conflicts they settled.
 const KEPT_FOR_NEXT_COMMIT = ['MERGE_MSG', 'MERGE_RR'];
@@ -830,8 +831,25 @@ async function gitPathsExist(cwd, names, run = git) {
   return names.some((name, i) => !!out[i] && fs.existsSync(path.resolve(cwd, out[i])));
 }
 
-/** Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder). */
-const underWay = (cwd, run = git) => gitPathsExist(cwd, UNDER_WAY, run);
+/**
+ * Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder), found the way
+ * git itself finds it: MERGE_HEAD, BISECT_LOG and the rebase and sequencer folders are always files, while
+ * CHERRY_PICK_HEAD and REVERT_HEAD are refs, kept as files only with the files ref store (with reftable, git 2.45 and
+ * newer, they are in the ref store itself), so those are asked of git too.
+ */
+async function underWay(cwd, run = git) {
+  const found = await Promise.all([gitPathsExist(cwd, UNDER_WAY, run), ...UNDER_WAY_REFS.map(name => pseudoRef(cwd, name, run))]);
+  return found.some(Boolean);
+}
+
+/**
+ * Whether the ref `name` (CHERRY_PICK_HEAD, say) is there, in whichever ref store the repository uses. A branch or
+ * tag of that name does not count: rev-parse then names it refs/… (and names nothing when both are there).
+ */
+async function pseudoRef(cwd, name, run = git) {
+  const r = await run(['rev-parse', '-q', '--verify', '--symbolic-full-name', name], { cwd, okCodes: [1] });
+  return r.code === 0 && !r.stdout.startsWith('refs/');
+}
 
 /**
  * The paths with unresolved conflicts in this folder's index, each once. A `git stash pop` that did not apply cleanly

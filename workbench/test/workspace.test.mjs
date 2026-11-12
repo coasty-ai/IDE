@@ -1212,6 +1212,51 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(git(t.root, 'log', '-1', '--format=%P', r.merge), `${picked} ${r.work}`);
   });
 
+  test('with the reftable ref store, where CHERRY_PICK_HEAD and REVERT_HEAD are refs and not files, a cherry-pick or revert under way is busy', async (c) => {
+    if (gitTry(T, 'init', '-q', '--ref-format=reftable', path.join(T, 'reftable-probe')).code !== 0) return c.skip('this git has no reftable ref store (git 2.45 and newer)');
+    await inParallel(['cherry-pick', 'revert'].map((op, k) => async () => {
+      const r = path.join(T, `reftable-${op}`);
+      fs.mkdirSync(r);
+      git(r, 'init', '-q', '-b', 'main', '--ref-format=reftable');
+      git(r, 'config', 'user.name', PERSON.name);
+      git(r, 'config', 'user.email', PERSON.email);
+      for (const [f, text] of Object.entries({ ...STARTING_FILES, 'p.txt': 'p\n' })) write(path.join(r, f), text);
+      git(r, 'add', '-A');
+      git(r, 'commit', '-q', '-m', 'first');
+      const root = fs.realpathSync.native(r);
+      const id = `rt000${k + 1}`;
+      const ws = await createWorkspace({ repoRoot: root, agentId: id, slug: 'Reftable', baseDir });
+      const t = { root, ws, id, w: f => path.join(ws.path, f), p: f => path.join(root, f) };
+      if (op === 'cherry-pick') {
+        git(root, 'checkout', '-q', '-b', 'side');
+        write(t.p('p.txt'), 'side\n');
+        git(root, 'commit', '-q', '-am', 'side');
+        git(root, 'checkout', '-q', 'main');
+        write(t.p('p.txt'), 'main\n');
+        git(root, 'commit', '-q', '-am', 'main');
+        assert.notEqual(gitTry(root, 'cherry-pick', 'side').code, 0);
+      } else {
+        write(t.p('p.txt'), 'p2\n');
+        git(root, 'commit', '-q', '-am', 'p2');
+        const target = headOf(root);
+        write(t.p('p.txt'), 'p3\n');
+        git(root, 'commit', '-q', '-am', 'p3');
+        assert.notEqual(gitTry(root, 'revert', target).code, 0);
+      }
+      // Settled, not committed yet.
+      write(t.p('p.txt'), 'settled\n');
+      git(root, 'add', 'p.txt');
+      const ref = op === 'cherry-pick' ? 'CHERRY_PICK_HEAD' : 'REVERT_HEAD';
+      assert.equal(fs.existsSync(path.resolve(root, git(root, 'rev-parse', '--git-path', ref))), false, `${op}: a ref, not a file`);
+      assert.equal(gitTry(root, 'rev-parse', '-q', '--verify', ref).code, 0, op);
+      write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+      const { expect } = await proposal(t);
+      const was = await everything(t);
+      assert.deepEqual(await mergeWork(mergeOpts(t, expect)), { ok: false, why: 'busy', sentence: 'Your folder is in the middle of a merge or rebase. Finish that first.' }, op);
+      assert.deepEqual(await everything(t), was, `${op}: nothing changed`);
+    }));
+  });
+
   test('what git keeps for the person’s next commit survives a merge: the message of a cherry-pick --no-commit, and rerere’s record', async () => {
     const t = await agentRepo({ ...STARTING_FILES, 'p.txt': 'p\n' });
     git(t.root, 'config', 'rerere.enabled', 'true');
