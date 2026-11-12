@@ -8,6 +8,7 @@ Workbench is a local program that runs coding agents (Claude Code, and Codex whe
 - `workbench/README.md`: what a person sees, and how to run it.
 - `workbench/src/core/`: engine, store, history, commands, permission policy, worktrees and git, receipts. `workbench/src/adapters/`: Claude Code, Codex, the simulator. `workbench/src/server/`: the local web server. `workbench/src/shared/`: code the page loads too. `workbench/ui/`: the page, with no build step.
 - `workbench/test/`: one `<module>.test.mjs` per module; stand-ins for Claude Code and Codex in `test/helpers/`.
+- `workbench/app/mac/`: the Mac app, a window around the page, with Node and Workbench inside (Swift; not part of `npm test`).
 
 ## Rules
 
@@ -26,4 +27,5 @@ Workbench is a local program that runs coding agents (Claude Code, and Codex whe
 - `node` (22 or later) and `npm` must be on the PATH. When it has no node, Workbench puts its own there for its agents and checks; in a shell of your own, put the `bin` folder of a Node install in front of `PATH` first.
 - `npm run demo` starts Workbench with simulated agents; nothing is spent.
 - The page checks need Chrome (set `CHROME_BIN` when it is not in the usual place) and are not part of `npm test`. From `workbench/`: `node scripts/ui-behaviour-check.mjs`, `node scripts/ui-fit-check.mjs`, `node scripts/ui-shots.mjs <folder>`.
+- The Mac app: `bash workbench/app/mac/build.sh --no-dmg` builds it into `workbench/dist/` (it needs the Xcode command line tools), and `workbench/dist/Workbench.app/Contents/MacOS/Workbench --demo --self-test` checks it. `--install` is refused inside an agent: it would replace the app the person may be using.
 - Never start a live Workbench (`npm run dogfood`, or `workbench/bin/workbench.mjs --repo …`) or `workbench/scripts/accept-real.mjs` from inside an agent: they start real Claude Code agents on the owner's login and spend money. Both refuse when `WORKBENCH_AGENT_ID` is set. Leave them to the owner.

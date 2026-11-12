@@ -39,6 +39,8 @@ Options:
                       PATH, then the newest Claude Code extension in VS Code or Cursor
   --port <n>          the port for the web page (default 4317; 0 picks a free one)
   --no-open           do not open the browser
+  --app               for the Mac app: no browser, one line the app reads (WORKBENCH_APP {...}), and Workbench
+                      stops, as on Ctrl-C, when its standard input closes (the app quit or crashed)
   --event-log <file>  also write every event to this file, one JSON object per line
   --verbose           print more about what Workbench is doing
   --help              show this help`;
@@ -46,7 +48,7 @@ Options:
 // ------------------------------------------------------------------ arguments
 
 function parseArgs(argv) {
-  const out = { demo: false, repo: null, budget: null, model: null, claude: null, port: DEFAULT_PORT, open: true, help: false, verbose: false, eventLog: null, error: null };
+  const out = { demo: false, repo: null, budget: null, model: null, claude: null, port: DEFAULT_PORT, open: true, app: false, help: false, verbose: false, eventLog: null, error: null };
   for (let i = 0; i < argv.length && !out.error; i++) {
     const raw = argv[i];
     let flag = raw;
@@ -79,6 +81,7 @@ function parseArgs(argv) {
       }
       case '--event-log': out.eventLog = value(); break;
       case '--no-open': out.open = false; break;
+      case '--app': out.app = true; out.open = false; break;
       case '--verbose': out.verbose = true; break;
       case '--help': case '-h': out.help = true; break;
       case '--budget': {
@@ -445,6 +448,15 @@ async function main() {
     if (identity === null) say(NO_GIT_IDENTITY);
   }
   say('Press Ctrl-C to stop.');
+  if (args.app) {
+    // The Mac app reads this one line to show the page in its own window. Its pipe to our standard input is the
+    // lifeline: when the app quits, or crashes, the pipe closes and Workbench stops its agents as on Ctrl-C.
+    say(`WORKBENCH_APP ${JSON.stringify({ url: address, repo: args.demo ? null : (repo.name || null), root: args.demo ? null : (repo.root || null), demo: !!args.demo })}`);
+    process.stdin.on('end', () => stopAll(0));
+    process.stdin.on('close', () => stopAll(0));
+    process.stdin.on('error', () => stopAll(0));
+    process.stdin.resume();
+  }
   if (args.open) openBrowser(address);
   return null; // keep running
 }

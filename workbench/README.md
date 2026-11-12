@@ -26,6 +26,16 @@ Options for real agents:
 | `--claude <path>` | the Claude Code program to run. Without it: `WORKBENCH_CLAUDE_BIN`, then `claude` on the PATH, then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor |
 | `--port 4317` | where the page is served (`0` picks a free port) |
 
+## The Mac app
+
+Workbench is also a Mac app, for Apple silicon. From the top of this repository, `bash workbench/app/mac/build.sh --install` (or `npm run app`) builds it and puts `Workbench.app` in your Applications folder. It also leaves `Workbench-<version>-arm64.dmg` in `workbench/dist/`, to copy to another Mac. Building needs the Xcode command line tools (`xcode-select --install`). The first build downloads Node from nodejs.org and checks it against its published checksum.
+
+- **Open it like any app.** Its first window offers Open Folder… and Try the Demo, and lists the folders you opened lately. File → Open Folder… (⌘O), File → Open Recent, and dropping a folder on its icon do the same. It starts Workbench on that git repository and shows the board in its own window. It works on one folder at a time: opening another stops the first folder's agents, after asking.
+- **Nothing else to install.** Node and npm are inside the app, so agents and checks can run `npm test` on a Mac with no Node. It still needs git, and Claude Code or Codex. It looks for Claude Code where the command does (on the PATH, then in VS Code's Claude Code extension), and also where Claude Code's installer and Homebrew put it, which an app is not told. If it finds none, it asks you where Claude Code is and remembers your answer.
+- **Closing the window, or quitting, stops the agents.** If any are still working, it asks first. What they did stays in their folders. If the app is closed in any other way (it crashed, say), Workbench notices and stops its agents too.
+- **A copy downloaded on another Mac** opens only after System Settings → Privacy & Security → Open Anyway, because the app is not signed by Apple. A copy you build yourself opens directly.
+- **Its log** is `~/Library/Logs/Workbench/workbench.log` (View → Show Log). What Workbench prints in a terminal goes there, such as the folders that keep an agent's work when it stops.
+
 ## What you see
 
 A circuit board. The chip in the middle is you; each agent is a chip on its own lane.
@@ -181,11 +191,14 @@ npm run dogfood                            # node workbench/bin/workbench.mjs --
 npm run dogfood -- --budget 1 --verbose    # options go after --
 ```
 
+Or open this folder in the Mac app (see "The Mac app"), which needs no Node on your PATH.
+
 - **Claude Code is found** in this order: `--claude <path>`, then `WORKBENCH_CLAUDE_BIN`, then `claude` on the PATH, then the newest Claude Code that the VS Code extension installed, in `~/.vscode`, `~/.vscode-insiders` or `~/.cursor`. With only the extension, nothing needs setting: the terminal says, for example, "Claude Code 2.1.322 is ready (from the VS Code extension)." (`--verbose` also prints where it is). It is looked up again at each launch, because the extension moves to a new folder with each update. A path you give that is not there is reported as it is, never swapped for another Claude Code.
 - **Node on the PATH.** `npm run dogfood` itself needs node and npm. Agents and checks get node from the workbench: when the PATH it gives them has no `node`, the folder of the node running the workbench goes first, so `npm test` and `node --test` can find it.
 - **Checks and rules.** This repository's `workbench.json` runs `npm test` (the whole suite, for up to 600 seconds) when an agent says it is done, and sets two rules: "Do not change the research and mockups in docs/" (the top `docs/` folder, not `workbench/docs/`) and "Add no packages" (any `package-lock.json` or `node_modules/`).
 - **Git's name and email** must be set before you can merge (see "Your name and email" above). When git has none, the terminal says so at the start.
 - **Merging into the folder the workbench runs from.** `npm run dogfood` runs the workbench from this folder, and a merge changes its files. Reload the page to see a merged change to the page (`ui/` and `src/shared/`). The engine runs the code it started with until you restart the workbench (Ctrl-C, then `npm run dogfood` again). One exception: Claude Code starts the permission hook, `src/adapters/claude/hook-bridge.mjs`, afresh for each step, so a merged change to it reaches running agents at once. When a change touches both the page and the engine, restart and reload.
+- **The Mac app runs its own copy of the workbench,** not the one in this folder. A change you merge reaches the app once you build it again (`bash workbench/app/mac/build.sh --install`) and reopen the folder.
 - **An agent cannot start a live workbench.** Every agent has `WORKBENCH_AGENT_ID` in its environment, and so do the checks the workbench runs for it. With it set, `bin/workbench.mjs` refuses to start real agents ("Workbench is running inside an agent. It will not start real agents from there."), and so does `scripts/accept-real.mjs`. `--demo` still works. This guards against accidents, not against code that removes the variable on purpose.
 
 `CLAUDE.md` at the top of this repository gives agents working on the workbench its rules.

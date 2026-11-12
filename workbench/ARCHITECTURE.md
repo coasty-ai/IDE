@@ -32,13 +32,14 @@ The browser UI is served by the engine on `127.0.0.1` and talks to it over HTTP 
 | Language, policy, workspaces and source control, receipt | `src/core/commands.mjs`, `src/core/policy.mjs`, `src/core/workspace.mjs`, `src/core/receipt.mjs` |
 | Simulator and machines | `src/adapters/sim/simulator.mjs`, `src/core/machines.mjs` |
 | UI | `ui/index.html`, `ui/app.css`, `ui/app.js`, `ui/*.js` (the git screen: `ui/gitgraph.js`, `ui/diffview.js`, `ui/gitscreen.js`), `ui/fonts/` |
+| The Mac app | `app/mac/WorkbenchApp.swift`, `app/mac/MakeIcon.swift`, `app/mac/build.sh` |
 | Working on Workbench itself (the repository root, one folder up) | `package.json`, `workbench.json`, `CLAUDE.md` |
 
 Each module's tests are owned with it. A builder edits only its own files.
 
 **The repository root** holds what running Workbench on its own repository needs; `test/workbench-cli.test.mjs` pins all three:
 
-- `package.json`: `workbench-ide`, private, no dependencies, with the scripts `"test": "npm --prefix workbench test"`, `"demo": "node workbench/bin/workbench.mjs --demo"` and `"dogfood": "node workbench/bin/workbench.mjs --repo ."`.
+- `package.json`: `workbench-ide`, private, no dependencies, with the scripts `"test": "npm --prefix workbench test"`, `"demo": "node workbench/bin/workbench.mjs --demo"`, `"dogfood": "node workbench/bin/workbench.mjs --repo ."` and `"app": "bash workbench/app/mac/build.sh --install"`.
 - `workbench.json`: the check `{ "name": "tests", "run": "npm test", "timeoutSec": 600 }`, and the rules "Do not change the research and mockups in docs/" for `docs/**` (the root `docs/`, not `workbench/docs/`) and "Add no packages" for `**/package-lock.json` and `**/node_modules/**`.
 - `CLAUDE.md`, for agents working on Workbench: what it is; that `workbench/ARCHITECTURE.md` is the contract and changes in the same commit as the code; the rules above; run the tests with `npm test` at the repo root; `node` on the PATH; plain language; never start a live Workbench or `scripts/accept-real.mjs` from inside an agent; the page checks need Chrome.
 
@@ -762,21 +763,51 @@ Messages, authors and dates:
 ## CLI (`bin/workbench.mjs`)
 
 ```
-node bin/workbench.mjs --demo [--port 4317] [--no-open]
-node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
+node bin/workbench.mjs --demo [--port 4317] [--no-open] [--app]
+node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open] [--app]
 ```
 
-The repository root's `npm run demo` and `npm run dogfood` (Workbench on its own repository) run the first and the second.
+The repository root's `npm run demo` and `npm run dogfood` (Workbench on its own repository) run the first and the second. `npm run app` builds and installs the Mac app (see "The Mac app").
 
 - Prints `Workbench is running at http://127.0.0.1:<port>/?t=<token>`.
 - Opens the browser with `open` (macOS) or `xdg-open`, unless `--no-open`.
 - `--port 0` picks a free port.
+- **`--app`**, for the Mac app: no browser, as with `--no-open`. After "Press Ctrl-C to stop." it prints one more line, `WORKBENCH_APP {"url":…,"repo":…,"root":…,"demo":…}`: JSON with the page's address and its key, the repository's name and folder (null in the demo), and whether it is the demo. From then on it reads its standard input, and when that ends or fails (the app quit, or crashed), Workbench stops as on Ctrl-C. `test/workbench-cli.test.mjs` pins the line and the stop.
 - Exits with a plain-language message if `--repo` is missing in live mode.
 - **No Workbench inside an agent.** Every agent (and every check Workbench runs for one) has `WORKBENCH_AGENT_ID`. When it is set, even to an empty string, live mode is refused before any module loads: "Workbench is running inside an agent. It will not start real agents from there." on stderr, exit code 2. An agent working on this repository could otherwise start a second Workbench whose real agents run on the person's login unseen. `--help`, argument errors and `--demo` still work, and `scripts/accept-real.mjs` refuses with the same sentence and exit code. It guards against accidents, not a determined agent: code it runs can delete the variable first.
 - **`--claude <path>`**: the Claude Code program. Without it: `WORKBENCH_CLAUDE_BIN`, then `claude` on the PATH, then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor (see "Binary" in the Claude Code adapter). The CLI wraps the adapter so that `available()` and `createRunner()` get it as `claudePath`, and every launch looks Claude Code up again from it. A missing value: "--claude needs a value."; a blank one: "--claude needs the path of the Claude Code program." (both exit 2, with the usage).
 - **Start lines** (live mode): "Claude Code 2.1.322 is ready (from the VS Code extension)." ("(from --claude)" for the flag, "(from WORKBENCH_CLAUDE_BIN)" for the variable, nothing for the PATH; with `--verbose` the program's path is logged too), or "Claude Code is not available: <reason>"; the same for Codex. A reason gets a full stop of its own only when it does not already end in ".", "!" or "?", so no line ends in two. When neither can run: "Workbench could not find Claude Code or Codex on this computer, so it has nothing to run.", "  Claude Code: <reason>", "  Codex: <reason>", "Install one of them, or try Workbench with simulated agents using --demo." (exit 1). After the spending line, when `gitIdentity` finds no name and email: "Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: git config --global user.name "Your Name" and git config --global user.email you@example.com".
 - Agents and checks get node on the PATH when theirs has none (see the Claude Code adapter's "Node on the PATH"), so a Workbench started by a node that is not on the PATH still gives them a working `npm test`.
 - Ctrl-C shuts down cleanly: it stops every agent and every check, then prints each folder that keeps an agent's work (`engine.shutdown()`'s `kept`) with its branch. A merge or throw-away under way finishes first: its git runs in a process group of its own, so the Ctrl-C does not reach it. A second Ctrl-C, or 12 seconds, forces the exit: `killAllSync`, then every folder still on disk (`engine.keptFolders()`, untouched ones too, since the tidying was skipped) under "The agent’s folder is still on this computer:" (or "The agents’ folders are…"). Either way it exits once the words have reached the terminal or pipe, or after half a second; a third Ctrl-C exits at once.
+
+## The Mac app (`app/mac/`)
+
+A native window around the page, for macOS 13 or later on Apple silicon. Workbench does not depend on it, and it is not part of `npm test`: it is Swift, and needs a Mac to build.
+
+- **`build.sh`** (the repository root's `npm run app` runs it with `--install`) compiles `WorkbenchApp.swift` and `MakeIcon.swift` with `swiftc`, draws the icon, and assembles `dist/Workbench.app`:
+  - `Contents/MacOS/Workbench`, the window.
+  - `Contents/Resources/node/`: Node's `bin/node`, and npm (`lib/node_modules/npm`, with `bin/npm` and `bin/npx` linking into it). Without `--node <folder>`, the pinned Node release is downloaded from nodejs.org into `~/Library/Caches/workbench-build` and checked against the release's published SHA-256.
+  - `Contents/Resources/workbench/`: `bin/`, `src/`, `ui/`, `package.json`, `README.md` and `ARCHITECTURE.md`, as they are in this folder.
+  - `Info.plist`: bundle id `ai.coasty.workbench`; local networking allowed; the microphone and speech recognition, for talking to Workbench; folders as documents it opens.
+
+  It signs the app ad hoc (there is no Apple Developer ID), writes `dist/Workbench-<version>-arm64.dmg` unless `--no-dmg`, and with `--install` copies the app to `/Applications` (or `~/Applications` when that is not writable). `--install` is refused when `WORKBENCH_AGENT_ID` is set, even to an empty string: an agent must not replace the app the person may be running it in. `dist/` is ignored by git.
+- **Running Workbench.** The app runs `Resources/node/bin/node Resources/workbench/bin/workbench.mjs --repo <folder> --app --port 4317` in the person's home folder: `--demo` instead of `--repo` for the demo, and `--claude <path>` when the person chose a Claude Code program. When Workbench says the port is already in use, the app tries once more with `--port 0`. It shows the page at the address in the `WORKBENCH_APP` line. Everything Workbench prints goes to `~/Library/Logs/Workbench/workbench.log`, with the page's key replaced by `<key>`. One folder at a time: opening another stops the first.
+- **The environment** is the app's own (launchd's, when it was opened from the Finder or the Dock), with:
+  - PATH extended as a terminal would have it. The folders Claude Code's installer and Homebrew use (`~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`), where they exist, go first when the PATH holds only system folders, and after it otherwise. Then come the folders in `/etc/paths` and `/etc/paths.d`.
+  - USER, LOGNAME and SHELL, when missing.
+  - LANG, a UTF-8 locale, when no locale is set.
+
+  Node is not added: when the PATH has none, Workbench's own rule puts the bundled node's folder first, npm included (see "Node on the PATH" in the Claude Code adapter).
+- **Stopping.** The pipe to Workbench's standard input is its lifeline. Closing the board window, opening another folder, and quitting first ask, when root agents are at work. The app counts them from `/api/state`: no parent, not from an earlier run, in a working state. It says, for example, "2 agents are still working." and "Quitting Workbench stops them. What they did so far stays in their folders." Then it closes the pipe, and Workbench stops as on Ctrl-C. If Workbench has not exited 20 seconds later, it gets SIGTERM, then SIGKILL 5 seconds after that. A crashed app closes the pipe too.
+- **No Claude Code.** When Workbench exits before it is ready because it found neither Claude Code nor Codex, its words name command-line flags. So the app says "Workbench could not find Claude Code on this Mac." instead, and offers to choose the program. The choice is kept in the app's settings, and given with `--claude` while that file is there.
+- **The window** is a WKWebView.
+  - Only `127.0.0.1` and `localhost` load in it; any other link opens in the browser.
+  - The microphone is granted to the page alone.
+  - When WebKit's process for the page ends, the page loads again.
+  - While Workbench runs, the app holds a macOS activity, so App Nap does not slow it down while its window is hidden. The Mac may still sleep.
+
+  Closing the window closes the folder. The app stays open, like other Mac apps, and its Dock icon brings back the board or the first window.
+- **Without clicks**, for checks: `Workbench --repo <folder>` or `--demo` opens it at once. `--self-test` writes what the page shows to standard output and the log (`SELF-TEST {…}`), then quits. `--self-test-shot <file.png>` also saves WebKit's picture of the page.
 
 ## UI contract (`ui/`)
 

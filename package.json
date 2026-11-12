@@ -6,7 +6,8 @@
   "scripts": {
     "test": "npm --prefix workbench test",
     "demo": "node workbench/bin/workbench.mjs --demo",
-    "dogfood": "node workbench/bin/workbench.mjs --repo ."
+    "dogfood": "node workbench/bin/workbench.mjs --repo .",
+    "app": "bash workbench/app/mac/build.sh --install"
   },
   "engines": {
     "node": ">=22"

@@ -134,6 +134,32 @@ test('bad options get plain messages', async () => {
   }
 });
 
+test('--app: one line the Mac app reads, no browser, and Workbench stops when the app closes its standard input', async (t) => {
+  const w = setup(t);
+  const proc = spawn(process.execPath, [BIN, '--demo', '--app', '--port', '0'], { env: w.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  proc.stderr.on('data', (d) => { out += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code) => resolve(code)));
+  t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+  const deadline = Date.now() + 20_000;
+  let m;
+  while (!(m = /^WORKBENCH_APP (\{.*\})$/m.exec(out)) && proc.exitCode == null && Date.now() < deadline) await sleep(25);
+  assert.ok(m, out);
+  const ready = JSON.parse(m[1]);
+  assert.equal(ready.demo, true);
+  assert.match(ready.url, /^http:\/\/127\.0\.0\.1:\d+\/\?t=[0-9a-f]{64}$/);
+  const url = new URL(ready.url);
+  const res = await fetch(`${url.origin}/api/state`, { headers: { 'X-Workbench-Token': url.searchParams.get('t') } });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).mode, 'demo');
+  // The app quits (or crashes): its end of the pipe closes, and Workbench stops as on Ctrl-C.
+  proc.stdin.end();
+  const code = await Promise.race([exited, sleep(15_000).then(() => 'still running')]);
+  assert.equal(code, 0, out);
+  assert.match(out, /Stopping the agents and closing Workbench/);
+});
+
 test('inside an agent, Workbench will not start real agents; the demo still starts', async (t) => {
   const w = setup(t);
   // An agent working on this repository runs `node bin/workbench.mjs --repo .`: it is refused before anything loads.
@@ -269,6 +295,7 @@ test('the repository runs its own tests, demo and dogfood, and checks the work o
     test: 'npm --prefix workbench test',
     demo: 'node workbench/bin/workbench.mjs --demo',
     dogfood: 'node workbench/bin/workbench.mjs --repo .',
+    app: 'bash workbench/app/mac/build.sh --install',
   });
   for (const k of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'bundleDependencies', 'bundledDependencies']) {
     assert.equal(pkg[k], undefined, `no ${k}`);
