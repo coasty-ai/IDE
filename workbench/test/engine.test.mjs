@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +8,8 @@ import { Engine } from '../src/core/engine.mjs';
 import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
 import * as commands from '../src/core/commands.mjs';
+import * as receiptMod from '../src/core/receipt.mjs';
+import * as workspaceMod from '../src/core/workspace.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
 import { FakeSim, FakeGitSim, FakeMachines, fakeAdapter, fakeDeps, gate, gitError, until, FAKE_BASE, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
 
@@ -39,6 +42,50 @@ function liveFolders(ctx, opts = {}) {
   const t = live({ ...opts, deps: { ...(opts.deps || {}), folders: dir } });
   t.dir = dir;
   return t;
+}
+
+/**
+ * A live engine on a real temporary git repository, with the real workspace module: the agents' folders are made under
+ * a temporary folder (never ~/.workbench), and the person's name and email come from a temporary global git config,
+ * never the machine's own. The runners are fakes: a test writes an agent's work into its folder itself. `git` runs git
+ * in the person's folder.
+ */
+async function realGit(ctx) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-engine-git-')));
+  const keys = ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'];
+  const saved = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  ctx.after(() => {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  fs.mkdirSync(path.join(dir, 'home'));
+  fs.writeFileSync(path.join(dir, 'gitconfig'), '[user]\n\tname = Person Testing\n\temail = person@example.invalid\n');
+  Object.assign(process.env, {
+    HOME: path.join(dir, 'home'), XDG_CONFIG_HOME: path.join(dir, 'home', '.config'), GIT_CONFIG_GLOBAL: path.join(dir, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
+  });
+  const repo = path.join(dir, 'repo');
+  fs.mkdirSync(repo);
+  const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  git('init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(repo, 'cart.js'), 'export const total = 1;\n');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'First commit');
+  const store = new Store();
+  const claude = fakeAdapter('claude');
+  const codex = fakeAdapter('codex');
+  const { deps, calls } = fakeDeps();
+  deps.workspace = { ...workspaceMod, createWorkspace: (o) => workspaceMod.createWorkspace({ ...o, baseDir: path.join(dir, 'worktrees') }) };
+  const notices = [];
+  store.on('notice', n => notices.push(n.text));
+  const engine = new Engine({
+    store, mode: 'live', repo: await workspaceMod.prepareRepo(repo), hook: HOOK, defaultBudgetUsd: 2,
+    adapters: { claude, codex }, machines: new FakeMachines(), deps,
+    options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20 },
+  });
+  return { store, engine, claude, codex, deps, calls, notices, repo, git };
 }
 
 /** Start an agent and run its turn to "says it is done" (or the done state its checks give). */
@@ -289,6 +336,21 @@ test('receipt: a failed check is checks_failed; no checks is done_claimed', asyn
   await until(() => u.store.get(b.id).state === 'done_claimed');
   assert.equal(u.store.get(b.id).checks, null);
   assert.equal(u.store.get(b.id).says, 'I updated the README.');
+  await u.engine.shutdown();
+});
+
+test('receipt: the checks run with the agent’s own WORKBENCH_AGENT_ID, as its shell does, so a Workbench started from them refuses', async (ctx) => {
+  // What the engine hands the checks: Workbench's own environment, which never has the marker, plus this agent's.
+  const t = live({ deps: { checks: [{ name: 'unit tests', run: 'npm test' }] } });
+  const a = await doneAgent(t);
+  assert.equal(t.calls.runChecks[0].env?.WORKBENCH_AGENT_ID, a.id);
+  await t.engine.shutdown();
+  // What a check really sees: the real checks, a shell in the agent's folder.
+  const u = liveFolders(ctx, { deps: { checks: [{ name: 'marker', run: 'echo "agent id in check: ${WORKBENCH_AGENT_ID-unset}"', timeoutSec: 20 }] } });
+  u.engine.deps.receipt = receiptMod;
+  const b = await doneAgent(u);
+  assert.equal(u.store.get(b.id).state, 'done_checked', u.store.get(b.id).stateReason);
+  assert.equal(u.store.get(b.id).checks.results[0].tail, `agent id in check: ${b.id}`);
   await u.engine.shutdown();
 });
 
@@ -2490,7 +2552,9 @@ test('merge: yes merges once, records it, counts its work from the merged commit
   assert.equal(t.calls.diffStats.at(-1).base, FAKE_WORK);
   assert.equal(t.store.get(a.id).work.merged.merge, FAKE_MERGE, 'the last merge is still known');
   await t.engine.shutdown();
-  assert.equal(t.calls.removeWorkspace.at(-1).base, FAKE_WORK);
+  // The tidy tells git where it started (base) and where its unmerged work starts (since: the merged work commit).
+  const tidy = t.calls.removeWorkspace.at(-1);
+  assert.deepEqual([tidy.path, tidy.base, tidy.since, tidy.onlyIfUnchanged, tidy.deleteBranch], [a.v.workspace, FAKE_BASE, FAKE_WORK, true, true]);
 });
 
 test('merge: a merge that does not go through says why in plain words, and keeps the reason on the agent while it applies', async (ctx) => {
@@ -2517,17 +2581,21 @@ test('merge: a merge that does not go through says why in plain words, and keeps
     ['something new', [], 'Git could not finish the merge. Nothing in your folder changed.', true], // read as 'git'
     ['git-old', [], 'Workbench needs git 2.38 or newer to merge.', false],
     ['changed', [], 'Fix cart total’s work changed since you looked. Have another look.', false],
-    ['nothing', [], 'Fix cart total’s work is already in main.', false],
+    // Already in (merged by hand, say): nothing is left to merge, so a reason from before no longer holds.
+    ['nothing', [], 'Fix cart total’s work is already in main.', 'cleared'],
   ];
   for (const [why, paths, sentence, kept] of cases) {
     const before = work().problem;
     const out = await attempt({ ok: false, why, ...(paths.length ? { paths } : {}) });
     assert.deepEqual(out, { reply: sentence, focusId: a.id }, why);
     assert.equal(t.notices.at(-1), sentence);
-    if (kept) {
+    if (kept === true) {
       const p = work().problem;
       assert.deepEqual({ ...p, at: 0 }, { why: why === 'something new' ? 'git' : why, sentence, paths, into: 'main', at: 0 }, why); // into: the branch it was going into, for the conflict lid
       assert.ok(Number.isFinite(p.at));
+    } else if (kept === 'cleared') {
+      assert.ok(before, 'there was a reason before');
+      assert.equal(work().problem, null, `${why} clears the last reason`);
     } else {
       assert.deepEqual(work().problem, before, `${why} leaves the last reason as it was`);
     }
@@ -2689,6 +2757,143 @@ test('merge: one git job at a time, engine-wide; while its merge waits or runs a
   await t.engine.shutdown();
 });
 
+test('merge (real git): two pages hold cards for one agent; once one merges it, the other page’s cards are gone and nothing is kept on merged work', async (ctx) => {
+  const t = await realGit(ctx);
+  const a = await started(t, { task: 'Fix the cart total' });
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'export const total = 2;\n');
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I fixed the cart total.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(a.id).state === 'done_claimed', { timeout: 10_000 });
+  // Page A and page B each ask to merge it; page B also asks to throw it away.
+  const pageA = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
+  const pageB = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
+  const away = await t.engine.proposeDiscard(a.id, { state: 'done_claimed' });
+  assert.ok(pageA.confirm && pageB.confirm && away.confirm, `${pageA.reply} | ${pageB.reply} | ${away.reply}`);
+  assert.deepEqual(await t.engine.confirm(pageA.confirm.id, true), { reply: 'Merged Fix cart total into main.', focusId: a.id });
+  const merge = t.git('rev-parse', 'HEAD');
+  assert.equal(t.git('show', 'HEAD:cart.js'), 'export const total = 2;');
+  // Page B's cards describe work that is merged now: they are no longer waiting, and nothing happens.
+  assert.deepEqual(await t.engine.confirm(pageB.confirm.id, true), { reply: GONE_REPLY });
+  assert.deepEqual(await t.engine.confirm(away.confirm.id, true), { reply: GONE_REPLY });
+  assert.equal(t.git('rev-parse', 'HEAD'), merge);
+  assert.equal(fs.existsSync(path.join(a.v.workspace, 'cart.js')), true, 'its folder is still there');
+  const w = t.store.get(a.id).work;
+  assert.equal(w.problem, null, 'merged work is not marked as not merged');
+  assert.equal(w.merged.into, 'main');
+  assert.equal(w.thrownAway, null);
+  // Asked again, it says plainly that the work is in already.
+  assert.deepEqual(await t.engine.proposeMerge(a.id), { ok: false, reply: 'Fix cart total’s work is already in main.' });
+  await t.engine.shutdown();
+});
+
+test('merge: a card made from a look taken just before the agent was merged says its work is in already, and keeps no reason on it', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  const pageA = await t.engine.proposeMerge(a.id);
+  // Page B asks while git still reads the work, and page A's yes merges it meanwhile: page B's card is made after
+  // the merge, from what git read before it.
+  const reading = gate();
+  const snapshot = t.deps.workspace.snapshotWork;
+  t.deps.workspace.snapshotWork = async (o) => {
+    const s = await snapshot(o);
+    await reading.wait;
+    return s;
+  };
+  const asking = t.engine.proposeMerge(a.id);
+  await until(() => t.calls.snapshotWork.length === 2);
+  t.deps.workspace.snapshotWork = snapshot;
+  assert.equal((await t.engine.confirm(pageA.confirm.id, true)).reply, 'Merged Fix cart total into main.');
+  reading.open();
+  const pageB = await asking;
+  assert.ok(pageB.confirm, pageB.reply);
+  // git refuses it because main moved, which it did: by this agent's own merge. Nothing went wrong.
+  assert.deepEqual(await t.engine.confirm(pageB.confirm.id, true), { reply: 'Fix cart total’s work is already in main.', focusId: a.id });
+  assert.equal(t.calls.mergeWork.at(-1).expect.intoHead, FAKE_BASE, 'git was asked, and refused it as moved');
+  assert.equal(t.store.get(a.id).work.problem, null);
+  assert.equal(t.store.get(a.id).work.merged.merge, FAKE_MERGE);
+  await t.engine.shutdown();
+});
+
+test('merge: on merged work whose newer files Workbench could not read, a yes refused as moved keeps the reason: there may be new work', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  assert.equal((await t.engine.confirm((await t.engine.proposeMerge(a.id)).confirm.id, true)).reply, 'Merged Fix cart total into main.');
+  // A follow-up whose receipt cannot read what changed: its files are not known.
+  t.deps.workspace.diffStats = async () => { throw new Error('git could not read it'); };
+  assert.equal((await t.engine.say(a.id, 'Also round the tax')).ok, true);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I rounded the tax.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(a.id).state === 'done_claimed');
+  assert.equal(t.store.get(a.id).files, null);
+  const card = await t.engine.proposeMerge(a.id);
+  assert.ok(card.confirm, card.reply);
+  t.git.head = '12'.repeat(20); // the person commits in their own folder
+  assert.deepEqual(await t.engine.confirm(card.confirm.id, true), { reply: 'main changed since you looked. Have another look.', focusId: a.id });
+  assert.equal(t.store.get(a.id).work.problem.why, 'moved');
+  await t.engine.shutdown();
+});
+
+test('merge: a reason left on work with nothing left to merge goes when the merge is tried again; a throw-away withdraws the merge cards', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  assert.equal((await t.engine.confirm((await t.engine.proposeMerge(a.id)).confirm.id, true)).reply, 'Merged Fix cart total into main.');
+  // A reason from before (an older Workbench kept "moved" on merged work, and history brings it back).
+  const problem = { why: 'moved', sentence: 'main changed since you looked. Have another look.', paths: [], into: 'main', at: 1 };
+  t.store.apply([{ kind: EV.WORK, agentId: a.id, work: { ...t.store.get(a.id).work, problem }, ts: Date.now() }]);
+  assert.deepEqual(t.store.get(a.id).work.problem, problem);
+  t.git.work.changed = false;
+  // "Try again": nothing is left to merge, so the reason no longer says anything true.
+  assert.deepEqual(await t.engine.proposeMerge(a.id), { ok: false, reply: 'Fix cart total’s work is already in main.' });
+  assert.equal(t.store.get(a.id).work.problem, null);
+  assert.equal(t.store.get(a.id).work.merged.merge, FAKE_MERGE);
+
+  // Throwing an agent's work away withdraws its merge cards, as a merge does.
+  const b = await doneAgent(t, { task: 'Fix the tax rounding' }, 'I fixed the rounding.');
+  t.git.work.changed = true;
+  const card = await t.engine.proposeMerge(b.id);
+  const away = await t.engine.proposeDiscard(b.id);
+  assert.match((await t.engine.confirm(away.confirm.id, true)).reply, /^Threw away Fix tax rounding’s work\./);
+  assert.deepEqual(await t.engine.confirm(card.confirm.id, true), { reply: GONE_REPLY });
+  assert.equal(t.calls.mergeWork.length, 1, 'only the first agent was ever merged');
+  await t.engine.shutdown();
+});
+
+test('status: work with changes since its merge is not called merged, and a failed check on settled work needs no one, as on the page', async (ctx) => {
+  const t = liveFolders(ctx, { deps: { checks: [{ name: 'unit tests', run: 'npm test' }], checkState: 'failed' } });
+  t.deps.commands.intent = (text, c) => ({ 'what needs me': { kind: 'status' }, 'what is it doing': { kind: 'status', agentId: c.focusId } })[text] || null;
+  const needs = () => t.engine.command('what needs me');
+  const doing = async (id) => (await t.engine.command('what is it doing', { focusId: id })).reply;
+  const a = await doneAgent(t);
+  assert.equal(t.store.get(a.id).state, 'checks_failed');
+  assert.deepEqual(await needs(), { reply: 'One thing needs you: Fix cart total is done, but a check failed.', focusId: a.id });
+  // Merged anyway: nothing of it is left to merge, so its failed check waits on no one.
+  assert.equal((await t.engine.confirm((await t.engine.proposeMerge(a.id)).confirm.id, true)).reply, 'Merged Fix cart total into main.');
+  assert.deepEqual(await needs(), { reply: 'Nothing needs you right now.' });
+  assert.equal(await doing(a.id), 'Fix cart total is done, but a check failed. The check “unit tests” did not pass. It says: I fixed the cart total. Its work was merged into main.');
+  // A follow-up changes a file: that file is not merged, and the failed check needs the person again.
+  assert.equal((await t.engine.say(a.id, 'Also round the tax')).ok, true);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I rounded the tax.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(a.id).state === 'checks_failed');
+  assert.equal(t.store.get(a.id).files.changed, 1);
+  assert.ok(t.store.get(a.id).work.merged, 'the last merge is still known');
+  assert.equal(await doing(a.id), 'Fix cart total is done, but a check failed. The check “unit tests” did not pass. It says: I rounded the tax. Its earlier work was merged into main, but 1 changed file is not merged yet.');
+  assert.deepEqual(await needs(), { reply: 'One thing needs you: Fix cart total is done, but a check failed.', focusId: a.id });
+  // Stopped in the middle of its next turn, it has said nothing yet of what it changed.
+  assert.equal((await t.engine.say(a.id, 'And the docs')).ok, true);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  await t.engine.stop(a.id);
+  assert.equal(t.store.get(a.id).files, null);
+  assert.equal(await doing(a.id), 'Fix cart total was stopped. Its earlier work was merged into main. Anything it changed since is not merged yet.');
+  // Thrown away: settled too.
+  const b = await doneAgent(t, { task: 'Fix the tax rounding' }, 'I fixed the rounding.');
+  assert.deepEqual(await needs(), { reply: 'One thing needs you: Fix tax rounding is done, but a check failed.', focusId: b.id });
+  assert.match((await t.engine.confirm((await t.engine.proposeDiscard(b.id)).confirm.id, true)).reply, /^Threw away /);
+  assert.deepEqual(await needs(), { reply: 'Nothing needs you right now.' });
+  assert.equal(await doing(b.id), 'Fix tax rounding is done, but a check failed. The check “unit tests” did not pass. It says: I fixed the rounding. Its work was thrown away.');
+  await t.engine.shutdown();
+});
+
 test('merge: nothing writes in its folder while git takes its work: its idle process is closed, and checks still ending are waited for', async (ctx) => {
   const t = liveFolders(ctx);
   const a = await doneAgent(t);
@@ -2751,9 +2956,12 @@ test('shutdown waits for a merge under way, and no new git work starts once it h
   await down;
   assert.equal(t.calls.mergeWork.length, 1);
   assert.equal(t.calls.discardWork.length, 0);
-  // The tidy counts the merged agent's folder as unchanged from its merged work commit.
-  assert.equal(t.calls.removeWorkspace.find(c => c.path === a.v.workspace).base, FAKE_WORK);
-  assert.equal(t.calls.removeWorkspace.find(c => c.path === b.v.workspace).base, FAKE_BASE);
+  // The tidy counts the merged agent's folder as unchanged from its merged work commit (since); the other, never merged,
+  // from where it started, with no since at all.
+  const tidyA = t.calls.removeWorkspace.find(c => c.path === a.v.workspace);
+  const tidyB = t.calls.removeWorkspace.find(c => c.path === b.v.workspace);
+  assert.deepEqual([tidyA.base, tidyA.since], [FAKE_BASE, FAKE_WORK]);
+  assert.deepEqual([tidyB.base, 'since' in tidyB], [FAKE_BASE, false]);
 });
 
 test('merge and throw away by words: the card is for the agent the words named, and a typed yes answers only the card on screen', async (ctx) => {
@@ -2811,6 +3019,53 @@ test('merge and throw away by words: the card is for the agent the words named, 
   assert.equal((await t.engine.command('mumble', { confirmId: away.confirm.id })).reply, 'I did not catch that. Say “do it” to throw it away, or “cancel”.');
   assert.deepEqual(await t.engine.confirm(away.confirm.id, false), { reply: 'OK, I won’t throw it away.' });
   assert.equal(t.calls.discardWork.length, 0);
+  await t.engine.shutdown();
+});
+
+test('command: a look at an agent’s changes is read-only, so the merge or throw-away card on screen stays, and its yes still answers it', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  const b = await doneAgent(t, { task: 'Fix the tax rounding' }, 'I fixed the rounding.');
+  t.deps.commands.intent = (text, c) => ({
+    'merge it': { kind: 'merge', agentId: c.focusId },
+    'throw it away': { kind: 'discard', agentId: c.focusId },
+    'show me the changes': { kind: 'changes', agentId: c.pendingConfirm?.agentId ?? c.focusId },
+    'what did fix tax rounding change': { kind: 'changes', agentId: b.id },
+    'what did the twins change': { kind: 'changes', agentId: null },
+    yes: { kind: 'confirm', go: true },
+  })[text] || null;
+  const card = await t.engine.command('merge it', { focusId: a.id });
+  assert.equal(card.confirm.kind, 'merge');
+  const before = t.notices.length;
+  // The changes of the agent on the card: the page opens them, and the card is still the one on screen.
+  assert.deepEqual(await t.engine.command('show me the changes', { confirmId: card.confirm.id }),
+    { reply: 'Here is what Fix cart total changed.', review: a.id, focusId: a.id, confirm: card.confirm });
+  // Another agent's changes, or words that name no one, leave it too.
+  assert.deepEqual(await t.engine.command('what did fix tax rounding change', { confirmId: card.confirm.id }),
+    { reply: 'Here is what Fix tax rounding changed.', review: b.id, focusId: b.id, confirm: card.confirm });
+  assert.deepEqual(await t.engine.command('what did the twins change', { confirmId: card.confirm.id }),
+    { reply: 'Which one do you mean? Pick it on the board, then ask again.', confirm: card.confirm });
+  assert.equal(t.notices.length, before, 'a card that stays is not talked over');
+  assert.equal(t.calls.mergeWork.length, 0);
+  assert.deepEqual(await t.engine.command('yes', { confirmId: card.confirm.id }), { reply: 'Merged Fix cart total into main.', focusId: a.id });
+  // A throw-away card stays the same way.
+  const away = await t.engine.command('throw it away', { focusId: b.id });
+  assert.equal(away.confirm.kind, 'discard');
+  const look = await t.engine.command('show me the changes', { confirmId: away.confirm.id });
+  assert.deepEqual([look.review, look.confirm], [b.id, away.confirm]);
+  assert.match((await t.engine.confirm(away.confirm.id, true)).reply, /^Threw away Fix tax rounding’s work\./);
+  await t.engine.shutdown();
+});
+
+test('command (real parser): asking what an agent changed while its merge card shows keeps the card, and "yes" then merges', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.engine.deps.commands = commands;
+  const a = await doneAgent(t);
+  const card = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
+  assert.deepEqual(await t.engine.command('what did fix cart total change', { confirmId: card.confirm.id }),
+    { reply: 'Here is what Fix cart total changed.', review: a.id, focusId: a.id, confirm: card.confirm });
+  assert.equal(t.claude.runners.length, 1, 'nothing was launched');
+  assert.deepEqual(await t.engine.command('yes', { confirmId: card.confirm.id }), { reply: 'Merged Fix cart total into main.', focusId: a.id });
   await t.engine.shutdown();
 });
 
@@ -3236,6 +3491,29 @@ test('demo: with the simulator’s git methods, cards and outcomes come from it,
   assert.equal(gone.reply, 'Threw away Write help pages’s work. Its folder and branch are gone. This is the demo: nothing was really thrown away.');
   assert.deepEqual(t.sim.git.find(c => c[0] === 'discard')[2].expect, { workId: `w-${b.id}` });
   assert.equal(t.store.get(b.id).work.thrownAway.saved, `refs/workbench/discarded/${b.id}`);
+  await t.engine.shutdown();
+});
+
+test('demo: once an agent is merged or thrown away, its other cards are gone, so a second page’s yes does nothing', async () => {
+  const t = gitDemo();
+  await t.engine.start();
+  const a = await demoDone(t);
+  const pageA = await t.engine.proposeMerge(a.id);
+  const pageB = await t.engine.proposeMerge(a.id);
+  const awayB = await t.engine.proposeDiscard(a.id);
+  assert.match((await t.engine.confirm(pageA.confirm.id, true)).reply, /^Merged Export invoices into main\./);
+  assert.deepEqual(await t.engine.confirm(pageB.confirm.id, true), { reply: GONE_REPLY });
+  assert.deepEqual(await t.engine.confirm(awayB.confirm.id, true), { reply: GONE_REPLY });
+  assert.equal(t.sim.git.filter(c => c[0] === 'merge').length, 1);
+  assert.equal(t.sim.git.filter(c => c[0] === 'discard').length, 0);
+  assert.equal(t.store.get(a.id).work.problem, null);
+  // And a throw-away withdraws a merge card.
+  const b = await demoDone(t, 'Write the help pages');
+  const card = await t.engine.proposeMerge(b.id);
+  const away = await t.engine.proposeDiscard(b.id);
+  assert.match((await t.engine.confirm(away.confirm.id, true)).reply, /^Threw away Write help pages’s work\./);
+  assert.deepEqual(await t.engine.confirm(card.confirm.id, true), { reply: GONE_REPLY });
+  assert.equal(t.sim.git.filter(c => c[0] === 'merge').length, 1);
   await t.engine.shutdown();
 });
 

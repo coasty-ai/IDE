@@ -651,6 +651,10 @@ test('an earlier agent can be merged: it stays an earlier agent, and its record 
   assert.equal(rec.work.merged.merge, FAKE_MERGE);
   assert.deepEqual(rec.files, { changed: 0, adds: 0, dels: 0, list: [] });
   await second.engine.shutdown();
+  // The tidy asked about its folder, from its merged work commit; git kept it here (it holds something), and so does
+  // its record.
+  assert.deepEqual(second.calls.removeWorkspace.map(c => [c.path, c.base, c.since, c.onlyIfUnchanged]), [[rec.workspace.path, BASE, FAKE_WORK, true]]);
+  assert.equal(readFile(second).agents.find(r => r.id === id).workspace.path, rec.workspace.path);
 
   // Next time it is still merged, and a message picks it up with its unmerged work counted from there.
   const third = world(t, dir);
@@ -662,6 +666,65 @@ test('an earlier agent can be merged: it stays an earlier agent, and its record 
   runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Docs too.', backgroundTasks: 0 });
   await until(() => third.store.get(id).state === 'done_claimed');
   assert.equal(third.calls.diffStats.at(-1).base, FAKE_WORK);
+});
+
+test('a reason a merge did not go through, saved on merged work, goes for good once trying again finds nothing left to merge', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  assert.equal((await first.engine.confirm((await first.engine.proposeMerge(id)).confirm.id, true)).reply, 'Merged Fix login redirect into main.');
+  // A reason an older Workbench kept on merged work (another page's stale card), saved with it.
+  const problem = { why: 'moved', sentence: 'main changed since you looked. Have another look.', paths: [], into: 'main', at: 1 };
+  first.store.apply([{ kind: EV.WORK, agentId: id, work: { ...first.store.get(id).work, problem }, ts: Date.now() }]);
+  await first.engine.shutdown();
+  assert.equal(readFile(first).agents[0].work.problem.why, 'moved');
+
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.equal(second.store.get(id).work.problem.why, 'moved', 'it comes back with the record');
+  second.git.work.changed = false;
+  assert.deepEqual(await second.engine.proposeMerge(id), { ok: false, reply: 'Fix login redirect’s work is already in main.' });
+  assert.equal(second.store.get(id).work.problem, null);
+  await second.engine.shutdown();
+  assert.equal(readFile(second).agents.find(r => r.id === id).work.problem, null, 'the record says so too');
+
+  const third = world(t, dir);
+  await third.engine.start();
+  assert.equal(third.store.get(id).work.problem, null, 'and it does not come back');
+  assert.equal(third.store.get(id).work.merged.merge, FAKE_MERGE);
+});
+
+test('an earlier agent merged in this run is tidied at shutdown like one of this run: its folder and branch go when unchanged since', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const folder = readFile(first).agents[0].workspace.path;
+  const second = world(t, dir, { workspaceKept: false });
+  await second.engine.start();
+  const card = await second.engine.proposeMerge(id, { state: 'done_claimed' });
+  assert.equal((await second.engine.confirm(card.confirm.id, true)).reply, 'Merged Fix login redirect into main.');
+  await second.engine.shutdown();
+  // Asked once, only if nothing changed since its merged work commit (since), with its branch.
+  assert.deepEqual(second.calls.removeWorkspace.filter(c => c.path === folder).map(c => ({ ...c, repoRoot: null })), [
+    { repoRoot: null, path: folder, base: BASE, since: FAKE_WORK, onlyIfUnchanged: true, deleteBranch: true },
+  ]);
+  const w = second.store.get(id).work;
+  assert.deepEqual([w.folder, w.branch, w.merged.merge], [false, null, FAKE_MERGE]);
+  const rec = readFile(second).agents.find(r => r.id === id);
+  assert.equal(rec.workspace, null, 'its record keeps no folder');
+  assert.deepEqual([rec.work.folder, rec.work.branch, rec.work.merged.merge], [false, null, FAKE_MERGE]);
+
+  // Next time it is still merged; it has no folder to continue in, and no branch on the git screen.
+  const third = world(t, dir);
+  await third.engine.start();
+  const v = third.store.get(id);
+  assert.equal(v.work.merged.merge, FAKE_MERGE);
+  assert.equal(v.canContinue, false);
+  assert.equal(v.continueReason, 'Its folder was not kept, so it cannot continue.');
+  assert.deepEqual((await third.engine.gitGraph()).agents, []);
+  await third.engine.shutdown();
+  assert.equal(third.calls.removeWorkspace.length, 0, 'nothing is left to tidy');
 });
 
 test('an earlier agent can be thrown away: its record keeps no folder, and its view stays, thrown away', async (t) => {

@@ -56,6 +56,7 @@ const DEMO_NO_DISCARD = 'This is the demo, so nothing is really thrown away.';
 const DEMO_MERGED = 'This is the demo: nothing was really merged.';
 const DEMO_THROWN = 'This is the demo: nothing was really thrown away.';
 const THROWN_REASON = 'Its work was thrown away, so it cannot continue.';
+const NOT_KEPT_REASON = 'Its folder was not kept, so it cannot continue.';
 const WHICH_ONE = 'Which one do you mean? Pick it on the board, then ask again.';
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
@@ -162,6 +163,25 @@ function countFiles(list) {
 /** Where an agent's unmerged work starts: its last merged work commit, else the commit it started from. */
 function sinceOf(ws) {
   return (ws && (ws.since || ws.base)) || null;
+}
+
+/**
+ * Work in a root's folder that is not merged yet, read as the page reads it (ui/queue.js unmergedWork): files changed
+ * since its last merge (or since it started), or, when the files are not known, a stopped, failed or earlier agent,
+ * which may hold some.
+ */
+function unmergedWork(v) {
+  const w = v && v.work;
+  if (!w || w.thrownAway || !w.folder) return false;
+  if (v.files) return count(v.files.changed) > 0;
+  return v.state === STATE.STOPPED || v.state === STATE.FAILED || !!v.earlier;
+}
+
+/** A root's work is settled: thrown away, or merged with nothing new since (ui/queue.js workSettled). */
+function workSettled(v) {
+  const w = v && !v.parentId ? v.work : null;
+  if (!w) return false;
+  return !!w.thrownAway || (!!w.merged && !unmergedWork(v));
 }
 
 /** "a.js, b.js and c.js", or "a.js, b.js, c.js and 2 more": paths as words fit for a sentence. */
@@ -379,6 +399,7 @@ export class Engine extends EventEmitter {
     this._busy = new Map();      // rootId -> 'merge' | 'discard'
     this._gitChain = Promise.resolve();
     this._gitWork = new Set();   // git jobs under way
+    this._mergedEarlier = new Set(); // earlier agents merged in this run: the shutdown tidy looks at their folders too
     this.repoIdentity = null;    // live mode: does git know the person's name and email (true/false); null: not known
     this._repoKey = null;        // the repository as the page last heard of it (see _setRepo)
     this._repoReading = null;    // a periodic refresh of the repository under way
@@ -482,6 +503,7 @@ export class Engine extends EventEmitter {
       // A runner that would not stop may still be writing in its folder: that one stays.
       const tidy = [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved && !this._busy.has(r.id)
         && this._runnerInfo(r)?.alive !== true);
+      tidy.push(...this._earlierToTidy());
       if (tidy.length) {
         await withTimeout(Promise.all(tidy.map(r => this._removeUnchanged(r))), this.options.tidyTimeoutMs)
           .catch(() => this.log.warn('Some agent folders were not tidied up in time.'));
@@ -793,7 +815,10 @@ export class Engine extends EventEmitter {
           };
           let res;
           try {
-            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal }));
+            // The checks run the agent's own code (its package.json, its tests), so they carry its marker as its shell
+            // does: a Workbench or an acceptance run started from a check then refuses, as it would in the agent.
+            const env = { ...process.env, WORKBENCH_AGENT_ID: agentId };
+            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal, env }));
             const done = running.then(() => {}, () => {});
             run.checksDone = done;
             done.then(() => { if (run.checksDone === done) run.checksDone = null; });
@@ -1497,7 +1522,7 @@ export class Engine extends EventEmitter {
       return { ok: false, reason: `${harnessName(rec.harness)} is not available on this computer.` };
     }
     if (!rec.sessionId) return { ok: false, reason: 'It never saved its conversation, so there is nothing to pick up.' };
-    if (!rec.workspace) return { ok: false, reason: 'Its folder was not kept, so it cannot continue.' };
+    if (!rec.workspace) return { ok: false, reason: NOT_KEPT_REASON };
     let there = false;
     try { there = fs.statSync(rec.workspace.path).isDirectory() && fs.existsSync(path.join(rec.workspace.path, '.git')); } catch { /* gone */ }
     if (!there) return { ok: false, reason: 'Its folder is gone, so it cannot continue.' };
@@ -1952,28 +1977,55 @@ export class Engine extends EventEmitter {
 
   /**
    * Remove an agent's folder and branch when they hold nothing: never while it might hold work (see removeWorkspace's
-   * onlyIfUnchanged). Used when an agent could not start, and at shutdown. Never during the session otherwise:
-   * stopped, failed and done agents all take follow-ups in the same folder.
+   * onlyIfUnchanged). Used when an agent could not start, and at shutdown (this run's agents, and the earlier agents
+   * merged in this run: `run.earlier`). Never during the session otherwise: stopped, failed and done agents all take
+   * follow-ups in the same folder.
    */
   async _removeUnchanged(run) {
     const ws = run && run.workspace;
     if (!ws || run.folderRemoved || !this.repoInfo || typeof this.deps.workspace?.removeWorkspace !== 'function') return false;
     try {
-      // Unchanged since its last merge (or since it started): a merged agent that did nothing more goes too.
-      const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace({
-        repoRoot: this.repoInfo.root, path: ws.path, base: sinceOf(ws), onlyIfUnchanged: true, deleteBranch: true,
-      })), this.options.stopTimeoutMs);
+      // Unchanged since its last merge (or since it started): a merged agent that did nothing more goes too. git hears
+      // where it started (base) and, once it was merged, where its unmerged work starts (since, its merged work
+      // commit): then the folder goes only while that commit is still in another branch, so a merge the person undid
+      // never takes the only copy of the work with it.
+      const args = { repoRoot: this.repoInfo.root, path: ws.path, base: ws.base ?? null, onlyIfUnchanged: true, deleteBranch: true };
+      if (ws.since && ws.since !== ws.base) args.since = ws.since;
+      const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace(args)), this.options.stopTimeoutMs);
       if (out?.removed) {
         run.folderRemoved = true;
         // Its folder and branch went with nothing in them: the view says so too.
         const w = this.store.get(run.id)?.work;
         if (w) this._apply([{ kind: EV.WORK, agentId: run.id, work: { ...w, folder: false, branch: null } }]);
+        if (run.earlier) {
+          // An earlier agent's record keeps no folder from now on, so next time it says it cannot continue.
+          this._replaceEarlier(run.id, null);
+          this.store.markContinue(run.id, { ok: false, reason: NOT_KEPT_REASON });
+        }
       }
       return !!out?.removed;
     } catch (err) {
       this.log.warn(`Could not tidy up the folder of ${run.id}:`, err);
       return false;
     }
+  }
+
+  /**
+   * For the shutdown tidy: the earlier agents merged in this run whose record still keeps a folder, as run-like
+   * { id, earlier, workspace } for _removeUnchanged. Not one that is busy, being picked up, or was picked up (it is
+   * one of this run's then), and not one this run never merged: another Workbench may be running that one.
+   */
+  _earlierToTidy() {
+    const out = [];
+    for (const id of this._mergedEarlier) {
+      const rec = this.earlierRecs.get(id);
+      const v = this.store.get(id);
+      const ws = rec?.workspace;
+      if (!ws || !v?.earlier || v.work?.thrownAway || this.runs.has(id) || this._busy.has(id) || this._resuming.has(id)) continue;
+      if (!folderThere(ws.path)) continue;
+      out.push({ id, earlier: true, workspace: { ...ws } });
+    }
+    return out;
   }
 
   /** This agent's own hook token, or null (Claude Code then refuses to start: fail closed). */
@@ -2146,11 +2198,17 @@ export class Engine extends EventEmitter {
     return w || { branch: null, from: null, folder: false, merged: null, problem: null, thrownAway: null };
   }
 
-  /** A merge that did not go through no longer describes the work (a turn starts, a message is taken): it goes. */
+  /**
+   * A merge that did not go through no longer describes the work (a turn starts, a message is taken, nothing is left to
+   * merge): it goes. An earlier agent's saved record is written back as it was unless it is replaced, so it is, or the
+   * reason would come back at the next start.
+   */
   _clearProblem(agentId) {
     const v = this.store.get(agentId);
     if (!v || v.parentId || !v.work?.problem) return;
     this._apply([{ kind: EV.WORK, agentId, work: { ...v.work, problem: null } }]);
+    const rec = v.earlier ? this.earlierRecs.get(agentId) : null;
+    if (rec) this._replaceEarlier(agentId, rec.workspace ?? null);
   }
 
   /** Its folder turned out to be gone: its view says so. */
@@ -2377,6 +2435,8 @@ export class Engine extends EventEmitter {
       return { ok: false, reply: `Workbench could not read ${v.name}’s work, so it cannot be merged right now.` };
     }
     if (!snap.changed) {
+      // Nothing to merge, so a reason a merge did not go through no longer says anything true ("Try again" settles it).
+      this._clearProblem(v.id);
       // Nothing since its last merge is "already in"; an agent never merged that changed nothing changed nothing.
       return { ok: false, reply: cur.work?.merged ? mergeSentence('nothing', { name: v.name, into: repo.branch }) : `${v.name} changed nothing, so there is nothing to merge.` };
     }
@@ -2499,14 +2559,36 @@ export class Engine extends EventEmitter {
       { kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), merged, problem: null } },
       { kind: EV.FILES, agentId: v.id, files: { ...NO_FILES, list: [] } }, // nothing is left unmerged
     ]);
-    if (where.rec) this._replaceEarlier(v.id, { ...where.rec.workspace, ...(W ? { since: W } : {}) });
+    this._dropWorkCards(v.id);
+    if (where.rec) {
+      this._replaceEarlier(v.id, { ...where.rec.workspace, ...(W ? { since: W } : {}) });
+      this._mergedEarlier.add(v.id);
+    }
     try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
     return { reply: `Merged ${v.name} into ${into}.`, focusId: v.id };
+  }
+
+  /**
+   * Its work was just merged or thrown away: any other merge or throw-away card still out for it (another page's, say)
+   * was drawn for work that is not there to merge or throw away any more. Withdraw them, so a yes to one hears that it
+   * is no longer waiting, instead of being refused by git and leaving a reason on work that is fine.
+   */
+  _dropWorkCards(agentId) {
+    for (const [id, c] of this.confirms) {
+      if (c.agentId === agentId && (c.kind === 'merge' || c.kind === 'discard')) this.confirms.delete(id);
+    }
   }
 
   /** The merge did not go through: say why, and keep the reason on the agent when it is worth acting on. */
   _mergeFailed(v, res, c) {
     const why = MERGE_WHYS.has(res?.why) ? res.why : 'git';
+    // Its branch moved because this agent's own work went in after the card was drawn (from a look git took just
+    // before that merge, say): what the card showed is in already, and nothing new is left to merge. Nothing went wrong.
+    // Only when its files are known: when they could not be read, it may hold new work, and the reason stands.
+    if (why === 'moved' && v.work?.merged && v.files && !unmergedWork(v)) {
+      this._clearProblem(v.id);
+      return { reply: mergeSentence('nothing', { name: v.name, into: v.work.merged.into || c.expect.into }), focusId: v.id };
+    }
     const paths = (Array.isArray(res?.paths) ? res.paths : []).filter(p => typeof p === 'string' && p);
     const own = typeof res?.sentence === 'string' && res.sentence.trim() ? aboutAgent(v.name, res.sentence) : null;
     let sentence;
@@ -2517,6 +2599,8 @@ export class Engine extends EventEmitter {
     else sentence = mergeSentence(why, { name: v.name, into: c.expect.into, paths });
     if (why === 'gone') {
       this._markFolderGone(v);
+    } else if (why === 'nothing') {
+      this._clearProblem(v.id); // already in (merged by hand, say): a reason from before no longer holds
     } else if (PROBLEM_WHYS.has(why)) {
       this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), problem: { why, sentence, paths: paths.slice(0, 50), into: c.expect.into || null, at: this.now() } } }]);
     }
@@ -2687,6 +2771,7 @@ export class Engine extends EventEmitter {
     const saved = typeof res.saved === 'string' && res.saved ? res.saved : null;
     if (where.run) where.run.folderRemoved = true; // out of keptFolders and the tidy; follow-ups are refused
     this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), branch: null, folder: false, problem: null, thrownAway: { at: this.now(), saved } } }]);
+    this._dropWorkCards(v.id);
     if (where.rec) {
       this._replaceEarlier(v.id, null); // its record keeps no folder from now on
       this.store.markContinue(v.id, { ok: false, reason: THROWN_REASON });
@@ -2838,6 +2923,7 @@ export class Engine extends EventEmitter {
       }
       if (cur.files === before.files) batch.push({ kind: EV.FILES, agentId: cur.id, files: { ...NO_FILES, list: [] } });
       if (batch.length) this._apply(batch);
+      this._dropWorkCards(cur.id);
       return { reply: (typeof res?.reply === 'string' && res.reply.trim()) || `Merged ${cur.name} into ${into}. ${DEMO_MERGED}`, focusId: cur.id };
     } finally {
       this._busy.delete(v.id);
@@ -2900,6 +2986,7 @@ export class Engine extends EventEmitter {
         const thrownAway = { at: this.now(), saved: typeof res?.saved === 'string' ? res.saved : null };
         this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, this._demoInto(cur)), branch: null, folder: false, problem: null, thrownAway } }]);
       }
+      this._dropWorkCards(cur.id);
       return { reply: (typeof res?.reply === 'string' && res.reply.trim()) || `Threw away ${cur.name}’s work. ${DEMO_THROWN}`, focusId: cur.id };
     } finally {
       this._busy.delete(v.id);
@@ -2938,8 +3025,11 @@ export class Engine extends EventEmitter {
           ? { reply: GONE }
           : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
       } else {
-        // Any other command withdraws the card on screen, without a notice: the page lets go of it.
-        if (shown && !shown.gone && intent.kind !== 'confirm') this.confirms.delete(shown.id);
+        // Any other command withdraws the card on screen, without a notice: the page lets go of it. A look at an
+        // agent's changes does not: it is read-only, so the card keeps waiting, and the reply carries it, as for words
+        // not caught, so the page keeps it too ("show me the changes" before saying yes to a merge).
+        const keep = intent.kind === 'changes' && shown && !shown.gone;
+        if (shown && !shown.gone && intent.kind !== 'confirm' && !keep) this.confirms.delete(shown.id);
         try {
           // With a card on screen, no ask was: the centre shows one thing at a time.
           out = await this._runIntent(intent, { focusId, askId: shown ? null : askId, shown });
@@ -2947,6 +3037,8 @@ export class Engine extends EventEmitter {
           this.log.error('A command failed:', err);
           out = { reply: err?.plain ? err.message : 'Something went wrong while doing that. The details are in the log.' };
         }
+        const kept = keep ? this.confirms.get(shown.id) : null;
+        if (kept) out = { ...out, confirm: this._card(kept) };
       }
     }
     if (out.reply && !out.confirm) this._notice(out.reply, out.focusId || null);
@@ -3294,7 +3386,9 @@ export class Engine extends EventEmitter {
     }
     const all = this.store.list();
     if (!all.length) return { reply: 'No agents yet. Say “start an agent to …” to begin.' };
-    const needs = all.filter(v => !v.earlier && NEEDS_YOU.has(v.state)); // an earlier agent waits on nobody
+    // An earlier agent waits on nobody, and neither does a failed check on work that is settled (merged with nothing new
+    // since, or thrown away), as the page's needsPerson has it.
+    const needs = all.filter(v => !v.earlier && NEEDS_YOU.has(v.state) && !(v.state === STATE.CHECKS_FAILED && workSettled(v)));
     const working = all.filter(v => !v.parentId && (v.state === STATE.WORKING || v.state === STATE.STARTING || v.state === STATE.WAITING_HELPERS));
     const parts = [];
     if (needs.length) {
@@ -3338,14 +3432,23 @@ export class Engine extends EventEmitter {
     return s;
   }
 
-  /** What became of a root's work, for its status: thrown away, a merge that did not go through, or merged. */
+  /**
+   * What became of a root's work, for its status: thrown away, a merge that did not go through, or merged. "Merged" only
+   * while nothing new is left to merge, as the page's card has it; work changed since its last merge is not merged.
+   */
   _workWords(v) {
     const w = v.parentId ? null : v.work;
     if (!w) return '';
     if (w.thrownAway) return ' Its work was thrown away.';
     if (w.problem?.sentence) return ` The last merge did not go through: ${w.problem.sentence}`;
-    if (w.merged) return w.merged.into ? ` Its work was merged into ${w.merged.into}.` : ' Its work was merged.';
-    return '';
+    if (!w.merged) return '';
+    const into = w.merged.into;
+    if (!unmergedWork(v)) return into ? ` Its work was merged into ${into}.` : ' Its work was merged.';
+    const earlier = into ? `Its earlier work was merged into ${into}` : 'Its earlier work was merged';
+    const n = v.files ? count(v.files.changed) : 0;
+    return n
+      ? ` ${earlier}, but ${n} changed file${n === 1 ? ' is' : 's are'} not merged yet.`
+      : ` ${earlier}. Anything it changed since is not merged yet.`; // what it changed is not known
   }
 
   _spendSentence() {
