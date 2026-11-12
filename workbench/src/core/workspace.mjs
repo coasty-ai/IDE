@@ -322,7 +322,8 @@ async function listWorktrees(root, run = git) {
  * never the main folder. The branch is kept unless deleteBranch is set (and it is a workbench/ branch).
  * With onlyIfUnchanged (and the commit it started from, `base`), it removes nothing that might hold work: the folder
  * goes only while its HEAD is still `base`, `git status` lists nothing at all (not even a file .gitignore hides, such
- * as a .env or a build) and `git worktree remove` without --force agrees; then the branch goes only while it still
+ * as a .env or a build), no file its index marks as not to be looked at differs from `base` (see filesAsCommitted)
+ * and `git worktree remove` without --force agrees; then the branch goes only while it still
  * points at `base` (`update-ref -d`). In that order: update-ref would delete the branch of a folder that was kept.
  * `since` (with onlyIfUnchanged): the agent's last merged work commit. When given and not `base`, `since` takes the
  * place of `base` above, and the folder and branch also go only while a branch of the person's holds `since` (any
@@ -346,6 +347,7 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     if (head !== start) return { removed: false, kept: true }; // the agent made commits, or the folder is unreadable
     const status = await git(['status', '--porcelain', '--ignored', '--untracked-files=all'], { cwd: entry.path }).then(r => r.stdout, () => null);
     if (status !== '') return { removed: false, kept: true };
+    if (!(await filesAsCommitted(entry.path, start))) return { removed: false, kept: true }; // an edit git status cannot see
     if (merged && !(await inPersonsBranch(root, start))) return { removed: false, kept: true }; // the merge was undone
     try {
       await git(['worktree', 'remove', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
@@ -373,6 +375,37 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     fs.rmdirSync(path.dirname(entry.path)); // the per-repository folder, only if now empty
   } catch {}
   return { removed: true, branch: entry.branch };
+}
+
+/**
+ * Whether the tracked files in the folder `cwd` are exactly those of commit `head`, as far as `git status` cannot
+ * tell. Its index may mark files as not to be looked at: an assume-unchanged or skip-worktree bit (which an agent can
+ * set), or the assume-unchanged bit that the person's core.ignoreStat gives every file git writes. git status, and
+ * `git worktree remove` without --force, then miss an edit to such a file. When any file is marked, the files are
+ * judged again in a new index that only `read-tree` has written, which marks nothing, so every file is read
+ * (`update-index --refresh` exits 1 when one differs or is missing). Writing that index runs no hook (see
+ * withoutHooks). Never rejects: false when git cannot say.
+ */
+async function filesAsCommitted(cwd, head) {
+  try {
+    const marked = nulList((await git(['ls-files', '-v', '-z'], { cwd })).stdout).some(rec => rec[0] !== 'H');
+    if (!marked) return true;
+    return await withoutHooks(async run => {
+      await run.shield(cwd);
+      const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
+      try {
+        const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
+        await run(['-c', 'core.splitIndex=false', 'read-tree', head], { cwd, env });
+        const r = await run(['-c', 'core.splitIndex=false', '-c', 'core.ignoreStat=false', 'update-index', '--refresh'],
+          { cwd, env, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS });
+        return r.code === 0;
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    });
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -622,7 +655,12 @@ const BODY_MAX = 4000;
 const PATCH_BATCH_FILES = 64; // patches are asked for this many files at a time...
 const PATCH_BATCH_BYTES = 8 * 1024 * 1024; // ...as long as their blobs are not too big together
 const LOCK_TRIES = 4; // another git command holding your folder's index.lock (an editor's git, say): wait, then try again
-const UNDER_WAY = ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG'];
+// A merge, rebase, cherry-pick or revert (one commit, or a sequence of them waiting between two: `sequencer`) or bisect.
+const UNDER_WAY = ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'sequencer'];
+const UNDER_WAY_REFS = ['CHERRY_PICK_HEAD', 'REVERT_HEAD']; // asked of the ref store as well (see underWay)
+// What git keeps in a folder's git folder for the person's next commit, which a fast-forward deletes as if it had ended
+// a merge: the message it prepared (`git cherry-pick --no-commit`, say) and rerere's record of the conflicts they settled.
+const KEPT_FOR_NEXT_COMMIT = ['MERGE_MSG', 'MERGE_RR'];
 const WORKBENCH_IDENTITY = { name: 'Workbench', email: 'workbench@localhost' }; // the hidden copy of thrown-away work only
 const CLAUDE_TRAILER = 'Co-authored-by: Claude <noreply@anthropic.com>';
 
@@ -634,11 +672,15 @@ const SAY = {
   identity: 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.',
   gitOld: 'Workbench needs git 2.38 or newer to merge.',
   changed: 'Its work changed since you looked. Have another look.',
+  reviewChanged: into => `What merging it would change in ${into} is no longer what you saw. Have another look.`,
   moved: into => `${into} changed since you looked. Have another look.`,
   nothing: into => `Its work is already in ${into}.`,
   ancestry: into => `It started from a commit that is no longer in ${into}, so merging it would bring in other work.`,
   conflict: into => `Its work does not merge cleanly into ${into}.`,
   blocked: paths => `Your own changes are in the way: ${listOf(paths, 3)}. Commit or put them aside, then merge again.`,
+  alreadyThere: paths => (paths.length === 1
+    ? `A file in your folder already holds what the merge brings in, and git will not write over it: ${paths[0]}. Undo that change, then merge again.`
+    : `Files in your folder already hold what the merge brings in, and git will not write over them: ${listOf(paths, 3)}. Undo those changes, then merge again.`),
   gone: 'Its folder is gone, so there is nothing to merge.',
   agentBusy: 'Its folder is in the middle of a merge or rebase, so its work cannot be merged yet.',
   git: 'Git could not finish the merge. Nothing in your folder changed.',
@@ -647,6 +689,15 @@ const SAY = {
 
 /** git's words when another git command holds the index: "Unable to create '<git dir>/index.lock': File exists." */
 const INDEX_LOCKED = /^(?:fatal|error): Unable to create '[^\n]*index\.lock': File exists/m;
+
+/**
+ * git's words when `merge --ff-only` stopped before it changed anything (exit 128): the branch moved before git read it
+ * ("Not possible to fast-forward, aborting."), an operation started ("You have not concluded your merge (MERGE_HEAD
+ * exists)." or "... your cherry-pick ..."), or conflicts appeared ("Exiting because of an unresolved conflict."). Git
+ * also exits 128 after it wrote the files and the index, when it cannot move the branch ("update_ref failed for ref
+ * 'HEAD'"): those words are not here.
+ */
+const STOPPED_BEFORE = /^fatal: (?:Not possible to fast-forward|You have not concluded your |Exiting because of an unresolved conflict)/m;
 
 /** "a, b, c and 2 more" */
 function listOf(items, max) {
@@ -788,8 +839,25 @@ async function gitPathsExist(cwd, names, run = git) {
   return names.some((name, i) => !!out[i] && fs.existsSync(path.resolve(cwd, out[i])));
 }
 
-/** Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder). */
-const underWay = (cwd, run = git) => gitPathsExist(cwd, UNDER_WAY, run);
+/**
+ * Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder), found the way
+ * git itself finds it: MERGE_HEAD, BISECT_LOG and the rebase and sequencer folders are always files, while
+ * CHERRY_PICK_HEAD and REVERT_HEAD are refs, kept as files only with the files ref store (with reftable, git 2.45 and
+ * newer, they are in the ref store itself), so those are asked of git too.
+ */
+async function underWay(cwd, run = git) {
+  const found = await Promise.all([gitPathsExist(cwd, UNDER_WAY, run), ...UNDER_WAY_REFS.map(name => pseudoRef(cwd, name, run))]);
+  return found.some(Boolean);
+}
+
+/**
+ * Whether the ref `name` (CHERRY_PICK_HEAD, say) is there, in whichever ref store the repository uses. A branch or
+ * tag of that name does not count: rev-parse then names it refs/… (and names nothing when both are there).
+ */
+async function pseudoRef(cwd, name, run = git) {
+  const r = await run(['rev-parse', '-q', '--verify', '--symbolic-full-name', name], { cwd, okCodes: [1] });
+  return r.code === 0 && !r.stdout.startsWith('refs/');
+}
 
 /**
  * The paths with unresolved conflicts in this folder's index, each once. A `git stash pop` that did not apply cleanly
@@ -798,6 +866,43 @@ const underWay = (cwd, run = git) => gitPathsExist(cwd, UNDER_WAY, run);
 async function unresolved(cwd, run = git) {
   const out = (await run(['ls-files', '-u', '-z'], { cwd })).stdout;
   return [...new Set(nulList(out).map(rec => rec.slice(rec.indexOf('\t') + 1)))]; // "<mode> <id> <stage>\t<path>"
+}
+
+/**
+ * The files of KEPT_FOR_NEXT_COMMIT that are in this folder's git folder now, with their bytes: [{ file, bytes }].
+ * One that cannot be read is a plain error: better no merge than a lost message.
+ */
+async function keptForNextCommit(cwd, run = git) {
+  const out = (await run(['rev-parse', ...KEPT_FOR_NEXT_COMMIT.flatMap(name => ['--git-path', name])], { cwd })).stdout.split('\n');
+  const kept = [];
+  KEPT_FOR_NEXT_COMMIT.forEach((name, i) => {
+    if (!out[i]) return;
+    const file = path.resolve(cwd, out[i]);
+    try {
+      kept.push({ file, bytes: fs.readFileSync(file) });
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw plainError('Workbench could not read what git keeps for your next commit, so nothing was merged.', e);
+    }
+  });
+  return kept;
+}
+
+/** Put back each of `kept` that is gone, never over one written meanwhile. */
+function putBack(kept) {
+  for (const { file, bytes } of kept) {
+    try {
+      fs.writeFileSync(file, bytes, { flag: 'wx' });
+    } catch {} // still there (git stopped before it deleted it), or written anew
+  }
+}
+
+/**
+ * The tracked files missing from this folder that are not marked skip-worktree (`ls-files --deleted`): deleted or
+ * renamed without staging it. A sparse checkout's files outside it are not listed. Their names as bytes, one character
+ * for each (the `key` of changesBetween).
+ */
+async function deletedFiles(cwd, run = git) {
+  return new Set(nulFields((await run(['ls-files', '--deleted', '-z'], { cwd, encoding: 'buffer' })).stdout).map(b => b.toString('latin1')));
 }
 
 /**
@@ -915,9 +1020,9 @@ async function snap(run, root, folder, since, { review = true } = {}) {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
   };
-  const [{ tree, nested }, hidden, trees, into] = await Promise.all([
+  const [{ tree, nested }, hidden, trees, person] = await Promise.all([
     work(), hiddenByAgent(cwd, from, run), run(['rev-parse', `${head}^{tree}`, `${from}^{tree}`], { cwd }),
-    review ? headHolding(run, root, from) : null,
+    review ? personsHead(run, root, from) : null,
   ]);
   const [headTree, sinceTree] = trees.stdout.split('\n');
   if (!OID.test(headTree || '') || !OID.test(sinceTree || '')) throw plainError('Git could not read a commit it was given.');
@@ -932,43 +1037,78 @@ async function snap(run, root, folder, since, { review = true } = {}) {
   const s = { head, headTree, tree, since: from, sinceTree, workId: `${head}:${tree}`, changed: tree !== sinceTree, left };
   if (!review) return s;
   // Nothing changed since `since`: nothing to merge, and nothing to show.
-  [s.fromTree, s.toTree] = s.changed ? await reviewTrees(run, root, s, into) : [sinceTree, tree];
+  const r = s.changed ? await reviewTrees(run, root, s, person.holds ? person.head : null) : { from: sinceTree, to: tree, merged: null };
+  [s.fromTree, s.toTree] = [r.from, r.to];
+  s.workId = cardId(s, person.head, r.merged);
   s.files = s.fromTree === s.toTree ? [] : await changesBetween(run, root, s.fromTree, s.toTree);
   return s;
 }
 
-/** The person's HEAD when it holds `since` (so a merge would not be refused for where the work started), else null. Never rejects. */
-async function headHolding(run, root, since) {
+/**
+ * A card's workId: `<head>:<tree>`, the agent folder's HEAD and the tree of its work set, then `:<into>:<merged>`, the
+ * review it was shown with: the person's HEAD when the review was made, and the tree that merging the work into it
+ * makes (empty when the review was not that merge: a conflict, a HEAD that does not hold `since`, or git could not
+ * say). A merge then lands exactly what the card showed, or is refused.
+ */
+const cardId = ({ head, tree }, into, merged) => `${head}:${tree}:${into || ''}:${merged || ''}`;
+
+/** What a workId says: { work: `<head>:<tree>`, into, merged } (into and merged '' when the review had none), or null. */
+function cardOf(workId) {
+  const parts = String(workId ?? '').split(':');
+  if (parts.length !== 2 && parts.length !== 4) return null;
+  if (!OID.test(parts[0]) || !OID.test(parts[1]) || parts.slice(2).some(p => p !== '' && !OID.test(p))) return null;
+  return { work: `${parts[0]}:${parts[1]}`, into: parts[2] ?? null, merged: parts[3] ?? null };
+}
+
+/**
+ * The person's HEAD (null when git cannot say), and whether it holds `since` (so a merge would not be refused for where
+ * the work started). Never rejects.
+ */
+async function personsHead(run, root, since) {
   try {
-    const into = await commitOf(root, 'HEAD', run);
-    return into && (await isAncestor(root, since, into, run)) ? into : null;
+    const head = await commitOf(root, 'HEAD', run);
+    return { head, holds: !!head && (await isAncestor(root, since, head, run)) };
   } catch {
-    return null;
+    return { head: null, holds: false };
   }
 }
 
-/** The date of the commit merge-tree is given for the work as it is (see reviewTrees): any fixed one. */
-const WORK_AS_IS_DATE = '@1000000000 +0000';
+/**
+ * The date of the commit merge-tree is given for the work as it is (see reviewTrees): its parent's own (the agent's
+ * HEAD's committer date), so the same work on the same HEAD makes the same commit, and it is never older than its
+ * parent. git looks for where two histories met newest first: a commit dated before its parent would have it walk all
+ * of the person's history first, on every card and diff, where there is no commit-graph. A fixed date when git cannot
+ * say.
+ */
+async function workAsIsDate(run, cwd, head) {
+  try {
+    const text = (await run(['cat-file', 'commit', head], { cwd })).stdout;
+    const m = /^committer [^\n]* (\d+) ([+-]\d{4})$/m.exec(text.slice(0, text.indexOf('\n\n')));
+    if (m) return `@${m[1]} ${m[2]}`;
+  } catch {}
+  return '@1000000000 +0000';
+}
 
 /**
- * The two trees the review compares (see "Source control" above), as [from, to]: the person's HEAD `into` (null when it
- * does not hold `since`) and the tree merge-tree makes of it and the work; on a conflict, where the work's history and
- * HEAD last met and the work; otherwise `since` and the work. merge-tree takes commits, so work not yet committed is
- * given as a commit on top of the agent's HEAD that nothing points at, made by Workbench at a fixed date: the same work
- * makes the same commit each time. Never rejects.
+ * The two trees the review compares (see "Source control" above), as { from, to }, and `merged`, the tree merge-tree
+ * makes, when that is what the review shows (else null): the person's HEAD `into` (null when it does not hold `since`)
+ * and that merged tree; on a conflict, where the work's history and HEAD last met and the work; otherwise `since` and
+ * the work. merge-tree takes commits, so work not yet committed is given as a commit on top of the agent's HEAD that
+ * nothing points at, made by Workbench and dated as that HEAD (see workAsIsDate): the same work makes the same commit
+ * each time. Never rejects.
  */
 async function reviewTrees(run, root, { head, headTree, tree, sinceTree }, into) {
-  if (!into) return [sinceTree, tree];
+  if (!into) return { from: sinceTree, to: tree, merged: null };
   try {
     const work = tree === headTree ? head
-      : await commitTree(run, root, tree, [head], 'The agent’s work as it is\n', WORKBENCH_IDENTITY, WORK_AS_IS_DATE);
+      : await commitTree(run, root, tree, [head], 'The agent’s work as it is\n', WORKBENCH_IDENTITY, await workAsIsDate(run, root, head));
     const merged = await mergeTrees(run, root, into, work);
-    if (merged.tree) return [await treeOf(root, into, run), merged.tree];
+    if (merged.tree) return { from: await treeOf(root, into, run), to: merged.tree, merged: merged.tree };
     const met = await run(['merge-base', into, head], { cwd: root, okCodes: [1] });
     const base = met.code === 0 ? met.stdout.trim() : '';
-    if (OID.test(base)) return [await treeOf(root, base, run), tree];
+    if (OID.test(base)) return { from: await treeOf(root, base, run), to: tree, merged: null };
   } catch {} // git could not say: the work against `since`, as below
-  return [sinceTree, tree];
+  return { from: sinceTree, to: tree, merged: null };
 }
 
 /**
@@ -989,32 +1129,52 @@ async function mergeTrees(run, root, into, work) {
 
 const isBlobMode = mode => mode === '100644' || mode === '100755' || mode === '120000';
 
+/** The fields of `buf` between NUL bytes, as buffers (nothing after a last NUL). */
+function nulFields(buf) {
+  const out = [];
+  let at = 0;
+  for (let i = buf.indexOf(0); i >= 0; i = buf.indexOf(0, at)) {
+    out.push(buf.subarray(at, i));
+    at = i + 1;
+  }
+  if (at < buf.length) out.push(buf.subarray(at));
+  return out;
+}
+
 /**
  * The files that differ between two trees, in git's order: [{ path, status, adds, dels, binary?, large? }], plus the
- * blob sizes (oldSize, newSize) that workDiff plans its patches with. No rename detection.
+ * blob sizes (oldSize, newSize) that workDiff plans its patches with. No rename detection. git's names are read as
+ * bytes: `path` is read as UTF-8, `key` is the bytes as they are (one character for each, to compare names exactly),
+ * and `lossy` marks a name that is not UTF-8 (two such names can read the same: workDiff gives them no patch).
  */
 async function changesBetween(run, cwd, from, to) {
   const common = ['-c', `core.bigFileThreshold=${LARGE_FILE_BYTES}`, 'diff-tree', '-r', '-z', '--no-renames', '--no-ext-diff', '--no-textconv'];
   const [rawOut, numstat] = await Promise.all([
-    run([...common, '--raw', '--no-abbrev', from, to], { cwd }), run([...common, '--numstat', from, to], { cwd }),
+    run([...common, '--raw', '--no-abbrev', from, to], { cwd, encoding: 'buffer' }), run([...common, '--numstat', from, to], { cwd, encoding: 'buffer' }),
   ]);
-  const raw = rawOut.stdout.split('\0');
+  const raw = nulFields(rawOut.stdout);
   const files = [];
   for (let i = 0; i + 1 < raw.length; i += 2) {
-    const m = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])/.exec(raw[i]);
+    const m = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])/.exec(raw[i].toString('latin1'));
     if (!m) throw plainError('Git listed the changes in a way Workbench does not understand.');
+    const name = raw[i + 1].toString('utf8');
     files.push({
-      path: raw[i + 1], status: m[5] === 'A' ? 'added' : m[5] === 'D' ? 'deleted' : 'modified',
+      path: name, key: raw[i + 1].toString('latin1'), lossy: !Buffer.from(name, 'utf8').equals(raw[i + 1]),
+      status: m[5] === 'A' ? 'added' : m[5] === 'D' ? 'deleted' : 'modified',
       oldMode: m[1], newMode: m[2], oldId: m[3], newId: m[4], adds: 0, dels: 0, oldSize: 0, newSize: 0,
     });
   }
   if (!files.length) return files;
 
-  const counts = new Map();
-  for (const rec of numstat.stdout.split('\0')) {
-    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(rec);
-    if (m) counts.set(m[3], m);
-  }
+  // --numstat lists the same files in the same order, one record each ("<adds>\t<dels>\t<path>"): they are paired by
+  // place, and checked by their bytes, never matched by a name read as UTF-8, which two different names can share.
+  const records = nulFields(numstat.stdout);
+  if (records.length !== files.length) throw plainError('Git listed the changes in a way Workbench does not understand.');
+  const counts = files.map((f, k) => {
+    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(records[k].toString('latin1'));
+    if (!m || m[3] !== f.key) throw plainError('Git listed the changes in a way Workbench does not understand.');
+    return m;
+  });
   const ids = new Set();
   for (const f of files) {
     if (isBlobMode(f.oldMode) && !ZERO_OID.test(f.oldId)) ids.add(f.oldId);
@@ -1028,10 +1188,10 @@ async function changesBetween(run, cwd, from, to) {
       if (OID.test(id || '') && /^\d+$/.test(size || '')) sizes.set(id, Number(size));
     }
   }
-  for (const f of files) {
+  for (const [k, f] of files.entries()) {
     f.oldSize = sizes.get(f.oldId) || 0;
     f.newSize = sizes.get(f.newId) || 0;
-    const m = counts.get(f.path);
+    const m = counts[k];
     if (m && m[1] !== '-') {
       f.adds = Number(m[1]);
       f.dels = Number(m[2]);
@@ -1064,7 +1224,8 @@ function publicFile(f) {
  * @returns {Promise<{ head: string, tree: string, since: string, workId: string, changed: boolean,
  *   files: { path: string, status: 'added'|'modified'|'deleted', adds: number, dels: number, binary?: true, large?: true }[],
  *   left: { path: string, why: 'ignored'|'nested-repo' }[] }>}
- *   head: its folder's HEAD; tree: the work as a tree; workId: `${head}:${tree}`; changed: tree differs from since's.
+ *   head: its folder's HEAD; tree: the work as a tree; workId: `${head}:${tree}:${into}:${merged}`, the work and the
+ *   review it is shown with (see cardId); changed: tree differs from since's.
  *   files: what merging the work into the person's current HEAD would change there, the merge commit's first-parent
  *   diff (see "Source control" above for a conflict, and for a HEAD that does not hold `since`); none when !changed.
  *   Rejects with a plain error (with `.why` when it is a refusal) when the folder is not an agent's or git fails.
@@ -1093,22 +1254,19 @@ function splitPatches(text) {
   return starts.map((s, n) => text.slice(s, n + 1 < starts.length ? starts[n + 1] : text.length));
 }
 
-/** How git writes a path in a patch's header with core.quotePath=false: as it is, or in quotes with C escapes. */
+/** `p` in git's C-style quotes: control characters, `"` and `\` escaped, everything else as it is. */
 const C_ESCAPES = { 7: 'a', 8: 'b', 9: 't', 10: 'n', 11: 'v', 12: 'f', 13: 'r', 34: '"', 92: '\\' };
-function headerPath(p) {
-  let quoted = false;
+function cQuoted(p) {
   let out = '';
   for (const ch of p) {
     const c = ch.codePointAt(0);
-    if (c < 0x20 || c === 0x7f || c === 34 || c === 92) {
-      quoted = true;
-      out += `\\${C_ESCAPES[c] || c.toString(8).padStart(3, '0')}`;
-    } else {
-      out += ch;
-    }
+    out += c < 0x20 || c === 0x7f || c === 34 || c === 92 ? `\\${C_ESCAPES[c] || c.toString(8).padStart(3, '0')}` : ch;
   }
-  return quoted ? `"${out}"` : out;
+  return `"${out}"`;
 }
+
+/** How git writes a path in a patch's header with core.quotePath=false: as it is, or in quotes with C escapes. */
+const headerPath = p => (/[\u0000-\u001f\u007f"\\]/.test(p) ? cQuoted(p) : p);
 
 /** The first line of the patch of `path`. */
 const patchHeader = p => `diff --git ${headerPath(`a/${p}`)} ${headerPath(`b/${p}`)}\n`;
@@ -1178,7 +1336,9 @@ export async function workDiff({ repoRoot, path: wsPath, since, maxFiles = 300, 
       let budget = Math.max(0, Number(maxTotalBytes) || 0);
       const perFile = Math.max(0, Number(maxFileBytes) || 0);
       let cutAll = false;
-      const want = shown.flatMap((f, k) => (f.binary || f.large ? [] : [k])); // the files that get a patch
+      // The files that get a patch. Not one whose name is not UTF-8: asked for by that name read as UTF-8, git would
+      // find another file, or none.
+      const want = shown.flatMap((f, k) => (f.binary || f.large || f.lossy ? [] : [k]));
       const reached = new Set();
       for (let i = 0; i < want.length && budget > 0;) {
         const batch = [];
@@ -1297,6 +1457,34 @@ function inTheWay(stderr) {
 }
 
 /**
+ * Of `paths` (in the way of the fast-forward, in the person's folder `root`), those that already hold exactly what the
+ * merge brings in there: a plain file (not a link or a folder) where M has one (`brought`, M's first-parent diff), whose
+ * bytes, cleaned the way git would store them (`hash-object` with their filters), are M's. Anything that cannot be
+ * shown to be one counts as the person's own. Never rejects.
+ */
+async function alreadyThere(run, root, paths, brought) {
+  const merged = new Map(brought.filter(f => !f.lossy).map(f => [f.path, f])); // git's words name files as UTF-8
+  const asked = paths.filter(p => {
+    const f = merged.get(p);
+    if (!f || f.status === 'deleted' || !(f.newMode === '100644' || f.newMode === '100755') || !safeParts(p)) return false;
+    try {
+      return fs.lstatSync(path.join(root, p)).isFile();
+    } catch {
+      return false;
+    }
+  });
+  if (!asked.length) return new Set();
+  try {
+    // Each name in quotes: git reads a line that starts with a quote as a quoted name, and drops a carriage return at
+    // its end, so a name such as `"x"` would otherwise be read as x.
+    const ids = (await run(['hash-object', '--stdin-paths'], { cwd: root, input: asked.map(p => `${cQuoted(p)}\n`).join('') })).stdout.split('\n');
+    return new Set(asked.filter((p, i) => ids[i] === merged.get(p).newId));
+  } catch {
+    return new Set(); // a filter that fails, a file that went meanwhile: theirs, as far as Workbench can tell
+  }
+}
+
+/**
  * Commit the agent's work on its own branch, then join it into the person's current branch with a merge commit, in
  * the person's folder, by fast-forward only. Every refusal before the work commit changes nothing at all; `conflict`,
  * `blocked` and the later refusals leave the work commit W on the agent's branch (its index reset to match, its files
@@ -1304,6 +1492,7 @@ function inTheWay(stderr) {
  * @param {{ repoRoot: string, path: string, branch: string, since: string,
  *   expect: { workId: string, into: string, intoHead: string }, message: { subject: string, body?: string, name?: string },
  *   agentId: string, harness?: string, name?: string }} opts
+ *   expect.workId: snapshotWork's, which names the work and the review the card showed (see cardId);
  *   name: the agent's name for the merge commit's subject ("Merge <name>: <subject>"); its branch when not given
  * @returns {Promise<{ ok: true, into: string, merge: string, work: string, files: number, adds: number, dels: number }
  *   | { ok: false, why: string, sentence: string, paths?: string[] }>}
@@ -1345,6 +1534,10 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   if (!atLeast(version, MIN_GIT)) throw new Refusal('git-old', SAY.gitOld);
   const seen = typeof exp.into === 'string' && exp.into ? exp.into : into;
   if (into !== exp.into || !intoHead || intoHead !== exp.intoHead) throw new Refusal('moved', SAY.moved(seen));
+  // The card's review was made against the person's HEAD as it was then (see cardId), read apart from intoHead: a
+  // folder that was on another branch then, and is back now, would land what the card did not show.
+  const card = cardOf(exp.workId);
+  if (card?.into && card.into !== intoHead) throw new Refusal('moved', SAY.moved(into));
   progress.into = into;
 
   // 2. The agent's work, read afresh (and, meanwhile, step 3's question).
@@ -1364,7 +1557,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   ]);
   if (agentBusy || unmerged) throw new Refusal('git', SAY.agentBusy); // `add -A` would take its conflict markers as work
   const s = unwrap(snapped);
-  if (s.workId !== exp.workId) throw new Refusal('changed', SAY.changed);
+  if (!card || card.into === null || card.work !== s.workId) throw new Refusal('changed', SAY.changed); // no review: none shown
   if (!s.changed) throw new Refusal('nothing', SAY.nothing(into));
 
   // 3. Its start must be in the person's branch, or the merge would bring in another branch's commits.
@@ -1403,6 +1596,10 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   if (already) throw new Refusal('nothing', SAY.nothing(into));
   const mt = unwrap(merged);
   if (mt.conflicts) throw new Refusal('conflict', SAY.conflict(into), mt.conflicts);
+  // The review made this same merge (W has the tree and the parent of the commit the review gave merge-tree), so it
+  // made this same tree, unless something it reads changed since: the person's attributes (a merge driver, merge=union)
+  // or merge settings. Or the review showed no merge at all (a conflict then, a HEAD that did not hold `since`).
+  if (mt.tree !== card.merged) throw new Refusal('changed', SAY.reviewChanged(into));
 
   // 7. The merge commit M: the person's HEAD first, W second. What it brings in is its first-parent diff, the files
   //    and counts the review showed.
@@ -1413,7 +1610,10 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   ]);
 
   // 8. Check again, then fast-forward the person's folder to M. Git refuses, changing nothing, when their own
-  //    changes or files are in the way; ignored files count (--no-overwrite-ignore), and nothing is stashed.
+  //    changes or files are in the way; ignored files count (--no-overwrite-ignore), and nothing is stashed. Not a
+  //    tracked file they deleted (or renamed) without staging it: git takes a missing file for an unchanged one and
+  //    writes M's version there, so Workbench looks for those itself first. Only where M changes the file: one that M
+  //    deletes too stays deleted, and git writes nothing for one that M does not touch.
   //    No automatic upkeep (gc) is started in their repository either. Git reads branch.<name>.mergeOptions before
   //    these flags, and each flag here outweighs its counterpart there; --no-squash outweighs a --squash, which would
   //    otherwise write and stage M's files while leaving the branch where it was.
@@ -1425,15 +1625,23 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   };
   let r;
   for (let attempt = 1; ; attempt++) {
-    const [on, at, busy, conflicts, locked] = await Promise.all([
+    const [on, at, busy, conflicts, locked, missing] = await Promise.all([
       currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run), unresolved(root, run), branchLocked(root, into, run),
+      deletedFiles(root, run),
     ]);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
     if (busy) throw new Refusal('busy', SAY.busy);
     if (conflicts.length) throw new Refusal('busy', SAY.conflicted(conflicts), conflicts);
+    const back = brought.filter(f => f.status === 'modified' && missing.has(f.key)).map(f => f.path);
+    if (back.length) throw new Refusal('blocked', SAY.blocked(back), back);
     if (!locked) {
+      const kept = await keptForNextCommit(root, run);
       progress.started = true;
-      r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
+      try {
+        r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
+      } finally {
+        putBack(kept); // the fast-forward deletes them as if it had ended a merge; this one ended nothing of theirs
+      }
       // Another git command holds the index (an editor's git, say): git stopped before it changed anything (exit 1 on
       // newer git, 128 on older).
       if (r.code === 0 || !INDEX_LOCKED.test(r.stderr)) break;
@@ -1453,17 +1661,28 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   }
   if (on === into && at === mergeCommit) return done; // it moved the branch, then complained about something after
   if (r.code === 1) {
-    // Their own changes or files are in the way: git checks every path before it writes any, so nothing changed.
+    // Files in the way: git checks every path before it writes any, so nothing changed. Those that already hold what
+    // M brings in there are not the person's own changes: a fast-forward that stopped part-way before (a filter that
+    // failed, a full disk) leaves the files it wrote, and puts its index back.
     const paths = inTheWay(r.stderr);
-    if (paths.length && on === into && at === intoHead) throw new Refusal('blocked', SAY.blocked(paths), paths);
-  } else {
-    // Exit 128: git stopped before it began (another operation started, or the branch moved meanwhile). A fast-forward
-    // never leaves unresolved conflicts itself: those came from something else, and git refuses to merge over them.
+    if (paths.length && on === into && at === intoHead) {
+      const there = await alreadyThere(run, root, paths, brought);
+      const own = paths.filter(p => !there.has(p));
+      if (own.length) throw new Refusal('blocked', SAY.blocked(own), own);
+      throw new Refusal('git', SAY.alreadyThere(paths), paths);
+    }
+  } else if (STOPPED_BEFORE.test(r.stderr)) {
+    // Exit 128, and git's own words say it stopped before it began: another operation started, conflicts appeared, or
+    // the branch moved before git read it. A fast-forward never leaves unresolved conflicts itself: those came from
+    // something else, and git refuses to merge over them.
     if (busy) throw new Refusal('busy', SAY.busy);
     if (conflicts.length && on === into && at === intoHead) throw new Refusal('busy', SAY.conflicted(conflicts), conflicts);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
+    throw new Refusal('git', SAY.git);
   }
-  // Anything else may have stopped part-way through updating their files, so say nothing about them having stayed.
+  // Anything else may have stopped part-way through updating their files, so say nothing about them having stayed. Exit
+  // 128 is one of these when git wrote the files and the index, then could not move the branch: a command that moves
+  // only the branch (`git reset --soft`, say) is not kept out by the index lock git holds while it writes.
   throw new Refusal('git', SAY.unfinished(into));
 }
 
@@ -1506,7 +1725,8 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
   if (entry && isFolder(target)) {
     const folder = await agentFolder(run, root, wsPath, b);
     const s = await snap(run, root, folder, since, { review: false });
-    if (s.workId !== exp.workId) throw new Refusal('changed', SAY.changed);
+    // The work the card showed. A workId from snapshotWork names the review of a merge too, which is not about what goes.
+    if (cardOf(exp.workId)?.work !== s.workId) throw new Refusal('changed', SAY.changed);
     const copy = s.tree === s.headTree ? s.head : await commitTree(run, root, s.tree, [s.head],
       `Thrown away: ${b}\n\nWorkbench-Agent: ${id}\nWorkbench-Kind: discarded\n`, (await identityAt(run, root)) || WORKBENCH_IDENTITY);
     await run(['update-ref', '--create-reflog', '-m', note, saved, copy], { cwd: root });
@@ -1538,7 +1758,7 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
   if ((await listWorktrees(root, run)).some(w => w.branch === b)) {
     throw new Refusal('git', `Its branch ${b} is checked out in another folder, so Workbench left it alone.`);
   }
-  if (exp.workId != null && exp.workId !== `${tip}:${await treeOf(root, tip, run)}`) throw new Refusal('changed', SAY.changed);
+  if (exp.workId != null && cardOf(exp.workId)?.work !== `${tip}:${await treeOf(root, tip, run)}`) throw new Refusal('changed', SAY.changed);
   await run(['update-ref', '--create-reflog', '-m', note, saved, tip], { cwd: root });
   progress.saved = saved;
   const gone = await run(['update-ref', '-m', note, '-d', `refs/heads/${b}`, tip], { cwd: root, okCodes: [1, 128] });

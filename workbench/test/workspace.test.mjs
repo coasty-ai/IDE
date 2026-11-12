@@ -730,7 +730,8 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(s.head, head);
     assert.equal(s.since, t.ws.base);
     assert.match(s.tree, /^[0-9a-f]{40}$/);
-    assert.equal(s.workId, `${head}:${s.tree}`);
+    // The work, then the review: the person's HEAD (where the agent started, so the merge makes the work's own tree).
+    assert.equal(s.workId, `${head}:${s.tree}:${t.ws.base}:${s.tree}`);
     assert.equal(s.changed, true);
     assert.deepEqual(s.files, [
       { path: '.gitignore', status: 'modified', adds: 1, dels: 0 },
@@ -879,6 +880,52 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     const fewer = await workDiff({ repoRoot: t.root, path: ws.path, since: ws.base, maxFiles: 7 });
     assert.equal(fewer.omitted, 1);
     check(fewer, 'one by one');
+  });
+
+  test('the commit the review makes of work not committed yet is dated as its parent, never older, and is the same each time', async () => {
+    // git looks for where two histories met newest first: a commit dated before its own parent would have it walk all of
+    // the person's history for every card and diff.
+    const t = await agentRepo();
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    // Nothing points at it: it is found by its tree and its parent, the agent's HEAD.
+    const made = () => git(t.root, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname) %(objecttype)').split('\n')
+      .filter(l => l.endsWith(' commit')).map(l => l.split(' ')[0])
+      .filter(id => git(t.root, 'log', '-1', '--format=%T %P', id) === `${s.tree} ${s.head}`);
+    const found = made();
+    assert.equal(found.length, 1);
+    const dates = id => git(t.root, 'log', '-1', '--format=%at %ct', id);
+    const parent = git(t.root, 'log', '-1', '--format=%ct', s.head);
+    assert.equal(dates(found[0]), `${parent} ${parent}`);
+    await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    assert.deepEqual(made(), found, 'the same commit each time');
+  });
+
+  test('file names that are not UTF-8 each keep their own counts, and get no patch: never another file’s', async () => {
+    const t = await agentRepo();
+    const blob = text => execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: t.ws.path, input: text, encoding: 'utf8' }).trim();
+    const latin1 = byte => Buffer.concat([Buffer.from('caf'), Buffer.from([byte]), Buffer.from('.txt')]);
+    // Two Latin-1 names. This disk may refuse them as files, so they are in the agent's index only, marked skip-worktree
+    // so that `add -A` leaves them in its work; on Linux they would be ordinary files.
+    const entries = [[latin1(0xe9), blob('line\n'.repeat(40))], [latin1(0xe8), blob('just one\n')]];
+    execFileSync('git', ['update-index', '--add', '--index-info'], { cwd: t.ws.path,
+      input: Buffer.concat(entries.map(([name, id]) => Buffer.concat([Buffer.from(`100644 ${id}\t`), name, Buffer.from('\n')]))) });
+    execFileSync('git', ['update-index', '--skip-worktree', '-z', '--stdin'], { cwd: t.ws.path,
+      input: Buffer.concat(entries.flatMap(([name]) => [name, Buffer.from([0])])) });
+    // And a real file whose UTF-8 name holds U+FFFD, the character both of those read as.
+    const read = 'caf�.txt';
+    write(t.w(read), 'a\nb\nc\n');
+    const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    assert.deepEqual(s.files, [ // in git's order, by bytes: e8, e9, then ef bf bd
+      { path: read, status: 'added', adds: 1, dels: 0 },
+      { path: read, status: 'added', adds: 40, dels: 0 },
+      { path: read, status: 'added', adds: 3, dels: 0 },
+    ]);
+    const d = await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    assert.deepEqual(d.files.map(({ patch, ...f }) => f), s.files);
+    assert.deepEqual(d.files.map(f => f.patch), [null, null, d.files[2].patch]);
+    assert.ok(d.files[2].patch.endsWith('\n+a\n+b\n+c\n'), d.files[2].patch);
   });
 
   test('a .gitattributes of the agent’s own cannot make a text change look binary in the review, hidden or only in its index', async () => {
@@ -1031,6 +1078,49 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(holding(), `refs/heads/kept-${t.id}`);
   });
 
+  test('the tidy keeps an agent’s folder whose edits git status cannot see: an assume-unchanged or skip-worktree bit, or core.ignoreStat', async () => {
+    const t = await agentRepo();
+    let n = 0;
+    const another = () => createWorkspace({ repoRoot: t.root, agentId: `${t.id}x${++n}`, slug: 'Hidden edits', baseDir });
+    const tidy = (ws, since = null) => removeWorkspace({ repoRoot: t.root, path: ws.path, base: ws.base, since, onlyIfUnchanged: true, deleteBranch: true });
+    const kept = async (ws, since, label) => {
+      assert.equal(statusOf(ws.path), '', `${label}: git status sees nothing`);
+      assert.deepEqual(await tidy(ws, since), { removed: false, kept: true }, label);
+      assert.equal(fs.readFileSync(path.join(ws.path, 'a.txt'), 'utf8'), 'one\ntwo\nthree\nNOT SAVED\n', `${label}: the edit is still there`);
+      assert.notEqual(git(t.root, 'branch', '--list', ws.branch), '', `${label}: its branch is kept`);
+    };
+    // An agent sets a bit on a file, then edits it.
+    for (const bit of ['assume-unchanged', 'skip-worktree']) {
+      const ws = await another();
+      git(ws.path, 'update-index', `--${bit}`, 'a.txt');
+      write(path.join(ws.path, 'a.txt'), 'one\ntwo\nthree\nNOT SAVED\n');
+      await kept(ws, null, bit);
+    }
+    // The same after a merge, when the tidy gets `since`.
+    write(t.w('b.txt'), 'b by the agent\n');
+    const m = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+    assert.equal(m.ok, true);
+    git(t.ws.path, 'update-index', '--assume-unchanged', 'a.txt');
+    write(t.w('a.txt'), 'one\ntwo\nthree\nNOT SAVED\n');
+    await kept(t.ws, m.work, 'after a merge');
+    // The person's core.ignoreStat gives every file git writes in a new agent folder the assume-unchanged bit.
+    git(t.root, 'config', 'core.ignoreStat', 'true');
+    const quiet = await another();
+    assert.match(git(quiet.path, 'ls-files', '-v', 'a.txt'), /^h a\.txt$/);
+    write(path.join(quiet.path, 'a.txt'), 'one\ntwo\nthree\nNOT SAVED\n');
+    await kept(quiet, null, 'core.ignoreStat');
+    // An untouched folder still goes, bits or not.
+    const untouched = await another();
+    assert.deepEqual(await tidy(untouched), { removed: true, branch: untouched.branch });
+    assert.equal(fs.existsSync(untouched.path), false);
+    // Judging the files again writes an index of Workbench's own: no hook of the repository's runs for it.
+    const log = path.join(T, `hooks-tidy-${t.id}.log`);
+    plantHooks(path.join(t.root, '.git'), log);
+    plantConfigHooks(path.join(t.root, '.git', 'config'), log);
+    await kept(quiet, null, 'core.ignoreStat, with hooks planted');
+    assert.deepEqual(ranHooks(log), [], 'no hook ran');
+  });
+
   test('mergeWork refuses, changing nothing at all, before it makes the work commit', async () => {
     const cases = [];
     /** A case: an agent edits a.txt, the card is drawn, `setup` changes something, and the merge is refused for `why`. */
@@ -1060,11 +1150,11 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     });
     refused('detached', t => { git(t.root, 'checkout', '-q', '--detach'); }, 'detached', 'Your folder is not on a branch, so there is nowhere to merge it.');
 
-    // A merge, rebase, cherry-pick, revert or bisect under way.
-    for (const marker of ['MERGE_HEAD', 'rebase-merge', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-apply']) {
+    // A merge, rebase, cherry-pick, revert (one commit, or a sequence of them) or bisect under way.
+    for (const marker of ['MERGE_HEAD', 'rebase-merge', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-apply', 'sequencer']) {
       refused(marker, t => {
         const f = path.join(t.root, '.git', marker);
-        if (marker.startsWith('rebase')) fs.mkdirSync(f);
+        if (marker.startsWith('rebase') || marker === 'sequencer') fs.mkdirSync(f);
         else write(f, `${t.ws.base}\n`);
       }, 'busy', 'Your folder is in the middle of a merge or rebase. Finish that first.');
     }
@@ -1141,6 +1231,175 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
       t => `Its folder is on the branch ${t.ws.branch} now, not on workbench/someone-else-a1a1a1.`);
 
     await inParallel(cases);
+  });
+
+  test('a cherry-pick of several commits that waits between two of them is under way: busy, and the person can still finish it', async () => {
+    const t = await agentRepo({ ...STARTING_FILES, 'p.txt': 'p\n', 'q.txt': 'q\n' });
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    git(t.root, 'checkout', '-q', '-b', 'side');
+    write(t.p('p.txt'), 'side p\n');
+    git(t.root, 'commit', '-q', '-am', 'side 1');
+    write(t.p('q.txt'), 'side q\n');
+    git(t.root, 'commit', '-q', '-am', 'side 2');
+    git(t.root, 'checkout', '-q', 'main');
+    write(t.p('p.txt'), 'main p\n');
+    git(t.root, 'commit', '-q', '-am', 'main p');
+    // The first commit does not apply cleanly; the person settles it and commits it, and the second one waits.
+    assert.notEqual(gitTry(t.root, 'cherry-pick', 'main..side').code, 0);
+    write(t.p('p.txt'), 'settled\n');
+    git(t.root, 'add', 'p.txt');
+    git(t.root, 'commit', '-q', '--no-edit');
+    assert.match(git(t.root, 'status'), /Cherry-pick currently in progress/);
+    assert.equal(gitTry(t.root, 'rev-parse', '-q', '--verify', 'CHERRY_PICK_HEAD').code, 1);
+    const { expect } = await proposal(t);
+    const was = await everything(t);
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)), { ok: false, why: 'busy', sentence: 'Your folder is in the middle of a merge or rebase. Finish that first.' });
+    assert.deepEqual(await everything(t), was);
+    // Their cherry-pick goes on where it waited, on their own commit; once it is done, the merge goes through.
+    const settled = headOf(t.root);
+    assert.equal(gitTry(t.root, 'cherry-pick', '--continue').code, 0);
+    assert.equal(git(t.root, 'log', '-1', '--format=%s %P'), `side 2 ${settled}`);
+    const picked = headOf(t.root);
+    const r = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(git(t.root, 'log', '-1', '--format=%P', r.merge), `${picked} ${r.work}`);
+  });
+
+  test('with the reftable ref store, where CHERRY_PICK_HEAD and REVERT_HEAD are refs and not files, a cherry-pick or revert under way is busy', async (c) => {
+    if (gitTry(T, 'init', '-q', '--ref-format=reftable', path.join(T, 'reftable-probe')).code !== 0) return c.skip('this git has no reftable ref store (git 2.45 and newer)');
+    await inParallel(['cherry-pick', 'revert'].map((op, k) => async () => {
+      const r = path.join(T, `reftable-${op}`);
+      fs.mkdirSync(r);
+      git(r, 'init', '-q', '-b', 'main', '--ref-format=reftable');
+      git(r, 'config', 'user.name', PERSON.name);
+      git(r, 'config', 'user.email', PERSON.email);
+      for (const [f, text] of Object.entries({ ...STARTING_FILES, 'p.txt': 'p\n' })) write(path.join(r, f), text);
+      git(r, 'add', '-A');
+      git(r, 'commit', '-q', '-m', 'first');
+      const root = fs.realpathSync.native(r);
+      const id = `rt000${k + 1}`;
+      const ws = await createWorkspace({ repoRoot: root, agentId: id, slug: 'Reftable', baseDir });
+      const t = { root, ws, id, w: f => path.join(ws.path, f), p: f => path.join(root, f) };
+      if (op === 'cherry-pick') {
+        git(root, 'checkout', '-q', '-b', 'side');
+        write(t.p('p.txt'), 'side\n');
+        git(root, 'commit', '-q', '-am', 'side');
+        git(root, 'checkout', '-q', 'main');
+        write(t.p('p.txt'), 'main\n');
+        git(root, 'commit', '-q', '-am', 'main');
+        assert.notEqual(gitTry(root, 'cherry-pick', 'side').code, 0);
+      } else {
+        write(t.p('p.txt'), 'p2\n');
+        git(root, 'commit', '-q', '-am', 'p2');
+        const target = headOf(root);
+        write(t.p('p.txt'), 'p3\n');
+        git(root, 'commit', '-q', '-am', 'p3');
+        assert.notEqual(gitTry(root, 'revert', target).code, 0);
+      }
+      // Settled, not committed yet.
+      write(t.p('p.txt'), 'settled\n');
+      git(root, 'add', 'p.txt');
+      const ref = op === 'cherry-pick' ? 'CHERRY_PICK_HEAD' : 'REVERT_HEAD';
+      assert.equal(fs.existsSync(path.resolve(root, git(root, 'rev-parse', '--git-path', ref))), false, `${op}: a ref, not a file`);
+      assert.equal(gitTry(root, 'rev-parse', '-q', '--verify', ref).code, 0, op);
+      write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+      const { expect } = await proposal(t);
+      const was = await everything(t);
+      assert.deepEqual(await mergeWork(mergeOpts(t, expect)), { ok: false, why: 'busy', sentence: 'Your folder is in the middle of a merge or rebase. Finish that first.' }, op);
+      assert.deepEqual(await everything(t), was, `${op}: nothing changed`);
+    }));
+  });
+
+  test('what git keeps for the person’s next commit survives a merge: the message of a cherry-pick --no-commit, and rerere’s record', async () => {
+    const t = await agentRepo({ ...STARTING_FILES, 'p.txt': 'p\n' });
+    git(t.root, 'config', 'rerere.enabled', 'true');
+    git(t.root, 'checkout', '-q', '-b', 'side');
+    write(t.p('p.txt'), 'side p\n');
+    git(t.root, 'commit', '-q', '-am', 'Port the fix', '-m', 'Why it matters.');
+    git(t.root, 'checkout', '-q', 'main');
+    write(t.p('p.txt'), 'main p\n');
+    git(t.root, 'commit', '-q', '-am', 'main p');
+    // Picked without a commit: git writes the message for the next commit (MERGE_MSG), and rerere notes the conflict
+    // the person settles (MERGE_RR). Git does not count this as a cherry-pick under way.
+    assert.notEqual(gitTry(t.root, 'cherry-pick', '-n', '-x', 'side').code, 0);
+    write(t.p('p.txt'), 'settled\n');
+    git(t.root, 'add', 'p.txt');
+    assert.doesNotMatch(git(t.root, 'status'), /in progress/);
+    const kept = cwd => Object.fromEntries(['MERGE_MSG', 'MERGE_RR'].map(f => {
+      const file = path.join(cwd, '.git', f);
+      return [f, fs.existsSync(file) ? fs.readFileSync(file, 'latin1') : null];
+    }));
+    const before = kept(t.root);
+    assert.match(before.MERGE_MSG, /^Port the fix\n\nWhy it matters\.\n\n\(cherry picked from commit [0-9a-f]{40}\)\n/);
+    assert.notEqual(before.MERGE_RR, null);
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    git(t.ws.path, 'commit', '-q', '-am', 'agent');
+
+    // The danger is real: git's fast-forward deletes both, as if it ended a merge.
+    const demo = path.join(T, `demo-${t.id}`);
+    fs.cpSync(t.root, demo, { recursive: true });
+    const tree = git(demo, 'merge-tree', '--write-tree', 'HEAD', t.ws.branch).split('\n')[0];
+    const m = git(demo, 'commit-tree', tree, '-p', 'HEAD', '-p', t.ws.branch, '-m', 'merge');
+    assert.equal(gitTry(demo, 'merge', '--ff-only', '-q', m).code, 0);
+    assert.deepEqual(kept(demo), { MERGE_MSG: null, MERGE_RR: null });
+
+    const r = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(headOf(t.root), r.merge);
+    assert.deepEqual(kept(t.root), before);
+    assert.equal(statusOf(t.root), 'M  p.txt\n');
+    // Their next commit is the one they prepared, and rerere learns how they settled the conflict.
+    git(t.root, 'commit', '-q', '--no-edit');
+    assert.equal(git(t.root, 'log', '-1', '--format=%s'), 'Port the fix');
+    const cache = path.join(t.root, '.git', 'rr-cache');
+    assert.ok(fs.readdirSync(cache).some(id => fs.existsSync(path.join(cache, id, 'postimage'))), 'rerere recorded the settled file');
+  });
+
+  test('a merge card is bound to the review it showed: the person’s HEAD it was made against, and the tree that merge makes', async () => {
+    await inParallel([
+      async () => {
+        // The person's folder is on another branch while the review is made, and back on main when they say yes.
+        const t = await agentRepo();
+        write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+        write(t.w('b.txt'), 'b by the agent\n');
+        git(t.root, 'checkout', '-q', '-b', 'feature');
+        write(t.p('b.txt'), 'b by the agent\n'); // feature already holds the agent's change to b.txt
+        git(t.root, 'commit', '-q', '-am', 'feature');
+        git(t.root, 'checkout', '-q', 'main');
+        const info = await prepareRepo(t.root); // what the engine binds the card to: main, and its HEAD
+        git(t.root, 'checkout', '-q', 'feature');
+        const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+        git(t.root, 'checkout', '-q', 'main');
+        assert.deepEqual(s.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }], 'the card shows a.txt only');
+        const was = await everything(t);
+        assert.deepEqual(await mergeWork(mergeOpts(t, { workId: s.workId, into: info.branch, intoHead: info.head })),
+          { ok: false, why: 'moved', sentence: 'main changed since you looked. Have another look.' });
+        assert.deepEqual(await everything(t), was, 'nothing changed');
+      },
+      async () => {
+        // The person's own attributes change what the merge makes after the card was drawn: here a conflict, which the
+        // card showed as the agent's change from where the two last met, becomes a merge of both lines.
+        const t = await agentRepo();
+        write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+        write(t.p('a.txt'), 'one\nPERSON\nthree\n');
+        git(t.root, 'commit', '-q', '-am', 'person');
+        const head = headOf(t.root);
+        const { s, expect } = await proposal(t);
+        assert.deepEqual(s.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }]);
+        write(t.p('.gitattributes'), 'a.txt merge=union\n');
+        const person = folderPrint(t.root);
+        assert.deepEqual(await mergeWork(mergeOpts(t, expect)),
+          { ok: false, why: 'changed', sentence: 'What merging it would change in main is no longer what you saw. Have another look.' });
+        assert.deepEqual(folderPrint(t.root), person);
+        assert.equal(headOf(t.root), head);
+        // A new look shows what it would bring in now, and that is what lands.
+        const again = await proposal(t);
+        assert.deepEqual(again.s.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 0 }]);
+        const ok = await mergeWork(mergeOpts(t, again.expect));
+        assert.deepEqual(ok, { ok: true, into: 'main', merge: ok.merge, work: ok.work, files: 1, adds: 1, dels: 0 });
+        assert.equal(fs.readFileSync(t.p('a.txt'), 'utf8'), 'one\nPERSON\nAGENT\nthree\n');
+      },
+    ]);
   });
 
   test('mergeWork refuses a conflict and writes nothing into the person’s folder; the agent can then bring the branch in', async () => {
@@ -1290,6 +1549,59 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(ok.ok, true);
     assert.equal(ok.work, tip);
     assert.equal(fs.readFileSync(p('cache'), 'utf8'), 'an agent file where the person has a folder\n');
+  });
+
+  test('a file the person deleted or renamed without staging it never comes back with the agent’s version: blocked', async () => {
+    // The danger is real: git's fast-forward writes over a tracked file that is missing, as if it were unchanged.
+    const d = await agentRepo();
+    write(d.w('a.txt'), 'one\nAGENT\nthree\n');
+    git(d.ws.path, 'commit', '-q', '-am', 'agent');
+    const demo = cloneOf(d.root);
+    fs.rmSync(path.join(demo, 'a.txt'));
+    assert.equal(gitTry(demo, 'merge', '--ff-only', '-q', `origin/${d.ws.branch}`).code, 0);
+    assert.equal(fs.readFileSync(path.join(demo, 'a.txt'), 'utf8'), 'one\nAGENT\nthree\n');
+    assert.equal(statusOf(demo), '', 'the deletion is gone, without a word');
+
+    const files = { ...STARTING_FILES, 'docs/x.md': 'x\n', 'docs/y.md': 'y\n' };
+    const blocked = (label, setup, paths, agent = t => write(t.w('a.txt'), 'one\nAGENT\nthree\n')) => async () => {
+      const t = await agentRepo(files);
+      agent(t);
+      setup(t);
+      const before = { person: folderPrint(t.root), status: statusOf(t.root), head: headOf(t.root) };
+      const { expect } = await proposal(t);
+      assert.deepEqual(await mergeWork(mergeOpts(t, expect)), {
+        ok: false, why: 'blocked', paths, sentence: `Your own changes are in the way: ${paths.join(', ')}. Commit or put them aside, then merge again.`,
+      }, label);
+      assert.deepEqual({ person: folderPrint(t.root), status: statusOf(t.root), head: headOf(t.root) }, before, `${label}: nothing in the person’s folder changed`);
+      return t;
+    };
+    await inParallel([
+      async () => {
+        const t = await blocked('deleted', t => fs.rmSync(t.p('a.txt')), ['a.txt'])();
+        // Once the file is back, the merge goes through.
+        git(t.root, 'checkout', '--', 'a.txt');
+        assert.equal((await mergeWork(mergeOpts(t, (await proposal(t)).expect))).ok, true);
+        assert.equal(fs.readFileSync(t.p('a.txt'), 'utf8'), 'one\nAGENT\nthree\n');
+      },
+      blocked('renamed, with an edit', t => {
+        fs.renameSync(t.p('a.txt'), t.p('renamed.txt'));
+        write(t.p('renamed.txt'), 'one\ntwo\nthree\nmine\n');
+      }, ['a.txt']),
+      blocked('a deleted folder', t => fs.rmSync(t.p('docs'), { recursive: true }), ['docs/x.md'], t => write(t.w('docs/x.md'), 'x by the agent\n')),
+      // A file the agent deletes too, or does not touch, stays deleted, and the merge goes through.
+      async () => {
+        const t = await agentRepo(files);
+        write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+        fs.rmSync(t.w('b.txt'));
+        fs.rmSync(t.p('b.txt'));
+        fs.rmSync(t.p('c.txt'));
+        const r = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+        assert.equal(r.ok, true, JSON.stringify(r));
+        assert.equal(fs.existsSync(t.p('b.txt')), false);
+        assert.equal(fs.existsSync(t.p('c.txt')), false);
+        assert.equal(statusOf(t.root), ' D c.txt\n');
+      },
+    ]);
   });
 
   test('blocked names at most three paths', async () => {
@@ -1493,6 +1805,88 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(ok.ok, true);
     assert.equal(headOf(t.root), ok.merge);
     assert.equal(statusOf(t.root), '');
+  });
+
+  test('when a write fails part-way through the fast-forward, the files git left are never called the person’s own changes', async () => {
+    const t = await agentRepo();
+    const pages = Array.from({ length: 6 }, (_, i) => `page${i}.txt`);
+    for (const f of pages) write(t.w(f), `${f} by the agent\n`);
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    write(t.w('b.txt'), 'b by the agent\n');
+    // The person's own required filter (as Git LFS sets one up), which fails on one file while they are offline.
+    const offline = path.join(T, `offline-${t.id}`);
+    write(offline, '');
+    git(t.root, 'config', 'filter.lfsish.smudge', `sh -c 'if [ "$0" = page3.txt ] && [ -e '"'"'${offline}'"'"' ]; then exit 1; fi; cat' %f`);
+    git(t.root, 'config', 'filter.lfsish.clean', 'cat');
+    git(t.root, 'config', 'filter.lfsish.required', 'true');
+    write(path.join(t.root, '.git', 'info', 'attributes'), 'page*.txt filter=lfsish\n');
+    let { expect } = await proposal(t);
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)),
+      { ok: false, why: 'git', sentence: 'Git could not finish the merge into main. Have a look at your folder before you try again.' });
+    assert.equal(headOf(t.root), t.ws.base);
+    // Git wrote some of the merge's files, then put its index back: they look like the person's own changes.
+    const left = statusOf(t.root).split('\n').filter(Boolean).map(l => l.slice(3));
+    assert.ok(left.includes('a.txt') && left.includes('b.txt') && left.includes('page0.txt') && !left.includes('page3.txt'), statusOf(t.root));
+
+    // Back online. Meanwhile the person changes b.txt: only that one is theirs.
+    fs.rmSync(offline);
+    write(t.p('b.txt'), 'mine\n');
+    ({ expect } = await proposal(t));
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)),
+      { ok: false, why: 'blocked', paths: ['b.txt'], sentence: 'Your own changes are in the way: b.txt. Commit or put them aside, then merge again.' });
+    // Without it, the rest are named for what they are.
+    git(t.root, 'checkout', '--', 'b.txt');
+    ({ expect } = await proposal(t));
+    const again = await mergeWork(mergeOpts(t, expect));
+    const leftovers = left.filter(p => p !== 'b.txt');
+    assert.deepEqual([...(again.paths || [])].sort(), [...leftovers].sort(), JSON.stringify(again));
+    const named = again.paths.length > 3 ? `${again.paths.slice(0, 3).join(', ')} and ${again.paths.length - 3} more` : again.paths.join(', ');
+    assert.deepEqual(again, {
+      ok: false, why: 'git', paths: again.paths,
+      sentence: `Files in your folder already hold what the merge brings in, and git will not write over them: ${named}. Undo those changes, then merge again.`,
+    });
+    // Undone, the merge goes through.
+    git(t.root, 'checkout', '--', 'a.txt');
+    for (const f of leftovers) if (f.startsWith('page')) fs.rmSync(t.p(f));
+    ({ expect } = await proposal(t));
+    const ok = await mergeWork(mergeOpts(t, expect));
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    assert.equal(statusOf(t.root), '');
+    for (const f of pages) assert.equal(fs.readFileSync(t.p(f), 'utf8'), `${f} by the agent\n`);
+    assert.equal(fs.readFileSync(t.p('b.txt'), 'utf8'), 'b by the agent\n');
+  });
+
+  test('a file in the way is judged by its own bytes, whatever its name: one that starts with a quote is never read as another', async () => {
+    const t = await agentRepo();
+    write(t.w('"x"'), 'agent\n');
+    write(t.p('"x"'), 'mine\n'); // the person's own file, in the way
+    write(t.p('x'), 'agent\n'); // and x, which holds what the agent's "x" holds (git reads the line "x" as x)
+    const { expect } = await proposal(t);
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)), {
+      ok: false, why: 'blocked', paths: ['"x"'], sentence: 'Your own changes are in the way: "x". Commit or put them aside, then merge again.',
+    });
+  });
+
+  test('when the person’s branch moves while git writes their files, mergeWork says the merge did not finish, never that it moved', async () => {
+    const t = await agentRepo();
+    write(t.p('c.txt'), 'c by the person\n');
+    git(t.root, 'commit', '-q', '-am', 'person');
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    write(t.w('page.txt'), 'page\n');
+    // While git writes the agent's page.txt, the person undoes their last commit and keeps its changes (an IDE's "Undo
+    // commit"): a command that moves only the branch, which the index lock git holds does not keep out. The person's
+    // own smudge filter does it here, once, so that it lands in that moment every time.
+    const flag = path.join(T, `undo-${t.id}`);
+    git(t.root, 'config', 'filter.undo.smudge', `if [ ! -e '${flag}' ]; then : > '${flag}'; git reset -q --soft HEAD~1 >/dev/null 2>&1; fi; cat`);
+    git(t.root, 'config', 'filter.undo.clean', 'cat');
+    write(path.join(t.root, '.git', 'info', 'attributes'), 'page.txt filter=undo\n');
+    const { expect } = await proposal(t);
+    const r = await mergeWork(mergeOpts(t, expect));
+    assert.ok(fs.existsSync(flag), 'the filter ran');
+    assert.deepEqual(r, { ok: false, why: 'git', sentence: 'Git could not finish the merge into main. Have a look at your folder before you try again.' });
+    // "main changed since you looked" would not be the whole truth: the agent's files are in the folder, staged.
+    assert.equal(headOf(t.root), t.ws.base);
+    assert.equal(statusOf(t.root), 'M  a.txt\nM  c.txt\nA  page.txt\n');
   });
 
   test('a Ctrl-C in the terminal while the fast-forward writes the person’s files reaches only Workbench: git finishes the merge', async (c) => {
@@ -1898,6 +2292,30 @@ test('mergeWork refuses with git-old when git is older than 2.38', async () => {
     process.env.PATH = savedPath;
   }
   assert.deepEqual(await everything(t), was);
+});
+
+test('when the person’s branch moves just before git reads it, git stops before it begins, and mergeWork says main changed', async () => {
+  const t = await agentRepo();
+  write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+  const { expect } = await proposal(t);
+  // A git that makes a commit in the person's folder just before it fast-forwards: the moment after Workbench's last look.
+  const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  const shimDir = path.join(T, 'commit-first-git');
+  write(path.join(shimDir, 'git'), `#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "--ff-only" ]; then '${realGit}' commit -q --allow-empty -m meanwhile >/dev/null 2>&1; break; fi\ndone\nexec '${realGit}' "$@"\n`);
+  fs.chmodSync(path.join(shimDir, 'git'), 0o755);
+  const person = folderPrint(t.root);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${shimDir}${path.delimiter}${savedPath}`;
+  let r;
+  try {
+    r = await mergeWork(mergeOpts(t, expect));
+  } finally {
+    process.env.PATH = savedPath;
+  }
+  assert.equal(git(t.root, 'log', '-1', '--format=%s %P'), `meanwhile ${expect.intoHead}`);
+  assert.deepEqual(r, { ok: false, why: 'moved', sentence: 'main changed since you looked. Have another look.' });
+  assert.deepEqual(folderPrint(t.root), person);
+  assert.equal(statusOf(t.root), '');
 });
 
 test('nothing is left behind in the temporary folder', () => {
