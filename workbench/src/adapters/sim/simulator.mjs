@@ -410,16 +410,21 @@ const ONBOARDING_JOBS = [
 // a branch per agent, and what merging or throwing away an agent's work does to it. The shapes follow workspace.mjs
 // (gitGraph, workDiff, mergeWork, discardWork) and the engine's cards, so the page treats the demo like a real run.
 
-// The engine's event for an agent's git state (src/shared/events.mjs gains EV.WORK; until then, its value).
+// The engine's event for what became of a root's work in git (EV.WORK in src/shared/events.mjs).
 const WORK_EVENT = EV.WORK || 'agent.work';
 const DEMO_REPO = 'storefront';
 const TRUNK_BRANCH = 'main';
 const YOU = 'you';                 // the author of the person's own commits and of every merge commit
 const DEMO_DIRTY = 2;              // the person's own uncommitted changes, which no merge touches
 const DAY_MIN = 24 * 60;
+// What workspace.mjs accepts in a Workbench-Agent trailer, and the trailer it adds to a Claude Code agent's work.
+const AGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+const CLAUDE_TRAILER = 'Co-authored-by: Claude <noreply@anthropic.com>';
+// The demo says plainly that nothing real happened: after the fact, and on the cards before it.
 const SIM_SAYS_MERGED = 'This is the demo: nothing was really merged.';
 const SIM_SAYS_THROWN = 'This is the demo: nothing was really thrown away.';
-const SIM_NO_GIT = 'This is the demo, so nothing is really merged.';
+const SIM_CARD_MERGE = 'This is the demo, so nothing is really merged.';
+const SIM_CARD_DISCARD = 'This is the demo, so nothing is really thrown away.';
 
 // The repository's history, oldest first, in minutes before seedWorld(). Each line is a commit by the person, or
 // (`merge`) the merge commit that joined an earlier agent's work into main (EARLIER_MERGES). The seeded agents start
@@ -455,11 +460,14 @@ const TRUNK = [
   { ago: 5, subject: 'Update the README for the new search page' },
 ];
 
-// Two agents from earlier today whose work was merged. Their folders and branches were tidied away after the merge, so
-// they are not on the board: the graph shows them through their work and merge commits (and those commits' trailers).
+// Two Claude Code agents from earlier today whose work was merged. Their folders and branches were tidied away after
+// the merge, so they are not on the board: the graph shows them through their work and merge commits (and those
+// commits' trailers). `says`: the agent's own summary, which became its work commit's body.
 const EARLIER_MERGES = [
-  { name: 'Payment retry', task: 'Retry a failed card payment once before showing an error', fromAgo: 280, workAgo: 170 },
-  { name: 'New search page', task: 'Build the new search page with filters and instant results', fromAgo: 220, workAgo: 100 },
+  { name: 'Payment retry', task: 'Retry a failed card payment once before showing an error', fromAgo: 280, workAgo: 170,
+    says: 'A failed card payment is now tried once more before the customer sees an error.' },
+  { name: 'New search page', task: 'Build the new search page with filters and instant results', fromAgo: 220, workAgo: 100,
+    says: 'The new search page has filters and shows results as you type.' },
 ];
 
 /** 40 hex characters made from text, like a git object id: the same text gives the same id. */
@@ -476,20 +484,80 @@ function slugify(name) {
   return s || 'task';
 }
 
-/**
- * A work commit's subject, made from the agent's task as the engine makes it: the first sentence, its first letter
- * capitalised, cut at a word boundary to at most 72 characters. A closing full stop is left off, as in most projects.
- */
-export function subjectOf(task) {
-  let s = firstSentence(String(task || ''), 100_000).replace(/\.$/, '').trim();
-  s = s.charAt(0).toUpperCase() + s.slice(1);
-  if (s.length > 72) {
-    const cut = s.slice(0, 73);
-    const at = cut.lastIndexOf(' ');
-    s = (at > 0 ? cut.slice(0, at) : s.slice(0, 72)).replace(/[\s,;:.!?-]+$/, '');
-  }
-  return s || 'Work by an agent';
+/** One line of plain text: no control, direction or zero-width characters, spaces collapsed. */
+function oneLine(text) {
+  return String(text ?? '').replace(/[\u200b-\u200f\u2060\ufeff\u202a-\u202e\u2066-\u2069]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ').replace(/\s+/g, ' ').trim();
 }
+
+/**
+ * A work commit's subject, made from the agent's task as the engine makes it: the first sentence (one ends before a
+ * capital, so "e.g. the" does not end it), without a closing full stop, cut at a word boundary to at most 72
+ * characters, its first letter capitalised. `name`: the agent's, for "Work by <name>" when the task gives nothing.
+ */
+export function subjectOf(task, name = 'an agent') {
+  let t = oneLine(task);
+  const m = /^(.+?[.!?])(?=\s+[A-Z0-9“"'(]|$)/.exec(t);
+  if (m) t = m[1];
+  t = t.replace(/(?<!\.)\.$/, '').trim();
+  if (t.length > 72) {
+    const cut = t.slice(0, 73);
+    const sp = cut.lastIndexOf(' ');
+    t = (sp >= 24 ? cut.slice(0, sp) : t.slice(0, 72)).replace(/[\s,;:–—-]+$/, '');
+  }
+  t = t.charAt(0).toUpperCase() + t.slice(1);
+  return t || `Work by ${oneLine(name) || 'an agent'}`;
+}
+
+/**
+ * The messages Workbench writes (workspace.mjs mergeWork and discardWork). The work commit W: the subject, the agent's
+ * own summary, then its trailers (Co-authored-by only for a Claude Code agent). The merge commit M: "Merge <Name>:
+ * <subject>" and its trailers. The hidden copy kept when work is thrown away: "Thrown away: <branch>".
+ */
+function workMessage({ subject, body, agentId, harness }) {
+  const lines = [subject, ''];
+  const said = oneLine(body);
+  if (said && !/^[A-Za-z0-9-]+\s*:/.test(said)) lines.push(said, '');   // never a line that could pass for a trailer
+  lines.push(`Workbench-Agent: ${agentId}`, 'Workbench-Kind: work');
+  if (harness === 'claude') lines.push(CLAUDE_TRAILER);
+  return `${lines.join('\n')}\n`;
+}
+
+function mergeMessage({ name, subject, agentId }) {
+  return `Merge ${oneLine(name)}: ${subject}\n\nWorkbench-Agent: ${agentId}\nWorkbench-Kind: merge\n`;
+}
+
+function discardMessage({ branch, agentId }) {
+  return `Thrown away: ${branch}\n\nWorkbench-Agent: ${agentId}\nWorkbench-Kind: discarded\n`;
+}
+
+/**
+ * What gitGraph reads from a commit's own trailers, never from its subject: `agentId` from the last Workbench-Agent
+ * (when it is a valid agent id), `kind` from the last Workbench-Kind ('merge' needs two parents too; anything else is
+ * 'commit'). Trailers are the lines of the message's last paragraph, after its subject, each "Key: value".
+ */
+function trailersOf(message, parents) {
+  const paras = String(message ?? '').replace(/\r\n?/g, '\n').trim().split(/\n[ \t]*\n/);
+  const last = paras.length > 1 ? paras[paras.length - 1].split('\n') : [];
+  const lines = last.length && last.every(l => /^[A-Za-z0-9-]+[ \t]*:/.test(l)) ? last : [];
+  const valueOf = key => {
+    let v = '';
+    for (const l of lines) {
+      const m = /^([A-Za-z0-9-]+)[ \t]*:(.*)$/.exec(l);
+      if (m && m[1].toLowerCase() === key) v = m[2].trim();
+    }
+    return v;
+  };
+  const agent = valueOf('workbench-agent');
+  const word = valueOf('workbench-kind');
+  return {
+    agentId: AGENT_ID_RE.test(agent) ? agent : null,
+    kind: word === 'merge' && parents.length > 1 ? 'merge' : word === 'work' ? 'work' : 'commit',
+  };
+}
+
+/** Git keeps a commit's time in whole seconds. */
+const toSeconds = ms => Math.floor(ms / 1000) * 1000;
 
 function joinAnd(list) {
   const a = list.filter(Boolean);
@@ -853,8 +921,9 @@ function newFileLines(n, kit, words, rng) {
 const hunkRange = (start, len) => (len === 1 ? `${start}` : `${start},${len}`);
 
 /**
- * A unified diff of one file, for `workDiff`'s `patch`. status 'added' is a new file of `adds` lines; 'modified' has
- * one to three hunks with three lines of context around them, `dels` lines taken out and `adds` put in.
+ * A unified diff of one file, for `workDiff`'s `patch`. status 'added' is a new file of `adds` lines, 'deleted' a file
+ * of `dels` lines taken out; 'modified' has one to three hunks with three lines of context around them, `dels` lines
+ * taken out and `adds` put in.
  */
 function syntheticPatch({ path, status, adds, dels, key }) {
   const rng = new Rng(`diff:${key}:${path}:${status}:${adds}:${dels}`);
@@ -869,6 +938,12 @@ function syntheticPatch({ path, status, adds, dels, key }) {
     const lines = newFileLines(adds, kit, words, rng);
     out.push('new file mode 100644', `index 0000000..${blob('new')}`, '--- /dev/null', `+++ b/${path}`);
     if (lines.length) out.push(`@@ -0,0 +${hunkRange(1, lines.length)} @@`, ...lines.map(l => `+${l}`));
+    return `${out.join('\n')}\n`;
+  }
+  if (status === 'deleted') {
+    const lines = newFileLines(dels, kit, words, rng);
+    out.push('deleted file mode 100644', `index ${blob('old')}..0000000`, `--- a/${path}`, '+++ /dev/null');
+    if (lines.length) out.push(`@@ -${hunkRange(1, lines.length)} +0,0 @@`, ...lines.map(l => `-${l}`));
     return `${out.join('\n')}\n`;
   }
   out.push(`index ${blob('old')}..${blob('new')} 100644`, `--- a/${path}`, `+++ b/${path}`);
@@ -1066,6 +1141,7 @@ export class Simulator {
     if (!this._buffer && a.lastTs != null && ts < a.lastTs) ts = a.lastTs;   // never go back in time per agent
     const ev = { kind, ts, agentId: a.id, ...fields };
     ev.kind = kind;   // a field must never replace the event's kind
+    if (kind === EV.SAYS && typeof ev.text === 'string') a.says = ev.text;   // its own summary, for its work commit
     if (this._buffer) { this._buffer.push(ev); return ev; }
     a.lastTs = ts;
     this._deliver(a, ev);
@@ -1098,8 +1174,11 @@ export class Simulator {
       checks: 'none', checkResults: [], rules: null, closedFrom: null,
       // Its pretend git: the branch and where it stands (see "the demo's git repository"); for roots that have one.
       git: null,
-      created: new Set(),  // paths its work added as new files (never shown: the diff says "new file" for them)
+      created: new Set(),  // paths its work added as new files since its unmerged work began: their diff is all new lines
+      deleted: new Set(),  // paths its work took out that were there when its unmerged work began
       paths: new Set(),    // every path it has changed, kept after a merge empties `files`
+      lines: new Map(),    // path -> lines, for the files it added and merged: what taking one out again removes
+      says: null,          // the last thing it said to the person: the body of its work commit
     };
     this._agents.set(id, a);
     return a;
@@ -1166,9 +1245,17 @@ export class Simulator {
     const r = a.rng;
     const f = root.files.get(path) || { path, adds: 0, dels: 0 };
     if (tool === 'Write' && !root.files.has(path)) {
-      f.adds += r.int(14, 72);
+      const n = r.int(14, 72);
+      f.adds += /\.sql$/i.test(path) ? 6 + (n % 9) : n;   // a migration is short
       if (!root.paths.has(path)) root.created.add(path);   // a file its work adds, not one it rewrote
-    } else { f.adds += r.int(2, 18); f.dels += r.int(0, 9); }
+    } else {
+      const adds = r.int(2, 18);
+      const dels = r.int(0, 9);
+      root.deleted.delete(path);   // written again after it was taken out: it is back, changed
+      // A file its work added is all new lines in its diff, however often it was edited since.
+      if (root.created.has(path)) f.adds += adds;
+      else { f.adds += adds; f.dels += dels; }
+    }
     root.files.set(path, f);
     root.paths.add(path);
     if (!this._buffer) this._emitFiles(root);   // history writes one files event at the end instead
@@ -1351,6 +1438,7 @@ export class Simulator {
     });
     this._ev(a, EV.TURN, { phase: 'end', finalText, backgroundTasks, isError });
     a.lastFinal = finalText;
+    if (!isError && !backgroundTasks) a.says = firstSentence(finalText) || a.says;   // what the engine shows it saying
     a.phase = isError ? 'failed' : backgroundTasks > 0 ? 'waiting_helpers' : 'idle';
   }
 
@@ -1427,7 +1515,7 @@ export class Simulator {
 
   _seedRoot(spec, now, live, factors) {
     let id;
-    do { id = this._rng.hex(6); } while (this._agents.has(id));
+    do { id = this._rng.hex(6); } while (this._agents.has(id) || this._gitWorld().agentIds.has(id));
     const a = this._agent({
       id, name: spec.name, task: spec.task, machineId: spec.machineId, model: spec.model, harnessName: spec.harness || 'claude',
       budgetUsd: spec.budgetUsd, costScale: spec.costScale || 1, rngKey: `seed:${spec.name}`,
@@ -1759,7 +1847,20 @@ export class Simulator {
     yield* this._doSteps(a, plan.steps);
     if (plan.after) plan.after();
     if (plan.forget) {
-      for (const p of plan.forget) a.files.delete(p);
+      for (const p of plan.forget) {
+        if (a.created.delete(p)) {
+          // Its unmerged work had added it: taken out again, it was never there.
+          a.files.delete(p);
+          a.paths.delete(p);
+        } else if (a.paths.has(p)) {
+          // It was there when its unmerged work began (merged earlier, say): taking it out deletes it.
+          const f = a.files.get(p);
+          a.files.set(p, { path: p, adds: 0, dels: a.lines.get(p) ?? Math.max(12, f ? f.dels : 0) });
+          a.deleted.add(p);
+        } else {
+          a.files.delete(p);
+        }
+      }
       this._emitFiles(a);
     }
     if (plan.checks) a.checkNames = plan.checks;
@@ -2086,49 +2187,70 @@ export class Simulator {
   // Every root agent gets a branch, workbench/<slug>-<id>, from what was newest on main when it started. Its work stays
   // uncommitted in its folder until it is merged, as with a real agent: then a work commit W goes on its branch and a
   // merge commit M joins W into main. The engine calls the public methods below in demo mode (section 6 of the spec).
-  // gitGraph() and changes() only read: they never draw from a random stream and never move simulated time.
+  // gitGraph() and changes() only read: they never draw from a random stream, move simulated time or emit anything.
 
   /**
    * The repository, made once, at seedWorld() or on first use: the person's history and two agents' work merged earlier
-   * today, ending at main. Ids and times come from the repository's own seeded stream, so looking changes nothing.
+   * today, ending at main. Ids come from the repository's own seeded stream, so the same seed gives the same ids.
    */
   _gitWorld(at) {
     if (this._git) return this._git;
     const now = Number.isFinite(at) ? at : this._now();
     const rng = new Rng(`git:${this.seed}`);
-    this._git = { name: DEMO_REPO, branch: TRUNK_BRANCH, dirty: DEMO_DIRTY, identity: true, head: null,
-      commits: new Map(), refs: new Map(), hidden: new Map() };
+    this._git = {
+      name: DEMO_REPO, branch: TRUNK_BRANCH, dirty: DEMO_DIRTY, identity: true, head: null,
+      commits: new Map(),   // id -> { id, parents, subject, author, at, agentId, kind, message, tree }
+      refs: new Map(),      // branch name -> commit id: main and every workbench/* branch
+      hidden: new Map(),    // refs/workbench/discarded/<id> -> the copy kept of work thrown away
+      agentIds: new Set(),  // the ids in the earlier agents' trailers
+    };
     const g = this._git;
     const when = ago => now - ago * MIN + Math.round(rng.between(-30, 30) * SEC);
     for (const step of TRUNK) {
       if (step.merge === undefined) {
-        g.head = this._addCommit({ id: rng.hex(40), parents: g.head ? [g.head] : [], subject: step.subject, author: YOU,
-          at: when(step.ago), agentId: null, kind: 'commit' }).id;
+        g.head = this._addCommit({ id: rng.hex(40), parents: g.head ? [g.head] : [], author: YOU, at: when(step.ago), message: `${step.subject}\n` }).id;
         continue;
       }
       const e = EARLIER_MERGES[step.merge];
-      const agentId = rng.hex(6);
-      const subject = subjectOf(e.task);
-      const work = this._addCommit({ id: rng.hex(40), parents: [this._gitBaseAt(now - e.fromAgo * MIN)], subject, author: e.name,
-        at: when(e.workAgo), agentId, kind: 'work' });
-      g.head = this._addCommit({ id: rng.hex(40), parents: [g.head, work.id], subject: `Merge ${e.name}: ${subject}`, author: YOU,
-        at: when(step.ago), agentId, kind: 'merge' }).id;
+      let agentId;
+      do { agentId = rng.hex(6); } while (g.agentIds.has(agentId));
+      g.agentIds.add(agentId);
+      const subject = subjectOf(e.task, e.name);
+      const work = this._addCommit({
+        id: rng.hex(40), parents: [this._gitBaseAt(now - e.fromAgo * MIN)], author: e.name, at: when(e.workAgo),
+        message: workMessage({ subject, body: e.says, agentId, harness: 'claude' }),
+      });
+      g.head = this._addCommit({
+        id: rng.hex(40), parents: [g.head, work.id], author: YOU, at: when(step.ago),
+        message: mergeMessage({ name: e.name, subject, agentId }),
+      }).id;
     }
     g.refs.set(TRUNK_BRANCH, g.head);
     return g;
   }
 
-  _addCommit(c) {
-    const commit = { id: c.id, parents: [...c.parents], subject: c.subject, author: c.author, at: c.at,
-      agentId: c.agentId ?? null, kind: c.kind || 'commit', tree: c.tree || hex40(`tree:${c.id}`) };
-    this._git.commits.set(commit.id, commit);
+  /** Record a commit. Its subject is its message's first line; agentId and kind come from its trailers, as gitGraph reads them. */
+  _addCommit({ id, parents, author, at, message, tree = null }) {
+    const ps = [...parents];
+    const { agentId, kind } = trailersOf(message, ps);
+    const commit = {
+      id, parents: ps, subject: String(message).split('\n')[0], author, at: toSeconds(at), agentId, kind,
+      message: String(message), tree: tree || hex40(`tree:${id}`),
+    };
+    this._git.commits.set(id, commit);
     return commit;
   }
 
-  /** A commit made now: its id comes from what it holds, as git's does. */
+  /** A commit made now: its id comes from everything it holds, as git's does. */
   _newCommit(c) {
-    const id = hex40(`commit|${c.parents.join(',')}|${c.tree}|${c.subject}|${c.author}|${c.at}`);
-    return this._addCommit({ ...c, id });
+    const at = toSeconds(c.at);
+    const id = hex40(`commit|${c.tree}|${c.parents.join(',')}|${c.author}|${at}|${c.message}`);
+    return this._git.commits.get(id) || this._addCommit({ ...c, at, id });
+  }
+
+  _treeOf(id) {
+    const c = this._gitWorld().commits.get(id);
+    return c ? c.tree : hex40(`tree:${id}`);
   }
 
   /** The newest commit on main's own line (first parents) made at or before `t`: where an agent started then. */
@@ -2157,13 +2279,18 @@ export class Simulator {
     return false;
   }
 
-  /** Give a root its branch at `base`. `extra.conflict`: paths you changed on main since, which its work clashes with. */
+  /**
+   * Give a root its branch at `base`, as the engine's createWorkspace does for a real agent. `extra.conflict`: the paths
+   * you changed on main after it started, which its work clashes with until it brings in main.
+   */
   _attachGit(a, base, extra = null) {
     const g = this._gitWorld();
     const branch = `workbench/${slugify(a.name)}-${a.id}`;
-    const conflict = extra && Array.isArray(extra.conflict) ? [...extra.conflict] : null;
-    a.git = { branch, from: g.branch, base, since: base, head: base, folder: true, behind: !!conflict, conflict,
-      merged: null, problem: null, thrownAway: null };
+    const conflict = extra && Array.isArray(extra.conflict) && extra.conflict.length ? [...extra.conflict] : null;
+    a.git = {
+      branch, from: g.branch, base, since: base, head: base, folder: true, behind: !!conflict, conflict,
+      merged: null, problem: null, thrownAway: null,
+    };
     g.refs.set(branch, base);
     return a.git;
   }
@@ -2209,17 +2336,23 @@ export class Simulator {
 
   /**
    * Its work now, like workspace.mjs's snapshotWork: every changed file not hidden by a .gitignore, as a tree, and the
-   * ones left out. `workId` binds a card to exactly what it showed.
+   * ones left out. Status: 'added' for a file its work added, 'deleted' for one it took out, else 'modified' (no rename
+   * detection). `workId` binds a card to exactly what it showed.
    */
   _snapshotWork(a) {
-    const g = this._gitWorld();
     const w = a.git;
     const all = this._filesOf(a).list;
-    const files = all.filter(f => !f.ignored);
+    const files = all.filter(f => !f.ignored).map(f => {
+      const status = a.created.has(f.path) ? 'added' : a.deleted.has(f.path) ? 'deleted' : 'modified';
+      const out = { path: f.path, status, adds: f.adds, dels: f.dels };
+      if (f.binary) out.binary = true;
+      if (f.large) out.large = true;
+      return out;
+    });
     const left = all.filter(f => f.ignored).map(f => ({ path: f.path, why: 'ignored' }));
-    const sinceTree = (g.commits.get(w.since) || {}).tree || hex40(`tree:${w.since}`);
+    const sinceTree = this._treeOf(w.since);
     const tree = files.length
-      ? hex40(`tree|${w.since}|${JSON.stringify(files.map(f => [f.path, f.adds, f.dels, !!f.binary, !!f.large]))}`)
+      ? hex40(`tree|${sinceTree}|${JSON.stringify(files.map(f => [f.path, f.status, f.adds, f.dels, !!f.binary, !!f.large]))}`)
       : sinceTree;
     return { head: w.head, tree, since: w.since, workId: `${w.head}:${tree}`, changed: tree !== sinceTree, files, left };
   }
@@ -2232,23 +2365,24 @@ export class Simulator {
       if (use === 'show') return this._gitTarget(a.rootId, use);
       return { refusal: use === 'merge'
         ? 'Helpers work in their agent’s folder. Merge the agent instead.'
-        : 'Helpers work in their agent’s folder. Throw away the agent instead.' };
+        : 'Helpers work in their agent’s folder. Throw away the agent’s work instead.' };
     }
     if (!a.git) {
-      return { refusal: use === 'merge' ? SIM_NO_GIT : use === 'discard' ? 'This is the demo, so nothing is really thrown away.'
-        : 'This is the demo, so there are no changes to show.' };
+      return { refusal: use === 'merge' ? SIM_CARD_MERGE : use === 'discard' ? SIM_CARD_DISCARD
+        : 'This is the demo, so there are no real changes to show.' };
     }
     return { agent: a };
   }
 
   /**
-   * The git screen's data, in the shape of the engine's gitGraph() (which wraps workspace.mjs's gitGraph()):
+   * The git screen's data, shaped like the engine's gitGraph() and workspace.mjs's gitGraph() at once:
    *   { ok: true, head, branch, repo: { name, branch, head, dirty, identity }, commits, more, agents }
-   * commits: [{ id, parents, subject, author, at, refs, agentId, kind }], newest first in topological order, at most
-   * `limit`; `agentId` and `kind` follow the commit's Workbench trailers (only work and merge commits carry them).
+   * commits: [{ id, parents, subject, author, at, refs, agentId, kind }], newest first in topological order (as
+   * `git log --topo-order` from main and every workbench/* branch), at most `limit`. `at`: ms, in whole seconds. `refs`:
+   * the branches at that commit, main first. `agentId` and `kind` come from each commit's own Workbench trailers.
    * agents: every root with a branch: [{ id, name, state, earlier, harness, branch, from, base, since, files, work }].
-   * `views` (optional: AgentViews, a Map of them, or a lookup by id) supplies the state, name and work the person
-   * sees; without them the simulator's own record of each agent is used.
+   * `views` (optional: AgentViews, a Map of them, or a function from id to view) gives the name, state, files and work
+   * the page shows; without them the simulator's own record of each agent is used. Read-only.
    */
   gitGraph({ views = null, limit = 200 } = {}) {
     const g = this._gitWorld();
@@ -2261,20 +2395,24 @@ export class Simulator {
       if (!refsAt.has(id)) refsAt.set(id, []);
       refsAt.get(id).push(name);
     }
-    const order = topoOrder(g.commits, [...new Set(g.refs.values())]);
-    const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 200;
+    const byName = (x, y) => (x === g.branch ? -1 : y === g.branch ? 1 : x < y ? -1 : x > y ? 1 : 0);
+    for (const names of refsAt.values()) names.sort(byName);
+    const tips = [g.head, ...[...g.refs].filter(([name]) => name.startsWith('workbench/')).map(([, id]) => id)];
+    const order = topoOrder(g.commits, [...new Set(tips)]);
+    const max = Math.max(1, Math.min(5000, Math.floor(Number(limit)) || 200));
     const commits = order.slice(0, max).map(c => ({
       id: c.id, parents: [...c.parents], subject: c.subject, author: c.author, at: c.at,
       refs: [...(refsAt.get(c.id) || [])], agentId: c.agentId, kind: c.kind,
     }));
     const agents = [];
     for (const a of this._agents.values()) {
-      if (a.kind === 'helper' || !a.git || !a.git.folder || a.git.thrownAway) continue;
+      if (a.kind === 'helper' || !a.git || a.git.thrownAway) continue;
       const v = viewOf(a.id) || null;
       agents.push({
         id: a.id, name: (v && v.name) || a.name, state: (v && v.state) || this._shownState(a), earlier: !!(v && v.earlier),
         harness: (v && v.harness) || a.harness, branch: a.git.branch, from: a.git.from, base: a.git.base, since: a.git.since,
-        files: this._filesOf(a), work: v && v.work ? copyOf(v.work) : this._workOf(a),
+        files: v && v.files !== undefined ? copyOf(v.files) : this._filesOf(a),
+        work: v && v.work ? copyOf(v.work) : this._workOf(a),
       });
     }
     return {
@@ -2285,91 +2423,103 @@ export class Simulator {
   }
 
   /**
-   * An agent's work as a diff, in workspace.mjs's workDiff shape: { ok: true, workId, since, head, files, left, omitted }.
-   * files: [{ path, status: 'added'|'modified', adds, dels, binary?, large?, patch }], the files its `files` lists (left
-   * out: those a .gitignore hides), each `patch` a unified diff of exactly that many added and removed lines.
-   * A helper's id gives its agent's work. Refusals: { ok: false, reply }.
+   * An agent's work as a diff, in workspace.mjs's workDiff shape: { workId, since, head, files, left, omitted }.
+   * files: [{ path, status: 'added'|'modified', adds, dels, binary?, large?, patch }]: the files its `files` lists, but
+   * for those a .gitignore hides (in `left`). Each patch is a unified diff with exactly that many added and removed
+   * lines, and the same every time for the same work. A helper's id gives its agent's work. Refusals: { ok: false, reply }.
    */
   changes(agentId, { maxFiles = 300 } = {}) {
     const t = this._gitTarget(agentId, 'show');
     if (t.refusal) return { ok: false, reply: t.refusal };
     const a = t.agent;
     if (a.git.thrownAway) return { ok: false, reply: `${a.name}’s work was thrown away, so there is nothing to show.` };
+    if (!a.git.folder) return { ok: false, reply: 'Its folder is gone, so there is nothing to show.' };
     const snap = this._snapshotWork(a);
-    const max = Number.isFinite(maxFiles) && maxFiles >= 0 ? Math.floor(maxFiles) : 300;
-    const files = snap.files.slice(0, max).map(f => {
-      const status = a.created.has(f.path) && !f.dels ? 'added' : 'modified';
-      const out = { path: f.path, status, adds: f.adds, dels: f.dels };
-      if (f.binary) out.binary = true;
-      if (f.large) out.large = true;
-      out.patch = f.binary || f.large ? null
-        : syntheticPatch({ path: f.path, status, adds: f.adds, dels: f.dels, key: `${this.seed}:${a.id}:${a.git.since}` });
-      return out;
-    });
-    return { ok: true, workId: snap.workId, since: snap.since, head: snap.head, files, left: snap.left, omitted: Math.max(0, snap.files.length - max) };
+    const max = Math.max(0, Math.floor(Number(maxFiles)) || 0);
+    const files = snap.files.slice(0, max).map(f => ({
+      ...f,
+      patch: f.binary || f.large ? null
+        : syntheticPatch({ path: f.path, status: f.status, adds: f.adds, dels: f.dels, key: `${this.seed}:${a.id}:${a.git.since}` }),
+    }));
+    return { workId: snap.workId, since: snap.since, head: snap.head, files, left: snap.left, omitted: snap.files.length - files.length };
   }
 
-  /** Why it cannot be merged now, in the engine's words, or null. */
-  _mergeRefusal(a, shown, state) {
-    if (ACTIVE.has(shown)) return `${a.name} is still working. Merge it when it is done.`;
-    if (!a.git.folder || a.git.thrownAway) return 'Its folder is gone, so there is nothing to merge.';
-    if (state && state !== shown) return 'That changed. Have another look.';
-    if (!this._snapshotWork(a).changed) return `${a.name}’s work is already in ${this._gitWorld().branch}.`;
+  /** Why it cannot be merged now, in the engine's words ({ why?, reply }), or null. */
+  _mergeRefusal(a, shown, state, into) {
+    if (ACTIVE.has(shown)) return { reply: `${a.name} is still working. Merge it when it is done.` };
+    if (a.git.thrownAway) return { why: 'gone', reply: `${a.name}’s work was thrown away, so there is nothing to merge.` };
+    if (!a.git.folder) return { why: 'gone', reply: 'Its folder is gone, so there is nothing to merge.' };
+    if (state && state !== shown) return { reply: 'That changed. Have another look.' };
+    if (!this._snapshotWork(a).changed) return { why: 'nothing', reply: `${a.name}’s work is already in ${into}.` };
     return null;
   }
 
-  /** The merge card's detail: the counts first, then whatever applies, in the engine's words. */
-  _mergeDetail(a, snap) {
+  /** The merge card's detail, in the engine's words: the counts first, then whatever applies, then that it is the demo. */
+  _mergeDetail(a, snap, into) {
     const g = this._gitWorld();
     const adds = snap.files.reduce((s, f) => s + f.adds, 0);
     const dels = snap.files.reduce((s, f) => s + f.dels, 0);
-    const parts = [`${plural(snap.files.length, 'file', 'files')}, +${adds} −${dels}. Its work becomes a commit on its branch, joined into ${g.branch} by a merge commit.`];
-    const failed = a.checkResults.filter(r => !r.ok).map(r => r.name);
-    if (a.checks === 'failed' && failed.length) parts.push(`${failed.length === 1 ? 'A check' : 'Checks'} failed: ${joinAnd(failed)}.`);
-    else if (a.checks !== 'passed') parts.push('Nothing checked its work.');
-    for (const r of (a.rules && a.rules.broken) || []) parts.push(`It broke a rule you set: ${String(r.say).replace(/[.!?]+$/, '')}.`);
+    const parts = [`${plural(snap.files.length, 'file', 'files')}, +${adds} −${dels}. Its work becomes a commit on its branch, joined into ${into} by a merge commit.`];
+    if (a.checks === 'failed') {
+      const failed = a.checkResults.filter(r => !r.ok).map(r => String(r.name));
+      parts.push(failed.length > 1 ? `${failed.length} checks failed: ${joinAnd(failed)}.` : `A check failed: ${failed[0] || 'one of its checks'}.`);
+    } else if (a.checks !== 'passed') {
+      parts.push('Nothing checked its work.');
+    }
+    const broken = ((a.rules && a.rules.broken) || []).map(r => String(r.say || '').trim().replace(/[.!?]+$/, '')).filter(Boolean);
+    if (broken.length === 1) parts.push(`It broke a rule you set: ${broken[0]}.`);
+    else if (broken.length > 1) parts.push(`It broke ${broken.length} rules you set: ${joinAnd(broken)}.`);
     const paths = snap.files.map(f => f.path);
     if (paths.includes('workbench.json')) parts.push('It changes workbench.json, which sets the checks for later agents.');
-    const loaded = paths.filter(p => /(^|\/)\.claude\//.test(p) || /(^|\/)\.mcp\.json$/.test(p));
-    if (loaded.length) parts.push(`It changes ${joinAnd(loaded)}, which later agents load.`);
-    if (snap.left.length) parts.push(`${plural(snap.left.length, 'file stays', 'files stay')} out: hidden by a .gitignore.`);
-    if (g.dirty > 0) parts.push(g.dirty === 1 ? 'Your 1 uncommitted change stays as it is.' : `Your ${g.dirty} uncommitted changes stay as they are.`);
+    if (paths.some(p => /(^|\/)\.claude(\/|$)/i.test(p))) parts.push('It changes .claude/, which holds Claude Code’s settings for this repository.');
+    if (paths.some(p => /(^|\/)\.mcp\.json$/i.test(p))) parts.push('It changes .mcp.json, which can give Claude Code new tools here.');
+    const ignored = snap.left.filter(l => l.why === 'ignored').length;
+    if (ignored) parts.push(`${ignored} file${ignored === 1 ? ' stays' : 's stay'} out: hidden by a .gitignore.`);
+    if (g.dirty > 0) parts.push(`Your ${g.dirty} uncommitted change${g.dirty === 1 ? ' stays as it is' : 's stay as they are'}.`);
+    parts.push(SIM_CARD_MERGE);
     return parts.join(' ');
   }
 
   /**
    * The merge card for an agent, or why not. Never merges. `state`: the state the page drew its button for.
-   * -> { ok: true, agentId, reply, confirm: { kind: 'merge', sentence, detail, yes, no, danger }, expect: { workId, into, intoHead } }
-   *    (the engine gives the card its id and keeps `expect` for merge()) | { ok: false, reply }
+   * -> { ok: true, agentId, kind: 'merge', into, sentence, detail, yes, no, danger, reply, files, adds, dels,
+   *      expect: { workId, into, intoHead } }   (the engine gives the card its id, and may pass `expect` to merge())
+   *  | { ok: false, why?, reply }
    */
   proposeMerge(agentId, { state = null, view = null } = {}) {
     const t = this._gitTarget(agentId, 'merge');
     if (t.refusal) return { ok: false, reply: t.refusal };
     const a = t.agent;
-    const why = this._mergeRefusal(a, (view && view.state) || this._shownState(a), state);
-    if (why) return { ok: false, reply: why };
     const g = this._gitWorld();
+    const into = g.branch;
+    const no = this._mergeRefusal(a, (view && view.state) || this._shownState(a), state, into);
+    if (no) return { ok: false, ...no };
     const snap = this._snapshotWork(a);
-    const sentence = `Merge ${a.name} into ${g.branch}?`;
+    const sentence = `Merge ${a.name} into ${into}?`;
     return {
-      ok: true, agentId: a.id, reply: sentence,
-      confirm: { kind: 'merge', sentence, detail: this._mergeDetail(a, snap), yes: 'Merge', no: 'Cancel', danger: false },
-      expect: { workId: snap.workId, into: g.branch, intoHead: g.head },
+      ok: true, agentId: a.id, kind: 'merge', into, sentence, detail: this._mergeDetail(a, snap, into),
+      yes: 'Merge', no: 'Cancel', danger: false, reply: sentence,
+      files: snap.files.length, adds: snap.files.reduce((s, f) => s + f.adds, 0), dels: snap.files.reduce((s, f) => s + f.dels, 0),
+      expect: { workId: snap.workId, into, intoHead: g.head },
     };
   }
 
-  /** A merge that did not happen: a problem the lid keeps showing, for the reasons the engine keeps one. */
+  /** A merge that did not happen, for a reason the engine keeps on the agent (work.problem) until it clears. */
   _mergeProblem(a, why, sentence, paths = []) {
     a.git.problem = { why, sentence, paths: [...paths], at: this._ts ?? this._now() };
-    return { ok: false, why, sentence, paths: [...paths], reply: sentence, events: [this._emitWork(a)] };
+    this._emitWork(a);
+    return { ok: false, why, sentence, paths: [...paths], into: this._gitWorld().branch, reply: `${sentence} ${SIM_SAYS_MERGED}` };
   }
 
   /**
-   * Merge an agent's work, as mergeWork does: its work becomes a commit W on its branch, and a merge commit M joins W
-   * into main. Always works, except for Help pages, whose work clashes with yours until it brings in main.
-   * `expect` (from proposeMerge) binds it to what the card showed. The outcome goes out as the same events the engine
-   * sends for a real merge (`agent.work`, and `agent.files` emptied), and comes back in `events` too.
-   * -> { ok: true, into, merge, work, files, adds, dels, reply, events } | { ok: false, why?, sentence?, paths?, reply, events? }
+   * Merge an agent's work, as mergeWork does: its work becomes a commit W on its branch, and a merge commit M (main
+   * first, W second) joins W into main, even when main has not moved. Always works, except for Help pages, whose work
+   * clashes with yours until it brings in main. `expect` (from proposeMerge) binds it to what the card showed.
+   * The outcome goes out as the same events the engine sends for a real merge: `agent.work` (merged, or the problem)
+   * and, after a merge, `agent.files` emptied. From then on its unmerged work starts at W.
+   * -> { ok: true, into, merge, work, files, adds, dels, reply }
+   *  | { ok: false, why, sentence, paths?, into, reply }   why: 'gone'|'moved'|'changed'|'nothing'|'ancestry'|'conflict'
+   *  | { ok: false, reply }                                 not a git reason: not in the demo, a helper, still working
    */
   merge(agentId, { expect = null, view = null } = {}) {
     this._sync();
@@ -2379,42 +2529,40 @@ export class Simulator {
     const w = a.git;
     const g = this._gitWorld();
     const into = g.branch;
-    const shown = (view && view.state) || this._shownState(a);
-    if (ACTIVE.has(shown)) return { ok: false, reply: `${a.name} is still working. Merge it when it is done.` };
-    if (!w.folder || w.thrownAway) {
-      const sentence = 'Its folder is gone, so there is nothing to merge.';
-      return { ok: false, why: 'gone', sentence, reply: sentence };
-    }
+    if (ACTIVE.has((view && view.state) || this._shownState(a))) return { ok: false, reply: `${a.name} is still working. Merge it when it is done.` };
+    const fail = (why, sentence) => ({ ok: false, why, sentence, into, reply: `${sentence} ${SIM_SAYS_MERGED}` });
+    if (w.thrownAway) return fail('gone', `${a.name}’s work was thrown away, so there is nothing to merge.`);
+    if (!w.folder) return fail('gone', 'Its folder is gone, so there is nothing to merge.');
     if (expect && ((expect.into && expect.into !== into) || (expect.intoHead && expect.intoHead !== g.head))) {
       return this._mergeProblem(a, 'moved', `${into} changed since you looked. Have another look.`);
     }
     const snap = this._snapshotWork(a);
-    if (expect && expect.workId && expect.workId !== snap.workId) {
-      const sentence = `${a.name}’s work changed since you looked. Have another look.`;
-      return { ok: false, why: 'changed', sentence, reply: sentence };
-    }
+    if (expect && expect.workId && expect.workId !== snap.workId) return fail('changed', `${a.name}’s work changed since you looked. Have another look.`);
     const nothing = `${a.name}’s work is already in ${into}.`;
-    if (!snap.changed) return { ok: false, why: 'nothing', sentence: nothing, reply: nothing };
+    if (!snap.changed) return fail('nothing', nothing);
     if (!this._isAncestor(w.since, g.head)) {
       return this._mergeProblem(a, 'ancestry', `${a.name} started from a commit that is no longer in ${into}, so merging it would bring in other work.`);
     }
     const at = this._ts ?? this._now();
-    const subject = subjectOf(a.task);
+    const subject = subjectOf(a.task, a.name);
     let work = w.head;
-    if (snap.tree !== g.commits.get(w.head).tree) {   // its folder holds work not yet committed: commit it on its branch
-      work = this._newCommit({ parents: [w.head], tree: snap.tree, subject, author: a.name, at, agentId: a.id, kind: 'work' }).id;
+    if (snap.tree !== this._treeOf(w.head)) {   // its folder holds work not committed yet: it becomes W on its branch
+      work = this._newCommit({
+        parents: [w.head], tree: snap.tree, author: a.name, at,
+        message: workMessage({ subject, body: a.says, agentId: a.id, harness: a.harness }),
+      }).id;
       g.refs.set(w.branch, work);
       w.head = work;
     }
-    if (this._isAncestor(work, g.head)) return { ok: false, why: 'nothing', sentence: nothing, reply: nothing };
-    if (w.behind) {   // W stays on its branch; nothing changes on main
+    if (this._isAncestor(work, g.head)) return fail('nothing', nothing);
+    if (w.behind) {   // W stays on its branch, and nothing changes on main
       const clash = (w.conflict || []).filter(p => snap.files.some(f => f.path === p));
-      const out = this._mergeProblem(a, 'conflict', `${a.name}’s work does not merge cleanly into ${into}.`, clash.length ? clash : w.conflict || []);
-      out.reply = `${out.sentence} ${SIM_SAYS_MERGED}`;
-      return out;
+      return this._mergeProblem(a, 'conflict', `${a.name}’s work does not merge cleanly into ${into}.`, clash.length ? clash : w.conflict || []);
     }
-    const m = this._newCommit({ parents: [g.head, work], tree: hex40(`tree|${g.head}|${work}`), subject: `Merge ${a.name}: ${subject}`,
-      author: YOU, at, agentId: a.id, kind: 'merge' });
+    const m = this._newCommit({
+      parents: [g.head, work], tree: hex40(`tree|${this._treeOf(g.head)}|${snap.tree}`), author: YOU, at,
+      message: mergeMessage({ name: a.name, subject, agentId: a.id }),
+    });
     g.head = m.id;
     g.refs.set(into, m.id);
     const files = snap.files.length;
@@ -2423,27 +2571,44 @@ export class Simulator {
     w.since = work;
     w.merged = { into, merge: m.id, at, files, adds, dels };
     w.problem = null;
+    for (const f of snap.files) {   // what is in main now, so that taking a file out later removes all of it
+      if (f.status === 'added') a.lines.set(f.path, f.adds);
+      else if (f.status === 'deleted') a.lines.delete(f.path);
+    }
     a.files.clear();
     a.created.clear();
-    const events = [this._emitWork(a), this._ev(a, EV.FILES, { files: { changed: 0, adds: 0, dels: 0, list: [] } })];
-    return { ok: true, into, merge: m.id, work, files, adds, dels, reply: `Merged ${a.name} into ${into}. ${SIM_SAYS_MERGED}`, events };
+    a.deleted.clear();
+    this._emitWork(a);
+    this._ev(a, EV.FILES, { files: { changed: 0, adds: 0, dels: 0, list: [] } });   // nothing is left unmerged
+    return { ok: true, into, merge: m.id, work, files, adds, dels, reply: `Merged ${a.name} into ${into}. ${SIM_SAYS_MERGED}` };
   }
 
-  /** After a conflict, the agent merged main into its own branch and settled the clash: its next merge goes through. */
+  /**
+   * After a conflict, the agent brought in main and settled the clash on its own branch, as a real agent does: its work
+   * so far as a commit (when none is on its branch yet), then "Merge branch 'main' into <its branch>". Neither carries
+   * Workbench trailers. Its next merge goes through.
+   */
   _bringInMain(a) {
     const g = this._gitWorld();
     const w = a.git;
-    if (!w || w.thrownAway || !w.behind) return;
-    const c = this._newCommit({ parents: [w.head, g.head], tree: this._snapshotWork(a).tree, subject: `Merge branch '${g.branch}' into ${w.branch}`,
-      author: a.name, at: this._ts ?? this._now(), agentId: null, kind: 'commit' });
+    if (!w || w.thrownAway || !w.folder || !w.behind) return;
+    const at = this._ts ?? this._now();
+    const snap = this._snapshotWork(a);
+    let head = w.head;
+    if (head === w.since && snap.changed) {
+      head = this._newCommit({ parents: [head], tree: snap.tree, author: a.name, at, message: `${subjectOf(a.task, a.name)}\n` }).id;
+    }
+    const c = this._newCommit({ parents: [head, g.head], tree: snap.tree, author: a.name, at, message: `Merge branch '${g.branch}' into ${w.branch}\n` });
     g.refs.set(w.branch, c.id);
     w.head = c.id;
     w.behind = false;
+    w.conflict = null;
   }
 
   /**
    * The throw-away card for an agent, or why not. `state`: the state the page drew its button for.
-   * -> { ok: true, agentId, reply, confirm: { kind: 'discard', sentence, detail, yes, no, danger: true }, expect: { workId } } | { ok: false, reply }
+   * -> { ok: true, agentId, kind: 'discard', sentence, detail, yes, no, danger: true, active, reply, expect: { workId } }
+   *  | { ok: false, why?, reply }
    */
   proposeDiscard(agentId, { state = null, view = null } = {}) {
     const t = this._gitTarget(agentId, 'discard');
@@ -2451,25 +2616,28 @@ export class Simulator {
     const a = t.agent;
     const w = a.git;
     if (w.thrownAway) return { ok: false, reply: `${a.name}’s work was already thrown away.` };
-    if (!w.folder) return { ok: false, reply: 'Its folder is gone, so there is nothing to throw away.' };
+    if (!w.folder) return { ok: false, why: 'gone', reply: 'Its folder is gone, so there is nothing to throw away.' };
     const shown = (view && view.state) || this._shownState(a);
     if (state && state !== shown) return { ok: false, reply: 'That changed. Have another look.' };
-    const n = this._filesOf(a).changed;
+    const snap = this._snapshotWork(a);
+    const n = snap.files.length;
+    const active = ACTIVE.has(shown);
     const sentence = `Throw away ${a.name}’s work?`;
-    let detail = `Its folder and its branch ${w.branch} are deleted, with ${n ? plural(n, 'changed file', 'changed files') : 'no changed files'}. Workbench keeps a hidden copy in git.`;
-    if (ACTIVE.has(shown)) detail += ' It is still working: it will be stopped first.';
+    const parts = [`Its folder and its branch ${w.branch} are deleted, with ${n ? plural(n, 'changed file', 'changed files') : 'no changed files'}. Workbench keeps a hidden copy in git.`];
+    if (active) parts.push('It is still working: it will be stopped first.');
+    parts.push(SIM_CARD_DISCARD);
     return {
-      ok: true, agentId: a.id, reply: sentence,
-      confirm: { kind: 'discard', sentence, detail, yes: 'Throw it away', no: 'Keep it', danger: true },
-      expect: { workId: this._snapshotWork(a).workId },
+      ok: true, agentId: a.id, kind: 'discard', sentence, detail: parts.join(' '), yes: 'Throw it away', no: 'Keep it', danger: true,
+      active, reply: sentence, expect: { workId: snap.workId },
     };
   }
 
   /**
    * Throw away an agent's work, as discardWork does: a hidden copy is kept (refs/workbench/discarded/<id>), then its
-   * folder and branch go. An agent still at work is stopped first. The outcome goes out as `agent.work` (thrownAway,
-   * no folder, no branch), and comes back in `events` too.
-   * -> { ok: true, saved, reply, events } | { ok: false, why?, sentence?, reply }
+   * folder and branch go. Nothing may run in its folder meanwhile: an agent at work is stopped first, and a finished
+   * one's idle process is closed quietly (it keeps showing the state it finished in). The outcome goes out as
+   * `agent.work` (thrownAway, no folder, no branch), the event the engine sends for a real throw-away.
+   * -> { ok: true, saved, reply } | { ok: false, why?, sentence?, reply }   why: 'gone'|'changed'
    */
   discard(agentId, { expect = null, view = null } = {}) {
     this._sync();
@@ -2479,27 +2647,31 @@ export class Simulator {
     const w = a.git;
     const g = this._gitWorld();
     if (w.thrownAway) return { ok: false, reply: `${a.name}’s work was already thrown away.` };
-    if (!w.folder) {
-      const sentence = 'Its folder is gone, so there is nothing to throw away.';
-      return { ok: false, why: 'gone', sentence, reply: sentence };
-    }
+    const fail = (why, sentence) => ({ ok: false, why, sentence, reply: sentence });
+    if (!w.folder) return fail('gone', 'Its folder is gone, so there is nothing to throw away.');
     const snap = this._snapshotWork(a);
-    if (expect && expect.workId && expect.workId !== snap.workId) {
-      const sentence = `${a.name}’s work changed since you looked. Have another look.`;
-      return { ok: false, why: 'changed', sentence, reply: sentence };
+    if (expect && expect.workId && expect.workId !== snap.workId) return fail('changed', `${a.name}’s work changed since you looked. Have another look.`);
+    if (a.phase !== 'stopped') {
+      if (ACTIVE.has((view && view.state) || this._shownState(a))) {
+        this._stopTree(a, true);
+      } else {
+        a.closedFrom = this._shownState(a);
+        this._stopTree(a, false);
+      }
     }
-    if (ACTIVE.has((view && view.state) || this._shownState(a)) && a.phase !== 'stopped') this._stopTree(a, true);
     const at = this._ts ?? this._now();
     const saved = `refs/workbench/discarded/${a.id}`;
-    const copy = this._newCommit({ parents: [w.head], tree: snap.tree, subject: `Thrown away: ${subjectOf(a.task)}`, author: YOU, at, agentId: a.id, kind: 'work' });
-    g.hidden.set(saved, copy.id);
+    const copy = snap.tree === this._treeOf(w.head) ? w.head
+      : this._newCommit({ parents: [w.head], tree: snap.tree, author: YOU, at, message: discardMessage({ branch: w.branch, agentId: a.id }) }).id;
+    g.hidden.set(saved, copy);
     g.refs.delete(w.branch);
     w.folder = false;
     w.problem = null;
     w.thrownAway = { at, saved };
     a.files.clear();
     a.created.clear();
-    const events = [this._emitWork(a)];
-    return { ok: true, saved, reply: `Threw away ${a.name}’s work. Its folder and branch are gone. ${SIM_SAYS_THROWN}`, events };
+    a.deleted.clear();
+    this._emitWork(a);
+    return { ok: true, saved, reply: `Threw away ${a.name}’s work. Its folder and branch are gone. ${SIM_SAYS_THROWN}` };
   }
 }
