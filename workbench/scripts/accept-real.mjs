@@ -42,7 +42,11 @@ const positional = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--keep') keep = true;
-  else if (a === '--claude') claudePath = argv[++i] ?? '';
+  else if (a === '--claude') {
+    const v = argv[i + 1];
+    claudePath = v != null && !v.startsWith('--') ? v : ''; // a missing path is a usage error, never the next option
+    if (claudePath) i += 1;
+  }
   else if (a.startsWith('--claude=')) claudePath = a.slice('--claude='.length);
   else positional.push(a);
 }
