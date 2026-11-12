@@ -13,6 +13,8 @@
 //                                  steps: true to make working agents take steps
 //   GET  /ctl/log                  every request the page sent to /api, with its body
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
+//   GET  /ctl/reads                the git screen's reads: every GET of /api/git and /api/agents/:id/changes (D1)
+// The git screen's routes (D1): GET /api/git (any scenario) and GET /api/agents/:id/changes; answer "refuse" refuses them.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,6 +67,7 @@ function view(o, now) {
     budgetUsd: o.parentId ? null : (o.budgetUsd ?? 2), plan: o.plan || null, files: o.files || null, checks: o.checks || null, rules: o.rules || null,
     ask: o.ask ? { ...o.ask, createdAt: now - (o.ask.ageMin ?? 1) * MIN } : null,
     approvals: o.approvals || { auto: 8, byYou: 0, denied: 0 }, says: o.says || null, error: o.error || null, sessionId: null, workspace: null,
+    work: o.work ? JSON.parse(JSON.stringify(o.work)) : null,
     earlier: !!o.earlier, canContinue: o.earlier ? o.canContinue !== false : null,
     continueReason: o.earlier && o.canContinue === false ? (o.continueReason || 'Its folder is gone, so it cannot continue.') : null,
   };
@@ -241,7 +244,218 @@ export function scenario(name, now = Date.now()) {
     raw.push({ id: 'C', name: 'Docs site', state: 'working' });
     return world(raw, now);
   }
+  if (GIT_SCENARIOS.includes(name)) return gitWorld(name, now);
   return world([], now);   // zero: a fresh start
+}
+
+// ---------------------------------------------------------------- D1: the git screen (GET /api/git, GET /api/agents/:id/changes)
+// Live repositories whose history the git screen draws, in the engine's gitGraph() shape:
+//   git           invoices-api on main: your commits over a few days, an agent's work merged with a merge commit, done
+//                 agents with work not merged yet (one with a commit of its own), one working from HEAD, a stopped one,
+//                 an earlier one whose folder is still there, and one thrown away (it has no branch, so it is not drawn)
+//   git-many      48 commits and 6 agent branches, a very long branch name, a subject with a right-to-left override
+//   git-empty     a repository with only its first commit, and no agents
+//   git-detached  your folder is not on a branch
+// Every other scenario gets a history made from its own agents, so the DRAM opens a git screen on any board.
+// "Invoice export", in any scenario, answers /changes with the stress diff: CRLF, tabs, a 400-character line, a binary,
+// a large and a deleted file, files left out, a link, a right-to-left override and zero-width characters, a long path.
+const GIT_SCENARIOS = ['git', 'git-many', 'git-empty', 'git-detached'];
+SCENARIOS.push(...GIT_SCENARIOS);
+const GIT_READS = [];        // every GET the page made of /api/git and /api/agents/:id/changes (GET /ctl/reads)
+const RLO = String.fromCodePoint(0x202e), ZWSP = String.fromCodePoint(0x200b);
+/** A commit id that looks like one: 40 hex characters, the same for the same seed. */
+function gitId(seed) {
+  let h = 2166136261 ^ [...String(seed)].reduce((s, c) => Math.imul(s ^ c.charCodeAt(0), 16777619) >>> 0, 7);
+  let s = '';
+  while (s.length < 40) { h = Math.imul(h ^ (h >>> 15), 2246822507) >>> 0; h = Math.imul(h ^ (h >>> 13), 3266489909) >>> 0; s += h.toString(16).padStart(8, '0'); }
+  return s.slice(0, 40);
+}
+const slugOf = name => String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'agent';
+const workOf = (a, o = {}) => ({ branch: `workbench/${slugOf(a.name)}-${a.id}`, from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...o });
+const filesOf = list => ({ changed: list.length, adds: list.reduce((s, x) => s + x.adds, 0), dels: list.reduce((s, x) => s + x.dels, 0), list });
+const YOUR_SUBJECTS = ['Tidy the order emails', 'Fix the checkout total on small screens', 'Add the export page', 'Speed up the invoice query', 'Tidy the tests',
+  'Start the refunds page', 'Explain the tax rules in the README', 'Move the price helpers into one file', 'Log failed payments with their order id',
+  'Show the customer name on invoices', 'Use the new date picker', 'Keep the cart when the session ends', 'Add a health check', 'Set up linting',
+  'Write the first invoice tests', 'Add the invoices service', 'Initial commit'];
+
+/**
+ * A history in gitGraph()'s shape. `trunk` is your branch's commits, newest first (their subjects). `branches` are the
+ * agents' lines of work: { agent, from: index of the trunk commit it started at, own: [subjects of its own commits],
+ * merged: index of the trunk commit that merged it (its work commit W comes just below), atHead: its branch is HEAD }.
+ */
+function gitHistory({ seed, trunk, branches, branch = 'main', now, author = 'Sam Lee', stepMin = 170 }) {
+  const ids = trunk.map((_, i) => gitId(`${seed}:t${i}`));
+  const at = i => now - (i * stepMin + 3) * MIN;
+  const rows = trunk.map((subject, i) => ({ id: ids[i], parents: i < trunk.length - 1 ? [ids[i + 1]] : [], subject, author, at: at(i), refs: [], agentId: null, kind: 'commit' }));
+  const above = new Map(), below = new Map();   // trunk index -> commits listed just above or just below it
+  const put = (m, i, list) => { if (!m.has(i)) m.set(i, []); m.get(i).push(...list); };
+  for (const b of branches) {
+    const a = b.agent, ref = a.work && a.work.branch;
+    if (b.merged != null) {
+      // the merge commit M is trunk commit `merged`; the work commit W it joined (from trunk commit `from`) comes after it
+      const m = rows[b.merged];
+      const W = { id: gitId(`${seed}:w:${a.id}`), parents: [ids[b.from]], subject: b.subject || 'Its work', author, at: at(b.merged) + MIN, refs: ref ? [ref] : [], agentId: a.id, kind: 'work' };
+      Object.assign(m, { parents: [m.parents[0], W.id].filter(Boolean), subject: `Merge ${a.name}: ${W.subject}`, agentId: a.id, kind: 'merge' });
+      put(below, b.merged, [W]);
+      continue;
+    }
+    const own = b.own || [];
+    if (!own.length) { if (ref) rows[b.from].refs.push(ref); continue; }
+    // its own commits, on top of the trunk commit it started from, newest first, just above that commit
+    let parent = ids[b.from];
+    const chain = own.map((subject, k) => {
+      const c = { id: gitId(`${seed}:o:${a.id}:${k}`), parents: [parent], subject, author: a.name, at: at(b.from) + (k + 1) * 7 * MIN, refs: [], agentId: null, kind: 'commit' };
+      parent = c.id;
+      return c;
+    }).reverse();
+    if (ref) chain[0].refs.push(ref);
+    put(above, b.from, chain);
+  }
+  if (branch) rows[0].refs.unshift(branch);
+  const out = [];
+  rows.forEach((r, i) => { out.push(...(above.get(i) || []), r, ...(below.get(i) || [])); });
+  return out;
+}
+
+function gitWorld(name, now) {
+  const raw = [];
+  let repo = { name: 'invoices-api', root: '/Users/someone/code/invoices-api', head: '', branch: 'main', dirty: 2, identity: true };
+  let commits = [];
+  const add = o => { raw.push(o); return o; };
+  if (name === 'git-empty') {
+    commits = [{ id: gitId('empty:0'), parents: [], subject: 'Initial commit', author: 'Sam Lee', at: now - 5 * MIN, refs: ['main'], agentId: null, kind: 'commit' }];
+    repo = { ...repo, name: 'new-project', dirty: 0 };
+  } else if (name === 'git' || name === 'git-detached') {
+    const invoice = add({ id: 'g1', name: 'Invoice export', state: 'done_checked', endedMin: 4, says: 'Invoices now go out in small batches, so large accounts can export without timing out.',
+      files: filesOf([{ path: 'src/invoices/batch.ts', adds: 47, dels: 0 }, { path: 'src/invoices/export.ts', adds: 8, dels: 2 }, { path: 'test/invoices/large-account.test.ts', adds: 64, dels: 0 }]),
+      checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 48200 }] } });
+    const help = add({ id: 'g2', name: 'Help pages', harness: 'codex', model: 'gpt-5-codex', state: 'done_claimed', endedMin: 11, says: 'I rewrote the three help pages in plain language.',
+      files: filesOf([{ path: 'docs/help/billing.md', adds: 17, dels: 2 }, { path: 'docs/help/exports.md', adds: 13, dels: 0 }]), checks: { state: 'none', results: [] } });
+    const search = add({ id: 'g3', name: 'Search cleanup', state: 'working', now: 'Removing the old search code', ageMin: 9 });
+    const price = add({ id: 'g4', name: 'Price rounding', state: 'done_checked', endedMin: 50, says: 'Totals now round once, at the end.', files: filesOf([]) });
+    const digest = add({ id: 'g5', name: 'Email digest', state: 'done_checked', earlier: true, ageMin: 27 * 60, sinceMin: 26 * 60, endedMin: 26 * 60,
+      says: 'The weekly digest now groups orders by customer.', files: filesOf([{ path: 'src/email/digest.ts', adds: 30, dels: 4 }]) });
+    const orders = add({ id: 'g7', name: 'Order history', state: 'stopped', endedMin: 35 });
+    add({ id: 'g6', name: 'Dark mode', state: 'stopped', endedMin: 90, work: { branch: null, from: 'main', folder: false, merged: null, problem: null, thrownAway: { at: now - 80 * MIN, saved: 'refs/workbench/discarded/g6' } } });
+    for (const a of [invoice, help, search, price, digest, orders]) a.work = workOf(a);
+    const trunk = YOUR_SUBJECTS.slice(0, 17);
+    commits = gitHistory({ seed: name, now, trunk, branches: [
+      { agent: price, from: 4, merged: 1, subject: 'Round totals once, at the end' },
+      { agent: invoice, from: 3, own: ['Batch invoices for large accounts'] },
+      { agent: help, from: 2 }, { agent: search, from: 0 }, { agent: orders, from: 5 }, { agent: digest, from: 9 },
+    ] });
+    price.work.merged = { into: 'main', merge: commits.find(c => c.kind === 'merge').id, at: now - 6 * MIN, files: 1, adds: 9, dels: 3 };
+    if (name === 'git-detached') { repo = { ...repo, branch: null, dirty: 0 }; for (const c of commits) c.refs = c.refs.filter(r => r !== 'main'); }
+  } else {
+    // git-many: a long history, six lines of work, a long branch name and a subject that tries to read backwards
+    const names = ['Invoice export', 'Help pages', 'Search cleanup', 'Price rounding', 'Onboarding emails for the new pricing plans and trial periods', 'Release notes'];
+    const states = ['done_checked', 'done_claimed', 'working', 'done_checked', 'done_checked', 'checks_failed'];
+    const agents = names.map((n, i) => add({ id: `m${i + 1}`, name: n, state: states[i], endedMin: states[i] === 'working' ? null : 3 + 7 * i, ageMin: 30 + 9 * i,
+      files: states[i] === 'working' ? null : filesOf([{ path: `src/${slugOf(n).slice(0, 18)}/index.ts`, adds: 10 + 3 * i, dels: i }, { path: `test/${slugOf(n).slice(0, 18)}.test.ts`, adds: 20, dels: 0 }]),
+      checks: states[i] === 'checks_failed' ? { state: 'failed', results: [{ name: 'Unit tests', ok: false, ms: 4100 }] } : null }));
+    for (const a of agents) a.work = workOf(a);
+    agents[4].work.branch = 'workbench/onboarding-emails-for-the-new-pricing-plans-and-trial-periods-m5';
+    agents[3].files = filesOf([]);
+    const trunk = [];
+    for (let i = 0; i < 44; i++) trunk.push(i === 7 ? `Fix the ${RLO}gnp.tropxe file name check` : i === 43 ? 'Initial commit' : `${YOUR_SUBJECTS[i % (YOUR_SUBJECTS.length - 1)]}${i >= 16 ? ` (part ${Math.floor(i / 16) + 1})` : ''}`);
+    commits = gitHistory({ seed: name, now, trunk, stepMin: 95, branches: [
+      { agent: agents[3], from: 6, merged: 2, subject: 'Round totals once, at the end' },
+      { agent: agents[0], from: 4, own: ['Batch invoices', 'Add a test for large accounts'] },
+      { agent: agents[1], from: 1 }, { agent: agents[2], from: 0 }, { agent: agents[4], from: 12, own: ['Draft the trial emails'] }, { agent: agents[5], from: 9 },
+    ] });
+    agents[3].work.merged = { into: 'main', merge: commits.find(c => c.kind === 'merge').id, at: now - 20 * MIN, files: 2, adds: 12, dels: 4 };
+  }
+  repo.head = commits[0].id.slice(0, 7);
+  const st = world(raw, now);
+  st.mode = 'live';
+  st.repo = repo;
+  const n = st.agents.filter(a => !a.parentId && !a.earlier && ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(a.state)).length;
+  st.machines = [{ ...LAPTOP, agents: n, note: n ? `${n} agent${n === 1 ? '' : 's'}` : 'idle' }];
+  st.git = { commits, head: commits[0].id };
+  return st;
+}
+
+/** The git screen's data for any world: the scenario's own history, or one made from its agents. */
+function gitGraphOf(state, now = Date.now()) {
+  const roots = state.agents.filter(a => !a.parentId);
+  let commits = state.git && state.git.commits, head = state.git && state.git.head;
+  const repo = state.repo ? { name: state.repo.name, branch: state.repo.branch, head: state.repo.head, dirty: state.repo.dirty || 0, identity: state.repo.identity !== false }
+    : { name: 'demo-shop', branch: 'main', head: '', dirty: 0, identity: true };
+  // agents as the engine lists them: every root with a branch, this run's and earlier ones (the demo makes branches up)
+  const agentsOf = list => list.filter(a => (a.work ? a.work.branch : state.mode === 'demo')).map((a, i) => {
+    const work = a.work || workOf(a);
+    return { id: a.id, name: a.name, state: a.state, earlier: !!a.earlier, harness: a.harness, branch: work.branch, from: work.from, base: null, since: null, files: a.files, work, i };
+  });
+  if (!commits) {
+    // a history from the world's own agents: work merged near the top, the rest started from a commit of yours
+    const agents = agentsOf(roots).filter(a => a.work && a.work.branch);
+    const trunk = YOUR_SUBJECTS.slice(0, 14);
+    const merged = agents.filter(a => a.work.merged);
+    const branches = agents.map((a, i) => (a.work.merged ? { agent: a, from: Math.min(trunk.length - 2, 3 + i), merged: Math.min(trunk.length - 3, merged.indexOf(a) + 1) }
+      : { agent: a, from: ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(a.state) ? 0 : Math.min(trunk.length - 2, 1 + (i % 6)) }));
+    commits = gitHistory({ seed: state.agents.map(a => a.id).join(','), now, trunk, branches, branch: repo.branch });
+    head = commits[0].id;
+  }
+  const agents = agentsOf(roots).filter(a => a.branch);
+  const byId = new Map(commits.map(c => [c.id, c]));
+  const trunk = new Set();
+  for (let c = byId.get(head); c && !trunk.has(c.id); c = byId.get(c.parents[0])) trunk.add(c.id);
+  for (const a of agents) {
+    // base: the commit of yours its lane leaves from; since: where its unmerged work starts (its work commit, once merged)
+    const tip = commits.find(c => c.refs.includes(a.branch));
+    let base = tip;
+    while (base && !trunk.has(base.id)) base = byId.get(base.parents[0]);
+    a.base = base ? base.id : head;
+    a.since = a.work.merged && tip ? tip.id : a.base;
+    delete a.i;
+  }
+  return { ok: true, repo: { ...repo, head: repo.head || head.slice(0, 7) }, commits, more: false, agents };
+}
+
+/** A unified diff of one file, made up from its counts: a hunk of believable lines. */
+function filePatch(f, i) {
+  const ctx = ['', 'export function total(items) {', '  return items.reduce((sum, item) => sum + item.price, 0);', '}'];
+  const adds = Math.min(f.adds, 40), dels = Math.min(f.dels, 20);
+  const lines = [];
+  for (let k = 0; k < 2; k++) lines.push(' ' + ctx[(k + i) % ctx.length]);
+  for (let k = 0; k < dels; k++) lines.push(`-  const old${k} = load(${k});`);
+  for (let k = 0; k < adds; k++) lines.push(`+  const batch${k} = await sendBatch(invoices.slice(${k * 50}, ${(k + 1) * 50}));`);
+  lines.push(' ' + ctx[3]);
+  const head = f.status === 'added' ? 'new file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null' : f.status === 'deleted' ? 'deleted file mode 100644\nindex 4f3e2d1..0000000\n--- a/' + f.path : 'index 1a2b3c4..5d6e7f8 100644\n--- a/' + f.path;
+  return `diff --git a/${f.path} b/${f.path}\n${head}\n+++ ${f.status === 'deleted' ? '/dev/null' : 'b/' + f.path}\n@@ -${10 + i},${dels + 3} +${10 + i},${adds + 3} @@ export function total(items) {\n${lines.join('\n')}\n`;
+}
+
+/** The stress diff, for "Invoice export" in any scenario. */
+function stressFiles() {
+  const crlf = ['@@ -1,6 +1,9 @@ import { db } from "../db";', ' import { db } from "../db";\r', '-const BATCH = 1000;\r', '+const BATCH = 50;\r',
+    '+\tconst total' + ZWSP + ' = 0;\r', '+\t\tif (invoice.lines.length > BATCH) { split(invoice); }\r', '+// ' + 'a very long line that never breaks '.repeat(11).slice(0, 400) + '\r',
+    ' export async function exportAll(account) {\r', '   const invoices = await db.invoices.forAccount(account.id);\r', '+  return sendBatches(invoices, BATCH);\r', ' }\r'].join('\n');
+  const longPath = 'src/' + 'deeply/nested/'.repeat(9) + 'invoice-export-batch-sender-for-large-accounts.ts';
+  return [
+    { path: 'src/invoices/export.ts', status: 'modified', adds: 6, dels: 1, patch: `diff --git a/src/invoices/export.ts b/src/invoices/export.ts\nindex 1a2b3c4..5d6e7f8 100644\n--- a/src/invoices/export.ts\n+++ b/src/invoices/export.ts\n${crlf}\n` },
+    { path: 'assets/invoice-logo.png', status: 'added', adds: 0, dels: 0, binary: true, patch: null },
+    { path: 'data/fixtures/large-accounts.json', status: 'added', adds: 48211, dels: 0, large: true, patch: null },
+    { path: 'src/legacy/old-export.ts', status: 'deleted', adds: 0, dels: 5, patch: 'diff --git a/src/legacy/old-export.ts b/src/legacy/old-export.ts\ndeleted file mode 100644\nindex 4f3e2d1..0000000\n--- a/src/legacy/old-export.ts\n+++ /dev/null\n@@ -1,5 +0,0 @@\n-// the old export, one invoice at a time\n-export function exportOld(account) {\n-  for (const invoice of account.invoices) send(invoice);\n-}\n-\n' },
+    { path: `docs/notes/readme${RLO}txt.exe`, status: 'added', adds: 1, dels: 0, patch: `diff --git a/docs/notes/x b/docs/notes/x\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/docs/notes/x\n@@ -0,0 +1 @@\n+This file name reads backwards on purpose.\n` },
+    { path: 'config/keys', status: 'added', adds: 1, dels: 0, patch: 'diff --git a/config/keys b/config/keys\nnew file mode 120000\nindex 0000000..2222222\n--- /dev/null\n+++ b/config/keys\n@@ -0,0 +1 @@\n+../../../.ssh/config\n\\ No newline at end of file\n' },
+    { path: longPath, status: 'added', adds: 3, dels: 0, patch: `diff --git a/${longPath} b/${longPath}\nnew file mode 100644\nindex 0000000..3333333\n--- /dev/null\n+++ b/${longPath}\n@@ -0,0 +1,3 @@\n+export const BATCH = 50;\n+export const PAUSE_MS = 200;\n+export const RETRIES = 3;\n` },
+  ];
+}
+
+/** GET /api/agents/:id/changes, as engine.changes() answers it. */
+function changesOf(state, agentId) {
+  const a = state.agents.find(x => x.id === agentId);
+  if (!a) return { ok: false, reply: 'There is no such agent.' };
+  const root = a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a;
+  const work = root.work || (state.mode === 'demo' ? workOf(root) : null);
+  if (!work || !work.branch || work.folder === false) return { ok: false, reply: `${root.name}’s folder is gone, so there is nothing to show.` };
+  let files = ((root.files && root.files.list) || []).map((f, i) => ({ path: f.path, status: f.adds && !f.dels && /test|docs|new/.test(f.path) ? 'added' : 'modified', adds: f.adds, dels: f.dels }));
+  files = files.map((f, i) => ({ ...f, patch: filePatch(f, i), cut: f.adds > 40 ? true : undefined }));
+  let left = [];
+  if (root.name === 'Invoice export') { files = [...stressFiles(), ...files]; left = [{ path: '.env.local', why: 'ignored' }, { path: 'vendor/payments-sdk', why: 'nested-repo' }]; }
+  const active = ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(root.state);
+  return { ok: true, agentId: root.id, name: root.name, branch: work.branch, into: state.repo ? state.repo.branch : 'main', live: active,
+    diff: { workId: `${gitId(root.id + ':head')}:${gitId(root.id + ':tree')}`, since: gitId(root.id + ':since'), head: gitId(root.id + ':head'), files, left, omitted: 0 } };
 }
 
 const LAPTOP = { id: 'laptop', name: 'Your laptop', kind: 'laptop', awake: true, simulated: false, cpuPct: 31, memPct: 62, costPerHourUsd: null, agents: 0, note: '' };
@@ -306,6 +520,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (p === '/ctl/state') { res.end(JSON.stringify(state)); return; }
       if (p === '/ctl/drop') { for (const c of clients) c.destroy(); clients.clear(); res.end('{"ok":true}'); return; }
       if (p === '/ctl/log') { res.end(JSON.stringify(posted)); return; }
+      if (p === '/ctl/reads') { res.end(JSON.stringify(GIT_READS)); return; }   // D1: the git screen's GETs
       if (p === '/ctl/clear') { posted.length = 0; res.end('{"ok":true}'); return; }
       res.statusCode = 404; res.end('{}'); return;
     }
@@ -331,6 +546,13 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (mode.answer === '500') { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"error":"Something went wrong."}'); return; }
       res.setHeader('content-type', 'application/json');
       const reply = r => res.end(JSON.stringify(r));
+      // D1: the git screen's two reads. Refusals are 200 { ok: false, reply }, as the engine's are.
+      const gm = req.method === 'GET' && (p === '/api/git' ? [p] : /^\/api\/agents\/([^/]+)\/changes$/.exec(p));
+      if (gm) {
+        GIT_READS.push({ at: Date.now(), path: p });
+        if (mode.answer === 'refuse') return reply({ ok: false, reply: p === '/api/git' ? 'Workbench could not read the history of your repository.' : 'Workbench could not read that agent’s changes.' });
+        return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1])));
+      }
       const m = /^\/api\/agents\/([^/]+)\/(answer|say|stop)$/.exec(p);
       if (m) {
         const a = state.agents.find(x => x.id === decodeURIComponent(m[1]));
