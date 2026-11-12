@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Engine } from '../src/core/engine.mjs';
 import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
 import * as commands from '../src/core/commands.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
-import { FakeSim, FakeMachines, fakeAdapter, fakeDeps, gate, until } from './helpers/engine-fakes.mjs';
+import { FakeSim, FakeMachines, fakeAdapter, fakeDeps, gate, until, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
 
 const REPO = { root: '/repos/shop', name: 'shop', head: 'abc1234', branch: 'main', dirty: 2 };
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${id}` };
@@ -18,7 +20,7 @@ function live({ deps: depOpts = {}, options = {}, adapters = null } = {}) {
   const store = new Store();
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
-  const { deps, calls } = fakeDeps(depOpts);
+  const { deps, calls, git } = fakeDeps(depOpts);
   const machines = new FakeMachines();
   const notices = [];
   store.on('notice', n => notices.push(n.text));
@@ -27,7 +29,25 @@ function live({ deps: depOpts = {}, options = {}, adapters = null } = {}) {
     adapters: adapters || { claude, codex }, machines, deps,
     options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
-  return { store, engine, claude, codex, deps, calls, machines, notices };
+  return { store, engine, claude, codex, deps, calls, git, machines, notices };
+}
+
+/** A live engine whose agents' folders are real (a directory holding a .git file), so the engine finds them on disk. */
+function liveFolders(ctx, opts = {}) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-engine-')));
+  ctx.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const t = live({ ...opts, deps: { ...(opts.deps || {}), folders: dir } });
+  t.dir = dir;
+  return t;
+}
+
+/** Start an agent and run its turn to "says it is done" (or the done state its checks give). */
+async function doneAgent(t, opts = { task: 'Fix the cart total' }, finalText = 'I fixed the cart total.') {
+  const a = await started(t, opts);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText, backgroundTasks: 0, isError: false });
+  await until(() => !['working', 'starting'].includes(t.store.get(a.id).state));
+  return a;
 }
 
 function demo({ options = {}, intent = null } = {}) {
@@ -2303,3 +2323,171 @@ test('live mode without a repo explains itself', async () => {
   await assert.rejects(engine.start(), /needs a git repository/);
   await engine.shutdown();
 });
+
+// ------------------------------------------------------------------ source control: merge
+
+const GONE_REPLY = 'That request is no longer waiting. Ask again if you still want it.';
+
+test('merge: the card asks first, counts first, and binds itself to the work it showed', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  t.git.work.files = [
+    { path: 'src/cart.js', status: 'modified', adds: 30, dels: 2 },
+    { path: 'src/total.js', status: 'added', adds: 8, dels: 0 },
+    { path: 'README.md', status: 'modified', adds: 2, dels: 0 },
+  ];
+  const before = t.notices.length;
+  const out = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
+  assert.equal(out.reply, 'Merge Fix cart total into main?');
+  assert.match(out.confirm.id, /^[0-9a-f]{12}$/);
+  assert.deepEqual({ ...out.confirm, id: null }, {
+    id: null, kind: 'merge', sentence: 'Merge Fix cart total into main?', yes: 'Merge', no: 'Cancel', danger: false,
+    detail: '3 files, +40 −2. Its work becomes a commit on its branch, joined into main by a merge commit. Nothing checked its work. Your 2 uncommitted changes stay as they are.',
+  });
+  assert.equal(t.notices.length, before, 'a card is not announced');
+  // It read the work as it is now, from where its unmerged work starts.
+  assert.deepEqual(t.calls.snapshotWork.at(-1), { repoRoot: REPO.root, path: a.v.workspace, since: 'abc1234' });
+  const stored = t.engine.confirms.get(out.confirm.id);
+  assert.equal(stored.agentId, a.id);
+  assert.deepEqual(stored.expect, { workId: 'abc1234:tree0', into: 'main', intoHead: 'abc1234' });
+  assert.equal(t.calls.mergeWork.length, 0, 'nothing is merged before the yes');
+  await t.engine.shutdown();
+});
+
+test('merge: the card names failed checks, broken rules, files that set later agents, files left out and the person’s own changes', async (ctx) => {
+  const t = liveFolders(ctx, { deps: { checks: [{ name: 'unit tests', run: 'npm test' }], checkState: 'failed', rules: [{ say: 'Do not touch migrations/', paths: ['migrations/**'] }] } });
+  // Rules are checked again against the files it would merge now, not only the last receipt's.
+  t.deps.receipt.checkRules = (rs, paths) => ({ kept: [], broken: paths.some(p => p.startsWith('migrations/')) ? rs.map(r => ({ say: r.say, paths: [] })) : [] });
+  const a = await doneAgent(t);
+  assert.equal(t.store.get(a.id).state, 'checks_failed');
+  t.git.dirty = 1;
+  t.git.work.files = [
+    { path: 'migrations/001.sql', status: 'added', adds: 4, dels: 0 },
+    { path: 'workbench.json', status: 'modified', adds: 1, dels: 1 },
+    { path: 'app/.claude/settings.json', status: 'added', adds: 3, dels: 0 },
+    { path: '.mcp.json', status: 'added', adds: 5, dels: 0 },
+  ];
+  t.git.work.left = [{ path: '.env', why: 'ignored' }, { path: 'dist/app.js', why: 'ignored' }, { path: 'vendor/lib', why: 'nested-repo' }];
+  const out = await t.engine.proposeMerge(a.id, { state: 'checks_failed' });
+  assert.equal(out.confirm.detail, [
+    '4 files, +13 −1. Its work becomes a commit on its branch, joined into main by a merge commit.',
+    'A check failed: unit tests.',
+    'It broke a rule you set: Do not touch migrations/.',
+    'It changes workbench.json, which sets the checks for later agents.',
+    'It changes .claude/, which holds Claude Code’s settings for this repository.',
+    'It changes .mcp.json, which can give Claude Code new tools here.',
+    '2 files stay out: hidden by a .gitignore.',
+    '1 folder stays out: it is a git repository of its own.',
+    'Your 1 uncommitted change stays as it is.',
+  ].join(' '));
+  await t.engine.shutdown();
+
+  // Checks that passed say nothing, nor does a workbench.json in a subfolder (only the one at the top sets checks).
+  const t2 = liveFolders(ctx, { deps: { checks: [{ name: 'unit tests', run: 'npm test' }] } });
+  const b = await doneAgent(t2);
+  assert.equal(t2.store.get(b.id).state, 'done_checked');
+  t2.git.dirty = 0;
+  t2.git.work.files = [{ path: 'docs/workbench.json', status: 'added', adds: 2, dels: 0 }, { path: 'a.claude.txt', status: 'added', adds: 1, dels: 0 }];
+  const out2 = await t2.engine.proposeMerge(b.id);
+  assert.equal(out2.confirm.detail, '2 files, +3 −0. Its work becomes a commit on its branch, joined into main by a merge commit.');
+  await t2.engine.shutdown();
+});
+
+test('merge: refusals come in plain words, are announced, and leave nothing behind', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  const refused = async (id, opts, reply) => {
+    const before = t.notices.length;
+    const out = await t.engine.proposeMerge(id, opts);
+    assert.deepEqual(out, { ok: false, reply }, reply);
+    assert.deepEqual(t.notices.slice(before), [reply], 'a refusal from a button is announced');
+  };
+  await refused('nobody', {}, 'I can’t find that agent.');
+  // A helper works in its agent's folder.
+  t.engine.ingest({ kind: EV.CREATED, agentId: `${a.id}-h1`, parentId: a.id, name: 'Find tests', task: 'find', harness: 'claude' });
+  await refused(`${a.id}-h1`, {}, 'Helpers work in their agent’s folder. Merge the agent instead.');
+  // The page drew its button for another state.
+  await refused(a.id, { state: 'done_checked' }, 'That changed. Have another look.');
+  // Nothing new to merge.
+  t.git.work.changed = false;
+  await refused(a.id, {}, 'Fix cart total’s work is already in main.');
+  t.git.work.changed = true;
+  // The person's folder is not on a branch; git does not know who they are.
+  t.git.branch = null;
+  await refused(a.id, {}, 'Your folder is not on a branch, so there is nowhere to merge it.');
+  t.git.branch = 'main';
+  t.git.identity = null;
+  await refused(a.id, {}, 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.');
+  assert.equal(t.engine.snapshot().repo.identity, false, 'the page hears it too');
+  t.git.identity = { name: 'Test Person', email: 'test@example.com' };
+  // An older workspace module that cannot merge gives a plain refusal, never a crash.
+  const mergeWork = t.deps.workspace.mergeWork;
+  delete t.deps.workspace.mergeWork;
+  await refused(a.id, {}, 'Workbench cannot merge work right now.');
+  t.deps.workspace.mergeWork = mergeWork;
+  // Its folder is gone.
+  fs.rmSync(a.v.workspace, { recursive: true, force: true });
+  await refused(a.id, {}, 'Its folder is gone, so there is nothing to merge.');
+  assert.equal(t.store.get(a.id).work.folder, false, 'its view says so');
+  assert.equal(t.calls.mergeWork.length, 0);
+  assert.equal(t.engine.confirms.size, 0, 'no card was kept');
+  await t.engine.shutdown();
+});
+
+test('merge: an agent at work, or whose receipt is being built, is not merged until it is done', async (ctx) => {
+  const checksGate = gate();
+  const t = liveFolders(ctx, { deps: { checks: [{ name: 'unit tests', run: 'npm test' }], checksGate } });
+  const { id, runner } = await started(t);
+  assert.deepEqual(await t.engine.proposeMerge(id), { ok: false, reply: 'Fix login redirect is still working. Merge it when it is done.' });
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Done.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(id).checks?.state === 'running');
+  assert.deepEqual(await t.engine.proposeMerge(id), { ok: false, reply: 'Fix login redirect is still working. Merge it when it is done.' });
+  checksGate.open();
+  await until(() => t.store.get(id).state === 'done_checked');
+  assert.ok((await t.engine.proposeMerge(id)).confirm);
+  await t.engine.shutdown();
+});
+
+test('merge: yes merges once, records it, counts its work from the merged commit and tells the page', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  const repoEvents = [];
+  t.store.on('repo', r => repoEvents.push(r));
+  const out = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
+  const yes = await t.engine.confirm(out.confirm.id, true);
+  assert.deepEqual(yes, { reply: 'Merged Fix cart total into main.', focusId: a.id });
+  assert.equal(t.notices.at(-1), 'Merged Fix cart total into main.');
+  assert.deepEqual(t.calls.mergeWork, [{
+    repoRoot: REPO.root, path: a.v.workspace, branch: `workbench/fix-cart-total-${a.id}`, since: 'abc1234',
+    expect: { workId: 'abc1234:tree0', into: 'main', intoHead: 'abc1234' },
+    message: { subject: 'Fix the cart total', body: 'I fixed the cart total.', name: 'Fix cart total' },
+    agentId: a.id, harness: 'claude',
+  }]);
+  const v = t.store.get(a.id);
+  assert.ok(Number.isFinite(v.work.merged.at));
+  assert.deepEqual(v.work, {
+    branch: `workbench/fix-cart-total-${a.id}`, from: 'main', folder: true,
+    merged: { into: 'main', merge: FAKE_MERGE, at: v.work.merged.at, files: 1, adds: 3, dels: 1 }, problem: null, thrownAway: null,
+  });
+  assert.deepEqual(v.files, { changed: 0, adds: 0, dels: 0, list: [] }, 'nothing is left unmerged');
+  assert.equal(v.state, 'done_claimed', 'it stays as it was');
+  assert.equal(t.engine.runs.get(a.id).workspace.since, FAKE_WORK, 'its unmerged work now starts at the merged work commit');
+  assert.deepEqual(repoEvents, [{ name: 'shop', head: FAKE_MERGE, branch: 'main', dirty: 2, identity: true }]);
+  assert.equal(t.engine.snapshot().repo.head, FAKE_MERGE);
+  // A second yes to the same card finds nothing.
+  assert.equal((await t.engine.confirm(out.confirm.id, true)).reply, GONE_REPLY);
+  assert.equal(t.calls.mergeWork.length, 1);
+  // It can take a follow-up in the same folder; its next receipt counts from the merged commit, and so does the tidy.
+  const sent = await t.engine.say(a.id, 'Also round the tax');
+  assert.equal(sent.ok, true, sent.reply);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Rounded.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(a.id).state === 'done_claimed');
+  assert.equal(t.calls.diffStats.at(-1).base, FAKE_WORK);
+  assert.equal(t.store.get(a.id).work.merged.merge, FAKE_MERGE, 'the last merge is still known');
+  await t.engine.shutdown();
+  assert.equal(t.calls.removeWorkspace.at(-1).base, FAKE_WORK);
+});
+
+// ------------------------------------------------------------------ end of the source-control tests
