@@ -313,6 +313,23 @@ function names(ws, a) {
 }
 
 /**
+ * The reference says every word of the agent's name, and nothing else: "the invoice export agent", and "the check out
+ * fix" for Checkout fix (two words heard for one). Part of it, "the unused imports" for Remove unused imports, does not.
+ */
+function saysWhole(ws, a) {
+  const key = agentWords(a).nameKey;
+  if (!key || nameWords(ws, a) === 0) return false;
+  const said = new Set();
+  for (let i = 0; i < ws.length; i++) {
+    if (REF_STOP.has(ws[i])) continue;
+    said.add(stem(ws[i].replace(/-/g, '')));
+    for (const part of ws[i].split('-')) if (part) said.add(stem(part)); // "feature-flag" says "feature" and "flag"
+    if (i + 1 < ws.length) said.add(stem(ws[i] + ws[i + 1]));
+  }
+  return key.split(' ').every(k => said.has(k));
+}
+
+/**
  * Resolve one reference ("the flaky test", "it", "search cleanup") to an agent.
  * `full`: every word of the reference matched. `sure`: also unmistakable, because it is "it",
  * an id, the agent's whole name, or at least two matching words ("stop the tests" is not sure).
@@ -451,9 +468,11 @@ function confirmReply(toks, kind, c) {
     if (yesAsked(words)) return 'asks';
     if (named) return 'keep';
     // On a throw-away card a bare "yes" is not enough: only its own words ("throw it away", "discard it") or "do it".
-    // "throw" counts only with its "away" or "out": a "throw" cut short is no answer.
+    // "throw" counts only with its "away" or "out", and "do" only with its "it" or "that": a "throw" or a "do" cut short
+    // ("do", "sure do", "yes do") is no answer.
     if (kind === 'discard') {
-      const explicit = ws.some(w => w === 'do' || (own.includes(w) && w !== 'throw')) || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
+      const explicit = ws.some((w, i) => (w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || (own.includes(w) && w !== 'throw'))
+        || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
       if (!explicit) return 'keep';
     }
     return true;
@@ -710,10 +729,13 @@ function bareName(ws, c) {
  * and nothing else, two or more of them (all of a one-word name), that no other root agent's name also has. Agents
  * that ended, and agents from an earlier run, count: theirs is the work that is merged or thrown away. When several
  * root agents have the words, the one whose whole name they are is named; two with that name give id null, so the
- * engine asks which one. Task words, state words and helpers' names never name a root agent here, and neither do
- * words for work alone: "the changes" and "your changes" are no agent's name, even when an agent is called "Changes"
- * (its id or "it" still name it).
- * @returns {{ id: string|null, form: 'id'|'name' } | null}
+ * engine asks which one. Words that several names share and that are none's whole name ("the config files" beside
+ * Update config files and Split config files per) name no agent: they keep their old meaning. Task words, state words
+ * and helpers' names never name a root agent here, and neither do words for work alone: "the changes" and "your
+ * changes" are no agent's name, even when an agent is called "Changes" (its id or "it" still name it).
+ * `partial`: the words are part of the one agent's name, not all of it ("the unused imports" for Remove unused
+ * imports). They name it, but they are not strong (see tooLoose).
+ * @returns {{ id: string|null, form: 'id'|'name', partial?: true } | null}
  */
 function namedRoot(ws, c) {
   const meaningful = ws.filter(w => !REF_STOP.has(w));
@@ -728,9 +750,12 @@ function namedRoot(ws, c) {
   if (meaningful.every(w => WORK_NOUN.has(w))) return null;
   const having = c.agents.filter(a => isRoot(a) && nameWords(ws, a) > 0);
   if (!having.some(a => names(ws, a))) return null;
-  if (having.length === 1) return { id: having[0].id, form: 'name' };
-  const key = refKey(ws);
-  const whole = having.filter(a => agentWords(a).nameKey === key);
+  if (having.length === 1) {
+    const a = having[0];
+    return saysWhole(ws, a) ? { id: a.id, form: 'name' } : { id: a.id, form: 'name', partial: true };
+  }
+  const whole = having.filter(a => saysWhole(ws, a));
+  if (!whole.length) return null;
   return { id: whole.length === 1 ? whole[0].id : null, form: 'name' };
 }
 
@@ -738,9 +763,10 @@ function namedRoot(ws, c) {
  * Whose work the words mean, for merging, throwing away and showing changes. Strict: the words must name the agent
  * (see namedRoot), or point at the focused one ("it", "this one", "its changes", "the diff").
  * `form`: 'id' and 'name' name it; 'pronoun' ("it") and 'generic' ("its changes") mean the focused agent.
+ * `partial`: a 'name' that is only part of the agent's name (see namedRoot).
  * `noun`: the words said "changes", "work", "diff" or the like. `id` is null when nothing is focused, or when two
  * root agents share the name. Null when the words name no agent, so they keep their old meaning.
- * @returns {{ id: string|null, form: 'id'|'name'|'pronoun'|'generic', noun: boolean } | null}
+ * @returns {{ id: string|null, form: 'id'|'name'|'pronoun'|'generic', partial?: true, noun: boolean } | null}
  */
 function workRef(toks, c) {
   const ws = toks.map(t => t.w);
@@ -784,6 +810,15 @@ function screenBusy(c) {
 
 /** A form that does not name the agent: "it", "its changes", a bare "merge". */
 const weakForm = ref => ref.form === 'pronoun' || ref.form === 'generic' || ref.form === 'bare';
+/** The words name the agent outright, so they win over an answer: its id, or its whole name. */
+const strongRef = ref => !weakForm(ref) && !ref.partial;
+/**
+ * Words too loose to act on now, so they keep their old meaning. A weak form, while anything waits on screen: "it" may
+ * be about that. Part of a name ("the unused imports" for Remove unused imports), while a question, a stuck ask or a
+ * permission waits: the words are the reply to it, never a card that takes its place. A card has no "it" for a name,
+ * so on a card part of a name is another command, as a whole name is (its old meaning would be a launch).
+ */
+const tooLoose = (ref, c) => (weakForm(ref) && screenBusy(c)) || (!!ref.partial && hasAsk(c.asker));
 
 const INTO = new Set(['into', 'onto', 'to', 'in', 'on']);
 /** The person's current branch, said without its name. */
@@ -821,8 +856,9 @@ function takeTarget(toks, c) {
 
 /**
  * "merge search cleanup", "merge it", "land it", "bring its changes in", "merge it into main": always asked first (the
- * engine shows a merge card). The words must name the agent; "merge the two config files" stays work. A name is strong;
- * "it", "its changes" and a bare "merge" are weak, and they keep their old meaning while anything else waits on screen.
+ * engine shows a merge card). The words must name the agent; "merge the two config files" stays work. A whole name or
+ * an id is strong. "it", "its changes" and a bare "merge" are weak, and they keep their old meaning while anything else
+ * waits on screen; so does part of a name while a question, a stuck ask or a permission waits (see tooLoose).
  */
 function matchMerge(core, c) {
   const ws = core.map(t => t.w);
@@ -845,7 +881,15 @@ function matchMerge(core, c) {
       if (t.said) {
         into = t.into;
         particle = true;
-        ref = t.toks.length ? workRef(t.toks, c) : bring ? null : { id: focusRoot(c), form: 'bare', noun: false };
+        let toks = t.toks;
+        ref = toks.length ? workRef(toks, c) : null;
+        // "merge it in to main", "merge it on to main", "bring it over to main": the particle, then where it goes. Only
+        // when the words name nothing with it, so a name that ends in "over" keeps its last word.
+        if (!ref && toks.length && ['in', 'on', 'over'].includes(toks[toks.length - 1].w)) {
+          toks = toks.slice(0, -1);
+          ref = toks.length ? workRef(toks, c) : null;
+        }
+        if (!ref && !toks.length && !bring) ref = { id: focusRoot(c), form: 'bare', noun: false }; // "merge into main"
       }
     }
     if (!ref && ['in', 'over'].includes(rest[rest.length - 1].w)) { // "merge it in", "bring its changes in"
@@ -856,10 +900,10 @@ function matchMerge(core, c) {
   if (!ref) return null;
   // "bring" means a merge only with its work or "it": "bring search cleanup in" is no merge.
   if (bring && (!particle || !(ref.form === 'pronoun' || ref.noun))) return null;
-  if (weakForm(ref) && screenBusy(c)) return null;
+  if (tooLoose(ref, c)) return null;
   const intent = { kind: 'merge', agentId: ref.id };
   if (into) intent.into = into;
-  return { intent, strong: !weakForm(ref) };
+  return { intent, strong: strongRef(ref) };
 }
 
 const DISCARD_VERBS = new Set(['discard', 'scrap', 'trash']);
@@ -867,6 +911,7 @@ const DISCARD_VERBS = new Set(['discard', 'scrap', 'trash']);
 /**
  * "throw away search cleanup's changes", "discard it", "throw it away", "scrap it": always asked first (the engine
  * shows a throw-away card). The words must name the agent, as for a merge; "discard unused imports" is no throw-away.
+ * Strength is as for a merge: while Remove unused imports asks, "discard the unused imports" is the answer.
  */
 function matchDiscard(core, c) {
   const ws = core.map(t => t.w);
@@ -889,8 +934,8 @@ function matchDiscard(core, c) {
   if (launchPhrase(rest.map(t => t.w))) return null;
   const ref = workRef(rest, c);
   if (!ref) return null;
-  if (weakForm(ref) && screenBusy(c)) return null;
-  return { intent: { kind: 'discard', agentId: ref.id }, strong: !weakForm(ref) };
+  if (tooLoose(ref, c)) return null;
+  return { intent: { kind: 'discard', agentId: ref.id }, strong: strongRef(ref) };
 }
 
 /** Questions about what an agent changed. They may find the agent by its task words too, as status questions do. */
@@ -907,28 +952,66 @@ const CHANGES_ASK = [
 /** "show me the changes", "show search cleanup's diff": it needs a word for the work, or it is a status ("show search cleanup"). */
 const CHANGES_SHOW = /^(?:show me|show us|show|let me see|let us see|can i see|could i see|may i see|see|look at|open|pull up|bring up|give me) (?<ref>.+)$/d;
 const CHANGES_DIFF = /^diff(?: (?<ref>.+))?$/d;
+/** On a merge or throw-away card only: "review the changes", "check the diff", "go over its work" (elsewhere, work). */
+const CHANGES_REVIEW = /^(?:let me |let us )?(?:review|check out|check|read through|read|inspect|examine|view|go over|go through|look over|look through|look at) (?<ref>.+)$/d;
+/**
+ * When, after review words on a merge or throw-away card: "first", "again", "real quick" ("before I merge it" too).
+ * The longer of two that end alike comes first: stripTrailing takes the first that fits.
+ */
+const REVIEW_TAIL = [...WORK_TAIL, ['first'], ['quickly'], ['real', 'quick'], ['quick'], ['one', 'more', 'time'], ['once', 'more'],
+  ['for', 'a', 'second'], ['for', 'a', 'sec'], ['for', 'a', 'moment'], ['so', 'far']];
+
+/**
+ * Review words that mean "it" ("show me the changes", "what changed", "diff it") while something else waits on screen.
+ * On a merge or throw-away card "it" is the card, so they show the work it is about, and never start anything. A card
+ * that does not say whose work it is keeps them (unknown: it stays, with its hint). Anything else on screen (a question,
+ * a permission, another kind of card) keeps their old meaning (null).
+ */
+function cardReview(c) {
+  const card = c.pendingConfirm;
+  if (!card || (card.kind !== 'merge' && card.kind !== 'discard')) return null;
+  const id = typeof card.agentId === 'string' && card.agentId ? card.agentId : null;
+  return { intent: id ? { kind: 'changes', agentId: id } : { kind: 'unknown' }, strong: true };
+}
 
 /**
  * "what did search cleanup change", "what changed" (the focused agent), "show me the changes", "show search cleanup's
  * changes", "diff it": read-only, so the engine shows them at once (the page opens the git screen on that agent).
+ * While a merge or throw-away card waits, the words without a name show the card's work (see cardReview), also when
+ * they go on with when ("show me the changes first", "review the diff before I merge it"). Review words about the work
+ * that are still not understood keep the card there, rather than becoming work for a new agent.
  */
 function matchChanges(core, c) {
+  const found = changesIn(core, c);
+  if (found || !cardReview(c)) return found;
+  const before = core.findIndex((t, i) => i > 1 && t.w === 'before'); // "… before I merge it", "… before merging"
+  const short = stripTrailing(before > 0 ? core.slice(0, before) : core, REVIEW_TAIL);
+  const again = short.length < core.length ? changesIn(short, c) : null;
+  if (again) return again;
+  const s = core.map(t => t.w).join(' ');
+  const m = CHANGES_SHOW.exec(s) || CHANGES_REVIEW.exec(s);
+  const aboutWork = m && refTokens(m, s, core).some(t => WORK_NOUN.has(t.w) || t.w === 'changed');
+  return aboutWork ? { intent: { kind: 'unknown' }, strong: true } : null;
+}
+
+function changesIn(core, c) {
   const ws = core.map(t => t.w);
   if (bareName(ws, c)) return null; // "diff viewer" is the name of the agent "Diff viewer"
   const s = ws.join(' ');
-  // "what changed", a bare "diff": the focused agent, said without its name.
-  const focused = () => (screenBusy(c) ? null : { intent: { kind: 'changes', agentId: focusRoot(c) }, strong: false });
+  // "what changed", a bare "diff": the focused agent, said without its name (on a merge or throw-away card, its agent).
+  const focused = () => (screenBusy(c) ? cardReview(c) : { intent: { kind: 'changes', agentId: focusRoot(c) }, strong: false });
+  // The work of the agent the words found. Words too loose for now (see tooLoose) are about what waits on screen.
+  const show = ref => (!tooLoose(ref, c) ? { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) }
+    : weakForm(ref) ? cardReview(c) : null);
   for (const re of CHANGES_ASK) {
     const m = re.exec(s);
     if (!m) continue;
     const refToks = refTokens(m, s, core);
     if (!refToks.length) return focused();
     const ref = workRef(refToks, c);
-    if (ref) {
-      if (weakForm(ref) && screenBusy(c)) return null;
-      return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
-    }
-    // A question may find the agent by its task words, as "what is the rounding bug one doing" does.
+    if (ref && !ref.partial) return show(ref);
+    // A question may find the agent by its task words, or by part of its name, as "what is the rounding bug one doing"
+    // does: it only shows.
     const r = resolveRef(refToks, c);
     const a = r.ids.length && r.full ? c.agents.find(x => x.id === r.ids[0]) : null;
     const root = a ? rootOf(a, c) : null;
@@ -938,8 +1021,7 @@ function matchChanges(core, c) {
   if (m) {
     const ref = workRef(refTokens(m, s, core), c);
     if (!ref || !ref.noun) return null; // "show search cleanup" is a status; "show the error on the login page" is work
-    if (weakForm(ref) && screenBusy(c)) return null;
-    return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
+    return show(ref);
   }
   m = CHANGES_DIFF.exec(s);
   if (m) {
@@ -947,8 +1029,13 @@ function matchChanges(core, c) {
     if (!refToks.length) return focused();
     const ref = workRef(refToks, c);
     if (!ref) return null; // "diff the two config files" is not about an agent
-    if (weakForm(ref) && screenBusy(c)) return null;
-    return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
+    return show(ref);
+  }
+  // "review the changes" is work for an agent, but on a merge or throw-away card it looks at the work, as "show" does.
+  m = cardReview(c) && CHANGES_REVIEW.exec(s);
+  if (m) {
+    const ref = workRef(refTokens(m, s, core), c);
+    if (ref && ref.noun) return show(ref);
   }
   return null;
 }
@@ -1496,6 +1583,9 @@ function parse(said, c) {
   // 3. Commands. While a question waits, only unmistakable commands win over an answer.
   const core = stripTrailing(stripPolite(stripSoft(base)));
   const found = matchCommand(core, c);
+  // Words about the card on screen that it cannot act on ("show me the changes" on a card that does not say whose work
+  // it is): the card stays, with its hint.
+  if (found && found.intent.kind === 'unknown') return { kind: 'unknown', text: said };
   const waiting = ask && (ask.type === 'question' || ask.type === 'stuck');
   if (found && (found.strong || !waiting)) return found.intent;
   if (waiting) return answerIntent(base, holder, ask);

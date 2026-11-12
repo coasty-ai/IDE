@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCommand, describeIntent } from '../src/core/commands.mjs';
+import { nameFromTask } from '../src/shared/narrate.mjs';
 
 // A small world like the demo seed. Asks sit on the agents, as in AgentView.
 const agents = [
@@ -46,6 +47,10 @@ const CTX = {
   pendingDiscardOnPermission: { agents, machines, harnesses, focusId: 'a1b2c3', pendingConfirm: { id: 'c7', kind: 'discard' } },
   // A card that ran out while it was on screen (the engine answers a yes to it with "no longer waiting").
   pendingGone: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c0', gone: true } },
+  // Merge and throw-away cards as the engine shows them: they say whose work they are about.
+  pendingMergeOf: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c12', kind: 'merge', agentId: '1a2b3c' } },
+  pendingDiscardOf: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c13', kind: 'discard', agentId: '1a2b3c' } },
+  pendingMergeOfOnQuestion: { agents, machines, harnesses, focusId: 'd4e5f6', pendingConfirm: { id: 'c14', kind: 'merge', agentId: '1a2b3c' } },
 };
 
 // Dogfooding: Workbench working on its own repository, so agent names share words with the commands themselves.
@@ -76,6 +81,46 @@ const DOG = {
   dogPendingMerge: { agents: dogAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c8', kind: 'merge' } },
   dogPendingDiscard: { agents: dogAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c9', kind: 'discard' } },
   dogBranch: { agents: dogAgents, machines, harnesses, focusId: 'aa0001', repo: { branch: 'feature/login-v2' } },
+};
+
+// Names as the engine makes them from a task (nameFromTask): a verb first, so people say the rest of the name.
+const fromTask = (task, fields) => ({ name: nameFromTask(task), task, kind: 'agent', ...fields });
+// Two names share "config files", and neither is only that; a third agent asks a question with "merge" in it.
+const configAgents = [
+  fromTask('Update the config files', { id: 'cf0001', state: 'done_claimed' }),
+  fromTask('Split the config files per environment', { id: 'cf0002', state: 'done_checked' }),
+  fromTask('Fix the login page error', { id: 'cf0003', state: 'question',
+    ask: { id: 'ask-cf', type: 'question', sentence: 'Should I merge them into one?', options: [] } }),
+];
+// An agent whose name people say without its verb ("the unused imports"), in each of the ways it can wait on the person.
+const importsAgent = fromTask('Remove the unused imports', { id: 'ab0001', state: 'question',
+  ask: { id: 'ask-ui', type: 'question', sentence: 'Should I keep the ones the tests use, or discard them too?', options: [] } });
+const stagingAgent = fromTask('Update the config files for staging', { id: 'ab0002', state: 'done_claimed' });
+const importsWith = (fields, staging = {}, more = []) => [{ ...importsAgent, ...fields }, { ...stagingAgent, ...staging }, ...more];
+const NAMED = {
+  configNone: { agents: configAgents, machines, harnesses, focusId: null },
+  configQuestion: { agents: configAgents, machines, harnesses, focusId: 'cf0003' },
+  importsQuestion: { agents: importsWith({}), machines, harnesses, focusId: 'ab0001' },
+  importsNone: { agents: importsWith({ state: 'done_claimed', ask: undefined }), machines, harnesses, focusId: null },
+  importsStuck: { agents: importsWith({ state: 'maybe_stuck', ask: { id: 'ask-us', type: 'stuck',
+    sentence: 'Remove unused imports has hit the same error three times.', options: ['Stop it', 'Let it keep trying'] } }), machines, harnesses, focusId: 'ab0001' },
+  importsPermission: { agents: importsWith({ state: 'needs_ok', ask: { id: 'ask-up', type: 'permission',
+    sentence: 'Remove unused imports wants to run a command', options: ['Allow', 'Deny'], primary: 'Allow' } }), machines, harnesses, focusId: 'ab0001' },
+  // Its helper asks, with the agent in the centre.
+  importsHelper: { agents: importsWith({ state: 'working', ask: undefined }, {}, [{ id: 'ab0001-44444444', name: 'Find unused imports',
+    task: 'Find the unused imports', state: 'question', kind: 'helper', parentId: 'ab0001', rootId: 'ab0001',
+    ask: { id: 'ask-uh', type: 'question', sentence: 'Should I look in the tests too?', options: [] } }]), machines, harnesses, focusId: 'ab0001' },
+  // Its helper holds a permission, with the agent in the centre.
+  importsHelperPermission: { agents: importsWith({ state: 'working', ask: undefined }, {}, [{ id: 'ab0001-55555555', name: 'Scan imports',
+    task: 'Scan the imports', state: 'needs_ok', kind: 'helper', parentId: 'ab0001', rootId: 'ab0001',
+    ask: { id: 'ask-hp', type: 'permission', sentence: 'Scan imports wants to run a command', options: ['Allow', 'Deny'], primary: 'Allow' } }]),
+  machines, harnesses, focusId: 'ab0001' },
+  // Another agent asks; this one is done.
+  importsOther: { agents: importsWith({ state: 'done_claimed', ask: undefined }, { state: 'question',
+    ask: { id: 'ask-st', type: 'question', sentence: 'Which unused imports should go?', options: [] } }), machines, harnesses, focusId: 'ab0002' },
+  // A merge card for the other agent is on screen (the page sends no focus then).
+  importsCard: { agents: importsWith({ state: 'done_claimed', ask: undefined }), machines, harnesses, focusId: null,
+    pendingConfirm: { id: 'c11', kind: 'merge', agentId: 'ab0002' } },
 };
 
 const start = (...tasks) => ({ kind: 'start', tasks: tasks.map(([task, harness = 'claude', machine = 'laptop']) => ({ task, harness, machine })) });
@@ -524,7 +569,7 @@ test('a stop verb that matches no agent is a work request; a name still stops at
 
 // ------------------------------------------------------------------ source control: changes, merge, throw away
 
-const ctxOf = name => CTX[name] || DOG[name];
+const ctxOf = name => CTX[name] || DOG[name] || NAMED[name];
 const changes = agentId => ({ kind: 'changes', agentId });
 const merge = (agentId, into) => (into ? { kind: 'merge', agentId, into } : { kind: 'merge', agentId });
 const discard = agentId => ({ kind: 'discard', agentId });
@@ -861,14 +906,113 @@ test('merge and throw-away name the agent: dogfood names, same-named twins, earl
   assert.deepEqual(parseCommand('merge the changes from it', withChanges), merge('aa0001'));
   assert.deepEqual(parseCommand('throw away your changes', withChanges), unknown('throw away your changes'));
   assert.deepEqual(parseCommand('merge 55000c', withChanges), merge('55000c'));
-  // The whole name of one agent names it, even when a longer name has the same words; a shorter part names neither.
+  // The whole name of one agent names it, even when a longer name has the same words; a shorter part names neither, so
+  // the words keep their old meaning (a task here), rather than asking which one.
   const v2 = { agents: [{ id: 'aa0001', name: 'Search cleanup', task: 'x', state: 'done_checked', kind: 'agent' },
     { id: 'bb0002', name: 'Search cleanup v2', task: 'y', state: 'done_checked', kind: 'agent' }] };
   assert.deepEqual(parseCommand('merge search cleanup', v2), merge('aa0001'));
   assert.deepEqual(parseCommand('merge search cleanup v2', v2), merge('bb0002'));
-  assert.deepEqual(parseCommand('merge search clean', v2), merge(null));
+  assert.deepEqual(parseCommand('merge search clean', v2), task('merge search clean'));
   // A helper whose agent is not in the list stands for nothing.
   assert.deepEqual(parseCommand('discard it', { agents: [{ id: 'q-1', name: 'Lost helper', kind: 'helper', parentId: 'gone' }], focusId: 'q-1' }), discard(null));
+});
+
+test('words that two names share, and that are neither one\'s whole name, name no agent: they keep their old meaning', () => {
+  assert.deepEqual(configAgents.map(a => a.name), ['Update config files', 'Split config files per', 'Fix login page error']);
+  const answerCf = text => answer(text, 'cf0003', 'ask-cf');
+  checkRows([
+    // Nothing waits: work stays work, and words that were nothing stay nothing. Never "Which one do you mean?".
+    ['merge the config files', 'configNone', task('merge the config files')],
+    ['merge config files', 'configNone', task('merge config files')],
+    ['discard the config files', 'configNone', unknown('discard the config files')],
+    ['trash the config files', 'configNone', unknown('trash the config files')],
+    ['throw away the config files', 'configNone', unknown('throw away the config files')],
+    ['diff the config files', 'configNone', unknown('diff the config files')],
+    ['show me the config files changes', 'configNone', { kind: 'status', agentId: 'cf0001' }], // as before these words
+    // A question waits: the words are its answer.
+    ['merge the config files', 'configQuestion', answerCf('merge the config files')],
+    ['discard the config files', 'configQuestion', answerCf('discard the config files')],
+    ['trash the config files', 'configQuestion', answerCf('trash the config files')],
+    ['diff the config files', 'configQuestion', answerCf('diff the config files')],
+    ['show me the config files changes', 'configQuestion', answerCf('show me the config files changes')],
+    // A question about what changed finds the agent by its words, as "what is the config files doing" always has (the
+    // best match, here the first of two): it only shows, and it was never an answer.
+    ['what did the config files change', 'configNone', changes('cf0001')],
+    ['what did the config files change', 'configQuestion', changes('cf0001')],
+    ['what is the config files doing', 'configQuestion', { kind: 'status', agentId: 'cf0001' }],
+    // A whole name or an id still names one, and acts whatever waits.
+    ['merge update config files', 'configNone', merge('cf0001')],
+    ['merge the update config files agent', 'configQuestion', merge('cf0001')],
+    ['discard split config files per', 'configQuestion', discard('cf0002')],
+    ['merge cf0002', 'configQuestion', merge('cf0002')],
+    ["show update config files' changes", 'configQuestion', changes('cf0001')],
+    // Same-named twins still give no agent, so the engine asks which one.
+    ['merge search cleanup', 'dogNone', merge(null)],
+  ]);
+});
+
+test('part of a name finds the agent but is not strong: while it, or anything, asks, the words keep their old meaning', () => {
+  assert.equal(importsAgent.name, 'Remove unused imports');
+  const answerUi = text => answer(text, 'ab0001', 'ask-ui');
+  checkRows([
+    // Its own question waits: part of its name is the answer, never a card that throws its work away.
+    ['discard the unused imports', 'importsQuestion', answerUi('discard the unused imports')],
+    ['discard unused imports', 'importsQuestion', answerUi('discard unused imports')],
+    ['throw away the unused imports', 'importsQuestion', answerUi('throw away the unused imports')],
+    ['throw the unused imports away', 'importsQuestion', answerUi('throw the unused imports away')],
+    ['scrap the unused imports', 'importsQuestion', answerUi('scrap the unused imports')],
+    ['trash the unused imports', 'importsQuestion', answerUi('trash the unused imports')],
+    ["throw away the unused imports' changes", 'importsQuestion', answerUi("throw away the unused imports' changes")],
+    ['merge the unused imports', 'importsQuestion', answerUi('merge the unused imports')],
+    ['land the unused imports', 'importsQuestion', answerUi('land the unused imports')],
+    ['merge the unused imports into main', 'importsQuestion', answerUi('merge the unused imports into main')],
+    ['diff the unused imports', 'importsQuestion', answerUi('diff the unused imports')],
+    ["show the unused imports' changes", 'importsQuestion', answerUi("show the unused imports' changes")],
+    ['discard them', 'importsQuestion', answerUi('discard them')],
+    ['keep the unused imports', 'importsQuestion', answerUi('keep the unused imports')],
+    // A question about what changed finds it by its words, as a status question does: it only shows.
+    ['what did the unused imports change', 'importsQuestion', changes('ab0001')],
+    // Its whole name or its id still acts at once.
+    ['discard remove unused imports', 'importsQuestion', discard('ab0001')],
+    ['throw away the remove unused imports agent', 'importsQuestion', discard('ab0001')],
+    ['merge remove unused imports', 'importsQuestion', merge('ab0001')],
+    ['discard ab0001', 'importsQuestion', discard('ab0001')],
+    ['diff remove unused imports', 'importsQuestion', changes('ab0001')],
+    // A stop keeps its own rule: two words of the name and nothing else name the agent (see ARCHITECTURE.md).
+    ['stop the unused imports', 'importsQuestion', { kind: 'stop', agentIds: ['ab0001'] }],
+    // Stuck, a helper asking, another agent asking: the answer too.
+    ['discard the unused imports', 'importsStuck', answer('discard the unused imports', 'ab0001', 'ask-us')],
+    ['merge the unused imports', 'importsStuck', answer('merge the unused imports', 'ab0001', 'ask-us')],
+    ['discard the unused imports', 'importsHelper', answer('discard the unused imports', 'ab0001-44444444', 'ask-uh')],
+    ['discard the unused imports', 'importsOther', answer('discard the unused imports', 'ab0002', 'ask-st')],
+    ['merge the unused imports', 'importsOther', answer('merge the unused imports', 'ab0002', 'ask-st')],
+    // A permission keeps its replies, as before these words existed.
+    ['discard the unused imports', 'importsPermission', unknown('discard the unused imports')],
+    ['throw away the unused imports', 'importsPermission', unknown('throw away the unused imports')],
+    ['merge the unused imports', 'importsPermission', task('merge the unused imports')],
+    ['no, discard the unused imports', 'importsPermission', { kind: 'deny', agentId: 'ab0001', askId: 'ask-up', text: 'discard the unused imports' }],
+    ['merge remove unused imports', 'importsPermission', merge('ab0001')], // the whole name still acts there
+    ['discard the unused imports', 'importsHelperPermission', unknown('discard the unused imports')],
+    ['merge the unused imports', 'importsHelperPermission', task('merge the unused imports')],
+    ['no, discard the unused imports', 'importsHelperPermission',
+      { kind: 'deny', agentId: 'ab0001-55555555', askId: 'ask-hp', text: 'discard the unused imports' }],
+    // Nothing waits: part of the name finds it, and the engine asks first, as before.
+    ['discard the unused imports', 'importsNone', discard('ab0001')],
+    ['throw away the unused imports', 'importsNone', discard('ab0001')],
+    ['merge the unused imports', 'importsNone', merge('ab0001')],
+    ['diff the unused imports', 'importsNone', changes('ab0001')],
+    ["show the unused imports' changes", 'importsNone', changes('ab0001')],
+    // A card is no question to answer and has no "it" for a name: part of a name is another command there, as a whole
+    // name is (the engine withdraws the card), never a launch of "merge the unused imports".
+    ['merge the unused imports', 'importsCard', merge('ab0001')],
+    ['discard the unused imports', 'importsCard', discard('ab0001')],
+    ["show the unused imports' changes", 'importsCard', changes('ab0001')],
+  ]);
+  // A name said as two words where it has one ("check out" for Checkout) is still the whole name: strong while a
+  // question waits.
+  assert.deepEqual(parseCommand('merge the check out fix', CTX.question), merge('a1b2c3'));
+  assert.deepEqual(parseCommand('merge the checkout fix', CTX.question), merge('a1b2c3'));
+  assert.deepEqual(parseCommand('merge the checkout', CTX.question), answer('merge the checkout'));
 });
 
 test('cards take their own words: "start it" only for a launch, "merge it" for a merge, "throw it away" for a throw-away', () => {
@@ -949,6 +1093,83 @@ test('a bare yes is not enough to throw work away, and it never falls through to
   }
 });
 
+test('on a throw-away card "do" counts only as "do it" or "do that": a "do" cut short is no answer', () => {
+  // A "do" on its own is a yes word, and the first word of "do not throw it away": said alone, or cut short by
+  // speech-to-text, it keeps the card, as a "throw" cut short does.
+  for (const text of ['do', 'Do.', 'sure do', 'yes do', 'yes, do.', 'you do', 'okay do', 'go do', 'do please', 'do so', 'well do']) {
+    assert.deepEqual(parseCommand(text, CTX.pendingDiscard), unknown(text), text);
+    assert.deepEqual(parseCommand(text, CTX.pendingDiscardOnPermission), unknown(text), `${text} (permission behind the card)`);
+    assert.deepEqual(parseCommand(text, DOG.dogPendingDiscard), unknown(text), `${text} [dogPendingDiscard]`);
+    // On every other card it is a yes, as before.
+    for (const ctxName of ['pending', 'pendingStart', 'pendingForget', 'pendingMerge']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), yes, `${text} [${ctxName}]`);
+    }
+  }
+  checkRows([
+    ['do it', 'pendingDiscard', yes], ['Do it.', 'pendingDiscard', yes], ['do that', 'pendingDiscard', yes], ['DO IT', 'pendingDiscard', yes],
+    ['yes do it', 'pendingDiscard', yes], ['yes, do it', 'pendingDiscard', yes], ['just do it', 'pendingDiscard', yes],
+    ['please do it', 'pendingDiscard', yes], ['do it please', 'pendingDiscard', yes], ['do it now', 'pendingDiscard', yes],
+    ['go ahead and do it', 'pendingDiscard', yes], ['okay do it', 'pendingDiscard', yes], ['do it', 'pendingDiscardOnPermission', yes],
+    ['do not throw it away', 'pendingDiscard', no],
+    ['do it?', 'pendingDiscard', unknown('do it?')], ['do it is that right', 'pendingDiscard', unknown('do it is that right')],
+  ]);
+  for (const text of ['do not', 'do not do it', "don't do it"]) assert.notDeepEqual(parseCommand(text, CTX.pendingDiscard), yes, text);
+});
+
+test('on a merge or throw-away card, review words show its work; they never withdraw it for a launch', () => {
+  // "it" is the card: the words are about the work it would merge or throw away.
+  const REVIEW = ['show me the changes', 'show me the diff', 'show me what changed', 'show me its changes', 'open the diff',
+    'look at the changes', 'let me see the changes', 'can I see the diff', 'can you show me the changes', 'pull up the diff',
+    'show me the changes please', 'what changed', 'what changed?', 'what did it change', 'what are its changes', 'which files changed',
+    'diff it', 'diff',
+    // Elsewhere these are work for an agent ("review the changes" is a task); on such a card they look at its work.
+    'review the changes', 'check the diff', 'read the diff', 'check out its changes', 'go through the changes', 'look over the work',
+    'let me review the changes', 'view the diff',
+    // Words that say when or what for, after the review words.
+    'show me the changes first', 'let me see the diff first', 'review the changes first', 'show me the diff again',
+    'show me what changed first', 'what changed first', 'diff it first', 'show me the changes before I merge',
+    'show me the changes before I merge it', 'can I see the changes before merging', 'show me the changes real quick',
+    'show me the changes one more time', 'show me the changes again please', 'open the diff for a second', 'show me the changes so far'];
+  for (const text of REVIEW) {
+    for (const ctxName of ['pendingMergeOf', 'pendingDiscardOf', 'pendingMergeOfOnQuestion']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), changes('1a2b3c'), `${text} [${ctxName}]`);
+    }
+    // A card that does not say whose work it is keeps them: it stays, with its hint. So does one with a permission behind it.
+    for (const ctxName of ['pendingMerge', 'pendingDiscard', 'pendingMergeOnPermission', 'pendingDiscardOnPermission']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), unknown(text), `${text} [${ctxName}]`);
+    }
+  }
+  checkRows([
+    // The card's own words still answer it.
+    ['merge it', 'pendingMergeOf', yes], ['do it', 'pendingMergeOf', yes], ['cancel', 'pendingMergeOf', no],
+    ['throw it away', 'pendingDiscardOf', yes], ['keep it', 'pendingDiscardOf', no], ['yes', 'pendingDiscardOf', unknown('yes')],
+    ['discard it', 'pendingMergeOf', unknown('discard it')],
+    // A name is another agent's work, whatever card waits.
+    ["show me help pages' changes", 'pendingMergeOf', changes('4d5e6f')],
+    ['what did help pages change', 'pendingDiscardOf', changes('4d5e6f')],
+    ["show me help pages' changes first", 'pendingMergeOf', changes('4d5e6f')],
+    ["review help pages' changes", 'pendingMergeOf', changes('4d5e6f')],
+    ['show me the changes from help pages before I merge', 'pendingMergeOf', changes('4d5e6f')],
+    // Review words about the work that are still not understood keep the card, with its hint: never a launch.
+    ['show me the changes to the login page', 'pendingMergeOf', unknown('show me the changes to the login page')],
+    ['show me the diff the way git does', 'pendingDiscardOf', unknown('show me the diff the way git does')],
+    // Work that is not a review keeps its old meaning.
+    ['show the error on the login page', 'pendingMergeOf', task('show the error on the login page')],
+    ['review it', 'pendingMergeOf', unknown('review it')],
+    ['check the tests first', 'pendingMergeOf', { kind: 'status', agentId: '0a0b0c' }], // as before: no word for the work
+    // Without a card, review words keep their old meaning: "review the changes" is work, and a question takes the words.
+    ['review the changes', 'invoice', task('review the changes')],
+    ['show me the changes', 'question', answer('show me the changes')],
+    ['what did it change', 'question', { kind: 'status', agentId: 'd4e5f6' }],
+  ]);
+  // Only a merge or throw-away card has work to show: on the other cards the words are what they were.
+  for (const text of ['show me the changes', 'what changed', 'review the changes']) {
+    for (const ctxName of ['pending', 'pendingStart', 'pendingStop', 'pendingSay', 'pendingForget', 'pendingGone']) {
+      assert.notEqual(parseCommand(text, CTX[ctxName]).kind, 'changes', `${text} [${ctxName}]`);
+    }
+  }
+});
+
 test('"stop an agent to fix the login" is a launch, not a stop of "Login fix"; "forget an agent …" forgets nothing', () => {
   const world = { agents: [
     { id: 'aa1111', name: 'Login fix', task: 'Fix the login page error', state: 'working', kind: 'agent' },
@@ -1006,6 +1227,38 @@ test('"into main" and "into my branch": a branch named is carried, so the engine
   assert.deepEqual(parseCommand('merge it into the wizard', { ...CTX.pendingMerge, repo: { branch: 'wizard' } }), unknown('merge it into the wizard'));
 });
 
+test('"merge it in to main" and "bring it over to main": the particle, then where it goes', () => {
+  checkRows([
+    ['merge it in to main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it in to the main branch', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it over to main', 'invoice', merge('1a2b3c', 'main')],
+    ['land it in to main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it on to main', 'invoice', merge('1a2b3c', 'main')], // "onto", heard as two words
+    ['land it on to master', 'invoice', merge('1a2b3c', 'master')],
+    ['merge in to main', 'invoice', merge('1a2b3c', 'main')], // "into", heard as two words
+    ['bring its changes in to main', 'invoice', merge('1a2b3c', 'main')],
+    ['bring the changes over to master', 'invoice', merge('1a2b3c', 'master')],
+    ['bring it over to main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it in to my branch', 'invoice', merge('1a2b3c')],
+    ['bring it in to my branch', 'invoice', merge('1a2b3c')],
+    ['merge invoice export in to main', 'none', merge('1a2b3c', 'main')],
+    ["bring invoice export's changes in to main", 'none', merge('1a2b3c', 'main')],
+    ['merge it in to feature/login-v2', 'dogBranch', merge('aa0001', 'feature/login-v2')],
+    // As without the particle: a branch it cannot check keeps the old meaning, and "bring" still needs its work or "it".
+    ['merge it in to develop', 'invoice', task('merge it in to develop')],
+    ['bring invoice export in to main', 'none', task('bring invoice export in to main')],
+    ['bring in to main', 'invoice', task('bring in to main')],
+    // "it" is weak: while a question waits, the words are the answer; on a merge card a branch named keeps the card.
+    ['merge it in to main', 'question', answer('merge it in to main')],
+    ['merge it in to main', 'pendingMerge', unknown('merge it in to main')],
+    ['merge it in to my branch', 'pendingMerge', yes],
+  ]);
+  // A name that ends in "over" keeps its last word: the particle is dropped only when the words name nothing with it.
+  const failOver = { agents: [{ id: 'f0f0f0', name: 'Fail over', task: 'Add a fail over for the database', state: 'done_checked', kind: 'agent' }] };
+  assert.deepEqual(parseCommand('merge fail over to main', failOver), merge('f0f0f0', 'main'));
+  assert.deepEqual(parseCommand('merge fail over in to main', failOver), merge('f0f0f0', 'main'));
+});
+
 test('describeIntent words changes, merge and throw-away', () => {
   assert.equal(describeIntent(changes('1a2b3c'), CTX.none), 'Show what Invoice export changed?');
   assert.equal(describeIntent(changes(null), CTX.none), 'Show what an agent changed? It is not clear which one.');
@@ -1028,6 +1281,10 @@ test('the source-control words stay fast on long dictation and never throw', () 
   parseCommand('merge ' + 'search cleanup and '.repeat(500), CTX.none);
   parseCommand('throw away ' + 'the changes from '.repeat(500) + 'it', CTX.invoice);
   parseCommand('merge it into ' + 'main '.repeat(2000), CTX.invoice);
+  // On a merge or throw-away card review words may run on ("show me the changes first"): long runs stay fast too.
+  for (const tail of ['first ', 'again ', 'before ', 'real quick ', 'word ']) parseCommand('show me the changes ' + tail.repeat(1500), CTX.pendingMergeOf);
+  parseCommand('show me ' + 'word '.repeat(3000) + 'first', CTX.pendingDiscardOf);
+  parseCommand('review ' + 'the changes from '.repeat(500) + 'it first', CTX.pendingMergeOf);
   assert.ok(Date.now() - t0 < 2000, 'took ' + (Date.now() - t0) + ' ms');
   for (const [text, ctx] of [['merge it', { focusId: 'zz' }], ['discard it', { agents: [{ id: 'h', parentId: 'h', kind: 'helper' }], focusId: 'h' }],
     ['merge it into main', { repo: 'x' }], ['merge it into x', { repo: { branch: 5 } }], ['yes', { pendingConfirm: { id: 'c', kind: 'toString' } }],
