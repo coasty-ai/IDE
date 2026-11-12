@@ -247,7 +247,8 @@ function loadChanges(force) {
   const d = st.detail;
   if (!d || d.kind !== 'agent') return;
   const a = agentOf(d.agentId);
-  const key = `${d.agentId}|${a ? a.state + '|' + workSig(a) : ''}|${st.data ? st.data.repo.head : ''}`;
+  // read again when the agent, its work or your branch's tip changes (a merge moves it)
+  const key = `${d.agentId}|${a ? a.state + '|' + workSig(a) : ''}|${(S.meta && S.meta.repo && S.meta.repo.head) || ''}`;
   const ch = st.changes;
   if (!force && ch.agentId === d.agentId && ch.key === key && (ch.data || ch.loading)) return;
   const seq = ++ch.seq;

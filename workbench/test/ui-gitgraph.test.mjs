@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { graphLayout, GRAPH_SIZES, NEWEST_AT_TOP, bendsOk, rowWords, workNodeOf, workActions, mergeLabel, gitScreenWords, cutMiddle, shortId, slotOf } from '../ui/gitgraph.js';
+import { palettes, ratio, THEMES } from '../scripts/ui-contrast.mjs';
 
 const U = n => String.fromCodePoint(n);
 const id = n => (n.toString(16).padStart(4, '0') + 'b'.repeat(40)).slice(0, 40);
@@ -240,4 +241,27 @@ test('any history lays out: unique rows, every node inside, lines at 45°, nothi
     const g = graphLayout({ ...odd, width: 300 }, GRAPH_SIZES.S);
     assert.ok(Array.isArray(g.rows) && bendsOk(g));
   }
+});
+
+test('the git screen\'s colours, in all three looks: text at 4.5:1, traces and marks at 3:1', () => {
+  // its own custom properties sit in D1's section of app.css, a second block per look after the looks' first blocks
+  const css = readFileSync(new URL('../ui/app.css', import.meta.url), 'utf8');
+  const base = palettes(css), sec = css.slice(css.indexOf('D1: the DRAM'));
+  const block = sel => { const i = sec.indexOf(sel + ' {'); assert.ok(i >= 0, sel); const body = sec.slice(sec.indexOf('{', i) + 1, sec.indexOf('}', i)); return Object.fromEntries([...body.matchAll(/--([\w-]+)\s*:\s*([^;]+);/g)].map(m => [m[1], m[2].trim()])); };
+  const mine = { green: block(':root, :root[data-theme="green"]'), 'black-gold': block(':root[data-theme="black-gold"]'), ivory: block(':root[data-theme="ivory"]') };
+  const pairs = [
+    ['card-ink', 'd-add-bg', 4.5, 'an added line'], ['card-ink', 'd-del-bg', 4.5, 'a removed line'], ['card-ink', 'd-hunk-bg', 4.5, 'a hunk\'s place'], ['card-sub', 'd-hunk-bg', 4.5, 'a hunk\'s words'],
+    ['d-add-mk', 'd-add-bg', 3, 'the + mark'], ['d-del-mk', 'd-del-bg', 3, 'the − mark'], ['d-del-mk', 'card-1', 4.5, 'a hidden character, shown'], ['d-del-mk', 'card-2', 4.5, 'a hidden character, shown'],
+    ...['mask-1', 'mask-2', 'mask-3'].flatMap(m => [['g-trunk', m, 3, 'your gold trunk'], ['g-lane', m, 3, 'an agent\'s copper lane']]),
+  ];
+  const low = [];
+  for (const t of THEMES) {
+    const p = { ...base[t], ...mine[t] };
+    const get = k => { let v = p[k]; for (let i = 0; i < 5 && v && v.startsWith('var('); i++) v = p[v.slice(6, -1)]; return v; };
+    for (const [fg, bg, min, what] of pairs) {
+      const r = ratio(get(fg), get(bg));
+      if (!(r >= min)) low.push(`${t}: ${what} (${fg} on ${bg}) ${r.toFixed(2)} < ${min}`);
+    }
+  }
+  assert.deepEqual(low, []);
 });
