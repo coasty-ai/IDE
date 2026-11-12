@@ -2288,6 +2288,30 @@ test('mergeWork refuses with git-old when git is older than 2.38', async () => {
   assert.deepEqual(await everything(t), was);
 });
 
+test('when the person’s branch moves just before git reads it, git stops before it begins, and mergeWork says main changed', async () => {
+  const t = await agentRepo();
+  write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+  const { expect } = await proposal(t);
+  // A git that makes a commit in the person's folder just before it fast-forwards: the moment after Workbench's last look.
+  const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  const shimDir = path.join(T, 'commit-first-git');
+  write(path.join(shimDir, 'git'), `#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "--ff-only" ]; then '${realGit}' commit -q --allow-empty -m meanwhile >/dev/null 2>&1; break; fi\ndone\nexec '${realGit}' "$@"\n`);
+  fs.chmodSync(path.join(shimDir, 'git'), 0o755);
+  const person = folderPrint(t.root);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${shimDir}${path.delimiter}${savedPath}`;
+  let r;
+  try {
+    r = await mergeWork(mergeOpts(t, expect));
+  } finally {
+    process.env.PATH = savedPath;
+  }
+  assert.equal(git(t.root, 'log', '-1', '--format=%s %P'), `meanwhile ${expect.intoHead}`);
+  assert.deepEqual(r, { ok: false, why: 'moved', sentence: 'main changed since you looked. Have another look.' });
+  assert.deepEqual(folderPrint(t.root), person);
+  assert.equal(statusOf(t.root), '');
+});
+
 test('nothing is left behind in the temporary folder', () => {
   assert.deepEqual(fs.readdirSync(tmp).filter(f => f.startsWith('workbench-')), []);
 });
