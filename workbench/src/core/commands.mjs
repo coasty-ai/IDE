@@ -404,8 +404,10 @@ const START_YES = new Set(['start', 'launch']);
 /**
  * Each card's own words: "stop it" while "Stop Flaky test?" waits, "send it" for a message, "merge it" or "land it"
  * for a merge, "throw it away" or "discard it" for a throw-away. A forget card has none: "forget it" means never mind.
+ * "scrap it" and "trash it" ask for a throw-away card, but they do not answer one: that card takes only its button,
+ * "throw it away", "discard it" or "do it", and "scrap that" is one sound from "scratch that", which means never mind.
  */
-const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw', 'scrap', 'trash'] };
+const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw'] };
 /** Words that may come with a card's own yes: "bring it in", "throw it away", "merge its changes". */
 const CARD_YES_FILL = { merge: ['in', 'its', 'work', 'changes', 'branch'], discard: ['away', 'out', 'its', 'work', 'changes', 'branch'] };
 /** A card's own no: the throw-away card's "Keep it" button, said. */
@@ -494,10 +496,10 @@ function asksSomething(toks) {
  * "merge it" on a merge card, "throw it away" on a throw-away card.
  */
 const OPENERS = new Set([...SOFT_LEAD, ...YES_STRONG, ...CONFIRM_YES, 'ahead', 'please', 'thanks', 'for', 'stop', 'send', 'run', 'let', 'make',
-  'merge', 'land', 'bring', 'in', 'discard', 'throw', 'away', 'out', 'scrap', 'trash']);
+  'merge', 'land', 'bring', 'in', 'discard', 'throw', 'away', 'out']);
 /** Words whose "it" is the thing said yes to: "do it", "allow it", "go for it", "stop it". In "yes it is", "it" is no such word. */
 const YES_VERB = new Set(['do', 'allow', 'approve', 'accept', 'permit', 'grant', 'confirm', 'start', 'launch', 'run', 'send', 'stop', 'let', 'make', 'for',
-  'merge', 'land', 'bring', 'discard', 'throw', 'scrap', 'trash']);
+  'merge', 'land', 'bring', 'discard', 'throw']);
 
 /** Words a left-out "is" or "are" leaves next to what is asked about: "that okay", "you sure", "that the right one". */
 const STATE_YES = new Set(['okay', 'alright', 'fine', 'good', 'great', 'sure', 'right', 'correct', 'allowed', 'approved', 'accepted',
@@ -878,6 +880,8 @@ function matchDiscard(core, c) {
     rest = rest.slice(0, -1);
   }
   if (!rest.length) return null; // "discard" alone throws nothing away
+  // "scrap that" and "trash this" say never mind ("scratch that"), not which work to throw away. "scrap it" does.
+  if ((ws[0] === 'scrap' || ws[0] === 'trash') && rest.length === 1 && (rest[0].w === 'that' || rest[0].w === 'this')) return null;
   if (launchPhrase(rest.map(t => t.w))) return null;
   const ref = workRef(rest, c);
   if (!ref) return null;
@@ -1443,7 +1447,9 @@ function answerIntent(base, focus, ask) {
 /**
  * Parse what the person typed or said.
  * @param {string} text
- * @param {{ agents?: object[], focusId?: string|null, machines?: object[], harnesses?: object, pendingConfirm?: any }} [ctx]
+ * @param {{ agents?: object[], focusId?: string|null, machines?: object[], harnesses?: object, pendingConfirm?: any,
+ *   repo?: { branch?: string|null } }} [ctx] `repo.branch`: the person's current branch, so "merge it into <that branch>"
+ *   can name it; without it only "main", "master" and "my branch" are understood as where to merge.
  * @returns {object} an intent; never throws
  */
 export function parseCommand(text, ctx) {
