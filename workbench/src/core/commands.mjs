@@ -883,9 +883,9 @@ function matchMerge(core, c) {
         particle = true;
         let toks = t.toks;
         ref = toks.length ? workRef(toks, c) : null;
-        // "merge it in to main", "bring it over to main": the particle, then where it goes. Only when the words name
-        // nothing with it, so a name that ends in "over" keeps its last word.
-        if (!ref && toks.length && ['in', 'over'].includes(toks[toks.length - 1].w)) {
+        // "merge it in to main", "merge it on to main", "bring it over to main": the particle, then where it goes. Only
+        // when the words name nothing with it, so a name that ends in "over" keeps its last word.
+        if (!ref && toks.length && ['in', 'on', 'over'].includes(toks[toks.length - 1].w)) {
           toks = toks.slice(0, -1);
           ref = toks.length ? workRef(toks, c) : null;
         }
@@ -954,6 +954,12 @@ const CHANGES_SHOW = /^(?:show me|show us|show|let me see|let us see|can i see|c
 const CHANGES_DIFF = /^diff(?: (?<ref>.+))?$/d;
 /** On a merge or throw-away card only: "review the changes", "check the diff", "go over its work" (elsewhere, work). */
 const CHANGES_REVIEW = /^(?:let me |let us )?(?:review|check out|check|read through|read|inspect|examine|view|go over|go through|look over|look through|look at) (?<ref>.+)$/d;
+/**
+ * When, after review words on a merge or throw-away card: "first", "again", "real quick" ("before I merge it" too).
+ * The longer of two that end alike comes first: stripTrailing takes the first that fits.
+ */
+const REVIEW_TAIL = [...WORK_TAIL, ['first'], ['quickly'], ['real', 'quick'], ['quick'], ['one', 'more', 'time'], ['once', 'more'],
+  ['for', 'a', 'second'], ['for', 'a', 'sec'], ['for', 'a', 'moment'], ['so', 'far']];
 
 /**
  * Review words that mean "it" ("show me the changes", "what changed", "diff it") while something else waits on screen.
@@ -971,9 +977,24 @@ function cardReview(c) {
 /**
  * "what did search cleanup change", "what changed" (the focused agent), "show me the changes", "show search cleanup's
  * changes", "diff it": read-only, so the engine shows them at once (the page opens the git screen on that agent).
- * While a merge or throw-away card waits, the words without a name show the card's work (see cardReview).
+ * While a merge or throw-away card waits, the words without a name show the card's work (see cardReview), also when
+ * they go on with when ("show me the changes first", "review the diff before I merge it"). Review words about the work
+ * that are still not understood keep the card there, rather than becoming work for a new agent.
  */
 function matchChanges(core, c) {
+  const found = changesIn(core, c);
+  if (found || !cardReview(c)) return found;
+  const before = core.findIndex((t, i) => i > 1 && t.w === 'before'); // "… before I merge it", "… before merging"
+  const short = stripTrailing(before > 0 ? core.slice(0, before) : core, REVIEW_TAIL);
+  const again = short.length < core.length ? changesIn(short, c) : null;
+  if (again) return again;
+  const s = core.map(t => t.w).join(' ');
+  const m = CHANGES_SHOW.exec(s) || CHANGES_REVIEW.exec(s);
+  const aboutWork = m && refTokens(m, s, core).some(t => WORK_NOUN.has(t.w) || t.w === 'changed');
+  return aboutWork ? { intent: { kind: 'unknown' }, strong: true } : null;
+}
+
+function changesIn(core, c) {
   const ws = core.map(t => t.w);
   if (bareName(ws, c)) return null; // "diff viewer" is the name of the agent "Diff viewer"
   const s = ws.join(' ');
@@ -1010,11 +1031,11 @@ function matchChanges(core, c) {
     if (!ref) return null; // "diff the two config files" is not about an agent
     return show(ref);
   }
-  // "review the changes" is work for an agent, but on a merge or throw-away card it looks at the card's work.
+  // "review the changes" is work for an agent, but on a merge or throw-away card it looks at the work, as "show" does.
   m = cardReview(c) && CHANGES_REVIEW.exec(s);
   if (m) {
     const ref = workRef(refTokens(m, s, core), c);
-    if (ref && ref.noun && weakForm(ref)) return cardReview(c);
+    if (ref && ref.noun) return show(ref);
   }
   return null;
 }

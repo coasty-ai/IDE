@@ -110,6 +110,11 @@ const NAMED = {
   importsHelper: { agents: importsWith({ state: 'working', ask: undefined }, {}, [{ id: 'ab0001-44444444', name: 'Find unused imports',
     task: 'Find the unused imports', state: 'question', kind: 'helper', parentId: 'ab0001', rootId: 'ab0001',
     ask: { id: 'ask-uh', type: 'question', sentence: 'Should I look in the tests too?', options: [] } }]), machines, harnesses, focusId: 'ab0001' },
+  // Its helper holds a permission, with the agent in the centre.
+  importsHelperPermission: { agents: importsWith({ state: 'working', ask: undefined }, {}, [{ id: 'ab0001-55555555', name: 'Scan imports',
+    task: 'Scan the imports', state: 'needs_ok', kind: 'helper', parentId: 'ab0001', rootId: 'ab0001',
+    ask: { id: 'ask-hp', type: 'permission', sentence: 'Scan imports wants to run a command', options: ['Allow', 'Deny'], primary: 'Allow' } }]),
+  machines, harnesses, focusId: 'ab0001' },
   // Another agent asks; this one is done.
   importsOther: { agents: importsWith({ state: 'done_claimed', ask: undefined }, { state: 'question',
     ask: { id: 'ask-st', type: 'question', sentence: 'Which unused imports should go?', options: [] } }), machines, harnesses, focusId: 'ab0002' },
@@ -987,6 +992,10 @@ test('part of a name finds the agent but is not strong: while it, or anything, a
     ['merge the unused imports', 'importsPermission', task('merge the unused imports')],
     ['no, discard the unused imports', 'importsPermission', { kind: 'deny', agentId: 'ab0001', askId: 'ask-up', text: 'discard the unused imports' }],
     ['merge remove unused imports', 'importsPermission', merge('ab0001')], // the whole name still acts there
+    ['discard the unused imports', 'importsHelperPermission', unknown('discard the unused imports')],
+    ['merge the unused imports', 'importsHelperPermission', task('merge the unused imports')],
+    ['no, discard the unused imports', 'importsHelperPermission',
+      { kind: 'deny', agentId: 'ab0001-55555555', askId: 'ask-hp', text: 'discard the unused imports' }],
     // Nothing waits: part of the name finds it, and the engine asks first, as before.
     ['discard the unused imports', 'importsNone', discard('ab0001')],
     ['throw away the unused imports', 'importsNone', discard('ab0001')],
@@ -1115,7 +1124,12 @@ test('on a merge or throw-away card, review words show its work; they never with
     'diff it', 'diff',
     // Elsewhere these are work for an agent ("review the changes" is a task); on such a card they look at its work.
     'review the changes', 'check the diff', 'read the diff', 'check out its changes', 'go through the changes', 'look over the work',
-    'let me review the changes', 'view the diff'];
+    'let me review the changes', 'view the diff',
+    // Words that say when or what for, after the review words.
+    'show me the changes first', 'let me see the diff first', 'review the changes first', 'show me the diff again',
+    'show me what changed first', 'what changed first', 'diff it first', 'show me the changes before I merge',
+    'show me the changes before I merge it', 'can I see the changes before merging', 'show me the changes real quick',
+    'show me the changes one more time', 'show me the changes again please', 'open the diff for a second', 'show me the changes so far'];
   for (const text of REVIEW) {
     for (const ctxName of ['pendingMergeOf', 'pendingDiscardOf', 'pendingMergeOfOnQuestion']) {
       assert.deepEqual(parseCommand(text, CTX[ctxName]), changes('1a2b3c'), `${text} [${ctxName}]`);
@@ -1133,9 +1147,16 @@ test('on a merge or throw-away card, review words show its work; they never with
     // A name is another agent's work, whatever card waits.
     ["show me help pages' changes", 'pendingMergeOf', changes('4d5e6f')],
     ['what did help pages change', 'pendingDiscardOf', changes('4d5e6f')],
+    ["show me help pages' changes first", 'pendingMergeOf', changes('4d5e6f')],
+    ["review help pages' changes", 'pendingMergeOf', changes('4d5e6f')],
+    ['show me the changes from help pages before I merge', 'pendingMergeOf', changes('4d5e6f')],
+    // Review words about the work that are still not understood keep the card, with its hint: never a launch.
+    ['show me the changes to the login page', 'pendingMergeOf', unknown('show me the changes to the login page')],
+    ['show me the diff the way git does', 'pendingDiscardOf', unknown('show me the diff the way git does')],
     // Work that is not a review keeps its old meaning.
     ['show the error on the login page', 'pendingMergeOf', task('show the error on the login page')],
     ['review it', 'pendingMergeOf', unknown('review it')],
+    ['check the tests first', 'pendingMergeOf', { kind: 'status', agentId: '0a0b0c' }], // as before: no word for the work
     // Without a card, review words keep their old meaning: "review the changes" is work, and a question takes the words.
     ['review the changes', 'invoice', task('review the changes')],
     ['show me the changes', 'question', answer('show me the changes')],
@@ -1212,6 +1233,8 @@ test('"merge it in to main" and "bring it over to main": the particle, then wher
     ['merge it in to the main branch', 'invoice', merge('1a2b3c', 'main')],
     ['merge it over to main', 'invoice', merge('1a2b3c', 'main')],
     ['land it in to main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it on to main', 'invoice', merge('1a2b3c', 'main')], // "onto", heard as two words
+    ['land it on to master', 'invoice', merge('1a2b3c', 'master')],
     ['merge in to main', 'invoice', merge('1a2b3c', 'main')], // "into", heard as two words
     ['bring its changes in to main', 'invoice', merge('1a2b3c', 'main')],
     ['bring the changes over to master', 'invoice', merge('1a2b3c', 'master')],
@@ -1258,6 +1281,10 @@ test('the source-control words stay fast on long dictation and never throw', () 
   parseCommand('merge ' + 'search cleanup and '.repeat(500), CTX.none);
   parseCommand('throw away ' + 'the changes from '.repeat(500) + 'it', CTX.invoice);
   parseCommand('merge it into ' + 'main '.repeat(2000), CTX.invoice);
+  // On a merge or throw-away card review words may run on ("show me the changes first"): long runs stay fast too.
+  for (const tail of ['first ', 'again ', 'before ', 'real quick ', 'word ']) parseCommand('show me the changes ' + tail.repeat(1500), CTX.pendingMergeOf);
+  parseCommand('show me ' + 'word '.repeat(3000) + 'first', CTX.pendingDiscardOf);
+  parseCommand('review ' + 'the changes from '.repeat(500) + 'it first', CTX.pendingMergeOf);
   assert.ok(Date.now() - t0 < 2000, 'took ' + (Date.now() - t0) + ' ms');
   for (const [text, ctx] of [['merge it', { focusId: 'zz' }], ['discard it', { agents: [{ id: 'h', parentId: 'h', kind: 'helper' }], focusId: 'h' }],
     ['merge it into main', { repo: 'x' }], ['merge it into x', { repo: { branch: 5 } }], ['yes', { pendingConfirm: { id: 'c', kind: 'toString' } }],
