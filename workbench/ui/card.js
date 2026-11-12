@@ -140,7 +140,7 @@ export function cardHtml(a, o) {
   }
   return `<p class="sr" id="cardSum">${vis(a.name)}: ${vis(summary(a, now))}</p>
     <div class="hd"><b>${vis(a.name)}</b><span class="stt">${mark(look.shape, look.tone)}${esc(look.label)}</span></div>
-    ${more || helper ? `<div class="sub">${esc(sub)}</div>` : ''}<hr>
+    ${more || helper ? `<div class="sub">${vis(sub)}</div>` : ''}<hr>
     <div class="cols"><div>${lines.join('')}</div>${o.one ? '' : '<div class="vr"></div>'}
     <div class="grid">${cells.join('')}</div></div>${foot.length ? `<div class="foot">${esc(foot.join(' · '))}</div>` : ''}`;
 }

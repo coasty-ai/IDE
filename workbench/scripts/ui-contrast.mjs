@@ -48,7 +48,7 @@ export const PAIRS = [
   ['card-ink', 'd-add-bg', 'an added line'], ['card-ink', 'd-del-bg', 'a removed line'], ['card-ink', 'd-hunk-bg', 'a hunk line'],
   ['card-sub', 'd-hunk-bg', 'quiet words on a hunk line'],
   ['d-add-mk', 'd-add-bg', 'the + mark of an added line', 3], ['d-del-mk', 'd-del-bg', 'the − mark of a removed line', 3],
-  ...['card-1', 'card-2'].map(bg => ['d-del-mk', bg, 'a removed-file mark on the card', 3]),
+  ...['card-1', 'card-2'].map(bg => ['d-del-mk', bg, 'the marks that show hidden characters in the diff and the detail (.vc text)']),
   // the git graph's traces on the board
   ...['mask-1', 'mask-2', 'mask-3'].flatMap(bg => [['g-trunk', bg, 'your branch, the gold trunk', 3], ['g-lane', bg, "an agent's lane", 3]]),
 ];

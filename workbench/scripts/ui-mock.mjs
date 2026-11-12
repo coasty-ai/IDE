@@ -585,9 +585,10 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const newConfirm = (card, extra = {}) => {
     const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
     confirms.set(id, { id, ...card, ...extra });
-    return { id, ...card };
+    // as the engine's _card: a merge or throw-away card names the agent it is about
+    return { id, ...card, ...((card.kind === 'merge' || card.kind === 'discard') && extra.agentId ? { agentId: extra.agentId } : {}) };
   };
-  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}) });
+  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}), ...((c.kind === 'merge' || c.kind === 'discard') && c.agentId ? { agentId: c.agentId } : {}) });
   const rootOf = a => (a && a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a);
   const joinAnd = xs => (xs.length <= 1 ? xs.join('') : xs.length === 2 ? `${xs[0]} and ${xs[1]}` : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
   const unend = s => String(s || '').replace(/[.\s]+$/, '');
@@ -855,7 +856,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           const no = merge ? mergeRefusal(a) : discardRefusal(a);
           if (no) return reply({ reply: no, focusId: a.id });
           const card = merge ? mergeCard(a) : discardCard(a);
-          // the engine's reply to a typed merge or throw-away is the card alone: no focusId, and the card names no agent
+          // the engine's reply to a typed merge or throw-away is the card alone: no focusId; the card names its agent
           return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }) });
         }
         if (/^forget\b/i.test(text)) {

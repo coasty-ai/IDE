@@ -3086,8 +3086,9 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger? }. `kind` is always there (start,
-   * stop, say, forget, merge or discard); yes and no are the buttons' own words when they are not "Do it" and "Cancel".
+   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId? }. `kind` is always there (start,
+   * stop, say, forget, merge or discard); yes and no are the buttons' own words when they are not "Do it" and "Cancel";
+   * agentId (merge and discard cards only) is the agent the card is about.
    */
   _card(c) {
     const out = { id: c.id, sentence: c.sentence, detail: c.detail ?? null, kind: c.kind };
