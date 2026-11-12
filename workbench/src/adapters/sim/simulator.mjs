@@ -4,8 +4,10 @@
 // Time is simulated: tick(now) advances it by the real time elapsed multiplied by `speed`.
 // Event timestamps are always real wall-clock milliseconds; speed only compresses the pacing.
 // Everything random comes from a small seeded PRNG, so a given seed always plays out the same way.
+// The demo also has a pretend git repository (see "The demo's git repository" below): a history, a branch per agent,
+// diffs, and merging or throwing away an agent's work, shaped like what workspace.mjs returns for a real repository.
 import { EV } from '../../shared/events.mjs';
-import { STATE, ENDED } from '../../shared/states.mjs';
+import { STATE, ENDED, ACTIVE } from '../../shared/states.mjs';
 import { narrate, nameFromTask, describeRequest, firstSentence, extractQuestion, baseName } from '../../shared/narrate.mjs';
 import { clip, money } from '../../shared/format.mjs';
 
@@ -348,6 +350,9 @@ const SEED_WORLD = [
     fill: { count: 6, pool: [['Read', 'docs/help/faq.md'], ['Grep', 'invoice'], ['Read', 'docs/style-guide.md']] },
     says: 'I rewrote the help pages for getting started, billing and exports in plain language.',
     rules: { kept: [{ say: 'Do not touch migrations/' }], broken: [] },
+    // You changed the billing help on main after it started (TRUNK below), so its work clashes there until it
+    // brings in main: merging it gives a conflict, as the demo should show once.
+    git: { conflict: ['docs/help/billing.md'] },
   },
   {
     name: 'Onboarding', machineId: 'laptop', model: HAIKU, budgetUsd: 5, costUsd: 0.38, costScale: 0.05,
@@ -401,6 +406,512 @@ const ONBOARDING_JOBS = [
 ];
 
 // ---------------------------------------------------------------------------
+// The demo's git repository. Nothing here touches a real repository: it is a believable history for the git screen,
+// a branch per agent, and what merging or throwing away an agent's work does to it. The shapes follow workspace.mjs
+// (gitGraph, workDiff, mergeWork, discardWork) and the engine's cards, so the page treats the demo like a real run.
+
+// The engine's event for an agent's git state (src/shared/events.mjs gains EV.WORK; until then, its value).
+const WORK_EVENT = EV.WORK || 'agent.work';
+const DEMO_REPO = 'storefront';
+const TRUNK_BRANCH = 'main';
+const YOU = 'you';                 // the author of the person's own commits and of every merge commit
+const DEMO_DIRTY = 2;              // the person's own uncommitted changes, which no merge touches
+const DAY_MIN = 24 * 60;
+const SIM_SAYS_MERGED = 'This is the demo: nothing was really merged.';
+const SIM_SAYS_THROWN = 'This is the demo: nothing was really thrown away.';
+const SIM_NO_GIT = 'This is the demo, so nothing is really merged.';
+
+// The repository's history, oldest first, in minutes before seedWorld(). Each line is a commit by the person, or
+// (`merge`) the merge commit that joined an earlier agent's work into main (EARLIER_MERGES). The seeded agents start
+// from whatever was newest on main when they started (SEED_WORLD's startedAgo), so their branches leave the trunk at
+// different places; main moved on after each of them started.
+const TRUNK = [
+  { ago: 6 * DAY_MIN + 300, subject: 'Initial commit' },
+  { ago: 6 * DAY_MIN + 120, subject: 'Add product list and product pages' },
+  { ago: 6 * DAY_MIN + 10, subject: 'Add the cart, with quantities and a running total' },
+  { ago: 5 * DAY_MIN + 200, subject: 'Set up the test runner and CI' },
+  { ago: 5 * DAY_MIN + 40, subject: 'Add checkout with card payments' },
+  { ago: 4 * DAY_MIN + 260, subject: 'Save orders and send an order confirmation email' },
+  { ago: 4 * DAY_MIN + 90, subject: 'Add invoices and a CSV export' },
+  { ago: 3 * DAY_MIN + 300, subject: 'Add help pages for getting started, billing and exports' },
+  { ago: 3 * DAY_MIN + 150, subject: 'Add search across products and orders' },
+  { ago: 3 * DAY_MIN + 20, subject: 'Show prices in local currencies' },
+  { ago: 2 * DAY_MIN + 280, subject: 'Move the payment code into its own folder' },
+  { ago: 2 * DAY_MIN + 130, subject: 'Add sign-up with email confirmation' },
+  { ago: 2 * DAY_MIN + 10, subject: 'Add order history to the account page' },
+  { ago: DAY_MIN + 250, subject: 'Fix the sign-up email link on small screens' },
+  { ago: DAY_MIN + 120, subject: 'Cache product images for a day' },
+  { ago: DAY_MIN + 15, subject: 'Bump Node to 22 in CI' },
+  { ago: 300, subject: 'Add a staging deploy script' },
+  { ago: 230, subject: 'Fix the cart badge count after removing an item' },
+  { ago: 160, merge: 0 },
+  { ago: 125, subject: 'Show the order number on the confirmation page' },
+  { ago: 88, merge: 1 },
+  { ago: 75, subject: 'Turn on the new search page for everyone' },
+  { ago: 52, subject: 'Log slow checkout requests' },
+  { ago: 40, subject: 'Update the billing help for annual plans' },   // Help pages changed docs/help/billing.md too
+  { ago: 30, subject: 'Fix a typo in the order confirmation email' },
+  { ago: 16, subject: 'Add alt text to product images' },
+  { ago: 5, subject: 'Update the README for the new search page' },
+];
+
+// Two agents from earlier today whose work was merged. Their folders and branches were tidied away after the merge, so
+// they are not on the board: the graph shows them through their work and merge commits (and those commits' trailers).
+const EARLIER_MERGES = [
+  { name: 'Payment retry', task: 'Retry a failed card payment once before showing an error', fromAgo: 280, workAgo: 170 },
+  { name: 'New search page', task: 'Build the new search page with filters and instant results', fromAgo: 220, workAgo: 100 },
+];
+
+/** 40 hex characters made from text, like a git object id: the same text gives the same id. */
+function hex40(text) {
+  let out = '';
+  for (let i = 0; i < 5; i++) out += hash32(`${i}:${text}`).toString(16).padStart(8, '0');
+  return out;
+}
+
+/** The branch name part the engine makes from an agent's name (engine.mjs slugify): "workbench/<slug>-<id>". */
+function slugify(name) {
+  const s = String(name || '').toLowerCase().normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32).replace(/-+$/, '');
+  return s || 'task';
+}
+
+/**
+ * A work commit's subject, made from the agent's task as the engine makes it: the first sentence, its first letter
+ * capitalised, cut at a word boundary to at most 72 characters. A closing full stop is left off, as in most projects.
+ */
+export function subjectOf(task) {
+  let s = firstSentence(String(task || ''), 100_000).replace(/\.$/, '').trim();
+  s = s.charAt(0).toUpperCase() + s.slice(1);
+  if (s.length > 72) {
+    const cut = s.slice(0, 73);
+    const at = cut.lastIndexOf(' ');
+    s = (at > 0 ? cut.slice(0, at) : s.slice(0, 72)).replace(/[\s,;:.!?-]+$/, '');
+  }
+  return s || 'Work by an agent';
+}
+
+function joinAnd(list) {
+  const a = list.filter(Boolean);
+  if (a.length <= 1) return a.join('');
+  return `${a.slice(0, -1).join(', ')} and ${a[a.length - 1]}`;
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const copyOf = (x) => (x == null ? x : structuredClone(x));
+
+/**
+ * The commits reachable from `tips`, newest first in topological order, the way `git log --topo-order` lists them:
+ * no commit before all of its children, and a merged branch's commits right after the merge that joined them.
+ */
+function topoOrder(commits, tips) {
+  const seen = new Set();
+  const walk = [...tips];
+  while (walk.length) {
+    const id = walk.pop();
+    if (seen.has(id) || !commits.has(id)) continue;
+    seen.add(id);
+    walk.push(...commits.get(id).parents);
+  }
+  const children = new Map([...seen].map(id => [id, 0]));
+  for (const id of seen) for (const p of commits.get(id).parents) if (children.has(p)) children.set(p, children.get(p) + 1);
+  // A stack: the newest tip first, then down each line until a commit still waits for another child.
+  const stack = [...seen].filter(id => children.get(id) === 0).map(id => commits.get(id))
+    .sort((x, y) => x.at - y.at || (x.id < y.id ? -1 : 1)).map(c => c.id);
+  const out = [];
+  while (stack.length) {
+    const c = commits.get(stack.pop());
+    out.push(c);
+    for (const p of c.parents) {
+      if (!children.has(p)) continue;
+      const left = children.get(p) - 1;
+      children.set(p, left);
+      if (left === 0) stack.push(p);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic diffs. One unified diff per file, shaped like `git diff --no-ext-diff --no-textconv --no-color
+// --no-renames` with core.quotePath=false, with exactly the added and removed line counts the agent's `files` list
+// reports. The lines are made up, in the style of each kind of file, from the file's own name and folder.
+
+/** Names for made-up code, from a path: src/invoices/large-account.ts gives invoice, Invoice, largeAccount, ... */
+function diffWords(path) {
+  const parts = String(path).split('/');
+  const file = parts[parts.length - 1];
+  const stem = file.replace(/\.(test|spec)\.[^.]+$/, '').replace(/\.[^.]+$/, '');
+  const split = s => s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(w => w && !/^\d+$/.test(w));
+  // Folders that hold any kind of thing do not name it: migrations/0042_invoice_lookup_index.sql is about invoices.
+  const containers = ['src', 'test', 'tests', 'lib', 'docs', 'app', 'db', 'schema', 'migrations', 'components', 'pages', 'routes', 'utils', 'helpers'];
+  const dirs = parts.slice(0, -1).filter(d => !containers.includes(d.toLowerCase()));
+  const stemWords = split(stem).length ? split(stem) : ['main'];
+  const dirWord = split(dirs[dirs.length - 1] || '')[0] || stemWords[0];
+  const one = w => (w.endsWith('ies') ? `${w.slice(0, -3)}y` : w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w);
+  const cap = w => w.charAt(0).toUpperCase() + w.slice(1);
+  const noun = one(dirWord);
+  const table = /(s|x|ch|sh)$/.test(noun) ? `${noun}es` : /[^aeiou]y$/.test(noun) ? `${noun.slice(0, -1)}ies` : `${noun}s`;
+  return {
+    noun, Noun: cap(noun), table,
+    thing: stemWords.map((w, i) => (i ? cap(w) : w)).join(''),
+    Thing: stemWords.map(cap).join(''),
+    THING: stemWords.join('_').toUpperCase(),
+    topic: stemWords.join(' '), Title: cap(stemWords.join(' ')),
+  };
+}
+
+/**
+ * Fill {{name}} placeholders. A word may be a function (a deck: the next card each time), and a card may hold
+ * placeholders of its own.
+ */
+function fillLine(line, words) {
+  let out = String(line);
+  for (let pass = 0; pass < 2 && out.includes('{{'); pass++) {
+    out = out.replace(/\{\{(\w+)\}\}/g, (m, k) => {
+      const v = words[k];
+      if (typeof v === 'function') return String(v());
+      return v == null ? m : String(v);
+    });
+  }
+  return out;
+}
+
+/** Cards from a list in a shuffled order, all of them before any comes again, never the same one twice in a row. */
+function deck(list, rng) {
+  let cards = [];
+  let last;
+  return () => {
+    if (!cards.length) {
+      cards = rng.shuffle(list);
+      if (cards.length > 1 && cards[cards.length - 1] === last) [cards[0], cards[cards.length - 1]] = [cards[cards.length - 1], cards[0]];
+    }
+    last = cards.pop();
+    return last;
+  };
+}
+
+const VERBS = ['load', 'send', 'retry', 'group', 'count', 'sort', 'find', 'mark', 'split', 'check', 'build', 'save', 'queue', 'merge'];
+const BEHAVIOURS = ['handles an empty list', 'keeps the order it was given', 'sends them in small batches', 'gives up after one retry',
+  'works for a large account', 'rounds the total to the cent', 'picks up a half-finished one', 'skips the ones already done',
+  'stops when it is cancelled', 'counts each one once', 'leaves the others alone', 'says what went wrong'];
+// Help text, before and after a rewrite in plain words.
+const PROSE = [
+  ['Navigate to the Billing section of the account dashboard to manage your subscription.', 'Open Billing to change your plan.'],
+  ['Utilise the Export functionality to generate a CSV of your invoices.', 'To download your invoices, choose Export, then CSV.'],
+  ['In the event that a payment fails, the system will reattempt the charge.', 'If a payment fails, we try again the next day.'],
+  ['Prior to inviting team members, ensure that you possess administrator privileges.', 'You need to be an admin to invite people to your team.'],
+  ['Upon successful registration, a verification email will be dispatched.', 'After you sign up, we send you an email to confirm your address.'],
+  ['Exports exceeding 10,000 rows are processed asynchronously.', 'Big exports take a few minutes. We email you when yours is ready.'],
+  ['Annual subscriptions are invoiced in advance for the full term.', 'Annual plans are paid up front for the whole year.'],
+  ['Refunds are issued to the original payment instrument.', 'Refunds go back to the card you paid with.'],
+  ['Users may modify their notification preferences at any time.', 'You can choose which emails you get, at any time.'],
+  ['Data is retained for a period of 90 days following account closure.', 'We keep your data for 90 days after you close your account.'],
+];
+const MORE_PROSE = ['Your plan renews on the same day each month.', 'You can switch to a yearly plan at any time.',
+  'Each invoice shows what you paid for, line by line.', 'Prices include tax where your country asks for it.',
+  'You can download any invoice again from the Invoices page.', 'Changes to your plan start right away.',
+  'If you downgrade, you keep the higher plan until the end of the month.', 'We send a receipt to the billing email after every payment.',
+  'Your card is never stored on our servers.', 'Need a hand? Write to us and a person will answer.'];
+const HEADINGS = ['## Before you start', '## Changing your plan', '## Downloading your invoices', '## If something goes wrong', '## Getting help'];
+const COPY = [
+  ['"welcome.title": "Welcome aboard",', '"welcome.title": "Welcome! Let us set up your shop",'],
+  ['"welcome.body": "Complete the onboarding flow to activate your account.",', '"welcome.body": "Three short steps and your shop is ready.",'],
+  ['"steps.profile": "Profile configuration",', '"steps.profile": "Tell us about your shop",'],
+  ['"steps.payments": "Payment provider integration",', '"steps.payments": "Choose how you get paid",'],
+  ['"steps.products": "Catalogue population",', '"steps.products": "Add your first products",'],
+  ['"steps.done": "Onboarding complete",', '"steps.done": "You are all set",'],
+  ['"button.next": "Proceed",', '"button.next": "Next",'],
+  ['"button.back": "Return",', '"button.back": "Back",'],
+  ['"button.skip": "Skip onboarding",', '"button.skip": "Skip for now",'],
+  ['"errors.required": "This field is mandatory",', '"errors.required": "Please fill this in",'],
+  ['"errors.email": "Invalid email format",', '"errors.email": "That email address does not look right",'],
+  ['"hint.storeName": "Enter store designation",', '"hint.storeName": "The name your customers will see",'],
+];
+const NEW_COPY = ['"checklist.title": "Your first steps",', '"checklist.products": "Add a product",', '"checklist.payments": "Connect payments",',
+  '"checklist.share": "Share your shop",', '"tips.photos": "Clear photos sell better",', '"tips.prices": "You can change prices later",',
+  '"progress.label": "Step {step} of {total}",', '"skip.confirm": "You can finish this later from Settings",',
+  '"done.title": "Your shop is ready",', '"done.body": "Share the link with your first customers.",',
+  '"errors.network": "We could not save that. Try again in a moment.",', '"hint.currency": "Prices show in the currency of your customer",',
+  '"tips.shipping": "Set your shipping prices before your first sale",', '"tips.tax": "We add tax for you where it applies",',
+  '"checklist.domain": "Use your own web address",', '"checklist.logo": "Upload your logo",', '"done.cta": "Open my shop",',
+  '"errors.storeName": "Pick a name with at least two letters",'];
+// A copy file's lines in order, for the unchanged lines around a change.
+const OLD_COPY_CONTEXT = ['"nav.home": "Home",', '"nav.products": "Products",', '"nav.orders": "Orders",', '"nav.customers": "Customers",',
+  '"nav.help": "Help",', '"account.title": "Your account",', '"account.signOut": "Sign out",', '"footer.contact": "Contact us",',
+  '"footer.terms": "Terms",', '"footer.privacy": "Privacy",'];
+
+// Each kind of file. A new file is `head`, then `blocks` (and one-line `notes` where a block does not fit), then
+// `foot`. A changed file has hunks of `context` lines around changed lines: `pairs` [before, after] where a line was
+// changed, `adds` where one was only added. `func` is what git puts after a hunk's @@ (the last line above it that
+// starts with a letter; none where git usually finds nothing).
+const KITS = {
+  code: {
+    head: ["import { db } from '../db/pool';", "import { log } from '../log';", "import type { {{Noun}} } from './types';", '',
+      'export const {{THING}}_LIMIT = {{n}};', ''],
+    foot: [],
+    blocks: [
+      ['export function is{{Thing}}Ready({{noun}}: {{Noun}}): boolean {', "  return {{noun}}.status === 'ready' && {{noun}}.total > 0;", '}'],
+      ['export type {{Thing}}Options = {', '  limit?: number;', '  signal?: AbortSignal;', '};'],
+      ['export async function {{verb}}{{Thing}}(accountId: string) {', '  const rows = await db.{{table}}.findMany({ where: { accountId } });',
+        "  log.debug('{{topic}}: {{table}} loaded', { accountId, count: rows.length });", '  return rows;', '}'],
+      ['export function to{{Noun}}Row({{noun}}: {{Noun}}) {', '  return {', '    id: {{noun}}.id,', '    total: {{noun}}.total,', '  };', '}'],
+      ['export async function {{verb}}{{Thing}}({{table}}: {{Noun}}[], size = {{THING}}_LIMIT) {', '  const done = [];',
+        '  for (let i = 0; i < {{table}}.length; i += size) {', '    done.push(...(await save{{Noun}}Batch({{table}}.slice(i, i + size))));', '  }',
+        '  return done;', '}'],
+      ['export async function {{verb}}{{Thing}}ForAccount(account: Account, options: {{Thing}}Options = {}) {',
+        '  if (options.signal?.aborted) return [];', '  const rows = await db.{{table}}.findMany({ where: { accountId: account.id }, take: options.limit });',
+        '  return rows.map(to{{Noun}}Row);', '}'],
+      ['function totalOf(rows: {{Noun}}[]): number {', '  return rows.reduce((sum, row) => sum + row.total, 0);', '}'],
+    ],
+    notes: ['// Keep each batch small, so one slow {{noun}} cannot hold up the rest.', '// Safe to run twice: it skips the {{table}} that are already done.',
+      '// Large accounts can have thousands of {{table}}.', '// Amounts are in cents, never in floats.', '// Times are in UTC everywhere in this file.',
+      '// Each step is logged, so support can follow what happened.', '// Returns early when there is nothing to do.'],
+    context: ['export async function {{verb}}{{Thing}}(account: Account) {', '  if (!account) return null;', '  const accountId = account.id;',
+      "  log.debug('{{topic}} started', { accountId });", '  const now = new Date();', '  try {', '    await lock(accountId);', '  } finally {',
+      '    release(accountId);', '  }', '  return { {{table}}: rows, total };', '}', ''],
+    pairs: [
+      ['  const rows = await db.{{table}}.findMany({ where: { accountId } });', '  const rows = await db.{{table}}.findMany({ where: { accountId }, take: {{THING}}_LIMIT });'],
+      ['  if (rows.length === 0) return [];', '  if (rows.length === 0) return { {{table}}: [], total: 0 };'],
+      ["  log.info('{{topic}} done', { accountId });", "  log.info('{{topic}} done', { accountId, count: rows.length });"],
+      ['  const total = rows.reduce((sum, row) => sum + row.amount, 0);', '  const total = roundToCents(rows.reduce((sum, row) => sum + row.amount, 0));'],
+      ['  await save{{Noun}}(row);', '  await save{{Noun}}(row, { retry: 1 });'],
+      ['  const started = Date.now();', '  const started = performance.now();'],
+      ["  if (!{{noun}}) throw new Error('{{Noun}} not found');", "  if (!{{noun}}) throw new NotFoundError('{{Noun}}', id);"],
+      ['  return rows.map(to{{Noun}}Row);', '  return rows.filter(isReady).map(to{{Noun}}Row);'],
+      ['  const options = { limit: 100, ...overrides };', '  const options = { limit: {{THING}}_LIMIT, ...overrides };'],
+      ['  for (const row of rows) {', '  for (const row of rows.slice(0, {{THING}}_LIMIT)) {'],
+      ['  }, 30_000);', '  }, 60_000);'],
+    ],
+    adds: ['  const batches = chunk(rows, {{THING}}_LIMIT);', "  log.info('{{topic}}: sending in batches', { accountId, batches: batches.length });",
+      '  for (const batch of batches) await send{{Noun}}Batch(batch);', '  if (options.signal?.aborted) return { sent, stopped: true };',
+      '  const sent = [];', '  await sleep(250);', '  sent.push(...batch);', '  return { sent, stopped: false };',
+      "  metrics.increment('{{topic}}.batches');", '  const retries = options.retries ?? 1;', '  if (!rows.length) return { sent: [], stopped: false };',
+      '  // One slow {{noun}} no longer holds up the rest.'],
+    func: 'export async function {{verb}}{{Thing}}(accountId: string, overrides = {}) {',
+  },
+  test: {
+    head: ["import { describe, it, expect, vi } from 'vitest';", "import { {{thing}}, make{{Noun}} } from './helpers/{{noun}}';", '', "describe('{{topic}}', () => {"],
+    foot: ['});'],
+    blocks: [
+      ["  it('{{behaviour}}', async () => {", '    const result = await {{thing}}(make{{Noun}}({ total: {{n}} }));', '    expect(result).toHaveLength({{m}});', '  });'],
+      ["  it('{{behaviour}}', () => {", '    expect({{thing}}([])).toEqual([]);', '  });'],
+      ["  it('{{behaviour}}', async () => {", "    const {{noun}} = make{{Noun}}({ status: 'pending' });", '    await {{thing}}([{{noun}}]);',
+        "    expect({{noun}}.status).toBe('done');", '  });'],
+      ["  it('{{behaviour}}', async () => {", '    const account = makeAccount({ {{table}}: {{n}} });', '    const result = await {{thing}}(account);',
+        '    expect(result.sent).toHaveLength({{m}});', '    expect(log.warn).not.toHaveBeenCalled();', '  });'],
+    ],
+    notes: ['  // These run against an account with forty {{table}}.', '  // Uses the fake clock, so no test waits for real.',
+      '  // Kept small, so a failure points at one thing.', '  // Slow on purpose: it checks the retry.'],
+    context: ['  beforeEach(() => vi.useRealTimers());', '', "  it('{{behaviour}}', async () => {", '    const account = makeAccount();',
+      '    const result = await {{thing}}([]);', '    expect(result).toEqual([]);', '  });', ''],
+    pairs: [
+      ['    expect(result).toHaveLength({{n}});', '    expect(result).toHaveLength({{m}});'],
+      ['    const result = await {{thing}}(make{{Noun}}({ total: {{n}} }));', '    const result = await {{thing}}(make{{Noun}}({ total: {{m}} }), { limit: 50 });'],
+      ['    expect(result.total).toBe({{n}});', '    expect(result.total).toBeCloseTo({{m}}.1, 2);'],
+      ["  it('{{behaviour}}', async () => {", "  it('{{behaviour}}', async () => {"],
+      ["    const {{noun}} = make{{Noun}}({ status: 'pending' });", "    const {{noun}} = make{{Noun}}({ status: 'paid', paidAt: new Date() });"],
+      ['    vi.useFakeTimers();', "    vi.useFakeTimers({ now: new Date('2026-01-01') });"],
+      ['    await {{thing}}([{{noun}}]);', '    await {{thing}}([{{noun}}], { retries: 1 });'],
+    ],
+    adds: ['    expect(result.sent).toHaveLength({{n}});', '    expect(log.warn).not.toHaveBeenCalled();', '    const account = makeAccount({ {{table}}: {{n}} });',
+      '    await vi.runAllTimersAsync();', '    expect(result.stopped).toBe(false);', '    controller.abort();', "  it('{{behaviour}}', async () => {", '  });', ''],
+    func: "describe('{{topic}}', () => {",
+  },
+  sql: {
+    head: ['-- Up', ''],
+    foot: [],
+    blocks: [
+      ['CREATE INDEX CONCURRENTLY IF NOT EXISTS {{table}}_account_id_created_at_idx', '  ON {{table}} (account_id, created_at);'],
+      ['CREATE INDEX CONCURRENTLY IF NOT EXISTS {{table}}_status_idx', "  ON {{table}} (status) WHERE status <> 'sent';"],
+      ['UPDATE {{table}}', '   SET batch_id = NULL', ' WHERE batch_id IS NOT NULL;'],
+      ['-- Down', 'DROP INDEX CONCURRENTLY IF EXISTS {{table}}_account_id_created_at_idx;', 'DROP INDEX CONCURRENTLY IF EXISTS {{table}}_status_idx;'],
+    ],
+    notes: ['-- Large accounts look up {{table}} by account and date when they export.', '-- CONCURRENTLY keeps the table usable while the index is built.',
+      '-- Safe to run again: every step checks first.', 'ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS batch_id uuid;',
+      'ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS sent_at timestamptz;', '-- Reviewed with the on-call engineer.'],
+    context: ['BEGIN;', '', '-- Up', '', 'COMMIT;', '', '-- Down', ''],
+    pairs: [
+      ['CREATE INDEX {{table}}_account_id_idx ON {{table}} (account_id);', 'CREATE INDEX {{table}}_account_id_idx ON {{table}} (account_id, created_at);'],
+      ['ALTER TABLE {{table}} ADD COLUMN status text;', "ALTER TABLE {{table}} ADD COLUMN status text NOT NULL DEFAULT 'open';"],
+      ['DROP INDEX {{table}}_account_id_idx;', 'DROP INDEX IF EXISTS {{table}}_account_id_idx;'],
+    ],
+    adds: ['ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS batch_id uuid;', '-- CONCURRENTLY keeps the table usable while the index is built.', ''],
+    func: null,
+  },
+  prose: {
+    head: ['# {{Title}}', ''],
+    foot: [],
+    blocks: [['{{heading}}', '', '{{more}}', '{{more}}'], ['1. Open Settings.', '2. Choose Billing.', '3. Pick a plan and press Save.'],
+      ['- {{more}}', '- {{more}}', '- {{more}}']],
+    notes: ['{{more}}'],
+    context: ['## Before you start', '', 'This page is for shop owners.', '', '## Getting help', '', 'Questions? Write to help@storefront.example.', ''],
+    pairs: PROSE,
+    adds: [...MORE_PROSE, ''],
+    func: '{{more}}',
+  },
+  json: {
+    head: ['{'],
+    foot: ['}'],
+    blocks: [],
+    notes: NEW_COPY.map(l => `  ${l}`),
+    context: OLD_COPY_CONTEXT.map(l => `  ${l}`),
+    pairs: COPY.map(p => p.map(l => `  ${l}`)),
+    adds: NEW_COPY.map(l => `  ${l}`),
+    func: null,
+  },
+  ui: {
+    head: ["import { useState } from 'react';", "import { Button } from '../components/Button';", "import { t } from '../i18n';", '', 'export function {{Thing}}() {'],
+    foot: ['}'],
+    blocks: [
+      ['  return (', '    <section className="{{thing}}">', "      <h1>{t('{{noun}}.title')}</h1>", "      <p className=\"lead\">{t('{{noun}}.intro')}</p>", '    </section>', '  );'],
+      ['  function next() {', '    setStep(Math.min(step + 1, lastStep));', '  }'],
+    ],
+    notes: ['  const [step, setStep] = useState(0);', '  const [open, setOpen] = useState(false);', '  const lastStep = steps.length - 1;',
+      '  // {{Title}} reads its words from the {{noun}} copy file.'],
+    context: ['  return (', '    <section className="{{thing}}">', "      <p>{t('{{noun}}.help')}</p>", '    </section>', '  );', '}', ''],
+    pairs: [
+      ["      <p className=\"lead\">{t('{{noun}}.intro')}</p>", "      <p className=\"lead muted\">{t('{{noun}}.intro')}</p>"],
+      ["      <Link to=\"/search/v1\">{t('nav.search')}</Link>", "      <Link to=\"/search\">{t('nav.search')}</Link>"],
+      ['  const [step, setStep] = useState(0);', '  const [step, setStep] = useState(() => savedStep() ?? 0);'],
+      ["      <h1>{t('{{noun}}.title')}</h1>", "      <h1 className=\"title\">{t('{{noun}}.title')}</h1>"],
+      ["      <Button onClick={() => setStep(step + 1)}>{t('button.next')}</Button>", "      <Button onClick={() => setStep(Math.min(step + 1, lastStep))}>{t('button.next')}</Button>"],
+      ["      <Button variant=\"link\" onClick={skip}>{t('button.skip')}</Button>", "      <Button variant=\"secondary\" onClick={skip}>{t('button.skip')}</Button>"],
+      ['    <section className="{{thing}}">', '    <section className="{{thing}}" aria-labelledby="{{thing}}-title">'],
+    ],
+    adds: ['      <Progress step={step} of={lastStep} />', '      {error && <p role="alert">{error}</p>}', '  const lastStep = steps.length - 1;',
+      '  useEffect(() => saveStep(step), [step]);', "      <Button variant=\"secondary\" onClick={skip}>{t('button.skip')}</Button>", ''],
+    func: 'export function {{Thing}}() {',
+  },
+  css: {
+    head: [],
+    foot: [],
+    blocks: [['.{{thing}} {', '  display: flex;', '  gap: 8px;', '}'], ['@media (max-width: 480px) {', '  .{{thing}} {', '    flex-direction: column;', '  }', '}']],
+    notes: ['/* {{Title}} on small screens */', '/* Keep tap targets at least 44px tall. */', ''],
+    context: ['.{{thing}} {', '  padding: 12px 16px;', '  font-size: 14px;', '}', ''],
+    pairs: [['  gap: 8px;', '  gap: 12px;'], ['  display: grid;', '  display: flex;'], ['  padding: 12px;', '  padding: 8px 12px;']],
+    adds: ['  flex-wrap: wrap;', '  min-height: 44px;', '  align-items: center;'],
+    func: null,
+  },
+  text: {
+    head: [],
+    foot: [],
+    blocks: [],
+    notes: ['{{more}}'],
+    context: ['', '{{Title}} notes'],
+    pairs: PROSE,
+    adds: MORE_PROSE,
+    func: null,
+  },
+};
+
+function kitFor(path) {
+  const p = String(path).toLowerCase();
+  if (/(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[a-z]+$/.test(p)) return KITS.test;
+  if (/\.(tsx|jsx)$/.test(p)) return KITS.ui;
+  if (/\.(ts|js|mjs|cjs)$/.test(p)) return KITS.code;
+  if (/\.sql$/.test(p)) return KITS.sql;
+  if (/\.(md|markdown|txt)$/.test(p)) return KITS.prose;
+  if (/\.json$/.test(p)) return KITS.json;
+  if (/\.(css|scss)$/.test(p)) return KITS.css;
+  return KITS.text;
+}
+
+/**
+ * Exactly `n` lines made of whole blocks (a function, a test), a blank line after each, and single lines from `one()`
+ * where no block fits. Blocks not used yet in this file (`used`) come first; a block is used again only when its name
+ * changes each time (a fresh verb or test name), so nothing is declared twice.
+ */
+function blockLines(n, kit, words, rng, one, used) {
+  const out = [];
+  let room = n;
+  let last = null;
+  while (room > 0) {
+    const fits = room >= 3 ? kit.blocks.filter(b => b.length <= room && b !== last) : [];
+    const fresh = fits.filter(b => !used.has(b));
+    const renamed = fits.filter(b => /\{\{(verb|behaviour|more|heading)\}\}/.test(b[0]));
+    const choice = fresh.length ? fresh : renamed;
+    const block = choice.length ? rng.pick(choice) : [one()];
+    if (block.length > 1) { used.add(block); last = block; }
+    out.push(...block);
+    room -= block.length;
+    if (room > 1 && block.length > 1) { out.push(''); room -= 1; }
+  }
+  return out.map(l => fillLine(l, words));
+}
+
+/** Exactly `n` lines of a new file of this kind. */
+function newFileLines(n, kit, words, rng) {
+  const framed = n >= kit.head.length + kit.foot.length + 2;
+  const head = framed ? kit.head : [];
+  const foot = framed ? kit.foot : [];
+  const body = blockLines(n - head.length - foot.length, kit, words, rng, deck(kit.notes, rng), new Set());
+  return [...head.map(l => fillLine(l, words)), ...body, ...foot.map(l => fillLine(l, words))];
+}
+
+/** `@@` ranges leave out a count of 1, as git does. */
+const hunkRange = (start, len) => (len === 1 ? `${start}` : `${start},${len}`);
+
+/**
+ * A unified diff of one file, for `workDiff`'s `patch`. status 'added' is a new file of `adds` lines; 'modified' has
+ * one to three hunks with three lines of context around them, `dels` lines taken out and `adds` put in.
+ */
+function syntheticPatch({ path, status, adds, dels, key }) {
+  const rng = new Rng(`diff:${key}:${path}:${status}:${adds}:${dels}`);
+  const kit = kitFor(path);
+  const words = {
+    ...diffWords(path), n: () => rng.int(2, 50), m: () => rng.int(2, 50),
+    verb: deck(VERBS, rng), behaviour: deck(BEHAVIOURS, rng), more: deck(MORE_PROSE, rng), heading: deck(HEADINGS, rng),
+  };
+  const blob = (side) => hex40(`blob:${key}:${path}:${adds}:${dels}:${side}`).slice(0, 7);
+  const out = [`diff --git a/${path} b/${path}`];
+  if (status === 'added') {
+    const lines = newFileLines(adds, kit, words, rng);
+    out.push('new file mode 100644', `index 0000000..${blob('new')}`, '--- /dev/null', `+++ b/${path}`);
+    if (lines.length) out.push(`@@ -0,0 +${hunkRange(1, lines.length)} @@`, ...lines.map(l => `+${l}`));
+    return `${out.join('\n')}\n`;
+  }
+  out.push(`index ${blob('old')}..${blob('new')} 100644`, `--- a/${path}`, `+++ b/${path}`);
+  const total = adds + dels;
+  const count = Math.max(1, Math.min(total > 30 ? 3 : total > 10 ? 2 : 1, total));
+  // Spread the changes over the hunks so that each one changes something: added lines from the first hunk on,
+  // removed lines from the last hunk back.
+  const share = (n, i, fromEnd) => Math.floor(n / count) + ((fromEnd ? i >= count - (n % count) : i < n % count) ? 1 : 0);
+  // Unchanged lines come in runs from the kit's context, in its order, as they would stand in the file.
+  let at = rng.int(0, kit.context.length - 1);
+  const context = () => kit.context[at++ % kit.context.length];
+  const pair = deck(kit.pairs, rng);
+  const added = deck(kit.adds, rng);
+  const used = new Set();   // blocks this file already added, so no hunk declares the same thing again
+  const changed = () => {
+    for (let k = 0; ; k++) {
+      const [before, after] = pair().map(l => fillLine(l, words));
+      if (before !== after || k >= 4) return [before, after];
+    }
+  };
+  let oldAt = rng.int(4, 28);
+  let shift = 0;
+  for (let i = 0; i < count && total > 0; i++) {
+    const a = share(adds, i, false);
+    const d = share(dels, i, true);
+    const pairs = Array.from({ length: Math.min(a, d) }, changed);
+    const removed = [...pairs.map(p => p[0]), ...Array.from({ length: d - pairs.length }, () => changed()[0])];
+    // Lines only added come as whole blocks where they fit (a new test, a new function), else as single new lines.
+    const put = [...pairs.map(p => p[1]), ...blockLines(a - pairs.length, kit, words, rng, added, used)];
+    const func = kit.func ? ` ${fillLine(kit.func, words)}` : '';
+    out.push(`@@ -${hunkRange(oldAt, 6 + d)} +${hunkRange(oldAt + shift, 6 + a)} @@${func}`);
+    for (let k = 0; k < 3; k++) out.push(` ${fillLine(context(), words)}`);
+    for (const l of removed) out.push(`-${l}`);
+    for (const l of put) out.push(`+${l}`);
+    for (let k = 0; k < 3; k++) out.push(` ${fillLine(context(), words)}`);
+    shift += a - d;
+    oldAt += 6 + d + rng.int(6, 40);
+    at += rng.int(1, 4);   // the next hunk is further down the file
+  }
+  return `${out.join('\n')}\n`;
+}
+
+// ---------------------------------------------------------------------------
 
 const PLAN_CODES = { x: 'completed', '>': 'in_progress', '.': 'pending' };
 
@@ -443,6 +954,7 @@ export class Simulator {
     this._rng = new Rng(`world:${seed}`);
     this._askSeq = 0;
     this._seeded = null;
+    this._git = null;        // the demo's git repository, made by seedWorld() or on first use (_gitWorld)
   }
 
   /** Same as the module's available(): the instance stands in for an adapter module. */
@@ -582,6 +1094,12 @@ export class Simulator {
       proc: null, waiting: null, pendingAsk: null, openTool: null, lastSentence: null, lastAnswer: null, lastTs: null,
       sessionId: null, script: null, lastFinal: null,
       checkNames: null,    // checks reported before each final turn end, if the "repo" declares any
+      // What the person sees after the engine decides a turn (see _shownState), and what a merge card says about it.
+      checks: 'none', checkResults: [], rules: null, closedFrom: null,
+      // Its pretend git: the branch and where it stands (see "the demo's git repository"); for roots that have one.
+      git: null,
+      created: new Set(),  // paths its work added as new files (never shown: the diff says "new file" for them)
+      paths: new Set(),    // every path it has changed, kept after a merge empties `files`
     };
     this._agents.set(id, a);
     return a;
@@ -647,20 +1165,28 @@ export class Simulator {
     const root = this._root(a);
     const r = a.rng;
     const f = root.files.get(path) || { path, adds: 0, dels: 0 };
-    if (tool === 'Write' && !root.files.has(path)) f.adds += r.int(14, 72);
-    else { f.adds += r.int(2, 18); f.dels += r.int(0, 9); }
+    if (tool === 'Write' && !root.files.has(path)) {
+      f.adds += r.int(14, 72);
+      if (!root.paths.has(path)) root.created.add(path);   // a file its work adds, not one it rewrote
+    } else { f.adds += r.int(2, 18); f.dels += r.int(0, 9); }
     root.files.set(path, f);
+    root.paths.add(path);
     if (!this._buffer) this._emitFiles(root);   // history writes one files event at the end instead
   }
 
-  _emitFiles(root) {
+  /** What the agent changed and has not merged: the `files` of its view. */
+  _filesOf(root) {
     const list = [...root.files.values()].map(f => ({ ...f }));
-    this._ev(root, EV.FILES, { files: {
+    return {
       changed: list.length,
       adds: list.reduce((s, f) => s + f.adds, 0),
       dels: list.reduce((s, f) => s + f.dels, 0),
       list,
-    } });
+    };
+  }
+
+  _emitFiles(root) {
+    return this._ev(root, EV.FILES, { files: this._filesOf(root) });
   }
 
   _emitPlan(a) { this._ev(a, EV.PLAN, { items: a.plan.map(p => ({ ...p })) }); }
@@ -735,6 +1261,8 @@ export class Simulator {
       const state = results.length === names.length ? 'passed' : 'running';
       this._ev(a, EV.CHECKS, { checks: { state, results: results.map(r => ({ ...r })) } });
     }
+    a.checks = results.every(r => r.ok) ? 'passed' : 'failed';
+    a.checkResults = results.map(r => ({ ...r }));
   }
 
   *_doSteps(a, steps) {
@@ -804,6 +1332,14 @@ export class Simulator {
     this._ev(a, EV.TURN, { phase: 'start' });
     this._ev(a, EV.STATE, { state: STATE.WORKING });
     a.phase = 'working';
+    // A new turn clears the last receipt (the store does the same), and a merge problem, as the engine does.
+    a.checks = 'none';
+    a.checkResults = [];
+    a.rules = null;
+    if (a.git && a.git.problem) {
+      a.git.problem = null;
+      this._emitWork(a);
+    }
   }
 
   /** End a turn the way Claude Code's result message does. The engine decides the root's state from it. */
@@ -858,6 +1394,7 @@ export class Simulator {
     if (this._seeded) return this._seeded.map(r => ({ ...r }));
     this._sync();
     const now = this._now();
+    this._gitWorld(now);      // the repository's history first: each agent starts from what was newest on main then
     const live = [];          // [agent, generator] to start once the history is out
     const roots = [];
     const factors = new Map();
@@ -910,6 +1447,9 @@ export class Simulator {
       });
       this._ev(a, EV.STATE, { state: STATE.STARTING });
     });
+    // Its own branch, from what was newest on main when it started, as the engine makes for a real agent.
+    this._attachGit(a, this._gitBaseAt(t0), spec.git);
+    this._at(t0, () => this._emitWork(a));
     this._at(t0 + 1500, () => this._turnStart(a));
 
     const jobs = (spec.helpers || []).map(h => this._seedJob(a, h));
@@ -966,6 +1506,9 @@ export class Simulator {
         });
         a.state = spec.end;
         a.phase = 'idle';
+        a.checks = checked ? 'passed' : 'none';
+        a.checkResults = checked ? spec.checks.map(c => ({ ...c })) : [];
+        a.rules = spec.rules ? structuredClone(spec.rules) : null;
         live.push([a, this._conversation(a, null)]);
         break;
       }
@@ -1203,7 +1746,8 @@ export class Simulator {
     this._think(a);
     yield a.rng.between(1000, 2200);
     const key = a.script ? a.script.topic.key : 'project';
-    const files = a.script ? a.script.files : [...a.files.keys()];
+    // After a merge its `files` are empty: it goes on with the files it worked on before.
+    const files = a.script ? a.script.files : [...(a.files.size ? a.files.keys() : a.paths)];
     const main = files[0] || 'src/index.ts';
     let plan;
     if (question && NEGATIVE_RE.test(text)) plan = { steps: [['Bash', 'git diff --stat']], done: 'OK, I left that as it is. Everything else is done.' };
@@ -1213,6 +1757,7 @@ export class Simulator {
       done: 'I made the change you asked for, and the tests still pass.',
     };
     yield* this._doSteps(a, plan.steps);
+    if (plan.after) plan.after();
     if (plan.forget) {
       for (const p of plan.forget) a.files.delete(p);
       this._emitFiles(a);
@@ -1222,8 +1767,17 @@ export class Simulator {
     this._turnEnd(a, this._withHints(a, plainFinal(plan.done)));
   }
 
-  /** Follow-ups the mockup offers for the two finished demo agents. */
+  /** Follow-ups the mockup offers for the two finished demo agents, and bringing in main after a conflict. */
   _specialFollowUp(a, text) {
+    // "Ask it to bring in main" after a conflict: it merges main into its own branch and settles the clash there.
+    if (a.git && a.git.behind && !a.git.thrownAway && /\b(conflicts?|bring in|merge)\b/i.test(text)) {
+      const path = (a.git.conflict || []).find(p => a.files.has(p)) || [...a.files.keys()][0] || 'README.md';
+      return {
+        steps: [['Bash', `git merge ${a.git.from}`, true, 'Bring in the latest work'], ['Read', path], ['Edit', path], ['Bash', 'git commit --no-edit']],
+        after: () => this._bringInMain(a),
+        done: `I brought in the latest ${a.git.from} and resolved the conflict in ${baseName(path)}, keeping both changes.`,
+      };
+    }
     if (a.name === 'Invoice export' && /\b(undo|revert|remove|take (it |that )?out|back out)\b/i.test(text)) {
       return {
         steps: [['Bash', 'git rm migrations/0042_invoice_lookup_index.sql', true, 'Take out the database change'], ['Edit', 'src/invoices/query.ts'], ['Bash', 'npm test']],
@@ -1311,6 +1865,8 @@ export class Simulator {
       return { ok: true, reply: `${a.name} already has that.` };   // the same answer arriving by a second route
     }
     if (a.kind === 'helper' && ENDED.has(a.state)) return { ok: false, reply: `${a.name} has already finished its part.` };
+    // Its folder is gone with its work, as for an earlier agent: "Its work was thrown away, so it cannot continue."
+    if (a.git && a.git.thrownAway) return { ok: false, reply: `${a.name}’s work was thrown away, so it cannot continue.` };
     if (a.phase === 'stopped' || a.phase === 'failed') return { ok: false, reply: `${a.name} has stopped, so it cannot take messages.` };
     if (a.pendingAsk && a.pendingAsk.type === 'question') return this._resolveOwnAsk(a, a.pendingAsk, text);
     if (a.waiting && a.waiting.wait === 'message') {
@@ -1374,7 +1930,13 @@ export class Simulator {
         const res = sim._message(a, String(text ?? '').trim(), null);
         if (res && res.ok === false) throw Object.assign(new Error(res.reply), { plain: true });
       },
-      async stop() { sim._sync(); if (a.phase !== 'stopped') sim._stopTree(a, false); },   // the engine emits the stopped state
+      async stop() {
+        sim._sync();
+        if (a.phase === 'stopped') return;
+        // The engine closes a finished agent's idle process quietly: it still shows the state it finished in.
+        if (a.phase === 'idle') a.closedFrom = sim._shownState(a);
+        sim._stopTree(a, false);   // the engine emits the stopped state, when there is one to show
+      },
       info() { return { pid: null, sessionId: a.sessionId, alive: !['new', 'stopped', 'failed'].includes(a.phase) }; },
     };
   }
@@ -1404,6 +1966,9 @@ export class Simulator {
     return this._handle(a, () => {
       if (started) return;
       started = true;
+      // Like a real agent, it works on its own branch, made from what is newest on main now.
+      this._attachGit(a, this._gitWorld().head);
+      this._emitWork(a);
       this._run(a, this._runnerProc(a));
     });
   }
@@ -1515,5 +2080,426 @@ export class Simulator {
     let text = this._withHints(a, plainFinal(doneSentence(s.topic), check, s.deniedNote, helpers));
     if (s.question) text += `\n\n${s.question.q(s.topic.key)}`;
     return text;
+  }
+
+  // ---- the demo's git repository ----
+  // Every root agent gets a branch, workbench/<slug>-<id>, from what was newest on main when it started. Its work stays
+  // uncommitted in its folder until it is merged, as with a real agent: then a work commit W goes on its branch and a
+  // merge commit M joins W into main. The engine calls the public methods below in demo mode (section 6 of the spec).
+  // gitGraph() and changes() only read: they never draw from a random stream and never move simulated time.
+
+  /**
+   * The repository, made once, at seedWorld() or on first use: the person's history and two agents' work merged earlier
+   * today, ending at main. Ids and times come from the repository's own seeded stream, so looking changes nothing.
+   */
+  _gitWorld(at) {
+    if (this._git) return this._git;
+    const now = Number.isFinite(at) ? at : this._now();
+    const rng = new Rng(`git:${this.seed}`);
+    this._git = { name: DEMO_REPO, branch: TRUNK_BRANCH, dirty: DEMO_DIRTY, identity: true, head: null,
+      commits: new Map(), refs: new Map(), hidden: new Map() };
+    const g = this._git;
+    const when = ago => now - ago * MIN + Math.round(rng.between(-30, 30) * SEC);
+    for (const step of TRUNK) {
+      if (step.merge === undefined) {
+        g.head = this._addCommit({ id: rng.hex(40), parents: g.head ? [g.head] : [], subject: step.subject, author: YOU,
+          at: when(step.ago), agentId: null, kind: 'commit' }).id;
+        continue;
+      }
+      const e = EARLIER_MERGES[step.merge];
+      const agentId = rng.hex(6);
+      const subject = subjectOf(e.task);
+      const work = this._addCommit({ id: rng.hex(40), parents: [this._gitBaseAt(now - e.fromAgo * MIN)], subject, author: e.name,
+        at: when(e.workAgo), agentId, kind: 'work' });
+      g.head = this._addCommit({ id: rng.hex(40), parents: [g.head, work.id], subject: `Merge ${e.name}: ${subject}`, author: YOU,
+        at: when(step.ago), agentId, kind: 'merge' }).id;
+    }
+    g.refs.set(TRUNK_BRANCH, g.head);
+    return g;
+  }
+
+  _addCommit(c) {
+    const commit = { id: c.id, parents: [...c.parents], subject: c.subject, author: c.author, at: c.at,
+      agentId: c.agentId ?? null, kind: c.kind || 'commit', tree: c.tree || hex40(`tree:${c.id}`) };
+    this._git.commits.set(commit.id, commit);
+    return commit;
+  }
+
+  /** A commit made now: its id comes from what it holds, as git's does. */
+  _newCommit(c) {
+    const id = hex40(`commit|${c.parents.join(',')}|${c.tree}|${c.subject}|${c.author}|${c.at}`);
+    return this._addCommit({ ...c, id });
+  }
+
+  /** The newest commit on main's own line (first parents) made at or before `t`: where an agent started then. */
+  _gitBaseAt(t) {
+    const g = this._gitWorld();
+    let id = g.head;
+    for (;;) {
+      const c = g.commits.get(id);
+      if (!c || c.at <= t || !c.parents.length) return id;
+      id = c.parents[0];
+    }
+  }
+
+  _isAncestor(ancestor, of) {
+    const g = this._gitWorld();
+    const walk = [of];
+    const seen = new Set();
+    while (walk.length) {
+      const id = walk.pop();
+      if (id === ancestor) return true;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const c = g.commits.get(id);
+      if (c) walk.push(...c.parents);
+    }
+    return false;
+  }
+
+  /** Give a root its branch at `base`. `extra.conflict`: paths you changed on main since, which its work clashes with. */
+  _attachGit(a, base, extra = null) {
+    const g = this._gitWorld();
+    const branch = `workbench/${slugify(a.name)}-${a.id}`;
+    const conflict = extra && Array.isArray(extra.conflict) ? [...extra.conflict] : null;
+    a.git = { branch, from: g.branch, base, since: base, head: base, folder: true, behind: !!conflict, conflict,
+      merged: null, problem: null, thrownAway: null };
+    g.refs.set(branch, base);
+    return a.git;
+  }
+
+  /** The AgentView's `work`, whole: `agent.work` replaces it as a whole. */
+  _workOf(a) {
+    const w = a.git;
+    return {
+      branch: w.thrownAway ? null : w.branch,
+      from: w.from,
+      folder: w.folder,
+      merged: w.merged ? { ...w.merged } : null,
+      problem: w.problem ? { ...w.problem, paths: [...w.problem.paths] } : null,
+      thrownAway: w.thrownAway ? { ...w.thrownAway } : null,
+    };
+  }
+
+  _emitWork(a) {
+    return this._ev(a, WORK_EVENT, { work: this._workOf(a) });
+  }
+
+  /**
+   * The state the person sees for a root, as the engine decides it from this agent's events: the end of a turn is
+   * decided from the final message and the checks it reported, as the engine does in the demo.
+   */
+  _shownState(a) {
+    if (a.kind === 'helper') return a.state;
+    switch (a.phase) {
+      case 'new': return STATE.STARTING;
+      case 'working': return STATE.WORKING;
+      case 'waiting_helpers': return STATE.WAITING_HELPERS;
+      case 'asking': {
+        const type = a.pendingAsk && a.pendingAsk.type;
+        return type === 'permission' ? STATE.NEEDS_OK : type === 'stuck' ? STATE.MAYBE_STUCK : STATE.QUESTION;
+      }
+      case 'failed': return STATE.FAILED;
+      case 'stopped': return a.closedFrom || STATE.STOPPED;
+      default:
+        if (a.lastFinal && extractQuestion(a.lastFinal)) return STATE.QUESTION;
+        return a.checks === 'passed' ? STATE.DONE_CHECKED : a.checks === 'failed' ? STATE.CHECKS_FAILED : STATE.DONE_CLAIMED;
+    }
+  }
+
+  /**
+   * Its work now, like workspace.mjs's snapshotWork: every changed file not hidden by a .gitignore, as a tree, and the
+   * ones left out. `workId` binds a card to exactly what it showed.
+   */
+  _snapshotWork(a) {
+    const g = this._gitWorld();
+    const w = a.git;
+    const all = this._filesOf(a).list;
+    const files = all.filter(f => !f.ignored);
+    const left = all.filter(f => f.ignored).map(f => ({ path: f.path, why: 'ignored' }));
+    const sinceTree = (g.commits.get(w.since) || {}).tree || hex40(`tree:${w.since}`);
+    const tree = files.length
+      ? hex40(`tree|${w.since}|${JSON.stringify(files.map(f => [f.path, f.adds, f.dels, !!f.binary, !!f.large]))}`)
+      : sinceTree;
+    return { head: w.head, tree, since: w.since, workId: `${w.head}:${tree}`, changed: tree !== sinceTree, files, left };
+  }
+
+  /** The root a git method is about, or the plain reason it cannot be. `use`: 'show' takes a helper to its agent. */
+  _gitTarget(agentId, use) {
+    const a = this._agents.get(String(agentId ?? ''));
+    if (!a) return { refusal: 'That agent is not part of the demo.' };
+    if (a.kind === 'helper') {
+      if (use === 'show') return this._gitTarget(a.rootId, use);
+      return { refusal: use === 'merge'
+        ? 'Helpers work in their agent’s folder. Merge the agent instead.'
+        : 'Helpers work in their agent’s folder. Throw away the agent instead.' };
+    }
+    if (!a.git) {
+      return { refusal: use === 'merge' ? SIM_NO_GIT : use === 'discard' ? 'This is the demo, so nothing is really thrown away.'
+        : 'This is the demo, so there are no changes to show.' };
+    }
+    return { agent: a };
+  }
+
+  /**
+   * The git screen's data, in the shape of the engine's gitGraph() (which wraps workspace.mjs's gitGraph()):
+   *   { ok: true, head, branch, repo: { name, branch, head, dirty, identity }, commits, more, agents }
+   * commits: [{ id, parents, subject, author, at, refs, agentId, kind }], newest first in topological order, at most
+   * `limit`; `agentId` and `kind` follow the commit's Workbench trailers (only work and merge commits carry them).
+   * agents: every root with a branch: [{ id, name, state, earlier, harness, branch, from, base, since, files, work }].
+   * `views` (optional: AgentViews, a Map of them, or a lookup by id) supplies the state, name and work the person
+   * sees; without them the simulator's own record of each agent is used.
+   */
+  gitGraph({ views = null, limit = 200 } = {}) {
+    const g = this._gitWorld();
+    const viewOf = typeof views === 'function' ? views
+      : views instanceof Map ? (id) => views.get(id)
+        : Array.isArray(views) ? ((byId) => (id) => byId.get(id))(new Map(views.filter(Boolean).map(v => [v.id, v])))
+          : () => null;
+    const refsAt = new Map();
+    for (const [name, id] of g.refs) {
+      if (!refsAt.has(id)) refsAt.set(id, []);
+      refsAt.get(id).push(name);
+    }
+    const order = topoOrder(g.commits, [...new Set(g.refs.values())]);
+    const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 200;
+    const commits = order.slice(0, max).map(c => ({
+      id: c.id, parents: [...c.parents], subject: c.subject, author: c.author, at: c.at,
+      refs: [...(refsAt.get(c.id) || [])], agentId: c.agentId, kind: c.kind,
+    }));
+    const agents = [];
+    for (const a of this._agents.values()) {
+      if (a.kind === 'helper' || !a.git || !a.git.folder || a.git.thrownAway) continue;
+      const v = viewOf(a.id) || null;
+      agents.push({
+        id: a.id, name: (v && v.name) || a.name, state: (v && v.state) || this._shownState(a), earlier: !!(v && v.earlier),
+        harness: (v && v.harness) || a.harness, branch: a.git.branch, from: a.git.from, base: a.git.base, since: a.git.since,
+        files: this._filesOf(a), work: v && v.work ? copyOf(v.work) : this._workOf(a),
+      });
+    }
+    return {
+      ok: true, head: g.head, branch: g.branch,
+      repo: { name: g.name, branch: g.branch, head: g.head, dirty: g.dirty, identity: g.identity },
+      commits, more: order.length > max, agents,
+    };
+  }
+
+  /**
+   * An agent's work as a diff, in workspace.mjs's workDiff shape: { ok: true, workId, since, head, files, left, omitted }.
+   * files: [{ path, status: 'added'|'modified', adds, dels, binary?, large?, patch }], the files its `files` lists (left
+   * out: those a .gitignore hides), each `patch` a unified diff of exactly that many added and removed lines.
+   * A helper's id gives its agent's work. Refusals: { ok: false, reply }.
+   */
+  changes(agentId, { maxFiles = 300 } = {}) {
+    const t = this._gitTarget(agentId, 'show');
+    if (t.refusal) return { ok: false, reply: t.refusal };
+    const a = t.agent;
+    if (a.git.thrownAway) return { ok: false, reply: `${a.name}’s work was thrown away, so there is nothing to show.` };
+    const snap = this._snapshotWork(a);
+    const max = Number.isFinite(maxFiles) && maxFiles >= 0 ? Math.floor(maxFiles) : 300;
+    const files = snap.files.slice(0, max).map(f => {
+      const status = a.created.has(f.path) && !f.dels ? 'added' : 'modified';
+      const out = { path: f.path, status, adds: f.adds, dels: f.dels };
+      if (f.binary) out.binary = true;
+      if (f.large) out.large = true;
+      out.patch = f.binary || f.large ? null
+        : syntheticPatch({ path: f.path, status, adds: f.adds, dels: f.dels, key: `${this.seed}:${a.id}:${a.git.since}` });
+      return out;
+    });
+    return { ok: true, workId: snap.workId, since: snap.since, head: snap.head, files, left: snap.left, omitted: Math.max(0, snap.files.length - max) };
+  }
+
+  /** Why it cannot be merged now, in the engine's words, or null. */
+  _mergeRefusal(a, shown, state) {
+    if (ACTIVE.has(shown)) return `${a.name} is still working. Merge it when it is done.`;
+    if (!a.git.folder || a.git.thrownAway) return 'Its folder is gone, so there is nothing to merge.';
+    if (state && state !== shown) return 'That changed. Have another look.';
+    if (!this._snapshotWork(a).changed) return `${a.name}’s work is already in ${this._gitWorld().branch}.`;
+    return null;
+  }
+
+  /** The merge card's detail: the counts first, then whatever applies, in the engine's words. */
+  _mergeDetail(a, snap) {
+    const g = this._gitWorld();
+    const adds = snap.files.reduce((s, f) => s + f.adds, 0);
+    const dels = snap.files.reduce((s, f) => s + f.dels, 0);
+    const parts = [`${plural(snap.files.length, 'file', 'files')}, +${adds} −${dels}. Its work becomes a commit on its branch, joined into ${g.branch} by a merge commit.`];
+    const failed = a.checkResults.filter(r => !r.ok).map(r => r.name);
+    if (a.checks === 'failed' && failed.length) parts.push(`${failed.length === 1 ? 'A check' : 'Checks'} failed: ${joinAnd(failed)}.`);
+    else if (a.checks !== 'passed') parts.push('Nothing checked its work.');
+    for (const r of (a.rules && a.rules.broken) || []) parts.push(`It broke a rule you set: ${String(r.say).replace(/[.!?]+$/, '')}.`);
+    const paths = snap.files.map(f => f.path);
+    if (paths.includes('workbench.json')) parts.push('It changes workbench.json, which sets the checks for later agents.');
+    const loaded = paths.filter(p => /(^|\/)\.claude\//.test(p) || /(^|\/)\.mcp\.json$/.test(p));
+    if (loaded.length) parts.push(`It changes ${joinAnd(loaded)}, which later agents load.`);
+    if (snap.left.length) parts.push(`${plural(snap.left.length, 'file stays', 'files stay')} out: hidden by a .gitignore.`);
+    if (g.dirty > 0) parts.push(g.dirty === 1 ? 'Your 1 uncommitted change stays as it is.' : `Your ${g.dirty} uncommitted changes stay as they are.`);
+    return parts.join(' ');
+  }
+
+  /**
+   * The merge card for an agent, or why not. Never merges. `state`: the state the page drew its button for.
+   * -> { ok: true, agentId, reply, confirm: { kind: 'merge', sentence, detail, yes, no, danger }, expect: { workId, into, intoHead } }
+   *    (the engine gives the card its id and keeps `expect` for merge()) | { ok: false, reply }
+   */
+  proposeMerge(agentId, { state = null, view = null } = {}) {
+    const t = this._gitTarget(agentId, 'merge');
+    if (t.refusal) return { ok: false, reply: t.refusal };
+    const a = t.agent;
+    const why = this._mergeRefusal(a, (view && view.state) || this._shownState(a), state);
+    if (why) return { ok: false, reply: why };
+    const g = this._gitWorld();
+    const snap = this._snapshotWork(a);
+    const sentence = `Merge ${a.name} into ${g.branch}?`;
+    return {
+      ok: true, agentId: a.id, reply: sentence,
+      confirm: { kind: 'merge', sentence, detail: this._mergeDetail(a, snap), yes: 'Merge', no: 'Cancel', danger: false },
+      expect: { workId: snap.workId, into: g.branch, intoHead: g.head },
+    };
+  }
+
+  /** A merge that did not happen: a problem the lid keeps showing, for the reasons the engine keeps one. */
+  _mergeProblem(a, why, sentence, paths = []) {
+    a.git.problem = { why, sentence, paths: [...paths], at: this._ts ?? this._now() };
+    return { ok: false, why, sentence, paths: [...paths], reply: sentence, events: [this._emitWork(a)] };
+  }
+
+  /**
+   * Merge an agent's work, as mergeWork does: its work becomes a commit W on its branch, and a merge commit M joins W
+   * into main. Always works, except for Help pages, whose work clashes with yours until it brings in main.
+   * `expect` (from proposeMerge) binds it to what the card showed. The outcome goes out as the same events the engine
+   * sends for a real merge (`agent.work`, and `agent.files` emptied), and comes back in `events` too.
+   * -> { ok: true, into, merge, work, files, adds, dels, reply, events } | { ok: false, why?, sentence?, paths?, reply, events? }
+   */
+  merge(agentId, { expect = null, view = null } = {}) {
+    this._sync();
+    const t = this._gitTarget(agentId, 'merge');
+    if (t.refusal) return { ok: false, reply: t.refusal };
+    const a = t.agent;
+    const w = a.git;
+    const g = this._gitWorld();
+    const into = g.branch;
+    const shown = (view && view.state) || this._shownState(a);
+    if (ACTIVE.has(shown)) return { ok: false, reply: `${a.name} is still working. Merge it when it is done.` };
+    if (!w.folder || w.thrownAway) {
+      const sentence = 'Its folder is gone, so there is nothing to merge.';
+      return { ok: false, why: 'gone', sentence, reply: sentence };
+    }
+    if (expect && ((expect.into && expect.into !== into) || (expect.intoHead && expect.intoHead !== g.head))) {
+      return this._mergeProblem(a, 'moved', `${into} changed since you looked. Have another look.`);
+    }
+    const snap = this._snapshotWork(a);
+    if (expect && expect.workId && expect.workId !== snap.workId) {
+      const sentence = `${a.name}’s work changed since you looked. Have another look.`;
+      return { ok: false, why: 'changed', sentence, reply: sentence };
+    }
+    const nothing = `${a.name}’s work is already in ${into}.`;
+    if (!snap.changed) return { ok: false, why: 'nothing', sentence: nothing, reply: nothing };
+    if (!this._isAncestor(w.since, g.head)) {
+      return this._mergeProblem(a, 'ancestry', `${a.name} started from a commit that is no longer in ${into}, so merging it would bring in other work.`);
+    }
+    const at = this._ts ?? this._now();
+    const subject = subjectOf(a.task);
+    let work = w.head;
+    if (snap.tree !== g.commits.get(w.head).tree) {   // its folder holds work not yet committed: commit it on its branch
+      work = this._newCommit({ parents: [w.head], tree: snap.tree, subject, author: a.name, at, agentId: a.id, kind: 'work' }).id;
+      g.refs.set(w.branch, work);
+      w.head = work;
+    }
+    if (this._isAncestor(work, g.head)) return { ok: false, why: 'nothing', sentence: nothing, reply: nothing };
+    if (w.behind) {   // W stays on its branch; nothing changes on main
+      const clash = (w.conflict || []).filter(p => snap.files.some(f => f.path === p));
+      const out = this._mergeProblem(a, 'conflict', `${a.name}’s work does not merge cleanly into ${into}.`, clash.length ? clash : w.conflict || []);
+      out.reply = `${out.sentence} ${SIM_SAYS_MERGED}`;
+      return out;
+    }
+    const m = this._newCommit({ parents: [g.head, work], tree: hex40(`tree|${g.head}|${work}`), subject: `Merge ${a.name}: ${subject}`,
+      author: YOU, at, agentId: a.id, kind: 'merge' });
+    g.head = m.id;
+    g.refs.set(into, m.id);
+    const files = snap.files.length;
+    const adds = snap.files.reduce((s, f) => s + f.adds, 0);
+    const dels = snap.files.reduce((s, f) => s + f.dels, 0);
+    w.since = work;
+    w.merged = { into, merge: m.id, at, files, adds, dels };
+    w.problem = null;
+    a.files.clear();
+    a.created.clear();
+    const events = [this._emitWork(a), this._ev(a, EV.FILES, { files: { changed: 0, adds: 0, dels: 0, list: [] } })];
+    return { ok: true, into, merge: m.id, work, files, adds, dels, reply: `Merged ${a.name} into ${into}. ${SIM_SAYS_MERGED}`, events };
+  }
+
+  /** After a conflict, the agent merged main into its own branch and settled the clash: its next merge goes through. */
+  _bringInMain(a) {
+    const g = this._gitWorld();
+    const w = a.git;
+    if (!w || w.thrownAway || !w.behind) return;
+    const c = this._newCommit({ parents: [w.head, g.head], tree: this._snapshotWork(a).tree, subject: `Merge branch '${g.branch}' into ${w.branch}`,
+      author: a.name, at: this._ts ?? this._now(), agentId: null, kind: 'commit' });
+    g.refs.set(w.branch, c.id);
+    w.head = c.id;
+    w.behind = false;
+  }
+
+  /**
+   * The throw-away card for an agent, or why not. `state`: the state the page drew its button for.
+   * -> { ok: true, agentId, reply, confirm: { kind: 'discard', sentence, detail, yes, no, danger: true }, expect: { workId } } | { ok: false, reply }
+   */
+  proposeDiscard(agentId, { state = null, view = null } = {}) {
+    const t = this._gitTarget(agentId, 'discard');
+    if (t.refusal) return { ok: false, reply: t.refusal };
+    const a = t.agent;
+    const w = a.git;
+    if (w.thrownAway) return { ok: false, reply: `${a.name}’s work was already thrown away.` };
+    if (!w.folder) return { ok: false, reply: 'Its folder is gone, so there is nothing to throw away.' };
+    const shown = (view && view.state) || this._shownState(a);
+    if (state && state !== shown) return { ok: false, reply: 'That changed. Have another look.' };
+    const n = this._filesOf(a).changed;
+    const sentence = `Throw away ${a.name}’s work?`;
+    let detail = `Its folder and its branch ${w.branch} are deleted, with ${n ? plural(n, 'changed file', 'changed files') : 'no changed files'}. Workbench keeps a hidden copy in git.`;
+    if (ACTIVE.has(shown)) detail += ' It is still working: it will be stopped first.';
+    return {
+      ok: true, agentId: a.id, reply: sentence,
+      confirm: { kind: 'discard', sentence, detail, yes: 'Throw it away', no: 'Keep it', danger: true },
+      expect: { workId: this._snapshotWork(a).workId },
+    };
+  }
+
+  /**
+   * Throw away an agent's work, as discardWork does: a hidden copy is kept (refs/workbench/discarded/<id>), then its
+   * folder and branch go. An agent still at work is stopped first. The outcome goes out as `agent.work` (thrownAway,
+   * no folder, no branch), and comes back in `events` too.
+   * -> { ok: true, saved, reply, events } | { ok: false, why?, sentence?, reply }
+   */
+  discard(agentId, { expect = null, view = null } = {}) {
+    this._sync();
+    const t = this._gitTarget(agentId, 'discard');
+    if (t.refusal) return { ok: false, reply: t.refusal };
+    const a = t.agent;
+    const w = a.git;
+    const g = this._gitWorld();
+    if (w.thrownAway) return { ok: false, reply: `${a.name}’s work was already thrown away.` };
+    if (!w.folder) {
+      const sentence = 'Its folder is gone, so there is nothing to throw away.';
+      return { ok: false, why: 'gone', sentence, reply: sentence };
+    }
+    const snap = this._snapshotWork(a);
+    if (expect && expect.workId && expect.workId !== snap.workId) {
+      const sentence = `${a.name}’s work changed since you looked. Have another look.`;
+      return { ok: false, why: 'changed', sentence, reply: sentence };
+    }
+    if (ACTIVE.has((view && view.state) || this._shownState(a)) && a.phase !== 'stopped') this._stopTree(a, true);
+    const at = this._ts ?? this._now();
+    const saved = `refs/workbench/discarded/${a.id}`;
+    const copy = this._newCommit({ parents: [w.head], tree: snap.tree, subject: `Thrown away: ${subjectOf(a.task)}`, author: YOU, at, agentId: a.id, kind: 'work' });
+    g.hidden.set(saved, copy.id);
+    g.refs.delete(w.branch);
+    w.folder = false;
+    w.problem = null;
+    w.thrownAway = { at, saved };
+    a.files.clear();
+    a.created.clear();
+    const events = [this._emitWork(a)];
+    return { ok: true, saved, reply: `Threw away ${a.name}’s work. Its folder and branch are gone. ${SIM_SAYS_THROWN}`, events };
   }
 }
