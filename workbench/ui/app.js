@@ -8,7 +8,7 @@ import { linkState, cannotSend } from './link.js';
 import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName } from './model.js';
 import { boardModel, splitEarlier, trayWords, agoText } from './boardmodel.js';
 import { Lanes, denseLanes } from './lanes.js';
-import { sizeClass, frame, layoutBoard, maxDenseRows, clipToLines } from './layout.js';
+import { sizeClass, frame, layoutBoard, maxDenseRows } from './layout.js';
 import { Board } from './board.js';
 import { lidView, tickSince } from './focus.js';
 import { cardHtml } from './card.js';
@@ -22,6 +22,7 @@ import { spentAmountWords } from './numbers.js';
 import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitFocusId } from './gitscreen.js';
 import { gitScreenWords } from './gitgraph.js';
 import { visibleText } from './diffview.js';
+import { clipToLines } from './layout.js';
 
 // The address is read once, before the key is taken out of it. Switches count only with the key (see address.js).
 const debug = debugSwitches(location.search);
