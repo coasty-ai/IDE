@@ -882,6 +882,32 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     check(fewer, 'one by one');
   });
 
+  test('file names that are not UTF-8 each keep their own counts, and get no patch: never another file’s', async () => {
+    const t = await agentRepo();
+    const blob = text => execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: t.ws.path, input: text, encoding: 'utf8' }).trim();
+    const latin1 = byte => Buffer.concat([Buffer.from('caf'), Buffer.from([byte]), Buffer.from('.txt')]);
+    // Two Latin-1 names. This disk may refuse them as files, so they are in the agent's index only, marked skip-worktree
+    // so that `add -A` leaves them in its work; on Linux they would be ordinary files.
+    const entries = [[latin1(0xe9), blob('line\n'.repeat(40))], [latin1(0xe8), blob('just one\n')]];
+    execFileSync('git', ['update-index', '--add', '--index-info'], { cwd: t.ws.path,
+      input: Buffer.concat(entries.map(([name, id]) => Buffer.concat([Buffer.from(`100644 ${id}\t`), name, Buffer.from('\n')]))) });
+    execFileSync('git', ['update-index', '--skip-worktree', '-z', '--stdin'], { cwd: t.ws.path,
+      input: Buffer.concat(entries.flatMap(([name]) => [name, Buffer.from([0])])) });
+    // And a real file whose UTF-8 name holds U+FFFD, the character both of those read as.
+    const read = 'caf�.txt';
+    write(t.w(read), 'a\nb\nc\n');
+    const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    assert.deepEqual(s.files, [ // in git's order, by bytes: e8, e9, then ef bf bd
+      { path: read, status: 'added', adds: 1, dels: 0 },
+      { path: read, status: 'added', adds: 40, dels: 0 },
+      { path: read, status: 'added', adds: 3, dels: 0 },
+    ]);
+    const d = await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    assert.deepEqual(d.files.map(({ patch, ...f }) => f), s.files);
+    assert.deepEqual(d.files.map(f => f.patch), [null, null, d.files[2].patch]);
+    assert.ok(d.files[2].patch.endsWith('\n+a\n+b\n+c\n'), d.files[2].patch);
+  });
+
   test('a .gitattributes of the agent’s own cannot make a text change look binary in the review, hidden or only in its index', async () => {
     const files = { ...STARTING_FILES, 'auth.js': 'function ok(u) { return check(u); }\n' };
     const shown = async (t, left) => {

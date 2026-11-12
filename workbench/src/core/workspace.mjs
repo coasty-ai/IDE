@@ -894,10 +894,11 @@ function putBack(kept) {
 
 /**
  * The tracked files missing from this folder that are not marked skip-worktree (`ls-files --deleted`): deleted or
- * renamed without staging it. A sparse checkout's files outside it are not listed.
+ * renamed without staging it. A sparse checkout's files outside it are not listed. Their names as bytes, one character
+ * for each (the `key` of changesBetween).
  */
 async function deletedFiles(cwd, run = git) {
-  return new Set(nulList((await run(['ls-files', '--deleted', '-z'], { cwd })).stdout));
+  return new Set(nulFields((await run(['ls-files', '--deleted', '-z'], { cwd, encoding: 'buffer' })).stdout).map(b => b.toString('latin1')));
 }
 
 /**
@@ -1110,32 +1111,52 @@ async function mergeTrees(run, root, into, work) {
 
 const isBlobMode = mode => mode === '100644' || mode === '100755' || mode === '120000';
 
+/** The fields of `buf` between NUL bytes, as buffers (nothing after a last NUL). */
+function nulFields(buf) {
+  const out = [];
+  let at = 0;
+  for (let i = buf.indexOf(0); i >= 0; i = buf.indexOf(0, at)) {
+    out.push(buf.subarray(at, i));
+    at = i + 1;
+  }
+  if (at < buf.length) out.push(buf.subarray(at));
+  return out;
+}
+
 /**
  * The files that differ between two trees, in git's order: [{ path, status, adds, dels, binary?, large? }], plus the
- * blob sizes (oldSize, newSize) that workDiff plans its patches with. No rename detection.
+ * blob sizes (oldSize, newSize) that workDiff plans its patches with. No rename detection. git's names are read as
+ * bytes: `path` is read as UTF-8, `key` is the bytes as they are (one character for each, to compare names exactly),
+ * and `lossy` marks a name that is not UTF-8 (two such names can read the same: workDiff gives them no patch).
  */
 async function changesBetween(run, cwd, from, to) {
   const common = ['-c', `core.bigFileThreshold=${LARGE_FILE_BYTES}`, 'diff-tree', '-r', '-z', '--no-renames', '--no-ext-diff', '--no-textconv'];
   const [rawOut, numstat] = await Promise.all([
-    run([...common, '--raw', '--no-abbrev', from, to], { cwd }), run([...common, '--numstat', from, to], { cwd }),
+    run([...common, '--raw', '--no-abbrev', from, to], { cwd, encoding: 'buffer' }), run([...common, '--numstat', from, to], { cwd, encoding: 'buffer' }),
   ]);
-  const raw = rawOut.stdout.split('\0');
+  const raw = nulFields(rawOut.stdout);
   const files = [];
   for (let i = 0; i + 1 < raw.length; i += 2) {
-    const m = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])/.exec(raw[i]);
+    const m = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])/.exec(raw[i].toString('latin1'));
     if (!m) throw plainError('Git listed the changes in a way Workbench does not understand.');
+    const name = raw[i + 1].toString('utf8');
     files.push({
-      path: raw[i + 1], status: m[5] === 'A' ? 'added' : m[5] === 'D' ? 'deleted' : 'modified',
+      path: name, key: raw[i + 1].toString('latin1'), lossy: !Buffer.from(name, 'utf8').equals(raw[i + 1]),
+      status: m[5] === 'A' ? 'added' : m[5] === 'D' ? 'deleted' : 'modified',
       oldMode: m[1], newMode: m[2], oldId: m[3], newId: m[4], adds: 0, dels: 0, oldSize: 0, newSize: 0,
     });
   }
   if (!files.length) return files;
 
-  const counts = new Map();
-  for (const rec of numstat.stdout.split('\0')) {
-    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(rec);
-    if (m) counts.set(m[3], m);
-  }
+  // --numstat lists the same files in the same order, one record each ("<adds>\t<dels>\t<path>"): they are paired by
+  // place, and checked by their bytes, never matched by a name read as UTF-8, which two different names can share.
+  const records = nulFields(numstat.stdout);
+  if (records.length !== files.length) throw plainError('Git listed the changes in a way Workbench does not understand.');
+  const counts = files.map((f, k) => {
+    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(records[k].toString('latin1'));
+    if (!m || m[3] !== f.key) throw plainError('Git listed the changes in a way Workbench does not understand.');
+    return m;
+  });
   const ids = new Set();
   for (const f of files) {
     if (isBlobMode(f.oldMode) && !ZERO_OID.test(f.oldId)) ids.add(f.oldId);
@@ -1149,10 +1170,10 @@ async function changesBetween(run, cwd, from, to) {
       if (OID.test(id || '') && /^\d+$/.test(size || '')) sizes.set(id, Number(size));
     }
   }
-  for (const f of files) {
+  for (const [k, f] of files.entries()) {
     f.oldSize = sizes.get(f.oldId) || 0;
     f.newSize = sizes.get(f.newId) || 0;
-    const m = counts.get(f.path);
+    const m = counts[k];
     if (m && m[1] !== '-') {
       f.adds = Number(m[1]);
       f.dels = Number(m[2]);
@@ -1299,7 +1320,9 @@ export async function workDiff({ repoRoot, path: wsPath, since, maxFiles = 300, 
       let budget = Math.max(0, Number(maxTotalBytes) || 0);
       const perFile = Math.max(0, Number(maxFileBytes) || 0);
       let cutAll = false;
-      const want = shown.flatMap((f, k) => (f.binary || f.large ? [] : [k])); // the files that get a patch
+      // The files that get a patch. Not one whose name is not UTF-8: asked for by that name read as UTF-8, git would
+      // find another file, or none.
+      const want = shown.flatMap((f, k) => (f.binary || f.large || f.lossy ? [] : [k]));
       const reached = new Set();
       for (let i = 0; i < want.length && budget > 0;) {
         const batch = [];
@@ -1424,7 +1447,7 @@ function inTheWay(stderr) {
  * shown to be one counts as the person's own. Never rejects.
  */
 async function alreadyThere(run, root, paths, brought) {
-  const merged = new Map(brought.map(f => [f.path, f]));
+  const merged = new Map(brought.filter(f => !f.lossy).map(f => [f.path, f])); // git's words name files as UTF-8
   const asked = paths.filter(p => {
     const f = merged.get(p);
     if (!f || f.status === 'deleted' || !(f.newMode === '100644' || f.newMode === '100755') || p.includes('\n') || !safeParts(p)) return false;
@@ -1590,7 +1613,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
     if (busy) throw new Refusal('busy', SAY.busy);
     if (conflicts.length) throw new Refusal('busy', SAY.conflicted(conflicts), conflicts);
-    const back = brought.filter(f => f.status === 'modified' && missing.has(f.path)).map(f => f.path);
+    const back = brought.filter(f => f.status === 'modified' && missing.has(f.key)).map(f => f.path);
     if (back.length) throw new Refusal('blocked', SAY.blocked(back), back);
     if (!locked) {
       const kept = await keptForNextCommit(root, run);
