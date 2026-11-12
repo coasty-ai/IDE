@@ -1329,6 +1329,59 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(fs.readFileSync(p('cache'), 'utf8'), 'an agent file where the person has a folder\n');
   });
 
+  test('a file the person deleted or renamed without staging it never comes back with the agent’s version: blocked', async () => {
+    // The danger is real: git's fast-forward writes over a tracked file that is missing, as if it were unchanged.
+    const d = await agentRepo();
+    write(d.w('a.txt'), 'one\nAGENT\nthree\n');
+    git(d.ws.path, 'commit', '-q', '-am', 'agent');
+    const demo = cloneOf(d.root);
+    fs.rmSync(path.join(demo, 'a.txt'));
+    assert.equal(gitTry(demo, 'merge', '--ff-only', '-q', `origin/${d.ws.branch}`).code, 0);
+    assert.equal(fs.readFileSync(path.join(demo, 'a.txt'), 'utf8'), 'one\nAGENT\nthree\n');
+    assert.equal(statusOf(demo), '', 'the deletion is gone, without a word');
+
+    const files = { ...STARTING_FILES, 'docs/x.md': 'x\n', 'docs/y.md': 'y\n' };
+    const blocked = (label, setup, paths, agent = t => write(t.w('a.txt'), 'one\nAGENT\nthree\n')) => async () => {
+      const t = await agentRepo(files);
+      agent(t);
+      setup(t);
+      const before = { person: folderPrint(t.root), status: statusOf(t.root), head: headOf(t.root) };
+      const { expect } = await proposal(t);
+      assert.deepEqual(await mergeWork(mergeOpts(t, expect)), {
+        ok: false, why: 'blocked', paths, sentence: `Your own changes are in the way: ${paths.join(', ')}. Commit or put them aside, then merge again.`,
+      }, label);
+      assert.deepEqual({ person: folderPrint(t.root), status: statusOf(t.root), head: headOf(t.root) }, before, `${label}: nothing in the person’s folder changed`);
+      return t;
+    };
+    await inParallel([
+      async () => {
+        const t = await blocked('deleted', t => fs.rmSync(t.p('a.txt')), ['a.txt'])();
+        // Once the file is back, the merge goes through.
+        git(t.root, 'checkout', '--', 'a.txt');
+        assert.equal((await mergeWork(mergeOpts(t, (await proposal(t)).expect))).ok, true);
+        assert.equal(fs.readFileSync(t.p('a.txt'), 'utf8'), 'one\nAGENT\nthree\n');
+      },
+      blocked('renamed, with an edit', t => {
+        fs.renameSync(t.p('a.txt'), t.p('renamed.txt'));
+        write(t.p('renamed.txt'), 'one\ntwo\nthree\nmine\n');
+      }, ['a.txt']),
+      blocked('a deleted folder', t => fs.rmSync(t.p('docs'), { recursive: true }), ['docs/x.md'], t => write(t.w('docs/x.md'), 'x by the agent\n')),
+      // A file the agent deletes too, or does not touch, stays deleted, and the merge goes through.
+      async () => {
+        const t = await agentRepo(files);
+        write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+        fs.rmSync(t.w('b.txt'));
+        fs.rmSync(t.p('b.txt'));
+        fs.rmSync(t.p('c.txt'));
+        const r = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+        assert.equal(r.ok, true, JSON.stringify(r));
+        assert.equal(fs.existsSync(t.p('b.txt')), false);
+        assert.equal(fs.existsSync(t.p('c.txt')), false);
+        assert.equal(statusOf(t.root), ' D c.txt\n');
+      },
+    ]);
+  });
+
   test('blocked names at most three paths', async () => {
     const t = await agentRepo();
     for (const f of ['n1', 'n2', 'n3', 'n4', 'n5']) {

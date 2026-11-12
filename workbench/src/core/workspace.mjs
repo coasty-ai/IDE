@@ -830,6 +830,14 @@ async function unresolved(cwd, run = git) {
 }
 
 /**
+ * The tracked files missing from this folder that are not marked skip-worktree (`ls-files --deleted`): deleted or
+ * renamed without staging it. A sparse checkout's files outside it are not listed.
+ */
+async function deletedFiles(cwd, run = git) {
+  return new Set(nulList((await run(['ls-files', '--deleted', '-z'], { cwd })).stdout));
+}
+
+/**
  * Whether another git command holds a lock on `branch` (or HEAD). A fast-forward takes that lock only after it has
  * updated the files, so it would stop half-way: check first.
  */
@@ -1442,7 +1450,10 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   ]);
 
   // 8. Check again, then fast-forward the person's folder to M. Git refuses, changing nothing, when their own
-  //    changes or files are in the way; ignored files count (--no-overwrite-ignore), and nothing is stashed.
+  //    changes or files are in the way; ignored files count (--no-overwrite-ignore), and nothing is stashed. Not a
+  //    tracked file they deleted (or renamed) without staging it: git takes a missing file for an unchanged one and
+  //    writes M's version there, so Workbench looks for those itself first. Only where M changes the file: one that M
+  //    deletes too stays deleted, and git writes nothing for one that M does not touch.
   //    No automatic upkeep (gc) is started in their repository either. Git reads branch.<name>.mergeOptions before
   //    these flags, and each flag here outweighs its counterpart there; --no-squash outweighs a --squash, which would
   //    otherwise write and stage M's files while leaving the branch where it was.
@@ -1454,12 +1465,15 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   };
   let r;
   for (let attempt = 1; ; attempt++) {
-    const [on, at, busy, conflicts, locked] = await Promise.all([
+    const [on, at, busy, conflicts, locked, missing] = await Promise.all([
       currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run), unresolved(root, run), branchLocked(root, into, run),
+      deletedFiles(root, run),
     ]);
     if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
     if (busy) throw new Refusal('busy', SAY.busy);
     if (conflicts.length) throw new Refusal('busy', SAY.conflicted(conflicts), conflicts);
+    const back = brought.filter(f => f.status === 'modified' && missing.has(f.path)).map(f => f.path);
+    if (back.length) throw new Refusal('blocked', SAY.blocked(back), back);
     if (!locked) {
       progress.started = true;
       r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
