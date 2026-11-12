@@ -231,7 +231,7 @@ export function graphLayout({ commits = [], agents = [], branch = null, head = n
   const trunkEnd = TRUNK.items.length ? TRUNK.items[TRUNK.items.length - 1].row : -1;
   const crossings = (ch, s) => {
     let n = 0;
-    for (const run of runsOf(ch, s)) if (Math.min(run.a, run.b) < 0 && 0 < Math.max(run.a, run.b) && run.row < trunkEnd) n += 2;
+    for (const run of runsOf(ch, s)) if (Math.min(run.a, run.b) < 0 && 0 < Math.max(run.a, run.b) && run.row <= trunkEnd) n += 2;
     for (const [t, list2] of inSlot) for (const o of list2) {
       if (o === ch) continue;
       for (const run of runsOf(ch, s)) if (Math.min(run.a, run.b) < t && t < Math.max(run.a, run.b) && o.top < run.row && run.row < o.bottom) n++;

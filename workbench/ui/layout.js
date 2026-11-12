@@ -2,10 +2,10 @@
 // Pure: no DOM, and nothing but words.js (pure too), so node:test can check it at every window size. Text widths come
 // from `measure` (the page passes a canvas measurer; the default uses JetBrains Mono's fixed advance of 0.6 em).
 // Names and words an agent controls are laid out as the board shows them, hidden characters shown (visibleControls).
-import { visibleControls } from './words.js';
 //
 // Everything is laid out in CSS pixels from the window size, so text never shrinks with the window. Three size
 // classes (S, M, L) pick the type sizes; positions are then derived from the room there is.
+import { visibleControls } from './words.js';
 
 export const MONO = 0.6;
 export const monoMeasure = (text, px) => Array.from(String(text ?? '')).length * MONO * px;
