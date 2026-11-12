@@ -88,9 +88,30 @@ const configAgents = [
   fromTask('Fix the login page error', { id: 'cf0003', state: 'question',
     ask: { id: 'ask-cf', type: 'question', sentence: 'Should I merge them into one?', options: [] } }),
 ];
+// An agent whose name people say without its verb ("the unused imports"), in each of the ways it can wait on the person.
+const importsAgent = fromTask('Remove the unused imports', { id: 'ab0001', state: 'question',
+  ask: { id: 'ask-ui', type: 'question', sentence: 'Should I keep the ones the tests use, or discard them too?', options: [] } });
+const stagingAgent = fromTask('Update the config files for staging', { id: 'ab0002', state: 'done_claimed' });
+const importsWith = (fields, staging = {}, more = []) => [{ ...importsAgent, ...fields }, { ...stagingAgent, ...staging }, ...more];
 const NAMED = {
   configNone: { agents: configAgents, machines, harnesses, focusId: null },
   configQuestion: { agents: configAgents, machines, harnesses, focusId: 'cf0003' },
+  importsQuestion: { agents: importsWith({}), machines, harnesses, focusId: 'ab0001' },
+  importsNone: { agents: importsWith({ state: 'done_claimed', ask: undefined }), machines, harnesses, focusId: null },
+  importsStuck: { agents: importsWith({ state: 'maybe_stuck', ask: { id: 'ask-us', type: 'stuck',
+    sentence: 'Remove unused imports has hit the same error three times.', options: ['Stop it', 'Let it keep trying'] } }), machines, harnesses, focusId: 'ab0001' },
+  importsPermission: { agents: importsWith({ state: 'needs_ok', ask: { id: 'ask-up', type: 'permission',
+    sentence: 'Remove unused imports wants to run a command', options: ['Allow', 'Deny'], primary: 'Allow' } }), machines, harnesses, focusId: 'ab0001' },
+  // Its helper asks, with the agent in the centre.
+  importsHelper: { agents: importsWith({ state: 'working', ask: undefined }, {}, [{ id: 'ab0001-44444444', name: 'Find unused imports',
+    task: 'Find the unused imports', state: 'question', kind: 'helper', parentId: 'ab0001', rootId: 'ab0001',
+    ask: { id: 'ask-uh', type: 'question', sentence: 'Should I look in the tests too?', options: [] } }]), machines, harnesses, focusId: 'ab0001' },
+  // Another agent asks; this one is done.
+  importsOther: { agents: importsWith({ state: 'done_claimed', ask: undefined }, { state: 'question',
+    ask: { id: 'ask-st', type: 'question', sentence: 'Which unused imports should go?', options: [] } }), machines, harnesses, focusId: 'ab0002' },
+  // A merge card for the other agent is on screen (the page sends no focus then).
+  importsCard: { agents: importsWith({ state: 'done_claimed', ask: undefined }), machines, harnesses, focusId: null,
+    pendingConfirm: { id: 'c11', kind: 'merge', agentId: 'ab0002' } },
 };
 
 const start = (...tasks) => ({ kind: 'start', tasks: tasks.map(([task, harness = 'claude', machine = 'laptop']) => ({ task, harness, machine })) });
@@ -919,6 +940,66 @@ test('words that two names share, and that are neither one\'s whole name, name n
     // Same-named twins still give no agent, so the engine asks which one.
     ['merge search cleanup', 'dogNone', merge(null)],
   ]);
+});
+
+test('part of a name finds the agent but is not strong: while it, or anything, asks, the words keep their old meaning', () => {
+  assert.equal(importsAgent.name, 'Remove unused imports');
+  const answerUi = text => answer(text, 'ab0001', 'ask-ui');
+  checkRows([
+    // Its own question waits: part of its name is the answer, never a card that throws its work away.
+    ['discard the unused imports', 'importsQuestion', answerUi('discard the unused imports')],
+    ['discard unused imports', 'importsQuestion', answerUi('discard unused imports')],
+    ['throw away the unused imports', 'importsQuestion', answerUi('throw away the unused imports')],
+    ['throw the unused imports away', 'importsQuestion', answerUi('throw the unused imports away')],
+    ['scrap the unused imports', 'importsQuestion', answerUi('scrap the unused imports')],
+    ['trash the unused imports', 'importsQuestion', answerUi('trash the unused imports')],
+    ["throw away the unused imports' changes", 'importsQuestion', answerUi("throw away the unused imports' changes")],
+    ['merge the unused imports', 'importsQuestion', answerUi('merge the unused imports')],
+    ['land the unused imports', 'importsQuestion', answerUi('land the unused imports')],
+    ['merge the unused imports into main', 'importsQuestion', answerUi('merge the unused imports into main')],
+    ['diff the unused imports', 'importsQuestion', answerUi('diff the unused imports')],
+    ["show the unused imports' changes", 'importsQuestion', answerUi("show the unused imports' changes")],
+    ['discard them', 'importsQuestion', answerUi('discard them')],
+    ['keep the unused imports', 'importsQuestion', answerUi('keep the unused imports')],
+    // A question about what changed finds it by its words, as a status question does: it only shows.
+    ['what did the unused imports change', 'importsQuestion', changes('ab0001')],
+    // Its whole name or its id still acts at once.
+    ['discard remove unused imports', 'importsQuestion', discard('ab0001')],
+    ['throw away the remove unused imports agent', 'importsQuestion', discard('ab0001')],
+    ['merge remove unused imports', 'importsQuestion', merge('ab0001')],
+    ['discard ab0001', 'importsQuestion', discard('ab0001')],
+    ['diff remove unused imports', 'importsQuestion', changes('ab0001')],
+    // A stop keeps its own rule: two words of the name and nothing else name the agent (see ARCHITECTURE.md).
+    ['stop the unused imports', 'importsQuestion', { kind: 'stop', agentIds: ['ab0001'] }],
+    // Stuck, a helper asking, another agent asking: the answer too.
+    ['discard the unused imports', 'importsStuck', answer('discard the unused imports', 'ab0001', 'ask-us')],
+    ['merge the unused imports', 'importsStuck', answer('merge the unused imports', 'ab0001', 'ask-us')],
+    ['discard the unused imports', 'importsHelper', answer('discard the unused imports', 'ab0001-44444444', 'ask-uh')],
+    ['discard the unused imports', 'importsOther', answer('discard the unused imports', 'ab0002', 'ask-st')],
+    ['merge the unused imports', 'importsOther', answer('merge the unused imports', 'ab0002', 'ask-st')],
+    // A permission keeps its replies, as before these words existed.
+    ['discard the unused imports', 'importsPermission', unknown('discard the unused imports')],
+    ['throw away the unused imports', 'importsPermission', unknown('throw away the unused imports')],
+    ['merge the unused imports', 'importsPermission', task('merge the unused imports')],
+    ['no, discard the unused imports', 'importsPermission', { kind: 'deny', agentId: 'ab0001', askId: 'ask-up', text: 'discard the unused imports' }],
+    ['merge remove unused imports', 'importsPermission', merge('ab0001')], // the whole name still acts there
+    // Nothing waits: part of the name finds it, and the engine asks first, as before.
+    ['discard the unused imports', 'importsNone', discard('ab0001')],
+    ['throw away the unused imports', 'importsNone', discard('ab0001')],
+    ['merge the unused imports', 'importsNone', merge('ab0001')],
+    ['diff the unused imports', 'importsNone', changes('ab0001')],
+    ["show the unused imports' changes", 'importsNone', changes('ab0001')],
+    // A card is no question to answer and has no "it" for a name: part of a name is another command there, as a whole
+    // name is (the engine withdraws the card), never a launch of "merge the unused imports".
+    ['merge the unused imports', 'importsCard', merge('ab0001')],
+    ['discard the unused imports', 'importsCard', discard('ab0001')],
+    ["show the unused imports' changes", 'importsCard', changes('ab0001')],
+  ]);
+  // A name said as two words where it has one ("check out" for Checkout) is still the whole name: strong while a
+  // question waits.
+  assert.deepEqual(parseCommand('merge the check out fix', CTX.question), merge('a1b2c3'));
+  assert.deepEqual(parseCommand('merge the checkout fix', CTX.question), merge('a1b2c3'));
+  assert.deepEqual(parseCommand('merge the checkout', CTX.question), answer('merge the checkout'));
 });
 
 test('cards take their own words: "start it" only for a launch, "merge it" for a merge, "throw it away" for a throw-away', () => {

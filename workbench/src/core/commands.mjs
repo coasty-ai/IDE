@@ -313,6 +313,23 @@ function names(ws, a) {
 }
 
 /**
+ * The reference says every word of the agent's name, and nothing else: "the invoice export agent", and "the check out
+ * fix" for Checkout fix (two words heard for one). Part of it, "the unused imports" for Remove unused imports, does not.
+ */
+function saysWhole(ws, a) {
+  const key = agentWords(a).nameKey;
+  if (!key || nameWords(ws, a) === 0) return false;
+  const said = new Set();
+  for (let i = 0; i < ws.length; i++) {
+    if (REF_STOP.has(ws[i])) continue;
+    said.add(stem(ws[i].replace(/-/g, '')));
+    for (const part of ws[i].split('-')) if (part) said.add(stem(part)); // "feature-flag" says "feature" and "flag"
+    if (i + 1 < ws.length) said.add(stem(ws[i] + ws[i + 1]));
+  }
+  return key.split(' ').every(k => said.has(k));
+}
+
+/**
  * Resolve one reference ("the flaky test", "it", "search cleanup") to an agent.
  * `full`: every word of the reference matched. `sure`: also unmistakable, because it is "it",
  * an id, the agent's whole name, or at least two matching words ("stop the tests" is not sure).
@@ -716,7 +733,9 @@ function bareName(ws, c) {
  * Update config files and Split config files per) name no agent: they keep their old meaning. Task words, state words
  * and helpers' names never name a root agent here, and neither do words for work alone: "the changes" and "your
  * changes" are no agent's name, even when an agent is called "Changes" (its id or "it" still name it).
- * @returns {{ id: string|null, form: 'id'|'name' } | null}
+ * `partial`: the words are part of the one agent's name, not all of it ("the unused imports" for Remove unused
+ * imports). They name it, but they are not strong (see tooLoose).
+ * @returns {{ id: string|null, form: 'id'|'name', partial?: true } | null}
  */
 function namedRoot(ws, c) {
   const meaningful = ws.filter(w => !REF_STOP.has(w));
@@ -731,9 +750,8 @@ function namedRoot(ws, c) {
   if (meaningful.every(w => WORK_NOUN.has(w))) return null;
   const having = c.agents.filter(a => isRoot(a) && nameWords(ws, a) > 0);
   if (!having.some(a => names(ws, a))) return null;
-  if (having.length === 1) return { id: having[0].id, form: 'name' };
-  const key = refKey(ws);
-  const whole = having.filter(a => agentWords(a).nameKey === key);
+  if (having.length === 1) return saysWhole(ws, having[0]) ? { id: having[0].id, form: 'name' } : { id: having[0].id, form: 'name', partial: true };
+  const whole = having.filter(a => saysWhole(ws, a));
   if (!whole.length) return null;
   return { id: whole.length === 1 ? whole[0].id : null, form: 'name' };
 }
@@ -742,9 +760,10 @@ function namedRoot(ws, c) {
  * Whose work the words mean, for merging, throwing away and showing changes. Strict: the words must name the agent
  * (see namedRoot), or point at the focused one ("it", "this one", "its changes", "the diff").
  * `form`: 'id' and 'name' name it; 'pronoun' ("it") and 'generic' ("its changes") mean the focused agent.
+ * `partial`: a 'name' that is only part of the agent's name (see namedRoot).
  * `noun`: the words said "changes", "work", "diff" or the like. `id` is null when nothing is focused, or when two
  * root agents share the name. Null when the words name no agent, so they keep their old meaning.
- * @returns {{ id: string|null, form: 'id'|'name'|'pronoun'|'generic', noun: boolean } | null}
+ * @returns {{ id: string|null, form: 'id'|'name'|'pronoun'|'generic', partial?: true, noun: boolean } | null}
  */
 function workRef(toks, c) {
   const ws = toks.map(t => t.w);
@@ -788,6 +807,15 @@ function screenBusy(c) {
 
 /** A form that does not name the agent: "it", "its changes", a bare "merge". */
 const weakForm = ref => ref.form === 'pronoun' || ref.form === 'generic' || ref.form === 'bare';
+/** The words name the agent outright, so they win over an answer: its id, or its whole name. */
+const strongRef = ref => !weakForm(ref) && !ref.partial;
+/**
+ * Words too loose to act on now, so they keep their old meaning. A weak form, while anything waits on screen: "it" may
+ * be about that. Part of a name ("the unused imports" for Remove unused imports), while a question, a stuck ask or a
+ * permission waits: the words are the reply to it, never a card that takes its place. A card has no "it" for a name,
+ * so on a card part of a name is another command, as a whole name is (its old meaning would be a launch).
+ */
+const tooLoose = (ref, c) => (weakForm(ref) && screenBusy(c)) || (!!ref.partial && hasAsk(c.asker));
 
 const INTO = new Set(['into', 'onto', 'to', 'in', 'on']);
 /** The person's current branch, said without its name. */
@@ -825,8 +853,9 @@ function takeTarget(toks, c) {
 
 /**
  * "merge search cleanup", "merge it", "land it", "bring its changes in", "merge it into main": always asked first (the
- * engine shows a merge card). The words must name the agent; "merge the two config files" stays work. A name is strong;
- * "it", "its changes" and a bare "merge" are weak, and they keep their old meaning while anything else waits on screen.
+ * engine shows a merge card). The words must name the agent; "merge the two config files" stays work. A whole name or
+ * an id is strong. "it", "its changes" and a bare "merge" are weak, and they keep their old meaning while anything else
+ * waits on screen; so does part of a name while a question, a stuck ask or a permission waits (see tooLoose).
  */
 function matchMerge(core, c) {
   const ws = core.map(t => t.w);
@@ -868,10 +897,10 @@ function matchMerge(core, c) {
   if (!ref) return null;
   // "bring" means a merge only with its work or "it": "bring search cleanup in" is no merge.
   if (bring && (!particle || !(ref.form === 'pronoun' || ref.noun))) return null;
-  if (weakForm(ref) && screenBusy(c)) return null;
+  if (tooLoose(ref, c)) return null;
   const intent = { kind: 'merge', agentId: ref.id };
   if (into) intent.into = into;
-  return { intent, strong: !weakForm(ref) };
+  return { intent, strong: strongRef(ref) };
 }
 
 const DISCARD_VERBS = new Set(['discard', 'scrap', 'trash']);
@@ -879,6 +908,7 @@ const DISCARD_VERBS = new Set(['discard', 'scrap', 'trash']);
 /**
  * "throw away search cleanup's changes", "discard it", "throw it away", "scrap it": always asked first (the engine
  * shows a throw-away card). The words must name the agent, as for a merge; "discard unused imports" is no throw-away.
+ * Strength is as for a merge: while Remove unused imports asks, "discard the unused imports" is the answer.
  */
 function matchDiscard(core, c) {
   const ws = core.map(t => t.w);
@@ -901,8 +931,8 @@ function matchDiscard(core, c) {
   if (launchPhrase(rest.map(t => t.w))) return null;
   const ref = workRef(rest, c);
   if (!ref) return null;
-  if (weakForm(ref) && screenBusy(c)) return null;
-  return { intent: { kind: 'discard', agentId: ref.id }, strong: !weakForm(ref) };
+  if (tooLoose(ref, c)) return null;
+  return { intent: { kind: 'discard', agentId: ref.id }, strong: strongRef(ref) };
 }
 
 /** Questions about what an agent changed. They may find the agent by its task words too, as status questions do. */
@@ -936,11 +966,12 @@ function matchChanges(core, c) {
     const refToks = refTokens(m, s, core);
     if (!refToks.length) return focused();
     const ref = workRef(refToks, c);
-    if (ref) {
+    if (ref && !ref.partial) {
       if (weakForm(ref) && screenBusy(c)) return null;
       return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
     }
-    // A question may find the agent by its task words, as "what is the rounding bug one doing" does.
+    // A question may find the agent by its task words, or by part of its name, as "what is the rounding bug one doing"
+    // does: it only shows.
     const r = resolveRef(refToks, c);
     const a = r.ids.length && r.full ? c.agents.find(x => x.id === r.ids[0]) : null;
     const root = a ? rootOf(a, c) : null;
@@ -950,8 +981,8 @@ function matchChanges(core, c) {
   if (m) {
     const ref = workRef(refTokens(m, s, core), c);
     if (!ref || !ref.noun) return null; // "show search cleanup" is a status; "show the error on the login page" is work
-    if (weakForm(ref) && screenBusy(c)) return null;
-    return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
+    if (tooLoose(ref, c)) return null;
+    return { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) };
   }
   m = CHANGES_DIFF.exec(s);
   if (m) {
@@ -959,8 +990,8 @@ function matchChanges(core, c) {
     if (!refToks.length) return focused();
     const ref = workRef(refToks, c);
     if (!ref) return null; // "diff the two config files" is not about an agent
-    if (weakForm(ref) && screenBusy(c)) return null;
-    return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
+    if (tooLoose(ref, c)) return null;
+    return { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) };
   }
   return null;
 }
