@@ -6,6 +6,7 @@
 // environment and a timeout that kills the whole group.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 
 /** Environment keys Claude Code sets for itself; a check must not look like it runs inside an agent. */
 const SCRUB = /^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_AGENT_SDK)/;
@@ -114,6 +115,31 @@ export function scrubEnv(env = process.env) {
     out[k] = v;
   }
   return out;
+}
+
+/** Is there a `node` program in one of these PATH folders? Relative folders do not count. */
+function nodeOnPath(pathValue) {
+  for (const dir of String(pathValue || '').split(path.delimiter)) {
+    if (!dir || !path.isAbsolute(dir)) continue;
+    try {
+      const p = path.join(dir, 'node');
+      if (!fs.statSync(p).isFile()) continue;
+      fs.accessSync(p, fs.constants.X_OK);
+      return true;
+    } catch { /* not here */ }
+  }
+  return false;
+}
+
+/**
+ * The checks' PATH: when it has no node, the folder of the node running Workbench goes first, so a check such as
+ * `npm test` works for a person whose own PATH lacks node. The same rule as for agents (withNodeOnPath in
+ * src/adapters/claude/args.mjs). Returned unchanged when a node is on PATH already.
+ */
+export function withNodeOnPath(env, execPath = process.execPath) {
+  const current = typeof env.PATH === 'string' ? env.PATH : '';
+  if (nodeOnPath(current)) return env;
+  return { ...env, PATH: `${path.dirname(execPath)}${path.delimiter}${current || '/usr/bin:/bin'}` };
 }
 
 /** Keeps only the last `limit` bytes of everything pushed into it. */
@@ -243,13 +269,14 @@ function runOne(check, name, cwd, env, signal) {
  * @param {{ cwd: string, checks: { name?: string, run: string, timeoutSec?: number }[],
  *   onProgress?: (p: { phase: 'start'|'end', index: number, total: number, name: string, result?: object, results: object[] }) => void,
  *   env?: object, signal?: AbortSignal }} opts
- *   env defaults to process.env (it is scrubbed either way); signal stops the running check.
+ *   env defaults to process.env (it is scrubbed either way, and gets node on its PATH when it has none);
+ *   signal stops the running check.
  * @returns {Promise<{ state: 'passed'|'failed'|'none', results: { name: string, ok: boolean, ms: number, tail: string }[] }>}
  */
 export async function runChecks({ cwd, checks, onProgress, env, signal } = {}) {
   const list = (Array.isArray(checks) ? checks : []).filter(c => c && typeof c.run === 'string' && c.run.trim());
   if (!list.length) return { state: 'none', results: [] };
-  const childEnv = scrubEnv(env || process.env);
+  const childEnv = withNodeOnPath(scrubEnv(env || process.env));
   const progress = p => {
     if (typeof onProgress !== 'function') return;
     try { onProgress(p); } catch {} // a broken listener must not break the checks

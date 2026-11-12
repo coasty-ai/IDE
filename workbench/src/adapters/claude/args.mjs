@@ -1,5 +1,6 @@
-// Builds the command line and environment for launching Claude Code as a workbench agent.
-// The flags below match what was verified with Claude Code 2.1.221 (see ARCHITECTURE.md, "Claude Code adapter").
+// Builds the command line and environment for launching Claude Code as a workbench agent, and finds Claude Code.
+// The flags below match what was verified with Claude Code 2.1.221 in real runs; Claude Code 2.1.322 still lists
+// every one of them in --help and parses the whole launch (see ARCHITECTURE.md, "Claude Code adapter").
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,10 +12,13 @@ export const WORKBENCH_PROMPT = 'You are running inside Workbench, which shows y
 
 /**
  * Tools a workbench agent may not use: they schedule work outside the workbench's view, wait for a terminal,
- * or need the person to sign in to another service (DesignSync, which cannot finish in a headless run).
- * CronList goes with CronCreate and CronDelete.
+ * need the person to sign in to another service (DesignSync, which cannot finish in a headless run), or reach past
+ * this agent. CronList goes with CronCreate and CronDelete. New in Claude Code 2.1.322: SendFile sends files to
+ * another Claude Code session, on this machine or another one; SendToProject sends the session's work to a Claude
+ * Project on claude.ai; PublishPlugin publishes a folder to the organisation's plugin library; ListAgents lists the
+ * person's other sessions; WrapUp draws a next-step box in the app and is told to run in every turn.
  */
-export const DISALLOWED_TOOLS = 'Workflow CronCreate CronDelete CronList ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger DesignSync';
+export const DISALLOWED_TOOLS = 'Workflow CronCreate CronDelete CronList ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger DesignSync SendFile SendToProject PublishPlugin ListAgents WrapUp';
 
 /** How long Claude Code waits for the PreToolUse hook, in seconds. The engine may hold a request for 25 minutes. */
 export const HOOK_TIMEOUT_SEC = 1800;
@@ -23,13 +27,18 @@ export const HOOK_TIMEOUT_SEC = 1800;
 export const DEFAULT_BUDGET_USD = 2;
 
 /**
- * Environment keys removed before launch: the markers a Claude Code session, or an editor or SDK hosting one, sets
- * for the programs it runs. Passed on, they would tie the agent to that session (its id, its messaging socket, the
- * editor connection). Claude Code's docs list the session markers (code.claude.com/docs/en/env-vars); the host ones
- * were seen in an editor session. Everything else is kept, including the person's own settings and credentials
- * (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_BEDROCK, ...): on a cloud machine the token may be the only login.
+ * Environment keys removed before launch:
+ * - the markers a Claude Code session, or an editor or SDK hosting one, sets for the programs it runs. Passed on,
+ *   they would tie the agent to that session (its id, its messaging socket). Claude Code's docs list the session
+ *   markers (code.claude.com/docs/en/env-vars); the host ones were seen in an editor session;
+ * - the editor's own (VSCODE_*, ELECTRON_RUN_AS_NODE, GIT_EDITOR), present when Workbench was started from VS Code
+ *   or from Claude Code inside it: they are a handle on the editor's connection, and change how programs start;
+ * - Workbench's own choice of programs (WORKBENCH_CLAUDE_BIN, WORKBENCH_CODEX_BIN), so a Workbench an agent starts
+ *   does not inherit them.
+ * Everything else is kept, including the person's own settings and credentials (CLAUDE_CODE_OAUTH_TOKEN,
+ * CLAUDE_CODE_USE_BEDROCK, ...): on a cloud machine the token may be the only login.
  */
-export const SCRUB_ENV_RE = /^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_JOB_DIR|CLAUDE_AGENT_SDK_.*|CLAUDE_CODE_(CHILD_SESSION|SESSION_.*|BRIDGE_SESSION_ID|MESSAGING_.*|REMOTE|REMOTE_.*|ENTRYPOINT|EXECPATH|SSE_PORT|EMIT_STARTUP_TIMING|ENABLE_SDK_FILE_CHECKPOINTING|ENABLE_TASKS|QUESTION_PREVIEW_FORMAT|STARTUP_FAILURE_RESULTS))$/;
+export const SCRUB_ENV_RE = /^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_JOB_DIR|CLAUDE_AGENT_SDK_.*|CLAUDE_CODE_(CHILD_SESSION|SESSION_.*|BRIDGE_SESSION_ID|MESSAGING_.*|REMOTE|REMOTE_.*|ENTRYPOINT|EXECPATH|SSE_PORT|EMIT_STARTUP_TIMING|ENABLE_SDK_FILE_CHECKPOINTING|ENABLE_TASKS|QUESTION_PREVIEW_FORMAT|STARTUP_FAILURE_RESULTS)|VSCODE_.*|ELECTRON_RUN_AS_NODE|GIT_EDITOR|WORKBENCH_CLAUDE_BIN|WORKBENCH_CODEX_BIN)$/;
 
 /** The hook bridge script that Claude Code runs before each tool call. */
 export const BRIDGE_PATH = fileURLToPath(new URL('./hook-bridge.mjs', import.meta.url));
@@ -38,9 +47,125 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/[\]-]*$/;
 
-/** The Claude Code binary: WORKBENCH_CLAUDE_BIN when set (tests point it at a fake), otherwise `claude`. */
-export function claudeBin(env = process.env) {
-  return (env && env.WORKBENCH_CLAUDE_BIN) || 'claude';
+/** Where VS Code, VS Code Insiders and Cursor keep their extensions, inside the home folder. */
+export const EXTENSION_FOLDERS = ['.vscode/extensions', '.vscode-insiders/extensions', '.cursor/extensions'];
+/** The Claude Code extension's folder: anthropic.claude-code-<version>[-<platform>-<arch>]. */
+const EXTENSION_RE = /^anthropic\.claude-code-(\d+)\.(\d+)\.(\d+)(?:-([a-z0-9]+)-([a-z0-9]+))?$/;
+/** The Claude Code program inside that folder. */
+const EXTENSION_BINARY = path.join('resources', 'native-binary', 'claude');
+/** The PATH a shell uses when none is set. */
+const DEFAULT_PATH = '/usr/bin:/bin';
+
+/** Said when no Claude Code was found anywhere Workbench looks. */
+export const CLAUDE_NOT_FOUND = 'Claude Code was not found: there is no claude command on the PATH, and no Claude Code extension in VS Code or Cursor. Tell Workbench where it is with --claude <path>, or with WORKBENCH_CLAUDE_BIN.';
+
+function isExecutableFile(p) {
+  try {
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The first `name` that is a program in one of the PATH's folders, as an absolute path, or null. Folders written as
+ * relative paths are skipped: a program started in an agent's folder would look for them there.
+ */
+export function onPath(name, pathValue) {
+  for (const dir of String(pathValue || '').split(path.delimiter)) {
+    if (!dir || !path.isAbsolute(dir)) continue;
+    const p = path.join(dir, name);
+    if (isExecutableFile(p)) return p;
+  }
+  return null;
+}
+
+/**
+ * The environment with the folder of the node running Workbench at the front of PATH when PATH has no node, so
+ * agents find `node` and `npm` for their tests (the permission check approves `npm test` and `node --test` by those
+ * words). Returned unchanged when a node is on PATH already.
+ * @param {Record<string,string>} env
+ */
+export function withNodeOnPath(env, execPath = process.execPath) {
+  const current = typeof env.PATH === 'string' ? env.PATH : '';
+  if (onPath('node', current)) return env;
+  return { ...env, PATH: `${path.dirname(execPath)}${path.delimiter}${current || DEFAULT_PATH}` };
+}
+
+const newerThan = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+
+/**
+ * The newest Claude Code that the VS Code extension installed, in VS Code, VS Code Insiders or Cursor: its program
+ * and version, or null. Folders VS Code has marked to delete (listed in .obsolete) and builds for another operating
+ * system are skipped; on the same version, a build for this processor wins.
+ */
+export function newestExtensionClaude(home) {
+  if (!home || !path.isAbsolute(home)) return null;
+  let best = null;
+  for (const folder of EXTENSION_FOLDERS) {
+    const dir = path.join(home, folder);
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    let obsolete = {};
+    try { obsolete = JSON.parse(fs.readFileSync(path.join(dir, '.obsolete'), 'utf8')) || {}; } catch { /* none */ }
+    for (const name of names) {
+      const m = EXTENSION_RE.exec(name);
+      if (!m || obsolete[name] === true) continue;
+      const system = m[4] === 'alpine' ? 'linux' : m[4];
+      if (system && system !== process.platform) continue;
+      const bin = path.join(dir, name, EXTENSION_BINARY);
+      if (!isExecutableFile(bin)) continue;
+      const version = [Number(m[1]), Number(m[2]), Number(m[3])];
+      const exact = !m[5] || m[5] === process.arch;
+      const order = best ? newerThan(version, best.version) : 1;
+      if (order > 0 || (order === 0 && exact && !best.exact)) best = { path: bin, version, exact };
+    }
+  }
+  return best && { path: best.path, version: best.version.join('.') };
+}
+
+/**
+ * Where Claude Code is, looked up afresh on every call (the VS Code extension moves to a new folder with each
+ * update). In this order: the --claude path (`flag`), WORKBENCH_CLAUDE_BIN (`env`), `claude` on the PATH (`path`),
+ * then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor (`vscode`). A path that was given but
+ * is not there is reported as it is, never swapped for another Claude Code. A given path is read from `cwd`; a bare
+ * name is looked up on the PATH.
+ * @param {{ flag?: string|null, env?: Record<string,string|undefined>, cwd?: string }} [o]
+ * @returns {{ path: string|null, from: 'flag'|'env'|'path'|'vscode'|null, reason?: string }}
+ *   `reason`, a plain sentence, is there when no usable Claude Code was found; `path` then says what was tried
+ */
+export function findClaude({ flag, env = process.env, cwd = process.cwd() } = {}) {
+  const e = env || {};
+  const home = e.HOME || (env === process.env ? os.homedir() : '');
+  const given = (value, from) => {
+    const where = from === 'flag' ? 'given with --claude' : 'in WORKBENCH_CLAUDE_BIN';
+    let v = value.trim();
+    if (!v.includes('/')) {
+      const found = onPath(v, e.PATH);
+      return found ? { path: found, from } : { path: null, from, reason: `There is no ${v} command on the PATH (the name ${where}).` };
+    }
+    if ((v === '~' || v.startsWith('~/')) && home) v = path.join(home, v.slice(1));
+    const p = path.resolve(cwd, v);
+    let st = null;
+    try { st = fs.statSync(p); } catch { /* not there */ }
+    if (!st) return { path: p, from, reason: `Claude Code is not at ${p}, the path ${where}.` };
+    if (st.isDirectory()) return { path: p, from, reason: `The path ${where}, ${p}, is a folder, not the Claude Code program.` };
+    return { path: p, from };
+  };
+  if (typeof flag === 'string' && flag.trim()) return given(flag, 'flag');
+  if (typeof e.WORKBENCH_CLAUDE_BIN === 'string' && e.WORKBENCH_CLAUDE_BIN.trim()) return given(e.WORKBENCH_CLAUDE_BIN, 'env');
+  const found = onPath('claude', e.PATH);
+  if (found) return { path: found, from: 'path' };
+  const ext = newestExtensionClaude(home);
+  if (ext) return { path: ext.path, from: 'vscode' };
+  return { path: null, from: null, reason: CLAUDE_NOT_FOUND };
+}
+
+/** The Claude Code program to start: what findClaude finds, or `claude` when it finds nothing. */
+export function claudeBin(env = process.env, { flag } = {}) {
+  return findClaude({ flag, env }).path || 'claude';
 }
 
 /** Quote one word for a POSIX shell. Claude Code runs hook commands through a shell. */
@@ -160,6 +285,7 @@ function budgetArg(usd) {
  * @param {string} [o.bridgePath]    hook bridge script (default: hook-bridge.mjs next to this file)
  * @param {string} [o.nodePath]      node binary for the hook (default: the running node)
  * @param {object} [o.env]           base environment (default: process.env)
+ * @param {string} [o.bin]           the Claude Code program (default: what findClaude finds in `env`, else `claude`)
  * @returns {{ bin: string, args: string[], env: Record<string,string>, sessionId: string, resume: boolean }}
  */
 export function buildClaudeLaunch(o = {}) {
@@ -206,12 +332,12 @@ export function buildClaudeLaunch(o = {}) {
   ];
   if (model) args.push('--model', String(model));
 
-  const env = scrubEnv(base);
+  const env = withNodeOnPath(scrubEnv(base));
   env.WORKBENCH_HOOK_URL = hook.url;
   env.WORKBENCH_HOOK_TOKEN = hook.token;
   env.WORKBENCH_AGENT_ID = String(agentId);
 
-  return { bin: claudeBin(base), args, env, sessionId: session, resume };
+  return { bin: o.bin || claudeBin(base), args, env, sessionId: session, resume };
 }
 
 /** One message for Claude Code's stdin (stream-json input), including the trailing newline. */

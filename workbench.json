@@ -1,0 +1,9 @@
+{
+  "checks": [
+    { "name": "tests", "run": "npm test", "timeoutSec": 600 }
+  ],
+  "rules": [
+    { "say": "Do not change the research and mockups in docs/", "paths": ["docs/**"] },
+    { "say": "Add no packages", "paths": ["**/package-lock.json", "**/node_modules/**"] }
+  ]
+}

@@ -148,6 +148,30 @@ test('the plan item comes from TaskCreate, with the id from its result', () => {
   assert.deepEqual(plans[0].items, [{ id: '1', text: 'Explore repo and test greet.js', status: 'pending' }]);
 });
 
+test('the session carries the Claude Code version from system/init', () => {
+  const { p, events } = run(fixture('claude-subagent-run.jsonl'));
+  const sessions = of(events, EV.SESSION, ROOT);
+  assert.equal(sessions.length, 3, 'one per turn');
+  assert.deepEqual(sessions[0], { kind: EV.SESSION, ts: 1234, agentId: ROOT, sessionId: '2ec20342-9d0d-4021-84b7-56de6b399622', version: '2.1.221' });
+  assert.equal(p.info().version, '2.1.221');
+  // Each process says its own version: a relaunch may run a newer Claude Code.
+  const later = run([{ ...init('s1'), claude_code_version: '2.1.221' }, result(), { ...init('s1'), claude_code_version: '2.1.322' }]);
+  assert.deepEqual(of(later.events, EV.SESSION).map((e) => e.version), ['2.1.221', '2.1.322']);
+  assert.equal(later.p.info().version, '2.1.322');
+  // No version, or one that does not look like a version: the event has none, and the last good one is kept.
+  for (const bad of [undefined, null, 7, '', 'latest', '2.1', '2.1.322 (Claude Code)', '2.1.322‮', `2.1.322-${'x'.repeat(50)}`]) {
+    const r = run([{ ...init('s2'), claude_code_version: bad }]);
+    assert.deepEqual(of(r.events, EV.SESSION)[0], { kind: EV.SESSION, ts: 1234, agentId: ROOT, sessionId: 's2' }, String(bad));
+    assert.equal(r.p.info().version, null);
+  }
+  const kept = run([{ ...init('s3'), claude_code_version: '2.1.322' }, result(), { ...init('s3'), claude_code_version: 'junk' }]);
+  assert.equal(kept.p.info().version, '2.1.322');
+  assert.equal(of(kept.events, EV.SESSION)[1].version, undefined);
+  assert.equal(run([{ ...init('s4'), claude_code_version: '2.2.0-beta.1' }]).p.info().version, '2.2.0-beta.1');
+  // Without a session id there is no session event at all, so the agent's saved session id is never wiped.
+  assert.deepEqual(of(run([{ type: 'system', subtype: 'init', model: 'm', claude_code_version: '2.1.322' }]).events, EV.SESSION), []);
+});
+
 test('model, session and thinking for the root', () => {
   const { events } = run(fixture('claude-subagent-run.jsonl'));
   assert.equal(of(events, EV.MODEL, ROOT)[0].model, 'claude-haiku-4-5-20251001');

@@ -2,7 +2,7 @@
 // Workbench: launch coding agents and see what each one is doing, in plain language.
 //
 //   node bin/workbench.mjs --demo [--port 4317] [--no-open]
-//   node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--port 4317] [--no-open]
+//   node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
 //
 // Wires the real modules together: store, engine, commands, policy, workspaces, receipt, machines,
 // the adapters and the local web server. Every agent process is stopped when Workbench exits.
@@ -15,19 +15,28 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_PORT = 4317;
 const DEFAULT_BUDGET_USD = 2;
 
+/** Said instead of starting, when the variable every agent gets is set: this is an agent's own command. */
+const INSIDE_AGENT = 'Workbench is running inside an agent. It will not start real agents from there.';
+/** Said at the start when git has no user.name and user.email for the repository. */
+const NO_GIT_IDENTITY ='Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: git config --global user.name "Your Name" and git config --global user.email you@example.com';
+/** How the start says where Claude Code was found. */
+const CLAUDE_FROM = { flag: ' (from --claude)', env: ' (from WORKBENCH_CLAUDE_BIN)', path: '', vscode: ' (from the VS Code extension)' };
+
 const USAGE = `Workbench launches coding agents and shows what each one is doing, in plain language.
 
 Try it with simulated agents (nothing is spent):
   node bin/workbench.mjs --demo [--port 4317] [--no-open]
 
 Run real agents on a git repository:
-  node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--port 4317] [--no-open]
+  node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
 
 Options:
   --demo              simulated agents and machines
   --repo <path>       the git repository the agents work on (each gets its own copy)
   --budget <usd>      the most each agent may spend, in US dollars (default 2)
   --model <name>      the model to ask for
+  --claude <path>     the Claude Code program to run. Without it: WORKBENCH_CLAUDE_BIN, then claude on the
+                      PATH, then the newest Claude Code extension in VS Code or Cursor
   --port <n>          the port for the web page (default 4317; 0 picks a free one)
   --no-open           do not open the browser
   --event-log <file>  also write every event to this file, one JSON object per line
@@ -37,7 +46,7 @@ Options:
 // ------------------------------------------------------------------ arguments
 
 function parseArgs(argv) {
-  const out = { demo: false, repo: null, budget: null, model: null, port: DEFAULT_PORT, open: true, help: false, verbose: false, eventLog: null, error: null };
+  const out = { demo: false, repo: null, budget: null, model: null, claude: null, port: DEFAULT_PORT, open: true, help: false, verbose: false, eventLog: null, error: null };
   for (let i = 0; i < argv.length && !out.error; i++) {
     const raw = argv[i];
     let flag = raw;
@@ -61,6 +70,13 @@ function parseArgs(argv) {
       case '--demo': out.demo = true; break;
       case '--repo': out.repo = value(); break;
       case '--model': out.model = value(); break;
+      case '--claude': {
+        const v = value();
+        if (v == null) break;
+        if (!v.trim()) out.error = '--claude needs the path of the Claude Code program.';
+        else out.claude = v;
+        break;
+      }
       case '--event-log': out.eventLog = value(); break;
       case '--no-open': out.open = false; break;
       case '--verbose': out.verbose = true; break;
@@ -168,6 +184,25 @@ async function loadModules(demo, log) {
   return { ...base, policy, workspace, receipt, history, claude, codex };
 }
 
+/** End a reason with one full stop: reasons are often whole sentences already. */
+function sentence(text) {
+  const t = String(text || '').trim();
+  return /[.!?]$/.test(t) ? t : `${t}.`;
+}
+
+/**
+ * The Claude Code adapter, told the --claude path when one was given. The engine calls available() and
+ * createRunner() itself, and every launch looks Claude Code up again from this path.
+ */
+function claudeAdapter(mod, claudePath) {
+  if (!mod || !claudePath) return mod;
+  return {
+    ...mod,
+    available: (o = {}) => mod.available({ ...o, claudePath }),
+    createRunner: (o = {}) => mod.createRunner({ ...o, claudePath }),
+  };
+}
+
 /** Whether an adapter can run here: { ok, version?, reason? }. */
 async function availability(mod, name) {
   if (!mod) return { ok: false, reason: `${name} support could not be loaded.` };
@@ -219,6 +254,12 @@ async function main() {
     complain(`${args.error}\n\n${USAGE}`);
     return 2;
   }
+  // Every agent Workbench starts has WORKBENCH_AGENT_ID. An agent working on this repository could otherwise start a
+  // second Workbench, whose real agents would run on the person's login without the person seeing them.
+  if (!args.demo && process.env.WORKBENCH_AGENT_ID !== undefined) {
+    complain(INSIDE_AGENT);
+    return 2;
+  }
   const log = createLogger(args.verbose);
 
   let mods;
@@ -232,6 +273,7 @@ async function main() {
 
   // Live mode: the repository and at least one harness must be there.
   let repo = null;
+  let identity; // { name, email } or null from the workspace module; undefined when it could not tell
   const adapters = {};
   if (!args.demo) {
     const repoPath = path.resolve(args.repo);
@@ -241,19 +283,32 @@ async function main() {
       complain(err?.message || `Workbench could not use ${repoPath} as a git repository.`);
       return 1;
     }
-    const claudeInfo = await availability(mods.claude, 'Claude Code');
+    if (typeof mods.workspace.gitIdentity === 'function') {
+      try {
+        identity = await mods.workspace.gitIdentity({ repoRoot: repo.root });
+      } catch (err) {
+        log.debug('Could not read git’s name and email:', err);
+      }
+    }
+    const claude = claudeAdapter(mods.claude, args.claude);
+    const claudeInfo = await availability(claude, 'Claude Code');
     const codexInfo = await availability(mods.codex, 'Codex');
-    if (claudeInfo.ok) adapters.claude = mods.claude;
+    if (claudeInfo.ok) adapters.claude = claude;
     if (codexInfo.ok) adapters.codex = mods.codex;
     if (!adapters.claude && !adapters.codex) {
       complain('Workbench could not find Claude Code or Codex on this computer, so it has nothing to run.');
-      complain(`  Claude Code: ${claudeInfo.reason || 'not available'}`);
-      complain(`  Codex: ${codexInfo.reason || 'not available'}`);
+      complain(`  Claude Code: ${sentence(claudeInfo.reason || 'It is not available')}`);
+      complain(`  Codex: ${sentence(codexInfo.reason || 'It is not available')}`);
       complain('Install one of them, or try Workbench with simulated agents using --demo.');
       return 1;
     }
-    say(claudeInfo.ok ? `Claude Code${claudeInfo.version ? ' ' + claudeInfo.version : ''} is ready.` : `Claude Code is not available: ${claudeInfo.reason || 'not found'}.`);
-    say(codexInfo.ok ? `Codex${codexInfo.version ? ' ' + codexInfo.version : ''} is ready.` : `Codex is not available: ${codexInfo.reason || 'not found'}.`);
+    if (claudeInfo.ok) {
+      say(`Claude Code${claudeInfo.version ? ' ' + claudeInfo.version : ''} is ready${CLAUDE_FROM[claudeInfo.from] || ''}.`);
+      if (claudeInfo.path) log.info(`Claude Code is ${claudeInfo.path}`);
+    } else {
+      say(`Claude Code is not available: ${sentence(claudeInfo.reason || 'it was not found')}`);
+    }
+    say(codexInfo.ok ? `Codex${codexInfo.version ? ' ' + codexInfo.version : ''} is ready.` : `Codex is not available: ${sentence(codexInfo.reason || 'it was not found')}`);
   }
 
   const token = crypto.randomBytes(32).toString('hex');
@@ -387,6 +442,7 @@ async function main() {
     const dirty = Number(repo.dirty) || 0;
     if (dirty) say(`Your ${dirty} uncommitted change${dirty === 1 ? ' is' : 's are'} not included.`);
     say(`Each agent can spend up to $${(args.budget ?? DEFAULT_BUDGET_USD).toFixed(2)}.`);
+    if (identity === null) say(NO_GIT_IDENTITY);
   }
   say('Press Ctrl-C to stop.');
   if (args.open) openBrowser(address);

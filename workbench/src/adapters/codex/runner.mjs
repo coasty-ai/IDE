@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
+import { withNodeOnPath } from '../claude/args.mjs';
 import { createCodexParser, plainError, STOPPED_EARLY } from './parse.mjs';
 
 export const harness = 'codex';
@@ -33,22 +34,29 @@ const CLAUDE_SESSION_VARS = /^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_PID|CLAUDE_EFFORT|
 const CODEX_SESSION_VARS = /^CODEX_(THREAD_ID|SESSION_ID|TOOL_CALL_ID|SANDBOX|SANDBOX_NETWORK_DISABLED|PERMISSION_PROFILE)$|^CODEX_(EXEC_SERVER|NETWORK_PROXY|SNAPSHOT|SHELL_SNAPSHOT)_/;
 // Workbench's hook credentials. Codex has no hook, and its commands must not be able to call the engine.
 const WORKBENCH_SECRETS = new Set(['WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN']);
+// The editor Workbench was started from (VS Code, or Claude Code inside it), and Workbench's own choice of programs:
+// an agent gets no handle on the editor's connection, and a Workbench an agent starts does not inherit the programs.
+// The Claude adapter removes the same ones.
+const HOST_VARS = /^(VSCODE_.*|ELECTRON_RUN_AS_NODE|GIT_EDITOR|WORKBENCH_CLAUDE_BIN|WORKBENCH_CODEX_BIN)$/;
 
 /** The Codex binary: `WORKBENCH_CODEX_BIN` (read at call time, so tests can point it at a fake) or `codex`. */
 export function codexBin(env = process.env) {
   return env.WORKBENCH_CODEX_BIN || 'codex';
 }
 
-/** A copy of `base` without other sessions' variables, plus WORKBENCH_AGENT_ID. */
+/**
+ * A copy of `base` without other sessions' variables, plus WORKBENCH_AGENT_ID. When PATH has no node, the folder of
+ * the node running Workbench goes first, so the agent's `npm test` and `node --test` work.
+ */
 export function buildEnv(base = process.env, agentId) {
   const env = {};
   for (const [key, value] of Object.entries(base)) {
     if (value === undefined) continue;
-    if (CLAUDE_SESSION_VARS.test(key) || CODEX_SESSION_VARS.test(key) || WORKBENCH_SECRETS.has(key)) continue;
+    if (CLAUDE_SESSION_VARS.test(key) || CODEX_SESSION_VARS.test(key) || WORKBENCH_SECRETS.has(key) || HOST_VARS.test(key)) continue;
     env[key] = value;
   }
   if (agentId) env.WORKBENCH_AGENT_ID = agentId;
-  return env;
+  return withNodeOnPath(env);
 }
 
 /** Arguments for the first turn. */

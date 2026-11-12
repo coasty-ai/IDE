@@ -1,0 +1,14 @@
+{
+  "name": "workbench-ide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Workbench runs coding agents and shows what each one is doing, in plain language. The program is in workbench/.",
+  "scripts": {
+    "test": "npm --prefix workbench test",
+    "demo": "node workbench/bin/workbench.mjs --demo",
+    "dogfood": "node workbench/bin/workbench.mjs --repo ."
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

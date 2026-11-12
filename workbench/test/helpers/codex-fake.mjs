@@ -30,7 +30,8 @@ const RESUME = { values: new Set(['-c', '--config', '-m', '--model']), flags: ne
 
 // Variables the tests look for. Only presence is recorded, apart from two harmless values.
 const WATCHED = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_THREAD_ID', 'CODEX_SANDBOX', 'CODEX_EXEC_SERVER_URL',
-  'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'CODEX_HOME', 'CODEX_API_KEY', 'WORKBENCH_AGENT_ID'];
+  'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'CODEX_HOME', 'CODEX_API_KEY', 'WORKBENCH_AGENT_ID',
+  'WORKBENCH_CLAUDE_BIN', 'WORKBENCH_CODEX_BIN', 'VSCODE_IPC_HOOK', 'ELECTRON_RUN_AS_NODE', 'GIT_EDITOR'];
 
 function usageError(message) {
   process.stderr.write(`error: ${message}\n`);

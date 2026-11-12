@@ -3,7 +3,8 @@
 // It never talks to a network and never spends anything.
 //
 // - With no arguments it exits 0 at once (the test runner may load every file under test/).
-// - `--version` prints a version (or hangs, with FAKE_CLAUDE_VERSION=hang).
+// - `--version` prints a version: FAKE_CLAUDE_VERSION when set (it hangs with FAKE_CLAUDE_VERSION=hang), else 2.1.221.
+//   Its system/init lines report the same version, with a short list of tools.
 // - Otherwise it checks the launch flags and environment the workbench must pass, and exits 3 with a reason
 //   on stderr when one is wrong. Then it reads stream-json user messages on stdin, one per line:
 //     * the first message replays FAKE_CLAUDE_FIXTURE (a file in test/fixtures/) with its session id,
@@ -42,13 +43,14 @@ import path from 'node:path';
 
 const argv = process.argv.slice(2);
 const env = process.env;
+const VERSION = env.FAKE_CLAUDE_VERSION && env.FAKE_CLAUDE_VERSION !== 'hang' ? env.FAKE_CLAUDE_VERSION : '2.1.221';
 
 if (argv.length === 0) {
   // Started with no arguments, as `node --test test/` does with every file under test/: nothing to do.
   process.exit(0);
 } else if (argv.includes('--version')) {
   if (env.FAKE_CLAUDE_VERSION === 'hang') setInterval(() => {}, 1000);
-  else { process.stdout.write('2.1.221 (Claude Code)\n'); process.exit(0); }
+  else { process.stdout.write(`${VERSION} (Claude Code)\n`); process.exit(0); }
 } else {
   main();
 }
@@ -66,7 +68,9 @@ function main() {
   need(value('--setting-sources') === 'project', '--setting-sources project');
   need(value('--permission-mode') === 'default', '--permission-mode default');
   need(argv.includes('--strict-mcp-config'), '--strict-mcp-config');
-  need(['AskUserQuestion', 'DesignSync', 'CronList'].every((t) => String(value('--disallowedTools') || '').split(' ').includes(t)), '--disallowedTools');
+  // A few of the turned-off tools, including the five new in Claude Code 2.1.322.
+  const off = ['AskUserQuestion', 'DesignSync', 'CronList', 'SendFile', 'SendToProject', 'PublishPlugin', 'ListAgents', 'WrapUp'];
+  need(off.every((t) => String(value('--disallowedTools') || '').split(' ').includes(t)), '--disallowedTools');
   let settings = null;
   try { settings = JSON.parse(value('--settings')); } catch { settings = null; }
   need(settings && settings.disableAllHooks === false, 'disableAllHooks: false in --settings');
@@ -86,7 +90,9 @@ function main() {
   need(!!value('--name'), '--name');
   for (const k of ['WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'WORKBENCH_AGENT_ID']) need(!!env[k], k);
   // The markers of a surrounding Claude Code session must be gone; the person's own CLAUDE_CODE_* settings may stay.
+  // So must the editor's variables and Workbench's own choice of programs.
   for (const k of Object.keys(env)) need(!/^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_AGENT_SDK_|CLAUDE_CODE_(ENTRYPOINT|CHILD_SESSION|SESSION_|MESSAGING_|SSE_PORT))/.test(k), `no ${k} in the environment`);
+  for (const k of Object.keys(env)) need(!/^(VSCODE_.*|ELECTRON_RUN_AS_NODE|GIT_EDITOR|WORKBENCH_CLAUDE_BIN|WORKBENCH_CODEX_BIN)$/.test(k), `no ${k} in the environment`);
   if (env.FAKE_CLAUDE_EXPECT_BUDGET) need(value('--max-budget-usd') === env.FAKE_CLAUDE_EXPECT_BUDGET, `--max-budget-usd ${env.FAKE_CLAUDE_EXPECT_BUDGET}`);
   if (problems.length) {
     process.stderr.write(`fake claude: bad launch: ${problems.join(', ')}\n`);
@@ -122,7 +128,7 @@ function main() {
   function reply(text) {
     n++;
     cost += 0.01;
-    out({ type: 'system', subtype: 'init', session_id: session, model: 'claude-fake-1', cwd: process.cwd() });
+    out({ type: 'system', subtype: 'init', session_id: session, model: 'claude-fake-1', cwd: process.cwd(), claude_code_version: VERSION, tools: ['Task', 'Bash', 'Edit', 'Read', 'Write'] });
     out({
       type: 'assistant', parent_tool_use_id: null, session_id: session,
       message: { id: `msg_fake_${n}`, model: 'claude-fake-1', role: 'assistant', content: [{ type: 'text', text }], usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },

@@ -5,7 +5,10 @@ import { existsSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
-import { buildClaudeLaunch, claudeBin, scrubEnv, userMessage, sessionFolders, sessionExists, DEFAULT_BUDGET_USD } from './args.mjs';
+import {
+  buildClaudeLaunch, findClaude, scrubEnv, withNodeOnPath, userMessage, sessionFolders, sessionExists,
+  DEFAULT_BUDGET_USD, DISALLOWED_TOOLS, CLAUDE_NOT_FOUND,
+} from './args.mjs';
 import { createClaudeParser } from './parse.mjs';
 
 export const harness = 'claude';
@@ -24,27 +27,37 @@ const CLOSE_WAIT_MS = 2000;
 
 const firstLine = (s) => String(s || '').trim().split('\n')[0].trim().slice(0, 200);
 
+/** Tools the launch turns off; Claude Code should never offer them to an agent. */
+const DISALLOWED = new Set(DISALLOWED_TOOLS.split(' '));
+
 /**
- * Is Claude Code installed? Runs `<bin> --version` with a 5 second timeout.
- * @returns {Promise<{ ok: boolean, version?: string, reason?: string }>}
+ * Is Claude Code here? Finds it (see findClaude in args.mjs: `claudePath` is the --claude flag), then runs
+ * `<path> --version` with a 5 second timeout.
+ * @returns {Promise<{ ok: boolean, version?: string, path?: string, from?: 'flag'|'env'|'path'|'vscode', reason?: string }>}
+ *   `path` and `from` say which Claude Code it found and how, also when that one cannot be used
  */
-export async function available({ env = process.env, timeoutMs = 5000 } = {}) {
-  const bin = claudeBin(env);
+export async function available({ env = process.env, timeoutMs = 5000, claudePath } = {}) {
+  const where = findClaude({ flag: claudePath, env });
+  const found = where.path ? { path: where.path, from: where.from } : {};
+  if (!where.path || where.reason) return { ok: false, reason: where.reason || CLAUDE_NOT_FOUND, ...found };
   return new Promise((resolve) => {
-    execFile(bin, ['--version'], { timeout: timeoutMs, env: scrubEnv(env), maxBuffer: 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+    execFile(where.path, ['--version'], { timeout: timeoutMs, env: withNodeOnPath(scrubEnv(env)), maxBuffer: 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
       if (err) {
-        if (err.code === 'ENOENT') return resolve({ ok: false, reason: 'Claude Code is not installed here: the claude command was not found.' });
-        if (err.code === 'EACCES') return resolve({ ok: false, reason: 'Claude Code could not be run: permission was refused.' });
-        if (err.killed) return resolve({ ok: false, reason: 'Claude Code did not answer when asked for its version.' });
+        if (err.code === 'ENOENT') return resolve({ ok: false, reason: `Claude Code could not be started: ${where.path} was not found.`, ...found });
+        if (err.code === 'EACCES') return resolve({ ok: false, reason: 'Claude Code could not be run: permission was refused.', ...found });
+        if (err.killed) return resolve({ ok: false, reason: 'Claude Code did not answer when asked for its version.', ...found });
         const said = firstLine(stderr);
-        return resolve({ ok: false, reason: 'Claude Code could not be started.' + (said ? ' It said: ' + said : '') });
+        return resolve({ ok: false, reason: 'Claude Code could not be started.' + (said ? ' It said: ' + said : ''), ...found });
       }
       const text = String(stdout || '').trim();
       const m = /\d+\.\d+\.\d+[\w.-]*/.exec(text);
-      resolve({ ok: true, version: m ? m[0] : (firstLine(text) || 'unknown') });
+      resolve({ ok: true, version: m ? m[0] : (firstLine(text) || 'unknown'), ...found });
     });
   });
 }
+
+/** A word Claude Code printed, safe to log: letters, digits and a few marks only. */
+const logWord = (w) => String(w).replace(/[^\w.:@/+-]/g, '?').slice(0, 80);
 
 /**
  * Split a byte or text stream into lines. Handles lines cut across chunks, multi-byte characters cut across
@@ -129,6 +142,8 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
  * @param {object} opts  { agentId, name, task, cwd, model?, budgetUsd?, emit, hook: { url, token }, log }
  *   `sessionId` continues an earlier session (from history) instead of starting one: call send(), not start(); the
  *   first message resumes it with `--resume` and the whole of `budgetUsd` (the new process has spent nothing).
+ *   `claudePath` is the --claude flag: Claude Code is looked up again at each launch (findClaude in args.mjs), since
+ *   the VS Code extension moves to a new folder with each update.
  *   Also accepted, mainly for tests: env (base environment), killGraceMs, now, bridgePath, nodePath, machineId.
  */
 export function createRunner(opts = {}) {
@@ -136,6 +151,7 @@ export function createRunner(opts = {}) {
   const emitFn = typeof opts.emit === 'function' ? opts.emit : () => {};
   const now = typeof opts.now === 'function' ? opts.now : Date.now;
   const baseEnv = opts.env || process.env;
+  const claudePath = typeof opts.claudePath === 'string' ? opts.claudePath : null;
   const budgetUsd = opts.budgetUsd == null ? DEFAULT_BUDGET_USD : Number(opts.budgetUsd);
   const graceMs = opts.killGraceMs ?? STOP_GRACE_MS;
   const log = makeLog(opts.log, agentId);
@@ -155,16 +171,32 @@ export function createRunner(opts = {}) {
   let stopping = null;    // promise of a stop in progress
   let closed = null;      // resolves when the current process is fully gone and reported
   let stderrTail = '';
+  let bin = null;         // the Claude Code program of the current process
+  let toldTools = false;  // its tools were logged (once per process)
 
   function emit(ev) {
     if (ev.ts == null) ev.ts = now();
     try { emitFn(ev); } catch (err) { log('error', `an event handler failed: ${err.message}`); }
   }
 
+  /** Log, once per process, which Claude Code started and the tools it offers the agent. */
+  function tellTools(o) {
+    if (toldTools) return;
+    toldTools = true;
+    const tools = Array.isArray(o.tools) ? o.tools.filter((t) => typeof t === 'string').map(logWord) : [];
+    const version = typeof o.claude_code_version === 'string' ? logWord(o.claude_code_version) : 'of an unknown version';
+    log('info', `Claude Code ${version} offers ${tools.length} tools: ${tools.join(' ') || 'none'}`);
+    const off = tools.filter((t) => DISALLOWED.has(t));
+    if (off.length) log('warn', `Claude Code offers tools Workbench turned off for its agents: ${off.join(' ')}`);
+  }
+
   function onLine(line) {
     let obj;
     try { obj = JSON.parse(line); } catch { log('debug', `ignored output that is not JSON: ${line.slice(0, 120)}`); return; }
-    if (obj && obj.type === 'system' && obj.subtype === 'init' && obj.session_id) sessionId = String(obj.session_id);
+    if (obj && obj.type === 'system' && obj.subtype === 'init') {
+      if (obj.session_id) sessionId = String(obj.session_id);
+      tellTools(obj);
+    }
     for (const ev of parser.push(obj)) emit(ev);
   }
 
@@ -178,7 +210,7 @@ export function createRunner(opts = {}) {
     if (err && err.code === 'ENOENT') {
       return cwd && !existsSync(cwd)
         ? "Claude Code could not be started: the agent's folder does not exist."
-        : 'Claude Code could not be started: the claude command was not found.';
+        : `Claude Code could not be started: ${bin || 'the claude command'} was not found.`;
     }
     if (err && err.code === 'EACCES') return 'Claude Code could not be started: permission was refused.';
     return 'Claude Code could not be started' + (err && err.message ? `: ${err.message}` : '.');
@@ -219,14 +251,21 @@ export function createRunner(opts = {}) {
         budget = budgetUsd - (typeof costUsd === 'number' ? costUsd : 0) - (unreportedUsd || 0);
         if (!(budget >= 0.01)) throw Object.assign(new Error(`${who} has used its whole spending limit, so it can’t continue.`), { plain: true });
       }
+      // Looked up again for every process: an update of the VS Code extension moves Claude Code to a new folder.
+      // Nothing was started when it is not found, so this is said as a plain refusal, like the spending limit: the
+      // engine reports it, and an agent from an earlier run stays as it was.
+      const where = findClaude({ flag: claudePath, env: baseEnv });
+      if (!where.path || where.reason) throw Object.assign(new Error(where.reason || CLAUDE_NOT_FOUND), { plain: true });
       const spec = buildClaudeLaunch({
-        name, model, budgetUsd: budget, hook, agentId, env: baseEnv,
+        name, model, budgetUsd: budget, hook, agentId, env: baseEnv, bin: where.path,
         sessionId: resume ? undefined : sessionId,
         resumeSessionId: resume ? sessionId : undefined,
         bridgePath: opts.bridgePath, nodePath: opts.nodePath,
       });
       if (!resume) sessionId = spec.sessionId;
       else parser.processRestarted();
+      bin = spec.bin;
+      toldTools = false;
       stderrTail = '';
       stopRequested = false;
 
@@ -272,7 +311,7 @@ export function createRunner(opts = {}) {
           else log('warn', `process error: ${err.message}`);
         });
       });
-      log('info', `started Claude Code (pid ${child.pid}${resume ? ', resuming its session' : ''})`);
+      log('info', `started Claude Code from ${bin} (pid ${child.pid}${resume ? ', resuming its session' : ''})`);
     })();
     launching = p;
     p.then(() => { if (launching === p) launching = null; }, () => { if (launching === p) launching = null; });
