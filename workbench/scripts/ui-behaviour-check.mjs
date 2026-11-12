@@ -29,6 +29,14 @@ await b.beforeLoad(`(() => {
   window.SpeechRecognition = FakeSR; window.webkitSpeechRecognition = FakeSR;
   try { sessionStorage.setItem('wb-voice-told', '1'); } catch (e) {}
 })()`);
+// A gate on animation frames, shut only by the checks that need it: while it is shut, the page's renders wait (they run
+// on a frame) but the stream still updates the page's data. So a button drawn before a change can be clicked after the
+// change has arrived and before the page draws it again, every time, without racing the 90 ms render.
+await b.beforeLoad(`(() => {
+  const raf = window.requestAnimationFrame.bind(window), held = [];
+  window.__frames = { hold: false, release() { this.hold = false; for (const cb of held.splice(0)) raf(cb); } };
+  window.requestAnimationFrame = cb => { if (window.__frames.hold) { held.push(cb); return 0; } return raf(cb); };
+})()`);
 
 const page = () => `document.querySelector('#pages .page:not(.old)')`;
 const h1 = () => b.ev(`${page()}?.querySelector('h1')?.textContent || ''`);
@@ -36,7 +44,7 @@ const posts = async () => { const l = await ctl('log'); return l; };
 const clearLog = async () => { allPosts.push(...(await posts())); await ctl('clear'); };
 async function open(scenario, { still = false, theme = 'green', detail = 'calm', mode = {} } = {}) {
   await clearLog();
-  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, ...mode });
+  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', ...mode });
   await ctl('scenario', { name: scenario, push: false });
   await b.ev(`(() => { try { localStorage.setItem('wb-theme', ${JSON.stringify(theme)}); localStorage.setItem('wb-detail', ${JSON.stringify(detail)}); localStorage.setItem('wb-answered', '1'); sessionStorage.removeItem('wb-later'); sessionStorage.removeItem('wb-reviewed'); } catch (e) {} return 1; })()`).catch(() => {});
   await b.goto(`${base}/?t=k${still ? '&still=1' : ''}`, 1600);
@@ -666,6 +674,249 @@ try {
     const txt = await b.ev(`${page()}?.textContent || ''`);
     const acts = await b.ev(`[...${page()}.querySelectorAll('[data-act]')].map(x => x.dataset.act).join(',')`);
     check('an earlier agent whose folder is gone says so and has no Continue', /Its folder is gone, so it cannot continue\./.test(txt) && !/fix/.test(acts) && /forget/.test(acts), `${acts} / ${txt.slice(0, 160)}`);
+  });
+
+  // ---------------------------------------------------------------- D2: merge, review and throw away (the 'merge' scenarios)
+  // In 'merge', the lid shows Invoice export (m1a2b3, done and checked, work not merged yet) first, of three to look at;
+  // Search cleanup (m7e8f9) has a merge that conflicts, Price rounding (mab0c1) one your own changes blocked.
+  const acts = () => b.ev(`[...(${page()}?.querySelectorAll('.acts button') || [])].map(x => x.textContent + (x.classList.contains('pri') ? '*' : '')).join(',')`);
+  const links = () => b.ev(`[...(${page()}?.querySelectorAll('.links button') || [])].map(x => x.textContent).join(',')`);
+  const said = () => b.ev(`document.getElementById('said').textContent`);
+  const typeIn = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); };
+  const workPosts = async () => (await posts()).filter(x => /\/(merge|discard|say|answer)$/.test(x.path) || x.path.startsWith('/api/confirm/') || x.path === '/api/command');
+  // the git screen is builder D1's (#gitScreen in ui/index.html, ui/gitscreen.js): checks that need it say so when it is not here
+  const gitHere = async () => { const r = await fetch(`${base}/ui/gitscreen.js`); await r.arrayBuffer().catch(() => {}); return r.ok && (await b.ev(`!!document.getElementById('gitScreen')`)); };
+  const NEEDS_D1 = 'needs builder D1\'s git screen: #gitScreen in ui/index.html and ui/gitscreen.js are not in this page yet';
+  const screen = () => b.ev(`(() => { const g = document.getElementById('gitScreen'), s = document.getElementById('boardScreen'); if (!g || !s) return 'none'; return s.inert && !g.inert ? 'git' : !s.inert && g.inert ? 'board' : 'moving'; })()`);
+
+  await run('Merge asks first: it posts the agent and the state it was drawn for, and the engine’s card shows its own words', async () => {
+    await open('merge');
+    await sleep(900);
+    const before = await lidNow(), row = await acts(), quiet = await links();
+    await clickIn('[data-act="merge"]');
+    await sleep(900);
+    const p = await workPosts(), card = await lidNow(), cardActs = await acts();
+    check('Merge asks first: it posts the agent and the state it was drawn for, and the engine’s card shows its own words',
+      /Invoice export is done and checked/.test(before) && row === 'Merge into main*,Ask for a change' && quiet === 'Review the changes,Not now'
+      && p.length === 1 && p[0].path === '/api/agents/m1a2b3/merge' && p[0].body.state === 'done_checked'
+      && /^Before it merges \/ Merge Invoice export into main\?/.test(card) && cardActs === 'Merge*,Cancel',
+      `"${before}" [${row}] [${quiet}] → ${JSON.stringify(p.map(x => [x.path, x.body]))} → "${card}" [${cardActs}]`);
+  });
+
+  await run('the merge card’s yes and no post /api/confirm/<id>; yes shows the outcome on that agent', async () => {
+    await open('merge');
+    await sleep(900);
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    await clickIn('[data-act="confirm"][data-go="0"]'); await sleep(900);
+    const no = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
+    const afterNo = await lidNow(), saidNo = await said();
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    await clickIn('[data-act="confirm"][data-go="1"]'); await sleep(1300);
+    const yes = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
+    const afterYes = await lidNow(), saidYes = await said(), quiet = await acts();
+    check('the merge card’s yes and no post /api/confirm/<id>; yes shows the outcome on that agent',
+      no.length === 1 && no[0].body.go === false && /OK, I won’t merge it\./.test(saidNo) && /Invoice export is done and checked/.test(afterNo)
+      && yes.length === 2 && yes[1].body.go === true && yes[1].path !== yes[0].path && /Merged Invoice export into main\./.test(saidYes)
+      && /^merged \/ Invoice export’s work is in main\./.test(afterYes) && quiet === 'See it in git*,Ask for a change',
+      `no ${JSON.stringify(no.map(x => [x.path, x.body]))} "${afterNo}" "${saidNo}"; yes ${JSON.stringify(yes.map(x => [x.path, x.body]))} "${afterYes}" "${saidYes}" [${quiet}]`);
+  });
+
+  await run('a Merge click right after the core changes is ignored', async () => {
+    await open('merge');
+    await sleep(900);
+    // Search cleanup's conflict clears and it finishes again, newest: it comes to the core with its own Merge
+    const s = await agentOf('m7e8f9');
+    await push('agents', [{ ...s, endedAt: Date.now(), stateSince: Date.now(), work: { ...s.work, problem: null } }]);
+    await sleep(260);
+    const shown = await h1();
+    await clickIn('[data-act="merge"]');
+    await sleep(300);
+    const early = (await posts()).filter(x => /\/merge$/.test(x.path));
+    await sleep(700);
+    await clickIn('[data-act="merge"]');
+    await sleep(500);
+    const later = (await posts()).filter(x => /\/merge$/.test(x.path));
+    check('a Merge click right after the core changes is ignored', /Search cleanup is done and checked/.test(shown) && early.length === 0 && later.length === 1 && later[0].path === '/api/agents/m7e8f9/merge',
+      `shown "${shown}", early ${early.length}, later ${JSON.stringify(later.map(x => x.path))}`);
+  });
+
+  // A button drawn before a change acts on nothing after it: the agent's state, where its work went, or your branch.
+  for (const [what, change] of [
+    ['its state', a => push('agents', [{ ...a, state: 'working', endedAt: null, now: 'Working on your message' }])],
+    ['where its work went', a => push('agents', [{ ...a, work: { ...a.work, merged: { into: 'main', merge: 'f'.repeat(40), at: Date.now(), files: 3, adds: 40, dels: 2 } }, files: { changed: 0, adds: 0, dels: 0, list: [] } }])],
+    ['your branch', () => push('repo', { name: 'invoices-api', head: 'abc1234', branch: 'release', dirty: 2, identity: true })],
+  ]) {
+    await run(`a Merge drawn before a change in ${what} says "That changed" and posts nothing`, async () => {
+      await open('merge');
+      await sleep(900);
+      const a = await agentOf('m1a2b3');
+      await b.ev(`window.__frames.hold = true, 1`);
+      await change(a);
+      await sleep(500);   // the stream has brought it; the lid has not been drawn again
+      const drawn = await b.ev(`${page()}?.querySelector('[data-act="merge"]')?.dataset.state || ''`);
+      await clickIn('[data-act="merge"]');
+      await sleep(150);
+      const words = await said();
+      await b.ev(`window.__frames.release(), 1`);
+      await sleep(800);
+      const p = (await posts()).filter(x => /\/merge$/.test(x.path));
+      check(`a Merge drawn before a change in ${what} says "That changed" and posts nothing`, drawn === 'done_checked' && p.length === 0 && /That changed\. Have another look\./.test(words),
+        `drawn for ${drawn}, posts ${p.length}, said "${words}"`);
+    });
+  }
+
+  await run('Throw it away always asks: no default answer, a bare "yes" is not enough, and Keep it keeps it', async () => {
+    await open('merge');
+    await sleep(900);
+    await typeIn('throw it away'); await sleep(1000);
+    const card = await lidNow(), row = await acts();
+    const discards = (await posts()).filter(x => /\/discard$/.test(x.path));
+    await typeIn('yes'); await sleep(800);
+    const afterYes = await lidNow(), saidYes = await said();
+    await clickIn('[data-act="confirm"][data-go="0"]'); await sleep(900);
+    const kept = (await agentOf('m1a2b3')).work;
+    await typeIn('throw it away'); await sleep(1000);
+    await clickIn('[data-act="confirm"][data-go="1"]'); await sleep(1300);
+    const gone = (await agentOf('m1a2b3')).work, after = await lidNow();
+    const p = (await posts()).filter(x => x.path === '/api/command' || x.path.startsWith('/api/confirm/'));
+    check('Throw it away always asks: no default answer, a bare "yes" is not enough, and Keep it keeps it',
+      /^Before it is thrown away \/ Throw away Invoice export’s work\?/.test(card) && row === 'Throw it away,Keep it' && discards.length === 0
+      && afterYes === card && /I did not catch that\. Say “do it” to throw it away, or “cancel”\./.test(saidYes)
+      && !kept.thrownAway && gone.thrownAway && /^thrown away \/ Invoice export’s work was thrown away\./.test(after)
+      && p[0].body.text === 'throw it away' && p[0].body.focusId === 'm1a2b3' && p[1].body.text === 'yes' && /^c/.test(p[1].body.confirmId || '')
+      && p.some(x => x.path.startsWith('/api/confirm/') && x.body.go === false) && p.some(x => x.path.startsWith('/api/confirm/') && x.body.go === true),
+      `"${card}" [${row}]; yes → "${afterYes}" "${saidYes}"; kept ${!kept.thrownAway}; then "${after}"; ${JSON.stringify(p.map(x => [x.path, x.body]))}`);
+  });
+
+  await run('"Not now" does what "Looks good" did: an answer without an ask id, and the core moves on', async () => {
+    await open('merge');
+    await sleep(900);
+    await clickIn('[data-act="looksgood"]'); await sleep(1100);
+    const p = (await posts()).filter(x => x.path.includes('/answer'));
+    const next = await lidNow();
+    check('"Not now" does what "Looks good" did: an answer without an ask id, and the core moves on',
+      p.length === 1 && p[0].path === '/api/agents/m1a2b3/answer' && p[0].body.answer === 'Looks good' && !('askId' in p[0].body) && /Search cleanup’s work does not merge cleanly into main/.test(next),
+      `${JSON.stringify(p.map(x => [x.path, x.body]))} → "${next}"`);
+  });
+
+  await run('a merge that conflicts: "Ask it to bring in main" sends its exact message; "Look later" sets it aside', async () => {
+    await open('merge');
+    await sleep(900);
+    await clickIn('[data-act="next"]'); await sleep(1100);
+    const shown = await lidNow(), row = await acts(), meta = await b.ev(`${page()}?.querySelector('.meta')?.textContent || ''`);
+    await clickIn('[data-act="fix"]'); await sleep(900);
+    const p = (await posts()).filter(x => x.path.includes('/say'));
+    check('a merge that conflicts: "Ask it to bring in main" sends its exact message',
+      /Search cleanup’s work does not merge cleanly into main\./.test(shown) && row === 'Ask it to bring in main*,Look later' && meta === 'Both changed: src/search/index.ts, src/search/redirects.ts'
+      && p.length === 1 && p[0].path === '/api/agents/m7e8f9/say'
+      && p[0].body.text === 'Your work conflicts with the latest main in: src/search/index.ts, src/search/redirects.ts. Please merge main into your branch, resolve the conflicts, and finish.',
+      `"${shown}" [${row}] "${meta}" ${JSON.stringify(p.map(x => [x.path, x.body]))}`);
+    await open('merge');
+    await sleep(900);
+    await clickIn('[data-act="next"]'); await sleep(1100);
+    await clickIn('[data-act="later"]'); await sleep(1100);
+    const after = await lidNow();
+    check('"Look later" on a merge that conflicts sets it aside', /Price rounding|Invoice export/.test(after) && !/Search cleanup/.test(after), `"${after}"`);
+  });
+
+  await run('your own changes in the way: "Try again" asks for the merge again', async () => {
+    await open('merge');
+    await sleep(900);
+    await clickIn('[data-act="next"]'); await sleep(1100);
+    await clickIn('[data-act="next"]'); await sleep(1100);
+    const shown = await lidNow(), row = await acts();
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    const p = (await posts()).filter(x => /\/merge$/.test(x.path));
+    const card = await h1();
+    check('your own changes in the way: "Try again" asks for the merge again', /Your own changes are in the way\./.test(shown) && row === 'Try again*,Not now'
+      && p.length === 1 && p[0].path === '/api/agents/mab0c1/merge' && p[0].body.state === 'done_claimed' && /^Merge Price rounding into main\?/.test(card),
+      `"${shown}" [${row}] ${JSON.stringify(p.map(x => [x.path, x.body]))} "${card}"`);
+  });
+
+  await run('a merge git refuses after yes: its reason stays on the agent, in the engine’s words', async () => {
+    await open('merge', { mode: { merge: 'conflict' } });
+    await sleep(900);
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    await clickIn('[data-act="confirm"][data-go="1"]'); await sleep(1300);
+    const shown = await lidNow(), row = await acts(), words = await said();
+    check('a merge git refuses after yes: its reason stays on the agent, in the engine’s words',
+      / \/ Invoice export’s work does not merge cleanly into main\./.test(shown) && row === 'Ask it to bring in main*,Look later' && /does not merge cleanly into main/.test(words),
+      `"${shown}" [${row}] "${words}"`);
+  });
+
+  await run('a refused Merge changes nothing: the reply shows and the button can be tried again', async () => {
+    await open('merge', { mode: { merge: 'refuse' } });
+    await sleep(900);
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    const shown = await lidNow(), words = await said();
+    const enabled = await b.ev(`!${page()}?.querySelector('[data-act="merge"]')?.disabled`);
+    check('a refused Merge changes nothing: the reply shows and the button can be tried again',
+      /Invoice export is done and checked/.test(shown) && enabled && /Invoice export is being merged now\./.test(words) && !/token|fetch/i.test(words), `"${shown}" enabled ${enabled} "${words}"`);
+  });
+
+  await run('Esc withdraws a merge card', async () => {
+    await open('merge');
+    await sleep(900);
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+    await b.key('Escape'); await sleep(700);
+    const p = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
+    const after = await lidNow();
+    check('Esc withdraws a merge card', p.length === 1 && p[0].body.go === false && /Invoice export is done and checked/.test(after), `${JSON.stringify(p.map(x => [x.path, x.body]))} "${after}"`);
+  });
+
+  await run('no Merge where git cannot: the lid says why, and "Looks good" stays', async () => {
+    await open('merge-detached');
+    await sleep(900);
+    const row = await acts(), why = await b.ev(`${page()}?.querySelector('.meta.git')?.textContent || ''`);
+    check('no Merge where git cannot: the lid says why, and "Looks good" stays', row === 'Looks good*,Ask for a change' && why === 'Your folder is not on a branch, so there is nowhere to merge it.', `[${row}] "${why}"`);
+  });
+
+  await run('Review the changes posts nothing', async () => {
+    await open('merge');
+    await sleep(900);
+    await clickIn('[data-act="review"]'); await sleep(900);
+    const p = (await posts()).filter(x => x.path !== '/api/state');
+    check('Review the changes posts nothing', p.length === 0, JSON.stringify(p.map(x => [x.path, x.body])));
+  });
+
+  await run('Review opens the git screen on that agent, and Esc comes back to the lid with focus on the link', async () => {
+    await open('merge');
+    await sleep(900);
+    if (!(await gitHere())) { check('Review opens the git screen on that agent, and Esc comes back to the lid with focus on the link', false, NEEDS_D1); return; }
+    await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+    const reached = await tabTo(`a.dataset.act === 'review'`);
+    await b.key('Enter'); await sleep(1400);
+    const there = await screen();
+    const detail = await b.ev(`(() => { const d = document.getElementById('gitDetail'); return d && !d.hidden ? d.textContent : ''; })()`);
+    for (let i = 0; i < 3 && (await screen()) !== 'board'; i++) { await b.key('Escape'); await sleep(1300); }
+    const back = await screen(), f = await b.ev(`document.activeElement?.dataset.act || document.activeElement?.id || ''`);
+    const p = (await posts()).filter(x => x.path !== '/api/state');
+    check('Review opens the git screen on that agent, and Esc comes back to the lid with focus on the link',
+      reached && there === 'git' && /Invoice export/.test(detail) && back === 'board' && f === 'review' && p.length === 0, `reached ${reached}, ${there}, detail "${detail.slice(0, 60)}", back ${back}, focus ${f}, posts ${p.length}`);
+  });
+
+  await run('the DRAM opens the git screen and "Back to the board" returns', async () => {
+    await open('merge');
+    await sleep(900);
+    if (!(await gitHere()) || !(await b.ev(`!!document.getElementById('dram')`))) { check('the DRAM opens the git screen and "Back to the board" returns', false, NEEDS_D1); return; }
+    await click('#dram'); await sleep(1400);
+    const there = await screen();
+    await b.ev(`[...document.querySelectorAll('#gitScreen button')].find(x => /Back to the board/.test(x.textContent))?.click(), 1`); await sleep(1400);
+    const back = await screen(), f = await b.ev(`document.activeElement?.id || ''`);
+    check('the DRAM opens the git screen and "Back to the board" returns', there === 'git' && back === 'board' && f === 'dram', `${there} → ${back}, focus ${f}`);
+  });
+
+  await run('while the git screen shows, something new needing you lights the top band’s button', async () => {
+    await open('merge');
+    await sleep(900);
+    if (!(await gitHere()) || !(await b.ev(`!!document.getElementById('dram')`))) { check('while the git screen shows, something new needing you lights the top band’s button', false, NEEDS_D1); return; }
+    await click('#dram'); await sleep(1400);
+    const a = await agentOf('m1a2b3');
+    await push('agents', [{ ...a, id: 'mq', name: 'Release prep', state: 'needs_ok', ask: askOf('pq', 'Release prep', 'git push --force origin main'), work: null }]);
+    await sleep(900);
+    const lit = await b.ev(`[...document.querySelectorAll('#gitScreen button')].filter(x => x.offsetParent !== null).map(x => x.textContent).find(t => /needs you/.test(t)) || ''`);
+    check('while the git screen shows, something new needing you lights the top band’s button', /Release prep needs you/.test(lit), `"${lit}"`);
   });
 
   if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);

@@ -13,7 +13,9 @@ import { launch, sleep } from './ui-cdp.mjs';
 const SIZES = ['960x900', '1024x700', '1280x680', '1440x789', '1512x862', '1728x1000', '1920x970', '2560x1300'];
 const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
-const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap'];
+const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
+  // D2: an agent's work in the lid, and the engine's cards for it (the 'merge' scenarios of scripts/ui-mock.mjs)
+  'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids'];
 
 const args = process.argv.slice(2);
 const opt = k => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : null; };
@@ -196,7 +198,17 @@ try {
     for (const s of sizes) for (const d of details) {
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
-      const load = async (sc, q = '') => { await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false }); await ctl('scenario', { name: sc }); await size(s); await b.goto(`${base}/?t=k&still=1${q}`, 1300); await setLook(t, d); await settle(100); };
+      const load = async (sc, q = '') => { await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, merge: 'ok' }); await ctl('scenario', { name: sc }); await size(s); await b.goto(`${base}/?t=k&still=1${q}`, 1300); await setLook(t, d); await settle(100); };
+      // D2: the lid's words and buttons, a click on one of them, typed words, and "See all of it" when the lid cut something
+      const lidH1 = () => b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
+      const clickLid = async sel => { await b.ev(`document.querySelector('#pages .page:not(.old) ${sel}')?.click(), true`); await sleep(900); await settle(100); };
+      const typeLid = async text => { await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return true; })()`); await sleep(1000); await settle(100); };
+      const expect = async (re, what) => { const h = await lidH1(); if (!re.test(h)) failures.push(`${tag}: ${what} did not show (${h.slice(0, 50)})`); };
+      const allOfIt = async label => {
+        const sel = '#pages .page:not(.old) [data-act="exact"], #pages .page:not(.old) [data-act="readall"]';
+        if (!(await b.ev(`!!document.querySelector(${JSON.stringify(sel)})`))) return;
+        await b.ev(`document.querySelector(${JSON.stringify(sel)}).click(), true`); await sleep(500); await settle(100); await check(`${label}, all of it`);
+      };
       if (v === 'card-root' || v === 'card-helper') {
         await load(v === 'card-root' ? 'busy' : 'demo');
         const sel = v === 'card-root' ? '.chip' : '.part';
@@ -312,6 +324,45 @@ try {
         await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="answer"]')?.click(), true`);
         await sleep(2600); await settle(200);
         await check(tag);
+      } else if (v === 'merge-card') {
+        // ---------------------------------------------------------------- D2: an agent's work and its cards
+        // Merge on main, then its card (whose detail stays at every fit step but the last, then under "See all of it");
+        // a failed check's "Merge anyway" on a long branch, and its card naming the failed check
+        await load('merge', '&focus=m1a2b3'); await check(tag + ' (the lid: Merge into main)');
+        await clickLid('[data-act="merge"]'); await expect(/^Merge Invoice export into main\?/, 'the merge card');
+        await check(tag + ' (merge card)'); await allOfIt(tag + ' (merge card)');
+        await load('merge-more', '&focus=n1'); await check(tag + ' (the lid: a failed check, Merge anyway)');
+        await clickLid('[data-act="merge"]'); await expect(/^Merge Release notes into release\/2026-11-payments-and-refunds\?/, 'the merge card on a long branch');
+        await check(tag + ' (merge card, a failed check, a long branch)'); await allOfIt(tag + ' (merge card, a failed check, a long branch)');
+        await load('merge-more', '&focus=n2'); await check(tag + ' (the lid: Merge into a long branch)');
+      } else if (v === 'discard-card') {
+        // Throw it away, typed: a card with no default answer, whose detail says what is deleted
+        await load('merge', '&focus=m1a2b3');
+        await typeLid('throw it away'); await expect(/^Throw away Invoice export’s work\?/, 'the throw-away card');
+        await check(tag + ' (throw-away card)'); await allOfIt(tag + ' (throw-away card)');
+        await load('merge-more', '&focus=n4');
+        await typeLid('throw it away'); await expect(/^Throw away Price rounding’s work\?/, 'the throw-away card of a stopped agent');
+        await check(tag + ' (throw-away card, a stopped agent)');
+      } else if (v === 'merge-conflict') {
+        await load('merge', '&focus=m7e8f9'); await expect(/does not merge cleanly into main\.$/, 'the conflict');
+        await check(tag + ' (both changed)');
+        await load('merge-more', '&focus=n5'); await expect(/^Git does not know your name and email yet/, 'the identity refusal');
+        await check(tag + ' (no name and email)'); await allOfIt(tag + ' (no name and email)');
+      } else if (v === 'merge-blocked') {
+        await load('merge', '&focus=mab0c1'); await expect(/^Your own changes are in the way\.$/, 'blocked');
+        await check(tag + ' (your own changes in the way)');
+      } else if (v === 'merge-lids') {
+        // where the work went, and where merge does not apply: merged, thrown away, an earlier agent, failed and stopped
+        // agents with a folder (Review), not on a branch, and no name and email (the lid says why)
+        await load('merge', '&focus=m4c5d6'); await expect(/work is in main\.$/, 'merged'); await check(tag + ' (merged)');
+        await load('merge', '&focus=md2e3f'); await expect(/work was thrown away\.$/, 'thrown away'); await check(tag + ' (thrown away)');
+        await load('merge', '&focus=mf4a5b'); await expect(/^Email digest was done and checked\.$/, 'the earlier agent'); await check(tag + ' (earlier, with Review)');
+        await load('merge-more', '&focus=n3'); await check(tag + ' (failed, with Review)');
+        await load('merge-more', '&focus=n4'); await check(tag + ' (stopped, with Review)');
+        await load('merge-detached', '&focus=d1'); await check(tag + ' (not on a branch)');
+        await load('merge-noid', '&focus=d2'); await check(tag + ' (no name and email)');
+      } else {
+        failures.push(`${tag}: no such view`);
       }
     }
     process.stdout.write(`${v} `);

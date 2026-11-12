@@ -1,10 +1,34 @@
 // Shaping text for small spaces. Pure: no DOM, no imports (node:test loads it).
 
 const PICTURES = { '\n': '⏎', '\t': '⇥', '\r': '␍', '\x7f': '␡' };
+// Characters that hide text or change the order it reads in, shown by their code: C1 controls, the Arabic letter mark,
+// zero-width characters and direction marks (U+200B to U+200F), the line and paragraph separators, bidirectional
+// embeddings and overrides (U+202A to U+202E), the word joiner and invisible operators, bidirectional isolates (U+2066
+// to U+2069), and the zero-width no-break space (U+FEFF). The git screen's diff (ui/diffview.js) shows the same set the
+// same way. [from, to] as code point numbers, so no such character is ever in this file raw.
+const HIDDEN_RANGES = [[0x80, 0x9f], [0x61c, 0x61c], [0x200b, 0x200f], [0x2028, 0x202e], [0x2060, 0x2069], [0xfeff, 0xfeff]];
+const HIDDEN = new RegExp(`[${HIDDEN_RANGES.map(([a, b]) => String.fromCharCode(a) + (b > a ? '-' + String.fromCharCode(b) : '')).join('')}]`, 'g');
 
-/** Control characters shown as visible symbols, so a command can never hide a line break or a tab. */
+/**
+ * Control characters shown as visible symbols, so a command, a path or a branch name can never hide a line break or a
+ * tab (⏎, ⇥, ␍, ␛, …). Characters that are invisible or change the direction of the text around them are shown by
+ * their code ("⟦U+202E⟧"), so text can never read in an order other than the one it is in.
+ */
 export function visibleControls(s) {
-  return String(s ?? '').replace(/[\x00-\x1f\x7f]/g, c => PICTURES[c] || String.fromCharCode(0x2400 + c.charCodeAt(0)));
+  return String(s ?? '')
+    .replace(/[\x00-\x1f\x7f]/g, c => PICTURES[c] || String.fromCharCode(0x2400 + c.charCodeAt(0)))
+    .replace(HIDDEN, c => `⟦U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}⟧`);
+}
+
+/**
+ * A name cut in the middle to at most `max` characters, with "…" where it was cut, so both ends stay readable
+ * ("workbenc…-a1b2c3"). Used for branch names on buttons; the whole name goes in the button's title.
+ */
+export function cutMiddle(s, max = 16) {
+  const t = Array.from(String(s ?? ''));
+  if (t.length <= max) return t.join('');
+  const keep = Math.max(1, max - 1), head = Math.ceil(keep / 2);
+  return t.slice(0, head).join('') + '…' + t.slice(t.length - (keep - head)).join('');
 }
 
 /**

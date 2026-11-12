@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { finishKey, needsPerson, needsQueue, reviewQueue, setAsideList, stepFrom, helpersByNeed, helpersAtWork } from '../ui/queue.js';
+import { unmergedWork, workSettled, workKey, canReview, mergeApplies, discardApplies, gitReason } from '../ui/queue.js';
 import { NEEDS_YOU, PRIORITY, ENDED, ACTIVE } from '../src/shared/states.mjs';
 
 const ag = (id, state, o = {}) => ({ id, state, parentId: null, startedAt: 0, stateSince: 100, endedAt: null, ask: null, ...o });
@@ -57,4 +58,109 @@ test('helpers by need: the one asking first, then working, then the latest ended
 test('one helper count everywhere: five working and one asking are six at work', () => {
   const kids = [...Array.from({ length: 5 }, (_, i) => ag('w' + i, 'working')), ag('n', 'needs_ok'), ag('f', 'finished')];
   assert.equal(helpersAtWork(kids, ACTIVE), 6);
+});
+
+// ---------------------------------------------------------------- an agent's work: merge, review, throw away
+const work = (o = {}) => ({ branch: 'workbench/invoice-export-a1b2c3', from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...o });
+const files = n => ({ changed: n, adds: 4 * n, dels: n, list: [] });
+const done = (o = {}) => ag('W', 'done_checked', { endedAt: 500, work: work(), files: files(3), ...o });
+const live = (repo = {}) => ({ ACTIVE, meta: { mode: 'live', repo: { name: 'invoices-api', head: 'abc1234', branch: 'main', dirty: 0, identity: true, ...repo } } });
+const MERGED = { into: 'main', merge: 'e4f1c3a9b8d7e4f1c3a9b8d7e4f1c3a9b8d7e4f1', at: 400, files: 3, adds: 12, dels: 3 };
+const THROWN = { at: 450, saved: 'refs/workbench/discarded/W' };
+
+test('merge applies: live mode, a root at rest with its folder and branch, your folder on a branch git can commit on, and unmerged work', () => {
+  assert.equal(mergeApplies(done(), live()), true);
+  assert.equal(mergeApplies(done({ state: 'done_claimed' }), live()), true);
+  assert.equal(mergeApplies(done({ state: 'checks_failed' }), live()), true, 'a failed check can be merged anyway');
+  assert.equal(mergeApplies(done(), live({ identity: undefined })), true, 'not known yet counts as known: the engine checks again');
+  // not here
+  assert.equal(mergeApplies(done(), { ACTIVE, meta: { mode: 'demo', repo: null } }), false, 'the demo');
+  assert.equal(mergeApplies(done(), { ACTIVE, meta: { mode: 'live', repo: null } }), false, 'no repository');
+  assert.equal(mergeApplies(done(), live({ branch: null })), false, 'not on a branch');
+  assert.equal(mergeApplies(done(), live({ identity: false })), false, 'no name and email');
+  for (const st of ACTIVE) assert.equal(mergeApplies(done({ state: st }), live()), false, st);
+  assert.equal(mergeApplies(done({ parentId: 'P' }), live()), false, 'a helper');
+  assert.equal(mergeApplies(done({ work: null }), live()), false, 'no git');
+  assert.equal(mergeApplies(done({ work: work({ folder: false }) }), live()), false, 'its folder is gone');
+  assert.equal(mergeApplies(done({ work: work({ branch: null, folder: false, thrownAway: THROWN }) }), live()), false, 'thrown away');
+  assert.equal(mergeApplies(done({ files: files(0) }), live()), false, 'nothing unmerged');
+});
+
+test('unmerged work: files changed since its last merge, or, when nothing counted them, a stopped, failed or earlier agent', () => {
+  assert.equal(unmergedWork(done()), true);
+  assert.equal(unmergedWork(done({ files: files(0) })), false);
+  for (const st of ['stopped', 'failed']) assert.equal(unmergedWork(done({ state: st, files: null })), true, st);
+  assert.equal(unmergedWork(done({ files: null, earlier: true })), true, 'an earlier agent');
+  for (const st of ['done_checked', 'done_claimed', 'checks_failed']) assert.equal(unmergedWork(done({ state: st, files: null })), false, `${st} without files`);
+  assert.equal(unmergedWork(done({ work: work({ folder: false }) })), false, 'nothing to merge from a folder that is gone');
+  assert.equal(unmergedWork(done({ work: null })), false);
+  assert.equal(mergeApplies(done({ state: 'stopped', files: null }), live()), true);
+  assert.equal(mergeApplies(done({ state: 'done_claimed', files: null }), live()), false);
+});
+
+test('settled work: thrown away, or merged with nothing new since; it needs no one and is not "to look at"', () => {
+  assert.equal(workSettled(done({ work: work({ merged: MERGED }), files: files(0) })), true);
+  assert.equal(workSettled(done({ work: work({ merged: MERGED }), files: files(2) })), false, 'new work since the merge');
+  assert.equal(workSettled(done({ work: work({ branch: null, folder: false, thrownAway: THROWN }) })), true);
+  assert.equal(workSettled(done()), false);
+  assert.equal(workSettled(done({ work: null })), false);
+  // the queues
+  const a = done({ id: 'a', work: work({ merged: MERGED }), files: files(0) }), b = done({ id: 'b', endedAt: 700 });
+  const c = done({ id: 'c', state: 'done_claimed', endedAt: 600, work: work({ branch: null, folder: false, thrownAway: THROWN }) });
+  assert.deepEqual(reviewQueue([a, b, c], { reviewed: new Set() }).map(x => x.id), ['b'], 'merged and thrown away are out of the review queue');
+  const failedCheck = ag('f', 'checks_failed', { endedAt: 500, work: work({ merged: MERGED }), files: files(0) });
+  assert.equal(needsPerson(failedCheck, { NEEDS_YOU }), false, 'a failed check merged anyway needs no one');
+  assert.equal(needsPerson({ ...failedCheck, files: files(1) }, { NEEDS_YOU }), true, 'until it has new work');
+  assert.equal(needsPerson({ ...failedCheck, work: work({ branch: null, folder: false, thrownAway: THROWN }) }, { NEEDS_YOU }), false, 'or once thrown away');
+});
+
+test('a merge that did not go through can be set aside like a failed check, for this finish only', () => {
+  const p = done({ work: work({ problem: { why: 'blocked', sentence: 'Your own changes are in the way: a.js. Commit or put them aside, then merge again.', paths: ['a.js'], at: 600 } }) });
+  assert.deepEqual(reviewQueue([p], { reviewed: new Set() }).map(x => x.id), ['W'], 'a problem stays to look at');
+  const later = new Set([finishKey(p)]);
+  assert.deepEqual(reviewQueue([p], { reviewed: new Set(), later }), [], '"Not now" or "Look later" sets it aside');
+  assert.deepEqual(setAsideList([p], { later }).map(x => x.id), ['W'], 'and it is listed as set aside');
+  assert.deepEqual(reviewQueue([{ ...p, endedAt: 900 }], { reviewed: new Set(), later }).map(x => x.id), ['W'], 'a new finish brings it back');
+  assert.deepEqual(setAsideList([ag('E', 'done_checked', { endedAt: 500, earlier: true })], { later: new Set(['E@500']) }), [], 'never an earlier agent');
+});
+
+test('the work signature changes with each outcome, and not with how many files changed', () => {
+  const keys = [
+    workKey(done()),
+    workKey(done({ work: work({ merged: MERGED }), files: files(0) })),
+    workKey(done({ work: work({ merged: { ...MERGED, merge: 'bbbb' } }), files: files(0) })),
+    workKey(done({ work: work({ merged: MERGED }), files: files(2) })),
+    workKey(done({ work: work({ problem: { why: 'conflict', sentence: 's', paths: [], at: 1 } }) })),
+    workKey(done({ work: work({ problem: { why: 'conflict', sentence: 's', paths: [], at: 2 } }) })),
+    workKey(done({ work: work({ problem: { why: 'blocked', sentence: 's', paths: [], at: 1 } }) })),
+    workKey(done({ work: work({ branch: null, folder: false, thrownAway: THROWN }) })),
+    workKey(done({ work: work({ folder: false }) })),
+  ];
+  assert.equal(new Set(keys).size, keys.length, keys.join(' | '));
+  assert.equal(workKey(done({ files: files(7) })), workKey(done()), 'more files is the same work for a button');
+  assert.equal(workKey(done({ work: null })), '');
+  assert.equal(workKey(done({ parentId: 'P' })), '', 'a helper has no work of its own');
+});
+
+test('review needs its branch and folder; throw away needs only one of them', () => {
+  assert.equal(canReview(done()), true);
+  assert.equal(canReview(done({ work: work({ folder: false }) })), false);
+  assert.equal(canReview(done({ work: work({ branch: null }) })), false);
+  assert.equal(canReview(done({ parentId: 'P' })), false);
+  assert.equal(discardApplies(done(), live()), true);
+  assert.equal(discardApplies(done({ state: 'working' }), live()), true, 'an agent at work is stopped first');
+  assert.equal(discardApplies(done({ work: work({ folder: false }) }), live()), true, 'its branch is still deleted when its folder is gone');
+  assert.equal(discardApplies(done({ work: work({ branch: null, folder: false, thrownAway: THROWN }) }), live()), false, 'already thrown away');
+  assert.equal(discardApplies(done({ work: work({ branch: null, folder: false }) }), live()), false, 'nothing left');
+  assert.equal(discardApplies(done(), { ACTIVE, meta: { mode: 'demo', repo: null } }), false, 'the demo');
+  assert.equal(discardApplies(done({ parentId: 'P' }), live()), false, 'a helper');
+});
+
+test('why there is no Merge, when git is the reason: in the engine\'s own words', () => {
+  assert.equal(gitReason(done(), live({ branch: null })), 'Your folder is not on a branch, so there is nowhere to merge it.');
+  assert.equal(gitReason(done(), live({ identity: false })), 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.');
+  assert.equal(gitReason(done(), live()), null, 'merge applies');
+  assert.equal(gitReason(done({ files: files(0) }), live({ branch: null })), null, 'nothing to merge: git is not the reason');
+  assert.equal(gitReason(done({ state: 'working' }), live({ branch: null })), null, 'still working');
+  assert.equal(gitReason(done(), { ACTIVE, meta: { mode: 'demo', repo: { branch: null } } }), null, 'the demo');
 });

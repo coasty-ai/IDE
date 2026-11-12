@@ -22,6 +22,16 @@ const SHOTS = [
   { name: 'board-black-gold', scenario: 'demo', theme: 'black-gold' },
   { name: 'board-ivory', scenario: 'demo', theme: 'ivory' },
   { name: 'board-more-detail', scenario: 'demo', detail: 'more' },
+  // D2: an agent's work in the lid (merge, review, what became of it), and the engine's cards for it
+  { name: 'merge-lid', scenario: 'merge' },
+  { name: 'merge-card', scenario: 'merge', query: '&focus=m1a2b3', type: 'merge it' },
+  { name: 'merge-throw-away-card', scenario: 'merge', query: '&focus=m1a2b3', type: 'throw it away' },
+  { name: 'merge-conflict', scenario: 'merge', query: '&focus=m7e8f9' },
+  { name: 'merge-blocked', scenario: 'merge', query: '&focus=mab0c1' },
+  { name: 'merge-merged', scenario: 'merge', query: '&focus=m4c5d6', detail: 'more' },
+  { name: 'merge-failed-check', scenario: 'merge-more', query: '&focus=n1', theme: 'black-gold' },
+  { name: 'merge-long-branch', scenario: 'merge-more', query: '&focus=n2', theme: 'ivory', detail: 'more' },
+  { name: 'merge-not-on-a-branch', scenario: 'merge-detached' },
 ];
 
 const mock = await startMock({ quiet: true });

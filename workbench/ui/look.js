@@ -1,8 +1,10 @@
-// How each state looks on the board: a mark, a tone and a few words. Pure: no DOM, no imports; LOOK comes from
-// /shared/states.mjs and is passed in. Two marks are the page's own: a speech bubble for a question and a half dot for
-// "waiting on its helpers", so every state has its own mark and never relies on colour.
+// How each state looks on the board: a mark, a tone and a few words. Pure: no DOM and nothing from /shared/ (LOOK comes
+// from /shared/states.mjs and is passed in; queue.js is pure too). Two marks are the page's own: a speech bubble for a
+// question and a half dot for "waiting on its helpers", so every state has its own mark and never relies on colour.
+import { workSettled } from './queue.js';
 
 const SHAPE = { question: 'ask', waiting_helpers: 'wait', checks_failed: 'cfail' };
+const AT_REST = new Set(['done_checked', 'done_claimed', 'checks_failed', 'failed', 'stopped']);
 const TONE = { failed: 'fail' };
 
 /** { label, shape, tone } for a state. */
@@ -17,8 +19,9 @@ export function markOfAgent(a, LOOK) {
   return markOf(a ? a.state : 'working', LOOK);
 }
 
-/** A few words for under a name ("more" detail): what it is doing, or its state. */
+/** A few words for under a name ("more" detail): what it is doing, or its state; for a root at rest, where its work went. */
 export function statusWords(a, LOOK) {
+  if (AT_REST.has(a.state) && workSettled(a)) return a.work.thrownAway ? 'thrown away' : 'merged';
   switch (a.state) {
     case 'working': case 'starting': {
       if (a.thinking && (!a.now || a.now === 'Thinking')) return 'thinking';
