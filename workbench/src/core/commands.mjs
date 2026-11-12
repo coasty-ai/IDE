@@ -449,7 +449,11 @@ function confirmReply(toks, kind, c) {
     if (yesAsked(words)) return 'asks';
     if (named) return 'keep';
     // On a throw-away card a bare "yes" is not enough: only its own words ("throw it away", "discard it") or "do it".
-    if (kind === 'discard' && !ws.some(w => own.includes(w) || w === 'do')) return 'keep';
+    // "throw" counts only with its "away" or "out": a "throw" cut short is no answer.
+    if (kind === 'discard') {
+      const explicit = ws.some(w => w === 'do' || (own.includes(w) && w !== 'throw')) || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
+      if (!explicit) return 'keep';
+    }
     return true;
   }
   // "start it", "yes launch it", "start it is that right" to a card that is no launch: not its yes, and no new launch
@@ -800,6 +804,7 @@ function targetOf(ws, c) {
  */
 function takeTarget(toks, c) {
   const ws = toks.map(t => t.w);
+  if (ws.length > 1 && ws[ws.length - 1] === 'here') return { toks: toks.slice(0, -1), into: undefined, said: true }; // "merge it here"
   for (let i = Math.max(0, ws.length - 5); i < ws.length; i++) {
     if (!INTO.has(ws[i])) continue;
     const t = targetOf(ws.slice(i + 1), c);
