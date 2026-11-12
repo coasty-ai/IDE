@@ -451,7 +451,7 @@ el.pages.addEventListener('click', e => {
   if (!b || b.disabled || b.closest('.page.old, .page[data-hidden]')) return;
   // clicks are ignored while the core swaps and for a moment after, so they cannot land on something new
   if (GUARDED.has(b.dataset.act) && performance.now() < armedUntil) return;
-  act(b);
+  actOn(b);
 });
 
 /**
@@ -461,20 +461,20 @@ el.pages.addEventListener('click', e => {
  * (the git screen's detail: Merge, Throw it away, a card's yes and no) can be handed to this too; the swap guard stays
  * with the caller.
  */
-async function act(b) {
-  const what = b.dataset.act;
+async function actOn(b) {
+  const act = b.dataset.act;
   touch();
-  if (what === 'next') { stepQueue(1); moved(); render(); return; }
-  if (what === 'exact' || what === 'changed' || what === 'all' || what === 'readall') {
-    const k = what === 'readall' ? 'all' : what;
+  if (act === 'next') { stepQueue(1); moved(); render(); return; }
+  if (act === 'exact' || act === 'changed' || act === 'all' || act === 'readall') {
+    const k = act === 'readall' ? 'all' : act;
     open[k] = !open[k];
     renderNow();
-    el.pages.querySelector(`.page:not(.old) [data-act="${what}"]`)?.focus({ preventScroll: true });
+    el.pages.querySelector(`.page:not(.old) [data-act="${act}"]`)?.focus({ preventScroll: true });
     return;
   }
-  if (what === 'unpick') { S.focusId = null; S.pinId = null; moved(); render(); return; }
-  if (what === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
-  if (what === 'confirm') {
+  if (act === 'unpick') { S.focusId = null; S.pinId = null; moved(); render(); return; }
+  if (act === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
+  if (act === 'confirm') {
     const id = b.dataset.confirm;
     const c = S.confirm;
     if (!c || c.id !== id) { changed(); return; }
@@ -507,40 +507,40 @@ async function act(b) {
   if (b.dataset.state && a.state !== b.dataset.state) { changed(); return; }
   if (b.dataset.work != null && workKey(a) !== b.dataset.work) { changed(); return; }
   if (b.dataset.into != null && (S.meta.repo?.branch || '') !== b.dataset.into) { changed(); return; }
-  if (what === 'review') {
+  if (act === 'review') {
     // read-only: the git screen, on this agent's branch, with its diff. Nothing is sent.
     openGitOn(a.id, b);
     return;
   }
   try {
-    if (what === 'answer') {
+    if (act === 'answer') {
       busy(b);
       const r = await api.answer(a.id, b.dataset.ask, b.dataset.answer);
       answeredOnce();
       say(r.reply || `Told ${a.name}: ${b.dataset.answer}.`);
       if (S.focusId === a.id) S.focusId = null;
-    } else if (what === 'reply') {
+    } else if (act === 'reply') {
       startReply(a, b.dataset.mode || 'say', b.dataset.ask || null, b.dataset.state || a.state);
       render();
       return;
-    } else if (what === 'fix') {
+    } else if (act === 'fix') {
       busy(b);
       const r = await api.say(a.id, b.dataset.text);
       say(r.reply || `Sent to ${a.name}.`);
       if (S.focusId === a.id) S.focusId = null;
-    } else if (what === 'forget') {
+    } else if (act === 'forget') {
       // an agent from an earlier run: the engine asks first, with a card like a launch's
       busy(b);
       const r = await api.command('forget it', { focusId: a.id });
       if (r.confirm) S.confirm = r.confirm; else say(r.reply || '');
-    } else if (what === 'merge' || what === 'discard') {
+    } else if (act === 'merge' || act === 'discard') {
       // Merge (also "Merge anyway" and "Try again") and Throw it away never act by themselves: the engine answers with a
       // card in its own words, bound by id, and the person answers that. Its outcome then shows on this agent.
       busy(b);
-      const r = await (what === 'merge' ? api.merge(a.id, { state: b.dataset.state }) : api.discard(a.id, { state: b.dataset.state }));
+      const r = await (act === 'merge' ? api.merge(a.id, { state: b.dataset.state }) : api.discard(a.id, { state: b.dataset.state }));
       S.focusId = a.id;
       if (r.confirm) S.confirm = { ...r.confirm, agentId: a.id }; else say(r.reply || '');
-    } else if (what === 'looksgood') {
+    } else if (act === 'looksgood') {
       // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is
       busy(b);
       const r = await api.answer(a.id, null, 'Looks good');
@@ -549,19 +549,19 @@ async function act(b) {
       say(r.reply || '', 4000);
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
-    } else if (what === 'reviewed') {
+    } else if (act === 'reviewed') {
       markReviewed(a);
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
-    } else if (what === 'later') {
+    } else if (act === 'later') {
       setAside(a);
       if (S.focusId === a.id) S.focusId = null;
       say(`OK, ${a.name} can wait.`);
-    } else if (what === 'stop') {
+    } else if (act === 'stop') {
       busy(b);
       const r = await api.stop(a.id);
       say(r.reply || `Stopped ${a.name}.`);
-    } else if (what === 'parent') {
+    } else if (act === 'parent') {
       S.focusId = a.parentId;
     }
     // the person's own move: what it leads to shows at once, even with the pointer or the keyboard still in the core
