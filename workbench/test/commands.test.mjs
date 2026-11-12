@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCommand, describeIntent } from '../src/core/commands.mjs';
+import { nameFromTask } from '../src/shared/narrate.mjs';
 
 // A small world like the demo seed. Asks sit on the agents, as in AgentView.
 const agents = [
@@ -76,6 +77,20 @@ const DOG = {
   dogPendingMerge: { agents: dogAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c8', kind: 'merge' } },
   dogPendingDiscard: { agents: dogAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c9', kind: 'discard' } },
   dogBranch: { agents: dogAgents, machines, harnesses, focusId: 'aa0001', repo: { branch: 'feature/login-v2' } },
+};
+
+// Names as the engine makes them from a task (nameFromTask): a verb first, so people say the rest of the name.
+const fromTask = (task, fields) => ({ name: nameFromTask(task), task, kind: 'agent', ...fields });
+// Two names share "config files", and neither is only that; a third agent asks a question with "merge" in it.
+const configAgents = [
+  fromTask('Update the config files', { id: 'cf0001', state: 'done_claimed' }),
+  fromTask('Split the config files per environment', { id: 'cf0002', state: 'done_checked' }),
+  fromTask('Fix the login page error', { id: 'cf0003', state: 'question',
+    ask: { id: 'ask-cf', type: 'question', sentence: 'Should I merge them into one?', options: [] } }),
+];
+const NAMED = {
+  configNone: { agents: configAgents, machines, harnesses, focusId: null },
+  configQuestion: { agents: configAgents, machines, harnesses, focusId: 'cf0003' },
 };
 
 const start = (...tasks) => ({ kind: 'start', tasks: tasks.map(([task, harness = 'claude', machine = 'laptop']) => ({ task, harness, machine })) });
@@ -524,7 +539,7 @@ test('a stop verb that matches no agent is a work request; a name still stops at
 
 // ------------------------------------------------------------------ source control: changes, merge, throw away
 
-const ctxOf = name => CTX[name] || DOG[name];
+const ctxOf = name => CTX[name] || DOG[name] || NAMED[name];
 const changes = agentId => ({ kind: 'changes', agentId });
 const merge = (agentId, into) => (into ? { kind: 'merge', agentId, into } : { kind: 'merge', agentId });
 const discard = agentId => ({ kind: 'discard', agentId });
@@ -861,14 +876,49 @@ test('merge and throw-away name the agent: dogfood names, same-named twins, earl
   assert.deepEqual(parseCommand('merge the changes from it', withChanges), merge('aa0001'));
   assert.deepEqual(parseCommand('throw away your changes', withChanges), unknown('throw away your changes'));
   assert.deepEqual(parseCommand('merge 55000c', withChanges), merge('55000c'));
-  // The whole name of one agent names it, even when a longer name has the same words; a shorter part names neither.
+  // The whole name of one agent names it, even when a longer name has the same words; a shorter part names neither, so
+  // the words keep their old meaning (a task here), rather than asking which one.
   const v2 = { agents: [{ id: 'aa0001', name: 'Search cleanup', task: 'x', state: 'done_checked', kind: 'agent' },
     { id: 'bb0002', name: 'Search cleanup v2', task: 'y', state: 'done_checked', kind: 'agent' }] };
   assert.deepEqual(parseCommand('merge search cleanup', v2), merge('aa0001'));
   assert.deepEqual(parseCommand('merge search cleanup v2', v2), merge('bb0002'));
-  assert.deepEqual(parseCommand('merge search clean', v2), merge(null));
+  assert.deepEqual(parseCommand('merge search clean', v2), task('merge search clean'));
   // A helper whose agent is not in the list stands for nothing.
   assert.deepEqual(parseCommand('discard it', { agents: [{ id: 'q-1', name: 'Lost helper', kind: 'helper', parentId: 'gone' }], focusId: 'q-1' }), discard(null));
+});
+
+test('words that two names share, and that are neither one\'s whole name, name no agent: they keep their old meaning', () => {
+  assert.deepEqual(configAgents.map(a => a.name), ['Update config files', 'Split config files per', 'Fix login page error']);
+  const answerCf = text => answer(text, 'cf0003', 'ask-cf');
+  checkRows([
+    // Nothing waits: work stays work, and words that were nothing stay nothing. Never "Which one do you mean?".
+    ['merge the config files', 'configNone', task('merge the config files')],
+    ['merge config files', 'configNone', task('merge config files')],
+    ['discard the config files', 'configNone', unknown('discard the config files')],
+    ['trash the config files', 'configNone', unknown('trash the config files')],
+    ['throw away the config files', 'configNone', unknown('throw away the config files')],
+    ['diff the config files', 'configNone', unknown('diff the config files')],
+    ['show me the config files changes', 'configNone', { kind: 'status', agentId: 'cf0001' }], // as before these words
+    // A question waits: the words are its answer.
+    ['merge the config files', 'configQuestion', answerCf('merge the config files')],
+    ['discard the config files', 'configQuestion', answerCf('discard the config files')],
+    ['trash the config files', 'configQuestion', answerCf('trash the config files')],
+    ['diff the config files', 'configQuestion', answerCf('diff the config files')],
+    ['show me the config files changes', 'configQuestion', answerCf('show me the config files changes')],
+    // A question about what changed finds the agent by its words, as "what is the config files doing" always has (the
+    // best match, here the first of two): it only shows, and it was never an answer.
+    ['what did the config files change', 'configNone', changes('cf0001')],
+    ['what did the config files change', 'configQuestion', changes('cf0001')],
+    ['what is the config files doing', 'configQuestion', { kind: 'status', agentId: 'cf0001' }],
+    // A whole name or an id still names one, and acts whatever waits.
+    ['merge update config files', 'configNone', merge('cf0001')],
+    ['merge the update config files agent', 'configQuestion', merge('cf0001')],
+    ['discard split config files per', 'configQuestion', discard('cf0002')],
+    ['merge cf0002', 'configQuestion', merge('cf0002')],
+    ["show update config files' changes", 'configQuestion', changes('cf0001')],
+    // Same-named twins still give no agent, so the engine asks which one.
+    ['merge search cleanup', 'dogNone', merge(null)],
+  ]);
 });
 
 test('cards take their own words: "start it" only for a launch, "merge it" for a merge, "throw it away" for a throw-away', () => {

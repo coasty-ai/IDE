@@ -712,9 +712,10 @@ function bareName(ws, c) {
  * and nothing else, two or more of them (all of a one-word name), that no other root agent's name also has. Agents
  * that ended, and agents from an earlier run, count: theirs is the work that is merged or thrown away. When several
  * root agents have the words, the one whose whole name they are is named; two with that name give id null, so the
- * engine asks which one. Task words, state words and helpers' names never name a root agent here, and neither do
- * words for work alone: "the changes" and "your changes" are no agent's name, even when an agent is called "Changes"
- * (its id or "it" still name it).
+ * engine asks which one. Words that several names share and that are none's whole name ("the config files" beside
+ * Update config files and Split config files per) name no agent: they keep their old meaning. Task words, state words
+ * and helpers' names never name a root agent here, and neither do words for work alone: "the changes" and "your
+ * changes" are no agent's name, even when an agent is called "Changes" (its id or "it" still name it).
  * @returns {{ id: string|null, form: 'id'|'name' } | null}
  */
 function namedRoot(ws, c) {
@@ -733,6 +734,7 @@ function namedRoot(ws, c) {
   if (having.length === 1) return { id: having[0].id, form: 'name' };
   const key = refKey(ws);
   const whole = having.filter(a => agentWords(a).nameKey === key);
+  if (!whole.length) return null;
   return { id: whole.length === 1 ? whole[0].id : null, form: 'name' };
 }
 
