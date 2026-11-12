@@ -2584,6 +2584,20 @@ test('merge: yes merges once, records it, counts its work from the merged commit
   assert.deepEqual([tidy.path, tidy.base, tidy.since, tidy.onlyIfUnchanged, tidy.deleteBranch], [a.v.workspace, FAKE_BASE, FAKE_WORK, true, true]);
 });
 
+test('merge: when what merging would bring in changed since the card, the git module\'s own words say so', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  t.git.mergeResult = { ok: false, why: 'changed', sentence: 'What merging it would change in main is no longer what you saw. Have another look.' };
+  const card = await t.engine.proposeMerge(a.id);
+  const out = await t.engine.confirm(card.confirm.id, true);
+  assert.equal(out.reply, 'What merging it would change in main is no longer what you saw. Have another look.');
+  // its own folder on another branch: "Its" is the agent's name
+  t.git.mergeResult = { ok: false, why: 'changed', sentence: 'Its folder is on the branch other now, not on workbench/fix-cart-total.' };
+  const card2 = await t.engine.proposeMerge(a.id);
+  assert.equal((await t.engine.confirm(card2.confirm.id, true)).reply, 'Fix cart total’s folder is on the branch other now, not on workbench/fix-cart-total.');
+  await t.engine.shutdown();
+});
+
 test('merge: a merge that does not go through says why in plain words, and keeps the reason on the agent while it applies', async (ctx) => {
   const t = liveFolders(ctx);
   const a = await doneAgent(t);

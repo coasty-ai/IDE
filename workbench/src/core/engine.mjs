@@ -2602,9 +2602,10 @@ export class Engine extends EventEmitter {
     const own = typeof res?.sentence === 'string' && res.sentence.trim() ? aboutAgent(v.name, res.sentence) : null;
     let sentence;
     if (res?.unexpected) sentence = 'Something went wrong during the merge. Have a look at your folder before you try again.';
-    // For these two the git module's own words say what really happened (a lock held by another git command; a merge
-    // git reported done that the branch does not hold), where the general sentence would not be true.
-    else if ((why === 'git' || why === 'busy') && own) sentence = own;
+    // For these the git module's own words say what really happened (a lock held by another git command; a merge git
+    // reported done that the branch does not hold; what merging would bring in is no longer what the card showed; its
+    // folder moved to another branch), where the general sentence would not be true.
+    else if ((why === 'git' || why === 'busy' || why === 'changed') && own) sentence = own;
     else sentence = mergeSentence(why, { name: v.name, into: c.expect.into, paths });
     if (why === 'gone') {
       this._markFolderGone(v);
