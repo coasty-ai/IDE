@@ -1220,7 +1220,8 @@ function publicFile(f) {
  * @returns {Promise<{ head: string, tree: string, since: string, workId: string, changed: boolean,
  *   files: { path: string, status: 'added'|'modified'|'deleted', adds: number, dels: number, binary?: true, large?: true }[],
  *   left: { path: string, why: 'ignored'|'nested-repo' }[] }>}
- *   head: its folder's HEAD; tree: the work as a tree; workId: `${head}:${tree}`; changed: tree differs from since's.
+ *   head: its folder's HEAD; tree: the work as a tree; workId: `${head}:${tree}:${into}:${merged}`, the work and the
+ *   review it is shown with (see cardId); changed: tree differs from since's.
  *   files: what merging the work into the person's current HEAD would change there, the merge commit's first-parent
  *   diff (see "Source control" above for a conflict, and for a HEAD that does not hold `since`); none when !changed.
  *   Rejects with a plain error (with `.why` when it is a refusal) when the folder is not an agent's or git fails.
@@ -1488,6 +1489,7 @@ async function alreadyThere(run, root, paths, brought) {
  * @param {{ repoRoot: string, path: string, branch: string, since: string,
  *   expect: { workId: string, into: string, intoHead: string }, message: { subject: string, body?: string, name?: string },
  *   agentId: string, harness?: string, name?: string }} opts
+ *   expect.workId: snapshotWork's, which names the work and the review the card showed (see cardId);
  *   name: the agent's name for the merge commit's subject ("Merge <name>: <subject>"); its branch when not given
  * @returns {Promise<{ ok: true, into: string, merge: string, work: string, files: number, adds: number, dels: number }
  *   | { ok: false, why: string, sentence: string, paths?: string[] }>}
