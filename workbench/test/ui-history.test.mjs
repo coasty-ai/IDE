@@ -103,6 +103,60 @@ test('a continued agent is an ordinary one again', { skip }, async () => {
   assert.ok(!/earlier run/.test(v.html));
 });
 
+// ---------------------------------------------------------------- their work (AgentView.work)
+const WORK = (o = {}) => ({ branch: 'workbench/invoice-export-e1e1e1', from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...o });
+const live = S => { S.meta = { mode: 'live', repo: { name: 'invoices-api', head: 'abc1234', branch: 'main', dirty: 0, identity: true }, harnesses: {}, defaultBudgetUsd: 2, spendTodayUsd: 0 }; };
+
+test('an earlier agent whose folder is still there: Continue and Forget, and a quiet "Review the changes"', { skip }, async () => {
+  const { lidView, S } = await load();
+  live(S);
+  for (const detail of ['calm', 'more']) {
+    const a = earlier('E1', 'done_checked', { work: WORK() });
+    S.agents.clear(); S.agents.set('E1', a);
+    const v = lidView({ agent: a, picked: true, queued: 0 }, { detail });
+    const b = buttons(v.html).filter(x => x.act !== 'unpick');
+    assert.deepEqual(b.map(x => x.act), ['fix', 'forget', 'review']);
+    assert.deepEqual([b[2].agent, b[2].state], ['E1', 'done_checked']);
+    assert.ok(!b.some(x => x.act === 'merge'), 'merge and throw-away are in the git screen\'s detail');
+  }
+});
+
+test('an earlier agent keeps its own lid whatever became of its work', { skip }, async () => {
+  const { lidView, S } = await load();
+  live(S);
+  // thrown away: it cannot continue, and says why; only Forget
+  const gone = earlier('E2', 'done_checked', { canContinue: false, continueReason: 'Its work was thrown away, so it cannot continue.', work: WORK({ branch: null, folder: false, thrownAway: { at: NOW - 60 * MIN, saved: 'refs/workbench/discarded/E2' } }) });
+  S.agents.clear(); S.agents.set('E2', gone);
+  let v = lidView({ agent: gone, picked: true, queued: 0 }, { detail: 'calm' });
+  assert.match(v.html, /From an earlier run/);
+  assert.match(v.html, /Its work was thrown away, so it cannot continue\./);
+  assert.deepEqual(buttons(v.html).filter(x => x.act !== 'unpick').map(x => x.act), ['forget']);
+  // a merge that did not go through: still Continue and Forget (the message it takes clears it), and Review
+  const stuck = earlier('E3', 'done_checked', { work: WORK({ problem: { why: 'conflict', sentence: 'Invoice export’s work does not merge cleanly into main.', paths: ['a.js'], at: NOW - 60 * MIN } }) });
+  S.agents.clear(); S.agents.set('E3', stuck);
+  v = lidView({ agent: stuck, picked: true, queued: 0 }, { detail: 'calm' });
+  assert.match(v.html, /Invoice export was done and checked\./);
+  assert.deepEqual(buttons(v.html).filter(x => x.act !== 'unpick').map(x => x.act), ['fix', 'forget', 'review']);
+});
+
+test('the card says where an agent\'s work is, on the Now line\'s second row, in "more" only', { skip }, async () => {
+  const { cardHtml, workWords, S } = await load();
+  const merged = agent('M1', 'done_checked', { work: WORK({ merged: { into: 'main', merge: 'aaaa', at: NOW - 2 * MIN, files: 3, adds: 12, dels: 3 } }), files: { changed: 0, adds: 0, dels: 0, list: [] } });
+  const open = agent('M2', 'done_checked', { work: WORK(), files: { changed: 3, adds: 12, dels: 3, list: [] } });
+  const thrown = agent('M3', 'stopped', { work: WORK({ branch: null, folder: false, thrownAway: { at: NOW - 5 * MIN, saved: 'refs/workbench/discarded/M3' } }) });
+  assert.equal(workWords(merged, NOW), 'Merged into main · 2 min ago');
+  assert.equal(workWords(open, NOW), 'Not merged yet');
+  assert.equal(workWords(thrown, NOW), 'Its work was thrown away · 5 min ago');
+  assert.equal(workWords(agent('M4', 'done_checked', { work: null }), NOW), '', 'nothing without git');
+  assert.equal(workWords(agent('M5', 'done_checked', { work: WORK(), files: { changed: 0, adds: 0, dels: 0, list: [] } }), NOW), '', 'nothing when there is nothing to merge');
+  for (const a of [merged, open]) {
+    S.agents.clear(); S.agents.set(a.id, a);
+    const more = cardHtml(a, { detail: 'more', now: NOW, one: false });
+    assert.match(more, new RegExp(`<span class="wk">${workWords(a, NOW)}</span>`));
+    assert.doesNotMatch(cardHtml(a, { detail: 'calm', now: NOW, one: false }), /class="wk"/, 'calm keeps the card short');
+  }
+});
+
 test('the card says "From an earlier run · time ago"', { skip }, async () => {
   const { cardHtml, S } = await load();
   const a = earlier('E1', 'done_claimed');

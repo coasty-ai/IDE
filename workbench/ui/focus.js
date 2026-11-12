@@ -4,7 +4,7 @@
 // exactly what the person read.
 import { clip, money, duration } from '/shared/format.mjs';
 import { LOOK, ACTIVE } from '/shared/states.mjs';
-import { S, machineName, harnessLabel, mergeApplies, gitReason, canReview, workKey, workSettled } from './model.js';
+import { S, machineName, harnessLabel, mergeApplies, gitReason, canReview, workKey, workSettled, unmergedWork } from './model.js';
 import { markOfAgent } from './look.js';
 import { spentWords } from './numbers.js';
 import { visibleControls, clipMiddle, cutMiddle, whoAsks, headlineClass } from './words.js';
@@ -55,13 +55,16 @@ const branchTitle = (words, b) => (Array.from(String(b)).length > 16 ? ` title="
 /** The count line of an engine card follows what it is about. */
 const CARD_COUNT = { merge: 'Before it merges', discard: 'Before it is thrown away', forget: 'Before it is forgotten' };
 
-/** Where a root's work went, when that is what the lid is about: thrown away, a merge that did not go through, merged. */
+/**
+ * Where a root's work went, when that is what the lid is about: thrown away, a merge that did not go through, merged
+ * with nothing new. An agent from an earlier run keeps its own lid (Continue, Forget): the git screen shows its work.
+ */
 function workLid(a) {
   const w = a.work;
-  if (!w || a.parentId || ACTIVE.has(a.state)) return null;
+  if (!w || a.parentId || a.earlier || ACTIVE.has(a.state)) return null;
   if (w.thrownAway) return 'thrown';
   if (w.problem) return 'problem';
-  if (w.merged && workSettled(a) && !a.earlier) return 'merged';
+  if (w.merged && workSettled(a)) return 'merged';
   return null;
 }
 const WORK_COUNT = { thrown: 'thrown away', problem: 'not merged', merged: 'merged' };
@@ -151,16 +154,18 @@ export function lidView(f, o = {}) {
     // button asked for (forget, merge, throw away). Its own words for yes and no; a dangerous one has no default answer.
     const c = f.confirm;
     const words = CARD_COUNT[c.kind] || 'You said';
-    const t = long(c.sentence);
+    // its words name branches, paths and tasks: anything that could hide or turn text is shown
+    const sentence = visibleControls(c.sentence), detail = c.detail ? visibleControls(c.detail) : '';
+    const t = long(sentence);
     // A card about an agent's work keeps what it says at every fit step but the last, where it goes under "See all of it":
     // a merge's counts and checks, and what a throw-away deletes, are what the person decides on.
     const keep = !!c.danger || c.kind === 'merge' || c.kind === 'discard';
     let msg = '';
-    if (c.detail && !keep) msg = fs.meta ? metaP(esc(c.detail)) : '';
-    else if (c.detail && !fs.last) msg = metaP(esc(c.detail));
-    else if (c.detail) msg = (open.exact ? readAllBox(metaP(esc(c.detail))) : '') + quiet(open.exact ? 'Show less' : 'See all of it', { act: 'exact' }, ` aria-expanded="${!!open.exact}"`);
+    if (detail && !keep) msg = fs.meta ? metaP(esc(detail)) : '';
+    else if (detail && !fs.last) msg = metaP(esc(detail));
+    else if (detail) msg = (open.exact ? readAllBox(metaP(esc(detail))) : '') + quiet(open.exact ? 'Show less' : 'See all of it', { act: 'exact' }, ` aria-expanded="${!!open.exact}"`);
     return {
-      key: focusKey(f), idle: false, count: words, say: `${words}: ${c.sentence} ${c.detail || ''}`.trim(), bind: { confirmId: c.id },
+      key: focusKey(f), idle: false, count: words, say: `${words}: ${sentence} ${detail}`.trim(), bind: { confirmId: c.id },
       html: page(countLine('ask', c.danger ? 'stuck' : 'work', words), t.html,
         { msg,
           acts: big(c.yes || 'Do it', { act: 'confirm', confirm: c.id, go: '1' }, !c.danger) + big(c.no || 'Cancel', { act: 'confirm', confirm: c.id, go: '0' }),
@@ -208,6 +213,9 @@ export function lidView(f, o = {}) {
   const into = S.meta.repo?.branch || null;
   const links = [];
   let leaves = false;   // the lid has its own way to let this item go ("Not now", "Look later", "Dismiss")
+  // "Review the changes" (the git screen, on its branch and its diff): its branch and folder are there, and it may hold
+  // work that is not merged yet (nothing counted its files, or some changed)
+  const reviewable = canReview(a) && (unmergedWork(a) || !a.files);
   const reviewLink = () => quiet('Review the changes', { act: 'review', ...st, work: wk });
   const mergeButton = () => big(`Merge into ${branchLabel(into)}`, { act: 'merge', ...st, work: wk, into }, true, branchTitle('Merge into ', into));
 
@@ -225,7 +233,8 @@ export function lidView(f, o = {}) {
       const p = a.work.problem;
       const paths = (Array.isArray(p.paths) ? p.paths : []).filter(x => typeof x === 'string' && x);
       const listed = pathsText(paths, fs.paths, fs.pathMax);
-      const target = into || a.work.from || null;
+      // the branch the merge went into, when the engine says; else where the next merge would go
+      const target = (typeof p.into === 'string' && p.into) || into || a.work.from || null;
       if (p.why === 'conflict') {
         sentence = `${a.name}’s work does not merge cleanly into ${target ? visibleControls(target) : 'your branch'}.`;
         if (paths.length) msg += metaP(esc(`Both changed: ${listed}`));
@@ -241,12 +250,13 @@ export function lidView(f, o = {}) {
         if (fs.meta) msg += metaP(esc(`Commit or put them aside, then merge ${a.name} again.`));
         acts = big('Try again', { act: 'merge', ...st, work: wk, into }, true) + big('Not now', { act: 'later', ...st, work: wk });
       } else {
-        spoken = String(p.sentence || `${a.name}’s work could not be merged.`);
+        // the engine's own sentence ("main changed since you looked. Have another look.", …)
+        spoken = visibleControls(String(p.sentence || `${a.name}’s work could not be merged.`));
         sentence = long(spoken);
         if (paths.length) msg += metaP(esc(listed));
         acts = big('Try again', { act: 'merge', ...st, work: wk, into }, true) + big('Not now', { act: 'later', ...st, work: wk });
       }
-      if (canReview(a)) links.push(reviewLink());
+      if (reviewable) links.push(reviewLink());
       leaves = true;
       break;
     }
@@ -272,8 +282,8 @@ export function lidView(f, o = {}) {
       if (fs.meta) msg += metaP(esc(note));
       acts = (a.canContinue ? big('Continue', { act: 'fix', ...st, text: 'Please continue where you left off.' }, true) : '')
         + big('Forget', { act: 'forget', ...st }, !a.canContinue);
-      // its folder is still there: what it changed can be looked at (merge and throw-away are in the git screen)
-      if (canReview(a)) links.push(reviewLink());
+      // its folder is still there: what it changed can be looked at (merge and throw-away are in the git screen's detail)
+      if (reviewable) links.push(reviewLink());
       break;
     }
     case 'needs_ok': {
@@ -340,7 +350,7 @@ export function lidView(f, o = {}) {
         + big('Look later', { act: 'later', ...st });
       // its work can be looked at, and merged anyway (through the same card, whose words name the failed check)
       if (mergeApplies(a)) links.push(reviewLink(), quiet('Merge anyway', { act: 'merge', ...st, work: wk, into }));
-      else if (canReview(a)) links.push(reviewLink());
+      else if (reviewable) links.push(reviewLink());
       else if (more && fs.extras) after = quiet(open.changed ? 'Hide the changes' : 'What changed?', { act: 'changed' }, ` aria-expanded="${!!open.changed}"`) + (open.changed ? filesList(a) : '');
       break;
     }
@@ -361,7 +371,7 @@ export function lidView(f, o = {}) {
         const why = gitReason(a);
         if (why) msg += `<p class="meta git">${esc(fs.last ? why.replace(/^(.*?\.)\s.*$/, '$1') : why)}</p>`;
         acts = big('Looks good', { act: 'looksgood', ...st, answer: 'Looks good' }, true) + big('Ask for a change', { act: 'reply', ...st, mode: 'say' });
-        if (canReview(a)) links.push(reviewLink());
+        if (reviewable) links.push(reviewLink());
         else if (more && fs.extras) after = quiet(open.changed ? 'Hide the changes' : 'What changed?', { act: 'changed' }, ` aria-expanded="${!!open.changed}"`) + (open.changed ? filesList(a) : '');
       }
       break;
@@ -371,7 +381,7 @@ export function lidView(f, o = {}) {
       msg += metaP(esc(clip(a.error || a.stateReason || 'The agent exited unexpectedly.', fs.meta ? 120 : 70)));
       acts = a.parentId ? big('Back', { act: 'parent', ...id }, true)
         : big('Try again', { act: 'fix', ...st, text: 'Please try again.' }, true) + big('Dismiss', { act: 'reviewed', ...st });
-      if (canReview(a)) links.push(reviewLink());
+      if (reviewable) links.push(reviewLink());
       break;
     }
     case 'stopped': {
@@ -379,7 +389,7 @@ export function lidView(f, o = {}) {
       if (more && fs.meta === 2) msg += meta('');
       acts = a.parentId ? big('Back', { act: 'parent', ...id }, true)
         : big('Continue', { act: 'fix', ...st, text: 'Please continue where you left off.' }, true) + big('Dismiss', { act: 'reviewed', ...st });
-      if (canReview(a)) links.push(reviewLink());
+      if (reviewable) links.push(reviewLink());
       break;
     }
     case 'finished': {
