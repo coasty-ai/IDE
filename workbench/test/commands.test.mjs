@@ -47,6 +47,10 @@ const CTX = {
   pendingDiscardOnPermission: { agents, machines, harnesses, focusId: 'a1b2c3', pendingConfirm: { id: 'c7', kind: 'discard' } },
   // A card that ran out while it was on screen (the engine answers a yes to it with "no longer waiting").
   pendingGone: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c0', gone: true } },
+  // Merge and throw-away cards as the engine shows them: they say whose work they are about.
+  pendingMergeOf: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c12', kind: 'merge', agentId: '1a2b3c' } },
+  pendingDiscardOf: { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c13', kind: 'discard', agentId: '1a2b3c' } },
+  pendingMergeOfOnQuestion: { agents, machines, harnesses, focusId: 'd4e5f6', pendingConfirm: { id: 'c14', kind: 'merge', agentId: '1a2b3c' } },
 };
 
 // Dogfooding: Workbench working on its own repository, so agent names share words with the commands themselves.
@@ -1101,6 +1105,48 @@ test('on a throw-away card "do" counts only as "do it" or "do that": a "do" cut 
     ['do it?', 'pendingDiscard', unknown('do it?')], ['do it is that right', 'pendingDiscard', unknown('do it is that right')],
   ]);
   for (const text of ['do not', 'do not do it', "don't do it"]) assert.notDeepEqual(parseCommand(text, CTX.pendingDiscard), yes, text);
+});
+
+test('on a merge or throw-away card, review words show its work; they never withdraw it for a launch', () => {
+  // "it" is the card: the words are about the work it would merge or throw away.
+  const REVIEW = ['show me the changes', 'show me the diff', 'show me what changed', 'show me its changes', 'open the diff',
+    'look at the changes', 'let me see the changes', 'can I see the diff', 'can you show me the changes', 'pull up the diff',
+    'show me the changes please', 'what changed', 'what changed?', 'what did it change', 'what are its changes', 'which files changed',
+    'diff it', 'diff',
+    // Elsewhere these are work for an agent ("review the changes" is a task); on such a card they look at its work.
+    'review the changes', 'check the diff', 'read the diff', 'check out its changes', 'go through the changes', 'look over the work',
+    'let me review the changes', 'view the diff'];
+  for (const text of REVIEW) {
+    for (const ctxName of ['pendingMergeOf', 'pendingDiscardOf', 'pendingMergeOfOnQuestion']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), changes('1a2b3c'), `${text} [${ctxName}]`);
+    }
+    // A card that does not say whose work it is keeps them: it stays, with its hint. So does one with a permission behind it.
+    for (const ctxName of ['pendingMerge', 'pendingDiscard', 'pendingMergeOnPermission', 'pendingDiscardOnPermission']) {
+      assert.deepEqual(parseCommand(text, CTX[ctxName]), unknown(text), `${text} [${ctxName}]`);
+    }
+  }
+  checkRows([
+    // The card's own words still answer it.
+    ['merge it', 'pendingMergeOf', yes], ['do it', 'pendingMergeOf', yes], ['cancel', 'pendingMergeOf', no],
+    ['throw it away', 'pendingDiscardOf', yes], ['keep it', 'pendingDiscardOf', no], ['yes', 'pendingDiscardOf', unknown('yes')],
+    ['discard it', 'pendingMergeOf', unknown('discard it')],
+    // A name is another agent's work, whatever card waits.
+    ["show me help pages' changes", 'pendingMergeOf', changes('4d5e6f')],
+    ['what did help pages change', 'pendingDiscardOf', changes('4d5e6f')],
+    // Work that is not a review keeps its old meaning.
+    ['show the error on the login page', 'pendingMergeOf', task('show the error on the login page')],
+    ['review it', 'pendingMergeOf', unknown('review it')],
+    // Without a card, review words keep their old meaning: "review the changes" is work, and a question takes the words.
+    ['review the changes', 'invoice', task('review the changes')],
+    ['show me the changes', 'question', answer('show me the changes')],
+    ['what did it change', 'question', { kind: 'status', agentId: 'd4e5f6' }],
+  ]);
+  // Only a merge or throw-away card has work to show: on the other cards the words are what they were.
+  for (const text of ['show me the changes', 'what changed', 'review the changes']) {
+    for (const ctxName of ['pending', 'pendingStart', 'pendingStop', 'pendingSay', 'pendingForget', 'pendingGone']) {
+      assert.notEqual(parseCommand(text, CTX[ctxName]).kind, 'changes', `${text} [${ctxName}]`);
+    }
+  }
 });
 
 test('"stop an agent to fix the login" is a launch, not a stop of "Login fix"; "forget an agent …" forgets nothing', () => {

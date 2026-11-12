@@ -949,27 +949,42 @@ const CHANGES_ASK = [
 /** "show me the changes", "show search cleanup's diff": it needs a word for the work, or it is a status ("show search cleanup"). */
 const CHANGES_SHOW = /^(?:show me|show us|show|let me see|let us see|can i see|could i see|may i see|see|look at|open|pull up|bring up|give me) (?<ref>.+)$/d;
 const CHANGES_DIFF = /^diff(?: (?<ref>.+))?$/d;
+/** On a merge or throw-away card only: "review the changes", "check the diff", "go over its work" (elsewhere, work). */
+const CHANGES_REVIEW = /^(?:let me |let us )?(?:review|check out|check|read through|read|inspect|examine|view|go over|go through|look over|look through|look at) (?<ref>.+)$/d;
+
+/**
+ * Review words that mean "it" ("show me the changes", "what changed", "diff it") while something else waits on screen.
+ * On a merge or throw-away card "it" is the card, so they show the work it is about, and never start anything. A card
+ * that does not say whose work it is keeps them (unknown: it stays, with its hint). Anything else on screen (a question,
+ * a permission, another kind of card) keeps their old meaning (null).
+ */
+function cardReview(c) {
+  const card = c.pendingConfirm;
+  if (!card || (card.kind !== 'merge' && card.kind !== 'discard')) return null;
+  const id = typeof card.agentId === 'string' && card.agentId ? card.agentId : null;
+  return { intent: id ? { kind: 'changes', agentId: id } : { kind: 'unknown' }, strong: true };
+}
 
 /**
  * "what did search cleanup change", "what changed" (the focused agent), "show me the changes", "show search cleanup's
  * changes", "diff it": read-only, so the engine shows them at once (the page opens the git screen on that agent).
+ * While a merge or throw-away card waits, the words without a name show the card's work (see cardReview).
  */
 function matchChanges(core, c) {
   const ws = core.map(t => t.w);
   if (bareName(ws, c)) return null; // "diff viewer" is the name of the agent "Diff viewer"
   const s = ws.join(' ');
   // "what changed", a bare "diff": the focused agent, said without its name.
-  const focused = () => (screenBusy(c) ? null : { intent: { kind: 'changes', agentId: focusRoot(c) }, strong: false });
+  const focused = () => (screenBusy(c) ? cardReview(c) : { intent: { kind: 'changes', agentId: focusRoot(c) }, strong: false });
+  const show = ref => (!tooLoose(ref, c) ? { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) }
+    : weakForm(ref) ? cardReview(c) : null);
   for (const re of CHANGES_ASK) {
     const m = re.exec(s);
     if (!m) continue;
     const refToks = refTokens(m, s, core);
     if (!refToks.length) return focused();
     const ref = workRef(refToks, c);
-    if (ref && !ref.partial) {
-      if (weakForm(ref) && screenBusy(c)) return null;
-      return { intent: { kind: 'changes', agentId: ref.id }, strong: !weakForm(ref) };
-    }
+    if (ref && !ref.partial) return show(ref);
     // A question may find the agent by its task words, or by part of its name, as "what is the rounding bug one doing"
     // does: it only shows.
     const r = resolveRef(refToks, c);
@@ -981,8 +996,7 @@ function matchChanges(core, c) {
   if (m) {
     const ref = workRef(refTokens(m, s, core), c);
     if (!ref || !ref.noun) return null; // "show search cleanup" is a status; "show the error on the login page" is work
-    if (tooLoose(ref, c)) return null;
-    return { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) };
+    return show(ref);
   }
   m = CHANGES_DIFF.exec(s);
   if (m) {
@@ -990,8 +1004,13 @@ function matchChanges(core, c) {
     if (!refToks.length) return focused();
     const ref = workRef(refToks, c);
     if (!ref) return null; // "diff the two config files" is not about an agent
-    if (tooLoose(ref, c)) return null;
-    return { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) };
+    return show(ref);
+  }
+  // "review the changes" is work for an agent, but on a merge or throw-away card it looks at the card's work.
+  m = cardReview(c) && CHANGES_REVIEW.exec(s);
+  if (m) {
+    const ref = workRef(refTokens(m, s, core), c);
+    if (ref && ref.noun && weakForm(ref)) return cardReview(c);
   }
   return null;
 }
@@ -1539,6 +1558,9 @@ function parse(said, c) {
   // 3. Commands. While a question waits, only unmistakable commands win over an answer.
   const core = stripTrailing(stripPolite(stripSoft(base)));
   const found = matchCommand(core, c);
+  // Words about the card on screen that it cannot act on ("show me the changes" on a card that does not say whose work
+  // it is): the card stays, with its hint.
+  if (found && found.intent.kind === 'unknown') return { kind: 'unknown', text: said };
   const waiting = ask && (ask.type === 'question' || ask.type === 'stuck');
   if (found && (found.strong || !waiting)) return found.intent;
   if (waiting) return answerIntent(base, holder, ask);
