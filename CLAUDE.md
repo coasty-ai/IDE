@@ -22,7 +22,7 @@ Workbench is a local program that runs coding agents (Claude Code, and Codex whe
 
 ## Running things
 
-- Run the tests with `npm test` at the repo root (a minute or so), and before you say you are done.
+- Run the tests with `npm test` at the repo root (a minute or so), and before you say you are done. Type exactly `npm test`, with nothing before or after it (no `cd … &&`, no `2>&1`, no `| tail`): that exact command is approved without asking, and anything added to it makes Workbench stop and ask the person. Its output is already short enough.
 - `node` (22 or later) and `npm` must be on the PATH. When it has no node, Workbench puts its own there for its agents and checks; in a shell of your own, put the `bin` folder of a Node install in front of `PATH` first.
 - `npm run demo` starts Workbench with simulated agents; nothing is spent.
 - The page checks need Chrome (set `CHROME_BIN` when it is not in the usual place) and are not part of `npm test`. From `workbench/`: `node scripts/ui-behaviour-check.mjs`, `node scripts/ui-fit-check.mjs`, `node scripts/ui-shots.mjs <folder>`.
