@@ -164,6 +164,25 @@ function sinceOf(ws) {
   return (ws && (ws.since || ws.base)) || null;
 }
 
+/**
+ * Work in a root's folder that is not merged yet, read as the page reads it (ui/queue.js unmergedWork): files changed
+ * since its last merge (or since it started), or, when the files are not known, a stopped, failed or earlier agent,
+ * which may hold some.
+ */
+function unmergedWork(v) {
+  const w = v && v.work;
+  if (!w || w.thrownAway || !w.folder) return false;
+  if (v.files) return count(v.files.changed) > 0;
+  return v.state === STATE.STOPPED || v.state === STATE.FAILED || !!v.earlier;
+}
+
+/** A root's work is settled: thrown away, or merged with nothing new since (ui/queue.js workSettled). */
+function workSettled(v) {
+  const w = v && !v.parentId ? v.work : null;
+  if (!w) return false;
+  return !!w.thrownAway || (!!w.merged && !unmergedWork(v));
+}
+
 /** "a.js, b.js and c.js", or "a.js, b.js, c.js and 2 more": paths as words fit for a sentence. */
 function pathWords(paths, max = 3) {
   const list = (Array.isArray(paths) ? paths : []).filter(p => typeof p === 'string' && p).map(p => quotable(p, 80));
@@ -2380,6 +2399,8 @@ export class Engine extends EventEmitter {
       return { ok: false, reply: `Workbench could not read ${v.name}’s work, so it cannot be merged right now.` };
     }
     if (!snap.changed) {
+      // Nothing to merge, so a reason a merge did not go through no longer says anything true ("Try again" settles it).
+      this._clearProblem(v.id);
       // Nothing since its last merge is "already in"; an agent never merged that changed nothing changed nothing.
       return { ok: false, reply: cur.work?.merged ? mergeSentence('nothing', { name: v.name, into: repo.branch }) : `${v.name} changed nothing, so there is nothing to merge.` };
     }
@@ -2502,14 +2523,32 @@ export class Engine extends EventEmitter {
       { kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), merged, problem: null } },
       { kind: EV.FILES, agentId: v.id, files: { ...NO_FILES, list: [] } }, // nothing is left unmerged
     ]);
+    this._dropWorkCards(v.id);
     if (where.rec) this._replaceEarlier(v.id, { ...where.rec.workspace, ...(W ? { since: W } : {}) });
     try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
     return { reply: `Merged ${v.name} into ${into}.`, focusId: v.id };
   }
 
+  /**
+   * Its work was just merged or thrown away: any other merge or throw-away card still out for it (another page's, say)
+   * was drawn for work that is not there to merge or throw away any more. Withdraw them, so a yes to one hears that it
+   * is no longer waiting, instead of being refused by git and leaving a reason on work that is fine.
+   */
+  _dropWorkCards(agentId) {
+    for (const [id, c] of this.confirms) {
+      if (c.agentId === agentId && (c.kind === 'merge' || c.kind === 'discard')) this.confirms.delete(id);
+    }
+  }
+
   /** The merge did not go through: say why, and keep the reason on the agent when it is worth acting on. */
   _mergeFailed(v, res, c) {
     const why = MERGE_WHYS.has(res?.why) ? res.why : 'git';
+    // Its branch moved because this agent's own work went in after the card was drawn (from a look git took just
+    // before that merge, say): what the card showed is in already, and nothing new is left to merge. Nothing went wrong.
+    if (why === 'moved' && !res?.unexpected && v.work?.merged && !unmergedWork(v)) {
+      this._clearProblem(v.id);
+      return { reply: mergeSentence('nothing', { name: v.name, into: v.work.merged.into || c.expect.into }), focusId: v.id };
+    }
     const paths = (Array.isArray(res?.paths) ? res.paths : []).filter(p => typeof p === 'string' && p);
     const own = typeof res?.sentence === 'string' && res.sentence.trim() ? aboutAgent(v.name, res.sentence) : null;
     let sentence;
@@ -2520,6 +2559,8 @@ export class Engine extends EventEmitter {
     else sentence = mergeSentence(why, { name: v.name, into: c.expect.into, paths });
     if (why === 'gone') {
       this._markFolderGone(v);
+    } else if (why === 'nothing') {
+      this._clearProblem(v.id); // already in (merged by hand, say): a reason from before no longer holds
     } else if (PROBLEM_WHYS.has(why)) {
       this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), problem: { why, sentence, paths: paths.slice(0, 50), into: c.expect.into || null, at: this.now() } } }]);
     }
@@ -2690,6 +2731,7 @@ export class Engine extends EventEmitter {
     const saved = typeof res.saved === 'string' && res.saved ? res.saved : null;
     if (where.run) where.run.folderRemoved = true; // out of keptFolders and the tidy; follow-ups are refused
     this._apply([{ kind: EV.WORK, agentId: v.id, work: { ...this._workNow(v), branch: null, folder: false, problem: null, thrownAway: { at: this.now(), saved } } }]);
+    this._dropWorkCards(v.id);
     if (where.rec) {
       this._replaceEarlier(v.id, null); // its record keeps no folder from now on
       this.store.markContinue(v.id, { ok: false, reason: THROWN_REASON });
@@ -2841,6 +2883,7 @@ export class Engine extends EventEmitter {
       }
       if (cur.files === before.files) batch.push({ kind: EV.FILES, agentId: cur.id, files: { ...NO_FILES, list: [] } });
       if (batch.length) this._apply(batch);
+      this._dropWorkCards(cur.id);
       return { reply: (typeof res?.reply === 'string' && res.reply.trim()) || `Merged ${cur.name} into ${into}. ${DEMO_MERGED}`, focusId: cur.id };
     } finally {
       this._busy.delete(v.id);
@@ -2903,6 +2946,7 @@ export class Engine extends EventEmitter {
         const thrownAway = { at: this.now(), saved: typeof res?.saved === 'string' ? res.saved : null };
         this._apply([{ kind: EV.WORK, agentId: cur.id, work: { ...this._demoWork(cur, this._demoInto(cur)), branch: null, folder: false, problem: null, thrownAway } }]);
       }
+      this._dropWorkCards(cur.id);
       return { reply: (typeof res?.reply === 'string' && res.reply.trim()) || `Threw away ${cur.name}’s work. ${DEMO_THROWN}`, focusId: cur.id };
     } finally {
       this._busy.delete(v.id);
