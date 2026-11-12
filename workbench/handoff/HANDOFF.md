@@ -28,11 +28,30 @@ Decisions already made:
 ## Status
 
 - **Done:** reading the code; the spec; a baseline on Linux with Chrome 157 (541/541 tests; behaviour check 57/57).
-- **Not started:** the code. Seven builders were launched and stopped for the handoff before they had written anything.
+- **Built partway:** seven builders ran on the laptop and were stopped mid-work for the move to the cloud. None of them got to report. Each one's work is pushed to its own branch, made from this branch at `1769f75`. A commit starting "WIP" holds edits made after the builder's last commit; they are unfinished and untested.
+
+| Branch | Builder | State when stopped |
+|---|---|---|
+| `wip/source-control/A-git-core` | A: `workspace.mjs` and its tests | one full commit (all six functions), then WIP |
+| `wip/source-control/B-engine-server` | B: engine, store, history, events, server and tests | one full commit, then WIP |
+| `wip/source-control/C-words` | C: `commands.mjs` and its tests | two commits, nothing left unsaved: probably close to done |
+| `wip/source-control/D2-lid-checks` | D2: lid, confirm cards, API, mock merge routes | one commit: the behaviour-check part is probably not done |
+| `wip/source-control/E-dogfood` | E: CLI, Claude adapter, root `package.json`, `workbench.json`, `CLAUDE.md` | one commit, nothing left unsaved: probably close to done |
+| `wip/source-control/D1-git-screen` | D1: git screen | WIP only: early `ui/gitgraph.js`, `ui/diffview.js` and its test. The DRAM, the transition and the screen itself are not started |
+| `wip/source-control/F-demo` | F: simulator | WIP only: early `simulator.mjs` changes, no tests |
+
+For each branch:
+
+1. Check it out.
+2. Run `cd workbench && npm test`.
+3. Compare it against its section of the spec.
+4. Finish it.
+
+Then integrate, as described below. D1 is the biggest piece of work left.
 
 ## What to do next
 
-1. **Build** with parallel builders, each owning disjoint files as the spec lists them:
+1. **Finish the builders' branches**, as listed under "Status": start from their `wip/source-control/*` branches, not from scratch. Each builder owns disjoint files, as the spec lists them:
    - A: git core
    - B: engine, store, history and server
    - C: words
