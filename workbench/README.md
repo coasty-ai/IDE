@@ -58,7 +58,7 @@ Each state has its own mark and its own words, so nothing depends on colour:
 | cross | failed |
 | ring | stopped |
 
-Screenshots of each look and view are in `docs/screens/`. They were taken before the git chip and the git screen were added; `scripts/ui-shots.mjs` takes them again.
+Screenshots of each look and view are in `docs/screens/`: the board (`board-*.png`, with the git chip) and the git screen (`git-*.png`). `node scripts/ui-shots.mjs <folder>` takes them again, along with the lid's merge views (`merge-*.png`), which are not kept in the repository so that every agent's copy of it stays smaller; the `live-*.png` shots come from an earlier real run.
 
 ## What is real in this prototype
 
