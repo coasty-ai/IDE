@@ -573,7 +573,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const changed = list => send('agents', list);
 
   // ---------------------------------------------------------------- D2: merge and throw-away
-  // As the engine does them (SPEC-source-control.md section 2; replies and words as src/core/engine.mjs gives them):
+  // As the engine does them (ARCHITECTURE.md, "Source control in the engine"; replies and words as src/core/engine.mjs gives them):
   //   POST /api/agents/:id/merge|discard { state }  the engine's card ({ reply, confirm }), or a refusal ({ ok: false, reply })
   //   POST /api/confirm/:id { go }                    settles a card by its kind; a merge or throw-away replies { reply, focusId }
   //   POST /api/command                               "merge it", "throw it away" and the cards' own yes and no words
