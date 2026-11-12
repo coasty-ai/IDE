@@ -1,15 +1,18 @@
 // The CLI: its argument handling (these cases stop before any module is loaded), the refusal inside an agent, and
 // what it says when it starts. The starts use a throwaway repository, a temporary HOME, stand-ins for Claude Code and
 // Codex, and a PATH without them; Workbench is stopped as soon as it has said where it runs. No agent is started.
+// Also the files at the top of this repository that run Workbench on itself (package.json, workbench.json, CLAUDE.md).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync, accessSync, constants } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync, accessSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as workspace from '../src/core/workspace.mjs';
+import { checkRules } from '../src/core/receipt.mjs';
 
+const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const BIN = fileURLToPath(new URL('../bin/workbench.mjs', import.meta.url));
 const ACCEPT = fileURLToPath(new URL('../scripts/accept-real.mjs', import.meta.url));
 const FAKE = fileURLToPath(new URL('./helpers/claude-fake.mjs', import.meta.url));
@@ -58,7 +61,7 @@ function setup(t) {
     ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1',
     PATH: `${bin}:/usr/bin:/bin`, WORKBENCH_CODEX_BIN: path.join(dir, 'no-codex-here'),
   };
-  for (const k of ['WORKBENCH_AGENT_ID', 'WORKBENCH_CLAUDE_BIN', 'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_COUNT']) delete env[k];
+  for (const k of ['WORKBENCH_AGENT_ID', 'WORKBENCH_CLAUDE_BIN', 'WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS']) delete env[k];
   return { dir, repo, home, env };
 }
 
@@ -206,4 +209,46 @@ test('without a git name and email, the start says merging must wait for them', 
   const known = await start(t, args, w.env);
   assert.equal(known.code, 0, known.err);
   assert.ok(!known.out.includes('Git does not know your name'), known.out);
+});
+
+test('the repository runs its own tests, demo and dogfood, and checks the work of agents that work on it', () => {
+  const pkg = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+  assert.equal(pkg.private, true);
+  assert.deepEqual(pkg.scripts, {
+    test: 'npm --prefix workbench test',
+    demo: 'node workbench/bin/workbench.mjs --demo',
+    dogfood: 'node workbench/bin/workbench.mjs --repo .',
+  });
+  for (const k of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'bundleDependencies', 'bundledDependencies']) {
+    assert.equal(pkg[k], undefined, `no ${k}`);
+  }
+
+  // workbench.json, read the way Workbench reads it: nothing in it is skipped.
+  const problems = [];
+  const config = workspace.normalizeConfig(JSON.parse(readFileSync(path.join(REPO_ROOT, 'workbench.json'), 'utf8')), (p) => problems.push(p));
+  assert.deepEqual(problems, []);
+  assert.deepEqual(config, {
+    checks: [{ name: 'tests', run: 'npm test', timeoutSec: 600 }],
+    rules: [
+      { say: 'Do not change the research and mockups in docs/', paths: ['docs/**'] },
+      { say: 'Add no packages', paths: ['**/package-lock.json', '**/node_modules/**'] },
+    ],
+    allow: [],
+  });
+  // What the rules catch, and what they leave alone: the program's own screenshots are not the research.
+  const broken = (paths) => checkRules(config.rules, paths).broken;
+  assert.deepEqual(broken(['workbench/src/core/engine.mjs', 'workbench/docs/screens/board-green.png', 'workbench/package.json', 'package.json', 'CLAUDE.md']), []);
+  assert.deepEqual(broken(['docs/pcb/board.png', 'package-lock.json', 'workbench/package-lock.json', 'workbench/node_modules/left-pad/index.js', 'node_modules']), [
+    { say: 'Do not change the research and mockups in docs/', paths: ['docs/pcb/board.png'] },
+    { say: 'Add no packages', paths: ['package-lock.json', 'workbench/package-lock.json', 'workbench/node_modules/left-pad/index.js', 'node_modules'] },
+  ]);
+
+  // CLAUDE.md, for agents (and people) working on Workbench itself.
+  const guide = readFileSync(path.join(REPO_ROOT, 'CLAUDE.md'), 'utf8');
+  for (const words of [
+    /`workbench\/ARCHITECTURE\.md` is the contract/, /change it in the same commit as the code/,
+    /no third-party packages/, /Plain language in anything a person sees/,
+    /Run the tests with `npm test` at the repo root/, /need Chrome/,
+    /Never start a live Workbench .* or `workbench\/scripts\/accept-real\.mjs` from inside an agent/,
+  ]) assert.match(guide, words);
 });

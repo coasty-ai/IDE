@@ -421,6 +421,22 @@ test('on the same version, a build for this processor is taken', (t) => {
   extension(home, '2.1.322', { suffix: `-${process.platform}-${otherArch}` });
   const mine = extension(home, '2.1.322', { folder: '.cursor/extensions' });
   assert.deepEqual(newestExtensionClaude(home), { path: mine.bin, version: '2.1.322' });
+  // The same, found the other way round: the build for this processor comes first and is kept.
+  const first = path.join(scratch(t), 'home');
+  const mineFirst = extension(first, '2.1.322');
+  extension(first, '2.1.322', { folder: '.cursor/extensions', suffix: `-${process.platform}-${otherArch}` });
+  assert.deepEqual(newestExtensionClaude(first), { path: mineFirst.bin, version: '2.1.322' });
+  // A build for Alpine's Linux is a Linux build, taken only when there is no build for the usual Linux of that
+  // version; on any other system it is skipped like every build for another system.
+  const alpine = path.join(scratch(t), 'home');
+  const musl = extension(alpine, '2.1.322', { suffix: `-alpine-${process.arch}` });
+  if (process.platform === 'linux') {
+    assert.deepEqual(newestExtensionClaude(alpine), { path: musl.bin, version: '2.1.322' });
+    const glibc = extension(alpine, '2.1.322', { folder: '.cursor/extensions' });
+    assert.deepEqual(newestExtensionClaude(alpine), { path: glibc.bin, version: '2.1.322' });
+  } else {
+    assert.equal(newestExtensionClaude(alpine), null);
+  }
   const universal = path.join(scratch(t), 'home');
   const plain = extension(universal, '2.1.400', { suffix: '' });
   assert.deepEqual(newestExtensionClaude(universal), { path: plain.bin, version: '2.1.400' });

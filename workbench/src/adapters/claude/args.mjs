@@ -99,7 +99,8 @@ const newerThan = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 /**
  * The newest Claude Code that the VS Code extension installed, in VS Code, VS Code Insiders or Cursor: its program
  * and version, or null. Folders VS Code has marked to delete (listed in .obsolete) and builds for another operating
- * system are skipped; on the same version, a build for this processor wins.
+ * system are skipped. On the same version, a build for this processor wins, then (on Linux) a build for the usual
+ * Linux over one for Alpine's.
  */
 export function newestExtensionClaude(home) {
   if (!home || !path.isAbsolute(home)) return null;
@@ -118,9 +119,9 @@ export function newestExtensionClaude(home) {
       const bin = path.join(dir, name, EXTENSION_BINARY);
       if (!isExecutableFile(bin)) continue;
       const version = [Number(m[1]), Number(m[2]), Number(m[3])];
-      const exact = !m[5] || m[5] === process.arch;
-      const order = best ? newerThan(version, best.version) : 1;
-      if (order > 0 || (order === 0 && exact && !best.exact)) best = { path: bin, version, exact };
+      const fit = (!m[5] || m[5] === process.arch ? 2 : 0) + (m[4] === 'alpine' ? 0 : 1);
+      const order = best ? newerThan(version, best.version) || fit - best.fit : 1;
+      if (order > 0) best = { path: bin, version, fit };
     }
   }
   return best && { path: best.path, version: best.version.join('.') };
@@ -321,6 +322,8 @@ export function buildClaudeLaunch(o = {}) {
     // (and, in a worktree, is read from the person's main checkout).
     '--setting-sources', 'project',
     // A defaultMode in a settings file cannot turn off Claude Code's own refusal to change protected files.
+    // 2.1.322's --help lists "manual" instead, but "default" is still accepted (it is the name "manual" stands for),
+    // and 2.1.221 knows only "default".
     '--permission-mode', 'default',
     '--strict-mcp-config',
     '--disallowedTools', DISALLOWED_TOOLS,

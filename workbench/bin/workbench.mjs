@@ -18,7 +18,7 @@ const DEFAULT_BUDGET_USD = 2;
 /** Said instead of starting, when the variable every agent gets is set: this is an agent's own command. */
 const INSIDE_AGENT = 'Workbench is running inside an agent. It will not start real agents from there.';
 /** Said at the start when git has no user.name and user.email for the repository. */
-const NO_GIT_IDENTITY ='Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: git config --global user.name "Your Name" and git config --global user.email you@example.com';
+const NO_GIT_IDENTITY = 'Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: git config --global user.name "Your Name" and git config --global user.email you@example.com';
 /** How the start says where Claude Code was found. */
 const CLAUDE_FROM = { flag: ' (from --claude)', env: ' (from WORKBENCH_CLAUDE_BIN)', path: '', vscode: ' (from the VS Code extension)' };
 
