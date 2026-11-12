@@ -746,6 +746,16 @@ function isFolder(p) {
   }
 }
 
+/** Whether nothing at all is at `p` (not a folder, a file or a link): lstat says so, and not for any other reason. */
+function nothingAt(p) {
+  try {
+    fs.lstatSync(p);
+    return false;
+  } catch (e) {
+    return e.code === 'ENOENT';
+  }
+}
+
 /** The commit `rev` names (HEAD, refs/heads/<name> or an object id), or null when there is none. */
 async function commitOf(cwd, rev, run = git) {
   const r = await run(['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], { cwd, okCodes: [1] });
@@ -1030,8 +1040,16 @@ async function changesBetween(run, cwd, from, to) {
       f.adds = Number(m[1]);
       f.dels = Number(m[2]);
     }
-    if (Math.max(f.oldSize, f.newSize) > LARGE_FILE_BYTES) f.large = true;
-    else if (m && m[1] === '-') f.binary = true;
+    if (f.newMode === '120000' && (f.oldMode === '100644' || f.oldMode === '100755')) {
+      // A file that became a link always gets its patch, which says where the link points. Git counts the pair as
+      // binary when the old file is binary or too large, and then gives that file a single "Binary files" line in the
+      // patch: the link's own line is the one counted.
+      if (!m || m[1] === '-') f.adds = 1;
+    } else if (Math.max(f.oldSize, f.newSize) > LARGE_FILE_BYTES) {
+      f.large = true;
+    } else if (m && m[1] === '-') {
+      f.binary = true;
+    }
   }
   return files;
 }
@@ -1513,8 +1531,10 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
 
   // The folder is already gone: still delete the branch, keeping its last commit. Its worktree record goes by itself
   // (`worktree remove` of a missing folder takes away only that record; never `worktree prune`, which would also take
-  // away the records of the person's own worktrees whose folders are away right now).
+  // away the records of the person's own worktrees whose folders are away right now). Only when nothing at all is at
+  // that path: a folder that is there but could not be read would go with its record, and with the work in it.
   if (entry) {
+    if (!nothingAt(entry.path)) throw new Refusal('git', `Workbench cannot read its folder ${entry.path}, so it left the folder and its branch alone.`);
     await run(['worktree', 'remove', '--force', ...(entry.locked ? ['--force'] : []), entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS }).catch(() => {});
   }
   const tip = await commitOf(root, `refs/heads/${b}`, run);

