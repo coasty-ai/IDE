@@ -512,6 +512,10 @@ test('when git stops part-way through making a workspace, its new branch and fol
 // ---------------------------------------------------------------------------------------------
 // Source control: snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity.
 
+// How many of the tests that share nothing run at once, and how many refusal cases within one test.
+const TESTS_AT_ONCE = 4;
+const CASES_AT_ONCE = 6;
+
 /** The person's identity, in each test repository's own config. The environment says someone else, on purpose. */
 const PERSON = { name: 'Pat Person', email: 'pat@example.invalid' };
 const STARTING_FILES = { 'a.txt': 'one\ntwo\nthree\n', 'b.txt': 'b\n', 'c.txt': 'c\n', '.gitignore': '.env\nnode_modules/\n' };
@@ -617,7 +621,7 @@ async function everything(t) {
 }
 
 /** Run `tasks` (functions that return promises), a few at a time; the first failure is thrown once all are done. */
-async function inParallel(tasks, limit = 6) {
+async function inParallel(tasks, limit = CASES_AT_ONCE) {
   let next = 0;
   const errors = [];
   await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, async () => {
@@ -663,7 +667,7 @@ function plantConfigHooks(configFile, log, prefix = 'config') {
 const ranHooks = log => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map(l => l.split(' ')[0]) : []);
 
 // These share nothing (each has repositories of its own, and none changes process.env), so they run a few at a time.
-describe('source control', { concurrency: 4 }, () => {
+describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
   test('snapshotWork reads the work set in a temporary index and never writes the agent’s own; workDiff shows the same files', async () => {
     const t = await agentRepo({ ...STARTING_FILES, 'src/x.js': 'x\n' });
     const { w } = t;
@@ -742,35 +746,6 @@ describe('source control', { concurrency: 4 }, () => {
     assert.match(patch('out-link'), /\nnew file mode 120000\n/);
     assert.ok(patch('out-link').endsWith(`+${outside}\n\\ No newline at end of file\n`));
     assert.ok(d.files.every(f => !String(f.patch).includes('SECRET OUTSIDE')), 'nothing from outside the folder');
-  });
-
-  test('a snapshot still sees an edit of the same size made in the second the agent’s index was written, however much later it is taken', async () => {
-    // Git trusts the size and times it noted for a file in an index unless the file is not older than the index. A
-    // fresh copy of the index is newer than everything, so a snapshot read through one would miss such an edit for good.
-    let t, index;
-    for (let tries = 1; ; tries++) {
-      t = await agentRepo({ 'a.txt': 'one\ntwo\nthree\n' });
-      write(t.w('a.txt'), 'one\nTWO\nthree\n'); // the same size, at once
-      index = path.resolve(t.ws.path, git(t.ws.path, 'rev-parse', '--git-path', 'index'));
-      const second = f => Math.floor(fs.statSync(f).mtimeMs / 1000);
-      if (second(t.w('a.txt')) === second(index)) break; // what makes it racy: the edit in the index's own second
-      assert.ok(tries < 5, 'the edit never landed in the second the index was written');
-    }
-    const first = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
-    assert.deepEqual(first.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }]);
-    // Into a later second than the index's.
-    await new Promise(resolve => setTimeout(resolve, (Math.floor(fs.statSync(index).mtimeMs / 1000) + 1) * 1000 - Date.now() + 50));
-
-    // The danger, where this git trusts whole seconds: a plain copy of the index hides the edit.
-    const copy = path.join(T, `index-copy-${t.id}`);
-    fs.copyFileSync(index, copy);
-    const plain = spawnSync('git', ['diff-files', '--quiet'], { cwd: t.ws.path, env: { ...process.env, GIT_INDEX_FILE: copy } });
-    if (plain.status === 0) assert.equal(statusOf(t.ws.path), ' M a.txt\n', 'git itself, with the real index, sees the edit');
-
-    const later = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
-    assert.equal(later.tree, first.tree);
-    assert.deepEqual(later.files, first.files);
-    assert.equal((await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base })).workId, first.workId);
   });
 
   test('workDiff marks binary and large files, and cuts long patches and long lists', async () => {
@@ -1456,6 +1431,36 @@ describe('source control', { concurrency: 4 }, () => {
     assert.deepEqual(await mergeWork({ ...mergeOpts(t, { workId: 'x', into: info.branch, intoHead: info.head }), path: other.path, branch: other.branch, since: other.base }),
       { ok: false, why: 'gone', sentence: 'Its folder is gone, so there is nothing to merge.' });
   });
+});
+
+// This one needs its edit to land in the same second as git writes the agent’s index, so it runs alone too.
+test('a snapshot still sees an edit of the same size made in the second the agent’s index was written, however much later it is taken', async () => {
+  // Git trusts the size and times it noted for a file in an index unless the file is not older than the index. A
+  // fresh copy of the index is newer than everything, so a snapshot read through one would miss such an edit for good.
+  let t, index;
+  for (let tries = 1; ; tries++) {
+    t = await agentRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+    write(t.w('a.txt'), 'one\nTWO\nthree\n'); // the same size, at once
+    index = path.resolve(t.ws.path, git(t.ws.path, 'rev-parse', '--git-path', 'index'));
+    const second = f => Math.floor(fs.statSync(f).mtimeMs / 1000);
+    if (second(t.w('a.txt')) === second(index)) break; // what makes it racy: the edit in the index's own second
+    assert.ok(tries < 5, 'the edit never landed in the second the index was written');
+  }
+  const first = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+  assert.deepEqual(first.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }]);
+  // Into a later second than the index's.
+  await new Promise(resolve => setTimeout(resolve, (Math.floor(fs.statSync(index).mtimeMs / 1000) + 1) * 1000 - Date.now() + 50));
+
+  // The danger, where this git trusts whole seconds: a plain copy of the index hides the edit.
+  const copy = path.join(T, `index-copy-${t.id}`);
+  fs.copyFileSync(index, copy);
+  const plain = spawnSync('git', ['diff-files', '--quiet'], { cwd: t.ws.path, env: { ...process.env, GIT_INDEX_FILE: copy } });
+  if (plain.status === 0) assert.equal(statusOf(t.ws.path), ' M a.txt\n', 'git itself, with the real index, sees the edit');
+
+  const later = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+  assert.equal(later.tree, first.tree);
+  assert.deepEqual(later.files, first.files);
+  assert.equal((await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base })).workId, first.workId);
 });
 
 // These change process.env, so they run alone.
