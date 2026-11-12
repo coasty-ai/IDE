@@ -1097,11 +1097,11 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     });
     refused('detached', t => { git(t.root, 'checkout', '-q', '--detach'); }, 'detached', 'Your folder is not on a branch, so there is nowhere to merge it.');
 
-    // A merge, rebase, cherry-pick, revert or bisect under way.
-    for (const marker of ['MERGE_HEAD', 'rebase-merge', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-apply']) {
+    // A merge, rebase, cherry-pick, revert (one commit, or a sequence of them) or bisect under way.
+    for (const marker of ['MERGE_HEAD', 'rebase-merge', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-apply', 'sequencer']) {
       refused(marker, t => {
         const f = path.join(t.root, '.git', marker);
-        if (marker.startsWith('rebase')) fs.mkdirSync(f);
+        if (marker.startsWith('rebase') || marker === 'sequencer') fs.mkdirSync(f);
         else write(f, `${t.ws.base}\n`);
       }, 'busy', 'Your folder is in the middle of a merge or rebase. Finish that first.');
     }
@@ -1178,6 +1178,83 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
       t => `Its folder is on the branch ${t.ws.branch} now, not on workbench/someone-else-a1a1a1.`);
 
     await inParallel(cases);
+  });
+
+  test('a cherry-pick of several commits that waits between two of them is under way: busy, and the person can still finish it', async () => {
+    const t = await agentRepo({ ...STARTING_FILES, 'p.txt': 'p\n', 'q.txt': 'q\n' });
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    git(t.root, 'checkout', '-q', '-b', 'side');
+    write(t.p('p.txt'), 'side p\n');
+    git(t.root, 'commit', '-q', '-am', 'side 1');
+    write(t.p('q.txt'), 'side q\n');
+    git(t.root, 'commit', '-q', '-am', 'side 2');
+    git(t.root, 'checkout', '-q', 'main');
+    write(t.p('p.txt'), 'main p\n');
+    git(t.root, 'commit', '-q', '-am', 'main p');
+    // The first commit does not apply cleanly; the person settles it and commits it, and the second one waits.
+    assert.notEqual(gitTry(t.root, 'cherry-pick', 'main..side').code, 0);
+    write(t.p('p.txt'), 'settled\n');
+    git(t.root, 'add', 'p.txt');
+    git(t.root, 'commit', '-q', '--no-edit');
+    assert.match(git(t.root, 'status'), /Cherry-pick currently in progress/);
+    assert.equal(gitTry(t.root, 'rev-parse', '-q', '--verify', 'CHERRY_PICK_HEAD').code, 1);
+    const { expect } = await proposal(t);
+    const was = await everything(t);
+    assert.deepEqual(await mergeWork(mergeOpts(t, expect)), { ok: false, why: 'busy', sentence: 'Your folder is in the middle of a merge or rebase. Finish that first.' });
+    assert.deepEqual(await everything(t), was);
+    // Their cherry-pick goes on where it waited, on their own commit; once it is done, the merge goes through.
+    const settled = headOf(t.root);
+    assert.equal(gitTry(t.root, 'cherry-pick', '--continue').code, 0);
+    assert.equal(git(t.root, 'log', '-1', '--format=%s %P'), `side 2 ${settled}`);
+    const picked = headOf(t.root);
+    const r = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(git(t.root, 'log', '-1', '--format=%P', r.merge), `${picked} ${r.work}`);
+  });
+
+  test('what git keeps for the person’s next commit survives a merge: the message of a cherry-pick --no-commit, and rerere’s record', async () => {
+    const t = await agentRepo({ ...STARTING_FILES, 'p.txt': 'p\n' });
+    git(t.root, 'config', 'rerere.enabled', 'true');
+    git(t.root, 'checkout', '-q', '-b', 'side');
+    write(t.p('p.txt'), 'side p\n');
+    git(t.root, 'commit', '-q', '-am', 'Port the fix', '-m', 'Why it matters.');
+    git(t.root, 'checkout', '-q', 'main');
+    write(t.p('p.txt'), 'main p\n');
+    git(t.root, 'commit', '-q', '-am', 'main p');
+    // Picked without a commit: git writes the message for the next commit (MERGE_MSG), and rerere notes the conflict
+    // the person settles (MERGE_RR). Git does not count this as a cherry-pick under way.
+    assert.notEqual(gitTry(t.root, 'cherry-pick', '-n', '-x', 'side').code, 0);
+    write(t.p('p.txt'), 'settled\n');
+    git(t.root, 'add', 'p.txt');
+    assert.doesNotMatch(git(t.root, 'status'), /in progress/);
+    const kept = cwd => Object.fromEntries(['MERGE_MSG', 'MERGE_RR'].map(f => {
+      const file = path.join(cwd, '.git', f);
+      return [f, fs.existsSync(file) ? fs.readFileSync(file, 'latin1') : null];
+    }));
+    const before = kept(t.root);
+    assert.match(before.MERGE_MSG, /^Port the fix\n\nWhy it matters\.\n\n\(cherry picked from commit [0-9a-f]{40}\)\n/);
+    assert.notEqual(before.MERGE_RR, null);
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    git(t.ws.path, 'commit', '-q', '-am', 'agent');
+
+    // The danger is real: git's fast-forward deletes both, as if it ended a merge.
+    const demo = path.join(T, `demo-${t.id}`);
+    fs.cpSync(t.root, demo, { recursive: true });
+    const tree = git(demo, 'merge-tree', '--write-tree', 'HEAD', t.ws.branch).split('\n')[0];
+    const m = git(demo, 'commit-tree', tree, '-p', 'HEAD', '-p', t.ws.branch, '-m', 'merge');
+    assert.equal(gitTry(demo, 'merge', '--ff-only', '-q', m).code, 0);
+    assert.deepEqual(kept(demo), { MERGE_MSG: null, MERGE_RR: null });
+
+    const r = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(headOf(t.root), r.merge);
+    assert.deepEqual(kept(t.root), before);
+    assert.equal(statusOf(t.root), 'M  p.txt\n');
+    // Their next commit is the one they prepared, and rerere learns how they settled the conflict.
+    git(t.root, 'commit', '-q', '--no-edit');
+    assert.equal(git(t.root, 'log', '-1', '--format=%s'), 'Port the fix');
+    const cache = path.join(t.root, '.git', 'rr-cache');
+    assert.ok(fs.readdirSync(cache).some(id => fs.existsSync(path.join(cache, id, 'postimage'))), 'rerere recorded the settled file');
   });
 
   test('mergeWork refuses a conflict and writes nothing into the person’s folder; the agent can then bring the branch in', async () => {

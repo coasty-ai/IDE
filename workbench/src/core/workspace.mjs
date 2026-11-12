@@ -651,7 +651,11 @@ const BODY_MAX = 4000;
 const PATCH_BATCH_FILES = 64; // patches are asked for this many files at a time...
 const PATCH_BATCH_BYTES = 8 * 1024 * 1024; // ...as long as their blobs are not too big together
 const LOCK_TRIES = 4; // another git command holding your folder's index.lock (an editor's git, say): wait, then try again
-const UNDER_WAY = ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG'];
+// A merge, rebase, cherry-pick or revert (one commit, or a sequence of them waiting between two: `sequencer`) or bisect.
+const UNDER_WAY = ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'sequencer'];
+// What git keeps in a folder's git folder for the person's next commit, which a fast-forward deletes as if it had ended
+// a merge: the message it prepared (`git cherry-pick --no-commit`, say) and rerere's record of the conflicts they settled.
+const KEPT_FOR_NEXT_COMMIT = ['MERGE_MSG', 'MERGE_RR'];
 const WORKBENCH_IDENTITY = { name: 'Workbench', email: 'workbench@localhost' }; // the hidden copy of thrown-away work only
 const CLAUDE_TRAILER = 'Co-authored-by: Claude <noreply@anthropic.com>';
 
@@ -836,6 +840,34 @@ const underWay = (cwd, run = git) => gitPathsExist(cwd, UNDER_WAY, run);
 async function unresolved(cwd, run = git) {
   const out = (await run(['ls-files', '-u', '-z'], { cwd })).stdout;
   return [...new Set(nulList(out).map(rec => rec.slice(rec.indexOf('\t') + 1)))]; // "<mode> <id> <stage>\t<path>"
+}
+
+/**
+ * The files of KEPT_FOR_NEXT_COMMIT that are in this folder's git folder now, with their bytes: [{ file, bytes }].
+ * One that cannot be read is a plain error: better no merge than a lost message.
+ */
+async function keptForNextCommit(cwd, run = git) {
+  const out = (await run(['rev-parse', ...KEPT_FOR_NEXT_COMMIT.flatMap(name => ['--git-path', name])], { cwd })).stdout.split('\n');
+  const kept = [];
+  KEPT_FOR_NEXT_COMMIT.forEach((name, i) => {
+    if (!out[i]) return;
+    const file = path.resolve(cwd, out[i]);
+    try {
+      kept.push({ file, bytes: fs.readFileSync(file) });
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw plainError('Workbench could not read what git keeps for your next commit.', e);
+    }
+  });
+  return kept;
+}
+
+/** Put back each of `kept` that is gone, never over one written meanwhile. */
+function putBack(kept) {
+  for (const { file, bytes } of kept) {
+    try {
+      fs.writeFileSync(file, bytes, { flag: 'wx' });
+    } catch {} // still there (git stopped before it deleted it), or written anew
+  }
 }
 
 /**
@@ -1484,8 +1516,13 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
     const back = brought.filter(f => f.status === 'modified' && missing.has(f.path)).map(f => f.path);
     if (back.length) throw new Refusal('blocked', SAY.blocked(back), back);
     if (!locked) {
+      const kept = await keptForNextCommit(root, run);
       progress.started = true;
-      r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
+      try {
+        r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
+      } finally {
+        putBack(kept); // the fast-forward deletes them as if it had ended a merge; this one ended nothing of theirs
+      }
       // Another git command holds the index (an editor's git, say): git stopped before it changed anything (exit 1 on
       // newer git, 128 on older).
       if (r.code === 0 || !INDEX_LOCKED.test(r.stderr)) break;
