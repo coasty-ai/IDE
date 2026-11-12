@@ -9,6 +9,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { STATE } from '../shared/states.mjs';
 
 const MAX_BODY = 64 * 1024;
 const DRAIN_LIMIT = 1024 * 1024;   // read and discard at most this much of an oversized body
@@ -45,6 +46,7 @@ const TYPES = Object.freeze({
 });
 
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const STATES = new Set(Object.values(STATE));
 
 /** An error with an HTTP status and a plain message for the person. */
 class HttpError extends Error {
@@ -281,12 +283,22 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     try { snap = engine.snapshot(); } catch (err) { L.error('Snapshot failed:', err); return; }
     broadcast('snapshot', snap);
   };
+  // The person's repository changed (a merge moved their branch; a refresh found a new head, branch, number of
+  // uncommitted changes or git identity): { name, head, branch, dirty, identity }.
+  const onRepo = (repo) => {
+    let data = repo;
+    if (!data || typeof data !== 'object') {
+      try { data = engine.snapshot()?.repo ?? null; } catch (err) { L.error('Snapshot failed:', err); return; }
+    }
+    broadcast('repo', data);
+  };
   if (store?.on) {
     store.on('agents', onAgents);
     store.on('machines', onMachines);
     store.on('notice', onNotice);
     // An earlier agent the person forgot: the stream has no "removed", so every page gets a fresh snapshot.
     store.on('removed', onRemoved);
+    store.on('repo', onRepo);
   }
 
   function openStream(req, res) {
@@ -330,10 +342,18 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
   const str = (v) => (v == null ? '' : String(v));
   // An id from a body, or null: anything that is not an id string is as if nothing was sent.
   const optId = (v) => (typeof v === 'string' && ID_RE.test(v) ? v : null);
+  // A state the page drew a button for (STATE in states.mjs), or null: anything else is as if nothing was sent.
+  const optState = (v) => (typeof v === 'string' && STATES.has(v) ? v : null);
 
   const routes = [
     { method: 'GET', re: /^\/api\/state$/, run: () => engine.snapshot() },
     { method: 'GET', re: /^\/api\/stream$/, stream: true },
+    // The git screen and an agent's diff: read-only. Merge and throw away only ever return a confirm card; they act on
+    // POST /api/confirm/:id { go: true }.
+    { method: 'GET', re: /^\/api\/git$/, run: () => engine.gitGraph() },
+    { method: 'GET', re: /^\/api\/agents\/([^/]+)\/changes$/, run: (b, m) => engine.changes(id(m[1])) },
+    { method: 'POST', re: /^\/api\/agents\/([^/]+)\/merge$/, run: (b, m) => engine.proposeMerge(id(m[1]), { state: optState(b.state) }) },
+    { method: 'POST', re: /^\/api\/agents\/([^/]+)\/discard$/, run: (b, m) => engine.proposeDiscard(id(m[1]), { state: optState(b.state) }) },
     {
       // What the page showed when the person began: the agent, the confirm card and the ask on screen.
       method: 'POST', re: /^\/api\/command$/,
@@ -468,6 +488,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     closed = true;
     store?.off?.('agents', onAgents);
     store?.off?.('removed', onRemoved);
+    store?.off?.('repo', onRepo);
     store?.off?.('machines', onMachines);
     store?.off?.('notice', onNotice);
     clearTimeout(flushTimer);

@@ -22,6 +22,14 @@ function state(agentId, s, ts = T0 + 1000, extra = {}) {
 function act(agentId, phase, sentence, ts = T0 + 1000, extra = {}) {
   return { kind: EV.ACTIVITY, ts, agentId, phase, sentence, toolKind: 'read', ...extra };
 }
+/** Wait until fn() is true, for at most `ms`. */
+async function eventually(fn, ms = 5000) {
+  const end = Date.now() + ms;
+  while (!fn()) {
+    if (Date.now() > end) throw new Error('Timed out waiting for a condition');
+    await new Promise(r => setTimeout(r, 10));
+  }
+}
 /** A store that records every 'agents' emission. */
 function recording() {
   const s = new Store();
@@ -389,15 +397,17 @@ test('the event log appends JSONL and never throws on write errors', async () =>
   const s = new Store({ logPath: file });
   s.apply([created('r1'), state('r1', 'working')]);
   s.close();
-  await new Promise(r => setTimeout(r, 50));
-  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  // The stream writes in the background: wait for it (a fixed pause was too short while the whole suite runs).
+  const written = () => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+  await eventually(() => written().endsWith('\n') && written().trim().split('\n').length >= 2);
+  const lines = written().trim().split('\n').map(l => JSON.parse(l));
   assert.deepEqual(lines.map(l => l.kind), ['agent.created', 'agent.state']);
 
   // A path that cannot be written: a directory where the file should be.
   const warnings = [];
   const bad = new Store({ logPath: TMP, log: { warn: (m) => warnings.push(m) } });
   bad.apply(created('r2'));
-  await new Promise(r => setTimeout(r, 50));
+  await eventually(() => warnings.length >= 1);
   bad.apply(state('r2', 'working'));
   assert.equal(bad.get('r2').state, 'working', 'the store keeps working');
   assert.ok(warnings.length >= 1);
@@ -515,4 +525,55 @@ test('a view has fullName: the event\'s whole description, or the name itself', 
   assert.equal(s.get('f1').fullName, 'Repository exploration and architecture mapping');
   assert.equal(s.get('f1').name, 'Repository exploration');
   assert.equal(s.get('f2').fullName, 'Fix login');
+});
+
+// ------------------------------------------------------------------ source control
+
+test('agent.work replaces a root’s work as a whole, keeps only its own fields, and is ignored for a helper', () => {
+  const { s, emitted } = recording();
+  s.apply([created('r1'), created('h1', { parentId: 'r1', name: 'Find tests' })]);
+  assert.equal(s.get('r1').work, null, 'no work before it has a folder');
+  assert.equal(s.get('h1').work, null);
+  emitted.length = 0;
+  s.apply({ kind: EV.WORK, ts: T0 + 1000, agentId: 'r1', work: { branch: 'workbench/fix-login-r1', from: 'main', folder: true, merged: null, problem: null, thrownAway: null, token: 'SECRET' } });
+  assert.deepEqual(s.get('r1').work, { branch: 'workbench/fix-login-r1', from: 'main', folder: true, merged: null, problem: null, thrownAway: null });
+  assert.deepEqual(emitted, [['r1']]);
+  // As a whole: what the next one leaves out is gone, and what it holds is a copy.
+  const problem = { why: 'conflict', sentence: 'Fix login’s work does not merge cleanly into main.', paths: ['a.js'], at: T0 + 2000 };
+  s.apply({ kind: EV.WORK, ts: T0 + 2000, agentId: 'r1', work: { branch: 'workbench/fix-login-r1', problem } });
+  assert.deepEqual(s.get('r1').work, { branch: 'workbench/fix-login-r1', from: null, folder: false, merged: null, problem, thrownAway: null });
+  problem.paths.push('b.js');
+  assert.deepEqual(s.get('r1').work.problem.paths, ['a.js']);
+  // Odd parts are dropped rather than kept.
+  s.apply({ kind: EV.WORK, ts: T0 + 3000, agentId: 'r1', work: { branch: 7, from: '', folder: 'yes', merged: ['x'], problem: 'conflict', thrownAway: { at: 1, saved: 'refs/workbench/discarded/r1' } } });
+  assert.deepEqual(s.get('r1').work, { branch: null, from: null, folder: false, merged: null, problem: null, thrownAway: { at: 1, saved: 'refs/workbench/discarded/r1' } });
+  s.apply({ kind: EV.WORK, ts: T0 + 4000, agentId: 'r1', work: null });
+  assert.equal(s.get('r1').work, null);
+  // A helper works in its agent's folder: what becomes of the work is the agent's.
+  emitted.length = 0;
+  s.apply({ kind: EV.WORK, ts: T0 + 5000, agentId: 'h1', work: { branch: 'workbench/x', folder: true } });
+  assert.equal(s.get('h1').work, null);
+  assert.deepEqual(emitted, []);
+  // A new turn clears the last receipt, never what became of the work.
+  s.apply({ kind: EV.WORK, ts: T0 + 6000, agentId: 'r1', work: { branch: 'workbench/fix-login-r1', from: 'main', folder: true, merged: { into: 'main', merge: 'ab'.repeat(20), at: 1, files: 1, adds: 2, dels: 0 } } });
+  s.apply({ kind: EV.TURN, ts: T0 + 7000, agentId: 'r1', phase: 'start' });
+  assert.equal(s.get('r1').work.merged.into, 'main');
+});
+
+test('restore puts the work back from history; repoChanged tells listeners about the person’s repository', () => {
+  const s = new Store();
+  const work = { branch: 'workbench/fix-login-e1', from: 'main', folder: true, merged: { into: 'main', merge: 'ab'.repeat(20), at: 5, files: 3, adds: 40, dels: 2 }, problem: null, thrownAway: null };
+  const v = s.restore({ id: 'e1', name: 'Fix login', task: 't', harness: 'claude', state: 'done_claimed', startedAt: T0, endedAt: T0 + 1, approvals: {}, usage: {}, work }, { ok: true });
+  assert.deepEqual(v.work, work);
+  work.merged.files = 99;
+  assert.equal(s.get('e1').work.merged.files, 3, 'a copy');
+  assert.equal(s.restore({ id: 'e2', name: 'Old', task: 't', harness: 'claude', state: 'stopped', approvals: {}, usage: {} }, { ok: false }).work, null);
+  const seen = [];
+  s.on('repo', r => seen.push(r));
+  const repo = { name: 'shop', head: 'ab'.repeat(20), branch: 'main', dirty: 0, identity: true };
+  s.repoChanged(repo);
+  repo.dirty = 5;
+  assert.deepEqual(seen, [{ name: 'shop', head: 'ab'.repeat(20), branch: 'main', dirty: 0, identity: true }], 'a copy');
+  s.repoChanged(null);
+  assert.equal(seen.at(-1), null);
 });

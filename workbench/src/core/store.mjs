@@ -5,6 +5,8 @@
 //   'agents'   (ids: string[])     views that changed, deduped per apply() or tick()
 //   'machines' (machines: Machine[]) machines that changed in one apply()
 //   'notice'   ({ text })          a short reply from the workbench to the person
+//   'removed'  (ids: string[])     roots taken out of the store (an earlier agent the person forgot)
+//   'repo'     (repo)              the person's repository changed: { name, head, branch, dirty, identity } (repoChanged)
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -50,6 +52,23 @@ function splitOf(b) {
 function copy(value) {
   if (value == null || typeof value !== 'object') return value ?? null;
   try { return structuredClone(value); } catch { return JSON.parse(JSON.stringify(value)); }
+}
+
+/**
+ * An agent.work payload as AgentView.work keeps it: its known fields only, copied. agent.work replaces the whole of it,
+ * so a payload that leaves a field out has none: { branch, from, folder, merged, problem, thrownAway }.
+ */
+function workOf(w) {
+  if (!w || typeof w !== 'object') return null;
+  const part = (x) => (x && typeof x === 'object' && !Array.isArray(x) ? copy(x) : null);
+  return {
+    branch: typeof w.branch === 'string' && w.branch ? w.branch : null,
+    from: typeof w.from === 'string' && w.from ? w.from : null,
+    folder: w.folder === true,
+    merged: part(w.merged),
+    problem: part(w.problem),
+    thrownAway: part(w.thrownAway),
+  };
 }
 
 /** End of the 30 s grid bucket that contains ts, so every agent's sparkline lines up. */
@@ -354,6 +373,11 @@ export class Store extends EventEmitter {
         v.sessionId = ev.sessionId ?? null;
         this._started(v, ev.ts, batch, index, changed);
         break;
+      case EV.WORK:
+        // A helper works in its agent's folder: what becomes of the work is the agent's.
+        if (v.parentId) return;
+        v.work = workOf(ev.work);
+        break;
       case EV.RESUMED:
         v.earlier = false;
         v.canContinue = null;
@@ -424,6 +448,7 @@ export class Store extends EventEmitter {
     v.earlier = true;
     v.canContinue = !!can?.ok;
     v.continueReason = can?.ok ? null : (can?.reason || null);
+    v.work = workOf(rec.work);
     this._views.set(v.id, v);
     this._meta.set(v.id, { seq: ++this._seq, openTools: new Map(), backgroundTasks: 0, background: null, waitedForHelpers: false });
     this.emit('agents', [v.id]);
@@ -437,6 +462,14 @@ export class Store extends EventEmitter {
     v.canContinue = !!can?.ok;
     v.continueReason = can?.ok ? null : (can?.reason || null);
     this.emit('agents', [id]);
+  }
+
+  /**
+   * The person's repository changed (a merge moved their branch, or a refresh found a new head, branch, number of
+   * uncommitted changes or git identity): tell listeners. The server sends it to every page as `event: repo`.
+   */
+  repoChanged(repo) {
+    this.emit('repo', repo && typeof repo === 'object' ? copy(repo) : null);
   }
 
   /** Take a root, and any helpers, out of the store (an earlier agent the person forgot). */

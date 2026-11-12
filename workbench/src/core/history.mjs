@@ -32,6 +32,35 @@ const num = (x, d = 0) => (Number.isFinite(x) ? x : d);
 const numOrNull = (x) => (Number.isFinite(x) ? x : null);
 const str = (x, max = 200) => (typeof x === 'string' && x ? x.slice(0, max) : null);
 
+/** A commit id: 40 hex characters (SHA-1) or 64 (SHA-256), else null. */
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const sha = (x) => (typeof x === 'string' && SHA_RE.test(x) ? x : null);
+
+/**
+ * A branch name git takes as it is, else null. It keeps to the rule of workspace.mjs's validRef (letters, digits and
+ * ._/@^~{}+-, no leading "-", no "..") and to git's own rules for branch names: parts joined by single "/", none empty
+ * or starting with ".", none ending in ".lock", nothing ending in "." or "/", no "@{", "^", "~", "{" or "}".
+ */
+export function branchName(x) {
+  if (typeof x !== 'string' || !x || x.length > 200) return null;
+  if (x.startsWith('-') || x.includes('..') || x.endsWith('.')) return null;
+  if (!/^[A-Za-z0-9._+-]+(?:\/[A-Za-z0-9._+-]+)*$/.test(x)) return null;
+  if (x.split('/').some(p => p.startsWith('.') || p.endsWith('.lock'))) return null;
+  return x;
+}
+
+/** An agent's own branch: a branch name that starts with "workbench/", else null. */
+export function agentBranch(x) {
+  const b = branchName(x);
+  return b && b.startsWith('workbench/') ? b : null;
+}
+
+/** Where a throw-away keeps its hidden copy: refs/workbench/discarded/<agent id>. */
+const SAVED_RE = /^refs\/workbench\/discarded\/[A-Za-z0-9_-]{1,80}$/;
+/** Why a merge did not go through, as AgentView.work.problem keeps it. */
+const PROBLEM_WHYS = new Set(['conflict', 'blocked', 'ancestry', 'moved', 'identity', 'detached', 'busy', 'git']);
+const PATHS_MAX = 20;
+
 function cleanFiles(f) {
   if (!f || typeof f !== 'object') return null;
   const list = (Array.isArray(f.list) ? f.list : []).slice(0, FILES_MAX).map((x) => {
@@ -73,14 +102,48 @@ function cleanUsage(u) {
   };
 }
 
+/**
+ * An agent's folder and git places, field by field: { path, branch, base, since, from }. base and since are commit ids
+ * (since: where its unmerged work starts, its last merged work commit once it has been merged); branch is its own
+ * workbench/ branch; from is the person's branch when it started.
+ */
 function cleanWorkspace(w) {
   if (!w || typeof w !== 'object' || typeof w.path !== 'string' || !path.isAbsolute(w.path)) return null;
-  return { path: w.path, branch: str(w.branch), base: str(w.base) };
+  if (w.path.length > 4096 || w.path.includes('\0')) return null;
+  return { path: w.path, branch: agentBranch(w.branch), base: sha(w.base), since: sha(w.since), from: branchName(w.from) };
+}
+
+/** What became of an agent's work in git (AgentView.work), field by field. */
+function cleanWork(w) {
+  if (!w || typeof w !== 'object') return null;
+  const m = w.merged && typeof w.merged === 'object' ? w.merged : null;
+  const p = w.problem && typeof w.problem === 'object' ? w.problem : null;
+  const t = w.thrownAway && typeof w.thrownAway === 'object' ? w.thrownAway : null;
+  const merged = m && sha(m.merge)
+    ? { into: branchName(m.into), merge: m.merge, at: num(m.at), files: num(m.files), adds: num(m.adds), dels: num(m.dels) }
+    : null;
+  const problem = p && PROBLEM_WHYS.has(p.why)
+    ? {
+      why: p.why,
+      sentence: str(p.sentence, 600) || '',
+      paths: (Array.isArray(p.paths) ? p.paths : []).filter(x => typeof x === 'string' && x).slice(0, PATHS_MAX).map(x => x.slice(0, 500)),
+      at: num(p.at),
+    }
+    : null;
+  const thrownAway = t ? { at: num(t.at), saved: typeof t.saved === 'string' && SAVED_RE.test(t.saved) ? t.saved : null } : null;
+  return {
+    branch: thrownAway ? null : agentBranch(w.branch),
+    from: branchName(w.from),
+    folder: !thrownAway && w.folder === true,
+    merged,
+    problem,
+    thrownAway,
+  };
 }
 
 /**
- * The record of one root agent, from its view and its workspace ({ path, branch, base }; null: its folder is gone;
- * left out: only the view's folder path is known). Returns null for anything
+ * The record of one root agent, from its view and its workspace ({ path, branch, base, since, from }; null: its folder
+ * is gone; left out: only the view's folder path is known). Returns null for anything
  * that is not a root Claude Code or Codex agent worth remembering.
  */
 export function recordOf(view, workspace = undefined, savedAt = Date.now()) {
@@ -108,6 +171,7 @@ export function recordOf(view, workspace = undefined, savedAt = Date.now()) {
     sessionId: str(view.sessionId),
     // `workspace` null means its folder was removed; undefined means ask the view
     workspace: workspace === undefined ? (view.workspace ? cleanWorkspace({ path: view.workspace }) : null) : cleanWorkspace(workspace),
+    work: cleanWork(view.work),
     budgetUsd: numOrNull(view.budgetUsd),
     turns: num(view.turns),
     toolCalls: num(view.toolCalls),
@@ -124,7 +188,7 @@ export function cleanRecord(raw) {
     id: raw.id, parentId: null, name: raw.name, task: raw.task, harness: raw.harness, model: raw.model, machineId: raw.machineId,
     startedAt: raw.startedAt, endedAt: raw.endedAt, state: raw.state, stateReason: raw.stateReason, says: raw.says,
     files: raw.files, checks: raw.checks, rules: raw.rules, approvals: raw.approvals, usage: raw.usage,
-    sessionId: raw.sessionId, budgetUsd: raw.budgetUsd, turns: raw.turns || 1, toolCalls: raw.toolCalls,
+    sessionId: raw.sessionId, budgetUsd: raw.budgetUsd, turns: raw.turns || 1, toolCalls: raw.toolCalls, work: raw.work,
   }, raw.workspace, savedAt);
   if (!rec) return null;
   // Whatever was still going when the file was written is not going now.

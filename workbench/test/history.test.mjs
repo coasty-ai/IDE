@@ -9,10 +9,12 @@ import { Store } from '../src/core/store.mjs';
 import { EV, newAgentView } from '../src/shared/events.mjs';
 import * as historyMod from '../src/core/history.mjs';
 import * as commands from '../src/core/commands.mjs';
-import { FakeMachines, fakeAdapter, fakeDeps, until } from './helpers/engine-fakes.mjs';
+import { FakeMachines, fakeAdapter, fakeDeps, gate, until, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
 
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${id}` };
 const SESSION = '0f8fad5b-d9cb-469f-a165-70867728950e';
+// The commit an agent starts from. A record keeps only real commit ids (40 or 64 hex characters).
+const BASE = 'c0ffee'.repeat(6) + 'c0ff';
 
 function tmp(t, label = 'wb-history-') {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), label)));
@@ -27,23 +29,31 @@ function world(t, dir, { adapters = null, options = {}, workspaceKept = true } =
   const store = new Store();
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
-  const { deps, calls } = fakeDeps();
+  const { deps, calls, git } = fakeDeps();
+  git.head = BASE;
+  git.dirty = 0;
   deps.history = historyMod;
   deps.commands = commands;
   deps.workspace.createWorkspace = async (o) => {
+    calls.createWorkspace.push(o);
     const p = path.join(dir, 'wt', `${o.slug}-${o.agentId}`);
     fs.mkdirSync(p, { recursive: true });
     fs.writeFileSync(path.join(p, '.git'), 'gitdir: elsewhere\n');
-    return { path: p, branch: `workbench/${o.slug}-${o.agentId}`, base: 'abc1234' };
+    return { path: p, branch: `workbench/${o.slug}-${o.agentId}`, base: BASE };
   };
-  deps.workspace.removeWorkspace = async () => ({ removed: !workspaceKept });
+  deps.workspace.removeWorkspace = async (o) => { calls.removeWorkspace.push(o); return { removed: !workspaceKept }; };
+  deps.workspace.discardWork = async (o) => {
+    calls.discardWork.push(o);
+    fs.rmSync(o.path, { recursive: true, force: true });
+    return { ok: true, saved: `refs/workbench/discarded/${o.agentId}` };
+  };
   const engine = new Engine({
-    store, mode: 'live', repo: { root: repoRoot, name: 'shop', head: 'abc1234', branch: 'main', dirty: 0 }, hook: HOOK,
+    store, mode: 'live', repo: { root: repoRoot, name: 'shop', head: BASE, branch: 'main', dirty: 0 }, hook: HOOK,
     defaultBudgetUsd: 2, adapters: adapters || { claude, codex }, machines: new FakeMachines(), deps,
     options: { tickMs: 10_000_000, permissionTimeoutMs: 5000, historyDir: path.join(dir, 'history'), historyDebounceMs: 15, exitGraceMs: 20, ...options },
   });
   t.after(() => engine.shutdown());
-  return { store, engine, claude, codex, calls, deps, repoRoot, historyDir: path.join(dir, 'history') };
+  return { store, engine, claude, codex, calls, deps, git, repoRoot, historyDir: path.join(dir, 'history') };
 }
 
 /** Run one agent to "says it is done", with a session id. */
@@ -91,12 +101,14 @@ test('a record is built field by field: nothing outside the list gets in, and no
     hookToken: 'SECRET-HOOK', token: 'SECRET-PAGE', env: { WORKBENCH_HOOK_TOKEN: 'SECRET-ENV' },
     checks: { state: 'failed', results: [{ name: 'tests', ok: false, ms: 5, tail: 'SECRET-IN-CHECK-OUTPUT' }] },
   };
-  const rec = historyMod.recordOf(view, { path: '/w/x', branch: 'workbench/fix-abc123', base: 'deadbeef', token: 'SECRET-WS' }, 5000);
+  const rec = historyMod.recordOf(view, { path: '/w/x', branch: 'workbench/fix-abc123', base: BASE, since: BASE, from: 'main', token: 'SECRET-WS' }, 5000);
   const text = JSON.stringify(rec);
   assert.ok(!text.includes('SECRET'), text);
+  // Pinned on purpose: `work` was added with source control. A new field must be added here, and to cleanRecord.
   assert.deepEqual(Object.keys(rec).sort(), ['approvals', 'budgetUsd', 'checks', 'endedAt', 'files', 'harness', 'id', 'machineId', 'model',
-    'name', 'rules', 'savedAt', 'says', 'sessionId', 'startedAt', 'state', 'stateReason', 'task', 'toolCalls', 'turns', 'usage', 'workspace']);
-  assert.deepEqual(rec.workspace, { path: '/w/x', branch: 'workbench/fix-abc123', base: 'deadbeef' });
+    'name', 'rules', 'savedAt', 'says', 'sessionId', 'startedAt', 'state', 'stateReason', 'task', 'toolCalls', 'turns', 'usage', 'work', 'workspace']);
+  assert.deepEqual(rec.workspace, { path: '/w/x', branch: 'workbench/fix-abc123', base: BASE, since: BASE, from: 'main' });
+  assert.equal(rec.work, null, 'a view without work keeps none');
   assert.deepEqual(rec.checks.results, [{ name: 'tests', ok: false, ms: 5 }]);
 });
 
@@ -357,7 +369,7 @@ test('a message to an earlier agent resumes its session in the same folder, with
   runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Both are fixed.', backgroundTasks: 0 });
   await until(() => second.store.get(id).state === 'done_claimed');
   assert.equal(second.calls.diffStats.at(-1).path, rec.workspace.path);
-  assert.equal(second.calls.diffStats.at(-1).base, 'abc1234');
+  assert.equal(second.calls.diffStats.at(-1).base, BASE, 'what is not merged yet: since the commit it started from (it was never merged)');
 });
 
 test('the Continue button’s message, and the words "continue <name>", pick it up', async (t) => {
@@ -514,6 +526,281 @@ test('a typed yes settles the forget card; an agent from this run cannot be forg
   const typed = await second.engine.command('do it', { confirmId: ask2.confirm.id });
   assert.match(typed.reply, /^Forgot /);
   assert.equal(second.store.get(id), null);
+});
+
+// ------------------------------------------------------------------ source control
+
+test('a record keeps where the work starts (since), the branch it came from and what became of its work, field by field', () => {
+  const W = 'cd'.repeat(32); // a SHA-256 commit id is kept too
+  const view = {
+    ...newAgentView({ agentId: 'w1', name: 'Merge command', task: 'add a merge command', harness: 'claude' }), state: 'done_claimed', turns: 1,
+    work: {
+      branch: 'workbench/merge-command-w1', from: 'main', folder: true, secret: 'SECRET-WORK',
+      merged: { into: 'main', merge: 'ab'.repeat(20), at: 5, files: 3, adds: 40, dels: 2, extra: 'SECRET-MERGED' }, problem: null, thrownAway: null,
+    },
+  };
+  const rec = historyMod.recordOf(view, { path: '/w/w1', branch: 'workbench/merge-command-w1', base: BASE, since: W, from: 'main' }, 9);
+  assert.ok(!JSON.stringify(rec).includes('SECRET'));
+  assert.deepEqual(rec.workspace, { path: '/w/w1', branch: 'workbench/merge-command-w1', base: BASE, since: W, from: 'main' });
+  assert.deepEqual(rec.work, {
+    branch: 'workbench/merge-command-w1', from: 'main', folder: true,
+    merged: { into: 'main', merge: 'ab'.repeat(20), at: 5, files: 3, adds: 40, dels: 2 }, problem: null, thrownAway: null,
+  });
+  // A merge that did not go through keeps its words and paths; a thrown-away agent has no branch and no folder.
+  const problem = { why: 'blocked', sentence: 'Your own changes are in the way: a.js. Commit or put them aside, then merge again.', paths: ['a.js', 42, ''], at: 7 };
+  assert.deepEqual(historyMod.recordOf({ ...view, work: { ...view.work, merged: null, problem } }, null, 9).work.problem,
+    { why: 'blocked', sentence: problem.sentence, paths: ['a.js'], at: 7 });
+  const thrown = historyMod.recordOf({ ...view, work: { ...view.work, folder: true, thrownAway: { at: 8, saved: 'refs/workbench/discarded/w1' } } }, null, 9);
+  assert.equal(thrown.workspace, null);
+  assert.deepEqual(thrown.work, { branch: null, from: 'main', folder: false, merged: { into: 'main', merge: 'ab'.repeat(20), at: 5, files: 3, adds: 40, dels: 2 }, problem: null, thrownAway: { at: 8, saved: 'refs/workbench/discarded/w1' } });
+});
+
+test('what is loaded is cleaned: commit ids are full ids, an agent’s branch starts with workbench/, any branch must be a name git takes', () => {
+  const raw = {
+    id: 'w2', name: 'Diff viewer', task: 'show diffs', harness: 'claude', state: 'done_claimed', turns: 1, startedAt: 1, savedAt: 2,
+    workspace: { path: '/w/w2', branch: 'main', base: 'abc1234', since: 'zz'.repeat(20), from: '-rf' },
+  };
+  assert.deepEqual(historyMod.cleanRecord(raw).workspace, { path: '/w/w2', branch: null, base: null, since: null, from: null });
+  assert.equal(historyMod.cleanRecord({ ...raw, workspace: { path: 'relative/w2', branch: 'workbench/w2' } }).workspace, null);
+  assert.equal(historyMod.cleanRecord({ ...raw, workspace: { path: '/w/\0w2', branch: 'workbench/w2' } }).workspace, null);
+  for (const bad of ['feature/x', 'workbench/../x', 'workbench/x.lock', 'workbench/.x', 'workbench//x', 'workbench/x/', 'workbench/x y',
+    'workbench/x~1', 'workbench/x^', 'workbench/@{x}', '-workbench/x', 'workbench/x.', '', 'workbench/' + 'x'.repeat(200), 42]) {
+    assert.equal(historyMod.agentBranch(bad), null, String(bad));
+  }
+  assert.equal(historyMod.agentBranch('workbench/merge-command-a1b2c3'), 'workbench/merge-command-a1b2c3');
+  assert.equal(historyMod.branchName('feature/login-fix'), 'feature/login-fix');
+  assert.equal(historyMod.branchName('release-2.1'), 'release-2.1');
+  assert.equal(historyMod.branchName('main..evil'), null);
+  // Work: an unknown reason, a merge that names no commit, a hidden copy anywhere but refs/workbench/discarded/<id>.
+  const w = historyMod.cleanRecord({
+    ...raw, workspace: null,
+    work: { branch: 'workbench/w2', from: 'main', folder: 'yes', merged: { into: 'main', merge: 'nope' }, problem: { why: 'weird', sentence: 'x' }, thrownAway: { at: 3, saved: 'refs/heads/main' } },
+  }).work;
+  assert.deepEqual(w, { branch: null, from: 'main', folder: false, merged: null, problem: null, thrownAway: { at: 3, saved: null } });
+  assert.equal(historyMod.cleanRecord({ ...raw, work: 'merged' }).work, null);
+});
+
+test('a thrown-away agent comes back thrown away: no folder, it cannot continue, and it has no branch on the git screen', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  const card = await first.engine.proposeDiscard(id);
+  assert.ok(card.confirm, card.reply);
+  assert.equal((await first.engine.confirm(card.confirm.id, true)).reply, 'Threw away Fix login redirect’s work. Its folder and branch are gone.');
+  // Saved at once, before any shutdown.
+  let rec = readFile(first).agents[0];
+  assert.equal(rec.workspace, null);
+  assert.deepEqual(rec.work, { branch: null, from: 'main', folder: false, merged: null, problem: null, thrownAway: { at: rec.work.thrownAway.at, saved: `refs/workbench/discarded/${id}` } });
+  await first.engine.shutdown();
+  rec = readFile(first).agents[0];
+  assert.equal(rec.workspace, null, 'the shutdown does not bring its folder back');
+
+  const second = world(t, dir);
+  await second.engine.start();
+  const v = second.store.get(id);
+  assert.equal(v.earlier, true);
+  assert.equal(v.canContinue, false);
+  assert.equal(v.continueReason, 'Its work was thrown away, so it cannot continue.');
+  assert.deepEqual(v.work, rec.work);
+  assert.deepEqual(await second.engine.say(id, 'carry on'), { ok: false, reply: 'Fix login redirect cannot continue. Its work was thrown away, so it cannot continue.' });
+  assert.deepEqual(await second.engine.proposeMerge(id), { ok: false, reply: 'Fix login redirect’s work was thrown away, so there is nothing to merge.' });
+  assert.deepEqual((await second.engine.gitGraph()).agents, []);
+  assert.equal(second.claude.runners.length, 0);
+});
+
+test('a merge in this run is in the record at once, and after a restart its work still counts from the merged work commit', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  const card = await first.engine.proposeMerge(id);
+  assert.equal((await first.engine.confirm(card.confirm.id, true)).reply, 'Merged Fix login redirect into main.');
+  const rec = readFile(first).agents[0];
+  assert.deepEqual({ since: rec.workspace.since, base: rec.workspace.base, from: rec.workspace.from }, { since: FAKE_WORK, base: BASE, from: 'main' });
+  assert.deepEqual({ ...rec.work, merged: { ...rec.work.merged, at: 0 } }, {
+    branch: `workbench/fix-login-redirect-${id}`, from: 'main', folder: true,
+    merged: { into: 'main', merge: FAKE_MERGE, at: 0, files: 1, adds: 3, dels: 1 }, problem: null, thrownAway: null,
+  });
+  await first.engine.shutdown();
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.equal(second.store.get(id).work.merged.merge, FAKE_MERGE);
+  assert.deepEqual((await second.engine.gitGraph()).agents.map(a => [a.id, a.since]), [[id, FAKE_WORK]]);
+});
+
+test('an earlier agent can be merged: it stays an earlier agent, and its record counts its work from the merged work commit', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.deepEqual((await second.engine.gitGraph()).agents.map(a => [a.id, a.earlier, a.base, a.since]), [[id, true, BASE, BASE]]);
+  const card = await second.engine.proposeMerge(id, { state: 'done_claimed' });
+  assert.ok(card.confirm, card.reply);
+  assert.equal((await second.engine.confirm(card.confirm.id, true)).reply, 'Merged Fix login redirect into main.');
+  assert.equal(second.calls.mergeWork[0].since, BASE);
+  const v = second.store.get(id);
+  assert.equal(v.earlier, true, 'it stays an earlier agent: nothing was started');
+  assert.equal(v.work.merged.merge, FAKE_MERGE);
+  assert.equal(second.claude.runners.length, 0);
+  // Saved at once: the record counts its work from the merged work commit.
+  const rec = readFile(second).agents.find(r => r.id === id);
+  assert.equal(rec.workspace.since, FAKE_WORK);
+  assert.equal(rec.workspace.base, BASE);
+  assert.equal(rec.work.merged.merge, FAKE_MERGE);
+  assert.deepEqual(rec.files, { changed: 0, adds: 0, dels: 0, list: [] });
+  await second.engine.shutdown();
+
+  // Next time it is still merged, and a message picks it up with its unmerged work counted from there.
+  const third = world(t, dir);
+  await third.engine.start();
+  assert.equal(third.store.get(id).work.merged.merge, FAKE_MERGE);
+  assert.equal((await third.engine.say(id, 'and the docs')).ok, true);
+  const runner = third.claude.runners.at(-1);
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Docs too.', backgroundTasks: 0 });
+  await until(() => third.store.get(id).state === 'done_claimed');
+  assert.equal(third.calls.diffStats.at(-1).base, FAKE_WORK);
+});
+
+test('an earlier agent can be thrown away: its record keeps no folder, and its view stays, thrown away', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const folder = readFile(first).agents[0].workspace.path;
+  const second = world(t, dir);
+  await second.engine.start();
+  const card = await second.engine.proposeDiscard(id, { state: 'done_claimed' });
+  assert.ok(card.confirm, card.reply);
+  assert.equal((await second.engine.confirm(card.confirm.id, true)).reply, 'Threw away Fix login redirect’s work. Its folder and branch are gone.');
+  assert.deepEqual(second.calls.discardWork.map(c => [c.path, c.branch, c.since]), [[folder, `workbench/fix-login-redirect-${id}`, BASE]]);
+  assert.equal(fs.existsSync(folder), false);
+  const v = second.store.get(id);
+  assert.equal(v.earlier, true);
+  assert.equal(v.canContinue, false);
+  assert.equal(v.continueReason, 'Its work was thrown away, so it cannot continue.');
+  const rec = readFile(second).agents.find(r => r.id === id);
+  assert.equal(rec.workspace, null);
+  assert.equal(rec.work.thrownAway.saved, `refs/workbench/discarded/${id}`);
+  // Forgetting it now promises nothing about a folder it no longer has.
+  const forget = await second.engine.command('forget it', { focusId: id });
+  assert.equal(forget.confirm.detail, 'It will not show here again.');
+  assert.equal((await second.engine.confirm(forget.confirm.id, true)).reply, 'Forgot Fix login redirect.');
+  assert.equal(second.store.get(id), null);
+  await second.engine.shutdown();
+  assert.deepEqual(readFile(second).agents, [], 'and it does not come back');
+});
+
+test('an earlier agent whose work is being merged cannot be continued or forgotten meanwhile', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const second = world(t, dir);
+  await second.engine.start();
+  const g = gate();
+  second.git.mergeGate = g;
+  const card = await second.engine.proposeMerge(id);
+  const yes = second.engine.confirm(card.confirm.id, true);
+  await until(() => second.calls.mergeWork.length === 1);
+  assert.deepEqual(await second.engine.say(id, 'carry on'), { ok: false, reply: 'Fix login redirect is being merged now.' });
+  const forget = await second.engine.command('forget it', { focusId: id });
+  assert.ok(forget.confirm, forget.reply);
+  assert.equal((await second.engine.confirm(forget.confirm.id, true)).reply, 'Fix login redirect is being merged now.');
+  assert.ok(second.store.get(id), 'it is still there');
+  g.open();
+  assert.equal((await yes).reply, 'Merged Fix login redirect into main.');
+  assert.equal(second.claude.runners.length, 0, 'nothing was started');
+  assert.ok(readFile(second).agents.some(r => r.id === id));
+});
+
+test('a record written before source control (no since, from or work) still loads: its branch shows, and its work counts from where it started', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  // The file as an older Workbench wrote it.
+  const file = historyMod.historyFile(first.repoRoot, { dir: first.historyDir });
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  for (const r of data.agents) {
+    delete r.work;
+    r.workspace = { path: r.workspace.path, branch: r.workspace.branch, base: r.workspace.base };
+  }
+  fs.writeFileSync(file, JSON.stringify(data));
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.deepEqual(second.store.get(id).work, { branch: `workbench/fix-login-redirect-${id}`, from: null, folder: true, merged: null, problem: null, thrownAway: null });
+  assert.deepEqual((await second.engine.gitGraph()).agents.map(a => [a.id, a.since, a.from]), [[id, BASE, null]]);
+  const card = await second.engine.proposeMerge(id);
+  assert.ok(card.confirm, card.reply);
+  assert.equal(second.calls.snapshotWork.at(-1).since, BASE);
+});
+
+test('a record that does not say where its work started, or which branch is its own, is refused plainly rather than guessed', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const file = historyMod.historyFile(first.repoRoot, { dir: first.historyDir });
+  const rewrite = (fn) => {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const r of data.agents) fn(r);
+    fs.writeFileSync(file, JSON.stringify(data));
+  };
+  // A commit id that is not a full one is dropped when loaded: where its work starts is not known.
+  rewrite((r) => { r.workspace.base = 'abc1234'; r.workspace.since = 'abc1234'; });
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.deepEqual(await second.engine.changes(id), { ok: false, reply: 'Workbench does not know which commit Fix login redirect started from, so it cannot show its changes.' });
+  assert.deepEqual(await second.engine.proposeMerge(id), { ok: false, reply: 'Workbench does not know which commit Fix login redirect started from, so it cannot merge its work.' });
+  assert.deepEqual(await second.engine.proposeDiscard(id), { ok: false, reply: 'Workbench does not know which commit Fix login redirect started from, so it cannot throw its work away.' });
+  assert.equal(second.calls.snapshotWork.length + second.calls.workDiff.length, 0, 'git was not asked to guess');
+  await second.engine.shutdown();
+  // A branch that is not one Workbench makes is dropped too: its work is not thrown away by guesswork.
+  rewrite((r) => { r.workspace.base = BASE; r.workspace.since = BASE; r.workspace.branch = 'feature/login'; });
+  const third = world(t, dir);
+  await third.engine.start();
+  assert.deepEqual(await third.engine.proposeDiscard(id), { ok: false, reply: 'Workbench does not know Fix login redirect’s branch, so it cannot throw its work away.' });
+  assert.equal(third.calls.discardWork.length, 0);
+});
+
+test('the earlier spend is added only when the resumed Claude Code does not restore it itself: 2.1.277 and newer do', async (t) => {
+  // [the version its session line reports, harness, is the earlier spend added?]
+  const cases = [
+    ['2.1.277', 'claude', false],
+    ['2.1.322', 'claude', false],
+    ['2.2.0', 'claude', false],
+    ['3.0.1 (Claude Code)', 'claude', false],
+    ['2.1.276', 'claude', true],
+    ['1.9.999', 'claude', true],
+    [null, 'claude', true], // not known: as before
+    ['not a version', 'claude', true],
+    [null, 'codex', true],
+  ];
+  for (const [version, harness, added] of cases) {
+    const dir = tmp(t);
+    const first = world(t, dir);
+    const { id } = await finishOne(first, harness === 'codex' ? { harness: 'codex', sessionId: 'thread-123' } : {});
+    await first.engine.shutdown();
+    const second = world(t, dir);
+    await second.engine.start();
+    assert.equal((await second.engine.say(id, 'more')).ok, true);
+    const runner = second[harness].runners.at(-1);
+    runner.emit({ kind: EV.SESSION, sessionId: harness === 'codex' ? 'thread-123' : SESSION, ...(version ? { version } : {}) });
+    // The new process's own totals: the same numbers either way, so only the engine's addition differs.
+    runner.emit({ kind: EV.USAGE, mode: 'set', inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0.1 });
+    const u = second.store.get(id).usage;
+    const label = `${harness} ${version}`;
+    if (added) {
+      assert.deepEqual([u.inputTokens, u.outputTokens], [110, 55], label);
+      assert.ok(Math.abs(u.costUsd - 0.41) < 1e-9, `${label}: ${u.costUsd}`);
+    } else {
+      assert.deepEqual([u.inputTokens, u.outputTokens], [10, 5], label);
+      assert.ok(Math.abs(u.costUsd - 0.1) < 1e-9, `${label}: ${u.costUsd}`);
+    }
+    await second.engine.shutdown();
+  }
 });
 
 // ------------------------------------------------------------------ words

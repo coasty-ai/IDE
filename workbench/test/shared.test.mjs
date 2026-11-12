@@ -362,3 +362,10 @@ test('nameFromTask never cuts a word in half or ends on an ellipsis when whole w
   // One word longer than the limit is the only thing that is cut.
   assert.match(nameFromTask('Internationalization-and-localization-configuration'), /…$/);
 });
+
+test('agent.work is an event of its own, and a new view has no work until a root has a folder', () => {
+  assert.equal(EV.WORK, 'agent.work');
+  assert.equal(new Set(Object.values(EV)).size, Object.values(EV).length, 'every event kind is its own');
+  assert.equal(newAgentView({ agentId: 'abc123', name: 'X', harness: 'claude' }, 1000).work, null);
+  assert.equal(newAgentView({ agentId: 'abc123-h1', parentId: 'abc123', name: 'Y', harness: 'claude' }, 1000).work, null);
+});
