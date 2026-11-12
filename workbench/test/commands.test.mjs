@@ -1029,6 +1029,36 @@ test('"into main" and "into my branch": a branch named is carried, so the engine
   assert.deepEqual(parseCommand('merge it into the wizard', { ...CTX.pendingMerge, repo: { branch: 'wizard' } }), unknown('merge it into the wizard'));
 });
 
+test('"merge it in to main" and "bring it over to main": the particle, then where it goes', () => {
+  checkRows([
+    ['merge it in to main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it in to the main branch', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it over to main', 'invoice', merge('1a2b3c', 'main')],
+    ['land it in to main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge in to main', 'invoice', merge('1a2b3c', 'main')], // "into", heard as two words
+    ['bring its changes in to main', 'invoice', merge('1a2b3c', 'main')],
+    ['bring the changes over to master', 'invoice', merge('1a2b3c', 'master')],
+    ['bring it over to main', 'invoice', merge('1a2b3c', 'main')],
+    ['merge it in to my branch', 'invoice', merge('1a2b3c')],
+    ['bring it in to my branch', 'invoice', merge('1a2b3c')],
+    ['merge invoice export in to main', 'none', merge('1a2b3c', 'main')],
+    ["bring invoice export's changes in to main", 'none', merge('1a2b3c', 'main')],
+    ['merge it in to feature/login-v2', 'dogBranch', merge('aa0001', 'feature/login-v2')],
+    // As without the particle: a branch it cannot check keeps the old meaning, and "bring" still needs its work or "it".
+    ['merge it in to develop', 'invoice', task('merge it in to develop')],
+    ['bring invoice export in to main', 'none', task('bring invoice export in to main')],
+    ['bring in to main', 'invoice', task('bring in to main')],
+    // "it" is weak: while a question waits, the words are the answer; on a merge card a branch named keeps the card.
+    ['merge it in to main', 'question', answer('merge it in to main')],
+    ['merge it in to main', 'pendingMerge', unknown('merge it in to main')],
+    ['merge it in to my branch', 'pendingMerge', yes],
+  ]);
+  // A name that ends in "over" keeps its last word: the particle is dropped only when the words name nothing with it.
+  const failOver = { agents: [{ id: 'f0f0f0', name: 'Fail over', task: 'Add a fail over for the database', state: 'done_checked', kind: 'agent' }] };
+  assert.deepEqual(parseCommand('merge fail over to main', failOver), merge('f0f0f0', 'main'));
+  assert.deepEqual(parseCommand('merge fail over in to main', failOver), merge('f0f0f0', 'main'));
+});
+
 test('describeIntent words changes, merge and throw-away', () => {
   assert.equal(describeIntent(changes('1a2b3c'), CTX.none), 'Show what Invoice export changed?');
   assert.equal(describeIntent(changes(null), CTX.none), 'Show what an agent changed? It is not clear which one.');

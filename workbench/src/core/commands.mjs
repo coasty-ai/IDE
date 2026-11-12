@@ -847,7 +847,15 @@ function matchMerge(core, c) {
       if (t.said) {
         into = t.into;
         particle = true;
-        ref = t.toks.length ? workRef(t.toks, c) : bring ? null : { id: focusRoot(c), form: 'bare', noun: false };
+        let toks = t.toks;
+        ref = toks.length ? workRef(toks, c) : null;
+        // "merge it in to main", "bring it over to main": the particle, then where it goes. Only when the words name
+        // nothing with it, so a name that ends in "over" keeps its last word.
+        if (!ref && toks.length && ['in', 'over'].includes(toks[toks.length - 1].w)) {
+          toks = toks.slice(0, -1);
+          ref = toks.length ? workRef(toks, c) : null;
+        }
+        if (!ref && !toks.length && !bring) ref = { id: focusRoot(c), form: 'bare', noun: false }; // "merge into main"
       }
     }
     if (!ref && ['in', 'over'].includes(rest[rest.length - 1].w)) { // "merge it in", "bring its changes in"
