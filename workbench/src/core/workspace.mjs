@@ -530,7 +530,7 @@ function countLines(file, budget) {
 // folder, are left out and named in `left`.
 //
 // The person's folder only ever sees `git merge --ff-only` to a merge commit built in the object database (merge-tree
-// and commit-tree), with --no-autostash and --no-overwrite-ignore: never a real merge, never conflict markers, never
+// and commit-tree), with --no-squash, --no-autostash and --no-overwrite-ignore: never a real merge, never conflict markers, never
 // update-ref on a checked-out branch. Every git command here runs with core.hooksPath set to an empty folder and every
 // hook set in git config (hook.<name>.command, git 2.54 and newer) switched off, so no hook runs (commit-tree runs none
 // anyway). Clean and smudge filters and merge drivers from git config still run, as they would for git itself.
@@ -1202,9 +1202,11 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
 
   // 8. Check again, then fast-forward the person's folder to M. Git refuses, changing nothing, when their own
   //    changes or files are in the way; ignored files count (--no-overwrite-ignore), and nothing is stashed.
-  //    No automatic upkeep (gc) is started in their repository either.
+  //    No automatic upkeep (gc) is started in their repository either. Git reads branch.<name>.mergeOptions before
+  //    these flags, and each flag here outweighs its counterpart there; --no-squash outweighs a --squash, which would
+  //    otherwise write and stage M's files while leaving the branch where it was.
   const ff = ['-c', 'submodule.recurse=false', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0',
-    'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', '--no-verify-signatures', '-q', mergeCommit];
+    'merge', '--ff-only', '--no-squash', '--no-autostash', '--no-overwrite-ignore', '--no-verify-signatures', '-q', mergeCommit];
   const done = {
     ok: true, into, merge: mergeCommit, work,
     files: s.files.length, adds: s.files.reduce((n, f) => n + f.adds, 0), dels: s.files.reduce((n, f) => n + f.dels, 0),

@@ -1129,6 +1129,33 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(git(t.root, 'stash', 'list'), '');
   });
 
+  test('branch.<name>.mergeOptions=--squash in the person’s config changes nothing: the merge goes through, and no squash is left', async () => {
+    const t = await agentRepo();
+    write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+    write(t.w('new.txt'), 'new\n');
+    git(t.ws.path, 'add', '-A');
+    git(t.ws.path, 'commit', '-q', '-m', 'agent');
+
+    // The danger is real: with that setting, a plain fast-forward writes and stages the files, and the branch stays.
+    const demo = cloneOf(t.root);
+    git(demo, 'config', 'branch.main.mergeOptions', '--squash');
+    const was = headOf(demo);
+    assert.equal(gitTry(demo, 'merge', '--ff-only', '-q', `origin/${t.ws.branch}`).code, 0);
+    assert.equal(headOf(demo), was);
+    assert.equal(statusOf(demo), 'M  a.txt\nA  new.txt\n');
+    assert.equal(fs.existsSync(path.join(demo, '.git', 'SQUASH_MSG')), true);
+
+    git(t.root, 'config', 'branch.main.mergeOptions', '--squash');
+    const { expect } = await proposal(t);
+    const r = await mergeWork(mergeOpts(t, expect));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(headOf(t.root), r.merge);
+    assert.equal(git(t.root, 'log', '-1', '--format=%P', r.merge), `${t.ws.base} ${r.work}`);
+    assert.equal(statusOf(t.root), '');
+    assert.equal(fs.existsSync(path.join(t.root, '.git', 'SQUASH_MSG')), false);
+    assert.equal(fs.readFileSync(t.p('new.txt'), 'utf8'), 'new\n');
+  });
+
   test('the repository’s hooks never run: not for the snapshot, the diff, the merge, the throw-away or the graph', async () => {
     const t = await agentRepo();
     write(t.w('a.txt'), 'one\nAGENT\nthree\n');
