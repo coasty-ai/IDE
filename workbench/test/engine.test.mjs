@@ -2851,6 +2851,52 @@ test('cards: every card the page gets says its kind, and merge and throw-away ca
   await t.engine.shutdown();
 });
 
+test('merge: the work commit’s subject is the task’s first sentence, capitalised, at most 72 characters; its body is the agent’s own words', async (ctx) => {
+  const t = liveFolders(ctx);
+  const subjectOf = async (task, says = 'I did it.') => {
+    const a = await doneAgent(t, { task }, says);
+    const card = await t.engine.proposeMerge(a.id);
+    assert.ok(card.confirm, card.reply);
+    assert.match((await t.engine.confirm(card.confirm.id, true)).reply, /^Merged /);
+    return t.calls.mergeWork.at(-1).message;
+  };
+  assert.deepEqual(await subjectOf('fix the login redirect. Then add tests.'), { subject: 'Fix the login redirect', body: 'I did it.', name: 'Fix login redirect' });
+  assert.equal((await subjectOf('add a merge command\n\nIt should ask first, then merge.')).subject, 'Add a merge command');
+  assert.equal((await subjectOf('make the invoice export work for large accounts by sending invoices in batches of five hundred at most')).subject,
+    'Make the invoice export work for large accounts by sending invoices in');
+  assert.equal((await subjectOf('use e.g. the cart total. Then the tax.')).subject, 'Use e.g. the cart total');
+  assert.equal((await subjectOf('fix\u200B the \u202Elogin\u202C page')).subject, 'Fix the login page', 'hidden and direction-changing characters never reach git');
+  // Words that git could read as a trailer are not passed on as the body.
+  assert.equal((await subjectOf('tidy the docs', 'Signed-off-by: someone else')).body, '');
+  await t.engine.shutdown();
+});
+
+test('repository: a slow read that began before a newer one never steps the page back to an older head', async () => {
+  const t = live();
+  await t.engine.start();
+  const slow = gate();
+  const read = t.deps.workspace.prepareRepo;
+  let n = 0;
+  t.deps.workspace.prepareRepo = async (p) => {
+    n += 1;
+    if (n !== 1) return read(p);
+    const old = await read(p);
+    await slow.wait;
+    return old;
+  };
+  const heads = [];
+  t.store.on('repo', r => heads.push(r.head));
+  t.engine.tick(Date.now() + 60_000); // the 15 s refresh begins, and is slow
+  await until(() => n === 1);
+  t.git.head = '0f'.repeat(20); // the person commits meanwhile
+  assert.equal((await t.engine.gitGraph()).repo.head, '0f'.repeat(20));
+  slow.open();
+  await until(() => !t.engine._repoReading);
+  assert.equal(t.engine.snapshot().repo.head, '0f'.repeat(20), 'the older read is dropped');
+  assert.deepEqual(heads, ['0f'.repeat(20)]);
+  await t.engine.shutdown();
+});
+
 // ------------------------------------------------------------------ source control: throw away
 
 test('throw away: the card says what goes; yes deletes its folder and branch, keeps a hidden copy, and the agent stays, thrown away', async (ctx) => {

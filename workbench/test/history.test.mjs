@@ -608,6 +608,25 @@ test('a thrown-away agent comes back thrown away: no folder, it cannot continue,
   assert.equal(second.claude.runners.length, 0);
 });
 
+test('a merge in this run is in the record at once, and after a restart its work still counts from the merged work commit', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  const card = await first.engine.proposeMerge(id);
+  assert.equal((await first.engine.confirm(card.confirm.id, true)).reply, 'Merged Fix login redirect into main.');
+  const rec = readFile(first).agents[0];
+  assert.deepEqual({ since: rec.workspace.since, base: rec.workspace.base, from: rec.workspace.from }, { since: FAKE_WORK, base: BASE, from: 'main' });
+  assert.deepEqual({ ...rec.work, merged: { ...rec.work.merged, at: 0 } }, {
+    branch: `workbench/fix-login-redirect-${id}`, from: 'main', folder: true,
+    merged: { into: 'main', merge: FAKE_MERGE, at: 0, files: 1, adds: 3, dels: 1 }, problem: null, thrownAway: null,
+  });
+  await first.engine.shutdown();
+  const second = world(t, dir);
+  await second.engine.start();
+  assert.equal(second.store.get(id).work.merged.merge, FAKE_MERGE);
+  assert.deepEqual((await second.engine.gitGraph()).agents.map(a => [a.id, a.since]), [[id, FAKE_WORK]]);
+});
+
 test('an earlier agent can be merged: it stays an earlier agent, and its record counts its work from the merged work commit', async (t) => {
   const dir = tmp(t);
   const first = world(t, dir);

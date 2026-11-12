@@ -172,11 +172,13 @@ function pathWords(paths, max = 3) {
 }
 
 /**
- * A commit subject made from the task: its first sentence, its first letter capitalised, cut at a word boundary to at
- * most 72 characters. Hidden characters become spaces; a single full stop at the end goes, as git subjects have none.
+ * A commit subject made from the task: the first sentence of its first line, its first letter capitalised, cut at a
+ * word boundary to at most 72 characters. Hidden characters become spaces; a single full stop at the end goes, as git
+ * subjects have none.
  */
 function commitSubject(task, fallback) {
-  let t = quotable(String(task ?? '').replace(/[​-‍⁠﻿]/g, ''), 100_000);
+  const line = String(task ?? '').split(/\r\n|[\r\n\u2028\u2029]/).find(l => l.trim()) || '';
+  let t = quotable(line.replace(/[\u200B-\u200D\u2060\uFEFF]/g, ''), 100_000);
   const m = /^(.+?[.!?])(?=\s+[A-Z0-9“"'(]|$)/.exec(t); // a sentence ends before a capital, not at "e.g. the" or "U.S. date"
   if (m) t = m[1];
   t = t.replace(/(?<!\.)\.$/, '').trim();
@@ -191,7 +193,7 @@ function commitSubject(task, fallback) {
 
 /** The agent's own summary for a commit's body: one plain paragraph, or '' when it could pass for a git trailer. */
 function commitBody(text) {
-  const t = quotable(String(text ?? '').replace(/[​-‍⁠﻿]/g, ''), 2000);
+  const t = quotable(String(text ?? '').replace(/[\u200B-\u200D\u2060\uFEFF]/g, ''), 2000);
   return /^[A-Za-z0-9-]+\s*:/.test(t) ? '' : t;
 }
 
@@ -380,6 +382,8 @@ export class Engine extends EventEmitter {
     this.repoIdentity = null;    // live mode: does git know the person's name and email (true/false); null: not known
     this._repoKey = null;        // the repository as the page last heard of it (see _setRepo)
     this._repoReading = null;    // a periodic refresh of the repository under way
+    this._repoSeq = 0;           // reads of the repository begun (_freshRepo)...
+    this._repoKept = 0;          // ...and the latest one kept
     this._machineKeys = new Map();
     this._lastMachinesAt = 0;
     this._lastRepoAt = 0;
@@ -2027,9 +2031,14 @@ export class Engine extends EventEmitter {
   async _freshRepo() {
     const root = this.repoInfo?.root;
     if (!root || typeof this.deps.workspace?.prepareRepo !== 'function') return this.repoInfo;
+    // Reads can overlap (the 15 s refresh, a card, a merge): one that began before the last one kept is older than
+    // what is known, and is dropped, so the page never steps back to a head the person's branch has left.
+    const seq = ++this._repoSeq;
     const info = await this.deps.workspace.prepareRepo(root);
     if (!info || !info.root) return this.repoInfo;
     const identity = await this._readIdentity(info.root);
+    if (seq < this._repoKept) return this.repoInfo;
+    this._repoKept = seq;
     this._setRepo(info, identity);
     return this.repoInfo;
   }
