@@ -322,7 +322,8 @@ async function listWorktrees(root, run = git) {
  * never the main folder. The branch is kept unless deleteBranch is set (and it is a workbench/ branch).
  * With onlyIfUnchanged (and the commit it started from, `base`), it removes nothing that might hold work: the folder
  * goes only while its HEAD is still `base`, `git status` lists nothing at all (not even a file .gitignore hides, such
- * as a .env or a build) and `git worktree remove` without --force agrees; then the branch goes only while it still
+ * as a .env or a build), no file its index marks as not to be looked at differs from `base` (see filesAsCommitted)
+ * and `git worktree remove` without --force agrees; then the branch goes only while it still
  * points at `base` (`update-ref -d`). In that order: update-ref would delete the branch of a folder that was kept.
  * `since` (with onlyIfUnchanged): the agent's last merged work commit. When given and not `base`, `since` takes the
  * place of `base` above, and the folder and branch also go only while a branch of the person's holds `since` (any
@@ -346,6 +347,7 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     if (head !== start) return { removed: false, kept: true }; // the agent made commits, or the folder is unreadable
     const status = await git(['status', '--porcelain', '--ignored', '--untracked-files=all'], { cwd: entry.path }).then(r => r.stdout, () => null);
     if (status !== '') return { removed: false, kept: true };
+    if (!(await filesAsCommitted(entry.path, start))) return { removed: false, kept: true }; // an edit git status cannot see
     if (merged && !(await inPersonsBranch(root, start))) return { removed: false, kept: true }; // the merge was undone
     try {
       await git(['worktree', 'remove', entry.path], { cwd: root, timeout: WORKTREE_TIMEOUT_MS });
@@ -373,6 +375,33 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     fs.rmdirSync(path.dirname(entry.path)); // the per-repository folder, only if now empty
   } catch {}
   return { removed: true, branch: entry.branch };
+}
+
+/**
+ * Whether the tracked files in the folder `cwd` are exactly those of commit `head`, as far as `git status` cannot
+ * tell. Its index may mark files as not to be looked at: an assume-unchanged or skip-worktree bit (which an agent can
+ * set), or the assume-unchanged bit that the person's core.ignoreStat gives every file git writes. git status, and
+ * `git worktree remove` without --force, then miss an edit to such a file. When any file is marked, the files are
+ * judged again in a new index that only `read-tree` has written, which marks nothing, so every file is read
+ * (`update-index --refresh` exits 1 when one differs or is missing). Never rejects: false when git cannot say.
+ */
+async function filesAsCommitted(cwd, head) {
+  try {
+    const marked = nulList((await git(['ls-files', '-v', '-z'], { cwd })).stdout).some(rec => rec[0] !== 'H');
+    if (!marked) return true;
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
+    try {
+      const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
+      await git(['-c', 'core.splitIndex=false', 'read-tree', head], { cwd, env });
+      const r = await git(['-c', 'core.splitIndex=false', '-c', 'core.ignoreStat=false', 'update-index', '--refresh'],
+        { cwd, env, okCodes: [1], timeout: WORKTREE_TIMEOUT_MS });
+      return r.code === 0;
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  } catch {
+    return false;
+  }
 }
 
 /**

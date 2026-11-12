@@ -1031,6 +1031,43 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(holding(), `refs/heads/kept-${t.id}`);
   });
 
+  test('the tidy keeps an agent’s folder whose edits git status cannot see: an assume-unchanged or skip-worktree bit, or core.ignoreStat', async () => {
+    const t = await agentRepo();
+    let n = 0;
+    const another = () => createWorkspace({ repoRoot: t.root, agentId: `${t.id}x${++n}`, slug: 'Hidden edits', baseDir });
+    const tidy = (ws, since = null) => removeWorkspace({ repoRoot: t.root, path: ws.path, base: ws.base, since, onlyIfUnchanged: true, deleteBranch: true });
+    const kept = async (ws, since, label) => {
+      assert.equal(statusOf(ws.path), '', `${label}: git status sees nothing`);
+      assert.deepEqual(await tidy(ws, since), { removed: false, kept: true }, label);
+      assert.equal(fs.readFileSync(path.join(ws.path, 'a.txt'), 'utf8'), 'one\ntwo\nthree\nNOT SAVED\n', `${label}: the edit is still there`);
+      assert.notEqual(git(t.root, 'branch', '--list', ws.branch), '', `${label}: its branch is kept`);
+    };
+    // An agent sets a bit on a file, then edits it.
+    for (const bit of ['assume-unchanged', 'skip-worktree']) {
+      const ws = await another();
+      git(ws.path, 'update-index', `--${bit}`, 'a.txt');
+      write(path.join(ws.path, 'a.txt'), 'one\ntwo\nthree\nNOT SAVED\n');
+      await kept(ws, null, bit);
+    }
+    // The same after a merge, when the tidy gets `since`.
+    write(t.w('b.txt'), 'b by the agent\n');
+    const m = await mergeWork(mergeOpts(t, (await proposal(t)).expect));
+    assert.equal(m.ok, true);
+    git(t.ws.path, 'update-index', '--assume-unchanged', 'a.txt');
+    write(t.w('a.txt'), 'one\ntwo\nthree\nNOT SAVED\n');
+    await kept(t.ws, m.work, 'after a merge');
+    // The person's core.ignoreStat gives every file git writes in a new agent folder the assume-unchanged bit.
+    git(t.root, 'config', 'core.ignoreStat', 'true');
+    const quiet = await another();
+    assert.match(git(quiet.path, 'ls-files', '-v', 'a.txt'), /^h a\.txt$/);
+    write(path.join(quiet.path, 'a.txt'), 'one\ntwo\nthree\nNOT SAVED\n');
+    await kept(quiet, null, 'core.ignoreStat');
+    // An untouched folder still goes, bits or not.
+    const untouched = await another();
+    assert.deepEqual(await tidy(untouched), { removed: true, branch: untouched.branch });
+    assert.equal(fs.existsSync(untouched.path), false);
+  });
+
   test('mergeWork refuses, changing nothing at all, before it makes the work commit', async () => {
     const cases = [];
     /** A case: an agent edits a.txt, the card is drawn, `setup` changes something, and the merge is refused for `why`. */
