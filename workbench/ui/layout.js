@@ -36,7 +36,7 @@ export const SIZES = Object.freeze({
     padR: 10.5, padOff: 15, cardW: 452, cardWCalm: 320, cardR: 180, minTravel: 34,
     title: 13, silkSub: 11.5, mName: 11.5, mNote: 11, fingerH: 20, machMin: 104, machGap: 20, holeClear: 58, trayX: 52,
     lid: lid({ padT: 18, padX: 18, padB: 14, count: 12, h1: 18, h1m: 16, h1l: 15, h1xl: 13.5, meta: 12, small: 11, btn: 13, btnh: 36, btnmin: 104, quiet: 12, input: 12.5, inh: 36, gap1: 9, gap2: 13, gap3: 12 }),
-    dram: dram({ w: 164, min: 96, h: 28, bus: 17, pin: 3.5, pitch: 5, gap: 7, wireIn: 14, wireGap: 12, label: 10.5, labelW: 22, git: 17, lines: 2 }),
+    dram: dram({ w: 164, min: 96, h: 25, bus: 13, pin: 3, pitch: 5, gap: 4, wireIn: 14, wireGap: 12, label: 10.5, labelW: 22, git: 16, lines: 2 }),
   },
   S: {
     name: 'S', margin: 8, boardR: 14, topBand: 44, botBand: 64, rowPad: 6, pitchMax: 96,
