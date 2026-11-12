@@ -1,0 +1,215 @@
+{
+ "area": "Natural-language commands (src/core/commands.mjs, test/commands.test.mjs, the forget/continue parser tests in test/history.test.mjs, and the engine glue in src/core/engine.mjs that consumes the intents): how to add the intents \"show changes\", \"merge/land\" and \"discard\"",
+ "summary": "commands.mjs (1249 lines, no model calls, imports only shared/format.mjs and shared/states.mjs) exports parseCommand(text, ctx) and describeIntent(intent, ctx). parseCommand never throws: a try/catch returns {kind:'unknown', text}. ctx is {agents: AgentView[], focusId, machines, harnesses, pendingConfirm}. The engine builds it in _commandContext (engine.mjs:1824); pendingConfirm is {id, kind, sentence, detail, tasks, agentIds: c.intent?.agentIds} or {id, gone:true}.\n\nlex() turns text into tokens {w, raw, start, end, tail}. Along the way it expands contractions (\"what's\" becomes \"what is\"), drops a possessive \"'s\" (\"cleanup's\" becomes \"cleanup\"), and maps \"&\"/\"+\" to \"and\". parse() then drops disfluencies and runs five steps in order:\n1. confirmReply against a card on screen.\n2. permissionReply when the focused asker holds a permission.\n3. matchCommand on the core words (soft openers, polite openers and trailing fillers stripped). A command wins over a waiting question or stuck ask only when strong.\n4. matchTask, an imperative from WORK_VERBS.\n5. Loose permission replies, otherwise unknown.\n\nmatchCommand order is stop_all, machines, stop, forget, continue, status/spend, say, start. Every matcher returns {intent, strong} or null; null lets the words keep their old meaning further down.\n\nAgent references go through resolveRef, a fuzzy word overlap: name words score 2, task or state-label words 1, coverage must be at least 0.5, a pronoun gives focusId and an exact id wins. It reports `full` (every word matched), `sure` (full, plus two or more matches or the whole name) and `named` (full, only name words, and no other non-ended agent has all those name words). resolveList splits on \"and\".\n\n`forget` (matchForget, line 570) needs the verb \"forget\" plus \"about\" optionally, and a full resolveList. It is always confirmed by the engine, and strong is r.named. `continue` (matchContinue, line 582) takes \"pick up / continue / resume / carry on\", one agent with a full reference, and the agent must be `earlier`; otherwise it returns null. Both are pinned only in history.test.mjs:521-536.\n\nWork stays a task because \"merge\", \"show\", \"bring\", \"undo\" and \"revert\" are WORK_VERBS and no command matcher claims them. Today \"merge invoice export\" and \"show the changes\" are tasks (a launch card); \"merge it\", \"land it\", \"discard it\" and \"throw it away\" are unknown. \"discard unused imports\" is unknown, not a task: \"discard\" and \"throw\" are not WORK_VERBS. \"what did X change\" and \"show X changes\" are already status via STATUS_AGENT (lines 691 and 701).\n\nConfirm cards today are kind-blind beyond stop/say. On a forget card (and any new kind), \"start it\" or \"launch it\" is a yes, and \"forget it\" is a cancel. The engine's confirmVerb and _confirm treat every unknown kind as a launch; _confirm then crashes on c.tasks.\n\nNew intents should plug in between matchContinue and matchStatusOrSpend:\n- read-only `changes`, which acts at once like status;\n- `merge` and `discard`, always confirmed like forget.\n\nThey need a stricter reference rule than forget: named, unique among all root agents including ended and earlier ones, not a launch phrase, roots only. They also need per-kind yes words in confirmReply and matching engine cases.",
+ "keyFacts": [
+  {
+   "fact": "File header lists intents but is stale: forget and continue (added in commit b98fca1) are missing. New intents must be added here too.",
+   "where": "src/core/commands.mjs:7-15"
+  },
+  {
+   "fact": "Lexer: CONTRACTIONS maps \"what's\"/\"whats\" to 'what','is', so \"what's changed\" is seen as \"what is changed\". Any other \"'s\" is dropped (\"search cleanup's changes\" becomes search, cleanup, changes). \"its\" stays a word (in REF_STOP).",
+   "where": "src/core/commands.mjs:22-33, 84"
+  },
+  {
+   "fact": "REF_STOP words (the, a, an, its, it, agent, task, to, of, from, …) are invisible to reference matching. Today \"stop an agent to fix the login\" stops an agent named \"Login fix\" AT ONCE (named), and \"forget an agent to fix the login\" proposes forgetting it (verified by probe). matchSay guards this with launchNoun(); matchStop and matchForget do not.",
+   "where": "src/core/commands.mjs:50-54, 772 (guard), 880-884 (launchNoun)"
+  },
+  {
+   "fact": "resolveRef returns {ids, full, sure, named, pronoun?, coverage, total}. A pronoun (PRONOUN_REFS) gives focusId with named:true. An exact id gives named:true. Otherwise the best key is [coverage, total, root-over-helper, not-ended, focused]; coverage must be at least 0.5.",
+   "where": "src/core/commands.mjs:317-340"
+  },
+  {
+   "fact": "`named` only counts OTHER agents that are not ENDED: `const named = full && names(ws, best.a) && !c.agents.some(a => a !== best.a && !ENDED.has(a.state) && (best.a.kind === 'helper' || a.kind !== 'helper') && nameWords(ws, a) > 0);`. Probe: two done agents both named \"Fix flaky checkout test\" give \"stop the flaky test\" → {stop, ['aa0001']} with no sure:false, so the first in the list is picked silently. Merge/discard targets are exactly ended (and earlier) agents.",
+   "where": "src/core/commands.mjs:337-338"
+  },
+  {
+   "fact": "Task words and state-label words make a reference `full` without being `named`. Probes: \"forget the two config files\" → forget Config merge (its task is \"Merge the two config files\"); \"forget the done one\" → forget (state label \"done and checked\"); \"stop the two config files\" → stop with sure:false. So matchForget's `!r.full` guard is NOT enough for merge or discard.",
+   "where": "src/core/commands.mjs:244-245 (stateW from LOOK label), 576-577"
+  },
+  {
+   "fact": "Helpers resolve: \"forget read cart code\" → the helper id a1b2c3-11111111; \"forget it\" with a helper focused → the helper id. Helpers have no worktree of their own.",
+   "where": "src/core/commands.mjs:317-340; probe"
+  },
+  {
+   "fact": "Object nouns break `full`: \"forget search cleanup's changes\", \"forget its changes\" and \"forget search cleanup's work\" → unknown. Note that \"work\" can match a working agent's state label (stem 'work'), so the result is state-dependent.",
+   "where": "src/core/commands.mjs:262-282 (scoreAgent), 241-248"
+  },
+  {
+   "fact": "matchForget: `if (ws[0] !== 'forget') return null; … const r = resolveList(stripTrailing(rest, STOP_TAIL), c); if (!r.ids.length || !r.full) return null; return { intent: { kind: 'forget', agentIds: r.ids }, strong: r.named };`. It does NOT check `earlier`; the engine refuses at yes (\"… is from this run, so it stays.\").",
+   "where": "src/core/commands.mjs:570-579"
+  },
+  {
+   "fact": "matchContinue: verbs [['pick','up'],['continue'],['resume'],['carry','on']], trailing again/please stripped, resolveRef, one id and full, and `if (!a || !a.earlier) return null` so the old meaning stays. Returns {kind:'continue', agentId}, strong r.named. The engine acts at once with CONTINUE_TEXT 'Please continue where you left off.'",
+   "where": "src/core/commands.mjs:582-592; engine.mjs:42, 1894-1899"
+  },
+  {
+   "fact": "Pinned tests for forget/continue words: parse 'forget search cleanup', 'forget about the flaky test', 'forget it'+focus, 'continue search cleanup', 'pick up search cleanup again'; notEqual for 'continue flaky test' (not earlier) and 'forget the old plan and use the new one'; describeIntent 'Forget Search cleanup?'. Engine flows: history.test.mjs:463-519 (card, cancel 'OK, I won’t forget it.', typed yes/do it).",
+   "where": "test/history.test.mjs:521-536, 463-519, 363-374"
+  },
+  {
+   "fact": "matchCommand order: matchStopAll, matchMachines, matchStop, matchForget, matchContinue, matchStatusOrSpend, matchSay, matchStart. New matchers must go after matchContinue and BEFORE matchStatusOrSpend, since STATUS_AGENT already captures 'what did X change' and 'show X …'.",
+   "where": "src/core/commands.mjs:1151-1162"
+  },
+  {
+   "fact": "STATUS_AGENT already maps \"what did <ref> (do|change|find|say|finish|get done)\" (line 691) and \"(show me|show|open|focus on|…|bring up) <ref>\" (line 701) to status. Probes: 'what did invoice export change' → status; 'show invoice export changes' → status (partial, not strong). No test pins 'what did X change' (grep).",
+   "where": "src/core/commands.mjs:689-703, 734-753"
+  },
+  {
+   "fact": "WORK_VERBS contains merge (1036), revert/undo (1038-1039), show (1043), drop (1044), get/bring (1045-1046), but NOT discard, throw, land, scrap or trash. So 'merge the two config files' → task (a launch card) while 'discard unused imports' → unknown (HELP reply), contrary to the brief's premise. emptyTask() makes 'merge it', 'drop it' and 'ship it' unknown.",
+   "where": "src/core/commands.mjs:1033-1063"
+  },
+  {
+   "fact": "START_WEAK includes ['bring','in'] and ['bring']: 'bring in an agent to fix the login' → start today. A merge matcher placed before matchStart must bail on launchNoun(rest), or it would turn that into a merge of a 'Login fix' agent.",
+   "where": "src/core/commands.mjs:835-836, 1011-1029"
+  },
+  {
+   "fact": "parse step 3: `const found = matchCommand(core, c); const waiting = ask && (ask.type === 'question' || ask.type === 'stuck'); if (found && (found.strong || !waiting)) return found.intent; if (waiting) return answerIntent(base, holder, ask);`. A permission ask is not 'waiting'; step 2 handles it first.",
+   "where": "src/core/commands.mjs:1131-1136"
+  },
+  {
+   "fact": "Step 2 pre-empts commands at a permission. Probes with a permission focused: 'accept it' → ALLOW; 'accept its changes', 'approve the changes', 'sure, land it' and 'yes merge it' → deny with conditional:true and the whole text; 'no, throw it away' → deny with text 'throw it away'. 'okay merge it' and 'go ahead and merge it' reach step 3 today and fall to a conditional deny at step 5.",
+   "where": "src/core/commands.mjs:493-507 (permissionReply), 418-420 (FIRST_YES/FIRST_NO), 513-520"
+  },
+  {
+   "fact": "Pronoun refs are named and therefore strong, so 'forget it' beats a waiting question or stuck ask (probe: question ctx → {forget, ['d4e5f6']}). Do not copy this for merge/discard pronouns.",
+   "where": "src/core/commands.mjs:321-323, 578"
+  },
+  {
+   "fact": "confirmReply: `const launch = kind !== 'stop' && kind !== 'say'; const isYes = w => (CONFIRM_YES.has(w) && (launch || !START_YES.has(w))) || (kind === 'stop' && w === 'stop') || (kind === 'say' && w === 'send'); const isNo = w => CONFIRM_NO.has(w) && !(kind === 'stop' && w === 'stop');`. Probes on a forget card (and on kinds 'merge'/'discard'): 'start it'/'launch it' → {confirm, go:true} (violates ARCH 303), 'forget it' → go:false, and 'merge it'/'discard it'/'throw it away' → unknown.",
+   "where": "src/core/commands.mjs:382-414"
+  },
+  {
+   "fact": "yesAsked uses OPENERS (443) and YES_VERB (445) so that 'stop it is that right' on a stop card is 'asks' (kept card). New kind verbs need the same entries to get identical treatment (pinned for stop/say/start at commands.test.mjs:366-368).",
+   "where": "src/core/commands.mjs:443-484"
+  },
+  {
+   "fact": "describeIntent has cases for every current kind. Forget: `Forget ${names}?` or 'Forget an agent? It is not clear which one.'; continue: 'Continue X where it left off?'. The default is `Not sure what “…” means.`. The odd-input loop in tests requires a string for anything.",
+   "where": "src/core/commands.mjs:1223-1249; test/commands.test.mjs:444-472"
+  },
+  {
+   "fact": "Engine command(): parses, and with a card shown an unknown intent keeps it ('I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.'). Any other non-confirm intent WITHDRAWS the shown card (`this.confirms.delete(shown.id)`). With a card shown, askId is nulled, and the page also sends focusId null.",
+   "where": "src/core/engine.mjs:1787-1822"
+  },
+  {
+   "fact": "confirmVerb: say → 'send it', forget → 'forget it', otherwise `${kind==='stop'?'stop':'start'} it|them`, so a merge or discard card would say 'start it'.",
+   "where": "src/core/engine.mjs:103-108"
+  },
+  {
+   "fact": "_runIntent dispatch: forget → _proposeForget(views); continue → _say(v, CONTINUE_TEXT); stop with sure:false → _proposeIntent; unknown kinds → HELP. _proposeIntent's fallback sentence is 'Tell X “undefined”?' for any non-stop kind, and its detail is 'Its task: “…”' for one view.",
+   "where": "src/core/engine.mjs:1847-1940, 2010-2028"
+  },
+  {
+   "fact": "_proposeForget builds its own sentence (no describeIntent) and stores {id, kind:'forget', agentIds, sentence, detail, createdAt} without `intent`, so _shownConfirm's `agentIds: c.intent?.agentIds` is undefined for forget cards.",
+   "where": "src/core/engine.mjs:1370-1377, 1839-1845"
+  },
+  {
+   "fact": "_confirm: forget and stop/say have branches; everything else falls into the launch path (`if (!go) return { reply: c.tasks.length === 1 …`; `for (const t of c.tasks)`). That is a TypeError for a new kind, and confirm() has no try/catch.",
+   "where": "src/core/engine.mjs:2031-2074"
+  },
+  {
+   "fact": "UI: the Forget button routes literal text through the parser, `api.command('forget it', { focusId: a.id })`. The confirm card is kind-agnostic ('Do it'/'Cancel'), and the reply's confirm object carries no kind. 'What changed?' is a page-local toggle listing file names, only in 'more' detail.",
+   "where": "ui/app.js:498-502; ui/focus.js:108-115, 201, 230, 240"
+  },
+  {
+   "fact": "Test conventions: CTX map with pendingConfirm variants (pending without kind = launch semantics, pendingStop/Start/Say); TABLE rows [text, ctxName, expected] checked with deepEqual into a `failures` array; dedicated tests for card yes words, asked-yes on cards, describeIntent, never-throws and long-dictation-under-2s. Engine tests inject intents via fakeDeps({ intent }) or swap in the real parser (`t.deps.commands.parseCommand = commands.parseCommand`).",
+   "where": "test/commands.test.mjs:28-40, 48-261, 333-392, 404-442; test/helpers/engine-fakes.mjs:97-116; test/engine.test.mjs:2110"
+  },
+  {
+   "fact": "Baseline green: commands.test.mjs 13/13 and the history forget/continue parser test 1/1 (Node 26.13.1).",
+   "where": "test/commands.test.mjs; test/history.test.mjs:521"
+  },
+  {
+   "fact": "The contract says merge does not exist ('the page offers no merge, so they are kept'). The forget contract wording is 'Its folder and branch stay on this computer.'",
+   "where": "ARCHITECTURE.md:103, 112"
+  }
+ ],
+ "extensionPoints": [
+  {
+   "capability": "A shared work-reference helper used by all three new intents",
+   "where": "src/core/commands.mjs, new function after resolveList (line 366), e.g. `workRef(toks, c, { strict })`",
+   "how": "1) Bail out with `null` if `launchNoun(ws)`, as matchSay does at line 772 (\"bring in an agent to fix the login\").\n2) Pool = roots only: `c.agents.filter(a => !a.parentId)`. A focused helper maps to its root (`f.rootId || f.parentId`), as _sendTo does.\n3) Forms, tried in this order:\n   (a) [] or a PRONOUN_REFS phrase gives the focused root (pronoun).\n   (b) [its|the|their] + WORK_NOUN gives the focused root (generic). WORK_NOUN = changes, change, work, diff, edits, commits, branch.\n   (c) The words whole, unstripped: an agent may be named \"Diff viewer\" or \"Work queue\".\n   (d) <ref> + trailing WORK_NOUN (\"search cleanup's changes\" lexes as \"search cleanup changes\").\n   (e) [the|its]? WORK_NOUN (from|of|by|in|for) <ref>.\n4) Resolve with `resolveRef(refToks, { ...c, agents: roots })` and require one id with `full`.\n5) For strict use (merge, discard), also require id or pronoun, or `names(ws,a) && !roots.some(b => b !== a && nameWords(ws, b) > 0)`. That is uniqueness among ALL roots, ended and earlier included, unlike line 337. If two roots both carry the name words, return {id:null, ambiguous:true}. If the match is full but not named (task or state words), return null so the words keep their old meaning (a task).\n6) Return {id, named, pronoun, generic}. The cost is a constant number of resolveRef calls, so long dictation stays fast."
+  },
+  {
+   "capability": "Show an agent's changes: read-only `{ kind: 'changes', agentId }` (agentId null when not clear), never confirmed",
+   "where": "src/core/commands.mjs: new matchChanges() in a 'Source control' section after matchContinue (line 592); wired into matchCommand (1151-1162) after matchContinue and BEFORE matchStatusOrSpend; drop 'change' from STATUS_AGENT line 691 so there is one path",
+   "how": "Whole-utterance forms only, after stripPolite/stripTrailing; any extra words mean null, so the utterance falls through to status/task as today:\n- what (did|has|have) <ref|it> (change|changed) [so far]\n- what (is|has)? changed [(in|on|for|with) <ref>] (\"what's changed\" lexes to \"what is changed\")\n- what are (the|its) changes [(in|from|of|by|for) <ref>] / what are <ref> changes\n- (show|show me|let me see|can i see|see|look at|open) (the|its) (changes|diff|edits) [(from|of|by|in|for) <ref>]\n- (show|show me|let me see|see|look at) <ref> (changes|diff|edits|work)\n- show me what [<ref>] changed\n- diff [<ref>|it]\n\nReference rule: like status (read-only), so a `full` reference from task words is fine. Do not accept a partial (coverage < 1) match: leave that to the existing status patterns.\n\nStrength: r.sure for a resolved reference; true for pronoun or generic multiword forms (this mirrors the 'What changed?' link that a live question already shows); false for one-word utterances ('diff', 'changes'). A pronoun or generic form with no focus gives agentId null; the engine then asks which agent.\n\ndescribeIntent: `Show what ${name} changed?` / 'Show what an agent changed? It is not clear which one.'\n\nAlternative: status with a `changes: true` flag (like needsMe). An old engine would degrade to a plain status reply."
+  },
+  {
+   "capability": "Merge/land an agent's work: `{ kind: 'merge', agentId, into? }`, ALWAYS confirmed",
+   "where": "src/core/commands.mjs: matchMerge() after matchChanges in matchCommand; describeIntent case; engine glue listed below",
+   "how": "Verbs: [['merge'], ['land'], ['bring','in'], ['pull','in']]. Bare ['bring'] and ['pull'] need a particle after the object (in, over, across): \"bring its changes in\", \"bring it in\". The 'bring' forms need a WORK_NOUN or a pronoun object; a bare agent name after 'bring in' is not enough.\n\nNever use yes words or answer words as merge verbs: accept, approve, allow, keep, okay, sure, fine, go, ship. At a permission they become allow or deny (probes). Leave 'commit' and 'push' out too.\n\nOptional target tail from a CLOSED list: (into|onto|to|on) (main|master|my branch|mine|my code|my copy|my checkout|my repo|the repo|here). 'main' and 'master' are carried as `into:'main'`; the 'my …' forms mean the current branch and are omitted. Any other tail means null (\"merge the onboarding flow into the wizard\" stays a task).\n\nResolution: workRef strict. If it returns null, return null (\"merge the two config files\", \"merge the done one\" and \"merge branch main into feature\" stay tasks). If it returns id null (no focus, or same-named twins), return {kind:'merge', agentId:null}, which the engine answers 'Which one…'.\n\nA bare 'merge' or 'land' means the focused agent, with strong false.\n\nStrength: `named && !pronoun && !generic`. So 'merge it' while a question or stuck ask waits is the answer, but 'merge search cleanup' wins.\n\nResolve one agent only (resolveRef, not resolveList); lists give null or agentId null.\n\nDo NOT gate on state in the parser: the old meaning would be a launch card \"Start Claude on “merge search cleanup”?\". The engine refuses active, changeless or folderless agents in plain words.\n\ndescribeIntent (generic, no branch known): `Merge ${name} into ${it.into || 'your branch'}?`. The engine should build the real card sentence itself (like _proposeForget) with the actual current branch, plus detail: \"Its task: “…”\", the file/line counts, and that uncommitted changes are untouched."
+  },
+  {
+   "capability": "Throw away an agent's work: `{ kind: 'discard', agentId }`, ALWAYS confirmed, destructive",
+   "where": "src/core/commands.mjs: matchDiscard() after matchMerge; describeIntent case",
+   "how": "Verbs: [['throw','away'], ['throw','out'], ['discard'], ['scrap'], ['trash']]. Bare ['throw'] needs 'away' or 'out' after the object: \"throw it away\", \"throw its changes away\".\n\nExclude delete, remove, drop, undo, revert, reset, cancel, kill, 'get rid of' and forget. They are work verbs or other intents, and 'undo' may later mean 'undo the merge'.\n\nAn object is required; a bare 'discard' gives null. Resolution: workRef strict, the same null and agentId-null rules as merge, one agent only. Strength: `named && !pronoun && !generic` ('discard it' or 'throw it away' while a question waits is the answer).\n\ndescribeIntent: `Throw away what ${name} changed?` (this avoids possessives such as \"Help pages’s\"). The engine detail should say exactly what goes: its folder, its branch name and N changed files, and 'This cannot be undone.'\n\nOptionally add 'discard' and 'throw' to WORK_VERBS (1033-1046). Then 'discard unused imports' and 'throw an error when the token expires' become tasks. emptyTask still keeps 'discard it' from being a task, and matchDiscard runs earlier anyway."
+  },
+  {
+   "capability": "Confirm-card replies for forget/merge/discard cards",
+   "where": "src/core/commands.mjs:393-414 (START_YES, confirmReply), 443-445 (OPENERS, YES_VERB); engine.mjs:103-108 (confirmVerb)",
+   "how": "Replace the launch test with `const launch = kind == null || kind === 'start'`. Keep `undefined` as a launch, because CTX.pending has no kind and line 376 expects 'start it' → yes.\n\nAdd per-kind words:\n- `CARD_YES = { stop:['stop'], say:['send'], merge:['merge','land','bring'], discard:['discard','throw','scrap','trash'] }`\n- `CARD_FILL = { merge:['in','over'], discard:['away','out'] }`\n- `isYes = w => (CONFIRM_YES.has(w) && (launch || !START_YES.has(w))) || own.includes(w)`\n- `isNo = w => CONFIRM_NO.has(w) && !own.includes(w)`\n\nKeep 'forget' a no on every card: \"forget it\" also means \"never mind\", the safe reading. Add the new verbs to OPENERS and YES_VERB so \"merge it is that right\" is 'asks'.\n\nOn a discard card, consider a stricter yes that excludes 'right', 'good', 'great', 'perfect', 'cool', 'nice', 'fine', 'please' and 'correct'. Make 'keep it'/'keep them' a no.\n\nThe engine's confirmVerb must return 'merge it' / 'throw it away'. Without this fix, \"merge it\" on a merge card reaches step 3 with focusId null and WITHDRAWS the card (engine.mjs:1810)."
+  },
+  {
+   "capability": "Engine glue that the intents depend on (owned by the engine builder)",
+   "where": "src/core/engine.mjs: _runIntent 1847-1940; new _proposeMerge/_proposeDiscard modelled on _proposeForget 1370-1377; _confirm 2037-2055; _shownConfirm 1839-1845",
+   "how": "- Add cases 'changes' (read-only reply plus focusId, like _status), 'merge' and 'discard', each with a plain refusal for agentId null, helper, active, no changes or folder gone.\n- Store confirms as `{ id, kind, intent, agentIds:[id], sentence, detail, createdAt }` so _shownConfirm exposes agentIds.\n- Add _confirm branches for merge and discard BEFORE the launch fallthrough at 2055. Cancel replies: 'OK, I won’t merge it.' / 'OK, I won’t throw it away.'\n- Re-validate at yes: the agent still ended, and its branch head and the person's branch/HEAD/dirty state unchanged since the card. Otherwise reply 'That changed. Have another look.' This mirrors the ask-binding rules.\n- Never route merge or discard through _proposeIntent unchanged: its fallback sentence assumes stop/say."
+  },
+  {
+   "capability": "Tests that pin the words (following the existing conventions)",
+   "where": "test/commands.test.mjs (owned with commands.mjs); test/engine.test.mjs or test/history.test.mjs for card flows with the real parser",
+   "how": "Fixtures: add CTX entries pendingForget, pendingMerge and pendingDiscard ({pendingConfirm:{id, kind}}). Use agents that hit the edge cases: done twins with the same name; an earlier agent; a helper; dogfood-style names ('Merge command', 'Diff viewer', 'Work queue', a task 'Merge the two config files').\n\nTABLE rows, positive (sample):\n- 'merge invoice export' none → {merge,'1a2b3c'}\n- 'land it' invoice → {merge,'1a2b3c'}\n- 'bring its changes in' invoice → merge\n- \"throw away invoice export's changes\" none → {discard}\n- 'discard it' invoice → discard\n- 'what did invoice export change' → {changes}\n- 'show me the changes' invoice → {changes,'1a2b3c'}\n- \"what's changed\" invoice → changes\n\nTABLE rows, negative:\n- 'merge the two config files' → task\n- 'merge branch main into feature' → task\n- 'merge the onboarding flow into the wizard' → task\n- 'discard unused imports' → unknown, or task if WORK_VERBS is extended\n- 'show the error on the login page' → task\n- 'bring in an agent to fix the login' (with a 'Login fix' agent) → start\n- 'merge it' / 'discard it' in question and stuck contexts → answer\n- 'merge search cleanup' in question context → merge (strong)\n- 'accept it' in permission context → allow (unchanged)\n- twins → agentId null\n- 'merge read cart code' → null/agentId of root (pick one and pin it)\n\nCard rows, mirroring 372-392: 'merge it'/'land it' on pendingMerge → yes; 'throw it away'/'discard it' on pendingDiscard → yes; 'start it'/'launch it' on pendingForget/Merge/Discard → unknown; 'forget it' on any card → no.\n\nAdd the new kinds to the asked-yes card loop (356-368), to the describeIntent sentences and odd inputs ({kind:'merge'}, {kind:'discard'}, {kind:'changes'}), and to long dictation ('merge ' + 'word '.repeat(3000)).\n\nEngine: the hint 'Say “do it” to merge it, or “cancel”.'; cancel replies; no crash on confirm; and if buttons route text, the exact button text."
+  },
+  {
+   "capability": "Buttons for Merge / Throw away / What changed",
+   "where": "ui/app.js:498-502 (the Forget precedent), ui/focus.js:233-241 (done-state buttons 'Looks good'/'Ask for a change'), ARCHITECTURE.md:556-571 (button table)",
+   "how": "Either follow the Forget precedent (POST /api/command with a fixed text such as 'merge it' / 'throw it away' and focusId; pin that exact text in commands tests, because a parser change would silently break the button), or add dedicated routes (for example POST /api/agents/:id/merge returning {reply, confirm}). The second is sturdier. Note the lid's two-button limit, and that the reply's confirm object has no `kind`, so per-kind button labels would need it added."
+  },
+  {
+   "capability": "Contract text that must change with the code",
+   "where": "ARCHITECTURE.md:103, 112, 290-291, 300-306, 323-346, 531, 566; src/core/commands.mjs:7-15",
+   "how": "- Add table rows for changes, merge and discard, with the strict naming rule (uniqueness among all roots) and 'always asked first'.\n- Extend the card-words bullet (303): 'merge it' and 'land it' are a yes only to a merge, and 'throw it away' only to a discard; 'start it' and 'launch it' are a yes only to a launch (forget included).\n- In the lid-order item 1 (531), list forget, merge and discard cards.\n- Replace 'the page offers no merge' (103).\n- Update the stale header intent list in commands.mjs, adding forget and continue too."
+  }
+ ],
+ "rulesToHonour": [
+  "Rule-based, no model calls. parseCommand never throws (its try/catch returns unknown), and must stay fast on long dictation (test: four 3000-word inputs in under 2 s). New matchers must do only a bounded number of resolveRef calls.",
+  "Plain language in everything a person sees (ARCH:20): describeIntent returns a full question ending in '?', with agent names (never ids). Quote the person's words with quote()/clip(…, 80). Avoid possessives that break on names ending in 's'.",
+  "Launches always go through a confirm card. Stops and messages do only when their words did not name the agent. Forget always does. The new merge and discard must ALWAYS confirm whatever `strong` or `named` say; changes is read-only and never confirms.",
+  "A yes or no answers only the card on screen, identified by confirmId and never 'the latest'. 'start it' and 'launch it' are a yes only to a launch. A yes asked rather than said keeps the card. Words not understood keep the card, with the hint built from confirmVerb. Any other command withdraws it without a notice (ARCH:302-306).",
+  "Answers are bound to the ask on screen (askId). Merge and discard verbs must never be yes or no words (accept, approve, allow, okay, sure, fine, go, yes, no), because at a permission step 2 turns them into allow or deny before commands are tried.",
+  "While a question or stuck ask waits, only `strong` commands win over the answer. Read-only intents may resolve by task words (test row 233). Pronoun and generic forms of merge or discard must not be strong.",
+  "An action acts on an agent only when the words NAME it: its id, 'it' for the focused agent, or two or more name words (all of a one-word name) and nothing else. Merge and discard must be at least as strict as stop/say, and their uniqueness check must include ended and earlier agents, because those are the targets.",
+  "Words left over beside an agent's words are work, not a command (ARCH:346). Any extra words return null, so the utterance keeps its old meaning (task, status or answer).",
+  "Intents carry ids, never names. The engine re-fetches views by id and must re-check state at confirm time.",
+  "Earlier agents (`earlier: true`) are in ctx.agents and in the done tray. They can be merge or discard targets if their workspace is still recorded. Forget never touches the folder or branch: keep forget and discard clearly distinct in words.",
+  "Test conventions: node:test with node:assert/strict, in test/<module>.test.mjs; table rows with failure collectors; no network, never a real claude/codex; parser tests use plain ctx objects shaped like the CTX map.",
+  "Ownership (ARCH:34): commands.mjs and its tests belong to the 'Language, policy, workspaces, receipt' builder; the engine glue belongs to the 'Store, engine, history, server, CLI' builder. Code and ARCHITECTURE.md must agree (ARCH:3)."
+ ],
+ "risks": [
+  "Wrong agent on a destructive action: `named` ignores ended agents (line 337), so with two finished agents of the same name a strict-looking reference silently picks the first. That is unsafe for discard. Use uniqueness among all roots and return agentId null on ties.",
+  "REF_STOP invisibility is already a live bug: 'stop an agent to fix the login' stops an agent named 'Login fix' AT ONCE, and 'forget an agent to fix the login' proposes forgetting it. Any new matcher placed before matchStart (especially one with 'bring in') must apply the launchNoun guard. Consider fixing matchStop and matchForget the same way.",
+  "Task or state words alone make a reference `full` ('merge the two config files' would resolve to the agent whose task that is; 'the done one' resolves by state label). Copying matchForget's `r.full` guard would hijack ordinary work.",
+  "Card words: the current confirmReply makes 'start it'/'launch it' a YES on any non-stop/say card (forget today, merge/discard tomorrow). Without per-kind words, the natural 'merge it' on a merge card falls to step 3 with focusId null and WITHDRAWS the card instead of confirming it.",
+  "Engine crash path: _confirm falls into the launch branch for unknown kinds (`c.tasks.length`), and confirm() has no try/catch. confirmVerb would also tell the person to say 'start it'.",
+  "Asking to see the diff while a merge card is shown ('what did it change') withdraws the card (any other command withdraws it). Since the page sends focusId null with a card, 'it' also does not resolve. Put the change summary in the card detail, or change the contract for read-only intents.",
+  "Permission screens pre-empt: 'sure, land it' or 'yes merge it' deny the permission with the words passed to the agent, and 'accept it' ALLOWS. Never use yes-like merge verbs.",
+  "Pronoun strength copied from forget ('forget it' beats a waiting question, verified) would make 'discard it' or 'merge it' hijack answers. 'throw it away' as a stuck hint is plausible English.",
+  "Helpers resolve (forget read cart code → helper id). Merge or discard must map to roots or refuse; helpers have no worktree.",
+  "Moving 'what did X change' from status to changes changes current replies. No test pins it, but behaviour-check scripts and users may rely on it.",
+  "Dogfooding on Workbench's own repo: agent names and tasks will contain merge, diff, discard, branch, changes and work ('Merge command', 'Diff viewer'). Unstripped-first resolution and fixtures with such names are needed, or 'merge the merge command' style phrases misfire.",
+  "Branch target: the parser does not know the person's current branch (ctx has no repo), and the engine's repoInfo is read at start while the person may switch branches mid-run. An 'into main' said while on another branch must be refused, never silently retargeted.",
+  "Button text routed through the parser (the Forget precedent) couples UI buttons to NL wording; a later wording tweak can break a destructive button."
+ ],
+ "openQuestions": [
+  "Should the parser gate merge or discard on state the way matchContinue gates on `earlier`, returning null so the words keep their old meaning? I recommend no: for these verbs the old meaning is a nonsense launch card, so recognise the intent and let the engine refuse with plain words.",
+  "Single agent or lists: forget accepts lists via resolveList. Should discard or merge ever take two agents at once? I recommend single (agentId), because an irreversible card needs exact detail.",
+  "Target branch: a closed list of filler tails ('into main', 'into my branch'), raw capture of `into` with an engine comparison, or a new `ctx.repo.branch` so the parser can accept the real branch name?",
+  "Should read-only intents (status, changes, spend) stop withdrawing a shown card? And should a pronoun with a card on screen resolve to the card's agent (pendingConfirm.agentIds) when focusId is null?",
+  "Card wording and verb: 'Merge Search cleanup into main?' or 'Bring the changes from Search cleanup into main?'; 'Throw away what Search cleanup changed?'. Do button labels follow the verb, and does the confirm reply need a `kind` for per-kind buttons?",
+  "How strict should a yes be on a discard card? Exclude soft words (right, cool, fine, please)? Allow a spoken yes at all for an irreversible action?",
+  "Add 'discard' and 'throw' (maybe 'scrap') to WORK_VERBS so 'discard unused imports' and 'throw an error when…' become tasks, as the brief assumes? They are unknown today.",
+  "On a forget card, keep 'forget it' as a cancel (the safe reading of 'never mind', today's behaviour), or make it unknown so the card stays? And fix 'start it'/'launch it' being a yes there (a contract violation).",
+  "How does a `changes` reply deliver the diff: reply text only, a new reply field (for example show:'changes') plus a GET route, or a page-local command like pageCommand ('what changed' matches the existing 'What changed?' link)?",
+  "Should 'undo the merge' / 'revert it' become a future intent? If so, keep undo/revert out of discard now, as recommended.",
+  "Should the pre-existing launchNoun hole in matchStop and matchForget ('stop an agent to fix the login') be fixed in the same change, since the new matchers share the helper?"
+ ]
+}

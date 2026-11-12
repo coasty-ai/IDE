@@ -1,0 +1,256 @@
+{
+ "area": "HTTP server (src/server/http.mjs), CLI (bin/workbench.mjs), and the Claude Code adapter's launch, binary lookup and compatibility for dogfooding with the 2.1.322 VS Code native binary (args.mjs, runner.mjs available()/sessionExists, hook-bridge.mjs, scripts/accept-real.mjs)",
+ "summary": "createServer (src/server/http.mjs:100) listens on 127.0.0.1 only and serves the UI files, a JSON API, an SSE stream and the PreToolUse hook endpoint. Every response gets the security headers. Any Host other than 127.0.0.1:<port> or localhost:<port> gets 403. /api/* and /hook/* go through handleApi (:354-396), which checks things in this order. (1) The 64-hex page token, in the X-Workbench-Token header or in ?t= for GET only, compared as sha256 then timingSafeEqual. An agent's own HMAC hook token is accepted only on /hook/pretool, and only for body.agentId. (2) A regex match on pathname in the static `routes` table (:334-352): no match gives 404, a wrong method gives 405 with an Allow header. (3) For POSTs: Origin must be absent or exactly http://<Host> (else 403), Content-Type must be application/json (else 415), and the body must be a JSON object of at most 64 KB (413 or 400; an empty body counts as {}). Handlers have the shape run(body, match). They cannot see the URL or query, and whatever they return goes out as 200 JSON with no-store and no size cap. Path ids go through id() (decoded, then /^[A-Za-z0-9_-]{1,80}$/, else 404), body ids through optId() (anything that is not an id becomes null), and text through str(). Error handling: err.status is used as is; err.plain or err.expose gives 400 with the message shown; anything else is a generic 500 that gets logged. Expected refusals are 200 {ok:false, reply}. The SSE stream sends a snapshot on connect, then 'agents' every 250 ms (coalesced), 'machines', 'notice', and a fresh snapshot whenever the store emits 'removed' (Forget uses this). The CLI parses its own flags and resolves --repo to the git toplevel with prepareRepo. It calls each adapter's available() under a 15 s race, prints a plain error and exits 1 when no harness works, makes the page token and the hook HMAC key, wires Store/Engine/Machines/server, and on Ctrl-C stops everything and lists the kept worktrees. Claude Code is found only through the WORKBENCH_CLAUDE_BIN environment variable or `claude` on PATH. There is no CLI flag and no auto-discovery. On this Mac `claude` is not on PATH. Without the variable the CLI prints 'Workbench could not find Claude Code or Codex on this computer…' and exits 1 (executed). With the variable set to the VS Code extension binary, available() returns {ok:true, version:'2.1.322'} (executed). Every flag args.mjs passes is still in 2.1.322's --help. The exact argv args.mjs builds parses cleanly with -p removed and --version appended, in both the --session-id and the --resume form, while a bogus flag is rejected (executed). `--permission-mode default` is no longer listed in --help ('manual' is shown instead) but is still accepted. 'default' is the internal canonical value and 'manual' is a display alias that maps back to it (binary strings), so keep 'default'. All 11 names in DISALLOWED_TOOLS still exist in 2.1.322. The binary also defines new tools that are in neither SAFE_TOOLS nor DISALLOWED_TOOLS (SendFile, ListAgents, SendToProject, PublishPlugin, WrapUp, and others). Each one would become an 'unknown tool' ask if it is enabled in -p runs, which is feature-gated and not yet verified. 2.1.322's own result schema says a resumed session's total_cost_usd continues from the total its transcript saved, while --max-budget-usd counts only the new process's spend. The engine's _withEarlierSpend therefore double-counts spend when an earlier agent is continued. No diff, merge or discard exists anywhere today: ARCHITECTURE.md:103 says 'the page offers no merge'. The only removal primitive is workspace.removeWorkspace, which runs `worktree remove --force` and then `branch -D` for workbench/ branches when onlyIfUnchanged is false.",
+ "keyFacts": [
+  {
+   "fact": "Routes table (exact): GET ^/api/state$ -> engine.snapshot(); GET ^/api/stream$ (stream:true); POST ^/api/command$ -> engine.command(str(b.text), {focusId: optId(b.focusId), confirmId: optId(b.confirmId), askId: optId(b.askId)}); POST ^/api/confirm/([^/]+)$ -> engine.confirm(id(m[1]), b.go === true); POST ^/api/agents$ -> engine.startAgent({task: str(b.task), harness, model, machineId, budgetUsd, name}) (raw values, engine validates); POST /api/agents/:id/answer -> engine.answer(id, {askId: optId(b.askId), answer: b.answer}); /say -> engine.say(id, str(b.text)); /stop -> engine.stop(id); POST /api/machines/:id/awake -> engine.setMachineAwake(id, b.awake === true); POST ^/hook/pretool$ (hook:true).",
+   "where": "workbench/src/server/http.mjs:334-352"
+  },
+  {
+   "fact": "Dispatcher calls `route.run(body, m)` where m = pathname.match(route.re), then sendJson(res, 200, result ?? {}). Handlers never see `url`/searchParams, so a GET route cannot take query parameters (file, page) without changing the dispatcher.",
+   "where": "workbench/src/server/http.mjs:393-395"
+  },
+  {
+   "fact": "Token check runs before route matching. given = X-Workbench-Token header, or for GET only url.searchParams 't'. maybeHook = path starts with /hook/, hookTokenFor is set, and the token matches /^[0-9a-f]{64}$/ (lowercase only). Otherwise 401 {error:'Missing or wrong token.'}. On /hook/pretool, hookTokenOk(given, body.agentId) is checked after the body is read. A hook token never opens /api.",
+   "where": "workbench/src/server/http.mjs:357-362,389-391,399-404"
+  },
+  {
+   "fact": "POST guards in order: Origin present and != `http://${Host}` (both lowercased) -> 403 'Requests from other sites are not allowed.'; Content-Type base type != application/json -> 415 'Send JSON, with Content-Type: application/json.'; readJson: Content-Length over 1 MB -> 413 at once; body over 64 KB -> 413 'The request is too large. The limit is 64 KB.' (+Connection: close); invalid JSON -> 400; non-object or array -> 400; empty -> {}.",
+   "where": "workbench/src/server/http.mjs:147-182,372-386"
+  },
+  {
+   "fact": "sendError: status = err.status || (err.plain || err.expose ? 400 : 500); the message is shown only in those cases, otherwise 'Something went wrong in the workbench. The details are in its log.' (logged when >= 500). engine.mjs plainError sets e.plain = true (engine.mjs:74-78). workspace.mjs plainError does NOT set .plain (workspace.mjs:64-72), so a git error thrown through a route becomes a generic 500 unless the engine catches it and rewords it.",
+   "where": "workbench/src/server/http.mjs:130-137"
+  },
+  {
+   "fact": "id(s) = decodeURIComponent, then ID_RE /^[A-Za-z0-9_-]{1,80}$/, else HttpError 404 'Not found.'. optId(v) = v if it is a string matching ID_RE, else null (a 40- or 64-hex git sha passes optId). str(v) = '' for null/undefined, else String(v).",
+   "where": "workbench/src/server/http.mjs:47,324-332"
+  },
+  {
+   "fact": "Host check: only `127.0.0.1:<boundPort>` or `localhost:<boundPort>`, else 403 'This address is not allowed.' (blocks DNS rebinding). Security headers are set on every response (CSP default-src 'self' with no inline script, nosniff, no-referrer, X-Frame-Options DENY, CORP same-origin). No CORS headers are ever sent.",
+   "where": "workbench/src/server/http.mjs:18-24,141-144,427-439"
+  },
+  {
+   "fact": "sendJson serialises the whole body in memory with Content-Length and Cache-Control: no-store. There is no response size cap. A diff route must cap its own output.",
+   "where": "workbench/src/server/http.mjs:123-128"
+  },
+  {
+   "fact": "SSE: on connect 'retry: 2000' + snapshot; the store's 'agents' ids are coalesced (250 ms) into views; 'machines' sends the full list; 'notice' sends {text, agentId?}; the store's 'removed' event triggers a full engine.snapshot() broadcast (the stream has no 'removed' event). Ping every 15 s; a client with more than 8 MB buffered is destroyed.",
+   "where": "workbench/src/server/http.mjs:268-320"
+  },
+  {
+   "fact": "http.createServer requestTimeout defaults to 300_000 ms. It limits only receiving the request, so a long engine operation (a git merge) is not cut. The handler is handle(req,res).catch(sendError). The server does not serialise requests: two tabs can run the same POST at once.",
+   "where": "workbench/src/server/http.mjs:443-448"
+  },
+  {
+   "fact": "HTTP test harness: FakeEngine records calls (command, confirm, startAgent, answer, say, stop, setMachineAwake, hookPreToolUse). request()/post() helpers. Tests that pin route behaviour: hook token never opens /api (:230-244), POST guards (:286-310), 'API routes call the engine with the right arguments' with a deepEqual of the whole calls list (:312-342), 404/405/bad ids/plain vs crash errors (:344-358).",
+   "where": "workbench/test/http.test.mjs:20-49,109-110,230-358"
+  },
+  {
+   "fact": "Places that mirror the route table and must learn any new route: ui/api.js `api` object (state/command/confirm/answer/say/stop/awake), whose call() throws on !res.ok and throws `refused` on 200 {ok:false}; scripts/ui-mock.mjs stand-in API (404 fallthrough at :414); scripts/ui-behaviour-check.mjs request-shape listing (:683); scripts/demo-e2e.mjs; test/live-fake.test.mjs (full chain over a temp git repo with HOME isolated).",
+   "where": "workbench/ui/api.js:33-67; workbench/scripts/ui-mock.mjs:312-414; workbench/scripts/ui-behaviour-check.mjs:683"
+  },
+  {
+   "fact": "Forget is the existing confirm-first action from a button. The page posts /api/command {text:'forget it', focusId}. engine._proposeForget stores {id: hex(6), kind:'forget', agentIds, sentence, detail, createdAt} in this.confirms and returns {reply, confirm:{id, sentence, detail}}. POST /api/confirm/:id {go} -> _confirm dispatches on c.kind. confirmVerb(c) words the 'I did not catch that. Say “do it” to …' reply. Confirms expire after confirmTtlMs (10 min) and an expired one answers GONE.",
+   "where": "workbench/src/core/engine.mjs:26,49,103-108,204,1370-1400,2031-2046"
+  },
+  {
+   "fact": "engine.snapshot() exposes repo as {name, head, branch, dirty} (branch is null when HEAD is detached), refreshed periodically by _refreshRepo -> prepareRepo. It also exposes harnessInfo (e.g. claude {ok, version}) and defaultBudgetUsd.",
+   "where": "workbench/src/core/engine.mjs:1742-1749,2259-2273"
+  },
+  {
+   "fact": "CLI flags: --demo, --repo, --model, --event-log, --no-open, --verbose, --help/-h, --budget (> 0), --port (0-65535; 0 = free). --flag=value is accepted. Unknown option -> exit 2 'I don't know the option “…”'. No flag for the Claude binary. USAGE does not mention WORKBENCH_CLAUDE_BIN, and neither does the README.",
+   "where": "workbench/bin/workbench.mjs:18-95"
+  },
+  {
+   "fact": "Live start: prepareRepo(path.resolve(--repo)) resolves `git rev-parse --show-toplevel`, so --repo /Users/nkov47/IDE/workbench gives root /Users/nkov47/IDE with name 'IDE'. Then availability(mods.claude/codex) runs available() under a 15 s Promise.race. engine.start() calls available() again (_checkHarnesses).",
+   "where": "workbench/bin/workbench.mjs:236-257; workbench/src/core/workspace.mjs:132-167"
+  },
+  {
+   "fact": "Executed on this Mac (no WORKBENCH_CLAUDE_BIN, exit 1, nothing created): 'Workbench could not find Claude Code or Codex on this computer, so it has nothing to run.' / '  Claude Code: Claude Code is not installed here: the claude command was not found.' / '  Codex: Codex is not installed, or the codex command could not be found.' / 'Install one of them, or try Workbench with simulated agents using --demo.'",
+   "where": "workbench/bin/workbench.mjs:248-254; workbench/src/adapters/claude/runner.mjs:36"
+  },
+  {
+   "fact": "Wording bug (read from the code): the 'not available' lines append '.' to a reason that already ends in '.'. With WORKBENCH_CLAUDE_BIN set on this Mac, startup would print 'Claude Code 2.1.322 is ready.' and then 'Codex is not available: Codex is not installed, or the codex command could not be found..'",
+   "where": "workbench/bin/workbench.mjs:255-256"
+  },
+  {
+   "fact": "Page token = 32 random bytes as hex. hookTokenFor(agentId) = HMAC-SHA256(hookKey, `workbench-hook:${agentId}`) as hex, and the key never leaves the process. hook.url is set after listen() to new URL('hook/pretool', url). The CLI prints `Workbench is running at http://127.0.0.1:<port>/?t=<token>` on stdout (accept-real.mjs parses it with a regex).",
+   "where": "workbench/bin/workbench.mjs:259-264,370,381-382"
+  },
+  {
+   "fact": "Shutdown: stopAll -> engine.shutdown() -> {kept:[{id,name,path,branch}]} -> server.close() -> store.close() -> tellKept(kept, true) prints 'What the agent did stays…' plus '  <name>: <path> (branch <branch>)'. forceExit (second Ctrl-C or 12 s) runs killAllSync and keptFolders(). Merge or discard changes what these lists should contain.",
+   "where": "workbench/bin/workbench.mjs:297-339"
+  },
+  {
+   "fact": "claudeBin(env) = env.WORKBENCH_CLAUDE_BIN || 'claude', read at call time. The engine passes no env to createRunner (engine.mjs:1328-1334, 1629), so runners use process.env, and setting process.env.WORKBENCH_CLAUDE_BIN early in the CLI would cover available() and every launch. execFile/spawn resolve a bare 'claude' through the child env's PATH.",
+   "where": "workbench/src/adapters/claude/args.mjs:42-44"
+  },
+  {
+   "fact": "available() runs `<bin> --version` (5 s, scrubbed env). ENOENT -> 'Claude Code is not installed here: the claude command was not found.' (the same text even when WORKBENCH_CLAUDE_BIN names a bad path). EACCES -> 'permission was refused'. Timeout -> 'did not answer when asked for its version'. The version is parsed with /\\d+\\.\\d+\\.\\d+[\\w.-]*/. Executed with the VS Code binary: {ok:true, version:'2.1.322'}.",
+   "where": "workbench/src/adapters/claude/runner.mjs:31-47"
+  },
+  {
+   "fact": "The only Claude Code on this Mac is /Users/nkov47/.vscode/extensions/anthropic.claude-code-2.1.322-darwin-arm64/resources/native-binary/claude (`--version` prints '2.1.322 (Claude Code)'). The path contains the version, so it changes with every extension update. This very session runs that binary (CLAUDE_CODE_EXECPATH, ENTRYPOINT=claude-vscode, stream-json I/O).",
+   "where": "(executed) environment"
+  },
+  {
+   "fact": "The launch argv (2.1.221-verified): -p --input-format stream-json --output-format stream-json --verbose --forward-subagent-text --setting-sources project --permission-mode default --strict-mcp-config --disallowedTools '<11 names>' --settings <hook JSON> --append-system-prompt WORKBENCH_PROMPT --max-budget-usd <n> (--session-id <uuid> | --resume <id>) --name <name> [--model <m>]. env = scrubEnv(base) + WORKBENCH_HOOK_URL/TOKEN/AGENT_ID.",
+   "where": "workbench/src/adapters/claude/args.mjs:165-215"
+  },
+  {
+   "fact": "2.1.322 flag check (executed): all 15 flags appear in --help (-p/--print, --input-format, --output-format, --verbose, --forward-subagent-text, --setting-sources, --permission-mode, --strict-mcp-config, --disallowedTools, --settings, --append-system-prompt, --max-budget-usd, --session-id, -n/--name, -r/--resume, --model). The full buildClaudeLaunch argv minus -p plus --version exits 0 printing 2.1.322 for both variants. Appending --bogus-flag-xyz gives \"error: unknown option '--bogus-flag-xyz'\". Not exercised: validations that apply only with --print.",
+   "where": "(executed) 2.1.322 binary"
+  },
+  {
+   "fact": "--permission-mode in 2.1.322: --help choices are acceptEdits, auto, bypassPermissions, manual, dontAsk, plan. 'bogus' is rejected with an error listing those choices; 'default' and 'manual' are both accepted (executed). Binary: eN=['acceptEdits','auto','bypassPermissions','default','dontAsk','plan'], sz='manual', ZS(e) = e==='manual' ? 'default' : e. So 'default' is canonical and 'manual' is an alias. Keep 'default': 2.1.221 does not know 'manual'.",
+   "where": "workbench/src/adapters/claude/args.mjs:198"
+  },
+  {
+   "fact": "DISALLOWED_TOOLS = 'Workflow CronCreate CronDelete CronList ScheduleWakeup PushNotification EnterWorktree ExitWorktree AskUserQuestion RemoteTrigger DesignSync'. All 11 still exist as tool names in 2.1.322 (binary strings). The list is pinned in four places: args.mjs:17; test/claude-runner.test.mjs:101 (exact argv) and :108 (`DISALLOWED_TOOLS.split(' ').length, 11`); test/helpers/claude-fake.mjs:69 (subset check: AskUserQuestion, DesignSync, CronList); ARCHITECTURE.md:149-153 launch block and the :161 bullet.",
+   "where": "workbench/src/adapters/claude/args.mjs:17"
+  },
+  {
+   "fact": "New 2.1.322 tool names found in the binary (static; enablement is feature-gated): SendFile ('Send one or more files to another Claude Code session — a peer session on this machine, or a Remote Control / cloud session on another machine'); ListAgents (alias ListPeers; live in this SDK session's own tool list); SendToProject (sends the session's work to a Claude Project on claude.ai); PublishPlugin (publishes a folder to the org library on claude.ai); WrapUp ('Call it once in EVERY turn…', a next-step box drawn by the app); WaitForMcpServers; SendUserMessage (alias Brief, only with --brief); REPL (alias Eval, runs code); LSP; PowerShell; Artifact. Alias map: Task->Agent, KillShell/KillBash->TaskStop, ListPeers->ListAgents, Brief->SendUserMessage, Eval->REPL.",
+   "where": "(binary strings) 2.1.322"
+  },
+  {
+   "fact": "The policy fails closed on any unknown tool: judge() falls through to ask(R.unknownTool, 'This tool is not on the list of safe tools.'). SAFE_TOOLS = ToolSearch, TaskCreate, TaskUpdate, TaskGet, TaskList, TaskOutput, TaskStop, TodoWrite, Skill, WebSearch, ReportFindings. SendMessage to an address containing ':', '/' or '\\' (uds:…, bridge:…) already asks.",
+   "where": "workbench/src/core/policy.mjs:20-23,181-195,210-216"
+  },
+  {
+   "fact": "In 2.1.322, permission rules naming an unknown tool (which includes --disallowedTools) produce only the warning 'Permission deny rule \"X\" matches no known tool — check for typos.', not a failure. A hook matcher of '*' or '.*' is still match-all (matcherIsMatchAll).",
+   "where": "(binary strings) 2.1.322"
+  },
+  {
+   "fact": "--permission-prompts is new (default 'host'). With no --permission-prompt-tool and no --sdk-url, the target is undefined: FRr returns `t ? 'stdio' : e` and Dfe(undefined) is false. So a prompt Claude Code would raise itself in -p mode is still auto-denied, as in 2.1.221. Workbench needs no change here.",
+   "where": "(binary strings) 2.1.322"
+  },
+  {
+   "fact": "--system-prompt-snapshot defaults to 'on': the system prompt, including --append-system-prompt, is recorded on a conversation's first request and replayed verbatim on every later request and resume, even when a later launch passes different text, until compaction. Continued (resumed) agents therefore keep the old WORKBENCH_PROMPT.",
+   "where": "(executed) claude --help, 2.1.322"
+  },
+  {
+   "fact": "2.1.322 result schema text for total_cost_usd: '…a resumed or forked session continues from the total its transcript saved, when it has one (so the first result already carries the earlier turns; maxBudgetUsd counts only the spend since this query() call started or last /clear)…'. A new @internal field model_usage_since_last_result gives per-process usage since the previous result. parse.mjs continueSpend already detects whether totals were reset or kept after an in-run relaunch. The engine's _withEarlierSpend adds earlier-run spend unconditionally (ARCHITECTURE.md:109 predicted the resulting double count).",
+   "where": "workbench/src/adapters/claude/parse.mjs:620-660; workbench/src/core/engine.mjs:1355-1368"
+  },
+  {
+   "fact": "The stream-json stdin shape {type:'user', message:{role:'user', content:[{type:'text', text}]}} is still accepted. The 2.1.322 reader checks only `message.role === 'user'` (fatal otherwise). parent_tool_use_id is not required on input.",
+   "where": "workbench/src/adapters/claude/args.mjs:218-220"
+  },
+  {
+   "fact": "sessionExists/sessionFolders still match 2.1.322's layout: <config>/projects/<key>/<uuid>.jsonl plus a <uuid>/ folder, and /private/tmp/claude-<uid>/<key>/ (checked against this Mac's live sessions). sessionExists returns null for a non-UUID id and false for an unknown UUID (executed). A new <config>/projects/<key>/memory/ folder exists (auto-memory).",
+   "where": "workbench/src/adapters/claude/args.mjs:104-136"
+  },
+  {
+   "fact": "SCRUB_ENV_RE removes every Claude marker present in this 2.1.322 session (CLAUDECODE, CLAUDE_PID, CLAUDE_EFFORT, CLAUDE_AGENT_SDK_VERSION, CLAUDE_CODE_CHILD_SESSION, _ENTRYPOINT, _EXECPATH, _MESSAGING_SOCKET, _MESSAGING_TOKEN, _SESSION_ID, _SESSION_ATTENDED, _EMIT_STARTUP_TIMING, _ENABLE_SDK_FILE_CHECKPOINTING, _ENABLE_TASKS, _QUESTION_PREVIEW_FORMAT, _STARTUP_FAILURE_RESULTS). Kept when launched from VS Code: VSCODE_IPC_HOOK, VSCODE_PID and other VSCODE_*, ELECTRON_RUN_AS_NODE=1, GIT_EDITOR (=true under Claude Code), MCP_CONNECTION_NONBLOCKING, and WORKBENCH_CLAUDE_BIN/WORKBENCH_CODEX_BIN.",
+   "where": "workbench/src/adapters/claude/args.mjs:32,86-93"
+  },
+  {
+   "fact": "Hook bridge: exit 2 blocks (fail closed); waits up to 31 min (WAIT_MS) against Claude Code's 1800 s hook timeout and the engine's 25 min hold; request body at most 64 KB, shortening only the content/new_string/old_string/new_source fields of Write/Edit/MultiEdit/NotebookEdit; prints only {hookSpecificOutput:{hookEventName, permissionDecision, permissionDecisionReason?}}. The protocol strings (PreToolUse, hookSpecificOutput, permissionDecision, disableAllHooks) are all present in 2.1.322. Exit-2 behaviour was not re-run.",
+   "where": "workbench/src/adapters/claude/hook-bridge.mjs:14-19,91-108,152-184"
+  },
+  {
+   "fact": "accept-real.mjs spawns the CLI with --repo <throwaway> --no-open --port 0 --budget 0.5 --model haiku and needs a committed workbench.json there. It drives /api/command, then /api/confirm, then /api/agents/:id/answer, and polls /api/state for at most 300 s. Its cleanup runs `git worktree remove --force` and prune but never deletes the workbench/<slug>-<id> branch. On this Mac it needs WORKBENCH_CLAUDE_BIN, because it uses whatever the CLI finds.",
+   "where": "workbench/scripts/accept-real.mjs:45-72,142-149"
+  },
+  {
+   "fact": "Workspace primitives for merge, discard and changes: git(args, {cwd, timeout=30 s, input, okCodes}) always prepends -c core.fsmonitor=false and uses gitEnv(), which copies process.env (so GIT_EDITOR too), sets GIT_TERMINAL_PROMPT=0, GIT_OPTIONAL_LOCKS=0, LC_ALL=C, and drops GIT_DIR and the other redirect variables. removeWorkspace({repoRoot, path, deleteBranch, onlyIfUnchanged, base}): without onlyIfUnchanged it runs `worktree remove --force` and then `branch -D` only for workbench/ branches. diffStats already runs `git diff --numstat -z --no-renames --no-ext-diff --no-textconv <base> --`.",
+   "where": "workbench/src/core/workspace.mjs:26-62,255-299,405-412"
+  },
+  {
+   "fact": "Dogfood target repo: root /Users/nkov47/IDE on branch cloud-build (main also exists; the tree was clean). No committed workbench.json, .claude/ or CLAUDE.md, so agents end 'done_claimed' with no checks. .gitignore holds .env, .env.* and workbench/test/.http-tmp-*. node is not on PATH, and the policy auto-allows test runs only for the bare word `node`/`npm test` (policy.mjs:936-970).",
+   "where": "(executed) /Users/nkov47/IDE"
+  },
+  {
+   "fact": "Baseline: http, workbench-cli, claude-runner and claude-hook-bridge tests pass 57/57. The full suite passes 541/541 in about 23 s, also when run with an agent-like environment (WORKBENCH_CLAUDE_BIN=/nonexistent, dummy WORKBENCH_HOOK_URL/TOKEN/AGENT_ID), so no test depends on inherited WORKBENCH_* variables. test/live-fake.test.mjs builds the CLI env as {...process.env, HOME: tmp, WORKBENCH_CLAUDE_BIN: FAKE, …}.",
+   "where": "(executed) workbench/test/*.test.mjs; workbench/test/live-fake.test.mjs:64-77"
+  }
+ ],
+ "extensionPoints": [
+  {
+   "capability": "GET /api/agents/:id/changes (the agent's actual diff)",
+   "where": "workbench/src/server/http.mjs:334-352 (routes) and :393-394 (dispatcher)",
+   "how": "Add a route { method: 'GET', re: /^\\/api\\/agents\\/([^/]+)\\/changes$/, run: (b, m) => engine.changes(id(m[1])) }. GET skips the body, Origin and Content-Type checks, takes the token from the header or ?t=, and a hook token gets 401. If per-file or paged access is wanted, extend the dispatcher to `route.run(body, m, url)` and add a sanitiser next to optId (for example an optPath that rejects '..', NUL and absolute paths), because handlers cannot see the query today. The engine side should mirror workspace.mjs:412 flags (--no-ext-diff --no-textconv -z --no-renames, plus --no-color) against the agent's `base`. Include untracked files without touching the agent's index: never `git add -N`; use `git diff --no-index -- /dev/null <file>` per file or build the hunk in JS. Mark binary files, cap each file and the total (sendJson has no cap), and return something like { ok, base, head, files:[{path,status,adds,dels,binary,ignored,diff,truncated}], truncated }. Return expected refusals (unknown agent, folder gone) as 200 { ok:false, reply }. Tests to add in test/http.test.mjs: a FakeEngine.changes method; a row in the 'API routes call the engine' deepEqual (:312-342); 405 with Allow: GET for POST /changes (:344-358); 401 with a hook token (:230-244); 200 with ?t=<token>. Also add `changes: (agentId) => call('GET', …)` to ui/api.js:53-67 and a handler in scripts/ui-mock.mjs before the 404 at :414."
+  },
+  {
+   "capability": "POST /api/agents/:id/merge and /discard (confirm-first, bound to what the person saw)",
+   "where": "workbench/src/server/http.mjs:334-352; workbench/src/core/engine.mjs:2037-2046 (_confirm), :103-108 (confirmVerb), :1370-1377 (_proposeForget pattern)",
+   "how": "Follow the Forget pattern. The route only proposes: { method: 'POST', re: /^\\/api\\/agents\\/([^/]+)\\/merge$/, run: (b, m) => engine.proposeMerge(id(m[1]), { seen: optHex(b.seen) }) }, and the same for /discard. The engine stores { id: hex(6), kind: 'merge'|'discard', agentId, seen (the head sha or diff fingerprint the person viewed), target branch, sentence, detail, createdAt } in this.confirms and returns { reply, confirm: { id, sentence, detail } }. The page shows it as an ordinary confirm card ('Do it' / 'Cancel'). The act happens only on POST /api/confirm/:id { go: true }, through a new `c.kind` branch in _confirm; confirmVerb learns the new kinds, and Cancel gets its own sentences. On execution, re-check: the agent is ended and its runner is not alive, its head and status still match `seen`, the person's branch and HEAD are as shown on the card, and the main checkout's relevant files are not dirty. Anything else is 200 { ok:false, reply: 'That changed. Have another look.' }. Serialise merges per repo with an engine mutex, since HTTP does not serialise. Add an optHex sanitiser (/^[0-9a-f]{40}([0-9a-f]{24})?$/) beside optId; optId would also accept a sha. Catch git errors from workspace.mjs (no .plain) and reword them with plainReason, or they become a generic 500. Mirror the routes in ui/api.js, scripts/ui-mock.mjs, scripts/ui-behaviour-check.mjs:683 and demo-e2e.mjs. Extend test/http.test.mjs as above, and add an end-to-end case to test/live-fake.test.mjs, which already builds a temp git repo with HOME isolated."
+  },
+  {
+   "capability": "Discard removes the worktree and branch; views and history update",
+   "where": "workbench/src/core/workspace.mjs:255-299; workbench/src/server/http.mjs:279-289 (onRemoved)",
+   "how": "Use removeWorkspace({ repoRoot, path, deleteBranch: true }) without onlyIfUnchanged (worktree remove --force, then branch -D for workbench/ branches only), and stop the runner first. To take a discarded root off the board, call store.remove(id): it emits 'removed', which the server already turns into a fresh snapshot broadcast to every page (Forget does the same). Record the outcome in history field by field (recordOf, plus the cleaning in load(); ARCHITECTURE.md:410). keptFolders() and shutdown().kept must no longer list it, and they feed the CLI's exit listing (bin/workbench.mjs:297-305)."
+  },
+  {
+   "capability": "CLI: find Claude Code on this Mac and explain how",
+   "where": "workbench/bin/workbench.mjs:39-95 (parseArgs), :236-257 (availability and messages); workbench/src/adapters/claude/args.mjs:42-44 (claudeBin)",
+   "how": "Option A, a `--claude <path>` flag: add a `case '--claude'` in parseArgs and set process.env.WORKBENCH_CLAUDE_BIN before loadModules/availability (claudeBin reads the env at call time, and runners use process.env). Option B, auto-discovery in args.mjs: when WORKBENCH_CLAUDE_BIN is unset and `claude` is ENOENT, try the highest version of ~/.vscode/extensions/anthropic.claude-code-*-darwin-*/resources/native-binary/claude (also .vscode-insiders and .cursor). Have available() return which path it used, so the CLI can say 'Claude Code 2.1.322 is ready (from the VS Code extension).' Also: mention WORKBENCH_CLAUDE_BIN or --claude in the not-found block and in USAGE; give a distinct reason when WORKBENCH_CLAUDE_BIN names a missing path; fix the '..' at :255-256 by not appending '.' to a reason that already ends in one. Tests: test/workbench-cli.test.mjs (parse errors only; those cases stop before any module loads) and the available() test in test/claude-runner.test.mjs:258-268."
+  },
+  {
+   "capability": "CLI: refuse a nested live Workbench started by an agent",
+   "where": "workbench/bin/workbench.mjs:212-257",
+   "how": "Agents inherit WORKBENCH_AGENT_ID and WORKBENCH_CLAUDE_BIN, and policy.mjs:958-970 auto-allows `node <script inside folder>`. When process.env.WORKBENCH_AGENT_ID is set and not --demo, exit 2 with a plain sentence. test/live-fake*.test.mjs spread process.env into the CLI env, so they must then delete WORKBENCH_AGENT_ID (and WORKBENCH_HOOK_*) or they will fail when an agent runs npm test. Consider also adding WORKBENCH_CLAUDE_BIN and WORKBENCH_CODEX_BIN to the agent-env scrub in args.mjs. Tests set these variables explicitly, and the full suite passes without inheriting them."
+  },
+  {
+   "capability": "Claude 2.1.322 disallowed-tool update",
+   "where": "workbench/src/adapters/claude/args.mjs:17",
+   "how": "Candidates to add to DISALLOWED_TOOLS: SendFile (ships files to other sessions or machines), SendToProject (claude.ai cloud), PublishPlugin (claude.ai org library; its own confirm pane cannot show headless), ListAgents (lists other local and cloud sessions; live in this binary's SDK sessions). Possibly also WrapUp (would ask on every turn end if enabled headless), WaitForMcpServers and SendUserMessage. Unknown names only produce a warning in 2.1.322. Update all four pinned places together: args.mjs:17; test/claude-runner.test.mjs:101 and :108 (length 11); test/helpers/claude-fake.mjs:69; ARCHITECTURE.md:149-153 and :161. Never add REPL, SendFile or any code-running or message-sending tool to policy SAFE_TOOLS (policy.mjs:14-23)."
+  },
+  {
+   "capability": "Record which Claude Code version and tools each agent ran with (compatibility telemetry)",
+   "where": "workbench/src/adapters/claude/parse.mjs (system/init handling); workbench/src/adapters/claude/runner.mjs:164-169",
+   "how": "system/init already carries tools, claude_code_version and permissionMode (see the 2.1.221 fixtures), and nothing reads them today. Log tools and version once per process from onLine or the parser, and warn in plain words when a tool is in neither SAFE_TOOLS nor DISALLOWED_TOOLS nor known to the policy. Optionally show harnessInfo.claude.version on the page, and warn at startup when the version differs from the verified 2.1.221."
+  },
+  {
+   "capability": "Dogfood run configuration (no code)",
+   "where": "/Users/nkov47/IDE (repo root); workbench/scripts/accept-real.mjs",
+   "how": "Start the CLI with PATH=/Users/nkov47/.local/opt/node-v26.13.1-darwin-arm64/bin:$PATH so agents' `npm test`/`node --test` match the policy's bare `node` and checks find node, and with WORKBENCH_CLAUDE_BIN=<extension binary>. Command: node bin/workbench.mjs --repo /Users/nkov47/IDE --model <m> --budget <n>. Commit a root workbench.json; it is read from HEAD at the root, not from workbench/. Suggested check: { name: 'tests', run: 'cd workbench && npm test', timeoutSec: 300 }, since the suite takes about 23 s. First run scripts/accept-real.mjs on a throwaway repo with the same WORKBENCH_CLAUDE_BIN, to re-verify the hook (exit 2), init/result shapes and helpers on 2.1.322 before dogfooding."
+  }
+ ],
+ "rulesToHonour": [
+  "Node 22+, ES modules, no third-party packages; files in src/shared/ (e.g. a new event kind in events.mjs) must not import node: modules (ARCHITECTURE.md:16-17).",
+  "Tests use node:test and node:assert/strict in test/<module>.test.mjs, need no network, and never start a real claude or codex. Use the WORKBENCH_CLAUDE_BIN/WORKBENCH_CODEX_BIN fakes and temp HOME/git repos (ARCHITECTURE.md:18).",
+  "Every child process gets an argument array (execFile/spawn), never a shell string. All git work goes through workspace.git() (core.fsmonitor=false, scrubbed redirect variables, timeouts) (ARCHITECTURE.md:19).",
+  "Anything a person sees is plain sentences, not identifiers; page errors never say 'token' or 'fetch' (ARCHITECTURE.md:20, 504).",
+  "A builder edits only its own files and owns their tests. Routes and CLI belong to the 'Store, engine, history, server, CLI' area; git operations to 'Language, policy, workspaces, receipt'; the Claude flags to the 'Claude Code adapter' area (ARCHITECTURE.md:22-34). Code and ARCHITECTURE.md must agree: update the HTTP table (ARCHITECTURE.md:443-453), the button table (:553-571) and the Claude adapter section (:141-213) with any change.",
+  "HTTP safety, all required (ARCHITECTURE.md:455-463): 127.0.0.1 only; 32-byte hex token compared in constant time; every /api and /hook route needs the token; a hook token never opens /api; Host must be 127.0.0.1:<port> or localhost:<port>; POSTs need application/json, at most 64 KB, and an absent or same Origin; no CORS headers; the CSP and other security headers on every response.",
+  "Path ids are validated with ID_RE (404 otherwise); body ids that are not id strings become null; booleans are taken only as `=== true` (http.mjs:324-332,342,350).",
+  "Confirm first: launches always go through a confirm card (ARCHITECTURE.md:300), and so do stops or messages that do not name the agent (:301) and Forget (:112, :566). Merge and discard should use the same ordinary confirm card ('Do it' / 'Cancel', POST /api/confirm/:id {go}) (:567). Confirms expire after 10 minutes. A card the page drops for another reason is withdrawn with {go:false} (:587-588).",
+  "A yes answers only the confirm on screen, never 'the newest one' (ARCHITECTURE.md:302-306). Answers are bound to the ask on screen by id (:308-311). Buttons send the ids they were drawn for (:554). /say and /stop carry nothing about what was seen, so the page sends them only while the agent is still in the drawn state, else 'That changed. Have another look.' (:571). A merge or discard request must likewise carry, and the engine re-check, what the person saw (agent, head or diff fingerprint, target branch).",
+  "Refusals are 200 {ok:false, reply}; ui/api.js throws them as `refused`, and the request stays as it was (ARCHITECTURE.md:586).",
+  "The lid holds one thing at a time with at most two answers, side by side or stacked, with the first one primary (ARCHITECTURE.md:530, 538). Merge or discard buttons must fit that limit beside the existing 'Looks good' and follow-up buttons on finished work.",
+  "An agent's worktree and branch are the only copy of its work. Nothing that may hold work is removed without the person's explicit yes; shutdown tidies only unchanged folders (removeWorkspace onlyIfUnchanged); Forget never touches the folder or branch (ARCHITECTURE.md:103-104, 112).",
+  "History records are built field by field (recordOf) and cleaned again on load (unknown fields dropped). New merge or discard fields must be added to both, and must never include tokens, environment or command output (ARCHITECTURE.md:410-412).",
+  "Claude Code adapter facts must come from real runs; the section header still says 2.1.221 (ARCHITECTURE.md:143). Keep `--permission-mode default`, `--setting-sources project` and `--strict-mcp-config`, the pinned `--settings` env with disableAllHooks:false, the hook key only in the process environment (never in argv), and exit-2 fail-closed (ARCHITECTURE.md:122-167).",
+  "The SSE stream has no 'removed' event: removing an agent from the store must go through store.remove, which makes the server broadcast a fresh snapshot (ARCHITECTURE.md:445; http.mjs:279-289)."
+ ],
+ "risks": [
+  "Dogfood, high: an agent working on Workbench's own repo can run `node bin/workbench.mjs --repo . --no-open --port 0` or `node scripts/accept-real.mjs`, and these are auto-approved (policy.mjs:958-970, node script inside the folder). It inherits WORKBENCH_CLAUDE_BIN (not scrubbed), so the nested Workbench launches real Claude agents on the person's login that the person never sees. The agent can also read the nested URL and token from stdout and approve the nested agents' permission requests through the nested API, which bypasses the person entirely. The nested run would also create workbench/* branches in the shared repo.",
+  "Compatibility, high: on 2.1.322 a resumed session's total_cost_usd already includes earlier turns (from the result-schema text in the binary), yet engine._withEarlierSpend (engine.mjs:1355-1368) adds the earlier run's spend to every usage 'set' of a continued agent. The card's cost and 'spent today' would show earlier spend twice (predicted at ARCHITECTURE.md:109). --max-budget-usd counts only the new process, so the 'fresh limit' promise still holds. In-run relaunches are handled by parse.mjs continueSpend.",
+  "Compatibility: new 2.1.322 tools that are in neither SAFE_TOOLS nor DISALLOWED_TOOLS each become an ask with the reason 'This tool is not on the list of safe tools.' ListAgents is live in this binary's SDK sessions; WrapUp, if enabled headless, is told to run in every turn and would ask at every turn end; SendFile can send files to other sessions or machines. This fails closed, but it is noisy, and an approving person could exfiltrate files.",
+  "Compatibility: --system-prompt-snapshot defaults to on in 2.1.322, so agents continued from history keep the WORKBENCH_PROMPT they started with. Prompt changes made while dogfooding (for example 'commit your work') never reach resumed sessions until they are compacted.",
+  "Unverified on 2.1.322 (static or parse-only evidence): that the PreToolUse hook from --settings fires and that exit 2 blocks; the init and result shapes; background-task and helper event shapes; behaviour of the --print-only validations. The parse probe dropped -p. In -p mode, 'settings files that fail validation are silently ignored' (from --help). If the --settings hook JSON were ever rejected, agents would run under Claude Code's own checks with no asks shown: fail closed, but stuck. The first real step must be scripts/accept-real.mjs.",
+  "Merge safety: agent worktrees share the main checkout's .git (config, hooks, info). An agent that once got approval for `git config …` or a write into the common dir can plant core.hooksPath, hooks, merge drivers, or clean/smudge filters that a Workbench-run merge in the person's checkout would execute. The engine currently pins only core.fsmonitor=false (workspace.mjs:36). diff and changes code must keep --no-ext-diff --no-textconv (as workspace.mjs:412 does).",
+  "Merge mechanics: gitEnv copies process.env, so GIT_EDITOR is inherited. It is 'true' under Claude Code, but in a VS Code terminal it may be `code --wait`, and `git merge` without --no-edit/-m (and without GIT_MERGE_AUTOEDIT=no) would block until git()'s 30 s timeout. The person's repo may lack user.name/email for a merge commit. Agents are never told to commit (WORKBENCH_PROMPT), so the work is often uncommitted in the worktree (the README says so), and someone must commit it first. Files diffStats marks `ignored: true` would be silently left out by `git add -A`.",
+  "Merge preconditions: the agent may still be running, waiting on helpers, or have a background command that keeps writing even after 'It is done' (ARCHITECTURE: the command keeps running until the agent is stopped). The person's branch may have moved on, be mid-rebase or mid-merge, be dirty, or be a detached HEAD (repo.branch null). repo info is only refreshed periodically (engine.mjs:1742). All of this must be re-read at execution and shown on the confirm card.",
+  "Concurrency: HTTP does not serialise, so two tabs or a double click can start two merges or discards at once (git index.lock races, a half-done merge). An engine-level mutex is needed. requestTimeout (300 s) does not cut long handlers, so a slow merge simply holds the request.",
+  "Diff route: the response size is unbounded in sendJson (whole buffer in memory) and git() has a 64 MB maxBuffer. Diff text is agent-written and untrusted: the page must render it as text. The CSP blocks inline script, but injected HTML could still fake buttons.",
+  "Binary lookup: on this Mac the person must set WORKBENCH_CLAUDE_BIN to a path containing the extension version. The next VS Code extension update breaks it, and the error then says 'the claude command was not found' even though a path was given. Without node on PATH, agents' test runs are not auto-approved (the policy matches the bare word `node`) and declared checks fail.",
+  "Environment: when Workbench is started from a VS Code terminal or from Claude Code, agents inherit VSCODE_IPC_HOOK*, VSCODE_PID, ELECTRON_RUN_AS_NODE=1, GIT_EDITOR and MCP_CONNECTION_NONBLOCKING (not in SCRUB_ENV_RE), which gives them a handle on the editor connection. All CLAUDE_* markers present in a 2.1.322 session are scrubbed.",
+  "Startup wording bug: 'Codex is not available: Codex is not installed, or the codex command could not be found..' (double period, bin/workbench.mjs:255-256) will show on this Mac in every live start.",
+  "scripts/accept-real.mjs removes the worktree but leaves the workbench/<slug>-<id> branch in the throwaway repo (lines 142-149), and the README tells the person to delete branches by hand. A discard feature should become the one place that cleans up both."
+ ],
+ "openQuestions": [
+  "Which tools does 2.1.322 actually enable for `-p --input-format stream-json` agents? The first real run should record system/init `tools`, `claude_code_version` and `permissionMode`. Nothing in parse.mjs keeps them today. Of particular interest: WrapUp, ListAgents, SendFile, SendToProject, PublishPlugin, WaitForMcpServers, REPL, LSP, SendUserMessage and Artifact.",
+  "Does 2.1.322 restore modelUsage token totals on --resume, as it does total_cost_usd? Record a stop-then-resume run and an earlier-agent Continue run to fix _withEarlierSpend. The @internal model_usage_since_last_result field is a possibly more robust source.",
+  "Does a headless 2.1.322 agent register itself as a messaging peer (socket or registry) that the person's other sessions, or other agents, can reach with SendMessage/SendFile? Workbench scrubs CLAUDE_CODE_MESSAGING_*, but the agent may create its own.",
+  "Does 2.1.322 auto-memory make headless agents write under ~/.claude/projects/<key>/memory/ through tool calls? Those would become outside-folder asks during dogfooding.",
+  "Merge strategy: merge commit, squash, or rebase-and-fast-forward? Who commits the agent's uncommitted work, with which identity and message, and while the agent is guaranteed not running? Is the worktree and branch removed after a successful merge, and how is a merged agent listed at exit?",
+  "Should a merge in the person's checkout run the person's own git hooks (pre-commit, post-merge) and merge drivers? An agent can plant hooks and config in the shared .git. Disabling them, for example with core.hooksPath=/dev/null, also disables the person's legitimate hooks.",
+  "Button path for Merge/Discard: dedicated POST routes that return a confirm card (recommended, ids bound), or the Forget-style POST /api/command {text, focusId}? The latter also needs commands.mjs grammar for typed or spoken 'merge it' and 'throw it away'. Either way, typed and voice commands will eventually need intents.",
+  "Which two buttons does the lid show for a finished agent once Merge and Discard exist? Today 'Looks good' and follow-ups are there, and the limit is two answers (ARCHITECTURE.md:538).",
+  "Should the CLI auto-discover the VS Code extension's binary, take a --claude flag, or only document WORKBENCH_CLAUDE_BIN? And should agents' environments lose WORKBENCH_CLAUDE_BIN/WORKBENCH_CODEX_BIN, or should the CLI refuse live mode inside an agent (WORKBENCH_AGENT_ID set)?"
+ ]
+}

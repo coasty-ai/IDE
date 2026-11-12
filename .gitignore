@@ -1,3 +1,4 @@
 .env
 .env.*
 workbench/test/.http-tmp-*
+.claude/worktrees/

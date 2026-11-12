@@ -1,0 +1,316 @@
+{
+ "area": "Engine (workbench/src/core/engine.mjs): confirm cards, command() dispatch, answer/say/stop, the receipt, history wiring (continue/forget), shutdown tidy and keptFolders, the per-agent run record and snapshot(). Covers how to add 'merge an agent's work into the person's branch', 'discard an agent's work' and a read-only 'changes/diff' query.",
+ "summary": "The engine (class Engine extends EventEmitter, 2274 lines) owns every root agent's lifecycle and words every reply the person reads. Its deps (policy, commands, workspace, receipt, history) are injected and must never be imported (engine.mjs:4-7). Per-agent state lives in this.runs, a Map from rootId to a run record built in _launch (:1642-1648) or _continueEarlier (:1318-1326): { id, harness, runner, workspace: {path, branch, base}|null, config: Promise, turnSeq, inTurn, deciding, stopped, lastText, receipt, checksDone, waiting, background, backgroundAt, accepted }. Two fields are added later: folderRemoved and earlierSpend. The AgentView carries only the workspace path (agent.created :1651), so branch and base exist only on the run record and in history records. Agents restored from history (earlier: true) have no run at all: their {path, branch|null, base|null} is earlierRecs.get(id).workspace. Every view change goes through _apply (:399). It holds the held-request invariant and calls history.schedule() for HISTORY_KINDS (:40-41, :406).\n\nWhen a turn ends, _decide (:545) builds the receipt:\n- diffStats({path, base}) gives agent.files;\n- checkRules gives agent.rules;\n- runChecks (with an AbortController signal) gives agent.checks and a done state.\nWhile this runs, run.receipt and run.deciding mark it in progress, and run.checksDone tracks when checks (even cancelled ones) have really ended. _cancelReceipt (:671) aborts it on turn start, on a message the agent took, on stop and on shutdown. During the receipt the view stays working (ACTIVE), but a not-ACTIVE root can still have a live idle Claude process, background commands it was allowed to leave running, and checks still ending.\n\nConfirm cards live in this.confirms (id from hex(6), expire after confirmTtlMs = 10 min). Three functions make them: _proposeStart (:1956), _proposeIntent (:2010, for stop or say found without the agent's name) and _proposeForget (:1370). command() (:1787) settles only the card whose id the page sends (_shownConfirm :1839). On words it does not understand it keeps the card and words a near miss with confirmVerb (:103). Any other command withdraws the card without a notice. _confirm (:2037) branches by kind (forget, stop/say), and anything else falls through to the launch path, which reads c.tasks.\n\nPublic wrappers (answer, say, stop, confirm, command) return { ok?, reply, confirm?, focusId?, agentIds? } and post the reply as a notice, except when a confirm comes back. History runs in live mode only:\n- _openHistory restores records as earlier views;\n- _historyRecords (:1265) is the write source: earlier records go out unchanged, and this run's roots are rebuilt via recordOf with run.folderRemoved ? null : run.workspace;\n- _forgetEarlier calls history.forget + store.remove + history.save().\n\nshutdown() (:258) runs in this order: drop later decisions, deny held hooks, wait for launches under way (_launching), stop runners and checks, mark active roots stopped, tidy, close history. The tidy calls _removeUnchanged (:1688: removeWorkspace with onlyIfUnchanged, base and deleteBranch) for every run with a workspace that is not folderRemoved and has no live runner. keptFolders() (:321) lists the rest. Nothing today merges or deletes work: ARCHITECTURE.md:103 says 'the page offers no merge'. snapshot() (:2259) exposes repo {name, head, branch|null, dirty}. That comes from this.repoInfo, which _refreshRepo updates fire-and-forget every 15 s, and the page receives repo only inside a snapshot (on connect, and on store 'removed').\n\nMerge and discard fit best as new confirm kinds on the forget pattern: propose in _runIntent, return a card, add a branch in _confirm before the launch fall-through, then run an executor. They also need:\n- an in-flight guard and shutdown wait, mirroring _resuming and _launching;\n- one engine-wide lock;\n- all checks repeated at yes time;\n- a new event, view field and history field to record the outcome.\nThe diff query should be read-only and reuse diffStats with the same {path, base} as the receipt. Baseline: engine.test.mjs plus history.test.mjs is 138/138 passing with node on PATH. history.test.mjs:569 fails without it, because the fake claude starts with #!/usr/bin/env node.",
+ "keyFacts": [
+  {
+   "fact": "Deps are injected (deps: { policy, commands, workspace, receipt, history? }); engine.mjs must not import them. Every use is guarded with typeof this.deps.workspace?.X === 'function'.",
+   "where": "workbench/src/core/engine.mjs:4-7; workbench/ARCHITECTURE.md:274-275"
+  },
+  {
+   "fact": "Run record: { id, harness, runner, workspace: {path,branch,base}|null (null in demo), config: Promise (workbench.json read from base), turnSeq, inTurn, deciding, stopped, lastText, receipt: {ctl}|null, checksDone: Promise|null, waiting, background, backgroundAt, accepted: Set|null }. Later fields: folderRemoved (_removeUnchanged) and earlierSpend (continued runs). A folder made during shutdown that could not be removed is stored as { id, name, workspace } with no runner.",
+   "where": "workbench/src/core/engine.mjs:1642-1648, 1318-1326, 1637, 1695"
+  },
+  {
+   "fact": "The AgentView has only workspace (a path string, from agent.created). branch and base are only on run.workspace and in history records.",
+   "where": "workbench/src/core/engine.mjs:1651; workbench/src/shared/events.mjs (newAgentView)"
+  },
+  {
+   "fact": "Earlier agents have no run. Their workspace is earlierRecs.get(id).workspace = { path, branch|null, base|null } (cleanWorkspace uses str(), so branch and base can be null). _continueEarlier copies it ({...rec.workspace}) into a new run and deletes the earlierRecs entry on success.",
+   "where": "workbench/src/core/engine.mjs:197, 1253-1255, 1317, 1346; workbench/src/core/history.mjs:76-79"
+  },
+  {
+   "fact": "Engine-wide bookkeeping: confirms Map, held, later, asks, stopped Set, stopAsked, _resuming Set (earlier agents being continued: the guard pattern), _launching Set of launch promises (awaited by shutdown: the tracking pattern).",
+   "where": "workbench/src/core/engine.mjs:196-212, 1594-1600"
+  },
+  {
+   "fact": "Confirm record shapes. Start: {id, kind:'start', tasks, sentence, detail, createdAt}. Stop/say: {id, kind, intent, sentence, detail, createdAt}. Forget: {id, kind:'forget', agentIds, sentence, detail, createdAt}. The id is hex(6), 12 hex characters (a test asserts /^[0-9a-f]{12}$/).",
+   "where": "workbench/src/core/engine.mjs:1984, 2026, 1375; workbench/test/engine.test.mjs:1386"
+  },
+  {
+   "fact": "Confirm expiry: confirmTtlMs = 10 min. tick() deletes expired cards. _confirm answers GONE ('That request is no longer waiting. Ask again if you still want it.') for an unknown or expired id. _shownConfirm returns {id, gone:true} for those, so a 'yes' hears GONE and never reaches anything else.",
+   "where": "workbench/src/core/engine.mjs:26, 49, 347, 1839-1845, 2037-2042"
+  },
+  {
+   "fact": "_shownConfirm returns { id, kind, sentence, detail, tasks, agentIds: c.intent?.agentIds }. Top-level agentIds (as forget stores them) are not passed through.",
+   "where": "workbench/src/core/engine.mjs:1844"
+  },
+  {
+   "fact": "command():\n- ctx = { agents, focusId, machines, harnesses, pendingConfirm } (keys pinned by a test).\n- An unknown intent with a card shown gives the near miss 'I did not catch that. Say “do it” to <confirmVerb>, or “cancel”.' with the same confirm and no notice.\n- Any other intent withdraws the shown card silently.\n- With a card shown, askId is nulled.\n- A plain error becomes the reply; anything else becomes 'Something went wrong while doing that. The details are in the log.'",
+   "where": "workbench/src/core/engine.mjs:1787-1832; workbench/test/engine.test.mjs:1392"
+  },
+  {
+   "fact": "confirmVerb: 'say' gives 'send it', 'forget' gives 'forget it', 'stop' gives 'stop it/them'. Every other kind gives 'start it/them', so a new kind would be worded as a launch.",
+   "where": "workbench/src/core/engine.mjs:103-108"
+  },
+  {
+   "fact": "_confirm branches:\n- forget: cancel gives 'OK, I won’t forget it.' or '… them.'; yes calls _forgetEarlier.\n- stop/say: cancel wording; yes re-runs the intent with sure:true.\n- anything else: the launch path, which reads c.tasks.length. An unhandled new kind throws a TypeError, which becomes the generic reply in command() and HTTP 500 from POST /api/confirm/:id.",
+   "where": "workbench/src/core/engine.mjs:2044-2073; workbench/src/server/http.mjs:130-137"
+  },
+  {
+   "fact": "_runIntent:\n- 'forget' only proposes a card.\n- 'continue' calls _say(v, CONTINUE_TEXT), which reaches _continueEarlier for earlier roots.\n- 'confirm' settles only the card on screen (shown.id); after a launch it sets focusId to the first new agent.",
+   "where": "workbench/src/core/engine.mjs:1889-1899, 1929-1936, 42"
+  },
+  {
+   "fact": "_proposeForget: sentence 'Forget <names>?', detail 'It will not show here again. Its folder and branch stay on this computer.' (plural variant). _forgetEarlier re-checks at yes time (a this-run agent gets '<Name> is from this run, so it stays. It is kept for next time.'), then history.forget(id), store.remove(id) and history.save() at once, and returns agentIds: []. store.remove emits 'removed', and the server answers with a fresh snapshot to every page.",
+   "where": "workbench/src/core/engine.mjs:1370-1400; workbench/src/core/store.mjs:443-453; workbench/src/server/http.mjs:288-289"
+  },
+  {
+   "fact": "answer() is bound to askId through _askFor. With no ask, a DONE root takes 'Looks good' ('Good. <Name> stays as it is.') or a follow-up through _sendTo. Refusals are {ok:false, reply}.",
+   "where": "workbench/src/core/engine.mjs:1043-1081, 1215-1220, 47"
+  },
+  {
+   "fact": "_sendTo is the one path that wakes an agent:\n- refuses while shutting down;\n- sends earlier roots to _continueEarlier;\n- clears run.stopped and this.stopped, then runner.send;\n- on success cancels the receipt and moves an ENDED root to working.\nIt has no busy check and no folder-exists check.",
+   "where": "workbench/src/core/engine.mjs:1426-1472"
+  },
+  {
+   "fact": "_stop:\n- DONE root: _closeIdle (quietly stops a live idle process, sets stopped flags, no state change), reply '<Name> had already finished.'\n- earlier root: '<Name> is from an earlier run, so nothing is running.'\n- ACTIVE root: _stopRoot sets the stopped flags, cancels the receipt, drops later decisions, denies held requests (helpers too), calls runner.stop under stopTimeoutMs, marks the root and helpers stopped, and drops their asks.",
+   "where": "workbench/src/core/engine.mjs:1483-1547"
+  },
+  {
+   "fact": "A done Claude agent normally keeps a live idle process: messages go over stdin, and when the process has gone send() resumes it with --resume in cwd. Its process group includes background commands the person allowed with 'It is done'. Claude Code can start a new turn by itself when background work ends.",
+   "where": "workbench/src/adapters/claude/runner.mjs:308-331; workbench/src/core/engine.mjs:1186-1202; workbench/ARCHITECTURE.md:82-84"
+  },
+  {
+   "fact": "Receipt in _decide, in order:\n1. run.receipt = {ctl}, deciding = true.\n2. diffStats({path: ws.path, base: ws.base}) gives EV.FILES.\n3. await run.config.\n4. checkRules gives EV.RULES.\n5. With no question and declared checks: await run.checksDone, then runChecks({cwd, checks, onProgress, signal}), tracking run.checksDone.\nstale() re-checks after every await. finally clears receipt and deciding.",
+   "where": "workbench/src/core/engine.mjs:545-668 (572-577, 584-595, 599, 613-617, 642-647)"
+  },
+  {
+   "fact": "_cancelReceipt aborts the signal, clears receipt and deciding, and sets checks to none if they were running. It does not wait for checksDone. Called on turn start (:502), _sendTo success (:1466), _stopRoot (:1501) and shutdown (:284).",
+   "where": "workbench/src/core/engine.mjs:671-680"
+  },
+  {
+   "fact": "The done state is applied only at the very end of _decide, so the view is working (ACTIVE) for the whole receipt. 'Not ACTIVE' therefore excludes a receipt in progress, but not checks still ending or an idle live process.",
+   "where": "workbench/src/core/engine.mjs:648-667"
+  },
+  {
+   "fact": "In the store, a turn start and leaving an ENDED state clear says, files and rules and reset checks, so v.files is the last receipt, not a live diff. Unknown event kinds are ignored, and events for unknown agents are dropped.",
+   "where": "workbench/src/core/store.mjs:304-315, 390-395, 497-502, 240-241, 378-379"
+  },
+  {
+   "fact": "History wiring (live only): h.load() feeds store.restore(rec, _canContinue(rec)) and earlierRecs; h.source(() => _historyRecords()). _apply schedules a debounced write for HISTORY_KINDS. killAllSync saves. shutdown closes the history after the tidy.",
+   "where": "workbench/src/core/engine.mjs:1247-1262, 40-41, 406, 330, 310"
+  },
+  {
+   "fact": "_historyRecords pushes earlier records unchanged and rebuilds this run's roots as history.recordOf(v, run.folderRemoved ? null : (run.workspace||null), now). Roots with no run, and helpers, are skipped.",
+   "where": "workbench/src/core/engine.mjs:1265-1281"
+  },
+  {
+   "fact": "History.flush keeps records already in the file that are not in the source and not forgotten ('another Workbench'). A root removed from the store without history.forget(id) is therefore re-written with its last record, old workspace included.",
+   "where": "workbench/src/core/history.mjs:244-261, 211-214"
+  },
+  {
+   "fact": "recordOf builds a record field by field (keys pinned by a test). Its workspace argument: undefined means take the view's path; null means the folder was removed, which later reads 'Its folder was not kept, so it cannot continue.'",
+   "where": "workbench/src/core/history.mjs:86-116; workbench/test/history.test.mjs:97; workbench/src/core/engine.mjs:1290"
+  },
+  {
+   "fact": "_continueEarlier:\n- refuses while _shuttingDown, when the record is gone, or when _resuming already has the agent;\n- re-checks _canContinue (harness, sessionId, workspace, a directory with .git, sessionExists !== false) and calls store.markContinue on failure;\n- on success applies EV.RESUMED + working with a fresh budget.",
+   "where": "workbench/src/core/engine.mjs:1284-1353"
+  },
+  {
+   "fact": "Shutdown order: timers and machines, drop later, deny held, await _launching (withTimeout stopTimeoutMs = 8 s), stop runners and collect checksDone, mark active roots stopped, tidy, history.close(), return { kept: keptFolders() }. The tidy covers runs with a workspace, not folderRemoved and runner not alive, through _removeUnchanged under tidyTimeoutMs = 3 s.",
+   "where": "workbench/src/core/engine.mjs:258-314"
+  },
+  {
+   "fact": "_removeUnchanged calls removeWorkspace({ repoRoot: repoInfo.root, path, base, onlyIfUnchanged: true, deleteBranch: true }) under withTimeout and sets folderRemoved only on {removed:true}. withTimeout rejects at the limit but never cancels the underlying git call.",
+   "where": "workbench/src/core/engine.mjs:1688-1701, 124-130"
+  },
+  {
+   "fact": "removeWorkspace:\n- only acts on folders git lists as worktrees, never the main folder;\n- onlyIfUnchanged (needs base): removes only when HEAD equals base, status --ignored --untracked-files=all is empty and a non-force remove succeeds, then runs update-ref -d on the branch at base;\n- without it: worktree remove --force, then branch -D (workbench/ branches only);\n- a folder that is no longer listed: prune, return {removed:false}, and leave the branch.",
+   "where": "workbench/src/core/workspace.mjs:255-295"
+  },
+  {
+   "fact": "keptFolders() returns runs with a workspace and not folderRemoved as { id, name, path, branch }. The CLI prints these after shutdown, or after a forced exit.",
+   "where": "workbench/src/core/engine.mjs:321-325; workbench/bin/workbench.mjs:319, 331"
+  },
+  {
+   "fact": "repoInfo = prepareRepo() = { root, name, head, branch|null (detached HEAD), dirty }, where dirty counts porcelain entries. It is refreshed fire-and-forget every 15 s in live mode. snapshot().repo is { name, head, branch, dirty } (deepEqual-pinned by a test). The page receives repo only inside a snapshot.",
+   "where": "workbench/src/core/engine.mjs:184, 352-355, 1734-1749, 2259-2273; workbench/src/core/workspace.mjs:132-180; workbench/test/engine.test.mjs:2288"
+  },
+  {
+   "fact": "_startDetail already speaks about git in plain words: 'It works in its own copy of shop, made from the last commit.' and 'Your 2 uncommitted changes are not included.'",
+   "where": "workbench/src/core/engine.mjs:1988-2004"
+  },
+  {
+   "fact": "workbench.json (checks, rules, allow) is read once per run from the base commit, never from the agent's working copy. It is cached as the run.config promise.",
+   "where": "workbench/src/core/engine.mjs:1720-1732, 1644"
+  },
+  {
+   "fact": "diffStats covers committed and uncommitted changes against base, untracked files, and files an agent-added .gitignore hides (ignored: true). It runs git diff with --no-renames --no-ext-diff --no-textconv. Every git call uses an argument array, -c core.fsmonitor=false and GIT_OPTIONAL_LOCKS=0.",
+   "where": "workbench/src/core/workspace.mjs:405-449, 412, 23-36"
+  },
+  {
+   "fact": "Agent work is usually uncommitted: the README says 'The changes may not be committed.' The policy's safe git commands are status, diff, log, show, rev-parse, ls-files, blame, grep and branch without -d; any other git command asks.",
+   "where": "workbench/README.md:119; workbench/ARCHITECTURE.md:368"
+  },
+  {
+   "fact": "Parser behaviour, checked with the real parseCommand:\n- With a card of any kind other than stop or say: 'start it' and 'launch it' are {confirm, go:true}; 'forget it', 'stop', 'stop it' and 'cancel' are go:false; 'merge it', 'discard it', 'throw it away' and 'delete it' are unknown.\n- With no card: 'merge search cleanup', 'delete search cleanup', 'bring it in', 'show me the diff' and 'merge the two config files' parse as kind 'task' (a launch card); 'merge it', 'discard it', 'land it' and 'what changed' are unknown.",
+   "where": "workbench/src/core/commands.mjs:382-414, 1151-1162"
+  },
+  {
+   "fact": "matchForget and matchContinue are the pattern for commands about an agent: the verb comes first, resolveList/resolveRef reads the rest, and r.full must hold, so 'forget the old plan and use the new one' stays work. strong = r.named. matchCommand order: stop_all, machines, stop, forget, continue, status/spend, say, start.",
+   "where": "workbench/src/core/commands.mjs:569-592, 1151-1162"
+  },
+  {
+   "fact": "Lid buttons today:\n- done: Looks good + Ask for a change (in 'more', a quiet 'What changed?' lists the files);\n- earlier: Continue (when canContinue) + Forget (posts /api/command 'forget it' with focusId);\n- failed: Try again / Dismiss;\n- stopped: Continue / Dismiss.",
+   "where": "workbench/ui/focus.js:164-165, 239-254; workbench/ARCHITECTURE.md:543, 566"
+  },
+  {
+   "fact": "HTTP routes call engine methods directly. Ids must match ID_RE /^[A-Za-z0-9_-]{1,80}$/. POST /api/confirm/:id {go} calls engine.confirm. GET routes may carry the token in ?t=.",
+   "where": "workbench/src/server/http.mjs:47, 332-351; workbench/ARCHITECTURE.md:440-453"
+  },
+  {
+   "fact": "The server serves ui/ and src/shared/ live from the program's own folder (DEFAULT_ROOT = workbench/). Engine code is loaded once at start.",
+   "where": "workbench/src/server/http.mjs:16, 109-110; workbench/bin/workbench.mjs:153-168"
+  },
+  {
+   "fact": "The git root of this checkout is /Users/nkov47/IDE (workbench/ is a subfolder), so agent worktrees copy the whole repository. workbench.json is read from the repo root, and none exists today. Checks run as /bin/sh -c in the worktree root with the inherited, scrubbed environment, so PATH must contain node.",
+   "where": "workbench/src/core/receipt.mjs:110-117, 175; workbench/src/core/workspace.mjs:490"
+  },
+  {
+   "fact": "Test harness in engine.test.mjs:\n- live() builds a Store, fakeAdapter claude/codex, fakeDeps and FakeMachines with options { permissionTimeoutMs:5000, tickMs:10_000_000, helperWaitMs:60, exitGraceMs:20 }; demo() uses FakeSim;\n- started(t, opts) returns { v, id, runner }, and runner.emit({kind: EV.TURN, …}) drives turns;\n- settled(p), until(fn) and gate() hold or poll async work;\n- every test ends with engine.shutdown().",
+   "where": "workbench/test/engine.test.mjs:17-57; workbench/test/helpers/engine-fakes.mjs:86-170"
+  },
+  {
+   "fact": "fakeDeps returns { deps: {policy, commands, workspace, receipt}, calls }, where calls records decide, parse, createWorkspace, diffStats, readRepoConfig, checkRules, runChecks, removeWorkspace and killChecksSync.\n- workspace fake: prepareRepo returns {root, name:'shop', head:'abc1234', branch:'main', dirty:2}; createWorkspace returns {path:'/wt/shop/<slug>-<id>', branch:'workbench/<slug>-<id>', base:'abc1234'}; removeWorkspace returns {removed:true}.\n- There is no history, merge or diff fake.\n- commands.intent is an object or a (text, ctx) function; tests switch to the real parser with t.engine.deps.commands = commands.",
+   "where": "workbench/test/helpers/engine-fakes.mjs:97-159; workbench/test/engine.test.mjs:1432"
+  },
+  {
+   "fact": "history.test.mjs world() runs a live engine with the real history module (temp historyDir, 15 ms debounce), the real parser, fake worktree folders holding a .git file, and removeWorkspace returning {removed: !workspaceKept}. finishOne() drives an agent to done_claimed with a session id.",
+   "where": "workbench/test/history.test.mjs:24-63"
+  },
+  {
+   "fact": "Baseline: engine.test.mjs + history.test.mjs is 138/138 passing with node's bin folder on PATH. Without it, history.test.mjs:569 times out, because test/helpers/claude-fake.mjs starts with #!/usr/bin/env node.",
+   "where": "workbench/test/history.test.mjs:569-594"
+  }
+ ],
+ "extensionPoints": [
+  {
+   "capability": "Read-only changes/diff query (real diffs behind 'What changed?')",
+   "where": "engine.mjs: a new public async changes(agentId, opts) beside say()/stop() (~:1405-1495), plus a helper _workspaceOf(root). Needs a new deps.workspace.diffText (workspace area) and GET /api/agents/:id/changes (server area).",
+   "how": "1. Find the root: v.parentId ? store.get(v.rootId) : v.\n2. Find the workspace: run && !run.folderRemoved ? run.workspace : (root.earlier ? earlierRecs.get(root.id)?.workspace : null).\n3. Call deps.workspace.diffStats({ path, base }) exactly as the receipt does (:585), so the list equals v.files and what a land would take.\n4. Call a new deps.workspace.diffText({ path, base, paths?, maxBytes }):\n   - git diff --no-ext-diff --no-textconv --no-renames <base> --;\n   - read untracked and agent-ignored files with lstat, never following links;\n   - never run `git add -N`, never write the index;\n   - cap the bytes and the number of files.\n5. Return { ok:true, files, patches:[{ path, text|binary|large|truncated }], live: ACTIVE.has(root.state) }, or { ok:false, reply } (e.g. 'Fix login redirect’s folder is gone, so there is nothing to show.').\n6. Post no notice: answer, say and stop call _notice, a read must not.\n7. Allow it in every state, during a turn too (the page says the work may still change), and never take the busy flag.\n8. Demo: an optional sim method if present (pattern _simStop :1529), else a plain reply.\nTests: add diffText to fakeDeps.workspace, recording calls.diffText. Assert that path and base come from run.workspace and from the earlier record, that a removed folder is refused, that a helper resolves to its root, and that no notice is posted."
+  },
+  {
+   "capability": "Propose a merge ('bring its work into your branch')",
+   "where": "_runIntent: a new case 'merge' beside 'forget' (:1889-1893). A new async _proposeMerge(v) modelled on _proposeForget (:1370-1377). Optionally a public proposeMerge(agentId) for a button route.",
+   "how": "1. Refuse with a plain reply when:\n   - it is not live mode;\n   - the root is ACTIVE, or run.inTurn, run.deciding or run.receipt is set;\n   - this._busy or this._resuming has it;\n   - it has no folder.\n2. Refresh the repo now: await deps.workspace.prepareRepo(repoInfo.root) and set this.repoInfo. Do not use the fire-and-forget _refreshRepo.\n3. Refuse when the branch is null.\n4. Run diffStats fresh for the detail.\n5. Sentence: a question naming the agent and the branch, e.g. 'Bring Fix login redirect’s work into “main”?'.\n6. Detail, short and most important first:\n   - counts;\n   - check and rule status ('A check failed: “unit tests”.', 'Nothing checked its work.', broken rules);\n   - sensitive files (workbench.json, .claude/, .mcp.json);\n   - the person's own changes ('Your 2 uncommitted changes stay as they are.').\n7. Store { id: hex(6), kind:'merge', agentIds:[v.id], sentence, detail, createdAt: this.now(), seen: { turns: v.turns, stateSince: v.stateSince, workSig, into: branch, intoHead: head } } in this.confirms.\n8. Return { reply: sentence, confirm: { id, sentence, detail } }; command() then posts no notice."
+  },
+  {
+   "capability": "Run the merge on yes",
+   "where": "_confirm (:2037): a new branch for kind 'merge' BEFORE the launch fall-through at :2055. A new _merge(c), and a new deps.workspace.mergeWorkspace (workspace area).",
+   "how": "1. Cancel replies 'OK, I won’t bring it in.'\n2. Re-check everything at yes time, as _forgetEarlier does (:1386):\n   - the agent exists, is a root and is not ACTIVE;\n   - it is not busy, and Workbench is not shutting down;\n   - c.seen is unchanged, else reply '<Name> has changed since you were asked. Have another look.' with focusId.\n3. Take the engine-wide lock (one promise chain: every merge touches the same main checkout). this._busy.add(id). Track the promise in this._landings, awaited by shutdown, like _startAgent :1594-1600.\n4. Quiesce the folder: _closeIdle(v), which also ends the background commands it left running. Then `if (run.checksDone) await run.checksDone` (:599).\n5. Call mergeWorkspace({ repoRoot: repoInfo.root, path, branch, base, into, message }). Do not wrap it in withTimeout, which does not cancel git.\n6. On success, in one _apply batch: a new outcome event plus a fresh EV.FILES. Then either:\n   - remove the folder (removeWorkspace, run.folderRemoved = true); or\n   - set run.workspace.base to the landed commit and re-read run.config, which was read once from the old base.\n   Then history.save(), await prepareRepo into this.repoInfo, and reply e.g. 'Brought Fix login redirect’s work into “main”.' with focusId.\n7. On a conflict or refusal: a plain reply saying nothing in the person's folder changed.\n8. finally: release the lock and _busy."
+  },
+  {
+   "capability": "Propose and run a discard ('throw its work away')",
+   "where": "_runIntent: a new case 'discard'. A new _proposeDiscard(views) like _proposeForget. In _confirm, a 'discard' branch before :2055. A new _discard(c).",
+   "how": "Card: 'Throw away Fix login redirect’s work?'. The detail names exactly what goes:\n- 'Its folder and its branch are deleted, with 4 changed files. This cannot be undone.'\n- plus 'It is still working: it will be stopped first.' when it is ACTIVE.\nCancel: 'OK, I won’t throw it away.'\nOn yes:\n1. Re-check everything; take the lock and the busy flag as for merge.\n2. ACTIVE: await this._stopRoot(v, 'Stopped by you'), which denies held requests, drops later decisions and cancels the receipt. Otherwise _closeIdle(v).\n3. await run.checksDone.\n4. deps.workspace.removeWorkspace({ repoRoot, path, deleteBranch:true }) (a forced removal).\n5. A result of {removed:false} means the folder was already gone and the branch still exists: delete the branch by name with a new helper limited to workbench/ branches.\n6. This run: run.folderRemoved = true. Earlier agent: replace its earlierRecs record with workspace:null and store.markContinue(id, {ok:false, reason}).\n7. Record the outcome (new event and field) and history.save().\n8. Removing the view needs store.remove(id) + history.forget(id), or flush brings the stale record back.\nReply e.g. 'Threw away Fix login redirect’s work. Its folder and branch are gone.', with agentIds: [] if the view was removed."
+  },
+  {
+   "capability": "In-flight guard, follow-up guard and shutdown wait",
+   "where": "constructor (:196-212), _sendTo (:1426), _continueEarlier (:1305), _stop (:1483), the 'forget' path, shutdown (:272-275)",
+   "how": "1. Add this._busy (a Set of rootIds) and this._landings (a Set of promises).\n2. _sendTo and _continueEarlier refuse while busy ('Fix login redirect’s work is being brought in. Try again in a moment.').\n3. Both also refuse when the folder is gone (folderRemoved, or discarded/landed and removed). Today runner.send fails with 'the agent's folder does not exist', and every follow-up path goes through _sendTo: _answerDone, Continue, Try again, say.\n4. _stop and forget on a busy agent reply plainly.\n5. shutdown: after the _launching wait, await this._landings. A merge mid-way in the person's checkout must finish. Refuse new ones once _shuttingDown (pattern :1306, :1603), and skip busy runs in the tidy."
+  },
+  {
+   "capability": "Record merges and discards in history and on the view",
+   "where": "src/shared/events.mjs (EV, newAgentView); store.mjs _reduce and restore; engine.mjs HISTORY_KINDS (:40-41), _historyRecords (:1265-1281), _describe/_status (:2099-2148); history.mjs recordOf and cleanRecord (:86-137)",
+   "how": "Follow EV.RESUMED's path:\n1. A new event, e.g. 'agent.landed' { agentId, how:'merged'|'discarded', into?, commit?, at }, reduced into a new view field, e.g. landed: {how, into, commit, at} | null.\n2. Add it to HISTORY_KINDS so _apply schedules a write.\n3. Extend recordOf and cleanRecord, and update the pinned keys at history.test.mjs:97.\n4. Put it back in store.restore.\n5. Word it in _describe and _status, e.g. 'Fix login redirect’s work was brought into “main”.'\n6. For earlier agents, replace the record object in earlierRecs, because _historyRecords writes it unchanged.\n7. Call history.save() right after the git step succeeds, like _forgetEarlier (:1395).\nPrefer a view field to a new STATE: a new state ripples through states.mjs (LOOK, PRIORITY, ENDED/DONE/ACTIVE), the store's resume rules, the UI marks and the contrast checks."
+  },
+  {
+   "capability": "Confirm plumbing for new kinds",
+   "where": "confirmVerb (:103-108), _shownConfirm (:1844), _confirm (:2044-2055); commands.mjs confirmReply (:400-414) and describeIntent (:1223-1249)",
+   "how": "1. confirmVerb: 'merge' gives 'bring it in', 'discard' gives 'throw it away'. Today the near miss would say 'to start it'.\n2. _shownConfirm: agentIds: c.agentIds ?? c.intent?.agentIds.\n3. _confirm: handle both kinds before the launch fall-through.\n4. commands.mjs:\n   - make merge and discard non-launch kinds, so 'start it' and 'launch it' are not a yes (verified that they are today);\n   - decide whether 'bring it in' or 'throw it away' count as yes on their own card, as 'stop' does on a stop card and 'send' on a message card;\n   - add describeIntent cases."
+  },
+  {
+   "capability": "Words for merge, discard and diff in the command bar",
+   "where": "commands.mjs matchCommand (:1151-1162); new matchers modelled on matchForget (:570-579)",
+   "how": "1. The verb comes first: merge, bring … in, land, throw away, discard.\n2. The rest must resolve fully to agents (r.full). Today 'merge search cleanup' and 'delete search cleanup' are tasks, while 'merge the two config files' must stay work.\n3. Insert the matchers before matchSay and matchStart.\n4. Return { kind:'merge', agentIds } and { kind:'discard', agentIds }; optionally { kind:'changes', agentId } for 'what changed' or 'show me the diff'.\n5. The engine answers merge and discard with a card whatever `strong` says."
+  },
+  {
+   "capability": "UI buttons to engine actions",
+   "where": "ARCHITECTURE.md answers table (:556-569) and route table (:442-453); http.mjs routes (:334-351)",
+   "how": "Two established patterns:\n- like Forget: POST /api/command { text:'forget it', focusId }, and the engine returns the card;\n- a route POST /api/agents/:id/merge or /discard that calls a public proposeX(agentId) returning { reply, confirm }.\nEither way the action runs only through POST /api/confirm/:id {go}. Never add a route that acts without a card. Add GET /api/agents/:id/changes. The page binds buttons to the ids they were drawn for (data-agent, data-confirm)."
+  },
+  {
+   "capability": "Repo state after a land",
+   "where": "_refreshRepo (:1742-1749), snapshot (:2259-2273), http.mjs:281-289",
+   "how": "1. After a land, await prepareRepo and set this.repoInfo, so snapshot().repo.head and dirty and the next launch's detail are right.\n2. The page learns repo only from snapshots: emit a store event the server turns into a snapshot (like 'removed'), or add a stream event.\n3. engine.test.mjs:2288 compares snapshot.repo with deepEqual, so new repo fields need that test changed."
+  },
+  {
+   "capability": "Optional 'check before landing' with the receipt machinery",
+   "where": "_decide (:545-668), _cancelReceipt (:671)",
+   "how": "For a design that first merges the person's branch into the agent's folder (conflicts stay there, not in the person's checkout), re-run the declared checks in the agent's folder with the same parts:\n- run.receipt = { ctl: new AbortController() }, run.deciding = true;\n- await run.checksDone before runChecks, and track run.checksDone;\n- stale() checks after every await;\n- EV.CHECKS updates.\nIt must stay cancellable by _cancelReceipt and visible to shutdown. A conflict can go to the agent as a follow-up through _sendTo, which resumes a done, stopped or earlier agent."
+  },
+  {
+   "capability": "Tests",
+   "where": "test/helpers/engine-fakes.mjs fakeDeps (:97-159); test/engine.test.mjs; test/history.test.mjs",
+   "how": "1. Add to fakeDeps.workspace: mergeWorkspace, diffText and a branch delete, each pushing to calls.* and able to wait on a gate().\n2. Cover:\n   - a follow-up during a merge is refused;\n   - a second yes is GONE;\n   - a card answered after the agent worked on is refused;\n   - shutdown waits for a merge;\n   - a stop or a turn start during a merge;\n   - a discard of a working agent stops it and denies its held request;\n   - folderRemoved leaves keptFolders and the tidy;\n   - history records the outcome and a removed view does not come back.\n3. Name tests 'merge: …', 'discard: …', 'changes: …'.\n4. Use live() with options.now for expiry (pattern :1519-1530), world()/finishOne() for earlier agents and file contents, and the real parser for words.\n5. Update the pinned assertions: history.test.mjs:97 and engine.test.mjs:1392, :2288, :425, :446, :451, :481.\n6. Run with node on PATH."
+  },
+  {
+   "capability": "Demo mode",
+   "where": "_launch demo branch (:1617-1622), _simStop (:1529-1534), _answerSim (:1222-1242)",
+   "how": "Demo runs have workspace: null, and seeded agents have no run at all. Either give the simulator optional methods (e.g. sim.land(agentId, how), sim.diff(agentId)) used when present, or reply in plain words ('This is the demo: nothing was really brought in.'). The UI checks (ui-fit-check, ui-behaviour-check, scripts/ui-mock.mjs) need demo or mock scenarios for the new cards and the diff view."
+  }
+ ],
+ "rulesToHonour": [
+  "Plain language in everything the person sees (replies, card sentences, details, reasons): whole sentences, led by the agent's name, with the curly quotes “…” and ’ the existing replies use. Identifiers only where already accepted: branch names in keptFolders and the README; 'commit' and 'uncommitted' in _startDetail.",
+  "Reply shapes. Action methods return { ok, reply }. command() returns { reply, confirm?, focusId? }. confirm() returns { reply, agentIds?, focusId? }. Refusals are { ok:false, reply } with status 200, never thrown. Thrown errors meant for the person carry err.plain.",
+  "Notices: a reply becomes a notice except when it carries a confirm. A kept card (near miss) is not announced, and withdrawing a card says nothing.",
+  "Destructive and launching actions go through a card made by the engine, and act only through confirm(id, true). startAgent is the one documented exception ('only used after a confirm').",
+  "A yes or no settles only the card whose id the page sends:\n- never 'the newest';\n- an unknown or expired id answers GONE;\n- any other command withdraws the shown card;\n- words not understood keep it, with 'I did not catch that. Say “do it” to <verb>, or “cancel”.';\n- cards run out after 10 minutes;\n- a card the page drops is withdrawn by POST /api/confirm/<id> {go:false}.",
+  "Cancel replies follow 'OK, I won’t <verb> it.' / 'OK, I won’t <verb> them.'",
+  "Check again at yes time, as _forgetEarlier does. A card can be 10 minutes old, so state, busy, folder, the person's branch, head and dirty state, and the agent's work signature must all be checked when it is answered.",
+  "Answers are bound to the ask on screen (askId); with a card on screen no ask was. Commands (stop, tell, status, start, and so merge and discard) act on the agent their words or focusId name, even if the ask on screen has changed.",
+  "Held requests stay in view. needs_ok is ACTIVE, so no merge then. A discard that stops an agent must go through _stopRoot, which denies held requests (helpers' too) and drops later decisions.",
+  "One receipt at a time per agent, and never two sets of checks in one folder (await run.checksDone). While a receipt is built, no stuck check runs and a clean exit is not a failure.",
+  "Agent folders and workbench/ branches are the only copy of the work:\n- nothing removes them while they may hold work, except an explicit, confirmed discard;\n- the shutdown tidy only removes with onlyIfUnchanged and a base;\n- a runner that will not stop keeps its folder;\n- a folder that cannot go is listed in keptFolders, never left unmentioned.",
+  "Config comes from the base commit, never the agent's working copy. Git runs only through argument arrays (execFile, never a shell string), with GIT_SAFE_CONFIG; diffs add --no-ext-diff --no-textconv.",
+  "engine.mjs never imports deps: new capabilities arrive through deps.workspace and deps.history behind typeof checks, so tests can fake them.",
+  "History records are built field by field (recordOf), never copied whole: no secrets and no command output in the file. Writes are atomic. schedule() is debounced on HISTORY_KINDS, and save() runs at once after an irreversible action by the person (as forget does).",
+  "Earlier agents have no runner, are never stuck-checked and never need the person. Acting on one uses its record, which is written unchanged unless the engine replaces it.",
+  "Real git operations happen in live mode only. The demo spends nothing and touches no real folders.",
+  "ARCHITECTURE.md is the contract ('Where code and this document disagree, fix one of them'). Update:\n- :103 ('the page offers no merge');\n- the Engine API block :267-297;\n- the confirm rules :300-307;\n- the earlier-agent section :105-112;\n- the HTTP table :442-453;\n- the answers table :556-569;\n- History :405-414.",
+  "The lid shows one thing at a time, with at most two answers. Cards use the ordinary Do it / Cancel buttons, and long details are cut at 190 characters behind 'Read all of it', so lead the detail with what matters.",
+  "Everything an agent controls (diff text, file names, its words) is escaped before it reaches the page.",
+  "Tests:\n- node:test and node:assert/strict, in test/<module>.test.mjs, owned with the module;\n- no network, never a real claude or codex: use the fakes and fixtures;\n- engine tests end with shutdown(), keep the tick off (tickMs: 10_000_000), and drive time with options.now or engine.tick(ts).",
+  "Area owners: engine/store/history/server/CLI; commands/policy/workspace/receipt; UI. A builder edits only its own files, so the git functions in workspace.mjs and the parser words are separate tasks with agreed signatures.",
+  "Status words must stay true for the new outcomes (_describe, _status). An earlier agent never 'needs you'."
+ ],
+ "risks": [
+  "The engine treats any card it does not know as a launch:\n- confirmVerb words a new kind as 'start it';\n- _confirm's fall-through reads c.tasks.length, so a merge or discard card not handled before :2055 throws a TypeError (the generic reply from command(), HTTP 500 from /api/confirm).",
+  "Parser traps, all checked with the real parser:\n- on any card other than stop/say, 'start it' and 'launch it' are a yes;\n- 'forget it' and 'stop' are a no;\n- 'merge it' and 'discard it' are not understood, and the near miss would say 'to start it';\n- with no card, 'merge search cleanup' and 'delete search cleanup' become launch cards for a new agent.",
+  "State is not liveness. A done root can still have:\n- a live idle Claude process;\n- background commands it was allowed to leave running, writing in its folder;\n- cancelled checks still ending (run.checksDone);\n- a new turn Claude Code starts by itself when background work ends.\nA merge or discard gated on state alone races file writes. Quiesce first (_closeIdle, await checksDone) and hold a busy flag that _sendTo, _continueEarlier, _stop and forget respect.",
+  "withTimeout (:124) rejects at the limit but never cancels the git child. A timeout around a merge would report failure while git finishes later, or leave the person's checkout half-merged.",
+  "Shutdown waits only for _launching, so a merge under way must be awaited as well. A forced exit (second Ctrl-C or 12 s) runs killAllSync, and the terminal's SIGINT also reaches git children in the same foreground process group. A merge in the person's checkout can be cut mid-way, so the step the person sees must be short and recoverable.",
+  "folderRemoved is the one switch for keptFolders, the shutdown tidy and history's workspace. After a land that keeps the folder, HEAD differs from base, so the tidy keeps it forever and the CLI says it holds work. Moving base instead means re-reading run.config, and later receipts then diff against the landed commit.",
+  "store.remove without history.forget(id) lets History.flush re-write the old record as 'another Workbench's'. A landed or discarded agent would then return next run as an earlier agent pointing at a deleted folder. Removing a this-run view also needs runs, stopped, later, asks and held cleaned up, as _stopRoot does.",
+  "There are two sources of the workspace: run.workspace for this run, earlierRecs for earlier agents (branch and base may be null in old records). _historyRecords writes earlier records unchanged, so an outcome must replace the record. A null base also makes _removeUnchanged's validRef throw (caught, folder kept).",
+  "Another Workbench on the same repository may be running an agent that this one restored as 'earlier' (they share the history file). A discard here could delete a live agent's folder. Continue has the same hazard; discard makes it destructive.",
+  "Stale repo facts:\n- repoInfo refreshes every 15 s, and the page sees repo only in snapshots;\n- a card can be 10 minutes old;\n- the person may have switched branches, committed, started a rebase or detached HEAD meanwhile.\nRe-check inside the git operation at the moment of landing; the card's wording only informs.",
+  "The branch tip may hold none of the work: agents rarely commit (README:119). The work is the working tree against base, including untracked files and files hidden by an agent-added .gitignore (ignored: true). The diff shown, the card's counts and what lands must be the same set, and removing the folder after a land must not silently drop agent-ignored files.",
+  "Landing promotes agent-written config:\n- new agents start from the person's HEAD and read workbench.json from it, so a landed file can add checks (shell commands Workbench runs) and allow prefixes (commands allowed without asking);\n- a landed .claude/ or .mcp.json changes the person's own Claude Code.\nThe merge card should name these files.",
+  "Git hooks run on engine-made commits and merges. With a relative core.hooksPath (e.g. .githooks), a commit in the agent's worktree runs scripts the agent edited, and post-merge in the person's checkout runs whatever was just merged. Use --no-verify and -c core.hooksPath pointing nowhere for engine-made commits.",
+  "The agent may have moved its own HEAD (the person can allow git checkout, reset or commit), so its worktree may no longer be on ws.branch or descend from base. Verify before landing.",
+  "Without onlyIfUnchanged, removeWorkspace returns {removed:false} for a folder that is no longer a listed worktree, and then does NOT delete the branch. A forced removal deletes untracked and ignored files for good, and branch -D drops unmerged commits; consider keeping a recoverable ref.",
+  "Follow-ups after a removal: _sendTo would call runner.send in a missing folder (Claude reports 'the agent's folder does not exist'). The Looks good / Ask for a change, Try again and Continue buttons all route there.",
+  "A read-only diff query must not post notices, or every 'What changed?' fills the line under the core.",
+  "Dogfooding on Workbench's own repo:\n- the server serves ui/ and src/shared/ live from the program folder, so landing into the checkout Workbench runs from changes the page on reload while the engine in memory runs old code;\n- run Workbench from a separate checkout, or restart after landing;\n- the repo root is /Users/nkov47/IDE, so worktrees copy the whole repo, workbench.json must sit at the root (none exists), and checks need node on PATH.",
+  "Claude Code 2.1.322 versus the verified 2.1.221:\n- _withEarlierSpend adds the earlier spend to every usage 'set' of a continued run, so spend is counted twice if 2.1.322 restores totals on --resume (ARCHITECTURE.md:109);\n- the self-started turn after background work was only read from 2.1.221's code, never recorded;\n- the hook exit-2 blocking was verified on 2.1.221 only.",
+  "Pinned tests a design may break: engine.test.mjs:1392 (ctx keys), :2288 (snapshot.repo deepEqual), :425, :446 and :481 (exact removeWorkspace args), :451 (shape of a kept entry), and history.test.mjs:97 (record keys).",
+  "Landing two agents one after the other: both touch the same checkout and branch, and the second agent's base is behind the first land, so conflicts become the normal case. Run every source-control operation through one engine-wide lock."
+ ],
+ "openQuestions": [
+  "Where are conflicts resolved? Either in the person's checkout (abort, report the files, nothing changed), or in the agent's folder: merge the person's branch there, let the agent resolve it as a follow-up through _sendTo, then fast-forward.",
+  "Which states may land: only done_checked, done_claimed and checks_failed, or also stopped and failed (half-done work), or question? Should a failed check or a broken rule block a land, or only warn on the card?",
+  "After a land: remove the folder and branch (folderRemoved; no more follow-ups), or keep them and move base to the landed commit (follow-ups continue; the diff starts again)?",
+  "Do the person's uncommitted changes always block a land, or only when they touch the agent's files? repoInfo.dirty is only a count, and only 15 s fresh.",
+  "What lands: one squashed commit with a message from the task and name, the agent's own commits, or a merge commit? Whose git identity authors it?",
+  "After a discard, does the agent leave the board (store.remove + history.forget, or a kept 'discarded' record), or stay with a 'thrown away' marker in the done tray? 'Record all this in history' suggests a record that survives.",
+  "Can earlier agents (from history) be landed or discarded? Their lid already has two answers (Continue, Forget), and the lid allows at most two.",
+  "New view field (landed or outcome) or a new state? What is the event's name and payload? Does the page need the agent's branch name, which today is only on the run record?",
+  "How does the page learn the new repo head and dirty count after a land: a new stream event, or the snapshot-on-removed path?",
+  "How do diff, merge and discard behave in the demo (simulator methods or plain replies)? The UI checks need it.",
+  "Should a land re-run the declared checks on the merged result before moving the person's branch?",
+  "What does Forget say for an agent whose folder was discarded or landed? Its detail 'Its folder and branch stay on this computer.' would be false.",
+  "Is a lock or owner marker needed before destructive operations on 'earlier' agents, since two Workbench processes can share one repository?",
+  "Does Claude Code 2.1.322 restore usage totals on --resume (spend counted twice by _withEarlierSpend)? Does it still start a new turn by itself when background work ends? Both need a recorded run before dogfooding."
+ ]
+}
