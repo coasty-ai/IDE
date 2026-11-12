@@ -371,8 +371,9 @@ function paintBand(z = sizes()) {
   el.say.style.fontSize = P.silkSub + 'px';
   el.ph.style.fontSize = P.silkSub + 'px';
   el.said.style.fontSize = P.silkSub + 'px';
-  el.say.setAttribute('aria-label', st.detail && st.detail.kind === 'agent' && agentOf(st.detail.agentId)
-    ? `Type what you want. It goes to Workbench, about ${visibleText(agentOf(st.detail.agentId).name)}.` : 'Type what you want. It goes to Workbench.');
+  const sayLabel = st.detail && st.detail.kind === 'agent' && agentOf(st.detail.agentId)
+    ? `Type what you want. It goes to Workbench, about ${visibleText(agentOf(st.detail.agentId).name)}.` : 'Type what you want. It goes to Workbench.';
+  if (el.say.getAttribute('aria-label') !== sayLabel) el.say.setAttribute('aria-label', sayLabel);
 }
 
 /** The band's height, as laid out: the graph starts under it (measured from the screen's top, which moves as it slides). */
@@ -658,6 +659,11 @@ function paintDetail(z = sizes()) {
 }
 
 const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
+// the engine's sentences for why git cannot merge (SPEC section 2), when the lid's gitReason() is not there to ask
+const GIT_WORDS = {
+  detached: 'Your folder is not on a branch, so there is nowhere to merge it.',
+  identity: 'Git does not know your name and email yet, so Workbench cannot make the merge commit. Set user.name and user.email with git config, then try again.',
+};
 const btnAttrs = o => Object.entries(o).filter(([, v]) => v != null && v !== false).map(([k, v]) => ` data-${k}="${esc(v)}"`).join('');
 
 function agentDetail(agentId, z) {
@@ -711,10 +717,11 @@ function agentDetail(agentId, z) {
     if (canMerge && into) acts += `<button type="button" class="gbig pri" title="Merge into ${esc(visibleText(into))}"${btnAttrs({ act: 'merge', ...bind, into, key: 'merge' })}>${esc(mergeLabel(into))}</button>`;
     if (canDiscard) acts += `<button type="button" class="gbig"${btnAttrs({ act: 'discard', ...bind, key: 'discard' })}>Throw it away</button>`;
     if (acts) h += `<div class="dacts">${acts}</div>`;
-    else if (live && w.branch && !STATES.ACTIVE.has(a.state) && !w.merged) {
-      const why = !into ? 'Your folder is not on a branch, so there is nowhere to merge it.' : repo.identity === false ? 'Git does not know your name and email yet, so Workbench cannot make the merge commit.' : '';
-      if (why) h += `<p class="dwhy">${esc(why)}</p>`;
-    }
+    // no Merge for a reason about git (not on a branch, no name and email): the engine's words, as the lid says them
+    const why = typeof model.gitReason === 'function' ? model.gitReason(a)
+      : live && fallback.discard && !STATES.ACTIVE.has(a.state) && (a.files ? a.files.changed > 0 : ['stopped', 'failed'].includes(a.state) || a.earlier)
+        ? (!into ? GIT_WORDS.detached : repo.identity === false ? GIT_WORDS.identity : null) : null;
+    if (why && !canMerge) h += `<p class="dwhy">${esc(why)}</p>`;
   }
   if (ch && ch.data && ch.data.live) h += '<p class="dwhy">It is still working, so its work may still change.</p>';
   // the diff, in one scroll box
@@ -722,7 +729,11 @@ function agentDetail(agentId, z) {
   if (!ch || (ch.loading && !ch.data)) body = '<p class="dq">Reading its changes…</p>';
   else if (ch.error) body = `<p class="dq">${esc(ch.error)}</p>`;
   else if (ch.data && ch.data.ok === false) body = `<p class="dq">${esc(ch.data.reply || 'Workbench could not read its changes.')}</p>`;
-  else body = diffHtml(diff || { files: [] }, { maxLines: 4000 });
+  else {
+    // made once per answer: a long diff is not rebuilt on every render
+    if (ch.htmlOf !== ch.data) { ch.html = diffHtml(diff || { files: [] }, { maxLines: 4000 }); ch.htmlOf = ch.data; }
+    body = ch.html;
+  }
   h += `<div class="gdiff" data-scroll="1" tabindex="0" aria-label="${esc(name)}’s changes, in full">${body}</div>`;
   return h;
 }

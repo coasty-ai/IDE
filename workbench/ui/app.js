@@ -962,6 +962,7 @@ async function gitCommand(text, focusId) {
   if (words === 'open') return;
   const pc = pageCommand(text);
   if (pc && (pc.kind === 'theme' || pc.kind === 'detail')) { applyPref(pc.kind, pc[pc.kind]); return; }
+  if (pc && pc.kind === 'next') { say('“Next” steps through what needs you, on the board. Say “back” to go there.', 6000); return; }
   if (cannotSend(linkNow())) { say('Workbench is not answering, so that was not sent.'); return; }
   const focused = focusId ? S.agents.get(focusId) : null;
   const shown = S.confirm && focusId && S.confirm.agentId === focusId ? S.confirm : null;
