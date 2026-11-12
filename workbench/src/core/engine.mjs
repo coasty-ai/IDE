@@ -3341,7 +3341,9 @@ export class Engine extends EventEmitter {
     }
     const all = this.store.list();
     if (!all.length) return { reply: 'No agents yet. Say “start an agent to …” to begin.' };
-    const needs = all.filter(v => !v.earlier && NEEDS_YOU.has(v.state)); // an earlier agent waits on nobody
+    // An earlier agent waits on nobody, and neither does a failed check on work that is settled (merged with nothing new
+    // since, or thrown away), as the page's needsPerson has it.
+    const needs = all.filter(v => !v.earlier && NEEDS_YOU.has(v.state) && !(v.state === STATE.CHECKS_FAILED && workSettled(v)));
     const working = all.filter(v => !v.parentId && (v.state === STATE.WORKING || v.state === STATE.STARTING || v.state === STATE.WAITING_HELPERS));
     const parts = [];
     if (needs.length) {
@@ -3385,14 +3387,23 @@ export class Engine extends EventEmitter {
     return s;
   }
 
-  /** What became of a root's work, for its status: thrown away, a merge that did not go through, or merged. */
+  /**
+   * What became of a root's work, for its status: thrown away, a merge that did not go through, or merged. "Merged" only
+   * while nothing new is left to merge, as the page's card has it; work changed since its last merge is not merged.
+   */
   _workWords(v) {
     const w = v.parentId ? null : v.work;
     if (!w) return '';
     if (w.thrownAway) return ' Its work was thrown away.';
     if (w.problem?.sentence) return ` The last merge did not go through: ${w.problem.sentence}`;
-    if (w.merged) return w.merged.into ? ` Its work was merged into ${w.merged.into}.` : ' Its work was merged.';
-    return '';
+    if (!w.merged) return '';
+    const into = w.merged.into;
+    if (!unmergedWork(v)) return into ? ` Its work was merged into ${into}.` : ' Its work was merged.';
+    const earlier = into ? `Its earlier work was merged into ${into}` : 'Its earlier work was merged';
+    const n = v.files ? count(v.files.changed) : 0;
+    return n
+      ? ` ${earlier}, but ${n} changed file${n === 1 ? ' is' : 's are'} not merged yet.`
+      : ` ${earlier}. Anything it changed since is not merged yet.`; // what it changed is not known
   }
 
   _spendSentence() {

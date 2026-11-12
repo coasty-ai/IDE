@@ -2837,6 +2837,42 @@ test('merge: a reason left on work with nothing left to merge goes when the merg
   await t.engine.shutdown();
 });
 
+test('status: work with changes since its merge is not called merged, and a failed check on settled work needs no one, as on the page', async (ctx) => {
+  const t = liveFolders(ctx, { deps: { checks: [{ name: 'unit tests', run: 'npm test' }], checkState: 'failed' } });
+  t.deps.commands.intent = (text, c) => ({ 'what needs me': { kind: 'status' }, 'what is it doing': { kind: 'status', agentId: c.focusId } })[text] || null;
+  const needs = () => t.engine.command('what needs me');
+  const doing = async (id) => (await t.engine.command('what is it doing', { focusId: id })).reply;
+  const a = await doneAgent(t);
+  assert.equal(t.store.get(a.id).state, 'checks_failed');
+  assert.deepEqual(await needs(), { reply: 'One thing needs you: Fix cart total is done, but a check failed.', focusId: a.id });
+  // Merged anyway: nothing of it is left to merge, so its failed check waits on no one.
+  assert.equal((await t.engine.confirm((await t.engine.proposeMerge(a.id)).confirm.id, true)).reply, 'Merged Fix cart total into main.');
+  assert.deepEqual(await needs(), { reply: 'Nothing needs you right now.' });
+  assert.equal(await doing(a.id), 'Fix cart total is done, but a check failed. The check “unit tests” did not pass. It says: I fixed the cart total. Its work was merged into main.');
+  // A follow-up changes a file: that file is not merged, and the failed check needs the person again.
+  assert.equal((await t.engine.say(a.id, 'Also round the tax')).ok, true);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I rounded the tax.', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(a.id).state === 'checks_failed');
+  assert.equal(t.store.get(a.id).files.changed, 1);
+  assert.ok(t.store.get(a.id).work.merged, 'the last merge is still known');
+  assert.equal(await doing(a.id), 'Fix cart total is done, but a check failed. The check “unit tests” did not pass. It says: I rounded the tax. Its earlier work was merged into main, but 1 changed file is not merged yet.');
+  assert.deepEqual(await needs(), { reply: 'One thing needs you: Fix cart total is done, but a check failed.', focusId: a.id });
+  // Stopped in the middle of its next turn, it has said nothing yet of what it changed.
+  assert.equal((await t.engine.say(a.id, 'And the docs')).ok, true);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  await t.engine.stop(a.id);
+  assert.equal(t.store.get(a.id).files, null);
+  assert.equal(await doing(a.id), 'Fix cart total was stopped. Its earlier work was merged into main. Anything it changed since is not merged yet.');
+  // Thrown away: settled too.
+  const b = await doneAgent(t, { task: 'Fix the tax rounding' }, 'I fixed the rounding.');
+  assert.deepEqual(await needs(), { reply: 'One thing needs you: Fix tax rounding is done, but a check failed.', focusId: b.id });
+  assert.match((await t.engine.confirm((await t.engine.proposeDiscard(b.id)).confirm.id, true)).reply, /^Threw away /);
+  assert.deepEqual(await needs(), { reply: 'Nothing needs you right now.' });
+  assert.equal(await doing(b.id), 'Fix tax rounding is done, but a check failed. The check “unit tests” did not pass. It says: I fixed the rounding. Its work was thrown away.');
+  await t.engine.shutdown();
+});
+
 test('merge: nothing writes in its folder while git takes its work: its idle process is closed, and checks still ending are waited for', async (ctx) => {
   const t = liveFolders(ctx);
   const a = await doneAgent(t);
