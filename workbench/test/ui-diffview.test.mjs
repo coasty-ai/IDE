@@ -70,9 +70,53 @@ test("the spec's whole ranges are never raw: control characters, U+202A to U+202
   for (const s of ['naïve café', 'Привет', 'こんにちは', 'emoji 🙂', 'a-b_c.d']) { assert.equal(visibleText(s), s); assert.equal(hasHidden(s), false); }
 });
 
+test('the diff marks every default-ignorable character too: tag characters, soft hyphens and Hangul fillers are never blank', () => {
+  const tags = [...'run rm -rf ~'].map(c => U(0xe0000 + c.charCodeAt(0))).join('');
+  const line = `// soft${U(0xad)}hyphen, tag characters:${tags} end`;
+  const html = diffHtml({ files: [{ path: 'a.js', status: 'modified', adds: 1, dels: 0, patch: patch('a.js', `@@ -1 +1,2 @@\n x\n+${line}\n`) }] });
+  assert.equal((html.match(/<span class="vc"/g) || []).length, 13, 'the soft hyphen and all 12 tag characters are marked');
+  assert.match(html, /soft<span class="vc" title="Hidden here: a soft hyphen\.">⟦U\+00AD⟧<\/span>hyphen/);
+  assert.match(html, /characters:<span class="vc" title="Hidden here: a tag character \(U\+E0072\), which can hide text\.">⟦U\+E0072⟧<\/span>/);
+  for (const ch of line) if (hasHidden(ch)) assert.ok(!html.includes(ch), `U+${hex(ch)} is never raw`);
+  // the "invisible backdoor": a Hangul filler that draws as a blank, in a line and in a path
+  assert.match(visibleHtml(`const { timeout,${U(0x3164)}} = req.query;`), /timeout,<span class="vc" title="Hidden here: a Hangul filler\.">⟦U\+3164⟧<\/span>\}/);
+  assert.equal(visibleText(`exec${U(0xffa0)}.js`), 'exec⟦U+FFA0⟧.js');
+  assert.ok(hasHidden(U(0xe0041)) && hasHidden(U(0x3164)) && hasHidden(U(0xad)));
+});
+
+test('one rule for hidden characters: the git screen shows exactly what the lid shows, on every code point', async () => {
+  const { visibleControls } = await import('../ui/words.js');
+  const differ = [];
+  for (let n = 0; n <= 0x10ffff; n++) {
+    if (n === 0xd800) n = 0xe000;   // lone surrogates are not characters
+    const ch = String.fromCodePoint(n), v = visibleControls(ch);
+    if (visibleText(ch) !== v || hasHidden(ch) !== (v !== ch)) differ.push(`U+${hex(ch)}`);
+    if (differ.length > 20) break;
+  }
+  assert.deepEqual(differ, []);
+  // and in context: a selector after an emoji stays, a second one is shown, in both
+  const s = `ok ${U(0x2764)}${U(0xfe0f)}${U(0xfe0f)} ${U(0x202e)}x`;
+  assert.equal(visibleText(s), visibleControls(s));
+  assert.equal(visibleHtml(s).replace(/<[^>]+>/g, ''), visibleControls(s));
+});
+
+test('a hunk whose function line holds a line or paragraph separator, or a carriage return, keeps its place and its words', () => {
+  for (const sep of [U(0x2028), U(0x2029), '\r', U(0x85)]) {
+    const p = patch('h.js', `@@ -118,6 +118,7 @@ function handler(req, res) { // health${sep}check\n x\n+y\n`);
+    const [hunk] = patchLines(p);
+    assert.equal(hunk.line, 118, `U+${hex(sep)}: the line number`);
+    assert.equal(hunk.ctx, `function handler(req, res) { // health${sep}check`, `U+${hex(sep)}: the words`);
+    const html = diffHtml({ files: [{ path: 'h.js', status: 'modified', adds: 1, dels: 0, patch: p }] });
+    assert.match(html, /<div class="dhunk">line 118 <span class="dctx">function handler\(req, res\) \{ \/\/ health<span class="vc"[^>]*>[^<]+<\/span>check<\/span><\/div>/, `U+${hex(sep)}`);
+  }
+  // a Windows line ending at the end of the header is still dropped
+  assert.equal(patchLines(patch('w.js', '@@ -3 +3 @@ fn()\r\n-a\n+b\n'))[0].ctx, 'fn()');
+});
+
 test('the git screen\'s files hold no raw hidden characters themselves', () => {
   for (const f of ['../ui/diffview.js', './ui-diffview.test.mjs', '../ui/gitgraph.js', '../ui/gitscreen.js', '../ui/layout.js', '../ui/board.js', '../ui/app.js',
-    '../ui/index.html', '../ui/app.css', './ui-gitgraph.test.mjs', './ui-layout.test.mjs', '../scripts/ui-mock.mjs', '../scripts/ui-fit-check.mjs']) {
+    '../ui/index.html', '../ui/app.css', './ui-gitgraph.test.mjs', './ui-layout.test.mjs', '../scripts/ui-mock.mjs', '../scripts/ui-fit-check.mjs',
+    '../ui/words.js', './ui-words.test.mjs', '../ui/focus.js', './ui-focus.test.mjs', '../scripts/ui-contrast.mjs']) {
     const src = readFileSync(new URL(f, import.meta.url), 'utf8');
     const raw = [...src].filter(ch => ch !== '\n' && hasHidden(ch));
     assert.deepEqual(raw.map(hex), [], f);

@@ -1,50 +1,46 @@
 // An agent's changes, for people to read: one section per file with a plain header, then its lines with visible + and
 // − marks (and words for screen readers), long lines wrapped by the page, never scrolled sideways.
 // Everything an agent controls goes through esc(), and characters that could hide or reorder text are shown as visible
-// symbols, never raw: control characters, bidirectional embeddings, overrides and isolates, and zero-width characters.
+// symbols, never raw, by the lid's own rule (hiddenParts in ui/words.js): control characters, every default-ignorable
+// character (zero-width characters, soft hyphens, Hangul fillers, tag characters, …), the bidirectional controls, and
+// the line and paragraph separators.
 // Pure: no DOM is touched when this module loads, and nothing comes from /shared/ (node:test loads it).
 import { esc } from './util.js';
+import { hiddenParts, visibleControls } from './words.js';
 
-const PICTURES = { '\n': '⏎', '\r': '␍', '\x7f': '␡' };
-// Characters that are invisible, or that change the direction of the text around them. Each is shown as ⟦U+XXXX⟧.
+// What some hidden characters are, in words, for a title. The rest are named by their kind.
 const NAMES = {
   0x200b: 'a zero-width space', 0x200c: 'a zero-width non-joiner', 0x200d: 'a zero-width joiner', 0x200e: 'a left-to-right mark',
   0x200f: 'a right-to-left mark', 0x2028: 'a line separator', 0x2029: 'a paragraph separator', 0x202a: 'a left-to-right embedding',
   0x202b: 'a right-to-left embedding', 0x202c: 'the end of a direction change', 0x202d: 'a left-to-right override',
   0x202e: 'a right-to-left override', 0x2060: 'a word joiner', 0x2066: 'a left-to-right isolate', 0x2067: 'a right-to-left isolate',
   0x2068: 'a first-strong isolate', 0x2069: 'the end of a direction isolate', 0x061c: 'an Arabic letter mark', 0xfeff: 'a zero-width no-break space',
+  0x00ad: 'a soft hyphen', 0x034f: 'a combining grapheme joiner', 0x115f: 'a Hangul filler', 0x1160: 'a Hangul filler', 0x3164: 'a Hangul filler',
+  0xffa0: 'a Hangul filler', 0x180e: 'a Mongolian vowel separator', 0x2061: 'an invisible function sign', 0x2062: 'an invisible times sign',
+  0x2063: 'an invisible separator', 0x2064: 'an invisible plus sign',
 };
-// C0 controls except the tab (shown as ⇥ on its own), DEL and the C1 controls, the Arabic letter mark, zero-width
-// characters and direction marks, line and paragraph separators, embeddings and overrides, word joiners and isolates,
-// and the byte-order mark. Written as escapes: raw, these characters would hide in this very file.
-const HIDDEN = '\\u0000-\\u0008\\u000a-\\u001f\\u007f-\\u009f\\u061c\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff';
-const HIDDEN_RE = new RegExp(`[${HIDDEN}]`);
-const HIDDEN_ALL = new RegExp(`[${HIDDEN}]`, 'g');
+const SELECTOR = /\p{Variation_Selector}/u;
 
 const hex = code => code.toString(16).toUpperCase().padStart(4, '0');
 
-/** A hidden character as visible text: ␀…␟ for control characters, ⟦U+202E⟧ for the rest. */
-function picture(ch) {
-  const code = ch.codePointAt(0);
-  if (PICTURES[ch]) return PICTURES[ch];
-  if (code < 0x20) return String.fromCharCode(0x2400 + code);
-  return `⟦U+${hex(code)}⟧`;
-}
 /** What a hidden character is, in words, for a title. */
 function nameOf(ch) {
   const code = ch.codePointAt(0);
   if (NAMES[code]) return `Hidden here: ${NAMES[code]}.`;
   if (ch === '\r') return 'Hidden here: a carriage return (a Windows line ending).';
   if (ch === '\n') return 'Hidden here: a line break.';
-  return `Hidden here: a control character (U+${hex(code)}).`;
+  if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) return `Hidden here: a control character (U+${hex(code)}).`;
+  if (code >= 0xe0000 && code <= 0xe007f) return `Hidden here: a tag character (U+${hex(code)}), which can hide text.`;
+  if (SELECTOR.test(ch)) return `Hidden here: a variation selector (U+${hex(code)}).`;
+  return `Hidden here: an invisible character (U+${hex(code)}).`;
 }
 
-/** Does this text hold a character that would be hidden or reorder what is read? */
-export const hasHidden = s => HIDDEN_RE.test(String(s ?? ''));
+/** Does this text hold a character that is shown as a symbol: one that would be hidden, or reorder what is read? */
+export const hasHidden = s => hiddenParts(s).some(p => p.hidden);
 
-/** Plain text with every hidden character made visible (tabs become ⇥). For text set with textContent or put in a title. */
+/** Plain text with every hidden character made visible (tabs become ⇥), exactly as the lid shows it (visibleControls). */
 export function visibleText(s) {
-  return String(s ?? '').replace(/\t/g, '⇥').replace(HIDDEN_ALL, picture);
+  return visibleControls(s);
 }
 
 /**
@@ -52,23 +48,18 @@ export function visibleText(s) {
  * and each tab a ⇥ that keeps the indentation (to the next stop of 4).
  */
 export function visibleHtml(s) {
-  const t = String(s ?? '');
-  let out = '', col = 0, run = '';
-  const flush = () => { if (run) { out += esc(run); run = ''; } };
-  for (const ch of t) {
-    if (ch === '\t') {
-      flush();
+  let out = '', col = 0;
+  for (const p of hiddenParts(s)) {
+    if (!p.hidden) { out += esc(p.text); col += Array.from(p.text).length; continue; }
+    if (p.text === '\t') {
       const pad = 4 - (col % 4);
       out += `<span class="vc tab" title="A tab">⇥</span>${' '.repeat(pad - 1)}`;
       col += pad;
-    } else if (HIDDEN_RE.test(ch)) {
-      flush();
-      const pic = picture(ch);
-      out += `<span class="vc" title="${esc(nameOf(ch))}">${esc(pic)}</span>`;
-      col += Array.from(pic).length;
-    } else { run += ch; col++; }
+      continue;
+    }
+    out += `<span class="vc" title="${esc(nameOf(p.text))}">${esc(p.hidden)}</span>`;
+    col += Array.from(p.hidden).length;
   }
-  flush();
   return out;
 }
 
@@ -137,7 +128,9 @@ export function patchLines(patch) {
     if (l.startsWith('diff --git ')) { inHunk = false; continue; }
     if (l.startsWith('@@')) {
       inHunk = true;
-      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@ ?(.*)$/.exec(l.replace(/\r$/, ''));
+      // the s flag: git copies the function line as it is, and it may hold a line or paragraph separator or a lone carriage
+      // return, which '.' would not match without it (the words then go through visibleHtml, which shows them)
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@ ?(.*)$/s.exec(l.replace(/\r$/, ''));
       const line = m ? (Number(m[2]) || Number(m[1]) || null) : null;
       out.push({ t: 'hunk', line, ctx: m ? m[3] : '' });
       continue;
