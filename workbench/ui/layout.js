@@ -73,8 +73,15 @@ export function sizeClass(W, H) {
 
 const r1 = n => Math.round(n * 10) / 10;
 
+/** Where to end a piece of `c` (characters) of at most `max`: before a hidden character's code ("⟦U+202E⟧") it would cut. */
+function endBeforeCode(c, max) {
+  const open = c.lastIndexOf('⟦', max - 1);
+  return open > 0 && c.indexOf('⟧', open) >= max ? open : max;
+}
+
 /**
- * Break text into lines of at most `max` characters at spaces; a word longer than a line is split.
+ * Break text into lines of at most `max` characters at spaces; a word longer than a line is split, between hidden
+ * characters' codes rather than through one.
  * @returns {string[]}
  */
 export function wrapWords(text, max) {
@@ -82,7 +89,7 @@ export function wrapWords(text, max) {
   const lines = [];
   let cur = '';
   const push = w => {
-    while (Array.from(w).length > max) { const c = Array.from(w); if (cur) { lines.push(cur); cur = ''; } lines.push(c.slice(0, max).join('')); w = c.slice(max).join(''); }
+    while (Array.from(w).length > max) { const c = Array.from(w), k = endBeforeCode(c, max); if (cur) { lines.push(cur); cur = ''; } lines.push(c.slice(0, k).join('')); w = c.slice(k).join(''); }
     if (!cur) cur = w;
     else if (Array.from(cur).length + 1 + Array.from(w).length <= max) cur += ' ' + w;
     else { lines.push(cur); cur = w; }
@@ -105,12 +112,14 @@ export function clipToLines(text, perLine, maxLines) {
   return out;
 }
 
-/** Shorten to n characters with an ellipsis, at a word boundary when one is near. */
+/** Shorten to n characters with an ellipsis, at a word boundary when one is near, and never through a hidden character's code. */
 export function clipTo(text, n) {
   const t = String(text ?? '').replace(/\s+/g, ' ').trim();
   const c = Array.from(t);
   if (c.length <= n) return t;
   if (n <= 1) return '…';
+  const k = endBeforeCode(c, n - 1);
+  if (k < n - 1) return c.slice(0, k).join('').replace(/[,.;:\s]+$/, '') + '…';
   const cut = c.slice(0, n - 1).join('');
   // a cut that ends where a word ends keeps that word; otherwise back up to the last space, if one is near
   const sp = c[n - 1] === ' ' ? cut.length : cut.lastIndexOf(' ');

@@ -89,7 +89,11 @@ export function whoAsks(name, index, total, max = 28) {
   const room = Math.max(4, max - ' asks'.length - 1);
   // a name is cut at a word boundary whenever one is in reach, so "Investigate intermitte…" never happens with room to spare
   const cut = n.slice(0, room), sp = n.charAt(room) === ' ' ? room : cut.lastIndexOf(' ');
-  return (sp > room * 0.3 ? cut.slice(0, sp) : cut).replace(/[,.;:\s]+$/, '') + '… asks';
+  let s = sp > room * 0.3 ? cut.slice(0, sp) : cut;
+  // never through a hidden character's code ("⟦U+20…"): before it
+  const open = s.lastIndexOf('⟦');
+  if (open > 0 && open > s.lastIndexOf('⟧')) s = s.slice(0, open);
+  return s.replace(/[,.;:\s]+$/, '') + '… asks';
 }
 
 /**

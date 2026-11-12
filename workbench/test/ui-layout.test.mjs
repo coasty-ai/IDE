@@ -313,6 +313,20 @@ test('a long done tray never puts a machine on the DRAM\'s wire: the sections na
   assert.ok(G.machines.every(m => m.label == null), 'whole names');
 });
 
+test('a name is wrapped and cut between hidden characters\' codes, never through one ("⟦U+20" then "0B⟧")', () => {
+  const half = s => /⟦[^⟧]*$/.test(s) || /^[^⟦]*⟧/.test(s);
+  for (const text of ['Help⟦U+202E⟧pages⟦U+200B⟧', 'Onboarding⟦U+202E⟧⟦U+200B⟧', 'Checkout⟦U+202E⟧fix⟦U+200B⟧ and more words', 'reading welcome.mjml⟦U+202E⟧x⟦U+E0041⟧⟦U+3164⟧']) {
+    for (let max = 10; max <= 30; max++) {
+      for (const line of wrapWords(text, max)) assert.ok(!half(line) && Array.from(line).length <= max, `${max}: "${line}" of ${text}`);
+      const cut = clipTo(text, max);
+      assert.ok(!half(cut) && Array.from(cut).length <= max, `${max}: "${cut}"`);
+    }
+  }
+  // ordinary words are cut as before
+  assert.deepEqual(wrapWords('Investigate intermittent failures', 12), ['Investigate', 'intermittent', 'failures']);
+  assert.equal(clipTo('Investigate intermittent failures', 16), 'Investigate…');
+});
+
 test('names and words on the board show their hidden characters: chips, their status words, helpers and their labels', async () => {
   const { hasHidden } = await import('../ui/diffview.js');
   const U = n => String.fromCodePoint(n);

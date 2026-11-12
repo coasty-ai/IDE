@@ -94,6 +94,15 @@ test('who asks, in at most 28 characters: the counter goes first, then the name 
   for (const [n, i, t] of [['A very long agent name that goes on', 0, 9], ['Checkout fix', 8, 12], ['x', 0, 2]]) assert.ok(whoAsks(n, i, t).length <= 28, n);
 });
 
+test('a name is cut before a hidden character\'s code, never through it', () => {
+  const half = s => /⟦[^⟧]*…/.test(s);
+  for (let max = 16; max <= 40; max++) {
+    const w = whoAsks('Search⟦U+202E⟧cleanup⟦U+200B⟧', 0, 3, max);
+    assert.ok(!half(w) && w.length <= max, `${max}: ${w}`);
+  }
+  assert.equal(whoAsks('Search⟦U+202E⟧cleanup⟦U+200B⟧', 0, 3, 28), 'Search⟦U+202E⟧cleanup… asks');
+});
+
 test('the headline steps down a size as it gets longer, and further to fit', () => {
   assert.equal(headlineClass('short'), '');
   assert.equal(headlineClass('x'.repeat(60)), 'len-m');
