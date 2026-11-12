@@ -1474,11 +1474,19 @@ test('mergeWork says when git does not know the person’s name and email, whate
     assert.equal(await gitIdentity({ repoRoot: t.root }), null, 'both are needed');
     git(t.root, 'config', 'user.email', PERSON.email);
     assert.deepEqual(await gitIdentity({ repoRoot: t.root }), PERSON);
+    // Nor does a commit date in Workbench's own environment date the person's commits.
+    process.env.GIT_AUTHOR_DATE = process.env.GIT_COMMITTER_DATE = '@86400 +0000';
     const ok = await mergeWork(mergeOpts(t, expect));
     assert.equal(ok.ok, true);
-    assert.equal(git(t.root, 'log', '-1', '--format=%an <%ae>', ok.merge), 'Pat Person <pat@example.invalid>');
+    for (const c of [ok.work, ok.merge]) {
+      assert.equal(git(t.root, 'log', '-1', '--format=%an <%ae>|%cn <%ce>', c), 'Pat Person <pat@example.invalid>|Pat Person <pat@example.invalid>');
+      const [authored, committed] = git(t.root, 'log', '-1', '--format=%at %ct', c).split(' ').map(Number);
+      assert.ok(Math.abs(authored * 1000 - Date.now()) < 120_000 && Math.abs(committed * 1000 - Date.now()) < 120_000, 'dated now');
+    }
   } finally {
     process.env.GIT_CONFIG_GLOBAL = saved;
+    delete process.env.GIT_AUTHOR_DATE;
+    delete process.env.GIT_COMMITTER_DATE;
   }
   assert.equal(await gitIdentity({ repoRoot: path.join(T, 'missing') }), null);
 });

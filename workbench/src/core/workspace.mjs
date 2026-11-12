@@ -1053,7 +1053,10 @@ async function commitTree(run, cwd, tree, parents, message, who) {
   const args = ['-c', 'i18n.commitEncoding=UTF-8', 'commit-tree', '--no-gpg-sign', tree];
   for (const p of parents) args.push('-p', p);
   args.push('-F', '-');
-  const env = { GIT_AUTHOR_NAME: who.name, GIT_AUTHOR_EMAIL: who.email, GIT_COMMITTER_NAME: who.name, GIT_COMMITTER_EMAIL: who.email };
+  const env = {
+    GIT_AUTHOR_NAME: who.name, GIT_AUTHOR_EMAIL: who.email, GIT_COMMITTER_NAME: who.name, GIT_COMMITTER_EMAIL: who.email,
+    GIT_AUTHOR_DATE: undefined, GIT_COMMITTER_DATE: undefined, // now, whatever Workbench's own environment says
+  };
   const id = (await run(args, { cwd, input: message, env })).stdout.trim();
   if (!OID.test(id)) throw plainError('Git could not make the commit.');
   return id;
