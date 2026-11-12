@@ -381,7 +381,7 @@ export function lidView(f, o = {}) {
         // its work can go into the person's branch: Merge (always through the engine's card) or a change; "Not now" does
         // what "Looks good" did, and "Review the changes" opens its diff in the git screen
         acts = mergeButton() + big('Ask for a change', { act: 'reply', ...st, mode: 'say' });
-        links.push(reviewLink(), quiet('Not now', { act: 'looksgood', ...st, answer: 'Looks good' }));
+        links.push(reviewLink(), quiet('Not now', { act: 'looksgood', ...st, answer: 'Not now' }));
         leaves = true;
       } else {
         // not here (the demo, no git, nothing to merge), or git cannot (not on a branch, no name and email): say which

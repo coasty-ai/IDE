@@ -795,7 +795,7 @@ try {
     const p = (await posts()).filter(x => x.path.includes('/answer'));
     const next = await lidNow();
     check('"Not now" does what "Looks good" did: an answer without an ask id, and the core moves on',
-      p.length === 1 && p[0].path === '/api/agents/m1a2b3/answer' && p[0].body.answer === 'Looks good' && !('askId' in p[0].body) && /Search cleanup’s work does not merge cleanly into main/.test(next),
+      p.length === 1 && p[0].path === '/api/agents/m1a2b3/answer' && p[0].body.answer === 'Not now' && !('askId' in p[0].body) && /Search cleanup’s work does not merge cleanly into main/.test(next),
       `${JSON.stringify(p.map(x => [x.path, x.body]))} → "${next}"`);
   });
 

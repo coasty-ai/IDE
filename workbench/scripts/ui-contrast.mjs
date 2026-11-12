@@ -42,6 +42,15 @@ export const PAIRS = [
     ['card-ink', bg, 'card text'], ['card-ink-2', bg, 'card labels'], ['card-sub', bg, 'card sub line and notes'], ['c-fail', bg, 'a failed last step'],
     ['c-need', bg, 'needs-you mark', 3], ['c-stuck', bg, 'stuck mark', 3], ['c-ok', bg, 'done mark', 3], ['c-work', bg, 'working mark', 3], ['c-word', bg, 'says-done mark', 3],
   ]),
+  // focus rings drawn on card surfaces (the git detail, the menus)
+  ...['card-1', 'card-2'].map(bg => ['card-focus', bg, 'a focus ring on a card surface', 3]),
+  // the diff in the git screen's detail
+  ['card-ink', 'd-add-bg', 'an added line'], ['card-ink', 'd-del-bg', 'a removed line'], ['card-ink', 'd-hunk-bg', 'a hunk line'],
+  ['card-sub', 'd-hunk-bg', 'quiet words on a hunk line'],
+  ['d-add-mk', 'd-add-bg', 'the + mark of an added line', 3], ['d-del-mk', 'd-del-bg', 'the − mark of a removed line', 3],
+  ...['card-1', 'card-2'].map(bg => ['d-del-mk', bg, 'a removed-file mark on the card', 3]),
+  // the git graph's traces on the board
+  ...['mask-1', 'mask-2', 'mask-3'].flatMap(bg => [['g-trunk', bg, 'your branch, the gold trunk', 3], ['g-lane', bg, "an agent's lane", 3]]),
 ];
 
 const hex = h => { h = h.replace('#', ''); if (h.length === 3) h = [...h].map(c => c + c).join(''); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16) / 255); };
@@ -52,12 +61,14 @@ export const ratio = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => 
 /** The custom properties of each look, from app.css (green is also the default :root). */
 export function palettes(css) {
   const out = {};
+  // Every block whose selector is exactly `sel`, merged in order (a later one wins, as in the cascade): a look's
+  // colours may be set in more than one block (the git screen adds its own).
   const block = sel => {
-    const i = css.indexOf(sel);
-    if (i < 0) return {};
-    const body = css.slice(css.indexOf('{', i) + 1, css.indexOf('}', i));
     const vars = {};
-    for (const m of body.matchAll(/--([\w-]+)\s*:\s*([^;]+);/g)) vars[m[1]] = m[2].trim();
+    const esc = sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const m of css.matchAll(new RegExp(`(^|[}\\n])\\s*${esc}\\s*\\{([^}]*)\\}`, 'g'))) {
+      for (const v of m[2].matchAll(/--([\w-]+)\s*:\s*([^;]+);/g)) vars[v[1]] = v[2].trim();
+    }
     return vars;
   };
   const green = block(':root, :root[data-theme="green"]');

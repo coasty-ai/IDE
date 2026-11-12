@@ -85,11 +85,13 @@ export function workNodeOf(a, ACTIVE = ACTIVE_DEFAULT) {
  */
 export function workActions(a, { mode = null, repo = null, ACTIVE = ACTIVE_DEFAULT } = {}) {
   const w = a && a.work;
-  const reviewable = !!(w && !a.parentId && w.branch && w.folder && !w.thrownAway);
-  if (mode !== 'live' || !reviewable) return { merge: false, discard: false };
+  // the same rules as queue.js mergeApplies and discardApplies (which the page uses when model.js has them): a merge
+  // needs its folder and branch; throwing away needs its branch or its folder (a branch whose folder is gone still goes)
+  if (mode !== 'live' || !w || a.parentId || w.thrownAway) return { merge: false, discard: false };
+  const discard = !!(w.branch || w.folder);
   const unmerged = a.files ? (Number(a.files.changed) || 0) > 0 : (a.state === 'stopped' || a.state === 'failed' || !!a.earlier);
-  const merge = !ACTIVE.has(a.state) && !!(repo && repo.branch) && repo.identity !== false && unmerged;
-  return { merge, discard: true };
+  const merge = !!(w.branch && w.folder) && !ACTIVE.has(a.state) && !!(repo && repo.branch) && repo.identity !== false && unmerged;
+  return { merge, discard };
 }
 
 /** "Merge into main", with a branch past 16 characters cut in the middle, as the lid does (all of it in the title). */

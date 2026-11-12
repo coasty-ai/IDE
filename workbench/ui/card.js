@@ -11,6 +11,9 @@ import { esc } from './util.js';
 import { visibleControls } from './words.js';
 import { agoText } from './boardmodel.js';
 
+// Agent-controlled text: escaped, with hidden and direction-changing characters shown as marks (one rule, words.js).
+const vis = x => esc(visibleControls(String(x ?? '')));
+
 /**
  * Where a root's work is: "Merged into main · 2 min ago" (nothing new since), "Not merged yet", or "Its work was thrown
  * away · 5 min ago". Empty for helpers and agents without git, and while nothing is known.
@@ -39,20 +42,20 @@ function nowLine(a, now) {
   if (a.ask && NEEDS_YOU.has(a.state)) {
     let s = a.ask.sentence || '';
     if (s.startsWith(a.name + ' ')) s = s.slice(a.name.length + 1).replace(/^./, c => c.toUpperCase());
-    return `<span class="now">${esc(clip(s, 90))}</span> <em>· ${esc(calmDuration(now - (a.ask.createdAt || a.stateSince), duration, 'just now'))}</em>`;
+    return `<span class="now">${vis(clip(s, 90))}</span> <em>· ${esc(calmDuration(now - (a.ask.createdAt || a.stateSince), duration, 'just now'))}</em>`;
   }
   if (a.state === 'working' || a.state === 'starting') {
     const what = a.thinking && (!a.now || a.now === 'Thinking') ? 'Thinking' : (a.now || 'Working');
     // whole minutes only: the card does not tick every second
     const quietFor = now - (a.lastEventAt || a.stateSince);
-    return `<span class="now">${esc(clip(what, 70))}</span>${quietFor >= 60000 ? ` <em>· quiet for ${esc(duration(quietFor))}</em>` : ''}`;
+    return `<span class="now">${vis(clip(what, 70))}</span>${quietFor >= 60000 ? ` <em>· quiet for ${esc(duration(quietFor))}</em>` : ''}`;
   }
   if (a.state === 'waiting_helpers') {
     // what it waits for, in the engine's words ("Waiting for a background command"), never a count of helper views
-    return `<span class="now">${esc(clip(/^waiting/i.test(a.now || '') ? a.now : 'Waiting for its background work', 70))}</span>`;
+    return `<span class="now">${vis(clip(/^waiting/i.test(a.now || '') ? a.now : 'Waiting for its background work', 70))}</span>`;
   }
-  if (a.state === 'failed') return `<span class="now">${esc(clip(a.error || a.stateReason || 'It stopped with an error.', 110))}</span>`;
-  return `<span class="now">${esc(a.says ? clip(a.says, 110) : markOf(a.state, LOOK).label)}</span>`;
+  if (a.state === 'failed') return `<span class="now">${vis(clip(a.error || a.stateReason || 'It stopped with an error.', 110))}</span>`;
+  return `<span class="now">${vis(a.says ? clip(a.says, 110) : markOf(a.state, LOOK).label)}</span>`;
 }
 
 /** A one-sentence summary, for screen readers (the chip's aria-describedby points here). */
@@ -88,7 +91,7 @@ export function cardHtml(a, o) {
   // helpers by need (asking, working, latest ended): a few on hover, more once pinned, then a count of the rest
   const cap = o.pinned ? 10 : more ? 6 : 4;
   const listed = kids.length > cap ? kids.slice(0, cap - 1) : kids;
-  const kidsHtml = listed.map(k => { const m = markOf(k.state, LOOK); return `<div class="kid">${mark(m.shape, m.tone)}<span>${esc(k.name)}${more ? ` <em>· ${esc(k.state === 'working' || k.state === 'starting' ? clip(k.now || 'working', 40) : m.label)}</em>` : ''}</span></div>`; }).join('')
+  const kidsHtml = listed.map(k => { const m = markOf(k.state, LOOK); return `<div class="kid">${mark(m.shape, m.tone)}<span>${vis(k.name)}${more ? ` <em>· ${vis(k.state === 'working' || k.state === 'starting' ? clip(k.now || 'working', 40) : m.label)}</em>` : ''}</span></div>`; }).join('')
     + (kids.length > listed.length ? `<div class="kid"><em>and ${kids.length - listed.length} more${o.pinned ? '' : ' (click to see more)'}</em></div>` : '');
   const u = a.usage || {};
   const elapsed = (a.endedAt || now) - a.startedAt;
@@ -103,7 +106,7 @@ export function cardHtml(a, o) {
   const wk = more ? workWords(a, now) : '';
   const lines = [`<div class="ln"><span>Now</span><span>${nowLine(a, now)}${wk ? `<span class="wk">${esc(wk)}</span>` : ''}</span></div>`];
   if (more) {
-    const last = (a.recent || []).slice(-1).map(s => `<span class="${s.ok === false ? 'x' : ''}">${s.ok === false ? '✗' : '✓'} ${esc(clip(pastTense(s.sentence), 60))}</span>`).join('');
+    const last = (a.recent || []).slice(-1).map(s => `<span class="${s.ok === false ? 'x' : ''}">${s.ok === false ? '✗' : '✓'} ${vis(clip(pastTense(s.sentence), 60))}</span>`).join('');
     if (last) lines.push(`<div class="ln"><span>Last</span><span>${last}</span></div>`);
   }
   if (kidsHtml) lines.push(`<div class="ln"><span>Helpers</span><span>${kidsHtml}</span></div>`);
@@ -135,8 +138,8 @@ export function cardHtml(a, o) {
     if (a.checks?.state === 'running') foot.push('checks running');
     if (a.rules?.broken?.length) foot.push(`${a.rules.broken.length} rule broken: ${clip(a.rules.broken[0].say, 50)}`);
   }
-  return `<p class="sr" id="cardSum">${esc(a.name)}: ${esc(summary(a, now))}</p>
-    <div class="hd"><b>${esc(a.name)}</b><span class="stt">${mark(look.shape, look.tone)}${esc(look.label)}</span></div>
+  return `<p class="sr" id="cardSum">${vis(a.name)}: ${vis(summary(a, now))}</p>
+    <div class="hd"><b>${vis(a.name)}</b><span class="stt">${mark(look.shape, look.tone)}${esc(look.label)}</span></div>
     ${more || helper ? `<div class="sub">${esc(sub)}</div>` : ''}<hr>
     <div class="cols"><div>${lines.join('')}</div>${o.one ? '' : '<div class="vr"></div>'}
     <div class="grid">${cells.join('')}</div></div>${foot.length ? `<div class="foot">${esc(foot.join(' · '))}</div>` : ''}`;

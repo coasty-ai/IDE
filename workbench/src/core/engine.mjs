@@ -63,6 +63,8 @@ const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 const ALLOW_LABEL_RE = /^allow$/i;
 const DENY_LABEL_RE = /^deny$/i;
 const LOOKS_GOOD_RE = /^(looks good|look good|lgtm|great|thanks|thank you|good|fine|ok|okay|all good)[.!]*$/i;
+// The lid's "Not now" on work that can be merged: the agent stays as it is, and the reply does not sound like approval.
+const NOT_NOW_RE = /^not now[.!]*$/i;
 const HELP = 'I did not catch that. Try “start an agent to fix the login bug”, “what needs me”, or “stop everything”.';
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
 
@@ -1422,6 +1424,7 @@ export class Engine extends EventEmitter {
 
   async _answerDone(v, text) {
     if (!text || LOOKS_GOOD_RE.test(text)) return { ok: true, reply: `Good. ${v.name} stays as it is.` };
+    if (NOT_NOW_RE.test(text)) return { ok: true, reply: v.work?.branch ? `OK. ${v.name}’s work stays on its branch for now.` : `OK. ${v.name} stays as it is.` };
     const sent = await this._sendTo(v, text);
     if (!sent.ok) return sent;
     return { ok: true, reply: sent.reply || `Sent your follow-up to ${v.name}.` };
@@ -3091,6 +3094,8 @@ export class Engine extends EventEmitter {
     if (c.yes) out.yes = c.yes;
     if (c.no) out.no = c.no;
     if (typeof c.danger === 'boolean') out.danger = c.danger;
+    // a merge or throw-away card names the agent it is about, so the git screen can show it in that agent's detail
+    if ((c.kind === 'merge' || c.kind === 'discard') && typeof c.agentId === 'string' && c.agentId) out.agentId = c.agentId;
     return out;
   }
 

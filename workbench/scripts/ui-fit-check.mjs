@@ -577,8 +577,7 @@ try {
       } else if (v === 'taint') {
         // Everything an agent controls, with characters in it that hide text or turn it: its name, what it says, asks and
         // does, the words of its answers, its paths, its checks' and its helpers' names. The board, the lid and what is
-        // announced must show each one by its code, in text and in names for screen readers (the card is card.js's own,
-        // and is left out here).
+        // announced, and the pinned card, must show each one by its code, in text and in names for screen readers.
         const taint = async () => {
           const st = await (await fetch(base + '/ctl/state')).json();
           const U = n => String.fromCodePoint(n), RLO = U(0x202e), ZW = U(0x200b), TAG = U(0xe0041), HF = U(0x3164), LS = U(0x2028), SHY = U(0xad);
@@ -599,7 +598,7 @@ try {
         };
         const SCAN = String.raw`(async () => {
           const { hasHidden } = await import('/ui/diffview.js');
-          const out = [], skip = e => !!e.closest('#card');
+          const out = [], skip = () => false;
           const label = el => { let s = el.tagName.toLowerCase(); if (el.id) s += '#' + el.id; else if (el.classList && el.classList.length) s += '.' + [...el.classList].slice(0, 2).join('.'); return s; };
           const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
           for (let n; (n = walker.nextNode());) { const p = n.parentElement; if (p && !skip(p) && hasHidden(n.data.replace(/\n/g, ''))) out.push('raw hidden characters in the text of ' + label(p)); }
@@ -618,7 +617,7 @@ try {
         await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="next"]')?.click(), true`); await sleep(900); await settle(100);
         await scan('might be stuck');
         for (const [id, what] of [['228202', 'done and checked'], ['902d13', 'working, with helpers'], ['399e17-7a7143c0', 'a helper that finished']]) {
-          await load('demo', `&focus=${id}`); await taint(); await scan(what);
+          await load('demo', `&focus=${id}&pin=${id}`); await taint(); await scan(what + ', its card pinned');
         }
       } else {
         failures.push(`${tag}: no such view`);

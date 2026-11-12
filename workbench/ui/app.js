@@ -567,9 +567,10 @@ async function actOn(b) {
       S.focusId = a.id;
       if (r.confirm) S.confirm = { ...r.confirm, agentId: a.id }; else say(r.reply || '');
     } else if (act === 'looksgood') {
-      // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is
+      // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is ("Not now"
+      // says so in its own words, so it never sounds like approval)
       busy(b);
-      const r = await api.answer(a.id, null, 'Looks good');
+      const r = await api.answer(a.id, null, b.dataset.answer === 'Not now' ? 'Not now' : 'Looks good');
       markReviewed(a);
       answeredOnce();
       say(r.reply || '', 4000);
@@ -622,10 +623,10 @@ function startReply(a, mode, askId, state) {
   const P = G ? G.P : null, barW = P ? P.coreW - 2 * P.ring - 2 * P.lid.padX - 18 : 260;
   const verb = mode === 'answer' ? (a.state === 'maybe_stuck' ? 'hint to' : 'to') : 'tell';
   const chars = Math.floor((barW * 0.5 - 34) / measure('M', P ? P.lid.meta : 12, 600));
-  el.toText.textContent = `${verb} ${clip(a.name, Math.max(6, chars - verb.length - 2))}:`;
-  el.to.title = `${mode === 'answer' ? 'Your answer goes to' : 'This goes to'} ${a.name}`;
+  el.toText.textContent = `${verb} ${visibleControls(clip(a.name, Math.max(6, chars - verb.length - 2)))}:`;
+  el.to.title = `${mode === 'answer' ? 'Your answer goes to' : 'This goes to'} ${visibleControls(a.name)}`;
   el.bar.classList.add('replying');
-  el.say.setAttribute('aria-label', mode === 'answer' ? `Your answer to ${a.name}` : `What to tell ${a.name}`);
+  el.say.setAttribute('aria-label', mode === 'answer' ? `Your answer to ${visibleControls(a.name)}` : `What to tell ${visibleControls(a.name)}`);
   el.say.focus();
 }
 function endReply() {
@@ -916,7 +917,7 @@ function renderTrayList() {
     if (!a) return '';
     const m = markOf(a.state, STATES.LOOK);
     const note = a.earlier ? agoText(Date.now() - (a.endedAt || a.stateSince)) : m.label;
-    return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(a.name)} <em>· ${esc(note)}</em></span></button>`;
+    return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(visibleControls(a.name))} <em>· ${esc(note)}</em></span></button>`;
   };
   const done = trayIds.done.map(row).join(''), over = trayIds.over.map(row).join(''), early = (trayIds.earlier || []).map(row).join('');
   patchChildren(el.trayList, `${done || !early ? `<h2>Done or stopped</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);

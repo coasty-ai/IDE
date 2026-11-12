@@ -2406,7 +2406,7 @@ test('merge: the card asks first, counts first, and binds itself to the work it 
   assert.equal(out.reply, 'Merge Fix cart total into main?');
   assert.match(out.confirm.id, /^[0-9a-f]{12}$/);
   assert.deepEqual({ ...out.confirm, id: null }, {
-    id: null, kind: 'merge', sentence: 'Merge Fix cart total into main?', yes: 'Merge', no: 'Cancel', danger: false,
+    id: null, kind: 'merge', sentence: 'Merge Fix cart total into main?', yes: 'Merge', no: 'Cancel', danger: false, agentId: a.id,
     detail: '3 files, +40 −2. Its work becomes a commit on its branch, joined into main by a merge commit. Nothing checked its work. Your 2 uncommitted changes stay as they are.',
   });
   assert.equal(t.notices.length, before, 'a card is not announced');
@@ -2416,6 +2416,20 @@ test('merge: the card asks first, counts first, and binds itself to the work it 
   assert.equal(stored.agentId, a.id);
   assert.deepEqual(stored.expect, { workId: `${FAKE_BASE}:tree0`, into: 'main', intoHead: FAKE_BASE });
   assert.equal(t.calls.mergeWork.length, 0, 'nothing is merged before the yes');
+  await t.engine.shutdown();
+});
+
+test('finished work: "Not now" leaves the agent as it is, sends it nothing, and the reply is no approval', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await doneAgent(t);
+  const before = a.runner.sent.length;
+  const out = await t.engine.answer(a.id, { answer: 'Not now' });
+  assert.equal(out.ok, true);
+  assert.equal(out.reply, `OK. ${a.v.name}’s work stays on its branch for now.`);
+  assert.equal(a.runner.sent.length, before, '"Not now" is not a message for the agent');
+  assert.equal(t.store.get(a.id).state, 'done_claimed');
+  const good = await t.engine.answer(a.id, { answer: 'Looks good' });
+  assert.equal(good.reply, `Good. ${a.v.name} stays as it is.`);
   await t.engine.shutdown();
 });
 
@@ -2998,7 +3012,8 @@ test('merge and throw away by words: the card is for the agent the words named, 
   const before = t.notices.length;
   const card = await t.engine.command('merge it', { focusId: a.id });
   assert.equal(card.reply, 'Merge Fix cart total into main?');
-  assert.deepEqual(Object.keys(card.confirm).sort(), ['danger', 'detail', 'id', 'kind', 'no', 'sentence', 'yes']);
+  assert.deepEqual(Object.keys(card.confirm).sort(), ['agentId', 'danger', 'detail', 'id', 'kind', 'no', 'sentence', 'yes']);
+  assert.equal(card.confirm.agentId, a.id, 'a merge card names the agent it is about');
   assert.equal(card.confirm.kind, 'merge');
   assert.equal(t.notices.length, before, 'a card is not announced');
   // The parser sees the card on screen as it is, with its agent.
@@ -3113,9 +3128,9 @@ test('cards: every card the page gets says its kind, and merge and throw-away ca
   assert.equal((await card({ kind: 'say', agentId: a.id, text: 'also the docs', sure: false })).kind, 'say');
   assert.equal((await card({ kind: 'forget', agentIds: [a.id] })).kind, 'forget');
   const merge = await t.engine.proposeMerge(a.id);
-  assert.deepEqual({ ...merge.confirm, id: null, detail: null }, { id: null, detail: null, kind: 'merge', sentence: 'Merge Fix cart total into main?', yes: 'Merge', no: 'Cancel', danger: false });
+  assert.deepEqual({ ...merge.confirm, id: null, detail: null }, { id: null, detail: null, kind: 'merge', sentence: 'Merge Fix cart total into main?', yes: 'Merge', no: 'Cancel', danger: false, agentId: a.id });
   const away = await t.engine.proposeDiscard(a.id);
-  assert.deepEqual({ ...away.confirm, id: null, detail: null }, { id: null, detail: null, kind: 'discard', sentence: 'Throw away Fix cart total’s work?', yes: 'Throw it away', no: 'Keep it', danger: true });
+  assert.deepEqual({ ...away.confirm, id: null, detail: null }, { id: null, detail: null, kind: 'discard', sentence: 'Throw away Fix cart total’s work?', yes: 'Throw it away', no: 'Keep it', danger: true, agentId: a.id });
   await t.engine.shutdown();
 });
 
@@ -3181,7 +3196,7 @@ test('throw away: the card says what goes; yes deletes its folder and branch, ke
   const out = await t.engine.proposeDiscard(a.id, { state: 'done_claimed' });
   assert.equal(out.reply, 'Throw away Fix cart total’s work?');
   assert.deepEqual({ ...out.confirm, id: null }, {
-    id: null, kind: 'discard', sentence: 'Throw away Fix cart total’s work?', yes: 'Throw it away', no: 'Keep it', danger: true,
+    id: null, kind: 'discard', sentence: 'Throw away Fix cart total’s work?', yes: 'Throw it away', no: 'Keep it', danger: true, agentId: a.id,
     detail: `Its folder and its branch ${branch} are deleted, with 3 changed files. Workbench keeps a hidden copy in git. The hidden copy leaves out 1 file that a .gitignore hides and 1 folder that is a git repository of its own.`,
   });
   assert.equal(t.notices.length, before, 'a card is not announced');
@@ -3466,7 +3481,7 @@ test('demo: with the simulator’s git methods, cards and outcomes come from it,
   // The card: the simulator's words, the engine's id; the yes passes on what the card was bound to.
   const card = await t.engine.proposeMerge(a.id, { state: 'done_claimed' });
   assert.deepEqual({ ...card.confirm, id: null }, {
-    id: null, kind: 'merge', sentence: 'Merge Export invoices into main?', yes: 'Merge', no: 'Cancel', danger: false,
+    id: null, kind: 'merge', sentence: 'Merge Export invoices into main?', yes: 'Merge', no: 'Cancel', danger: false, agentId: a.id,
     detail: '2 files, +5 −1. Its work becomes a commit on its branch, joined into main by a merge commit. Nothing checked its work.',
   });
   const asked = t.sim.git.find(c => c[0] === 'proposeMerge');
@@ -3569,7 +3584,7 @@ test('demo: a simulator that merges and throws away but makes no cards of its ow
   await until(() => t.store.get(v.id).state === 'done_claimed');
   const card = await t.engine.proposeMerge(v.id);
   assert.deepEqual({ ...card.confirm, id: null }, {
-    id: null, kind: 'merge', sentence: 'Merge Export invoices into main?', yes: 'Merge', no: 'Cancel', danger: false,
+    id: null, kind: 'merge', sentence: 'Merge Export invoices into main?', yes: 'Merge', no: 'Cancel', danger: false, agentId: v.id,
     detail: '2 files, +5 −1. Its work becomes a commit on its branch, joined into main by a merge commit. This is the demo, so nothing is really merged.',
   });
   assert.equal((await t.engine.confirm(card.confirm.id, true)).reply, 'Merged Export invoices into main. This is the demo: nothing was really merged.');
@@ -3582,7 +3597,7 @@ test('demo: a simulator that merges and throws away but makes no cards of its ow
   await until(() => t.store.get(b.id).state === 'done_claimed');
   const away = await t.engine.proposeDiscard(b.id);
   assert.deepEqual({ ...away.confirm, id: null }, {
-    id: null, kind: 'discard', sentence: 'Throw away Write help pages’s work?', yes: 'Throw it away', no: 'Keep it', danger: true,
+    id: null, kind: 'discard', sentence: 'Throw away Write help pages’s work?', yes: 'Throw it away', no: 'Keep it', danger: true, agentId: b.id,
     detail: `Its folder and its branch workbench/write-help-pages-${b.id} are deleted, with 1 changed file. Workbench keeps a hidden copy in git. This is the demo, so nothing is really thrown away.`,
   });
   assert.match((await t.engine.confirm(away.confirm.id, true)).reply, /^Threw away Write help pages’s work\./);

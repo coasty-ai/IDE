@@ -155,7 +155,7 @@ test('finished work that can be merged: Merge into main and Ask for a change; Re
     assert.equal(review.cls, 'quiet');
     assert.deepEqual([review.act, review.agent, review.state, review.work], ['review', 'W1', st, 'u']);
     assert.equal(notNow.cls, 'quiet');
-    assert.deepEqual([notNow.act, notNow.answer, notNow.agent, notNow.state], ['looksgood', 'Looks good', 'W1', st], '"Not now" does what "Looks good" did');
+    assert.deepEqual([notNow.act, notNow.answer, notNow.agent, notNow.state], ['looksgood', 'Not now', 'W1', st], '"Not now" lets it go like "Looks good", in its own words');
     assert.equal(allButtons(v.html).filter(b => b.cls.startsWith('big')).length, 2, 'at most two answers');
   }
 });
