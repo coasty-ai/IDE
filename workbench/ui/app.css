@@ -599,6 +599,7 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitGraph .l1 svg.g { width: 10px; height: 10px; }
 #gitGraph .l2 { font-size: var(--g-l2); color: var(--silk-2); white-space: nowrap; line-height: 1.3; }
 #gitGraph .gr.work .sub { font-weight: 600; }
+#gitGraph.covered .gr .l1, #gitGraph.covered .gr .l2, #gitGraph.covered .gmore { visibility: hidden; }
 #gitGraph .ref { flex: none; padding: 0 5px; border: 1px solid var(--silk-2); border-radius: 3px; font-size: var(--g-l2); font-weight: 600; line-height: 1.35; color: var(--silk); }
 #gitGraph .ref.yours { border-color: var(--g-trunk); }
 #gitGraph .ref.agent { border-color: var(--g-lane); }

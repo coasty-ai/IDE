@@ -91,6 +91,7 @@ export function openGit({ agentId = null, opener = null } = {}) {
   st.opener = opener && opener.isConnected ? opener : null;
   st.openedOn = agentId && typeof agentId === 'string' ? agentId : null;
   if (st.openedOn) { st.sel = 'work:' + st.openedOn; st.detail = { kind: 'agent', agentId: st.openedOn }; st.armedUntil = performance.now() + 600; }
+  else if (!st.shown) st.detail = null;   // by the DRAM or the words: the graph, at the row last selected
   if (st.shown && st.moving !== 'up') { paint(); if (st.detail) loadChanges(true); focusAfterOpen(); return; }
   st.shown = true;
   ctx.onShow(true);
@@ -382,7 +383,9 @@ const bandBottom = z => {
 /** The graph: the SVG (traces, vias, pads, chips) under one row per commit, each row a listbox option. */
 function paintGraph(z) {
   const { P, bd, GP } = z;
-  const top = Math.round(bandBottom(z)), left = bd.x + 14, right = bd.r - 14, bottom = bd.b - 14;
+  // under the band: the wire's level run, then the graph
+  const band = Math.round(bandBottom(z));
+  const top = band + 24, left = bd.x + 14, right = bd.r - 14, bottom = bd.b - 14;
   Object.assign(el.graph.style, { left: left + 'px', top: top + 'px', width: right - left + 'px', height: Math.max(80, bottom - top) + 'px' });
   const areaW = right - left;
   const minText = P.name === 'S' ? 300 : P.name === 'M' ? 380 : 440;
@@ -390,7 +393,7 @@ function paintGraph(z) {
   const d = st.data;
   const detailLevel = el.html.dataset.detail || 'calm';
   const key = [st.seq, d ? 1 : 0, st.error || '', st.loading, z.W, z.H, graphW, st.sel, detailLevel, d && JSON.stringify(d.agents.map(a => { const x = agentOf(a.id); return x && [x.state, workSig(x), x.files && x.files.changed]; }))].join('|');
-  st.geo = { top, left, right, bottom, graphW, textX: 0, wire: st.geo && st.geo.wire };
+  st.geo = { band, top, left, right, bottom, graphW, textX: 0, wire: st.geo && st.geo.wire };
   if (!d) {
     st.g = null;
     const words = st.error ? esc(st.error) : 'Reading the history…';
@@ -406,6 +409,12 @@ function paintGraph(z) {
   }
   const g = st.g && st.keys.graph === key ? st.g : graphLayout({ commits: d.commits, agents: d.agents.map(a => agentOf(a.id) || a), branch: d.repo.branch, head: d.repo.head, width: graphW, height: bottom - top, ACTIVE: STATES.ACTIVE }, GP);
   st.g = g;
+  // opened on an agent with no work node (merged with nothing new: "See it in git"): its branch's tip, or its merge
+  if (st.sel && st.sel.startsWith('work:') && !g.rows.some(r => r.item.id === st.sel)) {
+    const a = agentOf(st.sel.slice(5)), br = a && a.branch;
+    const tip = (br && d.commits.find(c => c.refs.includes(br))) || d.commits.find(c => c.agentId === (a && a.id) && c.kind === 'merge');
+    if (tip) st.sel = tip.id;
+  }
   st.geo.textX = Math.ceil(g.w + 12);
   if (st.keys.graph === key) return;
   st.keys.graph = key;
@@ -500,7 +509,8 @@ function paintBoard(z) {
   if (tx == null) wire = [[wx, y0], [wx, yTop]];
   else if (Math.abs(tx - wx) < 1) wire = [[wx, y0], [wx, yTop]];
   else {
-    const D = 14, yRun = yTop - 10 - D, s = Math.sign(tx - wx);
+    // down between the band's two halves, a 45° bend, level just under the band, a 45° bend, down into the trunk
+    const D = 14, yRun = geo.band + 2, s = Math.sign(tx - wx);
     wire = [[wx, y0], [wx, yRun - D], [wx + s * D, yRun], [tx - s * D, yRun], [tx, yRun + D], [tx, yTop]];
   }
   geo.wire = wire;
@@ -627,6 +637,8 @@ function onDetailClick(e) {
 /** The panel at the right, over the text column: an agent's branch (its work, its actions, its diff) or a commit. */
 function paintDetail(z = sizes()) {
   const d = st.detail, geo = st.geo;
+  // the rows' words under the panel are hidden while it is open (the rows keep their names for screen readers)
+  el.graph.classList.toggle('covered', !!(d && geo));
   if (!d || !geo) { if (!el.detail.hidden) { el.detail.hidden = true; el.detail.innerHTML = ''; st.keys.detail = ''; } return; }
   // over the whole text column (the graph stays in sight), and clear of the mounting hole in the bottom right corner
   const left = geo.left + Math.max(120, (geo.textX || geo.graphW) - 8);
@@ -664,6 +676,11 @@ function agentDetail(agentId, z) {
     lines.push(`On its branch <b>${esc(visibleText(w.branch))}</b>${from ? `, from ${esc(visibleText(from))}${at ? ` at ${esc(at)}` : ''}` : at ? `, from ${esc(at)}` : ''}`);
   } else lines.push(w.thrownAway ? 'Its work was thrown away. Workbench keeps a hidden copy in git.' : 'It has no branch of its own.');
   if (w.merged) lines.push(`Merged into ${esc(visibleText(w.merged.into || 'your branch'))} ${esc(agoText(Date.now() - (w.merged.at || Date.now())))} · ${esc(plural(w.merged.files || 0, 'file'))}`);
+  // "more" detail: who did the work, as the lid's meta line says it
+  if (el.html.dataset.detail === 'more') {
+    const who = [a.harness === 'claude' ? 'Claude' : a.harness === 'codex' ? 'Codex' : a.harness === 'sim' ? 'Simulated' : '', a.model || '', a.machineId ? model.machineName(a.machineId) : ''].filter(Boolean);
+    if (who.length) lines.push(esc(visibleText(who.join(' · '))));
+  }
   // its counts, from the diff once it is here (exactly what a merge would take), else from what the agent reported
   const ch = st.changes.agentId === agentId ? st.changes : null;
   const diff = ch && ch.data && ch.data.ok !== false ? ch.data.diff : null;
