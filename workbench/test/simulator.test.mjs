@@ -1038,6 +1038,7 @@ test('git: Invoice export merges: its work becomes a commit on its branch, and a
   const adds = sum(v.files.list, 'adds');
   const dels = sum(v.files.list, 'dels');
   assert.equal(v.files.changed, 5);
+  const merging = sim.changes(iid);
   const n = store.events.length;
   const card = sim.proposeMerge(iid);
   assert.equal(store.events.length, n, 'a card changes nothing');
@@ -1100,6 +1101,11 @@ test('git: Invoice export merges: its work becomes a commit on its branch, and a
   const gone = d.files[1];
   assert.equal(gone.adds, 0);
   assert.equal(gone.dels, before.agents.find(a => a.id === iid).files.list.find(f => f.path === gone.path).adds, 'all of the merged file goes');
+  // The lines taken out are the ones that were put in, from the same blob.
+  const put = merging.files.find(f => f.path === gone.path).patch.split('\n');
+  const out = gone.patch.split('\n');
+  assert.equal(out[2], `index ${put[2].slice('index 0000000..'.length)}..0000000`);
+  assert.deepEqual(out.slice(6).map(l => l.slice(1)), put.slice(6).map(l => l.slice(1)));
   for (const f of d.files) checkPatch(f);
   assert.deepEqual(gitReads(d.files), readAs(d.files));
   const card2 = sim.proposeMerge(iid);
