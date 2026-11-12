@@ -17,6 +17,7 @@ import { THEME_NAMES, DETAIL_NAMES, loadPrefs, savePref, pageCommand } from './p
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { buttonRow } from './words.js';
+import { visibleControls } from './words.js'; // say(): what is said shows hidden characters as the lid does
 import { spentAmountWords } from './numbers.js';
 // D1: the git screen below the board, reached by the DRAM (gitscreen.js draws it; this file switches screens)
 import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitFocusId } from './gitscreen.js';
@@ -90,7 +91,10 @@ let leaveTimer = null;
 let notice = null, noticeTimer = null;
 const hintDone = () => { try { return localStorage.getItem('wb-answered') === '1'; } catch { return false; } };
 function say(text, ms = 9000) {
-  notice = text ? String(text) : null;
+  // A reply or notice can name an agent's branch or paths, which the agent chose: characters that hide text or change the
+  // order it reads in show by their code (⟦U+202E⟧) here and on the git screen. Line breaks, tabs and runs of spaces
+  // become one space first (not by \s or trim(), which would take U+FEFF, U+2028 and U+2029 for spaces too).
+  notice = text ? visibleControls(String(text).split(/[\t\n\v\f\r ]+/).filter(Boolean).join(' ')) || null : null;
   clearTimeout(noticeTimer);
   if (notice && ms) noticeTimer = setTimeout(() => { notice = null; paintSaid(); }, ms);
   paintSaid();
