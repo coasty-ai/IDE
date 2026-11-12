@@ -531,8 +531,9 @@ function countLines(file, budget) {
 //
 // The person's folder only ever sees `git merge --ff-only` to a merge commit built in the object database (merge-tree
 // and commit-tree), with --no-autostash and --no-overwrite-ignore: never a real merge, never conflict markers, never
-// update-ref on a checked-out branch. Every git command here runs with core.hooksPath set to an empty folder, so no
-// hook in the repository runs (commit-tree runs none anyway).
+// update-ref on a checked-out branch. Every git command here runs with core.hooksPath set to an empty folder and every
+// hook set in git config (hook.<name>.command, git 2.54 and newer) switched off, so no hook runs (commit-tree runs none
+// anyway). Clean and smudge filters and merge drivers from git config still run, as they would for git itself.
 
 const MIN_GIT = [2, 38, 0]; // merge-tree --write-tree
 const MERGE_TIMEOUT_MS = 10 * 60_000; // stopping git half-way through updating the person's folder would be worse than waiting
