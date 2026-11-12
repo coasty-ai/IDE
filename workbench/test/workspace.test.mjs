@@ -694,6 +694,35 @@ test('snapshotWork reads the work set in a temporary index and never writes the 
   assert.ok(d.files.every(f => !String(f.patch).includes('SECRET OUTSIDE')), 'nothing from outside the folder');
 });
 
+test('a snapshot still sees an edit of the same size made in the second the agent’s index was written, however much later it is taken', async () => {
+  // Git trusts the size and times it noted for a file in an index unless the file is not older than the index. A
+  // fresh copy of the index is newer than everything, so a snapshot read through one would miss such an edit for good.
+  let t, index;
+  for (let tries = 1; ; tries++) {
+    t = await agentRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+    write(t.w('a.txt'), 'one\nTWO\nthree\n'); // the same size, at once
+    index = path.resolve(t.ws.path, git(t.ws.path, 'rev-parse', '--git-path', 'index'));
+    const second = f => Math.floor(fs.statSync(f).mtimeMs / 1000);
+    if (second(t.w('a.txt')) === second(index)) break; // what makes it racy: the edit in the index's own second
+    assert.ok(tries < 5, 'the edit never landed in the second the index was written');
+  }
+  const first = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+  assert.deepEqual(first.files, [{ path: 'a.txt', status: 'modified', adds: 1, dels: 1 }]);
+  // Into a later second than the index's.
+  await new Promise(resolve => setTimeout(resolve, (Math.floor(fs.statSync(index).mtimeMs / 1000) + 1) * 1000 - Date.now() + 50));
+
+  // The danger, where this git trusts whole seconds: a plain copy of the index hides the edit.
+  const copy = path.join(T, `index-copy-${t.id}`);
+  fs.copyFileSync(index, copy);
+  const plain = spawnSync('git', ['diff-files', '--quiet'], { cwd: t.ws.path, env: { ...process.env, GIT_INDEX_FILE: copy } });
+  if (plain.status === 0) assert.equal(statusOf(t.ws.path), ' M a.txt\n', 'git itself, with the real index, sees the edit');
+
+  const later = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+  assert.equal(later.tree, first.tree);
+  assert.deepEqual(later.files, first.files);
+  assert.equal((await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base })).workId, first.workId);
+});
+
 test('workDiff marks binary and large files, and cuts long patches and long lists', async () => {
   const t = await agentRepo({ 'README.md': '#\n' });
   const { w } = t;
@@ -1288,7 +1317,8 @@ test('gitGraph lists HEAD and the agents’ branches newest first, with agentId 
   git(t.root, 'add', 'f.txt');
   git(t.root, 'commit', '-q', '-m', `Fix ${rlo}txt.exe`);
   const head = headOf(t.root);
-  // A branch that is neither HEAD nor an agent's is not followed.
+  // A branch that is neither HEAD nor an agent's is not followed, but it is named where it points at a listed commit.
+  git(t.root, 'branch', 'release', decoy);
   git(t.root, 'branch', 'side', decoy);
   git(t.root, 'checkout', '-q', 'side');
   write(t.p('side.txt'), 's\n');
@@ -1319,7 +1349,7 @@ test('gitGraph lists HEAD and the agents’ branches newest first, with agentId 
   assert.equal(by(m.work).kind, 'work');
   assert.equal(by(m.work).agentId, t.id);
   assert.deepEqual(by(secondTip), { ...by(secondTip), refs: ['workbench/graph-second-gr0002'], agentId: null, kind: 'commit', subject: 'Second agent’s own commit' });
-  assert.deepEqual(by(decoy), { ...by(decoy), refs: ['side'], agentId: null, kind: 'commit' });
+  assert.deepEqual(by(decoy), { ...by(decoy), refs: ['release'], agentId: null, kind: 'commit' });
   assert.equal(by(head).subject, `Fix ${rlo}txt.exe`, 'passed on as it is: the page shows such characters');
   assert.deepEqual(by(head).refs, ['main']);
   assert.deepEqual(by(t.ws.base).parents, []);

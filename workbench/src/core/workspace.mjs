@@ -539,7 +539,11 @@ const SAY = {
   gone: 'Its folder is gone, so there is nothing to merge.',
   agentBusy: 'Its folder is in the middle of a merge or rebase, so its work cannot be merged yet.',
   git: 'Git could not finish the merge. Nothing in your folder changed.',
+  unfinished: into => `Git could not finish the merge into ${into}. Have a look at your folder before you try again.`,
 };
+
+/** git's words when another git command holds the index: "Unable to create '<git dir>/index.lock': File exists." */
+const INDEX_LOCKED = /^(?:fatal|error): Unable to create '[^\n]*index\.lock': File exists/m;
 
 /** "a, b, c and 2 more" */
 function listOf(items, max) {
@@ -638,9 +642,9 @@ async function topFolder(run, repoRoot) {
   try {
     top = (await run(['rev-parse', '--show-toplevel'], { cwd: root })).stdout.trim();
   } catch (e) {
-    throw gitTrouble(e) || plainError(`${root} is not a git repository.`, e);
+    throw gitTrouble(e) || plainError(`The folder ${root} is not a git repository.`, e);
   }
-  if (!top || canonical(top) !== root) throw plainError(`${root} is not the top folder of a git repository.`);
+  if (!top || canonical(top) !== root) throw plainError(`The folder ${root} is not the top folder of a git repository.`);
   return root;
 }
 
@@ -665,8 +669,37 @@ async function agentFolder(run, root, wsPath, branch) {
 }
 
 /**
+ * Copy an index file for git to use in place of the original, or return false when there is none.
+ *
+ * Git notes each file's size and times in the index, and trusts a file whose notes still match as unchanged, unless the
+ * file is not older than the index itself: then it reads the file again ("racily clean"), because a change in the same
+ * second as the index was written leaves the notes matching. A copy is a new file, so git would trust every note in
+ * it, and miss such a change for good (a same-size edit made in the second the agent's index was written). So the copy
+ * gets the original's time, rounded down to the second and one second earlier: git then reads at least every file it
+ * would have read with the original. Never 0: git skips the check altogether for an index time of 0.
+ */
+function copyIndex(from, to) {
+  let st;
+  try {
+    st = fs.statSync(from);
+  } catch (e) {
+    if (e.code === 'ENOENT') return false;
+    throw plainError('Workbench could not read the git index of its folder.', e);
+  }
+  try {
+    fs.copyFileSync(from, to);
+    const t = Math.max(1, Math.floor(st.mtimeMs / 1000) - 1);
+    fs.utimesSync(to, t, t);
+  } catch (e) {
+    if (e.code === 'ENOENT') return false; // replaced between the two steps: start from its HEAD instead
+    throw plainError('Workbench could not read the git index of its folder.', e);
+  }
+  return true;
+}
+
+/**
  * The work in an agent's folder as a tree, read in a temporary index. The agent's own index is copied, never written:
- * that keeps what it staged (also a file it added with -f) and git's record of unchanged files.
+ * that keeps what it staged (also a file it added with -f) and git's record of unchanged files (see copyIndex).
  * @returns {Promise<{ head, headTree, tree, since, sinceTree, workId, changed, files, left }>}
  */
 async function snap(run, folder, since) {
@@ -681,13 +714,8 @@ async function snap(run, folder, since) {
   let tree, others;
   try {
     const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
-    const own = (await run(['rev-parse', '--git-path', 'index'], { cwd })).stdout.replace(/\r?\n$/, '');
-    try {
-      fs.copyFileSync(path.resolve(cwd, own), env.GIT_INDEX_FILE);
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw plainError('Workbench could not read the git index of its folder.', e);
-      await run(['read-tree', head], { cwd, env });
-    }
+    const own = path.resolve(cwd, (await run(['rev-parse', '--git-path', 'index'], { cwd })).stdout.replace(/\r?\n$/, ''));
+    if (!copyIndex(own, env.GIT_INDEX_FILE)) await run(['read-tree', head], { cwd, env });
     // A repository inside the folder shows as "name/". `add -A` would fail on one with no commit yet (and then the
     // tree would look unchanged) or record one with commits as a link to that commit: leave them out, and say so.
     others = nulList((await run(['ls-files', '--others', '--exclude-standard', '-z'], { cwd, env })).stdout);
@@ -853,21 +881,22 @@ export async function workDiff({ repoRoot, path: wsPath, since, maxFiles = 300, 
       let budget = Math.max(0, Number(maxTotalBytes) || 0);
       const perFile = Math.max(0, Number(maxFileBytes) || 0);
       let cutAll = false;
-      for (let i = 0; i < shown.length && budget > 0;) {
+      const want = shown.flatMap((f, k) => (f.binary || f.large ? [] : [k])); // the files that get a patch
+      const reached = new Set();
+      for (let i = 0; i < want.length && budget > 0;) {
         const batch = [];
         let bytes = 0;
-        let j = i;
-        for (; j < shown.length && batch.length < PATCH_BATCH_FILES; j++) {
-          const f = shown[j];
-          if (f.binary || f.large) continue;
+        for (; i < want.length && batch.length < PATCH_BATCH_FILES; i++) {
+          const f = shown[want[i]];
           const guess = 2 * (f.oldSize + f.newSize) + 512;
           if (batch.length && bytes + guess > PATCH_BATCH_BYTES) break;
-          batch.push(j);
+          batch.push(want[i]);
           bytes += guess;
         }
         const patches = await patchesOf(run, folder.path, s.sinceTree, s.tree, batch.map(k => shown[k].path));
-        batch.forEach((k, n) => {
-          if (budget <= 0) return;
+        for (const [n, k] of batch.entries()) {
+          if (budget <= 0) break;
+          reached.add(k);
           let p = patches[n] || '';
           let cut = false;
           const forFile = cutAt(p, perFile);
@@ -875,13 +904,12 @@ export async function workDiff({ repoRoot, path: wsPath, since, maxFiles = 300, 
           const forAll = cutAt(p, budget);
           if (forAll !== null) { p = forAll; cut = true; cutAll = true; }
           budget -= Buffer.byteLength(p);
-          files[k].patch = p;
+          files[k].patch = p || null; // cut down to nothing: no patch, but marked cut
           if (cut) files[k].cut = true;
-        });
-        i = j;
+        }
       }
-      for (const f of files) {
-        if (f.patch === null && !f.binary && !f.large) { f.cut = true; cutAll = true; } // past maxTotalBytes
+      for (const k of want) {
+        if (!reached.has(k)) { files[k].cut = true; cutAll = true; } // no room left within maxTotalBytes
       }
       const out = { workId: s.workId, since: s.since, head: s.head, files, left: s.left, omitted: s.files.length - shown.length };
       if (cutAll) out.cut = true;
@@ -950,10 +978,22 @@ async function commitTree(run, cwd, tree, parents, message, who) {
   return id;
 }
 
-/** The paths git lists (one per line, after a tab) under "would be overwritten by merge" and the like. */
+/**
+ * The paths git lists, one per line after a tab, under its headings for files in the way of a merge: "Your local
+ * changes to the following files would be overwritten by merge:", "The following untracked working tree files would
+ * be overwritten by merge:" (or "removed by merge"), "Updating the following directories would lose untracked files in
+ * them:", and "... are not up to date:" for a sparse checkout. Lines under any other heading are not paths.
+ */
 function inTheWay(stderr) {
   const paths = [];
-  for (const line of String(stderr || '').split('\n')) if (line.startsWith('\t') && line.length > 1) paths.push(line.slice(1));
+  let under = false;
+  for (const line of String(stderr || '').split('\n')) {
+    if (line.startsWith('\t')) {
+      if (under && line.length > 1) paths.push(line.slice(1));
+      continue;
+    }
+    under = /(?:would be (?:overwritten|removed) by|would lose untracked files in them|are not up to date):$/.test(line);
+  }
   return [...new Set(paths)];
 }
 
@@ -1058,37 +1098,44 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
 
   // 8. Check again, then fast-forward the person's folder to M. Git refuses, changing nothing, when their own
   //    changes or files are in the way; ignored files count (--no-overwrite-ignore), and nothing is stashed.
-  const ff = ['-c', 'submodule.recurse=false', 'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', '--no-verify-signatures', '-q', mergeCommit];
+  //    No automatic upkeep (gc) is started in their repository either.
+  const ff = ['-c', 'submodule.recurse=false', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0',
+    'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', '--no-verify-signatures', '-q', mergeCommit];
+  const done = {
+    ok: true, into, merge: mergeCommit, work,
+    files: s.files.length, adds: s.files.reduce((n, f) => n + f.adds, 0), dels: s.files.reduce((n, f) => n + f.dels, 0),
+  };
   let r;
   for (let attempt = 1; ; attempt++) {
-    if (await currentBranch(root, run) !== into || await commitOf(root, 'HEAD', run) !== intoHead) throw new Refusal('moved', SAY.moved(into));
-    if (await underWay(root, run)) throw new Refusal('busy', SAY.busy);
+    const [on, at, busy] = await Promise.all([currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run)]);
+    if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
+    if (busy) throw new Refusal('busy', SAY.busy);
     r = await run(ff, { cwd: root, okCodes: [1, 128], timeout: MERGE_TIMEOUT_MS });
-    if (r.code === 128 && /index\.lock/.test(r.stderr) && attempt < LOCK_TRIES) {
-      await sleep(200 * attempt);
-      continue;
-    }
-    break;
+    // Another git command holds the index (an editor's git, say): git stopped before it changed anything (exit 1 on
+    // newer git, 128 on older). Wait a little, then try again.
+    if (r.code === 0 || !INDEX_LOCKED.test(r.stderr)) break;
+    if (attempt >= LOCK_TRIES) throw new Refusal('busy', SAY.locked);
+    await sleep(200 * attempt);
   }
+  const [on, at, busy] = await Promise.all([currentBranch(root, run), commitOf(root, 'HEAD', run), underWay(root, run)]);
   if (r.code === 0) {
-    const tip = await commitOf(root, `refs/heads/${into}`, run);
-    if (tip !== mergeCommit && !(tip && (await isAncestor(root, mergeCommit, tip, run)))) {
-      throw new Refusal('git', `Git reported the merge as done, but ${into} does not hold it. Have a look at your folder.`);
+    if (on !== into || (at !== mergeCommit && !(at && (await isAncestor(root, mergeCommit, at, run))))) {
+      throw new Refusal('git', SAY.unfinished(into));
     }
-    return {
-      ok: true, into, merge: mergeCommit, work,
-      files: s.files.length, adds: s.files.reduce((n, f) => n + f.adds, 0), dels: s.files.reduce((n, f) => n + f.dels, 0),
-    };
+    return done;
   }
+  if (on === into && at === mergeCommit) return done; // it moved the branch, then complained about something after
   if (r.code === 1) {
+    // Their own changes or files are in the way: git checks every path before it writes any, so nothing changed.
     const paths = inTheWay(r.stderr);
-    if (paths.length) throw new Refusal('blocked', SAY.blocked(paths), paths);
-    throw new Refusal('git', SAY.git);
+    if (paths.length && on === into && at === intoHead) throw new Refusal('blocked', SAY.blocked(paths), paths);
+  } else {
+    // Exit 128: git stopped before it began (another operation started, or the branch moved meanwhile).
+    if (busy) throw new Refusal('busy', SAY.busy);
+    if (on !== into || at !== intoHead) throw new Refusal('moved', SAY.moved(into));
   }
-  if (/index\.lock/.test(r.stderr)) throw new Refusal('busy', SAY.locked);
-  if (await underWay(root, run)) throw new Refusal('busy', SAY.busy);
-  if (await currentBranch(root, run) !== into || await commitOf(root, 'HEAD', run) !== intoHead) throw new Refusal('moved', SAY.moved(into));
-  throw new Refusal('git', 'Git could not finish the merge.');
+  // Anything else may have stopped part-way through updating their files, so say nothing about them having stayed.
+  throw new Refusal('git', SAY.unfinished(into));
 }
 
 /**
