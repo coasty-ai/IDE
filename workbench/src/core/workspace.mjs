@@ -4,7 +4,8 @@
 // control: an agent's work as git objects, its diff, merging it into the person's branch with a merge
 // commit, throwing it away, and the commit graph.
 //
-// Every git call goes through execFile with an argument array and a timeout.
+// Every git call goes through git(): execFile (or spawn, for git in a process group of its own) with an argument array
+// and a timeout.
 import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
