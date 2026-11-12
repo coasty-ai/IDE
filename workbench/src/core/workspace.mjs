@@ -5,7 +5,7 @@
 // commit, throwing it away, and the commit graph.
 //
 // Every git call goes through execFile with an argument array and a timeout.
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -40,21 +40,24 @@ const GIT_SAFE_CONFIG = ['-c', 'core.fsmonitor=false'];
 /**
  * Run git with an argument array.
  * @param {{ cwd?: string, timeout?: number, input?: string, okCodes?: number[], env?: Record<string, string|undefined>,
- *   encoding?: 'utf8'|'buffer' }} [o]
+ *   encoding?: 'utf8'|'buffer', detached?: boolean }} [o]
  *   input goes to git's stdin; okCodes are exit codes that still count as success (check-ignore exits 1 when
  *   nothing matches); env adds variables after the scrub (a temporary GIT_INDEX_FILE, who a commit is by), and an
- *   undefined value takes one away; encoding 'buffer' gives stdout as bytes
+ *   undefined value takes one away; encoding 'buffer' gives stdout as bytes; detached starts git in a process group of
+ *   its own, so a Ctrl-C in the terminal (which goes to the whole foreground group) reaches Workbench, which waits for
+ *   the git work under way, and not git, which would stop part-way (a timeout still stops it)
  * @returns {Promise<{ stdout: string|Buffer, stderr: string, code: number }>} code is 0 or one of okCodes; rejects with
  *   the execFile error (plus .stdout and .stderr)
  */
-export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [], env, encoding = 'utf8' } = {}) {
+export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [], env, encoding = 'utf8', detached = false } = {}) {
   return new Promise((resolve, reject) => {
     const childEnv = gitEnv();
     for (const [k, v] of Object.entries(env || {})) {
       if (v === undefined) delete childEnv[k];
       else childEnv[k] = v;
     }
-    const child = execFile('git', [...GIT_SAFE_CONFIG, ...args], { cwd, timeout, maxBuffer: MAX_BUFFER, encoding, env: childEnv, windowsHide: true }, (err, stdout, stderr) => {
+    const options = { cwd, timeout, maxBuffer: MAX_BUFFER, encoding, env: childEnv, windowsHide: true };
+    const child = (detached ? execFileDetached : execFile)('git', [...GIT_SAFE_CONFIG, ...args], options, (err, stdout, stderr) => {
       if (err && !(typeof err.code === 'number' && okCodes.includes(err.code) && !err.killed)) {
         err.stdout = stdout;
         err.stderr = String(stderr || '');
@@ -68,6 +71,57 @@ export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [], 
       child.stdin.end(input);
     }
   });
+}
+
+/**
+ * execFile, but with the program as the leader of a process group of its own (execFile takes no `detached`). It ends
+ * the same ways: `done(err, stdout, stderr)`, where err carries the exit code as .code (or the signal as .signal, with
+ * .killed when the timeout stopped it), or is the spawn error (.code 'ENOENT'), or has .code
+ * 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' when the program said more than maxBuffer bytes (it is then stopped).
+ */
+function execFileDetached(file, args, { cwd, timeout, maxBuffer, encoding, env, windowsHide }, done) {
+  const child = spawn(file, args, { cwd, env, windowsHide, detached: true });
+  const chunks = { stdout: [], stderr: [] };
+  const sizes = { stdout: 0, stderr: 0 };
+  let failure = null;
+  let killed = false;
+  let ended = false;
+  const kill = () => {
+    killed = true;
+    child.kill(); // SIGTERM, as execFile's timeout sends
+  };
+  const timer = timeout > 0 ? setTimeout(kill, timeout) : null;
+  for (const kind of ['stdout', 'stderr']) {
+    child[kind].on('data', chunk => {
+      sizes[kind] += chunk.length;
+      if (sizes[kind] <= maxBuffer) {
+        chunks[kind].push(chunk);
+      } else if (!failure) {
+        failure = Object.assign(new RangeError(`${kind} maxBuffer length exceeded`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+        kill();
+      }
+    });
+  }
+  const end = (code, signal) => {
+    if (ended) return;
+    ended = true;
+    if (timer) clearTimeout(timer);
+    const out = Buffer.concat(chunks.stdout);
+    const stdout = encoding === 'buffer' ? out : out.toString(encoding);
+    const stderr = Buffer.concat(chunks.stderr).toString('utf8');
+    let err = failure;
+    if (!err && (code !== 0 || signal != null)) {
+      err = new Error(`Command failed: ${[file, ...args].join(' ')}\n${stderr}`);
+      Object.assign(err, { code, killed, signal, cmd: [file, ...args].join(' ') });
+    }
+    done(err, stdout, stderr);
+  };
+  child.on('error', e => { // it could not be started (or stopped)
+    if (!failure) failure = e;
+    end(null, null);
+  });
+  child.on('close', end);
+  return child;
 }
 
 /** An error whose message a person can read; git's own words go in `.detail`. */
@@ -631,8 +685,8 @@ function readable(e, fallback) {
  * The names of the hooks set in git config as seen from `cwd` (`hook.<name>.command` and `hook.<name>.event`, git 2.54
  * and newer). core.hooksPath does not reach these; `hook.<name>.enabled=false` does. Reading them runs nothing.
  */
-async function configHooks(cwd) {
-  const r = await git(['config', '--name-only', '-z', '--get-regexp', '^hook\\.'], { cwd, okCodes: [1] });
+async function configHooks(cwd, run = git) {
+  const r = await run(['config', '--name-only', '-z', '--get-regexp', '^hook\\.'], { cwd, okCodes: [1] });
   const names = new Set();
   for (const key of nulList(r.stdout)) {
     const m = /^hook\.([\s\S]+)\.[A-Za-z0-9-]+$/.exec(key); // hook.<name>.<setting>, where the name may hold dots
@@ -660,14 +714,18 @@ function configEnv(pairs) {
  * `fn(run)`, where `run` is git() that runs no hook: core.hooksPath points at a new empty folder (removed afterwards),
  * and the hooks set in git config are switched off for every folder handed to `run.shield(folder)` (the person's
  * folder and the agent's, as soon as they are known; before that, only commands that run no hook are used).
+ * `detached`: every git command of the job, the config read for the shield too, runs in a process group of its own
+ * (see git()). Merges and throw-aways use it: a Ctrl-C must not stop git part-way through the person's folder or the
+ * agent's, while Workbench waits for the job to finish.
  */
-async function withoutHooks(fn) {
+async function withoutHooks(fn, { detached = false } = {}) {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-nohooks-'));
   const names = new Set();
   let off = {};
-  const run = (args, o = {}) => git(['-c', `core.hooksPath=${empty}`, ...args], { ...o, env: { ...off, ...o.env } });
+  const any = (args, o = {}) => git(args, { ...o, detached });
+  const run = (args, o = {}) => any(['-c', `core.hooksPath=${empty}`, ...args], { ...o, env: { ...off, ...o.env } });
   run.shield = async cwd => {
-    for (const name of await configHooks(cwd)) names.add(name);
+    for (const name of await configHooks(cwd, any)) names.add(name);
     off = configEnv([...names].map(name => [`hook.${name}.enabled`, 'false']));
   };
   try {
@@ -1240,7 +1298,7 @@ function inTheWay(stderr) {
 export async function mergeWork(opts = {}) {
   const progress = { into: null, started: false }; // once git began on the person's folder, never say it did not
   try {
-    return await withoutHooks(run => merge(run, opts, progress));
+    return await withoutHooks(run => merge(run, opts, progress), { detached: true });
   } catch (e) {
     if (progress.started && !(e instanceof Refusal)) return { ok: false, why: 'git', sentence: SAY.unfinished(progress.into) };
     return failure(e, SAY.git);
@@ -1406,7 +1464,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
 export async function discardWork(opts = {}) {
   const progress = { saved: null }; // once deleting began, never say nothing was deleted
   try {
-    return await withoutHooks(run => discard(run, opts, progress));
+    return await withoutHooks(run => discard(run, opts, progress), { detached: true });
   } catch (e) {
     if (progress.saved && !(e instanceof Refusal)) {
       return { ok: false, why: 'git', sentence: `Git could not finish throwing its work away. A copy of its work is kept in git as ${progress.saved}.` };

@@ -1,13 +1,13 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   prepareRepo, createWorkspace, removeWorkspace, diffStats, readRepoConfig, normalizeConfig, slugify, workspacesFolder,
-  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity,
+  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit,
 } from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
 
@@ -142,6 +142,35 @@ test('prepareRepo is not fooled by GIT_DIR in the environment', async () => {
     if (saved === undefined) delete process.env.GIT_DIR;
     else process.env.GIT_DIR = saved;
   }
+});
+
+test('git in a process group of its own (detached) ends the same ways as git started the usual way', async () => {
+  const blob = git(repo, 'rev-parse', `${c1}:a.txt`);
+  const ended = o => p => p.then(
+    r => ({ stdout: Buffer.isBuffer(r.stdout) ? r.stdout.toString('hex') : r.stdout, stderr: r.stderr, code: r.code }),
+    e => ({ failed: true, code: e.code, killed: !!e.killed, signal: e.signal ?? null, stdout: e.stdout, stderr: e.stderr, timedOut: o.timeout === 300 }));
+  const cases = [
+    [['rev-parse', 'HEAD']],
+    [['rev-parse', '--verify', '--quiet', 'no-such-branch'], { okCodes: [1] }],
+    [['rev-parse', '--verify', 'no-such-branch']],
+    [['hash-object', '--stdin'], { input: 'some text\n' }],
+    [['cat-file', 'blob', blob], { encoding: 'buffer' }],
+    [['-c', 'alias.wait=!sleep 3', 'wait'], { timeout: 300 }],
+    [['rev-parse', 'HEAD'], { env: { PATH: path.join(T, 'no-git-here') } }],
+  ];
+  for (const [args, o = {}] of cases) {
+    const usual = await ended(o)(runGit(args, { cwd: repo, ...o }));
+    const detached = await ended(o)(runGit(args, { cwd: repo, ...o, detached: true }));
+    assert.deepEqual(detached, usual, args.join(' '));
+  }
+  // What each case shows: a failure's code and words, a stop at the timeout, and git not found.
+  const fail = await runGit(['rev-parse', '--verify', 'no-such-branch'], { cwd: repo, detached: true }).catch(e => e);
+  assert.equal(fail.code, 128);
+  assert.match(fail.stderr, /^fatal: /);
+  const slow = await runGit(['-c', 'alias.wait=!sleep 3', 'wait'], { cwd: repo, timeout: 300, detached: true }).catch(e => e);
+  assert.deepEqual([slow.killed, slow.signal], [true, 'SIGTERM']);
+  const none = await runGit(['rev-parse', 'HEAD'], { cwd: repo, detached: true, env: { PATH: path.join(T, 'no-git-here') } }).catch(e => e);
+  assert.equal(none.code, 'ENOENT');
 });
 
 test('createWorkspace makes a worktree from the last commit, diffStats counts the changes, removeWorkspace cleans up', async () => {
@@ -1452,6 +1481,50 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(ok.ok, true);
     assert.equal(headOf(t.root), ok.merge);
     assert.equal(statusOf(t.root), '');
+  });
+
+  test('a Ctrl-C in the terminal while the fast-forward writes the person’s files reaches only Workbench: git finishes the merge', async (c) => {
+    if (process.platform === 'win32') return c.skip('a terminal’s process groups are a Unix matter');
+    const t = await agentRepo();
+    const pages = Array.from({ length: 15 }, (_, i) => `page${String(i).padStart(2, '0')}.txt`);
+    for (const f of pages) write(t.w(f), `${f}\n`);
+    // A slow smudge filter on the person's text files, standing in for Git LFS: each file takes a moment to write.
+    git(t.root, 'config', 'filter.slow.smudge', 'sleep 0.1; cat');
+    git(t.root, 'config', 'filter.slow.clean', 'cat');
+    write(path.join(t.root, '.git', 'info', 'attributes'), '*.txt filter=slow\n');
+    const { expect } = await proposal(t);
+
+    // Workbench in a process of its own, as in a terminal: on Ctrl-C it waits for the merge under way, as shutdown does.
+    const script = path.join(T, `ctrl-c-${t.id}.mjs`);
+    write(script, [
+      `import { mergeWork } from ${JSON.stringify(new URL('../src/core/workspace.mjs', import.meta.url).href)};`,
+      'let interrupted = false;',
+      'process.on(\'SIGINT\', () => { interrupted = true; });',
+      'const result = await mergeWork(JSON.parse(process.env.WB_MERGE));',
+      'process.stdout.write(JSON.stringify({ result, interrupted }));',
+    ].join('\n'));
+    const child = spawn(process.execPath, [script], {
+      detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WB_MERGE: JSON.stringify(mergeOpts(t, expect)) },
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { err += d; });
+    const closed = new Promise(resolve => child.on('close', resolve));
+    // The terminal sends SIGINT to the whole foreground process group, once git has begun writing the merged files.
+    const began = Date.now();
+    while (!fs.existsSync(t.p(pages[0]))) {
+      assert.ok(child.exitCode === null && Date.now() - began < 60_000, `the merge never began writing files: ${out}${err}`);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    process.kill(-child.pid, 'SIGINT');
+    await closed;
+    const { result, interrupted } = JSON.parse(out || '{}');
+    assert.equal(interrupted, true, err);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(headOf(t.root), result.merge);
+    assert.equal(statusOf(t.root), '');
+    for (const f of pages) assert.equal(fs.readFileSync(t.p(f), 'utf8'), `${f}\n`);
   });
 
   test('discardWork keeps a hidden copy of the work, then deletes the folder and the branch; only for the work that was shown', async () => {
