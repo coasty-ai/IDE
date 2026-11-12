@@ -36,6 +36,8 @@
   --finger-1: #b48838; --finger-2: #ead08c; --finger-off-1: #4c544f; --finger-off-2: #69716c;
   --tray-cell: #163127; --tray-line: #2c4b3d;
   --focus: #edf0e8; --lid-focus: #141512; --badge-line: #8fa596;
+  /* the focus ring on the card's surface (the git screen's detail and input, the menus): dark cards here, so light */
+  --card-focus: #edf0e8;
   --lid-cut: 16px; --lid-radius: 5px; --btn-cut: 7px; --btn-radius: 0px;
 }
 
@@ -69,6 +71,8 @@
   --finger-1: #7d6532; --finger-2: #c9ab6a; --finger-off-1: #3f3b33; --finger-off-2: #5c574c;
   --tray-cell: #1e2120; --tray-line: #2f3331;
   --focus: #ece8dd; --lid-focus: #1c1a16; --badge-line: #6a675f;
+  /* the cards are ivory ceramic here, so their focus ring is dark, as the lid's is */
+  --card-focus: #1c1a16;
   --lid-cut: 0px; --lid-radius: 7px; --btn-cut: 8px; --btn-radius: 0px;
 }
 
@@ -102,6 +106,7 @@
   --finger-1: #c49b47; --finger-2: #f3dea4; --finger-off-1: #d9cfbe; --finger-off-2: #f3eee3;
   --tray-cell: #f2ede2; --tray-line: #bcb2a0;
   --focus: #2a57c2; --lid-focus: #2a57c2; --badge-line: #b0a48c;
+  --card-focus: #2a57c2;
   --lid-cut: 0px; --lid-radius: 10px; --btn-cut: 0px; --btn-radius: 99px;
 }
 
@@ -444,8 +449,8 @@ svg.g { width: 10px; height: 10px; flex: none; }
 .pop .note { margin: 6px 8px 2px; color: var(--card-sub); font-size: 11px; overflow-wrap: anywhere; }
 .pop .hint { margin: 6px 4px 2px; padding: 8px 10px; border-radius: 4px; background: var(--card-1); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .pop .hint button, .pop .row { border: 1px solid var(--card-rule); background: none; color: var(--card-ink); border-radius: 4px; padding: 3px 10px; }
-.pop button:focus-visible, .pop input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
-:root[data-theme="ivory"] .pop button:focus-visible, :root[data-theme="ivory"] .pop input:focus-visible + span { outline-color: var(--focus); }
+/* menus sit on the card's surface: its own focus colour, which stands out from it in every look */
+.pop button:focus-visible, .pop input:focus-visible + span { outline: 2px solid var(--card-focus); outline-offset: 2px; }
 #trayList .row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; border: 0; padding: 6px 8px; }
 #trayList .row:hover { background: var(--card-1); }
 #trayList .row.earlier { opacity: .78; }
@@ -472,6 +477,9 @@ svg.g { width: 10px; height: 10px; flex: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 1ms !important; animation-duration: 1ms !important; animation-iteration-count: 1 !important; }
   .chip:hover, .chip.hov, .part:hover, .part.hov { transform: none; }
+  /* the two screens swap at once: no transition at all, or each element's visibility would still be on its way from
+     hidden when the keyboard moves to the screen that comes in, and focus would be refused */
+  .screen, .screen * { transition: none !important; }
 }
 body.still *, body.still *::before, body.still *::after { animation: none !important; transition: none !important; }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: .42s; animation-timing-function: ease; }
@@ -560,7 +568,18 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitSay { width: 100%; border: 0; outline: 0; padding: 0; background: transparent; color: var(--card-ink); font: inherit; }
 #gitBar .ph { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--card-sub); pointer-events: none; white-space: nowrap; }
 #gitBar.typed .ph, #gitBar:focus-within .ph { display: none; }
-#gitBar:focus-within { box-shadow: inset 0 0 0 2px var(--focus); }
+#gitBar:focus-within { box-shadow: inset 0 0 0 2px var(--card-focus); }
+/* while voice listens: the wave and the words heard so far take the input's place, as on the board's own input */
+#gitBar .wave, #gitBar .heard { display: none; }
+#gitBar.listening .wave { display: inline-flex; flex: none; align-items: center; gap: 3px; height: 16px; margin-right: 8px; }
+#gitBar .wave i { width: 3px; height: 6px; border-radius: 2px; background: var(--c-fail); }
+#gitBar.listening .heard { display: block; flex: 1; min-width: 0; color: var(--card-ink); white-space: nowrap; overflow: hidden; direction: rtl; text-align: left; }
+#gitBar.listening #gitSay, #gitBar.listening .ph { display: none; }
+@media (prefers-reduced-motion: no-preference) {
+  #gitBar.listening .wave i { animation: wave .9s ease-in-out infinite; }
+  #gitBar.listening .wave i:nth-child(2) { animation-delay: .12s; } #gitBar.listening .wave i:nth-child(3) { animation-delay: .24s; }
+  #gitBar.listening .wave i:nth-child(4) { animation-delay: .36s; } #gitBar.listening .wave i:nth-child(5) { animation-delay: .48s; }
+}
 #gitSaid { margin: 0; max-width: 100%; color: var(--silk-2); text-align: right; overflow-wrap: anywhere; }
 #gitSaid:empty { display: none; }
 #gitScreen button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -586,6 +605,8 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 .gleads { fill: none; stroke: var(--tin); stroke-width: 2; stroke-dasharray: 1.6 2.4; }
 .gwork { fill: var(--mask-2); stroke: var(--g-lane); stroke-width: 1.8; stroke-dasharray: 3 2.2; }
 .ghead { fill: var(--silk-2); font: 600 10.5px "JetBrains Mono", monospace; letter-spacing: 1.2px; }
+/* only when copper runs through every place HEAD's label can go: a rim of the board's own colour keeps its letters whole */
+.ghead.halo { paint-order: stroke; stroke: var(--mask-2); stroke-width: 3px; stroke-linejoin: round; }
 .gfold { fill: var(--silk-2); font: 600 11px "JetBrains Mono", monospace; }
 .gsel { fill: none; stroke: var(--silk); stroke-width: 1.5; opacity: .85; }
 #gitGraph use { overflow: visible; }
@@ -617,7 +638,9 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitDetail h2 { flex: 0 1 auto; min-width: 0; margin: 0; font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
 #gitDetail .dhd > :nth-last-child(2) { margin-right: auto; }
 #gitDetail h2:focus { outline: none; }
-#gitDetail h2:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+#gitDetail h2:focus-visible { outline: 2px solid var(--card-focus); outline-offset: 2px; }
+/* the detail is the card's surface: its focus rings use the card's focus colour (a dark ring on black and gold's ivory) */
+#gitDetail button:focus-visible { outline-color: var(--card-focus); }
 #gitDetail .dst { font-size: 12px; font-weight: 600; color: var(--card-sub); white-space: nowrap; }
 #gitDetail .gx { align-self: flex-start; padding: 0 6px; border: 0; border-radius: 3px; background: none; color: var(--card-ink-2); font-size: 18px; line-height: 1.1; }
 #gitDetail .gx:hover { background: var(--card-rule); color: var(--card-ink); }
@@ -629,13 +652,17 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitDetail .dprob .paths { color: var(--card-ink-2); }
 #gitDetail .dacts { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0 2px; }
 #gitDetail .gbig { min-height: 34px; padding: 4px 16px; border: 1px solid var(--card-line); border-radius: 4px; background: none; color: var(--card-ink);
-  font-weight: 600; max-width: 100%; overflow-wrap: anywhere; }
+  font-weight: 600; max-width: 100%; overflow-wrap: anywhere; transition: opacity .3s ease; }
 #gitDetail .gbig.pri { border-color: var(--card-ink); background: var(--card-ink); color: var(--card-1); }
 #gitDetail .gbig:hover { border-color: var(--hover-line); }
 #gitDetail .gbig:disabled { opacity: .55; cursor: default; }
+/* just after the actions change (a card came in their place, or went), they wait a moment before they take a click */
+#gitDetail.arming .dacts .gbig { opacity: .62; }
 :root[data-theme="ivory"] #gitDetail .gbig { border-radius: 99px; }
 #gitDetail .dcard { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--card-rule); border-radius: 5px; }
 #gitDetail .dcard .dq { margin: 0; font-weight: 600; color: var(--card-ink); overflow-wrap: anywhere; }
+#gitDetail .dcard .dq:focus { outline: none; }
+#gitDetail .dcard .dq:focus-visible { outline: 2px solid var(--card-focus); outline-offset: 2px; border-radius: 2px; }
 #gitDetail .dcard .dcd { margin: 4px 0 0; color: var(--card-ink-2); overflow-wrap: anywhere; }
 #gitDetail .dwhy { margin: 10px 0 0; color: var(--card-sub); overflow-wrap: anywhere; }
 #gitDetail .dl2 { margin: 10px 0 0; display: grid; gap: 4px; }
@@ -648,7 +675,7 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitDetail .gdiff { position: relative; flex: 1; min-height: 60px; overflow-x: hidden; overflow-y: auto; margin-top: 12px; padding-top: 2px; border-top: 1px solid var(--card-rule);
   font-size: 12px; line-height: 1.45; scrollbar-width: thin; }
 #gitDetail .gdiff:focus { outline: none; }
-#gitDetail .gdiff:focus-visible { box-shadow: inset 0 0 0 2px var(--focus); }
+#gitDetail .gdiff:focus-visible { box-shadow: inset 0 0 0 2px var(--card-focus); }
 #gitDetail .df { margin: 0 0 4px; }
 #gitDetail .dh { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; margin: 12px 0 5px; font-size: 12px; font-weight: 600; }
 #gitDetail .dp { min-width: 0; overflow-wrap: anywhere; }

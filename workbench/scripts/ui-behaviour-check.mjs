@@ -44,7 +44,7 @@ const posts = async () => { const l = await ctl('log'); return l; };
 const clearLog = async () => { allPosts.push(...(await posts())); await ctl('clear'); };
 async function open(scenario, { still = false, theme = 'green', detail = 'calm', mode = {} } = {}) {
   await clearLog();
-  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', ...mode });
+  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null, ...mode });
   await ctl('scenario', { name: scenario, push: false });
   await b.ev(`(() => { try { localStorage.setItem('wb-theme', ${JSON.stringify(theme)}); localStorage.setItem('wb-detail', ${JSON.stringify(detail)}); localStorage.setItem('wb-answered', '1'); sessionStorage.removeItem('wb-later'); sessionStorage.removeItem('wb-reviewed'); } catch (e) {} return 1; })()`).catch(() => {});
   await b.goto(`${base}/?t=k${still ? '&still=1' : ''}`, 1600);
@@ -917,6 +917,378 @@ try {
     await sleep(900);
     const lit = await b.ev(`[...document.querySelectorAll('#gitScreen button')].filter(x => x.offsetParent !== null).map(x => x.textContent).find(t => /needs you/.test(t)) || ''`);
     check('while the git screen shows, something new needing you lights the top band’s button', /Release prep needs you/.test(lit), `"${lit}"`);
+  });
+
+  // ---------------------------------------------------------------- the git screen, held to the lid's rules
+  // The detail's Merge and Throw it away, and the engine's card in their place, answer only what was drawn and seen: the
+  // half-second guard after a change, words bound when they began, focus never dropped and never on an answer, Esc while
+  // listening throws away what was heard, hidden characters shown, what needs you said on this screen, reduced motion,
+  // HEAD's label, times that move on. Every name starts "Git screen: ", so --only 'Git screen' runs just these.
+  const GS = 'Git screen: ';
+  const gitFocus = () => b.ev(`(() => { const a = document.activeElement; if (!a || a === document.body) return 'body';
+    return (a.closest('#gitDetail') ? 'detail:' : a.closest('#gitGraph') ? 'graph:' : a.closest('#gitTop') ? 'top:' : a.closest('#core') ? 'core:' : '') + a.tagName + (a.dataset.act ? ':' + a.dataset.act : '') + (a.id ? '#' + a.id : ''); })()`);
+  const until = async (expr, ms = 3000, step = 15) => { const t0 = Date.now(); for (;;) { if (await b.ev(expr)) return true; if (Date.now() - t0 > ms) return false; await sleep(step); } };
+  const cardThere = `!!document.querySelector('#gitDetail .dcard [data-go="1"]')`;
+  // the live regions a screen reader hears on the git screen (none inside something aria-hidden)
+  const liveOnGit = () => b.ev(`[...document.querySelectorAll('#gitScreen [aria-live]')].filter(e => !e.closest('[aria-hidden="true"]')).map(e => e.textContent).join(' | ')`);
+  const releasePrep = async () => { const a = await agentOf('m1a2b3'); await push('agents', [{ ...a, id: 'mq', name: 'Release prep', state: 'needs_ok', ask: askOf('pq', 'Release prep', 'git push --force origin main'), work: null }]); };
+  const reviewIt = async () => { await clickIn('[data-act="review"]'); await sleep(900); };
+  const blur = () => b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+  // the characters that hide text or change the order it reads in, as words.js lists them (by number: never raw here)
+  const HIDDEN_RAW = new RegExp('[' + [[0x80, 0x9f], [0x61c, 0x61c], [0x200b, 0x200f], [0x2028, 0x202e], [0x2060, 0x2069], [0xfeff, 0xfeff]].map(([x, z]) => String.fromCharCode(x) + (z > x ? '-' + String.fromCharCode(z) : '')).join('') + ']');
+
+  await run(GS + 'the card that comes in place of the detail’s actions ignores a click for a moment, as the lid’s does', async () => {
+    const out = [];
+    for (const [act, still] of [['merge', true], ['discard', false]]) {
+      await open('merge', { still, mode: { delay: { [act]: 600 } } });
+      await sleep(900);
+      await reviewIt(); if (!still) await sleep(900);
+      await sleep(700);   // past the guard that opening the detail arms
+      await realClick(`#gitDetail [data-act="${act}"]`);
+      const came = await until(cardThere, 3000, 5);
+      await realClick('#gitDetail .dcard [data-go="1"]');   // a few milliseconds after it painted: a click aimed at what was there
+      await sleep(250);
+      const early = (await posts()).filter(x => x.path.startsWith('/api/confirm/')).length;
+      await sleep(900);
+      await realClick('#gitDetail .dcard [data-go="1"]');
+      await sleep(700);
+      const later = (await posts()).filter(x => x.path.startsWith('/api/confirm/')).map(x => x.body.go);
+      out.push({ act, still, came, early, later });
+    }
+    check(GS + 'the card that comes in place of the detail’s actions ignores a click for a moment, as the lid’s does',
+      out.every(o => o.came && o.early === 0 && o.later.length === 1 && o.later[0] === true), JSON.stringify(out));
+  });
+
+  await run(GS + 'Esc while listening in the detail throws away what was heard, and the screen and its card stay', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await reviewIt();
+    const onHeading = await gitFocus();
+    await sleep(300);
+    await realClick('#gitDetail [data-act="merge"]');
+    await until(cardThere); await sleep(900);
+    await clearLog();
+    const a0 = await b.ev('window.__sr.aborts');
+    await b.key(' ', { phase: 'down' }); await sleep(150);
+    await b.ev(`window.__sr.last && window.__sr.last.hear('yes'), 1`);
+    await b.key('Escape'); await sleep(300);
+    const aborts = (await b.ev('window.__sr.aborts')) - a0, there = await screen(), card = await b.ev(cardThere);
+    await b.key(' ', { phase: 'up' }); await sleep(800);
+    const p1 = await workPosts(), merged = !!(await agentOf('m1a2b3')).work.merged;
+    // a detail the person opened from the graph: Esc while listening keeps it open, and sends nothing
+    await open('merge', { still: true });
+    await sleep(900);
+    await click('#dram'); await sleep(700);
+    await click('#gitGraph .gr[data-id="work:m1a2b3"]'); await sleep(700);
+    await clearLog();
+    const a1 = await b.ev('window.__sr.aborts');
+    await b.key(' ', { phase: 'down' }); await sleep(150);
+    await b.ev(`window.__sr.last && window.__sr.last.hear('merge it'), 1`);
+    await b.key('Escape'); await sleep(300);
+    const aborts2 = (await b.ev('window.__sr.aborts')) - a1, open2 = await b.ev(`!document.getElementById('gitDetail').hidden`), there2 = await screen();
+    await b.key(' ', { phase: 'up' }); await sleep(800);
+    const p2 = await workPosts();
+    check(GS + 'Esc while listening in the detail throws away what was heard, and the screen and its card stay',
+      /^detail:H2/.test(onHeading) && aborts >= 1 && there === 'git' && card && p1.length === 0 && !merged && aborts2 >= 1 && open2 && there2 === 'git' && p2.length === 0,
+      `focus ${onHeading}; aborts ${aborts}, ${there}, card ${card}, posts ${JSON.stringify(p1.map(x => [x.path, x.body]))}, merged ${merged}; from the graph: aborts ${aborts2}, detail open ${open2}, ${there2}, posts ${JSON.stringify(p2.map(x => [x.path, x.body]))}`);
+  });
+
+  await run(GS + 'with reduced motion, every move between the screens keeps the keyboard: the DRAM, Review, back, and "needs you"', async () => {
+    const steps = [];
+    try {
+      await open('merge');
+      await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+      await sleep(900);
+      await b.ev(`document.getElementById('dram').focus(), 1`);
+      await b.key('Enter'); await sleep(500); steps.push(await gitFocus());
+      await b.key('Escape'); await sleep(500); steps.push(await gitFocus());
+      await blur();
+      const reached = await tabTo(`a.dataset.act === 'review'`);
+      await b.key('Enter'); await sleep(500); steps.push(await gitFocus());
+      await b.key('Escape'); await sleep(500); steps.push(await gitFocus());
+      await b.ev(`document.getElementById('dram').focus(), 1`);
+      await b.key('Enter'); await sleep(500);
+      await releasePrep(); await sleep(900);
+      await b.ev(`document.getElementById('gitNeeds').focus(), 1`);
+      await b.key('Enter'); await sleep(700); steps.push(await gitFocus());
+      check(GS + 'with reduced motion, every move between the screens keeps the keyboard: the DRAM, Review, back, and "needs you"',
+        reached && steps[0] === 'top:H1#gitTitle' && steps[1] === 'BUTTON#dram' && /^detail:H2/.test(steps[2]) && /^core:BUTTON:review/.test(steps[3]) && /^core:H1/.test(steps[4]), `review reached ${reached}: ${steps.join(' → ')}`);
+    } finally {
+      await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+    }
+  });
+
+  await run(GS + 'keyboard: Merge in the detail, its card and the card’s answer keep the keyboard, and the card is said on the git screen', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await reviewIt(); await sleep(300);
+    const reached = await tabTo(`!!a.closest('#gitDetail') && a.dataset.act === 'merge'`, 6);
+    await b.key('Enter'); await sleep(50);
+    const waiting = await gitFocus();
+    await until(cardThere); await sleep(200);
+    const withCard = await gitFocus(), told = await liveOnGit();
+    await sleep(900);   // past the guard
+    const reachedYes = await tabTo(`!!a.closest('#gitDetail .dcard') && a.dataset.go === '1'`, 4);
+    await b.key('Enter'); await sleep(50);
+    const answering = await gitFocus();
+    await sleep(1300);
+    const after = await gitFocus(), words = await b.ev(`document.getElementById('gitSaid').textContent`);
+    check(GS + 'keyboard: Merge in the detail, its card and the card’s answer keep the keyboard, and the card is said on the git screen',
+      reached && /^detail:/.test(waiting) && /^detail:P#gitCard/.test(withCard) && /Merge Invoice export into main\?/.test(told) && reachedYes && /^detail:/.test(answering) && /^detail:H2/.test(after) && /Merged Invoice export into main\./.test(words),
+      `reached ${reached}, waiting ${waiting}, with the card ${withCard}, said "${told.slice(0, 90)}", yes reached ${reachedYes}, answering ${answering}, after ${after}, "${words}"`);
+  });
+
+  await run(GS + 'the engine’s card in the detail shows hidden and direction-changing characters, as the lid does', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    // a check, a branch or a task can carry a right-to-left override into the engine's words for the card
+    await b.ev(`(() => { const f = window.fetch, R = String.fromCharCode(0x202e), P = String.fromCharCode(0x202c), Z = String.fromCharCode(0x200b);
+      window.fetch = async (u, o) => { const r = await f(u, o); if (!/\\/merge$/.test(String(u))) return r; const j = await r.clone().json();
+        if (j.confirm) { j.confirm.sentence = 'Merge Invoice export into rel' + R + 'niam' + P + '?'; j.confirm.detail = 'A check failed: Unit tests' + R + '.degrem eb nac ti os ,dessap skcehc llA' + P + Z; }
+        return new Response(JSON.stringify(j), { status: r.status, headers: { 'content-type': 'application/json' } }); }; return 1; })()`);
+    await reviewIt(); await sleep(300);
+    await realClick('#gitDetail [data-act="merge"]');
+    await until(cardThere); await sleep(200);
+    const txt = await b.ev(`document.querySelector('#gitDetail .dcard')?.textContent || ''`);
+    check(GS + 'the engine’s card in the detail shows hidden and direction-changing characters, as the lid does',
+      !!txt && !HIDDEN_RAW.test(txt) && /rel⟦U\+202E⟧niam⟦U\+202C⟧/.test(txt) && /Unit tests⟦U\+202E⟧/.test(txt) && /⟦U\+200B⟧/.test(txt), JSON.stringify(txt.slice(0, 220)));
+  });
+
+  await run(GS + 'words typed or spoken on the git screen are bound when they begin: a card that comes meanwhile gets nothing', async () => {
+    // typed: "merge it" begun while Merge's card was on its way, sent once the card is in the detail
+    await open('merge', { still: true, mode: { delay: { merge: 700 } } });
+    await sleep(900);
+    await reviewIt(); await sleep(300);
+    await realClick('#gitDetail [data-act="merge"]'); await sleep(80);
+    await b.ev(`document.getElementById('gitSay').focus(), 1`);
+    await b.type('merge it');
+    const came = await until(cardThere); await sleep(150);
+    await clearLog();
+    await b.key('Enter'); await sleep(800);
+    const typed = (await posts()).filter(x => x.path === '/api/command' || x.path.startsWith('/api/confirm/'));
+    const merged1 = !!(await agentOf('m1a2b3')).work.merged;
+    // spoken: the microphone turned on before the card came, "yes" heard after it
+    await open('merge', { still: true, mode: { delay: { merge: 700 } } });
+    await sleep(900);
+    await reviewIt(); await sleep(300);
+    await realClick('#gitDetail [data-act="merge"]'); await sleep(80);
+    await b.key(' ', { phase: 'down' }); await sleep(100);
+    const came2 = await until(cardThere); await sleep(150);
+    await clearLog();
+    await b.ev(`window.__sr.last && window.__sr.last.hear('yes'), 1`);
+    await b.key(' ', { phase: 'up' }); await sleep(800);
+    const spoken = (await posts()).filter(x => x.path === '/api/command' || x.path.startsWith('/api/confirm/'));
+    const merged2 = !!(await agentOf('m1a2b3')).work.merged;
+    check(GS + 'words typed or spoken on the git screen are bound when they begin: a card that comes meanwhile gets nothing',
+      came && came2 && typed.length === 1 && typed[0].body.confirmId === null && !merged1 && spoken.length === 1 && spoken[0].body.confirmId === null && !merged2,
+      `typed ${JSON.stringify(typed.map(x => [x.path, x.body]))}, merged ${merged1}; spoken ${JSON.stringify(spoken.map(x => [x.path, x.body]))}, merged ${merged2}`);
+  });
+
+  await run(GS + 'talking on the git screen shows that it listens and what it heard, on its own band', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await reviewIt();
+    await clearLog();
+    await b.key(' ', { phase: 'down' }); await sleep(150);
+    await b.ev(`window.__sr.last && window.__sr.last.hear('what changed'), 1`); await sleep(100);
+    const shown = await b.ev(`(() => { const bar = document.getElementById('gitBar'), h = document.getElementById('gitHeard');
+      const seen = e => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+      return { listening: bar.classList.contains('listening'), wave: seen(bar.querySelector('.wave')), heard: seen(h) ? h.textContent : '', hint: seen(document.getElementById('gitPh')) }; })()`);
+    await b.key(' ', { phase: 'up' }); await sleep(800);
+    const after = await b.ev(`document.getElementById('gitBar').classList.contains('listening')`);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check(GS + 'talking on the git screen shows that it listens and what it heard, on its own band',
+      shown.listening && shown.wave && shown.heard === 'what changed' && !shown.hint && !after && p.length === 1 && p[0].body.text === 'what changed' && p[0].body.focusId === 'm1a2b3',
+      JSON.stringify({ shown, after, sent: p.map(x => x.body) }));
+  });
+
+  await run(GS + 'black and gold: the focus rings in the detail and on the git screen’s input stand out from the card (3:1)', async () => {
+    await open('merge', { still: true, theme: 'black-gold' });
+    await sleep(900);
+    await reviewIt(); await sleep(300);
+    // the ring's colour on the focused control against the card it sits on (--card-1 and --card-2)
+    const ring = what => b.ev(`(() => {
+      const rgb = s => { s = String(s || '').trim(); if (s[0] === '#') { let h = s.slice(1); if (h.length === 3) h = [...h].map(c => c + c).join(''); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16)); } const m = s.match(/[\\d.]+/g); return m && m.length >= 3 ? m.slice(0, 3).map(Number) : null; };
+      const lum = c => { const [r, g, b] = c.map(v => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+      const ratio = (x, y) => { const [p, q] = [lum(x), lum(y)].sort((m, n) => n - m); return (p + 0.05) / (q + 0.05); };
+      const root = getComputedStyle(document.documentElement), bgs = ['--card-1', '--card-2'].map(v => rgb(root.getPropertyValue(v)));
+      const a = document.activeElement, what = ${JSON.stringify(what)};
+      const col = what === 'outline' ? getComputedStyle(a).outlineColor : getComputedStyle(what === 'bar' ? document.getElementById('gitBar') : a).boxShadow;
+      const c = rgb(col);
+      return { on: a.id || a.dataset.act || a.className, col, min: c ? Math.round(Math.min(...bgs.map(bg => ratio(c, bg))) * 100) / 100 : 0 };
+    })()`);
+    const out = [];
+    if (await tabTo(`!!a.closest('#gitDetail') && a.dataset.act === 'merge'`, 6)) out.push(await ring('outline'));
+    if (await tabTo(`!!a.closest('#gitDetail') && a.classList.contains('gdiff')`, 6)) out.push(await ring('shadow'));
+    await blur();
+    await b.key('x'); await sleep(150);   // letters go to the git screen's own input
+    out.push(await ring('bar'));
+    check(GS + 'black and gold: the focus rings in the detail and on the git screen’s input stand out from the card (3:1)', out.length === 3 && out.every(o => o.min >= 3), JSON.stringify(out));
+  });
+
+  await run(GS + 'something new that needs you is said on the git screen, not only lit', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await click('#dram'); await sleep(900);
+    const before = await liveOnGit();
+    await releasePrep(); await sleep(900);
+    const after = await liveOnGit();
+    check(GS + 'something new that needs you is said on the git screen, not only lit', !/Release prep/.test(before) && /Release prep needs you/.test(after), `before "${before}", after "${after}"`);
+  });
+
+  await run(GS + 'HEAD’s label is whole inside the graph, and no trace runs through it', async () => {
+    const out = [];
+    try {
+      for (const [sc, w, h] of [['git-empty', 1280, 680], ['live', 1024, 700], ['git-empty', 1440, 900], ['git-bring', 1280, 680], ['git-bring', 1024, 700], ['git-bring', 1440, 900], ['git', 1280, 680], ['git-many', 1440, 900]]) {
+        await b.size(w, h);
+        await open(sc, { still: true });
+        await sleep(700);
+        await click('#dram'); await sleep(700);
+        out.push({ sc, size: `${w}x${h}`, ...(await b.ev(`(() => {
+          const t = document.querySelector('#gitGraph text.ghead'); if (!t) return { none: true };
+          const lr = t.getBoundingClientRect(), gr = document.getElementById('gitGraph').getBoundingClientRect();
+          let through = 0;
+          for (const p of document.querySelectorAll('#gitGraph .gsvg path')) {
+            const L = p.getTotalLength(), m = p.getScreenCTM(), sw = (parseFloat(getComputedStyle(p).strokeWidth) || 2) / 2;
+            for (let s = 0; s <= L; s += 1) {
+              const q = p.getPointAtLength(s), x = m.a * q.x + m.c * q.y + m.e, y = m.b * q.x + m.d * q.y + m.f;
+              if (x > lr.left - sw && x < lr.right + sw && y > lr.top - sw && y < lr.bottom + sw) { through++; break; }
+            }
+          }
+          return { cut: Math.round(Math.max(0, gr.left - lr.left, lr.right - gr.right) * 10) / 10, through };
+        })()`)) });
+      }
+    } finally { await b.size(1440, 900); }
+    check(GS + 'HEAD’s label is whole inside the graph, and no trace runs through it', out.every(o => !o.none && o.cut === 0 && o.through === 0), JSON.stringify(out));
+  });
+
+  await run(GS + 'what Workbench says on the git screen shows hidden and direction-changing characters: notes, refusals, errors, notices', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await b.ev(`(() => { const f = window.fetch, R = String.fromCharCode(0x202e), Z = String.fromCharCode(0x200b);
+      const no = reply => new Response(JSON.stringify({ ok: false, reply }), { status: 200, headers: { 'content-type': 'application/json' } });
+      window.fetch = async (u, o) => { const s = String(u);
+        if (/\\/api\\/agents\\/m1a2b3\\/changes$/.test(s)) return no('Workbench could not read the folder rel' + R + 'niam' + Z + ' of Invoice export.');
+        if (/\\/api\\/git$/.test(s)) return no('Workbench could not read the history of rel' + R + 'niam' + Z + '.');
+        return f(u, o); }; return 1; })()`);
+    await reviewIt(); await sleep(300);
+    await push('notice', { text: `The branch rel${String.fromCharCode(0x202e)}niam changed since you looked.` }); await sleep(600);
+    const txt = await b.ev(`[document.querySelector('#gitDetail .gdiff')?.textContent || '', document.querySelector('#gitGraph .gnote')?.textContent || '',
+      document.getElementById('gitGraph').getAttribute('aria-label') || '', document.getElementById('gitSaid').textContent, document.getElementById('said').textContent].join(' | ')`);
+    const marks = (txt.match(/⟦U\+202E⟧/g) || []).length;
+    check(GS + 'what Workbench says on the git screen shows hidden and direction-changing characters: notes, refusals, errors, notices', !HIDDEN_RAW.test(txt) && marks >= 5, `${marks} marked: ${JSON.stringify(txt.slice(0, 320))}`);
+  });
+
+  await run(GS + 'a word spoken on the git screen leaves the board’s typing alone: a "yes" typed later goes to the ask on screen', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await click('#dram'); await sleep(900);
+    await blur();
+    await b.key(' ', { phase: 'down' }); await sleep(150);
+    await b.ev(`window.__sr.last && window.__sr.last.hear('back'), 1`);
+    await b.key(' ', { phase: 'up' }); await sleep(900);
+    const back = await screen();
+    await releasePrep(); await sleep(2500);
+    const shown = await h1();
+    await clearLog();
+    await blur();
+    await b.type('yes'); await b.key('Enter'); await sleep(700);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check(GS + 'a word spoken on the git screen leaves the board’s typing alone: a "yes" typed later goes to the ask on screen',
+      back === 'board' && /Release prep/.test(shown) && p.length === 1 && p[0].body.focusId === 'mq' && p[0].body.askId === 'pq', `${back}, lid "${shown}", ${JSON.stringify(p.map(x => x.body))}`);
+  });
+
+  await run(GS + 'Merge in the detail first withdraws a card that waits in the lid, so none waits unseen', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await typeIn('start an agent to fix the flaky test'); await sleep(900);
+    const launch = await h1();
+    await click('#dram'); await sleep(700);
+    await click('#gitGraph .gr[data-id="work:m1a2b3"]'); await sleep(900);
+    await clearLog();
+    await realClick('#gitDetail [data-act="merge"]'); await sleep(1000);
+    const p = await workPosts();
+    const w = p.findIndex(x => x.path.startsWith('/api/confirm/') && x.body.go === false), m = p.findIndex(x => x.path === '/api/agents/m1a2b3/merge');
+    const card = await b.ev(`document.querySelector('#gitDetail .dcard .dq')?.textContent || ''`);
+    check(GS + 'Merge in the detail first withdraws a card that waits in the lid, so none waits unseen',
+      /^Start a simulated Claude/.test(launch) && w >= 0 && m > w && /Merge Invoice export into main\?/.test(card), `"${launch}" ${JSON.stringify(p.map(x => [x.path, x.body]))} "${card}"`);
+  });
+
+  await run(GS + '"<name> needs you" takes that item to the lid even while a card waits, and withdraws the card', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await reviewIt(); await sleep(300);
+    await realClick('#gitDetail [data-act="merge"]'); await until(cardThere); await sleep(300);
+    await releasePrep(); await sleep(900);
+    await clearLog();
+    await click('#gitNeeds'); await sleep(1300);
+    const there = await screen(), shown = await lidNow();
+    const p = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
+    check(GS + '"<name> needs you" takes that item to the lid even while a card waits, and withdraws the card',
+      there === 'board' && /Release prep/.test(shown) && !/Merge Invoice export/.test(shown) && p.length === 1 && p[0].body.go === false, `${there}, lid "${shown}", ${JSON.stringify(p.map(x => [x.path, x.body]))}`);
+  });
+
+  await run(GS + 'a card from typed words goes in a detail only when it is that agent’s, never by a name inside another', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    const pr = await agentOf('mab0c1');
+    await push('agents', [{ ...pr, name: 'Search' }]); await sleep(400);
+    await click('#dram'); await sleep(700);
+    await click('#gitGraph .gr[data-id="work:mab0c1"]'); await sleep(900);
+    const title = await b.ev(`document.getElementById('gitDetailTitle')?.textContent || ''`);
+    await b.ev(`document.getElementById('gitSay').focus(), 1`);
+    await b.type('merge search cleanup'); await b.key('Enter'); await sleep(1300);
+    const inDetail = await b.ev(`document.querySelector('#gitDetail:not([hidden]) .dcard')?.textContent || ''`);
+    const there = await screen(), shown = await lidNow();
+    check(GS + 'a card from typed words goes in a detail only when it is that agent’s, never by a name inside another',
+      title === 'Search' && !/Search cleanup/.test(inDetail) && there === 'board' && /Merge Search cleanup into main\?/.test(shown), `detail "${title}", card there "${inDetail.slice(0, 60)}", ${there}, lid "${shown}"`);
+  });
+
+  await run(GS + 'focus on a row that goes away moves to a row that is there, and the list keeps one tab stop', async () => {
+    await open('git', { still: true });
+    await sleep(900);
+    await click('#dram'); await sleep(900);
+    await b.ev(`document.querySelector('#gitGraph .gr[data-id="work:g3"]').focus(), 1`);
+    const before = await gitFocus();
+    const g3 = await agentOf('g3');
+    await push('agents', [{ ...g3, state: 'done_checked', endedAt: Date.now(), stateSince: Date.now(), files: { changed: 0, adds: 0, dels: 0, list: [] } }]);
+    await sleep(1500);
+    const gone = await b.ev(`!document.querySelector('#gitGraph .gr[data-id="work:g3"]')`);
+    const after = await gitFocus(), stops = await b.ev(`[...document.querySelectorAll('#gitGraph .gr')].filter(r => r.tabIndex === 0).length`);
+    check(GS + 'focus on a row that goes away moves to a row that is there, and the list keeps one tab stop',
+      /^graph:DIV#gr-work_g3/.test(before) && gone && /^graph:DIV/.test(after) && stops === 1, `${before} → ${after}, row gone ${gone}, tab stops ${stops}`);
+  });
+
+  const helpMergeRow = () => b.ev(`[...document.querySelectorAll('#gitGraph .gr')].find(r => /^Merge Help pages/.test(r.querySelector('.sub')?.textContent || ''))?.dataset.id || ''`);
+  await run(GS + 'a link to an agent with no work node keeps a row selected, and Esc goes back to a row', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await click('#dram'); await sleep(700);
+    const id = await helpMergeRow();
+    await click(`#gitGraph .gr[data-id="${id}"]`); await sleep(700);
+    await b.ev(`document.querySelector('#gitDetail [data-git-act="agent"][data-key^="a:"]')?.focus(), 1`);
+    await b.key('Enter'); await sleep(800);
+    const detail = await b.ev(`document.getElementById('gitDetailTitle')?.textContent || ''`);
+    const stops = await b.ev(`[...document.querySelectorAll('#gitGraph .gr')].filter(r => r.tabIndex === 0).map(r => r.dataset.id + (r.getAttribute('aria-selected') === 'true' ? '*' : ''))`);
+    await b.key('Escape'); await sleep(500);
+    const f = await gitFocus();
+    check(GS + 'a link to an agent with no work node keeps a row selected, and Esc goes back to a row',
+      !!id && detail === 'Help pages' && stops.length === 1 && /\*$/.test(stops[0]) && /^graph:DIV/.test(f), `row ${id}, detail "${detail}", tab stops ${JSON.stringify(stops)}, focus after Esc ${f}`);
+  });
+
+  await run(GS + 'times on the git screen move on with the clock', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await click('#dram'); await sleep(700);
+    const id = await helpMergeRow();
+    await click(`#gitGraph .gr[data-id="${id}"]`); await sleep(700);
+    await b.ev(`document.querySelector('#gitDetail [data-git-act="agent"][data-key^="a:"]')?.click(), 1`); await sleep(800);
+    const read = () => b.ev(`[document.querySelector('#gitGraph .gr:not(.work) .l2')?.textContent || '', document.querySelector('#gitDetail .dmeta')?.textContent || ''].join(' | ')`);
+    const before = await read();
+    await b.ev(`(() => { const real = Date.now.bind(Date); window.__ahead = 0; Date.now = () => real() + window.__ahead; return 1; })()`);
+    await b.ev(`window.__ahead = 2 * 60000, 1`); await sleep(1600);
+    const after = await read();
+    check(GS + 'times on the git screen move on with the clock', /· 3 min ago ·/.test(before) && /· 5 min ago ·/.test(after) && /Merged into main 4 min ago/.test(before) && /Merged into main 6 min ago/.test(after), `"${before}" → "${after}"`);
   });
 
   if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);

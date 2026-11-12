@@ -6,9 +6,14 @@
 //
 // app.js sets it up once (setupGitScreen) and hands it what it shares with the board: the layout (for the wire's place),
 // the text measurer, say(), the lid's button handler for Merge, Throw it away and a card's answers, and a render.
-// Nothing here repaints at rest: every paint is keyed on what it shows.
+// Nothing here repaints at rest: every paint is keyed on what it shows, and the times change a word at a time.
+//
+// The detail's actions follow the lid's rules (ARCHITECTURE.md, "The lid"): when they change under the pointer (a card
+// comes in their place, or goes) their buttons ignore clicks for a moment, words typed or spoken before the change are
+// bound to nothing, and focus that was on them moves to the card's sentence (or the heading), never to an answer.
 import { graphLayout, GRAPH_SIZES, rowWords, workActions, mergeLabel, shortId, cutMiddle } from './gitgraph.js';
 import { diffHtml, visibleText } from './diffview.js';
+import { visibleControls } from './words.js';   // the engine's own words (cards, refusals): shown as the lid shows them
 import { esc, patchChildren, setText } from './util.js';
 import { pathD, sizeClass, clipTo } from './layout.js';
 import { markOfAgent } from './look.js';
@@ -41,31 +46,59 @@ const st = {
   readSig: '',        // the repository and the agents' work as the last read saw them
   keys: { band: '', board: '', graph: '', detail: '' },
   armedUntil: 0,      // the detail's buttons wait a moment after they change under the pointer
+  armTimer: null,
+  acts: '',           // the detail's action block as last drawn: its agent, state, work, card and buttons
+  bound: null,        // what words typed or spoken here go to, taken when they began ({} is nothing); see bindingNow()
+  needKey: null,      // what needs you, as this screen last saw it (null: not yet, since it opened)
+  dx: 0,              // the drawing's shift to the right, so HEAD's label has room left of the trunk
+  head: null,         // where HEAD's label goes: { x, y, anchor, halo }
+  times: null,        // the rows' times as drawn, so they move on with the clock: { rows, n2, agentById, branch }
+  detailWhen: '',     // the detail's times as drawn
 };
+// the guard after the detail's buttons change: the lid's (the swap and a moment more), or half a second without motion
+const ARM_MS = 760, ARM_CALM_MS = 500;
+const CARD_WORDS = { merge: 'Before it merges', discard: 'Before it is thrown away' };
 
 /** Is the git screen shown (or on its way)? The lid keeps holding while it is. */
 export const gitShown = () => st.shown;
 
-/** @param {object} c  { boardScreen, board, getG, measure, still, reduced, say, act, moved, render, command, onShow } */
+/**
+ * @param {object} c  { boardScreen, board, getG, measure, still, reduced, say, act, moved, render, command, onShow,
+ *   listening, pick }. command(text, binding) sends words typed or spoken here, with the binding taken when they began;
+ *   listening() is true while voice listens (Esc then throws the words away, so it is not the git screen's); pick(id)
+ *   puts that agent in the lid as picking a chip does (a card on screen is withdrawn first).
+ */
 export function setupGitScreen(c) {
   ctx = c;
   el = {
     html: document.documentElement, screen: $('gitScreen'), boardScreen: c.boardScreen, svg: $('gitBoard'), top: $('gitTop'),
     left: $('gitTop').querySelector('.gleft'), right: $('gitTop').querySelector('.gright'), back: $('gitBack'), mode: $('gitMode'),
     title: $('gitTitle'), state: $('gitState'), needs: $('gitNeeds'), bar: $('gitBar'), say: $('gitSay'), ph: $('gitPh'), said: $('gitSaid'),
-    graph: $('gitGraph'), detail: $('gitDetail'), wireEnd: $('gitWireEnd'),
+    graph: $('gitGraph'), detail: $('gitDetail'), wireEnd: $('gitWireEnd'), announce: $('gitAnnounce'),
   };
   el.back.addEventListener('click', () => closeGit());
   el.wireEnd.addEventListener('click', () => closeGit());
   el.needs.addEventListener('click', () => {
     const id = el.needs.dataset.agent;
     if (!id || !S.agents.has(id)) { paintBand(); return; }
-    S.focusId = id;
+    // "<Name> needs you" puts that item in the lid, as picking its chip does: a card on screen is withdrawn first
+    if (typeof ctx.pick === 'function') ctx.pick(id); else { S.focusId = id; ctx.moved(); }
     closeGit({ toLid: true });
-    ctx.moved(); ctx.render();
+    ctx.render();
   });
-  el.bar.addEventListener('submit', e => { e.preventDefault(); const t = el.say.value; el.say.value = ''; el.bar.classList.remove('typed'); ctx.command(t, detailAgentId()); });
-  el.say.addEventListener('input', () => el.bar.classList.toggle('typed', !!el.say.value));
+  // Typed words go with what the screen showed when the person began (the first key), as the core's input does
+  el.bar.addEventListener('submit', e => {
+    e.preventDefault();
+    const t = el.say.value, b = st.bound || bindingNow();
+    st.bound = null;
+    el.say.value = ''; el.bar.classList.remove('typed');
+    ctx.command(t, b);
+  });
+  el.say.addEventListener('input', () => {
+    el.bar.classList.toggle('typed', !!el.say.value);
+    if (el.say.value && !st.bound) st.bound = bindingNow();
+    if (!el.say.value) st.bound = null;
+  });
   el.graph.addEventListener('click', e => {
     const badge = e.target.closest('[data-badge-agent]');
     const row = e.target.closest('.gr');
@@ -76,7 +109,8 @@ export function setupGitScreen(c) {
   });
   el.graph.addEventListener('keydown', onGraphKey);
   el.detail.addEventListener('click', onDetailClick);
-  el.detail.addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); gitEscape(); } });
+  // Esc in the detail is the page's (app.js escape()): while voice listens it throws the words away; otherwise it comes
+  // to gitEscape(), which closes the detail, then the screen.
 }
 
 // ---------------------------------------------------------------- going down and coming back
@@ -90,10 +124,11 @@ export function openGit({ agentId = null, opener = null } = {}) {
   if (!ctx) return;
   st.opener = opener && opener.isConnected ? opener : null;
   st.openedOn = agentId && typeof agentId === 'string' ? agentId : null;
-  if (st.openedOn) { st.sel = 'work:' + st.openedOn; st.detail = { kind: 'agent', agentId: st.openedOn }; st.armedUntil = performance.now() + 600; }
+  if (st.openedOn) { st.sel = 'work:' + st.openedOn; st.detail = { kind: 'agent', agentId: st.openedOn }; arm(600); }
   else if (!st.shown) st.detail = null;   // by the DRAM or the words: the graph, at the row last selected
   if (st.shown && st.moving !== 'up') { paint(); if (st.detail) loadChanges(true); focusAfterOpen(); return; }
   st.shown = true;
+  st.needKey = null;   // what needs you as the screen opens is not news: only what comes while it shows is said
   ctx.onShow(true);
   read();
   if (st.detail) loadChanges(true);
@@ -106,6 +141,8 @@ export function closeGit({ toLid = false } = {}) {
   if (!ctx || !st.shown) return;
   st.shown = false;
   st.toLid = toLid;
+  // words begun while this screen showed are not for what the board shows
+  if (st.bound) st.bound = {};
   ctx.onShow(false);
   move('up');
 }
@@ -150,7 +187,7 @@ function settle(dir) {
   // on the way up: the person's place on the board
   const lidH1 = () => document.querySelector('#pages .page:not(.old) h1');
   const to = st.toLid ? lidH1() : st.opener && st.opener.isConnected && !st.opener.closest('[inert]') ? st.opener : document.getElementById('dram');
-  (to || lidH1())?.focus({ preventScroll: true });
+  focusOn(to || lidH1());
   st.opener = null; st.openedOn = null; st.toLid = false;
   ctx.render();
 }
@@ -159,7 +196,21 @@ function settle(dir) {
 function focusAfterOpen() {
   if (st.moving) return;
   const h = st.detail && st.openedOn ? el.detail.querySelector('h2') : el.title;
-  (h || el.title).focus({ preventScroll: true });
+  focusOn(h || el.title);
+}
+
+/**
+ * Focus `e`, never leaving the keyboard on nothing. A screen that has only just become visible can refuse focus for a
+ * frame (a style still on its way from hidden); then it is tried again on the next frame, if nothing else took it.
+ */
+function focusOn(e) {
+  if (!e) return;
+  e.focus({ preventScroll: true });
+  if (document.activeElement === e) return;
+  requestAnimationFrame(() => {
+    const ae = document.activeElement;
+    if (e.isConnected && (!ae || ae === document.body)) e.focus({ preventScroll: true });
+  });
 }
 
 /** A pulse along the git screen's wire: down from the top edge to HEAD, or back up. */
@@ -197,7 +248,8 @@ function read() {
   }, err => {
     if (seq !== st.seq) return;
     st.loading = false;
-    st.error = (err && err.message) || 'Workbench could not read the history.';
+    // the engine's words can name your branch or a folder: hidden characters show by their code
+    st.error = visibleControls((err && err.message) || 'Workbench could not read the history.');
     paint();
   });
 }
@@ -263,7 +315,7 @@ function loadChanges(force) {
     paintDetail();
   }, err => {
     if (seq !== ch.seq) return;
-    Object.assign(ch, { loading: false, data: null, error: (err && err.message) || 'Workbench could not read its changes.' });
+    Object.assign(ch, { loading: false, data: null, error: visibleControls((err && err.message) || 'Workbench could not read its changes.') });
     paintDetail();
   });
 }
@@ -283,7 +335,9 @@ export function gitRender() {
  */
 export function gitSay(text) {
   if (!el) return;
-  const full = text ? String(text) : '';
+  // replies and notices can name branches and paths: hidden characters show by their code (app.js's say() does this
+  // already; doing it again changes nothing)
+  const full = text ? visibleControls(String(text)) : '';
   const shown = full.length > (st.saidChars || 80) ? clipTo(full, st.saidChars || 80) : full;
   const html = shown === full ? esc(full) : `<span aria-hidden="true">${esc(shown)}</span><span class="sr">${esc(full)}</span>`;
   if (el.said.dataset.html !== html) { el.said.innerHTML = html; el.said.dataset.html = html; }
@@ -368,6 +422,7 @@ function paintBand(z = sizes()) {
     el.needs.dataset.agent = first.id;
   }
   el.needs.hidden = !first;
+  tellNeeds(q);
   el.needs.style.fontSize = P.silkSub + 'px';
   el.back.style.fontSize = P.silkSub + 'px';
   el.say.style.fontSize = P.silkSub + 'px';
@@ -376,6 +431,30 @@ function paintBand(z = sizes()) {
   const sayLabel = st.detail && st.detail.kind === 'agent' && agentOf(st.detail.agentId)
     ? `Type what you want. It goes to Workbench, about ${visibleText(agentOf(st.detail.agentId).name)}.` : 'Type what you want. It goes to Workbench.';
   if (el.say.getAttribute('aria-label') !== sayLabel) el.say.setAttribute('aria-label', sayLabel);
+}
+
+/**
+ * Something new needs the person while this screen shows: the band's button lights, and a screen reader hears it once
+ * (the lid's own live region is on the board, hidden while this screen shows). What needs you as the screen opens is
+ * not news; a new head of the queue is, and so is one more behind it.
+ */
+function tellNeeds(q) {
+  const first = q[0] || null;
+  const now = { head: first ? `${first.id}|${first.ask ? first.ask.id : first.state}` : '', n: q.length };
+  const was = st.needKey;
+  st.needKey = now;
+  if (!st.shown || st.moving || !was || !first) return;
+  if (now.head !== was.head) announce(`${visibleText(first.name || 'An agent')} needs you. The button at the top goes back to the board, to answer it.`);
+  else if (now.n > was.n) announce('Another one needs you. The button at the top goes back to the board.');
+}
+
+/** Say something to screen readers on this screen (its own live region). The same words again are said again. */
+function announce(text) {
+  const r = el && el.announce;
+  if (!r || !text) return;
+  if (r.textContent !== text) { r.textContent = text; return; }
+  r.textContent = '';
+  setTimeout(() => { r.textContent = text; }, 60);
 }
 
 /** The band's height, as laid out: the graph starts under it (measured from the screen's top, which moves as it slides). */
@@ -404,19 +483,23 @@ function paintGraph(z) {
   if (el.graph.getAttribute('aria-label') !== label) el.graph.setAttribute('aria-label', label);
   if (note) {
     st.g = null;
+    st.times = null;
     const html = `<p class="gnote" aria-hidden="true">${esc(note)}</p>`;
-    if (st.keys.graph !== html) { st.keys.graph = html; el.graph.innerHTML = html; }
+    if (st.keys.graph !== html) { st.keys.graph = html; const had = rowFocus(); el.graph.innerHTML = html; if (had) focusOn(el.title); }
     return;
   }
-  const g = st.g && st.keys.graph === key ? st.g : graphLayout({ commits: d.commits, agents: d.agents.map(a => agentOf(a.id) || a), branch: d.repo.branch, head: d.repo.head, width: graphW, height: bottom - top, ACTIVE: STATES.ACTIVE }, GP);
+  const fresh = !(st.g && st.keys.graph === key);
+  const g = fresh ? graphLayout({ commits: d.commits, agents: d.agents.map(a => agentOf(a.id) || a), branch: d.repo.branch, head: d.repo.head, width: graphW, height: bottom - top, ACTIVE: STATES.ACTIVE }, GP) : st.g;
   st.g = g;
+  // HEAD's label: where nothing runs through it, with the drawing moved right when the graph's edge would cut it
+  if (fresh) { const place = headPlace(g); st.dx = place.dx; st.head = place.label; }
   // opened on an agent with no work node (merged with nothing new: "See it in git"): its branch's tip, or its merge
   if (st.sel && st.sel.startsWith('work:') && !g.rows.some(r => r.item.id === st.sel)) {
     const a = agentOf(st.sel.slice(5)), br = a && a.branch;
     const tip = (br && d.commits.find(c => c.refs.includes(br))) || d.commits.find(c => c.agentId === (a && a.id) && c.kind === 'merge');
     if (tip) st.sel = tip.id;
   }
-  st.geo.textX = Math.ceil(g.w + 12);
+  st.geo.textX = Math.ceil(g.w + st.dx + 12);
   if (st.keys.graph === key) return;
   st.keys.graph = key;
   const now = Date.now();
@@ -424,10 +507,17 @@ function paintGraph(z) {
   const l1 = parseFloat(el.screen.style.getPropertyValue('--g-l1')), l2 = parseFloat(el.screen.style.getPropertyValue('--g-l2'));
   const cw1 = ctx.measure('M', l1, 500), cw2 = ctx.measure('M', l2, 400), cwB = ctx.measure('M', l2, 600);
   const agentById = new Map(d.agents.map(a => [a.id, agentOf(a.id) || a]));
+  // the list is one tab stop: the selected row, or the first when no row is selected
+  const stop = g.rows.some(r => r.item.id === st.sel) ? st.sel : (g.rows[0] ? g.rows[0].item.id : null);
+  const n2 = Math.max(4, Math.floor(textW / cw2));
+  const times = [];
   let rows = '';
   for (const r of g.rows) {
     const it = r.item, w = rowWords(it, { agentById, now, branch: d.repo.branch });
     const id = it.id, sel = id === st.sel;
+    // the row's time moves on with the clock (gitTick), a word at a time
+    const at = it.kind === 'commit' && it.commit && Number.isFinite(it.commit.at) ? (it.commit.at < 1e12 ? it.commit.at * 1000 : it.commit.at) : null;
+    if (at != null) times.push({ id, item: it, at, when: agoText(now - at) });
     // badges first (cut to fit, the rest counted), then the subject, cut at a word boundary
     let used = 0, badges = '';
     const shownBadges = [];
@@ -442,21 +532,81 @@ function paintGraph(z) {
     }
     const mark = it.kind === 'work' ? markOfAgent(it.agent || {}, STATES.LOOK) : null;
     const lead = mark ? 16 : 0;
-    const n1 = Math.max(4, Math.floor((textW - used - lead) / cw1)), n2 = Math.max(4, Math.floor(textW / cw2));
+    const n1 = Math.max(4, Math.floor((textW - used - lead) / cw1));
     const t1 = clipTo(w.line1, n1), t2 = clipTo(w.line2, n2);
     const title = [w.line1, w.line2].join('\n');
     const glyph = mark ? `<svg class="g t-${mark.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${mark.shape}"/></svg>` : '';
-    rows += `<div class="gr${it.kind === 'work' ? ' work' : ''}${sel ? ' sel' : ''}" role="option" id="gr-${esc(cssId(id))}" data-id="${esc(id)}" aria-selected="${sel}" tabindex="${sel || (!st.sel && r.row === 0) ? 0 : -1}"`
+    rows += `<div class="gr${it.kind === 'work' ? ' work' : ''}${sel ? ' sel' : ''}" role="option" id="gr-${esc(cssId(id))}" data-id="${esc(id)}" aria-selected="${sel}" tabindex="${id === stop ? 0 : -1}"`
       + ` aria-label="${esc(w.aria)}" title="${esc(title)}" style="top:${r1(r.y - g.rowH / 2)}px;height:${g.rowH}px;padding-left:${st.geo.textX}px">`
       + `<span class="l1">${glyph}${badges}<span class="sub">${esc(t1)}</span></span><span class="l2">${esc(t2)}</span></div>`;
   }
+  st.times = { rows: times, n2, agentById, branch: d.repo.branch };
   const more = d.more ? `<p class="gmore" aria-hidden="true" style="top:${g.h - 8}px;padding-left:${st.geo.textX}px">Older commits are not shown here.</p>` : '';
-  const html = `<div class="gin" style="height:${g.h + (d.more ? 22 : 0)}px"><svg class="gsvg" width="${g.w}" height="${g.h}" viewBox="0 0 ${g.w} ${g.h}" aria-hidden="true">${graphSvg(g)}</svg>${rows}${more}</div>`;
-  const hadFocus = el.graph.contains(document.activeElement) ? document.activeElement.dataset.id : null;
+  const W = g.w + st.dx;
+  const html = `<div class="gin" style="height:${g.h + (d.more ? 22 : 0)}px"><svg class="gsvg" width="${W}" height="${g.h}" viewBox="0 0 ${W} ${g.h}" aria-hidden="true"><g class="gshift" transform="translate(${st.dx} 0)">${graphSvg(g)}</g></svg>${rows}${more}</div>`;
+  const had = rowFocus();
   el.graph.innerHTML = html;
-  if (hadFocus) el.graph.querySelector(`.gr[data-id="${CSS.escape(hadFocus)}"]`)?.focus({ preventScroll: true });
+  if (had) {
+    // focus stays on its row; a row that went away hands it to the selected row (or the first), never to nothing
+    const rowsNow = rowEls();
+    const to = rowsNow.find(x => x.dataset.id === had.id) || rowsNow.find(x => x.tabIndex === 0) || rowsNow[Math.min(Math.max(0, had.at), rowsNow.length - 1)];
+    focusOn(to || el.title);
+  }
 }
 const cssId = id => String(id).replace(/[^A-Za-z0-9_-]/g, '_');
+/** The row that has the keyboard, if one does: its id and its place in the list. */
+function rowFocus() {
+  const ae = document.activeElement;
+  if (!ae || ae === el.graph || !el.graph.contains(ae)) return null;
+  const row = ae.closest('.gr');
+  return row ? { id: row.dataset.id, at: rowEls().indexOf(row) } : { id: null, at: 0 };
+}
+
+// .ghead in app.css: 600 10.5px JetBrains Mono, letter-spacing 1.2px; its box is the font's (ascent 1.02, descent 0.3)
+const HEAD_PX = 10.5, HEAD_TRACK = 1.2;
+const headPlace = g => headLabelPlace(g, ctx.measure('HEAD', HEAD_PX, 600) + 4 * HEAD_TRACK);
+/**
+ * Where HEAD's label goes: above the pad on its left, else on its right, else below the pad, left then right: the first
+ * place no trace or part runs through, inside the graph (left of the trunk, the drawing moves right by `dx` so the
+ * graph's edge never cuts it). When every place is crossed, the first that fits gets a halo, so the copper under it does
+ * not cut its letters. Works on the laid-out graph, so it follows whatever room the layout leaves left of the trunk.
+ * Pure (no DOM): `W` is the label's width in CSS pixels.
+ * @param {object} g  graphLayout()'s answer
+ * @returns {{ dx: number, label: { x: number, y: number, anchor: 'start'|'end', halo: boolean, box: { l, r, t, b } } | null }}
+ *   box is the room the label takes (its font box and a margin), in the drawing's own coordinates (before dx)
+ */
+export function headLabelPlace(g, W) {
+  const n = g.nodes.find(x => x.kind === 'head');
+  if (!n) return { dx: 0, label: null };
+  const h = n.size;
+  const asc = HEAD_PX * 1.02, desc = HEAD_PX * 0.3, pad = 1.5;
+  const segs = [];
+  for (const e of g.edges) for (let i = 1; i < e.pts.length; i++) segs.push([e.pts[i - 1], e.pts[i], e.kind === 'trunk' ? 3 : 1.5]);
+  const parts = g.nodes.filter(o => o !== n).map(o => ({ l: o.x - o.size, r: o.x + o.size, t: o.y - o.size, b: o.y + o.size }));
+  const clear = box => !segs.some(([a, b, w]) => segCuts(a, b, { l: box.l - w, r: box.r + w, t: box.t - w, b: box.b + w }))
+    && !parts.some(p => p.l < box.r && box.l < p.r && p.t < box.b && box.t < p.b);
+  const places = [];
+  for (const y of [n.y - h - 3, n.y + h + 3 + asc]) for (const left of [true, false]) {
+    const x = left ? n.x - h - 5 : n.x + h + 5, x0 = left ? x - W : x;
+    places.push({ x, y, anchor: left ? 'end' : 'start', box: { l: x0 - pad, r: x0 + W + pad, t: y - asc - pad, b: y + desc + pad } });
+  }
+  // on the right, the rows' text starts 12 px past the drawing; above and below, the drawing's own height
+  const fits = p => p.box.r <= g.w + 6 && p.box.t >= 0 && p.box.b <= g.h;
+  const ok = places.find(p => fits(p) && clear(p.box));
+  const pick = ok || places.find(fits) || places[0];
+  return { dx: Math.max(0, Math.ceil(1 - pick.box.l)), label: { x: pick.x, y: pick.y, anchor: pick.anchor, halo: !ok, box: pick.box } };
+}
+/** Does the segment a–b cross the box? (Liang–Barsky clipping) */
+function segCuts(a, b, box) {
+  let t0 = 0, t1 = 1;
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  for (const [p, q] of [[-dx, a[0] - box.l], [dx, box.r - a[0]], [-dy, a[1] - box.t], [dy, box.b - a[1]]]) {
+    if (p === 0) { if (q < 0) return false; continue; }
+    const t = q / p;
+    if (p < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; }
+  }
+  return t0 <= t1;
+}
 
 /** The drawing: the gold trunk under the copper lanes, then the nodes, the "+N" folds and the selection ring. */
 function graphSvg(g) {
@@ -477,9 +627,9 @@ function nodeSvg(n, g) {
   const { x, y } = n, sel = n.id === st.sel;
   let s = sel ? `<circle class="gsel" cx="${x}" cy="${y}" r="${r1(n.size + 5)}"/>` : '';
   if (n.kind === 'head') {
-    const h = n.size;
+    const h = n.size, lab = st.head || { x: x - h - 5, y: y - h - 3, anchor: 'end', halo: false };
     s += `<rect class="gpad gold" x="${r1(x - h)}" y="${r1(y - h)}" width="${2 * h}" height="${2 * h}" rx="2.5"/><circle class="ghole" cx="${x}" cy="${y}" r="${r1(h * 0.32)}"/>`;
-    s += `<text class="ghead" x="${r1(x - h - 5)}" y="${r1(y - h - 3)}" text-anchor="end">HEAD</text>`;
+    s += `<text class="ghead${lab.halo ? ' halo' : ''}" x="${r1(lab.x)}" y="${r1(lab.y)}" text-anchor="${lab.anchor}">HEAD</text>`;
   } else if (n.kind === 'merge') {
     const h = n.size;
     s += `<rect class="gpad ${n.trunk ? 'gold' : 'cu'}" x="${r1(x - h)}" y="${r1(y - h)}" width="${2 * h}" height="${2 * h}" rx="1.5"/><circle class="ghole" cx="${x}" cy="${y}" r="${r1(h * 0.3)}"/>`;
@@ -504,7 +654,7 @@ function nodeSvg(n, g) {
 function paintBoard(z) {
   const { W, H, P, bd, wx } = z, geo = st.geo;
   // the wire: down from the top edge at the board wire's x, then with 45° bends to the trunk at the graph's top
-  const tx = st.g ? r1(geo.left + st.g.trunkX) : null;
+  const tx = st.g ? r1(geo.left + st.g.trunkX + st.dx) : null;
   const y0 = bd.y - P.margin, yTop = geo.top;
   let wire;
   if (tx == null) wire = [[wx, y0], [wx, yTop]];
@@ -547,25 +697,43 @@ function rowEls() { return [...el.graph.querySelectorAll('.gr')]; }
 
 function select(id, { focus = false } = {}) {
   if (!id) return;
+  const rows = rowEls();
+  // a row that is not drawn is never selected: the list keeps its one tab stop where it was
+  if (rows.length && !rows.some(r => r.dataset.id === id)) return;
   st.sel = id;
-  for (const r of rowEls()) {
+  for (const r of rows) {
     const on = r.dataset.id === id;
     r.classList.toggle('sel', on);
     r.setAttribute('aria-selected', String(on));
     r.tabIndex = on ? 0 : -1;
     if (on && focus) { r.focus({ preventScroll: true }); r.scrollIntoView({ block: 'nearest' }); }
   }
-  // the ring on the selected node
+  // the ring on the selected node (inside the drawing, which may sit moved right for HEAD's label)
   const svg = el.graph.querySelector('.gsvg');
   if (svg && st.g) {
-    svg.querySelector('.gsel')?.remove();
+    const host = svg.querySelector('.gshift') || svg;
+    host.querySelector('.gsel')?.remove();
     const n = st.g.nodes.find(x => x.id === id);
     if (n) {
       const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
       c.setAttribute('class', 'gsel'); c.setAttribute('cx', n.x); c.setAttribute('cy', n.y); c.setAttribute('r', r1(n.size + 5));
-      svg.insertBefore(c, svg.firstChild);
+      host.insertBefore(c, host.firstChild);
     }
   }
+}
+
+/**
+ * The row that stands for an agent: its work node, else the tip of its branch, else the merge that brought its work in
+ * (as paintGraph does for the screen opened on an agent); null when none of them is drawn.
+ */
+function rowOfAgent(agentId) {
+  const drawn = id => !!(st.g && st.g.rows.some(r => r.item.id === id));
+  if (drawn('work:' + agentId)) return 'work:' + agentId;
+  const a = agentOf(agentId), br = a && a.branch, d = st.data;
+  const tip = d && br ? d.commits.find(c => c.refs.includes(br)) : null;
+  if (tip && drawn(tip.id)) return tip.id;
+  const merge = d ? d.commits.find(c => c.agentId === agentId && c.kind === 'merge') : null;
+  return merge && drawn(merge.id) ? merge.id : null;
 }
 
 /** What a row opens: an agent's work node or the tip of its branch (an agent's lane), else the commit. */
@@ -576,27 +744,70 @@ function openRow(id) {
 
 function openDetail(d) {
   st.detail = d;
-  st.armedUntil = performance.now() + 500;
+  arm(ARM_CALM_MS);
   if (d.kind === 'agent') loadChanges(true);
   paintDetail();
-  el.detail.querySelector('h2')?.focus({ preventScroll: true });
+  focusOn(el.detail.querySelector('h2'));
 }
 
+/** Close the detail: the keyboard goes back to the selected row (or the list's tab stop), else the heading. */
 function closeDetail() {
   st.detail = null;
   paintDetail();
-  const row = st.sel && el.graph.querySelector(`.gr[data-id="${CSS.escape(st.sel)}"]`);
-  (row || el.title).focus({ preventScroll: true });
+  const row = (st.sel && el.graph.querySelector(`.gr[data-id="${CSS.escape(st.sel)}"]`)) || el.graph.querySelector('.gr[tabindex="0"]');
+  focusOn(row || el.title);
+}
+
+/** The card shown in an agent's detail, in place of its actions: a merge or throw-away card its own buttons asked for. */
+const cardIn = agentId => { const c = S.confirm; return c && c.agentId === agentId && (c.kind === 'merge' || c.kind === 'discard') ? c : null; };
+const calm = () => ctx.still() || ctx.reduced() || document.hidden;
+
+/**
+ * What words typed or spoken here go to, as the screen shows it now (the lid's bindingNow, for this screen): the card in
+ * the detail by its id; else the agent whose detail is open; else nothing. While the screen moves, and for a moment
+ * after the detail's actions change, nothing: a "yes" then answers nothing it has not shown.
+ */
+function bindingNow() {
+  if (!st.shown || st.moving || performance.now() < st.armedUntil) return {};
+  const d = st.detail;
+  if (!d || d.kind !== 'agent') return {};
+  const c = cardIn(d.agentId);
+  return c ? { confirmId: c.id } : { agentId: d.agentId };
+}
+
+/** The microphone turned on over the git screen: what is said goes to what it shows now (unless typing began first). */
+export function gitHold() { if (!st.bound) st.bound = bindingNow(); }
+/** What words spoken on the git screen go to: the binding taken when they began, used once. */
+export function gitTake() {
+  const b = st.bound || bindingNow();
+  if (!el || !el.say.value) st.bound = null;
+  return b;
+}
+/** A voice session on the git screen ended with nothing heard: its binding goes (typed words keep theirs). */
+export function gitRelease() { if (el && !el.say.value) st.bound = null; }
+/** The band shows that voice listens (the wave and the words heard take the input's place). */
+export function gitListening(on) { if (el) el.bar.classList.toggle('listening', !!on); }
+
+/**
+ * Where a button in the detail hands the keyboard while it waits for its answer (a disabled button drops it): the card's
+ * sentence for the card's own answers, else the detail's heading. Null for any other button.
+ */
+export function gitHome(b) {
+  if (!el || !b || !el.detail.contains(b)) return null;
+  return (b.closest('.dcard') && el.detail.querySelector('#gitCard')) || el.detail.querySelector('h2');
 }
 
 const detailAgentId = () => (st.shown && st.detail && st.detail.kind === 'agent' ? st.detail.agentId : null);
-/** The agent whose detail is open, for words typed on the git screen (they go with focusId set to it). */
+/** The agent whose detail is open (words typed or spoken here bind to it; see bindingNow). */
 export const gitFocusId = detailAgentId;
 
-/** Esc on the git screen: the detail closes (back to its node); then back to the board. Opened on an agent, it goes back at once. */
+/**
+ * Esc on the git screen: typed words go first; then the detail closes (back to its node); then back to the board.
+ * Opened on an agent, it goes back at once. While voice listens, Esc is not this screen's: it throws the words away.
+ */
 export function gitEscape() {
-  if (!st.shown) return false;
-  if (document.activeElement === el.say && el.say.value) { el.say.value = ''; el.bar.classList.remove('typed'); return true; }
+  if (!st.shown || (ctx.listening && ctx.listening())) return false;
+  if (document.activeElement === el.say && el.say.value) { el.say.value = ''; el.bar.classList.remove('typed'); st.bound = null; return true; }
   if (st.detail && !(st.openedOn && st.detail.kind === 'agent' && st.detail.agentId === st.openedOn)) { closeDetail(); return true; }
   closeGit();
   return true;
@@ -618,14 +829,20 @@ function onGraphKey(e) {
   e.preventDefault();
   select(rows[j].dataset.id, { focus: true });
   // with the detail open, it follows the selection
-  if (st.detail) { const id = rows[j].dataset.id; st.detail = id.startsWith('work:') ? { kind: 'agent', agentId: id.slice(5) } : { kind: 'commit', id }; st.armedUntil = performance.now() + 500; if (st.detail.kind === 'agent') loadChanges(false); paintDetail(); }
+  if (st.detail) { const id = rows[j].dataset.id; st.detail = id.startsWith('work:') ? { kind: 'agent', agentId: id.slice(5) } : { kind: 'commit', id }; arm(ARM_CALM_MS); if (st.detail.kind === 'agent') loadChanges(false); paintDetail(); }
 }
 
 function onDetailClick(e) {
   const b = e.target.closest('button');
   if (!b || b.disabled) return;
   if (b.dataset.gitAct === 'close') { closeDetail(); return; }
-  if (b.dataset.gitAct === 'agent') { select('work:' + b.dataset.agent); openDetail({ kind: 'agent', agentId: b.dataset.agent }); return; }
+  if (b.dataset.gitAct === 'agent') {
+    // the agent's own row, the tip of its branch or its merge; when none is drawn, the selection stays where it was
+    const row = rowOfAgent(b.dataset.agent);
+    if (row) select(row);
+    openDetail({ kind: 'agent', agentId: b.dataset.agent });
+    return;
+  }
   if (b.dataset.gitAct === 'commit') { select(b.dataset.id, { focus: false }); openDetail({ kind: 'commit', id: b.dataset.id }); return; }
   if (b.dataset.act) {
     // Merge, Throw it away and a card's answers: bound like the lid's, and handed to the lid's own handler, which checks
@@ -635,29 +852,105 @@ function onDetailClick(e) {
   }
 }
 
+/** The detail's buttons ignore clicks for `ms` (and show it), as the lid's answers do after a swap. */
+function arm(ms) {
+  st.armedUntil = Math.max(st.armedUntil, performance.now() + ms);
+  if (!el) return;
+  el.detail.classList.add('arming');
+  clearTimeout(st.armTimer);
+  st.armTimer = setTimeout(() => el.detail.classList.remove('arming'), Math.max(0, st.armedUntil - performance.now()));
+}
+
+/**
+ * The detail's action block is not the one drawn before: another agent, a card came or went, other buttons, or the agent
+ * moved on (its state or where its work went). As the lid does when what it shows changes: its buttons wait a moment
+ * before they take a click, words typed or spoken before the change are bound to nothing, and a card that comes is said.
+ */
+function actsChanged(acts) {
+  const before = st.acts;
+  if (acts === before) return false;
+  st.acts = acts;
+  if (st.bound) st.bound = {};
+  if (!acts) return true;
+  arm(calm() ? ARM_CALM_MS : ARM_MS);
+  const c = st.detail && st.detail.kind === 'agent' ? cardIn(st.detail.agentId) : null;
+  if (c && !before.endsWith('|card:' + c.id)) {
+    const sentence = visibleControls(c.sentence || ''), detail = c.detail ? visibleControls(c.detail) : '';
+    announce(`${CARD_WORDS[c.kind] || 'Before it goes ahead'}: ${sentence} ${detail}`.trim());
+  }
+  return true;
+}
+
 /** The panel at the right, over the text column: an agent's branch (its work, its actions, its diff) or a commit. */
 function paintDetail(z = sizes()) {
   const d = st.detail, geo = st.geo;
   // the rows' words under the panel are hidden while it is open (the rows keep their names for screen readers)
   el.graph.classList.toggle('covered', !!(d && geo));
-  if (!d || !geo) { if (!el.detail.hidden) { el.detail.hidden = true; el.detail.innerHTML = ''; st.keys.detail = ''; } return; }
+  if (!d || !geo) {
+    if (!el.detail.hidden) { el.detail.hidden = true; el.detail.innerHTML = ''; st.keys.detail = ''; }
+    st.detailWhen = '';
+    actsChanged('');
+    return;
+  }
   // over the whole text column (the graph stays in sight), and clear of the mounting hole in the bottom right corner
   const left = geo.left + Math.max(120, (geo.textX || geo.graphW) - 8);
   const bottom = z.bd.b - 46;
   Object.assign(el.detail.style, { left: r1(left) + 'px', top: geo.top + 'px', width: r1(geo.right - left) + 'px', height: Math.max(120, bottom - geo.top) + 'px' });
-  const html = d.kind === 'agent' ? agentDetail(d.agentId, z) : commitDetail(d.id);
+  const { html, acts } = d.kind === 'agent' ? agentDetail(d.agentId, z) : { html: commitDetail(d.id), acts: '' };
+  st.detailWhen = detailWhen(Date.now());
   el.detail.hidden = false;
-  if (st.keys.detail === html) return;
-  st.keys.detail = html;
-  // the same detail, updated, keeps its place in the diff and the keyboard; another one starts at its top
-  const target = d.kind + ':' + (d.agentId || d.id), same = st.keys.target === target;
-  st.keys.target = target;
-  const focusKey = el.detail.contains(document.activeElement) ? document.activeElement.dataset.key : null;
-  const scroll = same ? el.detail.querySelector('.gdiff')?.scrollTop || 0 : 0;
-  patchChildren(el.detail, html);
-  const box = el.detail.querySelector('.gdiff');
-  if (box) box.scrollTop = scroll;
-  if (focusKey && same) el.detail.querySelector(`[data-key="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
+  if (st.keys.detail !== html) {
+    st.keys.detail = html;
+    // the same detail, updated, keeps its place in the diff and the keyboard; another one starts at its top
+    const target = d.kind + ':' + (d.agentId || d.id), same = st.keys.target === target;
+    st.keys.target = target;
+    const had = el.detail.contains(document.activeElement) ? document.activeElement : null;
+    const focusKey = had ? had.dataset.key : null;
+    // Focus on the actions, or on the heading (where a button waiting for its answer hands it), follows them when they
+    // change: to the card's sentence when a card comes in their place, else to the heading. Never to an answer.
+    const follow = !!had && same && acts !== st.acts && (!!had.closest('.dacts, .dcard') || had.id === 'gitDetailTitle');
+    const scroll = same ? el.detail.querySelector('.gdiff')?.scrollTop || 0 : 0;
+    patchChildren(el.detail, html);
+    const box = el.detail.querySelector('.gdiff');
+    if (box) box.scrollTop = scroll;
+    if (follow) focusOn(el.detail.querySelector('#gitCard') || el.detail.querySelector('h2'));
+    else if (had && !el.detail.contains(document.activeElement)) {
+      // focus is never dropped: the same control again (a button that is not waiting), else the detail's heading
+      focusOn((focusKey && same && el.detail.querySelector(`[data-key="${CSS.escape(focusKey)}"]:not(:disabled)`)) || el.detail.querySelector('h2'));
+    }
+  }
+  actsChanged(acts);
+}
+
+/** The words of the detail's times now ("4 min ago"): the tick repaints the detail only when they change. */
+function detailWhen(now) {
+  const d = st.detail;
+  if (!d) return '';
+  if (d.kind === 'agent') { const a = agentOf(d.agentId), m = a && a.work && a.work.merged; return m ? agoText(now - (m.at || now)) : ''; }
+  const c = st.data && st.data.commits.find(x => x.id === d.id);
+  return c && c.at != null ? agoText(now - (c.at < 1e12 ? c.at * 1000 : c.at)) : '';
+}
+
+/**
+ * Every second while the screen shows (app.js's tick): the rows' "who · when · short id" and the detail's times move on
+ * with the clock. Text changes only when its words do (at most once a minute each), so nothing repaints at rest.
+ */
+export function gitTick() {
+  if (!ctx || !st.shown || st.moving || !st.data) return;
+  const now = Date.now(), t = st.times;
+  if (t && t.rows) for (const x of t.rows) {
+    const when = agoText(now - x.at);
+    if (when === x.when) continue;
+    x.when = when;
+    const row = el.graph.querySelector(`.gr[data-id="${CSS.escape(x.id)}"]`);
+    if (!row) continue;
+    const w = rowWords(x.item, { agentById: t.agentById, now, branch: t.branch });
+    const l2 = row.querySelector('.l2');
+    if (l2) setText(l2, clipTo(w.line2, t.n2));
+    row.title = [w.line1, w.line2].join('\n');
+    row.setAttribute('aria-label', w.aria);
+  }
+  if (st.detail && detailWhen(now) !== st.detailWhen) paintDetail();
 }
 
 const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
@@ -668,10 +961,14 @@ const GIT_WORDS = {
 };
 const btnAttrs = o => Object.entries(o).filter(([, v]) => v != null && v !== false).map(([k, v]) => ` data-${k}="${esc(v)}"`).join('');
 
+/**
+ * An agent's detail: its work, its actions (or the engine's card in their place) and its diff.
+ * @returns {{ html: string, acts: string }} acts: what its action block is, as actsChanged() compares it
+ */
 function agentDetail(agentId, z) {
   const a = agentOf(agentId);
   const close = '<button type="button" class="gx" data-git-act="close" data-key="close" aria-label="Close the detail">×</button>';
-  if (!a) return `<header class="dhd"><h2 id="gitDetailTitle" tabindex="-1" data-key="title">That agent is no longer here.</h2>${close}</header>`;
+  if (!a) return { html: `<header class="dhd"><h2 id="gitDetailTitle" tabindex="-1" data-key="title">That agent is no longer here.</h2>${close}</header>`, acts: `${agentId}|gone` };
   const mark = markOfAgent(a, STATES.LOOK), name = visibleText(a.name || 'Agent');
   const w = a.work || {};
   const repo = st.data ? st.data.repo : (S.meta && S.meta.repo) || {};
@@ -703,12 +1000,16 @@ function agentDetail(agentId, z) {
     h += `<div class="dprob"><svg class="g" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-stuck"/></svg><p>${esc(visibleText(w.problem.sentence))}${paths ? `<br><span class="paths">${paths}</span>` : ''}</p></div>`;
   }
   // the engine's card in place of the actions, or the actions that apply
-  const c = S.confirm;
-  if (c && c.agentId === agentId && (c.kind === 'merge' || c.kind === 'discard')) {
-    const yes = c.yes || 'Do it', no = c.no || 'Cancel';
-    h += `<div class="dcard" role="group" aria-labelledby="gitCard"><p class="dq" id="gitCard">${esc(c.sentence || '')}</p>${c.detail ? `<p class="dcd">${esc(c.detail)}</p>` : ''}`
+  const c = cardIn(agentId);
+  let block;
+  if (c) {
+    // the engine's words name branches, checks and tasks: hidden and direction-changing characters show, as in the lid.
+    // Its sentence takes the keyboard when it comes (tabindex -1), never an answer.
+    const yes = visibleControls(c.yes || 'Do it'), no = visibleControls(c.no || 'Cancel');
+    h += `<div class="dcard" role="group" aria-labelledby="gitCard"><p class="dq" id="gitCard" tabindex="-1" data-key="card:${esc(c.id)}">${esc(visibleControls(c.sentence || ''))}</p>${c.detail ? `<p class="dcd">${esc(visibleControls(c.detail))}</p>` : ''}`
       + `<div class="dacts"><button type="button" class="gbig${c.danger ? '' : ' pri'}" data-act="confirm" data-confirm="${esc(c.id)}" data-go="1" data-key="cyes:${esc(c.id)}">${esc(yes)}</button>`
       + `<button type="button" class="gbig" data-act="confirm" data-confirm="${esc(c.id)}" data-go="0" data-key="cno:${esc(c.id)}">${esc(no)}</button></div></div>`;
+    block = 'card:' + c.id;
   } else {
     const live = !!(S.meta && S.meta.mode === 'live');
     const fallback = workActions(a, { mode: S.meta && S.meta.mode, repo: S.meta && S.meta.repo ? { ...S.meta.repo, identity: S.meta.repo.identity ?? repo.identity } : repo, ACTIVE: STATES.ACTIVE });
@@ -719,6 +1020,7 @@ function agentDetail(agentId, z) {
     if (canMerge && into) acts += `<button type="button" class="gbig pri" title="Merge into ${esc(visibleText(into))}"${btnAttrs({ act: 'merge', ...bind, into, key: 'merge' })}>${esc(mergeLabel(into))}</button>`;
     if (canDiscard) acts += `<button type="button" class="gbig"${btnAttrs({ act: 'discard', ...bind, key: 'discard' })}>Throw it away</button>`;
     if (acts) h += `<div class="dacts">${acts}</div>`;
+    block = 'acts:' + [canMerge && into ? 'merge:' + into : '', canDiscard ? 'discard' : ''].filter(Boolean).join(',');
     // no Merge for a reason about git (not on a branch, no name and email): the engine's words, as the lid says them
     const why = typeof model.gitReason === 'function' ? model.gitReason(a)
       : live && fallback.discard && !STATES.ACTIVE.has(a.state) && (a.files ? a.files.changed > 0 : ['stopped', 'failed'].includes(a.state) || a.earlier)
@@ -730,14 +1032,15 @@ function agentDetail(agentId, z) {
   let body;
   if (!ch || (ch.loading && !ch.data)) body = '<p class="dq">Reading its changes…</p>';
   else if (ch.error) body = `<p class="dq">${esc(ch.error)}</p>`;
-  else if (ch.data && ch.data.ok === false) body = `<p class="dq">${esc(ch.data.reply || 'Workbench could not read its changes.')}</p>`;
+  else if (ch.data && ch.data.ok === false) body = `<p class="dq">${esc(visibleControls(ch.data.reply || 'Workbench could not read its changes.'))}</p>`;
   else {
     // made once per answer: a long diff is not rebuilt on every render
     if (ch.htmlOf !== ch.data) { ch.html = diffHtml(diff || { files: [] }, { maxLines: 4000 }); ch.htmlOf = ch.data; }
     body = ch.html;
   }
   h += `<div class="gdiff" data-scroll="1" tabindex="0" aria-label="${esc(name)}’s changes, in full">${body}</div>`;
-  return h;
+  // the action block's identity: the agent, where it is (its state and its work), and the card or the buttons shown
+  return { html: h, acts: `${agentId}|${a.state}|${workSig(a)}|${block}` };
 }
 
 function commitDetail(id) {

@@ -13,7 +13,8 @@
 //                                  steps: true to make working agents take steps; merge: what the next merge does,
 //                                  "ok" | "conflict" | "blocked" | "moved" | "identity" | "detached" | "busy" |
 //                                  "ancestry" | "git" | "changed" | "nothing" | "git-old" | "gone" | "refuse"
-//                                  (see the D2 block in startMock)
+//                                  (see the D2 block in startMock); delay: { command, merge, discard, confirm: ms },
+//                                  how long those replies take (the engine does git work before it answers)
 //   GET  /ctl/log                  every request the page sent to /api, with its body
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 //   GET  /ctl/reads                the git screen's reads: every GET of /api/git and /api/agents/:id/changes (D1)
@@ -260,10 +261,12 @@ export function scenario(name, now = Date.now()) {
 //   git-many      48 commits and 6 agent branches, a very long branch name, a subject with a right-to-left override
 //   git-empty     a repository with only its first commit, and no agents
 //   git-detached  your folder is not on a branch
+//   git-bring     an agent on the left lane that brought your branch in (a merge of HEAD into its branch), beside one
+//                 working on the right: its line runs down the gutter beside HEAD
 // Every other scenario gets a history made from its own agents, so the DRAM opens a git screen on any board.
 // "Invoice export", in any scenario, answers /changes with the stress diff: CRLF, tabs, a 400-character line, a binary,
 // a large and a deleted file, files left out, a link, a right-to-left override and zero-width characters, a long path.
-const GIT_SCENARIOS = ['git', 'git-many', 'git-empty', 'git-detached'];
+const GIT_SCENARIOS = ['git', 'git-many', 'git-empty', 'git-detached', 'git-bring'];
 SCENARIOS.push(...GIT_SCENARIOS);
 const GIT_READS = [];        // every GET the page made of /api/git and /api/agents/:id/changes (GET /ctl/reads)
 const RLO = String.fromCodePoint(0x202e), ZWSP = String.fromCodePoint(0x200b);
@@ -324,7 +327,7 @@ function gitHistory({ seed, trunk, branches, branch = 'main', now, author = 'Sam
 function gitWorld(name, now) {
   const raw = [];
   let repo = { name: 'invoices-api', root: '/Users/someone/code/invoices-api', head: '', branch: 'main', dirty: 2, identity: true };
-  let commits = [];
+  let commits = [], headId = null;   // HEAD is the newest commit, unless a world says otherwise
   const add = o => { raw.push(o); return o; };
   if (name === 'git-empty') {
     commits = [{ id: gitId('empty:0'), parents: [], subject: 'Initial commit', author: 'Sam Lee', at: now - 5 * MIN, refs: ['main'], agentId: null, kind: 'commit' }];
@@ -350,6 +353,23 @@ function gitWorld(name, now) {
     ] });
     price.work.merged = { into: 'main', merge: commits.find(c => c.kind === 'merge').id, at: now - 6 * MIN, files: 1, adds: 9, dels: 3 };
     if (name === 'git-detached') { repo = { ...repo, branch: null, dirty: 0 }; for (const c of commits) c.refs = c.refs.filter(r => r !== 'main'); }
+  } else if (name === 'git-bring') {
+    // Search cleanup started from an older commit of yours, then brought your branch in (as "Ask it to bring in main"
+    // asks): its merge commit, newest of all, has your HEAD as its second parent. Help pages works from the commit under
+    // HEAD, on the right, so Search cleanup's longer line takes the left lane.
+    const search = add({ id: 'gb1', name: 'Search cleanup', state: 'done_checked', endedMin: 1, says: 'The old search code is gone, and main is merged in.',
+      files: filesOf([{ path: 'src/search/index.ts', adds: 4, dels: 22 }, { path: 'src/search/redirects.ts', adds: 10, dels: 8 }]), checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 9100 }] } });
+    const help = add({ id: 'gb2', name: 'Help pages', harness: 'codex', model: 'gpt-5-codex', state: 'working', now: 'Editing billing.md', ageMin: 40 });
+    for (const a of [search, help]) a.work = workOf(a);
+    const ids = YOUR_SUBJECTS.slice(0, 9).map((_, i) => gitId(`bring:t${i}`));
+    const at = i => now - (i * 170 + 3) * MIN;
+    const trunk = YOUR_SUBJECTS.slice(0, 9).map((subject, i) => ({ id: ids[i], parents: i < ids.length - 1 ? [ids[i + 1]] : [], subject, author: 'Sam Lee', at: at(i), refs: [], agentId: null, kind: 'commit' }));
+    trunk[0].refs.push('main');
+    trunk[1].refs.push(help.work.branch);
+    const own = { id: gitId('bring:own'), parents: [ids[2]], subject: 'Remove the old search code', author: search.name, at: at(2) + 7 * MIN, refs: [], agentId: null, kind: 'commit' };
+    const brought = { id: gitId('bring:in'), parents: [own.id, ids[0]], subject: 'Merge main into its branch', author: search.name, at: now - 2 * MIN, refs: [search.work.branch], agentId: null, kind: 'merge' };
+    commits = [brought, trunk[0], trunk[1], own, ...trunk.slice(2)];
+    headId = ids[0];
   } else {
     // git-many: a long history, six lines of work, a long branch name and a subject that tries to read backwards
     const names = ['Invoice export', 'Help pages', 'Search cleanup', 'Price rounding', 'Onboarding emails for the new pricing plans and trial periods', 'Release notes'];
@@ -369,13 +389,14 @@ function gitWorld(name, now) {
     ] });
     agents[3].work.merged = { into: 'main', merge: commits.find(c => c.kind === 'merge').id, at: now - 20 * MIN, files: 2, adds: 12, dels: 4 };
   }
-  repo.head = commits[0].id.slice(0, 7);
+  const head = headId || commits[0].id;
+  repo.head = head.slice(0, 7);
   const st = world(raw, now);
   st.mode = 'live';
   st.repo = repo;
   const n = st.agents.filter(a => !a.parentId && !a.earlier && ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(a.state)).length;
   st.machines = [{ ...LAPTOP, agents: n, note: n ? `${n} agent${n === 1 ? '' : 's'}` : 'idle' }];
-  st.git = { commits, head: commits[0].id };
+  st.git = { commits, head };
   return st;
 }
 
@@ -533,7 +554,7 @@ function mergeWorld(name, now) {
 export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) {
   const clients = new Set();
   const posted = [];
-  const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok' };
+  const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null };
   let name = 'demo';
   let state = scenario(name);
   let confirmSeq = 0;
@@ -736,6 +757,10 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       }
       if (mode.answer === 'drop') { req.socket.destroy(); return; }
       if (mode.answer === '500') { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"error":"Something went wrong."}'); return; }
+      // the engine does git work before it answers a merge or a throw-away: mode.delay makes those replies (and typed
+      // words, and a card's answers) take as long as it says
+      const slow = req.method === 'POST' && mode.delay && mode.delay[p === '/api/command' ? 'command' : p.startsWith('/api/confirm/') ? 'confirm' : (/\/(merge|discard)$/.exec(p) || [])[1]];
+      if (slow > 0) await new Promise(r => setTimeout(r, slow));
       res.setHeader('content-type', 'application/json');
       const reply = r => res.end(JSON.stringify(r));
       // D1: the git screen's two reads. Refusals are 200 { ok: false, reply }, as the engine's are.
@@ -822,12 +847,16 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         }
         if (/^(merge|land)\b|^bring its changes in\b/i.test(text) || /^(throw (it|its work|its changes) away|throw away|discard|scrap)\b/i.test(text)) {
           const merge = /^(merge|land|bring)/i.test(text);
-          const a = rootOf(state.agents.find(x => x.id === json?.focusId));
+          // the agent the words name ("merge search cleanup"), else the one on screen ("merge it"), as the parser does
+          const named = text.replace(/^(merge|land|bring its changes in|throw (it|its work|its changes) away|throw away|discard|scrap)\b\s*/i, '').replace(/\s+into\s+\S+$/i, '').trim().toLowerCase();
+          const byName = named && !/^(it|its work|its changes|that|this)$/.test(named) ? state.agents.find(x => !x.parentId && x.name.toLowerCase() === named) : null;
+          const a = byName || rootOf(state.agents.find(x => x.id === json?.focusId));
           if (!a) return reply({ reply: `I couldn’t tell which agent to ${merge ? 'merge' : 'throw away'}.` });
           const no = merge ? mergeRefusal(a) : discardRefusal(a);
           if (no) return reply({ reply: no, focusId: a.id });
           const card = merge ? mergeCard(a) : discardCard(a);
-          return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }), focusId: a.id });
+          // the engine's reply to a typed merge or throw-away is the card alone: no focusId, and the card names no agent
+          return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }) });
         }
         if (/^forget\b/i.test(text)) {
           const a = state.agents.find(x => x.id === json?.focusId && x.earlier);

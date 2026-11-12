@@ -20,7 +20,7 @@ import { buttonRow } from './words.js';
 import { visibleControls } from './words.js'; // say(): what is said shows hidden characters as the lid does
 import { spentAmountWords } from './numbers.js';
 // D1: the git screen below the board, reached by the DRAM (gitscreen.js draws it; this file switches screens)
-import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitFocusId } from './gitscreen.js';
+import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitTick, gitHold, gitTake, gitRelease, gitListening, gitHome } from './gitscreen.js';
 import { gitScreenWords } from './gitgraph.js';
 import { visibleText } from './diffview.js';
 import { clipToLines } from './layout.js';
@@ -450,10 +450,11 @@ const lookAt = id => { if (typeof id === 'string' && ID_RE.test(id)) { S.focusId
 const lookArrived = () => { if (lookPending && S.focusId === lookPending && S.agents.has(lookPending)) { lookPending = null; moved(); } };
 
 // A button about to wait for its answer is disabled, and a disabled button drops the keyboard focus: hand it to the
-// lid's sentence first, so the person keeps their place.
+// lid's sentence first (on the git screen, the detail's: its card's sentence or its heading), so the person keeps their
+// place.
 const gaveFocus = new WeakSet();
 function busy(b) {
-  if (document.activeElement === b) { gaveFocus.add(b); b.closest('.page')?.querySelector('h1')?.focus({ preventScroll: true }); }
+  if (document.activeElement === b) { gaveFocus.add(b); (b.closest('.page')?.querySelector('h1') || gitHome(b))?.focus({ preventScroll: true }); }
   b.disabled = true;
 }
 /** A failed answer: its button can be tried again, and gets the keyboard back if it had it. */
@@ -553,6 +554,15 @@ async function actOn(b) {
       // Merge (also "Merge anyway" and "Try again") and Throw it away never act by themselves: the engine answers with a
       // card in its own words, bound by id, and the person answers that. Its outcome then shows on this agent.
       busy(b);
+      // A card already on screen (a launch question in the lid while the git screen's detail is used, another agent's
+      // card) is withdrawn first, as picking a chip does, so none waits unseen. If that does not go through, it stays,
+      // nothing is asked, and this button can be tried again.
+      const old = S.confirm;
+      if (old) {
+        const w = await api.confirm(old.id, false);
+        if (S.confirm === old) S.confirm = null;
+        say(w.reply || '');
+      }
       const r = await (act === 'merge' ? api.merge(a.id, { state: b.dataset.state }) : api.discard(a.id, { state: b.dataset.state }));
       S.focusId = a.id;
       if (r.confirm) S.confirm = { ...r.confirm, agentId: a.id }; else say(r.reply || '');
@@ -702,9 +712,29 @@ async function submit(text) {
 }
 el.bar.addEventListener('submit', e => { e.preventDefault(); submit(el.say.value); });
 
+// Voice is bound to what the screen the microphone turned on over showed (the lid, or the git screen's detail), and what
+// it heard goes to that screen's words: a session begun on the git screen never takes the core's binding, and one that
+// heard nothing leaves no binding behind.
+let voiceOver = null;   // 'board' | 'git' while listening, and until what was heard is sent
 const voice = setupVoice({
-  mic: el.mic, heard: el.heard, onFinal: t => (gitShown() ? gitCommand(t, gitFocusId()) : submit(t)), onNotice: t => say(t),
-  onListening: on => { el.bar.classList.toggle('listening', on); if (on) { touch(); if (!bound) bound = bindingNow(); } else render(); },
+  mic: el.mic, heard: [el.heard, $('gitHeard')],
+  onFinal: t => { const over = voiceOver; voiceOver = null; if (over === 'git') gitCommand(t, gitTake()); else submit(t); },
+  onNotice: t => say(t),
+  onListening: (on, words) => {
+    el.bar.classList.toggle('listening', on);
+    gitListening(on);
+    if (on) {
+      touch();
+      voiceOver = gitShown() ? 'git' : 'board';
+      if (voiceOver === 'git') gitHold(); else if (!bound) bound = bindingNow();
+      return;
+    }
+    if (!words) {
+      if (voiceOver === 'git') gitRelease(); else if (!el.say.value) bound = null;
+      voiceOver = null;
+    }
+    render();
+  },
 });
 
 // A launch question the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot start it.
@@ -989,6 +1019,7 @@ setInterval(() => {
   const cur = el.pages.querySelector('.page:not(.old)');
   if (cur) tickSince(cur);
   if (!el.card.hidden) renderCard(true);
+  gitTick();   // the git screen's times, a word at a time
   // a held core lets go by itself once the person has been still for 20 s
   if (S.loaded && lidKey && !lidKey.startsWith('link:') && keyOf(currentFocus()) !== lidKey && !engaged()) renderSoon();
 }, 1000);
@@ -1012,11 +1043,13 @@ const gitAct = b => actOn(b);
 
 /**
  * Words typed or spoken on the git screen. The page's own words first ("back", "board", the looks, the detail); the rest
- * goes to POST /api/command as the core's input sends it, with focusId the agent whose detail is open. A card the reply
- * brings shows in that agent's detail when it names that agent; any other card is shown where it can be answered: in
- * the lid, back on the board.
+ * goes to POST /api/command as the core's input sends it, with what the screen showed when the person began (`b`, from
+ * gitscreen.js): the card in the detail by its id, or the agent whose detail is open, or nothing. A card the reply brings
+ * shows in that agent's detail only when the card itself names that agent (its agentId); any other card is shown where it
+ * can be answered: in the lid, back on the board. A card that was on screen and that the words were not sent to is
+ * still waiting in the engine: it is withdrawn, so none waits unseen.
  */
-async function gitCommand(text, focusId) {
+async function gitCommand(text, b = {}) {
   text = String(text || '').trim();
   if (!text) return;
   touch();
@@ -1027,16 +1060,19 @@ async function gitCommand(text, focusId) {
   if (pc && (pc.kind === 'theme' || pc.kind === 'detail')) { applyPref(pc.kind, pc[pc.kind]); return; }
   if (pc && pc.kind === 'next') { say('“Next” steps through what needs you, on the board. Say “back” to go there.', 6000); return; }
   if (cannotSend(linkNow())) { say('Workbench is not answering, so that was not sent.'); return; }
-  const focused = focusId ? S.agents.get(focusId) : null;
-  const shown = S.confirm && focusId && S.confirm.agentId === focusId ? S.confirm : null;
+  // as submit() does: a card is answered only by the id it had when the person began
+  const shown = S.confirm && b.confirmId && b.confirmId === S.confirm.id ? S.confirm : null;
+  const focusId = shown ? null : (b.agentId || null);
   try {
-    const res = await api.command(text, { focusId: shown ? null : focusId || null, confirmId: shown ? shown.id : null, askId: null });
+    const res = await api.command(text, { focusId, confirmId: shown ? shown.id : (b.confirmId || null), askId: null });
     // the card shown, back again: the words were not understood (or are not enough for it), so it stays where it is
     const same = !!(res.confirm && shown && res.confirm.id === shown.id);
     if (res.confirm) {
-      const about = same || (focused && (res.confirm.kind === 'merge' || res.confirm.kind === 'discard') && String(res.confirm.sentence || '').includes(focused.name));
-      S.confirm = about ? { ...res.confirm, agentId: focusId } : res.confirm;
-      if (!about) closeGit({ toLid: true });
+      const old = S.confirm;
+      if (!same && old && old !== shown && old.id !== res.confirm.id) api.confirm(old.id, false).catch(() => {});
+      const mine = same || (!!focusId && res.confirm.agentId === focusId && (res.confirm.kind === 'merge' || res.confirm.kind === 'discard'));
+      S.confirm = same ? { ...res.confirm, agentId: shown.agentId } : mine ? { ...res.confirm, agentId: focusId } : res.confirm;
+      if (!mine) closeGit({ toLid: true });
     } else if (shown && S.confirm === shown) S.confirm = null;
     lookAt(res.focusId);
     // as the core's input does: a new card says itself; anything else is said
@@ -1049,7 +1085,10 @@ async function gitCommand(text, focusId) {
 
 setupGitScreen({
   boardScreen: el.boardScreen, board, getG: () => G, measure, still: () => debug.still, reduced,
-  say: t => say(t), act: b => gitAct(b), moved, render: () => renderNow(), command: (t, id) => gitCommand(t, id),
+  say: t => say(t), act: b => gitAct(b), moved, render: () => renderNow(), command: (t, b) => gitCommand(t, b),
+  listening: () => voice.listening,
+  // "<Name> needs you" on the git screen: that agent in the lid, as picking its chip does (a card on screen is withdrawn)
+  pick: id => { if (S.confirm) dropConfirm(); S.focusId = id; moved(); },
   // going down: the board's menus and card close (they belong to the board); either way the board renders afresh
   onShow: shown => { if (shown) { closePop(); closeTray(); closeLook(false); S.pinId = null; S.hoverId = null; board.hideCard(); } renderSoon(); },
 });
