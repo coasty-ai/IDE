@@ -612,7 +612,15 @@ function plantHooks(gitDir, log) {
     fs.chmodSync(f, 0o755);
   }
 }
-const ranHooks = log => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []);
+/**
+ * The same hooks set in git config instead (git 2.54 and newer run these), one per event, under names holding a dot and
+ * an "=", written into `configFile`. They note `<prefix>-<event>`.
+ */
+function plantConfigHooks(configFile, log, prefix = 'config') {
+  fs.appendFileSync(configFile, HOOKS.map(h => `[hook "${prefix}.${h}=x"]\n\tcommand = echo ${prefix}-${h} >> '${log}'${h === 'pre-commit' ? '; exit 1' : ''}\n\tevent = ${h}\n`).join(''));
+}
+/** The hooks that noted themselves in `log`, in order (without the arguments git gives a hook set in config). */
+const ranHooks = log => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map(l => l.split(' ')[0]) : []);
 
 test('snapshotWork reads the work set in a temporary index and never writes the agent’s own; workDiff shows the same files', async () => {
   const t = await agentRepo({ ...STARTING_FILES, 'src/x.js': 'x\n' });
@@ -1162,16 +1170,32 @@ test('the repository’s hooks never run: not for the snapshot, the diff, the me
   write(path.join(other.path, 'x.txt'), 'x\n');
   const log = path.join(T, `hooks-${t.id}.log`);
   plantHooks(path.join(t.root, '.git'), log);
+  plantConfigHooks(path.join(t.root, '.git', 'config'), log);
+  // And in the agent's own config, where this git reads one (config.worktree).
+  git(t.root, 'config', 'extensions.worktreeConfig', 'true');
+  plantConfigHooks(path.resolve(t.ws.path, git(t.ws.path, 'rev-parse', '--git-path', 'config.worktree')), log, 'agent');
+  const agentHooksSeen = gitTry(t.ws.path, 'config', '--get', 'hook.agent.post-merge=x.event').out.trim() === 'post-merge';
 
   // The danger is real: plain git runs them.
   const demo = cloneOf(t.root);
   plantHooks(path.join(demo, '.git'), log);
+  plantConfigHooks(path.join(demo, '.git', 'config'), log);
   assert.equal(gitTry(demo, 'merge', '--ff-only', '-q', `origin/${t.ws.branch}`).code, 0);
   assert.ok(ranHooks(log).includes('post-merge'));
   assert.ok(ranHooks(log).includes('reference-transaction'));
   assert.notEqual(gitTry(demo, 'commit', '-q', '--allow-empty', '-m', 'x').code, 0, 'pre-commit said no');
   assert.ok(ranHooks(log).includes('pre-commit'));
+  const configHooksRun = ranHooks(log).includes('config-post-merge'); // git 2.54 and newer
   fs.rmSync(log);
+  if (configHooksRun) {
+    // ...and an empty core.hooksPath, which stops the hooks in the hooks folder, does not stop those set in config.
+    const demo2 = cloneOf(t.root);
+    plantConfigHooks(path.join(demo2, '.git', 'config'), log);
+    const empty = fs.mkdtempSync(path.join(T, 'empty-hooks-'));
+    assert.equal(gitTry(demo2, '-c', `core.hooksPath=${empty}`, 'merge', '--ff-only', '-q', `origin/${t.ws.branch}`).code, 0);
+    assert.ok(ranHooks(log).includes('config-post-merge'));
+    fs.rmSync(log);
+  }
 
   const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
   await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
@@ -1183,6 +1207,13 @@ test('the repository’s hooks never run: not for the snapshot, the diff, the me
   assert.equal((await discardWork({ repoRoot: t.root, path: other.path, branch: other.branch, since: other.base, expect: { workId: s2.workId }, agentId: 'hk0002' })).ok, true);
   assert.equal((await gitGraph({ repoRoot: t.root })).ok, true);
   assert.deepEqual(ranHooks(log), [], 'no hook ran');
+  // The agent's own hooks would have run in its folder (the snapshot and the reset after its work commit write an
+  // index there), had they not been off: plain git runs them.
+  if (configHooksRun && agentHooksSeen) {
+    write(t.w('later.txt'), 'later\n');
+    git(t.ws.path, 'add', '-A');
+    assert.ok(ranHooks(log).includes('agent-post-index-change'));
+  }
 });
 
 test('mergeWork waits a little for another git command in the person’s folder, then says so', async () => {

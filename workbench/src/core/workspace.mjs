@@ -575,10 +575,49 @@ function readable(e, fallback) {
   return gitTrouble(e) || plainError(fallback, e);
 }
 
-/** `fn(run)`, where `run` is git() with core.hooksPath set to a new empty folder, removed afterwards. */
+/**
+ * The names of the hooks set in git config as seen from `cwd` (`hook.<name>.command` and `hook.<name>.event`, git 2.54
+ * and newer). core.hooksPath does not reach these; `hook.<name>.enabled=false` does. Reading them runs nothing.
+ */
+async function configHooks(cwd) {
+  const r = await git(['config', '--name-only', '-z', '--get-regexp', '^hook\\.'], { cwd, okCodes: [1] });
+  const names = new Set();
+  for (const key of nulList(r.stdout)) {
+    const m = /^hook\.([\s\S]+)\.[A-Za-z0-9-]+$/.exec(key); // hook.<name>.<setting>, where the name may hold dots
+    if (m) names.add(m[1]);
+  }
+  return names;
+}
+
+/**
+ * Settings for git in its environment (GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>), after any that
+ * Workbench's own environment already gives. Unlike `-c name=value`, a name holding "=" stays whole.
+ */
+function configEnv(pairs) {
+  if (!pairs.length) return {};
+  const had = /^\d+$/.test(process.env.GIT_CONFIG_COUNT || '') ? Number(process.env.GIT_CONFIG_COUNT) : 0;
+  const env = { GIT_CONFIG_COUNT: String(had + pairs.length) };
+  pairs.forEach(([key, value], i) => {
+    env[`GIT_CONFIG_KEY_${had + i}`] = key;
+    env[`GIT_CONFIG_VALUE_${had + i}`] = value;
+  });
+  return env;
+}
+
+/**
+ * `fn(run)`, where `run` is git() that runs no hook: core.hooksPath points at a new empty folder (removed afterwards),
+ * and the hooks set in git config are switched off for every folder handed to `run.shield(folder)` (the person's
+ * folder and the agent's, as soon as they are known; before that, only commands that run no hook are used).
+ */
 async function withoutHooks(fn) {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-nohooks-'));
-  const run = (args, o) => git(['-c', `core.hooksPath=${empty}`, ...args], o);
+  const names = new Set();
+  let off = {};
+  const run = (args, o = {}) => git(['-c', `core.hooksPath=${empty}`, ...args], { ...o, env: { ...off, ...o.env } });
+  run.shield = async cwd => {
+    for (const name of await configHooks(cwd)) names.add(name);
+    off = configEnv([...names].map(name => [`hook.${name}.enabled`, 'false']));
+  };
   try {
     return await fn(run);
   } finally {
@@ -628,19 +667,16 @@ function atLeast(v, min) {
 
 /** Whether a merge, rebase, cherry-pick, revert or bisect is under way in this folder (its own git folder). */
 async function underWay(cwd, run = git) {
-  const found = await Promise.all(UNDER_WAY.map(async name => {
-    const p = (await run(['rev-parse', '--git-path', name], { cwd })).stdout.replace(/\r?\n$/, '');
-    return !!p && fs.existsSync(path.resolve(cwd, p));
-  }));
-  return found.includes(true);
+  const out = (await run(['rev-parse', ...UNDER_WAY.flatMap(name => ['--git-path', name])], { cwd })).stdout.split('\n');
+  return UNDER_WAY.some((name, i) => !!out[i] && fs.existsSync(path.resolve(cwd, out[i])));
 }
 
-/** The real path of a checkout's top folder (the person's main folder), checked with git. */
+/** The real path of a checkout's top folder (the person's main folder), checked with git; its config hooks are shielded. */
 async function topFolder(run, repoRoot) {
   const root = realRoot(repoRoot);
   let top;
   try {
-    top = (await run(['rev-parse', '--show-toplevel'], { cwd: root })).stdout.trim();
+    [top] = await Promise.all([run(['rev-parse', '--show-toplevel'], { cwd: root }).then(r => r.stdout.trim()), run.shield(root)]);
   } catch (e) {
     throw gitTrouble(e) || plainError(`The folder ${root} is not a git repository.`, e);
   }
@@ -665,6 +701,7 @@ async function agentFolder(run, root, wsPath, branch) {
   if (branch != null && entry.branch !== branch) {
     throw new Refusal('changed', `Its folder is on the branch ${entry.branch} now, not on ${branch}.`);
   }
+  await run.shield(target); // its own config (config.worktree) may set hooks too
   return { path: target, branch: entry.branch, locked: entry.locked };
 }
 
@@ -992,7 +1029,7 @@ function inTheWay(stderr) {
       if (under && line.length > 1) paths.push(line.slice(1));
       continue;
     }
-    under = /(?:would be (?:overwritten|removed) by|would lose untracked files in them|are not up to date):$/.test(line);
+    under = /(?:would be (?:overwritten|removed) by [\w -]+|would lose untracked files in them|are not up to date):$/.test(line);
   }
   return [...new Set(paths)];
 }
