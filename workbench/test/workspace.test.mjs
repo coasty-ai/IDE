@@ -793,6 +793,36 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(by(one, 'many/f5.txt').patch.includes('+5\n'), true);
   });
 
+  test('a .gitattributes of the agent’s own cannot make a text change look binary in the review, hidden or only in its index', async () => {
+    const files = { ...STARTING_FILES, 'auth.js': 'function ok(u) { return check(u); }\n' };
+    const shown = async (t, left) => {
+      const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+      const d = await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+      const auth = d.files.find(f => f.path === 'auth.js');
+      assert.deepEqual(s.files.find(f => f.path === 'auth.js'), { path: 'auth.js', status: 'modified', adds: 1, dels: 1 });
+      assert.ok(auth.patch.endsWith('-function ok(u) { return check(u); }\n+function ok(u) { return true; }\n'), auth.patch);
+      assert.deepEqual(d.left, left);
+    };
+
+    // A .gitattributes that says JavaScript is not to be diffed, hidden by the agent's own .gitignore.
+    const t = await agentRepo(files);
+    write(t.w('.gitattributes'), '*.js -diff\n');
+    write(t.w('.gitignore'), `${STARTING_FILES['.gitignore']}.gitattributes\n`);
+    write(t.w('auth.js'), 'function ok(u) { return true; }\n');
+    // The danger is real: in the agent's folder git takes the change for a binary one, and shows nothing of it.
+    assert.equal(git(t.ws.path, 'diff', '--numstat', t.ws.base, '--', 'auth.js'), '-\t-\tauth.js');
+    await shown(t, [{ path: '.gitattributes', why: 'ignored' }]);
+
+    // The same, staged in the agent's own index and then deleted from its folder: git still reads it there.
+    const u = await agentRepo(files);
+    write(u.w('.gitattributes'), '*.js -diff\n');
+    git(u.ws.path, 'add', '.gitattributes');
+    fs.rmSync(u.w('.gitattributes'));
+    write(u.w('auth.js'), 'function ok(u) { return true; }\n');
+    assert.equal(git(u.ws.path, 'check-attr', 'diff', '--', 'auth.js'), 'auth.js: diff: unset');
+    await shown(u, []);
+  });
+
   test('mergeWork commits the work on the agent’s branch and joins it into the person’s branch with a merge commit', async () => {
     const t = await agentRepo();
     const { w, p } = t;

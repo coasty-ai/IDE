@@ -800,9 +800,12 @@ function copyIndex(from, to) {
 /**
  * The work in an agent's folder as a tree, read in a temporary index. The agent's own index is copied, never written:
  * that keeps what it staged (also a file it added with -f) and git's record of unchanged files (see copyIndex).
+ * `root`: the person's folder. The files are compared there, never in the agent's folder: git reads the attributes
+ * that decide what is binary from the working folder and the index of the folder it runs in, and the agent's are its own
+ * to write (a `*.js -diff` it hid with its .gitignore, or kept only in its index, would hide a change to code).
  * @returns {Promise<{ head, headTree, tree, since, sinceTree, workId, changed, files, left }>}
  */
-async function snap(run, folder, since) {
+async function snap(run, root, folder, since) {
   const cwd = folder.path;
   const from = String(since ?? '');
   if (!OID.test(from)) throw new Refusal('git', 'Workbench does not know which commit its work started from.');
@@ -850,7 +853,7 @@ async function snap(run, folder, since) {
   }
   left.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const files = tree === sinceTree ? [] : await changesBetween(run, cwd, sinceTree, tree);
+  const files = tree === sinceTree ? [] : await changesBetween(run, root, sinceTree, tree);
   return { head, headTree, tree, since: from, sinceTree, workId: `${head}:${tree}`, changed: tree !== sinceTree, files, left };
 }
 
@@ -929,7 +932,8 @@ function publicFile(f) {
 export async function snapshotWork({ repoRoot, path: wsPath, since } = {}) {
   try {
     return await withoutHooks(async run => {
-      const s = await snap(run, await agentFolder(run, await topFolder(run, repoRoot), wsPath), since);
+      const root = await topFolder(run, repoRoot);
+      const s = await snap(run, root, await agentFolder(run, root, wsPath), since);
       return { head: s.head, tree: s.tree, since: s.since, workId: s.workId, changed: s.changed, files: s.files.map(publicFile), left: s.left };
     });
   } catch (e) {
@@ -982,8 +986,9 @@ function cutAt(text, maxBytes) {
 export async function workDiff({ repoRoot, path: wsPath, since, maxFiles = 300, maxFileBytes = 200_000, maxTotalBytes = 2_000_000 } = {}) {
   try {
     return await withoutHooks(async run => {
-      const folder = await agentFolder(run, await topFolder(run, repoRoot), wsPath);
-      const s = await snap(run, folder, since);
+      const root = await topFolder(run, repoRoot);
+      const folder = await agentFolder(run, root, wsPath);
+      const s = await snap(run, root, folder, since);
       const limit = Math.max(0, Math.floor(Number(maxFiles)) || 0);
       const shown = s.files.slice(0, limit);
       const files = shown.map(f => ({ ...publicFile(f), patch: null }));
@@ -1002,7 +1007,7 @@ export async function workDiff({ repoRoot, path: wsPath, since, maxFiles = 300, 
           batch.push(want[i]);
           bytes += guess;
         }
-        const patches = await patchesOf(run, folder.path, s.sinceTree, s.tree, batch.map(k => shown[k].path));
+        const patches = await patchesOf(run, root, s.sinceTree, s.tree, batch.map(k => shown[k].path));
         for (const [n, k] of batch.entries()) {
           if (budget <= 0) break;
           reached.add(k);
@@ -1171,7 +1176,7 @@ async function merge(run, { repoRoot, path: wsPath, branch, since, expect, messa
   const [agentBusy, unmerged, snapped, startIn] = await Promise.all([
     underWay(folder.path, run),
     run(['ls-files', '-u', '-z'], { cwd: folder.path }).then(r => r.stdout !== ''),
-    settle(snap(run, folder, since)),
+    settle(snap(run, root, folder, since)),
     OID.test(start) ? isAncestor(root, start, intoHead, run).catch(() => false) : false,
   ]);
   if (agentBusy || unmerged) throw new Refusal('git', SAY.agentBusy); // `add -A` would take its conflict markers as work
@@ -1320,7 +1325,7 @@ async function discard(run, { repoRoot, path: wsPath, branch, since, expect, age
 
   if (entry && isFolder(target)) {
     const folder = await agentFolder(run, root, wsPath, b);
-    const s = await snap(run, folder, since);
+    const s = await snap(run, root, folder, since);
     if (s.workId !== exp.workId) throw new Refusal('changed', SAY.changed);
     const copy = s.tree === s.headTree ? s.head : await commitTree(run, root, s.tree, [s.head],
       `Thrown away: ${b}\n\nWorkbench-Agent: ${id}\nWorkbench-Kind: discarded\n`, (await identityAt(run, root)) || WORKBENCH_IDENTITY);
