@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync, accessSync, existsSync, readdirSync, constants } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -15,12 +16,15 @@ import * as workspace from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
 import { Engine } from '../src/core/engine.mjs';
 // Imported, the CLI only exports its parts: it starts only when run as a program.
-import { parseArgs, createLogger, displayUrl, cloneFirst, connectGithubMode, githubReposMode, readLine, pathWithLocalBin } from '../bin/workbench.mjs';
+import { parseArgs, createLogger, displayUrl, cloneFirst, connectGithubMode, githubReposMode, readLine, pathWithLocalBin, agentLines, wireConnect } from '../bin/workbench.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const BIN = fileURLToPath(new URL('../bin/workbench.mjs', import.meta.url));
 const ACCEPT = fileURLToPath(new URL('../scripts/accept-real.mjs', import.meta.url));
 const FAKE = fileURLToPath(new URL('./helpers/claude-fake.mjs', import.meta.url));
+const CODEX_FAKE = fileURLToPath(new URL('./helpers/codex-fake.mjs', import.meta.url));
+/** What Claude Code signed in with a Claude subscription says first (Agents & keys' own sentence). */
+const SUBSCRIPTION = 'is ready, signed in with your Claude subscription.';
 const INSIDE_AGENT = 'Workbench is running inside an agent. It will not start real agents from there.';
 /** Merge and throw-away are there: the git work (builder A) and the engine's cards (builder B). */
 const MERGE_READY = typeof workspace.mergeWork === 'function' && typeof workspace.discardWork === 'function'
@@ -165,11 +169,17 @@ async function goneSoon(pid, ms = 5000) {
   }, ms);
 }
 
-/** A VS Code extension folder whose claude program says it is `version`. */
+/** A VS Code extension folder whose claude program says it is `version`, signed in with a Claude subscription. */
 function extension(home, version) {
   const dir = path.join(home, '.vscode', 'extensions', `anthropic.claude-code-${version}-${process.platform}-${process.arch}`, 'resources', 'native-binary');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "${version} (Claude Code)"; exit 0; fi\nexit 3\n`, { mode: 0o755 });
+  writeFileSync(path.join(dir, 'claude'), [
+    '#!/bin/sh',
+    `if [ "$1" = "--version" ]; then echo "${version} (Claude Code)"; exit 0; fi`,
+    'if [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\'; exit 0; fi',
+    'exit 3',
+    '',
+  ].join('\n'), { mode: 0o755 });
   return path.join(dir, 'claude');
 }
 
@@ -294,28 +304,25 @@ test('the start says which Claude Code is ready and where it was found, with one
   extension(w.home, '2.1.322');
   const found = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
   assert.equal(found.code, 0, found.err);
-  assert.equal(found.lines[0], 'Claude Code 2.1.322 is ready (from the VS Code extension).');
-  assert.equal(found.lines[1], 'Codex is not available: Codex is not installed, or the codex command could not be found.');
+  assert.equal(found.lines[0], `Claude Code 2.1.322 ${SUBSCRIPTION} Found in the VS Code extension.`);
+  assert.equal(found.lines[1], `Codex is not at ${path.join(w.dir, 'no-codex-here')}, the path in WORKBENCH_CODEX_BIN.`);
   assert.ok(!/\.\.(\s|$)/m.test(found.out + found.err), 'no doubled full stop');
   assert.match(found.out, /Workbench is running at http:\/\/127\.0\.0\.1:\d+\/\?t=[0-9a-f]{64}/);
   // --claude, then WORKBENCH_CLAUDE_BIN, win over the extension, and say so.
   const flag = await start(t, ['--repo', w.repo, '--no-open', '--port', '0', '--claude', FAKE], { ...w.env, WORKBENCH_CLAUDE_BIN: path.join(w.dir, 'not-this-one'), FAKE_CLAUDE_VERSION: '2.1.400' });
   assert.equal(flag.code, 0, flag.err);
-  assert.equal(flag.lines[0], 'Claude Code 2.1.400 is ready (from --claude).');
+  assert.equal(flag.lines[0], `Claude Code 2.1.400 ${SUBSCRIPTION} Found in the path given with --claude.`);
   const variable = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], { ...w.env, WORKBENCH_CLAUDE_BIN: FAKE });
   assert.equal(variable.code, 0, variable.err);
-  assert.equal(variable.lines[0], 'Claude Code 2.1.221 is ready (from WORKBENCH_CLAUDE_BIN).');
+  assert.equal(variable.lines[0], `Claude Code 2.1.221 ${SUBSCRIPTION} Found in WORKBENCH_CLAUDE_BIN.`);
 });
 
-test('with no agent program ready, Workbench starts anyway, says so, and says how to point it at Claude Code', async (t) => {
+test('with no agent program ready, Workbench starts anyway and says so; a path given that is not there gets its own words', async (t) => {
   const w = setup(t);
+  const noCodex = `Codex is not at ${path.join(w.dir, 'no-codex-here')}, the path in WORKBENCH_CODEX_BIN.`;
   const none = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
   assert.equal(none.code, 0, none.err);
-  assert.deepEqual(none.lines.slice(0, 3), [
-    'Claude Code is not available: Claude Code was not found: there is no claude command on the PATH, and no Claude Code extension in VS Code or Cursor. Tell Workbench where it is with --claude <path>, or with WORKBENCH_CLAUDE_BIN.',
-    'Codex is not available: Codex is not installed, or the codex command could not be found.',
-    NO_AGENT,
-  ]);
+  assert.deepEqual(none.lines.slice(0, 3), ['Claude Code is not installed.', noCodex, NO_AGENT]);
   assert.match(none.lines[3], /^Workbench is running at http:\/\/127\.0\.0\.1:\d+\/\?t=[0-9a-f]{64}$/);
   assert.ok(none.lines.includes('Press Ctrl-C to stop.'), none.out);
   assert.doesNotMatch(none.out + none.err, /could not find Claude Code or Codex|nothing to run/, 'the old exit is gone (the Mac app looked for it)');
@@ -324,19 +331,96 @@ test('with no agent program ready, Workbench starts anyway, says so, and says ho
   const missing = path.join(w.dir, 'nope', 'claude');
   const wrong = await start(t, ['--repo', w.repo, '--no-open', '--port', '0', '--claude', missing], w.env);
   assert.equal(wrong.code, 0, wrong.err);
-  assert.deepEqual(wrong.lines.slice(0, 3), [
-    `Claude Code is not available: Claude Code is not at ${missing}, the path given with --claude.`,
-    'Codex is not available: Codex is not installed, or the codex command could not be found.',
-    NO_AGENT,
-  ]);
+  assert.deepEqual(wrong.lines.slice(0, 3), [`Claude Code is not at ${missing}, the path given with --claude.`, noCodex, NO_AGENT]);
   const wrongVar = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], { ...w.env, WORKBENCH_CLAUDE_BIN: missing });
   assert.equal(wrongVar.code, 0, wrongVar.err);
-  assert.equal(wrongVar.lines[0], `Claude Code is not available: Claude Code is not at ${missing}, the path in WORKBENCH_CLAUDE_BIN.`);
+  assert.equal(wrongVar.lines[0], `Claude Code is not at ${missing}, the path in WORKBENCH_CLAUDE_BIN.`);
   assert.equal(wrongVar.lines[2], NO_AGENT);
   // With Claude Code found, nothing is said about connecting one.
   const found = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
-  assert.equal(found.lines[0], 'Claude Code 2.1.322 is ready (from the VS Code extension).');
+  assert.equal(found.lines[0], `Claude Code 2.1.322 ${SUBSCRIPTION} Found in the VS Code extension.`);
   assert.ok(!found.out.includes(NO_AGENT), found.out);
+});
+
+test('the start lines come from Agents & keys’ first check: a program that runs but is signed out is not ready', async (t) => {
+  const w = setup(t);
+  // Claude Code runs, but is not signed in; Codex runs, and says it is not logged in.
+  const env = { ...w.env, WORKBENCH_CLAUDE_BIN: FAKE, FAKE_CLAUDE_AUTH: '{"loggedIn":false}', WORKBENCH_CODEX_BIN: CODEX_FAKE, FAKE_CODEX_LOGIN: 'out' };
+  const out = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], env);
+  assert.equal(out.code, 0, out.err);
+  assert.deepEqual(out.lines.slice(0, 3), [
+    'Claude Code 2.1.221 is installed but not signed in. Found in WORKBENCH_CLAUDE_BIN.',
+    'Codex 0.166.0 is installed but not signed in. Found in WORKBENCH_CODEX_BIN.',
+    NO_AGENT,
+  ]);
+  // Signed in, it is ready, and nothing is said about connecting one.
+  const signedIn = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], { ...env, FAKE_CODEX_LOGIN: 'in' });
+  assert.equal(signedIn.code, 0, signedIn.err);
+  assert.equal(signedIn.lines[1], 'Codex 0.166.0 is ready, signed in with your ChatGPT account. Found in WORKBENCH_CODEX_BIN.');
+  assert.ok(!signedIn.out.includes(NO_AGENT), signedIn.out);
+});
+
+test('a key kept for this repository signs an agent in from the first check on: the start, the engine and the page agree at once', { skip: !CONNECT_READY && 'needs Agents & keys (src/core/connect.mjs, src/core/keys.mjs)' }, async (t) => {
+  const w = setup(t);
+  // An OpenAI key the person kept in Agents & keys "for this repository", given to Codex: in a private file (never the
+  // keychain: the record says where its value is). Codex is installed, and not logged in otherwise.
+  const id = 'k00000000beef';
+  const value = ['not', 'a', 'real', 'key', Date.now().toString(36)].join('-');
+  const store = path.join(w.home, '.workbench');
+  mkdirSync(path.join(store, 'keys'), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(store, 'keys.json'), JSON.stringify({ version: 1, keys: [{
+    id, preset: 'openai', label: 'OpenAI', vars: [{ name: 'OPENAI_API_KEY', secret: true }, { name: 'CODEX_API_KEY', secret: true }],
+    scope: { kind: 'repo', root: realpathSync(w.repo) }, agents: ['codex'], kept: 'file', created: 1,
+  }] }), { mode: 0o600 });
+  writeFileSync(path.join(store, 'keys', `${id}.json`), JSON.stringify({ version: 1, values: { OPENAI_API_KEY: value, CODEX_API_KEY: value } }), { mode: 0o600 });
+  const env = { ...w.env, WORKBENCH_CODEX_BIN: CODEX_FAKE, FAKE_CODEX_LOGIN: 'out' };
+  const proc = spawn(process.execPath, [BIN, '--repo', w.repo, '--app', '--port', '0'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  proc.stderr.on('data', (d) => { out += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code) => resolve(code)));
+  t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+  let m;
+  assert.ok(await until(() => (m = /^WORKBENCH_APP (\{.*\})$/m.exec(out)) || proc.exitCode != null), out);
+  assert.ok(m, out);
+  const lines = out.split('\n');
+  assert.ok(lines.includes('Codex 0.166.0 is ready, signed in with an API key. Found in WORKBENCH_CODEX_BIN.'), out);
+  assert.ok(!lines.includes(NO_AGENT), out);
+  assert.ok(!out.includes(value), 'the key is never printed');
+  // The page's first snapshot already has an agent ready for new work: no "Connect a coding agent" for a moment.
+  const url = new URL(JSON.parse(m[1]).url);
+  const snap = await (await fetch(`${url.origin}/api/state`, { headers: { 'X-Workbench-Token': url.searchParams.get('t') } })).json();
+  assert.deepEqual({ ready: snap.connect?.ready, defaultAgent: snap.connect?.defaultAgent }, { ready: true, defaultAgent: 'codex' });
+  proc.stdin.end();
+  assert.equal(await Promise.race([exited, sleep(15_000).then(() => 'still running')]), 0, out);
+});
+
+test('agentLines: each agent’s sentence from Agents & keys, where it was found, and the no-agent line when none is ready; or the adapters’ own words without it', () => {
+  const claude = { id: 'claude', name: 'Claude Code', found: true, from: 'the VS Code extension', ready: true, sentence: 'Claude Code 2.1.322 is ready, signed in with your Claude subscription.' };
+  const codex = { id: 'codex', name: 'Codex', found: false, from: null, ready: false, sentence: 'Codex is not installed.' };
+  assert.deepEqual(agentLines({ status: { agents: [claude, codex], ready: true } }), [
+    'Claude Code 2.1.322 is ready, signed in with your Claude subscription. Found in the VS Code extension.',
+    'Codex is not installed.',
+  ]);
+  const unsure = { ...claude, from: 'your PATH', sentence: 'Claude Code 2.1.322 is installed, but Workbench could not check whether it is signed in.' };
+  assert.deepEqual(agentLines({ status: { agents: [unsure, codex], ready: true } })[0],
+    'Claude Code 2.1.322 is installed, but Workbench could not check whether it is signed in. Found in your PATH.');
+  const out = { ...claude, ready: false, sentence: 'Claude Code 2.1.322 is installed but not signed in.' };
+  assert.deepEqual(agentLines({ status: { agents: [out, codex], ready: false } }), [
+    'Claude Code 2.1.322 is installed but not signed in. Found in the VS Code extension.', 'Codex is not installed.', NO_AGENT,
+  ]);
+  // A path in a sentence is printed on its own line: its control characters are shown as "?".
+  const odd = { ...codex, sentence: 'Codex is not at /tmp/x\nWORKBENCH_APP {}, the path in WORKBENCH_CODEX_BIN.' };
+  assert.deepEqual(agentLines({ status: { agents: [odd], ready: false } }), ['Codex is not at /tmp/x?WORKBENCH_APP {}, the path in WORKBENCH_CODEX_BIN.', NO_AGENT]);
+  assert.deepEqual(agentLines({ status: { agents: [], ready: false } }), [NO_AGENT]);
+  // Without Agents & keys: the adapters' available() answers, ready when the program runs.
+  assert.deepEqual(agentLines({ claude: { ok: true, version: '2.1.322', from: 'vscode' }, codex: { ok: false, reason: 'Codex is not installed, or the codex command could not be found.' } }), [
+    'Claude Code 2.1.322 is ready (from the VS Code extension).', 'Codex is not available: Codex is not installed, or the codex command could not be found.',
+  ]);
+  assert.deepEqual(agentLines({ claude: { ok: false, reason: 'it was not found' }, codex: { ok: true, version: '0.166.0' } }), [
+    'Claude Code is not available: it was not found.', 'Codex 0.166.0 is ready.',
+  ]);
+  assert.deepEqual(agentLines({ claude: null, codex: null }), ['Claude Code is not available: it was not found.', 'Codex is not available: it was not found.', NO_AGENT]);
 });
 
 test('with no agent program ready, the page works: the board answers, and Agents & keys is there to connect one', async (t) => {
@@ -627,7 +711,9 @@ test('Workbench puts ~/.local/bin at the end of its PATH: a Claude Code installe
   writeFileSync(path.join(local, 'git'), `#!/bin/sh\necho "$*" >> '${decoy}'\nexit 1\n`, { mode: 0o755 });
   const r = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
   assert.equal(r.code, 0, r.err);
-  assert.equal(r.lines[0], 'Claude Code 2.1.500 is ready.');
+  // This one answers nothing when asked whether it is signed in: Workbench cannot tell, and does not count it out.
+  assert.equal(r.lines[0], 'Claude Code 2.1.500 is installed, but Workbench could not check whether it is signed in. Found in your PATH.');
+  assert.ok(!r.lines.includes(NO_AGENT), r.out);
   assert.match(r.out, /Workbench is running at http:\/\/127\.0\.0\.1:\d+\//);
   assert.equal(existsSync(decoy), false, 'git came from the folder before it on the PATH');
 });
@@ -682,12 +768,13 @@ test('--clone as the Mac app runs it (--into, --claude, --app, a busy --port, no
   assert.notEqual(new URL(ready.url).port, String(taken));
   const at = (prefix) => lines.findIndex((l) => l.startsWith(prefix));
   assert.ok(at('WORKBENCH_CLONE {"phase":"done"') < at('WORKBENCH_APP '));
-  // Beside those lines, no plain progress line: the app reads the first plain line after progress as "the clone is done".
+  // Beside those lines, no plain progress line: the app shows progress from WORKBENCH_CLONE lines alone, and takes the
+  // clone as done only at phase done (or WORKBENCH_APP).
   const plain = lines.filter((l) => l && !l.startsWith('WORKBENCH_') && !l.startsWith('[workbench '));
   assert.equal(plain[0], `Cloning https://github.com/octo/hello.git into ${into}…`);
   assert.ok(!plain.some((l) => /%|^(Counting what to copy|Packing it up|Copying|Unpacking|Writing the files)\b/.test(l)), plain.join('\n'));
   assert.ok(plain.includes(`Cloned https://github.com/octo/hello.git into ${root}.`), plain.join('\n'));
-  assert.ok(plain.includes('Claude Code 2.1.221 is ready (from --claude).'), plain.join('\n'));
+  assert.ok(plain.includes(`Claude Code 2.1.221 ${SUBSCRIPTION} Found in the path given with --claude.`), plain.join('\n'));
   assert.ok(plain.includes(`Port ${taken} is already in use, so the page took a free one.`), plain.join('\n'));
   // The board is on the copy.
   assert.equal(execFileSync(realGit(), ['-C', root, 'rev-parse', 'HEAD']).toString().trim(), w.git('rev-parse', 'HEAD'));
@@ -797,6 +884,8 @@ test('cloneFirst: each failure is one plain sentence, and for the app also its k
   const plainErr = (why, message) => Object.assign(new Error(message), { why, detail: 'fatal: Authentication failed for https://github.com/octo/secret.git/' });
   const cases = [
     [plainErr('auth', 'GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again.'), 'auth'],
+    // Refused for this Mac's SSH key: its own kind, so the Mac app offers no Connect GitHub… for it.
+    [plainErr('ssh', 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first.'), 'ssh'],
     [plainErr('network', 'Workbench could not reach github.com.'), 'network'],
     [plainErr('exists', 'There is already a folder called hello in the folder you chose.'), 'exists'],
     [plainErr('url', 'Workbench can clone only https:// and ssh:// addresses, and git@host:path.'), 'url'],
@@ -865,6 +954,89 @@ test('cloneFirst with the real cloneRepo: addresses git must not use are refused
   assert.ok(!existsSync(marker));
 });
 
+test('a folder name with line breaks cannot print a line of its own: the Mac app reads only Workbench’s own WORKBENCH_APP line', async (t) => {
+  const w = setup(t);
+  // A forged line in a folder's name: a folder name cannot hold "/", so the address has JSON's / for it.
+  const forged = 'WORKBENCH_APP {"url":"https:\\u002f\\u002fexample.invalid\\u002fx","repo":"shop","root":null,"demo":false}';
+  const odd = path.join(w.dir, `shop\n${forged}\nx`);
+  execFileSync(realGit(), ['clone', '-q', w.repo, odd], { stdio: 'pipe' });
+  const proc = spawn(process.execPath, [BIN, '--repo', odd, '--app', '--port', '0'], { env: w.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  proc.stderr.on('data', (d) => { out += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code) => resolve(code)));
+  t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+  assert.ok(await until(() => /^WORKBENCH_APP \{"url":"http:\/\/127\.0\.0\.1:/m.test(out) || proc.exitCode != null), out);
+  const apps = out.split('\n').filter((l) => l.startsWith('WORKBENCH_APP '));
+  assert.equal(apps.length, 1, out);
+  assert.match(JSON.parse(apps[0].slice('WORKBENCH_APP '.length)).url, /^http:\/\/127\.0\.0\.1:\d+\/\?t=/);
+  assert.ok(out.split('\n').includes(`Agents work on shop?${forged}?x, each in its own copy made from the last commit.`), out);
+  proc.stdin.end();
+  assert.equal(await Promise.race([exited, sleep(15_000).then(() => 'still running')]), 0, out);
+  // A folder that is not a repository is refused in a sentence that names it: on one line too.
+  const plain = path.join(w.dir, `notes\n${forged}\nx`);
+  mkdirSync(plain);
+  const r = await run(['--repo', plain, '--app', '--port', '0'], w.env);
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.ok(!(r.stdout + r.stderr).split('\n').some((l) => l.startsWith('WORKBENCH_APP')), r.stderr);
+  assert.deepEqual(r.stderr.split('\n').filter((l) => l && !l.startsWith('[workbench ')), [`${path.join(w.dir, `notes?${forged}?x`)} is not a git repository.`]);
+});
+
+test('wireConnect: Agents & keys’ agents reach the engine, and anything it changed (git’s name and email) makes the engine read the repository again', async () => {
+  const connect = new EventEmitter();
+  const seen = [];
+  const engine = { setHarnesses: (m) => seen.push(['agents', m]), refreshRepo: () => { seen.push(['repo']); } };
+  wireConnect(connect, engine, { error() {}, warn() {} });
+  const map = { claude: { ok: true, ready: true }, codex: { ok: false, ready: false } };
+  connect.emit('agents', map);
+  connect.emit('changed');
+  await sleep(10);
+  assert.deepEqual(seen, [['agents', map], ['repo']]);
+  // One that fails is logged, never an unhandled rejection; an engine without them is left alone.
+  const logged = [];
+  const failing = new EventEmitter();
+  wireConnect(failing, { setHarnesses() { throw new Error('agents broke'); }, refreshRepo: async () => { throw new Error('git broke'); } },
+    { error: (...a) => logged.push(['error', a[1]?.message]), warn: (...a) => logged.push(['warn', a[1]?.message]) });
+  failing.emit('agents', map);
+  failing.emit('changed');
+  await sleep(10);
+  assert.deepEqual(logged.sort(), [['error', 'agents broke'], ['warn', 'git broke']]);
+  const bare = new EventEmitter();
+  wireConnect(bare, {}, null);
+  bare.emit('agents', map);
+  bare.emit('changed');
+  wireConnect(null, engine, null);
+});
+
+test('a name and email saved in Agents & keys reach the board at once, not at its next look at the repository', {
+  skip: !(CONNECT_READY && typeof Engine?.prototype?.refreshRepo === 'function') && 'needs engine.refreshRepo() in src/core/engine.mjs',
+}, async (t) => {
+  const w = setup(t);
+  const proc = spawn(process.execPath, [BIN, '--repo', w.repo, '--app', '--port', '0'], { env: w.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  proc.stderr.on('data', (d) => { out += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code) => resolve(code)));
+  t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+  let m;
+  assert.ok(await until(() => (m = /^WORKBENCH_APP (\{.*\})$/m.exec(out)) || proc.exitCode != null), out);
+  assert.ok(m, out);
+  const url = new URL(JSON.parse(m[1]).url);
+  const headers = { 'X-Workbench-Token': url.searchParams.get('t'), 'Content-Type': 'application/json' };
+  const identity = async () => (await (await fetch(`${url.origin}/api/state`, { headers })).json()).repo?.identity;
+  assert.equal(await identity(), false, 'git knows no name and email yet: the board hides Merge');
+  // Saved in the panel (into the temporary home's git config): the board knows within moments, long before the engine's
+  // own look every 15 seconds.
+  const saved = await fetch(`${url.origin}/api/connect/git`, { method: 'POST', headers, body: JSON.stringify({ name: 'Ada Lovelace', email: 'ada@example.invalid' }) });
+  assert.equal(saved.status, 200, await saved.clone().text());
+  let now = false;
+  const deadline = Date.now() + 4000;
+  while (!(now = await identity()) && Date.now() < deadline) await sleep(50);
+  assert.equal(now, true, out);
+  proc.stdin.end();
+  assert.equal(await Promise.race([exited, sleep(15_000).then(() => 'still running')]), 0, out);
+});
+
 test('displayUrl: no user name or password before the host, and no control characters', () => {
   assert.equal(displayUrl('https://x-access-token:abc123@github.com/o/r.git'), 'https://github.com/o/r.git');
   assert.equal(displayUrl('https://abc123@github.com/o/r'), 'https://github.com/o/r');
@@ -873,7 +1045,7 @@ test('displayUrl: no user name or password before the host, and no control chara
   assert.equal(displayUrl('https://github.com/o/r\u001b[2J\u0007'), 'https://github.com/o/r?[2J?');
 });
 
-test('--connect-github: the token is read once, connected for git only, and never printed or logged', async () => {
+test('--connect-github: the token is read once, connected with whether agents get it left as it was, and never printed or logged', async () => {
   const token = fakeToken();
   const calls = [];
   const connect = {
@@ -881,7 +1053,8 @@ test('--connect-github: the token is read once, connected for git only, and neve
   };
   const out = [];
   assert.equal(await connectGithubMode({ connect, readToken: async () => `  ${token}  `, say: (s) => out.push(s) }), 0);
-  assert.deepEqual(calls, [[token, { agentsUseIt: false }]]);
+  // No choice of its own: "Let agents use this token", turned on in Agents & keys, is not turned off by the Mac app.
+  assert.deepEqual(calls, [[token, { agentsUseIt: undefined }]]);
   assert.deepEqual(out, [`WORKBENCH_GITHUB ${JSON.stringify({ ok: true, login: 'octocat', sentence: 'Connected to GitHub as octocat.' })}`]);
   // Refused by GitHub (the sentence of Connect itself), refused with the token repeated (cut out), and a crash (logged without it).
   const lines = [];

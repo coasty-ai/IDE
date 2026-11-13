@@ -188,10 +188,42 @@ enum CloneAddress {
     return nil
   }
 
+  /**
+   * A github.com address over ssh (`git@github.com:owner/repo.git`, `ssh://git@github.com/owner/repo.git`) in its https
+   * form (`https://github.com/owner/repo.git`), which a GitHub token can read; nil for any other address. Connect
+   * GitHub… gives git a token for https only, so a clone tried again after it goes over https.
+   */
+  static func githubHTTPS(_ a: String) -> String? {
+    var path: Substring
+    if let r = a.range(of: "://") {
+      guard a[..<r.lowerBound].lowercased() == "ssh" else { return nil }
+      let rest = a[r.upperBound...]
+      guard let slash = rest.firstIndex(of: "/") else { return nil }
+      var authority = rest[..<slash]
+      if let at = authority.lastIndex(of: "@") { authority = authority[authority.index(after: at)...] }
+      guard authority.lowercased() == "github.com" || authority.lowercased() == "github.com:22" else { return nil }
+      path = rest[rest.index(after: slash)...]
+    } else {
+      guard let colon = a.firstIndex(of: ":") else { return nil }
+      var host = a[..<colon]
+      if let at = host.lastIndex(of: "@") { host = host[host.index(after: at)...] }
+      guard host.lowercased() == "github.com" else { return nil }
+      path = a[a.index(after: colon)...]
+    }
+    while path.hasPrefix("/") { path = path.dropFirst() }
+    return path.isEmpty ? nil : "https://github.com/" + path
+  }
+
   /// What the sheet says when a clone was refused and Workbench's own line gave no sentence.
   static func refusal(_ kind: String, address: String, into: URL) -> String {
     switch kind {
     case "auth": return "GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again."
+    case "ssh":
+      let h = host(address)
+      if h?.lowercased() == "github.com" {
+        return "GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first."
+      }
+      return "\(h ?? "The server") did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, make sure git can sign in to \(h ?? "it") first."
     case "network": return "Workbench could not reach \(host(address) ?? "the repository’s server")."
     case "exists": return "\(into.lastPathComponent) already has a folder named \(folderName(address) ?? shortName(address)), and it is not empty."
     case "url": return shape
@@ -263,7 +295,8 @@ enum Target {
 /// A step of a clone, from Workbench's `WORKBENCH_CLONE` lines.
 enum CloneStep {
   case progress(phase: String, percent: Double?)
-  /// The clone is done (its progress stopped and Workbench spoke again): Workbench is starting on the new folder.
+  /// The clone is done (`WORKBENCH_CLONE {"phase":"done",…}`): Workbench is starting on the new folder. Nothing else
+  /// means done: a refusal can come after progress, and the sheet must not say "Opening…" for it.
   case opening
 }
 
@@ -279,13 +312,13 @@ final class Engine {
   private(set) var ready: (url: URL, name: String)?
   /// The repository's folder: the one given, or, for a clone, the one Workbench made (the `root` it reports).
   private(set) var root: URL?
-  /// Why a clone was refused, from Workbench's `WORKBENCH_CLONE {"error",…}` line: auth, network, exists, url or git.
+  /// Why a clone was refused, from Workbench's `WORKBENCH_CLONE {"error",…}` line: auth, ssh, network, exists, url or
+  /// git.
   private(set) var cloneFailure: (kind: String, sentence: String?)?
   /// Started for the clone sheet: the clone itself, or its new folder opened on a free port.
   var forClone = false
   /// Stopped because the person cancelled the clone: its end needs no words.
   var cancelled = false
-  private var cloning = false     // the clone's progress is showing, and Workbench has said nothing else since
   private var exitStatus: Int32?
   private var outputEnded = false
   private var reported = false
@@ -372,14 +405,15 @@ final class Engine {
   }
 
   private func take(line: String) {
-    // A clone's progress and its refusal: shown in the clone sheet. Progress is not written to the log.
+    // A clone's progress and its refusal: shown in the clone sheet. Progress is not written to the log. Only phase
+    // "done" (or the page's own line, below) says the clone is done: any other line, a refusal's sentence included, can
+    // come after the progress.
     if let obj = payload(line, "WORKBENCH_CLONE") as? [String: Any] {
       if let r = obj["root"] as? String, r.hasPrefix("/") { root = URL(fileURLWithPath: r, isDirectory: true) }
       if let kind = obj["error"] as? String {
         cloneFailure = (kind, obj["sentence"] as? String)
         Log.shared.write(line)
       } else if let phase = obj["phase"] as? String {
-        cloning = phase != "done"
         onClone?(phase == "done" ? .opening : .progress(phase: phase, percent: (obj["percent"] as? NSNumber)?.doubleValue))
       }
       return
@@ -387,10 +421,9 @@ final class Engine {
     Log.shared.write(line.replacingOccurrences(of: #"t=[0-9a-f]{64}"#, with: "t=<key>", options: .regularExpression))
     if line.hasPrefix("WORKBENCH_APP ") {
       if ready == nil, let obj = payload(line, "WORKBENCH_APP") as? [String: Any],
-         let s = obj["url"] as? String, let url = URL(string: s) {
+         let s = obj["url"] as? String, let url = URL(string: s), Engine.isPage(url) {
         if let r = obj["root"] as? String, r.hasPrefix("/") { root = URL(fileURLWithPath: r, isDirectory: true) }
         let name = (obj["repo"] as? String) ?? ((obj["demo"] as? Bool) == true ? "Demo" : "Workbench")
-        cloning = false
         ready = (url, name)
         onReady?(url, name)
       }
@@ -398,11 +431,13 @@ final class Engine {
     }
     tail.append(line)
     if tail.count > 60 { tail.removeFirst(tail.count - 60) }
-    // The first words Workbench says once the clone's progress has stopped: the clone is done, and it is starting.
-    if cloning, !line.trimmingCharacters(in: .whitespaces).isEmpty, !line.hasPrefix("[workbench") {
-      cloning = false
-      onClone?(.opening)
-    }
+  }
+
+  /// Whether an address can be Workbench's own page: http on this Mac (127.0.0.1, or localhost), on any port. A
+  /// `WORKBENCH_APP` line with any other address is not Workbench's, and is ignored.
+  static func isPage(_ url: URL) -> Bool {
+    guard url.scheme?.lowercased() == "http", let host = url.host?.lowercased() else { return false }
+    return host == "127.0.0.1" || host == "localhost"
   }
 
   /**
@@ -1101,7 +1136,8 @@ struct GitHubRepo {
  * Clone Repository…: an address, or one of the person's repositories on GitHub; the folder it goes in; then progress
  * while git works. The clone runs in the board's own Workbench process (`--clone … --into … --app`), so once it is done
  * that process is the board, and the sheet goes. A refused clone says why here, with "Connect GitHub…" when GitHub did
- * not let Workbench read the repository.
+ * not let Workbench read the repository (`auth`); not when it did not accept this Mac's SSH key (`ssh`), which a
+ * token does not mend.
  */
 final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
   weak var app: AppDelegate?
@@ -1127,7 +1163,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
   private var folder = CloneFolder.url
   private var name = ""                 // the repository being cloned, as the sheet names it
   private var busy = false              // closing what is open, or cloning
-  private var lastFailure: String?      // auth, network, exists, url, git, …
+  private var lastFailure: String?      // auth, ssh, network, exists, url, git, …
   private var login: String?            // the GitHub account connected in this sheet
   private var loads = 0
   private var ended = false
@@ -1568,8 +1604,9 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
   // MARK: Connect GitHub…
 
   /**
-   * The token sheet. Once GitHub accepts the token, the list loads again; after a clone GitHub refused, the clone is
-   * tried again at once.
+   * The token sheet. Once GitHub accepts the token, the list loads again; after a clone GitHub refused (`auth`), the
+   * clone is tried again at once. The token is for https, so a github.com address over ssh is tried in its https form,
+   * which the address field then shows; so is one refused for this Mac's SSH key (`ssh`).
    */
   @objc func connectGitHub() {
     guard !busy, !ended, connect == nil else { return }
@@ -1580,11 +1617,13 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
       self.connect = nil
       guard let login = login, !self.ended else { return }
       self.login = login
-      let again = self.lastFailure == "auth"
-      self.loadRepos()
       let a = self.address.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+      let https = CloneAddress.githubHTTPS(a)
+      let again = self.lastFailure == "auth" || (self.lastFailure == "ssh" && https != nil)
+      self.loadRepos()
       if again, !a.isEmpty {
-        self.startClone(a, saying: visible(sentence))
+        if let https = https { self.address.stringValue = https }
+        self.startClone(https ?? a, saying: visible(sentence))
       } else {
         self.clearMessage()
         self.message.stringValue = visible(sentence)

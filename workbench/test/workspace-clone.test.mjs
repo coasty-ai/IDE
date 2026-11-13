@@ -308,6 +308,74 @@ test('cloneRepo refuses addresses it does not clone from, before git runs', asyn
   assert.equal(fs.existsSync(into), false);
 });
 
+test('cloneRepo refuses a backslash anywhere in an address, and an "@" before an https address’s path, before git runs', async () => {
+  // Read with URL, https://github.com\@evil.example/… is github.com with no user name, since URL takes "\" for "/" in
+  // https; git and curl read the user name "github.com\" at evil.example. A git that would run gets no network here.
+  process.env.FAKE_GIT_CLONE = 'fail';
+  process.env.FAKE_GIT_STDERR = 'fatal: this git must not have been run\n';
+  try {
+    clearCalls();
+    const into = path.join(T, 'backslash');
+    for (const url of [
+      'https://github.com\\@evil.example/owner/repo',
+      ['https://github.com\\', 'not-a-password@evil.example/owner/repo'].join(':'),
+      'https://@github.com/owner/repo',
+      'HTTPS://@github.com/owner/repo',
+      'https://github.com?@evil.example/owner/repo',
+      'ssh://git@github.com\\@evil.example/owner/repo',
+      'git@github.com:owner\\repo.git',
+      'https://github.com/owner\\repo',
+    ]) await refused(cloneRepo({ url, into }), 'url', ADDRESS_REFUSED);
+    assert.equal(calls().filter((l) => l.includes(' clone ')).length, 0);
+    assert.equal(fs.existsSync(into), false);
+    // An "@" in the path is the path's own.
+    process.env.FAKE_GIT_CLONE = 'ok';
+    assert.equal((await cloneRepo({ url: 'https://github.com/owner/repo@2', into })).root, path.join(into, 'repo@2'));
+  } finally {
+    delete process.env.FAKE_GIT_CLONE;
+    delete process.env.FAKE_GIT_STDERR;
+  }
+});
+
+test('cloneRepo hands git the address with its scheme in lower case, and the rest as it was', async () => {
+  // Git looks for a transport named as written, and protocol.HTTPS.allow is not protocol.https.allow: given HTTPS://…
+  // under protocol.allow=never, git refuses ("transport 'HTTPS' not allowed").
+  process.env.FAKE_GIT_CLONE = 'ok';
+  try {
+    const into = path.join(T, 'upper');
+    for (const [url, given, name] of [
+      ['HTTPS://github.com/Owner/Repo', 'https://github.com/Owner/Repo', 'Repo'],
+      ['  Https://GitHub.com/owner/Mixed.git ', 'https://GitHub.com/owner/Mixed.git', 'Mixed'],
+      ['SSH://git@example.org/team/Upper.git', 'ssh://git@example.org/team/Upper.git', 'Upper'],
+    ]) {
+      clearCalls();
+      const { root } = await cloneRepo({ url, into });
+      assert.equal(root, path.join(into, name), url);
+      const args = calls().find((l) => l.startsWith('ARGS ') && l.includes(' clone '));
+      assert.ok(args.endsWith(` clone --progress -- ${given} ${path.join(into, name)}`), args);
+    }
+  } finally {
+    delete process.env.FAKE_GIT_CLONE;
+  }
+});
+
+test('cloneRepo puts the repository in the folder it was given, also one whose name ends in a space', async () => {
+  process.env.FAKE_GIT_CLONE = 'ok';
+  try {
+    const base = path.join(T, 'spaced');
+    const into = path.join(base, 'Projects ');
+    fs.mkdirSync(into, { recursive: true });
+    assert.equal((await cloneRepo({ url: 'https://github.com/owner/repo', into })).root, path.join(into, 'repo'));
+    assert.deepEqual(fs.readdirSync(base), ['Projects '], 'no folder without the space was made beside it');
+    // Made when missing, as it was given.
+    const fresh = path.join(base, ' Fresh ');
+    assert.equal((await cloneRepo({ url: 'https://github.com/owner/repo', into: fresh })).root, path.join(fresh, 'repo'));
+    assert.deepEqual(fs.readdirSync(base).sort(), [' Fresh ', 'Projects ']);
+  } finally {
+    delete process.env.FAKE_GIT_CLONE;
+  }
+});
+
 test('cloneRepo takes https, ssh and scp-like addresses, names the folder after the repository, and runs git safely', async () => {
   process.env.FAKE_GIT_CLONE = 'ok';
   try {
@@ -378,15 +446,24 @@ test('a clone that fails says why in plain words, with git’s own words only in
   process.env.FAKE_GIT_CLONE = 'fail';
   const into = path.join(T, 'failing');
   const GITHUB_AUTH = 'GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again.';
+  // Refused for this Mac's SSH key: no GitHub sign-in mends that (a token is for https), so it is not 'auth', and the
+  // Mac app offers no Connect GitHub… for it.
+  const GITHUB_SSH = 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first.';
+  const NO_KEY = 'Permission denied (publickey).\r\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n';
   const cases = [
     ['https://github.com/owner/private', "remote: Repository not found.\nfatal: repository 'https://github.com/owner/private/' not found\n", 'auth', GITHUB_AUTH],
     ['https://github.com/owner/private', "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", 'auth', GITHUB_AUTH],
-    ['git@github.com:owner/private.git', 'git@github.com: Permission denied (publickey).\r\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n', 'auth', GITHUB_AUTH],
+    ['git@github.com:owner/private.git', `git@github.com: ${NO_KEY}`, 'ssh', GITHUB_SSH],
+    ['ssh://git@github.com/owner/private.git', `git@github.com: ${NO_KEY}`, 'ssh', GITHUB_SSH],
+    ['git@github.com:owner/repo.git', 'Host key verification failed.\r\nfatal: Could not read from remote repository.\n', 'ssh', GITHUB_SSH],
+    ['git@gitlab.example.org:team/x.git', `git@gitlab.example.org: ${NO_KEY}`, 'ssh',
+      'gitlab.example.org did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, make sure git can sign in to gitlab.example.org first.'],
+    // GitHub took the key, but that account cannot see the repository: a sign-in matter, which https and a token can mend.
+    ['git@github.com:owner/private.git', 'ERROR: Repository not found.\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n', 'auth', GITHUB_AUTH],
     ['https://gitlab.example.org/team/x', "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://gitlab.example.org/team/x/'\n", 'auth',
       'gitlab.example.org did not let Workbench read this repository. If it is private, make sure git can sign in to gitlab.example.org, then try again.'],
     ['https://example.invalid/x/y', "fatal: unable to access 'https://example.invalid/x/y/': Could not resolve host: example.invalid\n", 'network', 'Workbench could not reach example.invalid.'],
     ['git@example.invalid:x/y.git', 'ssh: Could not resolve hostname example.invalid: nodename nor servname provided, or not known\r\nfatal: Could not read from remote repository.\n', 'network', 'Workbench could not reach example.invalid.'],
-    ['git@github.com:owner/repo.git', 'Host key verification failed.\r\nfatal: Could not read from remote repository.\n', 'auth', /^SSH on this computer does not know github\.com yet/],
     ['https://github.com/owner/odd', 'fatal: something unexpected happened\n', 'git', 'Git could not clone https://github.com/owner/odd.'],
   ];
   try {
