@@ -440,18 +440,35 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     { method: 'GET', re: /^\/api\/connect$/, connect: true, run: () => done() },
     { method: 'POST', re: /^\/api\/connect\/recheck$/, connect: true, run: async () => { await connect.recheck(); return done(); } },
     {
-      // Terminal, running the vendor's own installer or sign-in (macOS); elsewhere the command, for the page to show.
-      method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/(install|signin)$/, connect: true,
+      // Terminal, running the vendor's own installer (macOS); elsewhere the command, for the page to show.
+      method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/install$/, connect: true,
+      run: async (b, m) => terminalAnswer(await connect.agentAction(agentId(m[1]), 'install')),
+    },
+    {
+      // Sign in: in the browser, the vendor's own login program run by Workbench (`console: true`: Claude Code's
+      // Anthropic Console account), answered at once while it waits; or with `terminal: true` in Terminal, as Install.
+      method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/signin$/, connect: true,
       run: async (b, m) => {
-        const r = await connect.agentAction(agentId(m[1]), m[2]);
-        return done(r, null, { opened: r?.opened === true, ...(typeof r?.command === 'string' && r.command ? { command: r.command } : {}) });
+        const id = agentId(m[1]);
+        if (b.terminal === true) return terminalAnswer(await connect.agentAction(id, 'signin', b.console === true ? { console: true } : {}));
+        const r = await connect.agentSignIn(id, { console: b.console === true });
+        return done(r, null, { waiting: r?.waiting === true, ...(r?.ok === false && typeof r.why === 'string' ? { why: r.why } : {}) });
       },
     },
+    { method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/signin\/cancel$/, connect: true, run: async (b, m) => done(await connect.cancelAgentSignIn(agentId(m[1]))) },
     {
       method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/key$/, connect: true,
       run: async (b, m) => done(await connect.setAgentKey(agentId(m[1]), secret(b.value, 'Paste the key first.'))),
     },
     { method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/default$/, connect: true, run: async (b, m) => done(await connect.setDefaultAgent(agentId(m[1]))) },
+    {
+      // Install git: on a Mac, Apple's own installer for its developer tools; elsewhere the sentence that says how.
+      method: 'POST', re: /^\/api\/connect\/git\/install$/, connect: true,
+      run: async () => {
+        const r = await connect.installGitTools();
+        return done(r, null, r?.ok === false && typeof r.why === 'string' ? { why: r.why } : {});
+      },
+    },
     {
       method: 'POST', re: /^\/api\/connect\/git$/, connect: true,
       run: async (b) => done(await connect.setGitIdentity({ name: text(b.name), email: text(b.email) }), 'Git now has your name and email.'),
@@ -523,6 +540,8 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     }
     return done(r, null, extra);
   }
+  /** The answer when Connect opened Terminal (`opened`), or gave the command to run in one (`command`). */
+  const terminalAnswer = (r) => done(r, null, { opened: r?.opened === true, ...(typeof r?.command === 'string' && r.command ? { command: r.command } : {}) });
 
   // src/shared/keypresets.mjs, loaded on first use: { presetById } or null. Tests may give their own (options.keyPresets),
   // or null for "it could not be read".

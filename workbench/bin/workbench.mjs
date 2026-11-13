@@ -5,6 +5,7 @@
 //   node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
 //   node bin/workbench.mjs --clone <address> [--into <folder>] [the --repo options]
 //   node bin/workbench.mjs --connect-github | --github-signin | --github-status | --github-repos      (for the Mac app)
+//   node bin/workbench.mjs --git-status                           (for the Mac app)
 //
 // Wires the real modules together: store, engine, commands, policy, workspaces, receipt, machines, the key store and
 // Agents & keys (connect), the adapters and the local web server. Every agent process is stopped when Workbench exits.
@@ -83,6 +84,7 @@ Options:
   --github-repos      for the Mac app: print the connected GitHub account's repositories, WORKBENCH_GITHUB_REPOS [...]
   --event-log <file>  also write every event to this file, one JSON object per line
   --verbose           print more about what Workbench is doing
+  --git-status        for the Mac app: print whether git can run on this computer, WORKBENCH_GIT {...}
   --help              show this help`;
 
 // ------------------------------------------------------------------ arguments
@@ -114,6 +116,7 @@ export function parseArgs(argv) {
     };
     switch (flag) {
       case '--demo': out.demo = true; break;
+      case '--git-status': out.gitStatus = true; break;
       case '--repo': out.repo = value(); break;
       case '--clone': {
         const v = value();
@@ -165,6 +168,13 @@ export function parseArgs(argv) {
       default:
         out.error = `I don't know the option “${raw}”. Use --help to see the options.`;
     }
+  }
+  // --git-status runs on its own: --demo, --repo, --clone (with --into) and the GitHub helpers (every flag named
+  // connect… or github…) are other ways to run.
+  if (!out.error && !out.help && out.gitStatus) {
+    const helpers = Object.keys(out).filter((k) => /^(?:connect|github)/.test(k) && out[k] === true);
+    if (out.demo || out.repo || out.clone || out.into || helpers.length) out.error = '--git-status runs on its own, without --demo, --repo, --clone or the GitHub helpers.';
+    return out;
   }
   if (!out.error && !out.help) {
     // The Mac app's helpers: each runs on its own.
@@ -575,6 +585,27 @@ export async function cloneFirst({ workspace, url, into, app = false, signal, sa
 }
 
 /**
+ * --git-status: print `WORKBENCH_GIT {"installed","canInstall","sentence"}`, whether git can run on this computer, as
+ * Agents & keys checks it (`presence`: gitPresence in src/core/connect.mjs). On a Mac without Apple's developer tools:
+ * installed false, canInstall true, "Git is not installed yet. Apple’s developer tools include it.". When the check
+ * itself cannot run: installed false, canInstall false, and a sentence that says so.
+ * @returns {Promise<number>} always 0
+ */
+export async function gitStatusMode({ presence, say: out = say, log }) {
+  let r = null;
+  try {
+    r = typeof presence === 'function' ? await presence() : null;
+  } catch (e) {
+    log?.warn?.('Workbench could not check whether git is installed:', e);
+  }
+  const answer = r && typeof r.installed === 'boolean'
+    ? { installed: r.installed, canInstall: r.canInstall === true, sentence: typeof r.sentence === 'string' ? r.sentence : '' }
+    : { installed: false, canInstall: false, sentence: 'Workbench could not check whether git is installed. The details are in its log.' };
+  out(`WORKBENCH_GIT ${JSON.stringify(answer)}`);
+  return 0;
+}
+
+/**
  * One line from a stream (the token the Mac app writes), without its line break: null when nothing came before the
  * stream ended, or when the line is too long to be a token. The stream is let go afterwards.
  */
@@ -799,6 +830,15 @@ async function main() {
   const withLocalBin = pathWithLocalBin(process.env.PATH, os.homedir());
   if (withLocalBin !== process.env.PATH) process.env.PATH = withLocalBin;
   const log = createLogger(args.verbose);
+  // --git-status, for the Mac app's first window: Agents & keys' own check that git can run, and nothing else (no key
+  // store, no agent). Then exit.
+  if (args.gitStatus) {
+    const connectMod = await loadOptional('src/core/connect.mjs', log);
+    const presence = typeof connectMod?.gitPresence === 'function'
+      ? () => connectMod.gitPresence({ platform: process.platform, env: process.env })
+      : null;
+    return gitStatusMode({ presence, log });
+  }
 
   // The Mac app's helpers: connect GitHub with a token from standard input, sign in to GitHub with gh, say whether it
   // is signed in, or list its repositories. Then exit. They need only the key store and Agents & keys, which checks no
