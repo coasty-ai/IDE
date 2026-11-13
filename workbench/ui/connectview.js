@@ -335,36 +335,58 @@ export const githubUrl = u => (typeof u === 'string' && /^https:\/\/github\.com\
 /**
  * GitHub's part of a status, cleaned: whether it is connected, and how ('gh', signed in through GitHub's command-line
  * tool, which keeps the sign-in; 'token', milestone 1's token, which Workbench keeps; connected with no `via` is a
- * token), as whom, whether that tool is here, and the sign-in under way while it is not connected: { phase
- * ('installing' | 'code' | 'terminal', or null when Workbench sent another), code (shown only when it has a code's
- * shape), url (github.com's only), sentence }.
+ * token), as whom, whether that tool is here, and the sign-in under way, for as long as Workbench says it is (connected
+ * too: gh has the sign-in before its last step, which makes git use it, has ended): { phase ('installing' | 'code' |
+ * 'terminal', or null when Workbench sent another), code (shown only when it has a code's shape), url (github.com's
+ * only), sentence, opened (false: Terminal could not open), command (then the one to run in a terminal, or '') }.
  */
 export function githubOf(status) {
   const g = status && status.github && typeof status.github === 'object' ? status.github : {};
   const connected = g.connected === true;
-  const si = !connected && g.signingIn && typeof g.signingIn === 'object' ? g.signingIn : null;
+  const si = g.signingIn && typeof g.signingIn === 'object' ? g.signingIn : null;
   const code = si && typeof si.code === 'string' && GH_CODE.test(si.code.trim()) ? si.code.trim() : '';
   return {
     connected, via: connected ? (g.via === 'gh' ? 'gh' : 'token') : null, login: str(g.login), agentsUseIt: g.agentsUseIt === true, sentence: str(g.sentence),
     ghInstalled: typeof g.ghInstalled === 'boolean' ? g.ghInstalled : null,
-    signingIn: si ? { phase: GH_PHASES.includes(si.phase) ? si.phase : null, code, url: githubUrl(si.url), sentence: str(si.sentence) } : null,
+    signingIn: si ? { phase: GH_PHASES.includes(si.phase) ? si.phase : null, code, url: githubUrl(si.url), sentence: str(si.sentence),
+      opened: typeof si.opened === 'boolean' ? si.opened : null, command: str(si.command).trim() } : null,
   };
 }
 /**
  * What GitHub's buttons were drawn for: 'signing' (a sign-in under way: Cancel), 'off' (Sign in to GitHub), or how it
- * is connected and as whom ('gh:octocat': Sign out). The page checks it before it sends.
+ * is connected and as whom ('gh:octocat': Sign out, and Sign in to GitHub while git does not use that sign-in). The
+ * page checks it before it sends.
  */
 export const githubState = g => (g.signingIn ? 'signing' : g.connected ? `${g.via}:${prose(g.login)}` : 'off');
-/** "Signed in to GitHub as octocat. Git in Terminal, Workbench and your agents use this sign-in.", or Workbench's own. */
+/**
+ * Whether Sign in to GitHub is offered, and sent: GitHub not connected, or signed in through GitHub's command-line tool
+ * while git does not use that sign-in (agentsUseIt false: Workbench then only makes git use it); never while a sign-in
+ * is under way.
+ */
+export const githubCanSignIn = g => !g.signingIn && (!g.connected || (g.via === 'gh' && !g.agentsUseIt));
+/**
+ * GitHub's command to run in a terminal, where Workbench could not open Terminal: the sign-in's while Workbench waits for
+ * it (phase 'terminal', opened false), else the one an answer gave (`open.ghCmd`: Sign out's), else ''.
+ */
+export function githubCommand(g, open = {}) {
+  const si = g && g.signingIn;
+  if (si && si.phase === 'terminal' && si.opened === false && si.command) return si.command;
+  return open && typeof open.ghCmd === 'string' ? open.ghCmd.trim() : '';
+}
+/**
+ * "Signed in to GitHub as octocat. Git in Terminal, Workbench and your agents use this sign-in.", or, while git does
+ * not use it, that it does not yet; Workbench's own first.
+ */
 export function githubSignedWords(g) {
   if (g.sentence.trim()) return prose(g.sentence);
-  return `Signed in to GitHub${g.login ? ` as ${prose(g.login)}` : ''}. ${GITHUB_USES}`;
+  const as = g.login ? ` as ${prose(g.login)}` : '';
+  return g.agentsUseIt ? `Signed in to GitHub${as}. ${GITHUB_USES}` : `Signed in to GitHub${as}, but git does not use this sign-in yet. Sign in to GitHub again to set that up.`;
 }
 /** The sign-in under way, in words: Workbench's sentence for it, else the panel's own for its phase. */
 export function githubPhaseWords(si) {
   if (si.sentence.trim() && !(si.phase === 'code' && si.code)) return prose(si.sentence);
   if (si.phase === 'installing') return 'Getting GitHub’s command-line tool…';
-  if (si.phase === 'terminal') return 'Terminal is open: follow the steps there, then come back.';
+  if (si.phase === 'terminal') return si.opened === false ? 'Run this command in a terminal, then come back here.' : 'Terminal is open: follow the steps there, then come back.';
   if (si.phase === 'code') return si.code ? `Your code: ${si.code}` : 'Waiting for a code from GitHub…';
   return 'Signing in to GitHub…';
 }
@@ -583,25 +605,36 @@ export function panelParts(status, v = {}) {
 
 /**
  * GitHub's parts, as [{ k, html }]:
- * - signed in through GitHub's command-line tool ('gh-signed'): "Signed in to GitHub as <login>. Git in Terminal,
- *   Workbench and your agents use this sign-in." (or Workbench's sentence), and Sign out;
+ * - signed in through GitHub's command-line tool ('gh-signed'), no sign-in under way: "Signed in to GitHub as <login>.
+ *   Git in Terminal, Workbench and your agents use this sign-in." (or Workbench's sentence), and Sign out; while git
+ *   does not use that sign-in, Sign in to GitHub first (Workbench then only makes git use it);
  * - connected with milestone 1's token ('gh-on'): as whom, "Let agents use this token (as GH_TOKEN)" and Disconnect;
- * - not connected ('gh-off'): Workbench's sentence (a refused install says why there), then the sign-in under way, by
+ * - otherwise ('gh-off'): Workbench's sentence (a refused install says why there), then the sign-in under way, by
  *   its phase ("Getting GitHub’s command-line tool…"; "Your code: WDJB-MJHT" with Open GitHub and Copy the code;
  *   "Terminal is open: …"), with Cancel, or else Sign in to GitHub; and "Use a token instead", which shows milestone
- *   1's token form as a part of its own ('gh-token'), so a sign-in's progress never redraws a token being typed; and
- *   the command to run ('gh-cmd') when Workbench gave one instead of opening Terminal.
+ *   1's token form as a part of its own ('gh-token'), so a sign-in's progress never redraws a token being typed.
+ * Under GitHub's part, the command to run ('gh-cmd', githubCommand()) where Workbench could not open Terminal: the
+ * sign-in's while Workbench waits for it, or the one Sign out's answer gave while gh is still signed in.
  */
 export function githubParts(status, open = {}, busy = new Set()) {
   const gh = githubOf(status);
   const parts = [];
   const head = '<h4 class="cn-h4">GitHub</h4>';
-  if (gh.connected && gh.via === 'gh') {
+  const signIn = pri => btn('Sign in to GitHub', { cn: 'gh-signin', key: 'gh-signin', state: githubState(gh) }, { pri, busy: busy.has('gh-signin') });
+  const cmd = githubCommand(gh, open);
+  const cmdPart = () => {
+    if (cmd) {
+      parts.push({ k: 'gh-cmd', html: '<div class="cn-part cn-form" data-k="gh-cmd"><p class="cn-note">Run this in a terminal, then come back here.</p>'
+        + `<div class="cn-inrow"><code class="cn-cmd" tabindex="0" data-scroll="1">${esc(visibleControls(cmd))}</code>${btn('Copy', { cn: 'gh-cmd-copy', key: 'gh-cmd-copy' })}</div></div>` });
+    }
+  };
+  if (gh.connected && gh.via === 'gh' && !gh.signingIn) {
     parts.push({ k: 'gh-signed', html: `<div class="cn-part cn-gh" data-k="gh-signed">${head}<p class="cn-line">${esc(githubSignedWords(gh))}</p><div class="cn-acts">`
-      + `${btn('Sign out', { cn: 'gh-signout', key: 'gh-signout', state: githubState(gh) }, { busy: busy.has('gh-signout') })}</div></div>` });
+      + `${githubCanSignIn(gh) ? signIn(true) : ''}${btn('Sign out', { cn: 'gh-signout', key: 'gh-signout', state: githubState(gh) }, { busy: busy.has('gh-signout') })}</div></div>` });
+    cmdPart();
     return parts;
   }
-  if (gh.connected) {
+  if (gh.connected && gh.via === 'token') {
     const login = prose(gh.login);
     const said = gh.sentence.trim() ? prose(gh.sentence) : login ? `Connected to GitHub as ${login}.` : 'Connected to GitHub.';
     // whether agents get the token: the box acts at once (Workbench keeps the token, so it is not asked for again); it
@@ -631,17 +664,12 @@ export function githubParts(status, open = {}, busy = new Set()) {
     const note = gh.ghInstalled === false
       ? 'Workbench first gets GitHub’s command-line tool from GitHub. Then you approve the sign-in on GitHub’s website: there is no token to copy.'
       : 'You approve the sign-in on GitHub’s website: there is no token to copy.';
-    body = `<p class="cn-line">${esc(said)}</p><div class="cn-acts">${btn('Sign in to GitHub', { cn: 'gh-signin', key: 'gh-signin', state: githubState(gh) }, { pri: true, busy: busy.has('gh-signin') })}</div>`
-      + `<p class="cn-sub">${esc(note)}</p>`;
+    body = `<p class="cn-line">${esc(said)}</p><div class="cn-acts">${signIn(true)}</div><p class="cn-sub">${esc(note)}</p>`;
   }
   const tokenOpen = open.ghToken === true;
   parts.push({ k: 'gh-off', html: `<div class="cn-part cn-gh" data-k="gh-off">${head}${body}`
     + `<p class="cn-sub"><button type="button" class="cn-textbtn" data-cn="gh-token-toggle" data-key="gh-token-toggle" aria-expanded="${tokenOpen}">Use a token instead</button></p></div>` });
-  const cmd = typeof open.ghCmd === 'string' ? open.ghCmd.trim() : '';
-  if (cmd) {
-    parts.push({ k: 'gh-cmd', html: '<div class="cn-part cn-form" data-k="gh-cmd"><p class="cn-note">Run this in a terminal, then come back here.</p>'
-      + `<div class="cn-inrow"><code class="cn-cmd" tabindex="0" data-scroll="1">${esc(visibleControls(cmd))}</code>${btn('Copy', { cn: 'gh-cmd-copy', key: 'gh-cmd-copy' })}</div></div>` });
-  }
+  cmdPart();
   if (tokenOpen) {
     // milestone 1's token form, as it was
     parts.push({ k: 'gh-token', html: `<div class="cn-part cn-gh cn-form cn-tokenform" data-k="gh-token" data-enter="gh-connect" role="group" aria-label="Connect GitHub with a token">`

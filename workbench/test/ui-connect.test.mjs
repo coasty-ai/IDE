@@ -455,13 +455,16 @@ test('a sign-in to GitHub under way, by its phase: getting the tool, the code wi
   }
   // another phase Workbench may add: its sentence, else plain words
   assert.match(part(html(status({ github: signing({ phase: 'later' }) })), 'gh-off'), /Signing in to GitHub…/);
-  // the panel reads the status again while any of these is under way, and not once GitHub is connected
+  // the panel reads the status again while any of these is under way, until Workbench says it ended: also once gh has
+  // the sign-in, since its last step (making git use it) may still be running
   assert.equal(V.signingInWaits(status({ github: signing() })), true);
-  assert.equal(V.signingInWaits(status({ github: { ...signing(), connected: true, via: 'gh', login: 'octocat' } })), false);
+  assert.equal(V.signingInWaits(status({ github: { ...signing(), connected: true, via: 'gh', login: 'octocat' } })), true);
+  assert.equal(V.signingInWaits(status({ github: { ...signing(), signingIn: null, connected: true, via: 'gh', login: 'octocat' } })), false);
 });
 
 test('signed in through GitHub’s command-line tool: who uses the sign-in, and Sign out; no token, no box', () => {
-  const gh = { connected: true, via: 'gh', login: 'octocat', ghInstalled: true, ghVersion: '2.104.0', ghPath: '/Users/sam/.local/bin/gh', agentsUseIt: false, sentence: '', signingIn: null };
+  // git uses the sign-in (Connect says so with agentsUseIt: true)
+  const gh = { connected: true, via: 'gh', login: 'octocat', ghInstalled: true, ghVersion: '2.104.0', ghPath: '/Users/sam/.local/bin/gh', agentsUseIt: true, sentence: '', signingIn: null };
   const h = html(status({ github: gh }));
   const signed = part(h, 'gh-signed');
   assert.match(signed, /<p class="cn-line">Signed in to GitHub as octocat\. Git in Terminal, Workbench and your agents use this sign-in\.<\/p>/);
@@ -485,7 +488,7 @@ test('GitHub’s part of a status is read field by field: a token connection wit
   assert.equal(V.githubOf({ github: { connected: true, login: 'octocat' } }).via, 'token', 'milestone 1’s connection');
   assert.equal(V.githubOf({ github: { connected: true, via: 'gh' } }).via, 'gh');
   assert.equal(V.githubOf({ github: { connected: false, via: 'gh' } }).via, null);
-  assert.equal(V.githubOf({ github: { connected: true, via: 'gh', signingIn: { phase: 'code' } } }).signingIn, null, 'connected: nothing under way');
+  assert.equal(V.githubOf({ github: { connected: true, via: 'gh', signingIn: { phase: 'code' } } }).signingIn.phase, 'code', 'connected, and still signing in: as Workbench says');
   assert.equal(V.githubOf({ github: { signingIn: { phase: 'code', code: ' WDJB-MJHT ' } } }).signingIn.code, 'WDJB-MJHT');
   assert.equal(V.githubState(V.githubOf({ github: { connected: true, login: `oct${U(0x202e)}o` } })), 'token:oct⟦U+202E⟧o');
   assert.equal(V.githubState(V.githubOf({})), 'off');
@@ -506,12 +509,132 @@ test('where Workbench gave a command for GitHub instead of opening Terminal, the
   assert.equal(part(html(status()), 'gh-cmd'), '');
 });
 
+// Where Terminal cannot open (Linux, or a Mac where it did not open), Connect gives gh's command: the sign-in's in its
+// status (github.signingIn: phase 'terminal', opened: false, command), Sign out's in its answer. These are Connect's own
+// commands (ghSignInCommand and ghSignOutCommand in src/core/github.mjs) for gh at /home/sam/.local/bin/gh.
+const GH_LINUX = '/home/sam/.local/bin/gh';
+const GH_SIGN_IN_CMD = `${GH_LINUX} auth login --hostname github.com --git-protocol https --web --scopes workflow && ${GH_LINUX} auth setup-git --hostname github.com`;
+const GH_SIGN_OUT_CMD = `${GH_LINUX} auth logout --hostname github.com`;
+const NO_TERMINAL = 'Run this command in a terminal, then come back here.';
+/** github.signingIn as Connect gives it once gh's sign-in without a terminal failed and Terminal could not open. */
+const inATerminal = (o = {}) => ({ phase: 'terminal', code: null, url: null, since: 1_800_000_000_000, sentence: NO_TERMINAL, opened: false, command: GH_SIGN_IN_CMD, ...o });
+const SIGNED_GH = 'Signed in to GitHub as octocat. Git in Terminal, Workbench and your agents use this sign-in.';
+const NOT_GIT = 'Signed in to GitHub as octocat, but git does not use this sign-in yet. Sign in to GitHub again to set that up.';
+/** status.github as Connect gives it while gh is signed in; git uses the sign-in when agentsUseIt is true. */
+const viaGh = (o = {}) => ({ connected: true, via: 'gh', login: 'octocat', ghInstalled: true, ghVersion: '2.104.0', ghPath: '/Users/sam/.local/bin/gh', agentsUseIt: true,
+  sentence: SIGNED_GH, signingIn: null, ...o });
+/** connect.js: one case of the buttons' switch, up to the next one. */
+const caseOf = (src, cn) => { const at = src.indexOf(`case '${cn}':`); return at < 0 ? '' : src.slice(at, src.indexOf('\n    case ', at + 1)); };
+
+test('where Terminal cannot open, GitHub’s sign-in shows the command in its status, with Copy, while Workbench waits for it', () => {
+  const s = status({ platform: 'linux', canOpenTerminal: false, github: ghOff({ ghInstalled: true, signingIn: inATerminal() }) });
+  const h = html(s);
+  const cmd = part(h, 'gh-cmd');
+  assert.ok(cmd.includes(`<code class="cn-cmd" tabindex="0" data-scroll="1">${esc(GH_SIGN_IN_CMD)}</code>`), 'the command, escaped');
+  assert.match(cmd, /Run this in a terminal, then come back here\./);
+  assert.deepEqual(buttons(cmd).map(b => [b.cn, b.label]), [['gh-cmd-copy', 'Copy']]);
+  const off = part(h, 'gh-off');
+  assert.match(off, /<span>Run this command in a terminal, then come back here\.<\/span>/, 'Workbench’s words');
+  assert.deepEqual(buttons(off).map(b => b.cn), ['gh-cancel', 'gh-token-toggle'], 'Workbench still waits for it: Cancel');
+  const g = V.githubOf(s);
+  assert.deepEqual([g.signingIn.opened, g.signingIn.command], [false, GH_SIGN_IN_CMD]);
+  assert.equal(V.githubCommand(g, {}), GH_SIGN_IN_CMD, 'what Copy copies');
+  assert.equal(V.githubCommand(g, { ghCmd: 'something else' }), GH_SIGN_IN_CMD, 'the sign-in’s own command first');
+  // a Mac where Terminal did not open: the same, in Workbench's words for it
+  const mac = html(status({ github: ghOff({ ghInstalled: true, signingIn: inATerminal({ sentence: `Workbench could not open Terminal. ${NO_TERMINAL}` }) }) }));
+  assert.ok(part(mac, 'gh-cmd').includes(esc(GH_SIGN_IN_CMD)));
+  assert.match(part(mac, 'gh-off'), /<span>Workbench could not open Terminal\. Run this command in a terminal, then come back here\.<\/span>/);
+  // with no words from Workbench, the panel never says Terminal is open when it is not
+  assert.match(part(html(status({ github: ghOff({ signingIn: inATerminal({ sentence: '' }) }) })), 'gh-off'), /<span>Run this command in a terminal, then come back here\.<\/span>/);
+  // Terminal open on it: no command; nor in any other phase, or with no sign-in under way
+  const opened = html(status({ github: signing({ phase: 'terminal', opened: true }) }));
+  assert.equal(part(opened, 'gh-cmd'), '');
+  assert.match(part(opened, 'gh-off'), /<span>Terminal is open: follow the steps there, then come back\.<\/span>/);
+  for (const github of [signing(), signing({ phase: 'code', code: 'WDJB-MJHT', opened: false, command: GH_SIGN_IN_CMD }), ghOff()]) {
+    assert.equal(part(html(status({ github })), 'gh-cmd'), '', JSON.stringify(github.signingIn));
+  }
+  // hidden characters in it are shown, and nothing in it becomes markup
+  const odd = part(html(status({ github: ghOff({ signingIn: inATerminal({ command: `gh auth login <b>x</b>${U(0x202e)}` }) }) })), 'gh-cmd');
+  assert.match(odd, />gh auth login &lt;b&gt;x&lt;\/b&gt;⟦U\+202E⟧<\/code>/);
+  // connect.js copies the command the panel shows
+  assert.match(caseOf(read('../ui/connect.js'), 'gh-cmd-copy'), /githubCommand\(githubOf\(s\), st\.open\)/);
+});
+
+test('where gh cannot sign out by itself and Terminal cannot open, Sign out’s command shows with Copy while gh is still signed in, until GitHub changes', () => {
+  const s = status({ platform: 'linux', canOpenTerminal: false, github: viaGh({ sentence: '' }) });
+  const ps = V.panelParts(s, { presets: PRESETS, open: { ghCmd: GH_SIGN_OUT_CMD } });
+  const keys = ps.map(p => p.k);
+  assert.equal(keys.indexOf('gh-cmd'), keys.indexOf('gh-signed') + 1, 'under GitHub’s part, as the sign-in’s is');
+  const h = ps.map(p => p.html).join('');
+  assert.deepEqual(buttons(part(h, 'gh-signed')).map(b => b.cn), ['gh-signout'], 'gh is still signed in: Sign out stays');
+  const cmd = part(h, 'gh-cmd');
+  assert.ok(cmd.includes(`<code class="cn-cmd" tabindex="0" data-scroll="1">${esc(GH_SIGN_OUT_CMD)}</code>`));
+  assert.match(cmd, /Run this in a terminal, then come back here\./);
+  assert.deepEqual(buttons(cmd).map(b => [b.cn, b.label]), [['gh-cmd-copy', 'Copy']]);
+  assert.equal(V.githubCommand(V.githubOf(s), { ghCmd: ` ${GH_SIGN_OUT_CMD} ` }), GH_SIGN_OUT_CMD);
+  // connect.js keeps the command Sign out's answer carries, as an agent's way in does ...
+  const conn = read('../ui/connect.js');
+  const out = caseOf(conn, 'gh-signout');
+  const keep = "if (r && typeof r.command === 'string' && r.command.trim()) { st.open.ghCmd = r.command.trim(); paint(); }";
+  assert.ok(out.indexOf('connectApi.githubSignOut()') > 0 && out.indexOf(keep) > out.indexOf('connectApi.githubSignOut()'), 'Sign out keeps its answer’s command');
+  // the keyboard goes to Sign in to GitHub only once gh is signed out: while Terminal still signs it out (git no longer
+  // using it), that button would make git use gh again
+  assert.match(out, /if \(okAnswer\(r\) && !githubOf\(st\.status\)\.connected\) focusKey\('gh-signin'\);/);
+  // ... and lets it go once GitHub signs in or out (it was for the state it was given in), before anything is drawn
+  const req = conn.slice(conn.indexOf('async function request('), conn.indexOf('\n}\n', conn.indexOf('async function request(')));
+  const drop = "if (githubState(githubOf(before)) !== githubState(githubOf(s))) st.open.ghCmd = '';";
+  assert.ok(req.indexOf(drop) > req.indexOf('st.status = s;') && req.indexOf(drop) < req.indexOf('signInEnded(before, s)'), 'a new status that changed GitHub drops it');
+});
+
+test('signed in through GitHub’s command-line tool, but git does not use it: Sign in to GitHub (which only sets git up) beside Sign out, and the panel sends it', () => {
+  const s = status({ github: viaGh({ agentsUseIt: false, sentence: NOT_GIT }) });
+  const signed = part(html(s), 'gh-signed');
+  assert.ok(signed.includes(`<p class="cn-line">${esc(NOT_GIT)}</p>`));
+  assert.deepEqual(buttons(signed).map(b => [b.cn, b.label, b.state, b.pri]), [['gh-signin', 'Sign in to GitHub', 'gh:octocat', true], ['gh-signout', 'Sign out', 'gh:octocat', false]]);
+  assert.equal(V.githubCanSignIn(V.githubOf(s)), true);
+  assert.equal(buttons(part(html(s, { busy: new Set(['gh-signin']) }), 'gh-signed'))[0].disabled, true, 'it waits while its request is on its way');
+  // with no sentence from Workbench, the panel's own words say the same
+  assert.ok(part(html(status({ github: viaGh({ agentsUseIt: false, sentence: '' }) })), 'gh-signed').includes(`<p class="cn-line">${esc(NOT_GIT)}</p>`));
+  // git uses it: Sign out alone. Sign in to GitHub is offered (and sent) only where it does something, one at a time.
+  assert.deepEqual(buttons(part(html(status({ github: viaGh() })), 'gh-signed')).map(b => b.cn), ['gh-signout']);
+  const can = github => V.githubCanSignIn(V.githubOf(status({ github })));
+  assert.deepEqual([can(ghOff()), can(viaGh({ agentsUseIt: false })), can(viaGh()), can(gh()), can(gh({ agentsUseIt: true })), can(signing()),
+    can(viaGh({ agentsUseIt: false, signingIn: signing().signingIn }))], [true, true, false, false, false, false, false]);
+  // connect.js sends it in that state: its check is the drawing's
+  const signin = caseOf(read('../ui/connect.js'), 'gh-signin');
+  assert.match(signin, /if \(!s \|\| githubState\(g\) !== b\.dataset\.state \|\| !githubCanSignIn\(g\)\) \{ changed\(\); return; \}/);
+  assert.ok(signin.indexOf('connectApi.githubSignIn()') > signin.indexOf('!githubCanSignIn(g)'));
+});
+
+test('a sign-in to GitHub whose last step (making git use it) still runs once gh has it: the panel keeps reading, and shows the sign-in until it ends', () => {
+  // Connect's status then: gh signed in, git not using it yet, and the sign-in still under way (its code still shown)
+  const code = { phase: 'code', code: 'WDJB-MJHT', url: 'https://github.com/login/device', since: 1_800_000_000_000, sentence: 'Your code: WDJB-MJHT. Open GitHub, enter the code there, and approve the sign-in.' };
+  const finishing = status({ github: viaGh({ agentsUseIt: false, sentence: NOT_GIT, signingIn: code }) });
+  assert.equal(V.signingInWaits(finishing), true, 'it reads the status again in 2 seconds');
+  assert.equal(V.githubState(V.githubOf(finishing)), 'signing');
+  const h = html(finishing);
+  assert.equal(part(h, 'gh-signed'), '', 'not “Sign in to GitHub again”: Workbench is doing that now');
+  assert.doesNotMatch(h, /does not use this sign-in yet/);
+  assert.deepEqual(buttons(part(h, 'gh-off')).map(b => b.cn), ['gh-copy', 'gh-cancel', 'gh-token-toggle'], 'the sign-in under way, with Cancel');
+  // nothing is said until it ends, then GitHub's sentence, git using the sign-in; and the reading stops
+  const before = status({ github: signing({ phase: 'code', code: 'WDJB-MJHT' }) });
+  assert.deepEqual(V.signInEnded(before, finishing), []);
+  const done = status({ github: viaGh() });
+  assert.deepEqual(V.signInEnded(finishing, done), [{ who: 'github', ok: true, sentence: SIGNED_GH }]);
+  assert.equal(V.signingInWaits(done), false);
+  // beside a token connection, a sign-in under way keeps the panel reading too, and the token's part is drawn as it was
+  const token = status({ github: { ...gh(), signingIn: code } });
+  assert.equal(V.signingInWaits(token), true);
+  assert.notEqual(part(html(token), 'gh-on'), '');
+  assert.equal(part(html(token), 'gh-off'), '');
+});
+
 test('what is said when a sign-in ends: signed in, not finished (then Terminal), or GitHub’s own words; a cancel says nothing here', () => {
   const waitingClaude = { ...CLAUDE_OUT, signingIn: { since: 1, browser: true, sentence: '' } };
   const before = status({ agents: [waitingClaude, { ...CODEX_OUT, signingIn: { since: 1 } }], github: signing({ phase: 'code', code: 'WDJB-MJHT' }) });
   // Claude Code signed in, Codex's did not finish, GitHub signed in through the tool
   const after = status({ agents: [{ ...CLAUDE_OUT, signedIn: 'yes', how: 'your Claude subscription', ready: true }, { ...CODEX_OUT, actions: ['signin-terminal', 'signin', 'key', 'recheck'] }],
-    github: { connected: true, via: 'gh', login: 'octocat', sentence: '' } });
+    github: { connected: true, via: 'gh', login: 'octocat', agentsUseIt: true, sentence: '' } });
   assert.deepEqual(V.signInEnded(before, after), [
     { who: 'claude', ok: true, sentence: 'Claude Code is signed in.' },
     { who: 'codex', ok: false, sentence: V.BROWSER_FAILED },
@@ -824,6 +947,7 @@ test('everything Workbench or a person wrote is escaped, and hidden characters a
     status({ agents: [{ ...CLAUDE_OUT, name: evil, signingIn: { since: 1, browser: true, sentence: `Finish ${evil}` } }, { ...CODEX_OUT, name: evil, actions: ['signin-terminal', 'key'] }],
       git: { installed: false, canInstall: true, sentence: evil }, github: signing({ phase: 'code', code: evil, url: `https://github.com/${evil}`, sentence: evil }) }),
     status({ github: signing({ phase: 'terminal', sentence: `Terminal ${evil}` }) }),
+    status({ github: ghOff({ signingIn: inATerminal({ sentence: `Run ${evil}`, command: `gh auth login ${evil}${zw}` }) }) }),
     status({ github: { connected: true, via: 'gh', login: evil, sentence: '' } }),
     status({ github: ghOff({ sentence: `Refused ${evil}` }) }),
   ];
@@ -1127,6 +1251,80 @@ test('the stand-in API’s milestone 1.5 scenarios hold still, and its sign-ins 
     assert.equal(r.body.opened, true);
     assert.equal(V.gitOf(V.statusOf((await call('/api/connect/recheck', {})).body)).installed, true);
     assert.equal((await call('/api/connect/git/install', {})).code, 409);
+  } finally { await mock.close(); }
+});
+
+test('the stand-in API answers GitHub as Connect does where Terminal cannot open, while git does not use gh’s sign-in, and while that is being set up', async () => {
+  const { startMock, scenario, SCENARIOS } = await import('../scripts/ui-mock.mjs');
+  for (const name of ['connect-gh-nogit', 'connect-gh-command']) {
+    assert.ok(SCENARIOS.includes(name), name);
+    assert.equal(V.connectMeta(scenario(name)).ready, false, `${name}: no agent ready, so the panel opens by itself and the fit check lays it out`);
+  }
+  const mock = await startMock({ quiet: true });
+  const base = `http://127.0.0.1:${mock.port}`;
+  const ctl = (p, b) => fetch(`${base}/ctl/${p}`, { method: 'POST', body: JSON.stringify(b) }).then(r => r.json());
+  const call = (p, body) => fetch(base + p, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': 'k' },
+    body: body === undefined ? undefined : JSON.stringify(body) }).then(async r => ({ code: r.status, body: await r.json() }));
+  const read = async () => V.statusOf((await call('/api/connect')).body);
+  const drawn = (s, open = {}) => V.panelParts(s, { presets: PRESETS, open }).map(p => p.html).join('');
+  const cns = (s, k, open) => buttons(part(drawn(s, open), k)).map(b => b.cn);
+  try {
+    // signed in through the tool, git using it: Sign out alone
+    await ctl('scenario', { name: 'connect-gh-signed' });
+    let s = await read();
+    assert.deepEqual([s.github.agentsUseIt, s.github.sentence, cns(s, 'gh-signed')], [true, SIGNED_GH, ['gh-signout']]);
+    // git not using it: Connect's sentence, with Sign in to GitHub beside Sign out; Sign in then only sets git up
+    await ctl('scenario', { name: 'connect-gh-nogit' });
+    s = await read();
+    assert.deepEqual([s.github.connected, s.github.via, s.github.login, s.github.agentsUseIt, s.github.sentence], [true, 'gh', 'octocat', false, NOT_GIT]);
+    assert.deepEqual(await read(), s, 'it holds still');
+    assert.deepEqual(cns(s, 'gh-signed'), ['gh-signin', 'gh-signout']);
+    let r = await call('/api/connect/github/signin', {});
+    assert.deepEqual([r.code, r.body.ok, r.body.sentence, r.body.status.github.agentsUseIt, r.body.status.github.signingIn], [200, true, SIGNED_GH, true, null]);
+    assert.equal((await call('/api/connect/github/signin', {})).code, 409, 'git uses it now: nothing to sign in to');
+    // Sign out where gh cannot sign out by itself and Terminal cannot open: the command (Connect's), and gh still signed in
+    const ghPath = r.body.status.github.ghPath;
+    await ctl('mode', { connect: { signout: 'fail' } });
+    r = await call('/api/connect/github/signout', {});
+    assert.deepEqual([r.code, r.body.ok, r.body.why, r.body.opened, r.body.command, r.body.sentence], [200, false, 'gh', false, `${ghPath} auth logout --hostname github.com`,
+      'Workbench could not sign out of GitHub. Run this command in a terminal, then check again.']);
+    assert.equal(V.statusOf(r.body).github.connected, true);
+    assert.ok(part(drawn(V.statusOf(r.body), { ghCmd: r.body.command }), 'gh-cmd').includes(`>${esc(r.body.command)}</code>`), 'the panel shows it');
+    await ctl('mode', { connect: null });
+    r = await call('/api/connect/github/signout', {});
+    assert.deepEqual([r.body.ok, r.body.opened, V.statusOf(r.body).github.connected], [true, false, false]);
+    // signing in again: gh has the sign-in one read before git uses it, and the panel keeps reading until it ends
+    r = await call('/api/connect/github/signin', {});
+    assert.equal(V.statusOf(r.body).github.signingIn.phase, 'code');
+    assert.equal((await read()).github.connected, false);
+    s = await read();
+    assert.deepEqual([s.github.connected, s.github.agentsUseIt, s.github.sentence, s.github.signingIn.phase], [true, false, NOT_GIT, 'code'], 'gh signed in, git not set up yet');
+    assert.equal(V.signingInWaits(s), true);
+    assert.deepEqual([part(drawn(s), 'gh-signed'), cns(s, 'gh-off')], ['', ['gh-copy', 'gh-cancel', 'gh-token-toggle']]);
+    s = await read();
+    assert.deepEqual([s.github.agentsUseIt, s.github.sentence, s.github.signingIn, V.signingInWaits(s)], [true, SIGNED_GH, null, false]);
+    // a sign-in where Terminal could not open: Workbench waits, and its status carries the command (Connect's)
+    await ctl('scenario', { name: 'connect-gh-command' });
+    s = await read();
+    const si = s.github.signingIn;
+    assert.deepEqual(si, { phase: 'terminal', code: null, url: null, since: si.since, sentence: `Workbench could not open Terminal. ${NO_TERMINAL}`, opened: false,
+      command: `${ghPath} auth login --hostname github.com --git-protocol https --web --scopes workflow && ${ghPath} auth setup-git --hostname github.com` });
+    assert.deepEqual(await read(), s, 'it holds still');
+    assert.ok(part(drawn(s), 'gh-cmd').includes(`>${esc(si.command)}</code>`));
+    assert.deepEqual(cns(s, 'gh-off'), ['gh-cancel', 'gh-token-toggle']);
+    // and the same through Sign in to GitHub, with no Terminal: { gh: 'terminal', terminal: false }
+    await ctl('scenario', { name: 'connect-gh-none' });
+    await ctl('mode', { connect: { gh: 'terminal', terminal: false } });
+    await call('/api/connect/github/signin', {});
+    s = await read();
+    assert.deepEqual([s.github.signingIn.phase, s.github.signingIn.opened, s.github.signingIn.command], ['terminal', false, si.command]);
+    await read();
+    assert.deepEqual([(await read()).github.via, V.signingInWaits(await read())], ['gh', false], 'then signed in');
+    await ctl('scenario', { name: 'connect-gh-none' });
+    await ctl('mode', { connect: { gh: 'terminal' } });
+    await call('/api/connect/github/signin', {});
+    s = await read();
+    assert.deepEqual([s.github.signingIn.phase, 'opened' in s.github.signingIn, 'command' in s.github.signingIn], ['terminal', false, false], 'Terminal open: no command');
   } finally { await mock.close(); }
 });
 
