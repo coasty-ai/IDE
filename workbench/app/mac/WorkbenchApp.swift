@@ -6,6 +6,9 @@
 // to Workbench's standard input is a lifeline: when the app quits, or crashes, the pipe closes and Workbench stops its
 // agents, as on Ctrl-C. Nothing here talks to the agents: the page does that, exactly as in a browser.
 //
+// The clone sheet signs the person in to GitHub with GitHub's own command-line tool (`--github-signin`), or takes a
+// token instead. The first window says when git is not installed yet, and opens Apple's installer for it.
+//
 // Testing without clicks: `Workbench --repo <folder>` or `Workbench --demo` opens it at once; `--self-test` loads
 // the board, writes what it found to the log and to standard output, and quits.
 
@@ -103,7 +106,8 @@ func visible(_ s: String) -> String {
 }
 
 /// The JSON after `NAME ` on a line Workbench printed for the app (`WORKBENCH_APP {…}`, `WORKBENCH_CLONE {…}`,
-/// `WORKBENCH_GITHUB {…}`, `WORKBENCH_GITHUB_REPOS […]`), or nil.
+/// `WORKBENCH_GITHUB {…}` from `--connect-github`, `--github-signin` and `--github-status`, `WORKBENCH_GITHUB_REPOS
+/// […]`), or nil.
 func payload(_ line: String, _ name: String) -> Any? {
   let prefix = name + " "
   guard line.hasPrefix(prefix) else { return nil }
@@ -115,7 +119,7 @@ func payload(_ line: String, _ name: String) -> Any? {
 /// a name and password, or text that is no address at all (a key pasted in the wrong field, say).
 enum CloneAddress {
   static let shape = "Workbench clones addresses like https://github.com/owner/repo or git@github.com:owner/repo.git."
-  static let credentials = "Leave your name and password out of the address. If the repository is private, connect your GitHub account instead."
+  static let credentials = "Leave your name and password out of the address. If the repository is private, sign in to GitHub instead."
 
   /// Why this address is not even tried, in words, or nil.
   static func problem(_ a: String) -> String? {
@@ -190,8 +194,8 @@ enum CloneAddress {
 
   /**
    * A github.com address over ssh (`git@github.com:owner/repo.git`, `ssh://git@github.com/owner/repo.git`) in its https
-   * form (`https://github.com/owner/repo.git`), which a GitHub token can read; nil for any other address. Connect
-   * GitHub… gives git a token for https only, so a clone tried again after it goes over https.
+   * form (`https://github.com/owner/repo.git`), which a GitHub sign-in can read; nil for any other address. Sign in to
+   * GitHub… and a token both give git a sign-in for https only, so a clone tried again after them goes over https.
    */
   static func githubHTTPS(_ a: String) -> String? {
     var path: Substring
@@ -217,11 +221,11 @@ enum CloneAddress {
   /// What the sheet says when a clone was refused and Workbench's own line gave no sentence.
   static func refusal(_ kind: String, address: String, into: URL) -> String {
     switch kind {
-    case "auth": return "GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again."
+    case "auth": return "GitHub did not let Workbench read this repository. If it is private, sign in to GitHub, then try again."
     case "ssh":
       let h = host(address)
       if h?.lowercased() == "github.com" {
-        return "GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first."
+        return "GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, sign in to GitHub first."
       }
       return "\(h ?? "The server") did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, make sure git can sign in to \(h ?? "it") first."
     case "network": return "Workbench could not reach \(host(address) ?? "the repository’s server")."
@@ -279,6 +283,105 @@ enum Environment {
       if FileManager.default.fileExists(atPath: "/usr/share/locale/\(name)") { return name }
     }
     return "en_US.UTF-8"
+  }
+}
+
+// ------------------------------------------------------------------ git on this Mac
+
+/**
+ * Whether git can run on this Mac. Apple's git comes with its developer tools (the Command Line Tools, or Xcode).
+ * Without them, /usr/bin/git is only a stand-in that opens Apple's installer by itself when it is run, so it is run only
+ * after `xcode-select -p` has named a developer folder with git in it. A git of another kind that comes first on
+ * Workbench's PATH (Homebrew's, say) counts too, since that is the one Workbench runs.
+ */
+enum GitTools {
+  enum State { case unknown, ready, missing }
+
+  static let missing = "Git is not installed yet. Apple’s developer tools include it."
+
+  /**
+   * The check, off the main thread, 5 seconds at most for each program; `done` gets the answer on the main thread. Call
+   * it on the main thread.
+   */
+  static func check(_ done: @escaping (Bool) -> Void) {
+    let env = Environment.forWorkbench()
+    DispatchQueue.global(qos: .utility).async {
+      let ok = runs(env)
+      DispatchQueue.main.async { done(ok) }
+    }
+  }
+
+  private static func runs(_ env: [String: String]) -> Bool {
+    if let p = run("/usr/bin/xcode-select", ["-p"], env: env), p.status == 0 {
+      let dir = p.output.trimmingCharacters(in: .whitespacesAndNewlines)
+      if dir.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: dir + "/usr/bin/git"),
+         run("/usr/bin/git", ["--version"], env: env)?.status == 0 {
+        return true
+      }
+    }
+    guard let first = firstOnPath("git", env), first != "/usr/bin/git" else { return false }
+    return run(first, ["--version"], env: env)?.status == 0
+  }
+
+  /** The program Workbench would run by this name: the first on its PATH, with links followed. */
+  private static func firstOnPath(_ name: String, _ env: [String: String]) -> String? {
+    for dir in (env["PATH"] ?? "").split(separator: ":") where dir.hasPrefix("/") {
+      let p = "\(dir)/\(name)"
+      if FileManager.default.isExecutableFile(atPath: p) { return URL(fileURLWithPath: p).resolvingSymlinksInPath().path }
+    }
+    return nil
+  }
+
+  /**
+   * Install Git: `/usr/bin/xcode-select --install`, which opens Apple's own installer for its developer tools. `done`
+   * gets, on the main thread, whether it opened (exit 0). It exits 1 when the tools are there already. What it printed
+   * goes to the log only. Call it on the main thread.
+   */
+  static func install(_ done: @escaping (Bool) -> Void) {
+    let env = Environment.forWorkbench()
+    DispatchQueue.global(qos: .userInitiated).async {
+      let r = run("/usr/bin/xcode-select", ["--install"], env: env, limit: 30)
+      DispatchQueue.main.async {
+        let said = r.map { $0.output.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        Log.shared.write("xcode-select --install: \(r.map { "exited (\($0.status))" } ?? "did not run or was stopped")\(said.isEmpty ? "" : ": \(said)")")
+        done(r?.status == 0)
+      }
+    }
+  }
+
+  /**
+   * A program run with an argument array, Workbench's environment and nothing on its standard input, its output read
+   * as it comes. Past `limit` seconds it is stopped. nil when it could not start, or was stopped. Not on the main thread.
+   */
+  static func run(_ program: String, _ args: [String], env: [String: String], limit: TimeInterval = 5) -> (status: Int32, output: String)? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: program)
+    p.arguments = args
+    p.environment = env
+    p.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = out
+    p.standardInput = FileHandle.nullDevice
+    let lock = NSLock()
+    let ended = DispatchSemaphore(value: 0)
+    var data = Data()
+    out.fileHandleForReading.readabilityHandler = { h in
+      let d = h.availableData
+      if d.isEmpty { h.readabilityHandler = nil; ended.signal(); return }
+      lock.lock(); if data.count < 65_536 { data.append(d) }; lock.unlock()
+    }
+    do { try p.run() } catch { out.fileHandleForReading.readabilityHandler = nil; return nil }
+    let stop = DispatchWorkItem { if p.isRunning { p.terminate() } }
+    DispatchQueue.global().asyncAfter(deadline: .now() + limit, execute: stop)
+    p.waitUntilExit()
+    stop.cancel()
+    // What it printed last; a program it left running may keep the pipe open, so this waits a second at most.
+    _ = ended.wait(timeout: .now() + 1)
+    out.fileHandleForReading.readabilityHandler = nil
+    lock.lock(); let text = String(decoding: data, as: UTF8.self); lock.unlock()
+    guard p.terminationReason == .exit else { return nil }
+    return (p.terminationStatus, text)
   }
 }
 
@@ -502,14 +605,34 @@ final class HelperRun {
   }
 }
 
+/// What `--github-status` says: whether GitHub is signed in, as whom, and how (`gh`, GitHub's own command-line tool,
+/// or `token`, a token Workbench keeps).
+struct GitHubStatus {
+  let signedIn: Bool
+  let login: String?
+  let via: String?
+}
+
 /**
- * Runs the bundled Workbench once, with the environment the board's own process gets: `--github-repos`, or
- * `--connect-github` with the token on its standard input (never in its arguments, which other programs on the Mac can
- * read, nor in its environment). What it prints is read whole and not written to the log, since it names the person's
- * private repositories. Past `limit` seconds it is stopped.
+ * Runs the bundled Workbench once, with the environment the board's own process gets: `--github-repos`,
+ * `--github-status`, or `--connect-github` with the token on its standard input (never in its arguments, which other
+ * programs on the Mac can read, nor in its environment). What it prints is read whole and not written to the log, since
+ * it names the person's private repositories. Past `limit` seconds it is stopped. `quiet`: its exit is not logged
+ * either (`--github-status`, asked every 3 seconds while a sign-in in Terminal is awaited).
  */
 enum Helper {
-  static func run(_ args: [String], input: Data? = nil, limit: TimeInterval, done: @escaping (HelperResult) -> Void) {
+  /** `--github-status`, 15 seconds at most; nil when it gave no answer. */
+  static func githubStatus(quiet: Bool = false, _ done: @escaping (GitHubStatus?) -> Void) {
+    run(["--github-status"], limit: 15, quiet: quiet) { r in
+      guard case .done(let lines, _) = r,
+            let o = lines.reversed().lazy.compactMap({ payload($0, "WORKBENCH_GITHUB") as? [String: Any] }).first,
+            let signedIn = o["signedIn"] as? Bool else { done(nil); return }
+      let login = (o["login"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+      done(GitHubStatus(signedIn: signedIn, login: login, via: o["via"] as? String))
+    }
+  }
+
+  static func run(_ args: [String], input: Data? = nil, limit: TimeInterval, quiet: Bool = false, done: @escaping (HelperResult) -> Void) {
     let what = args.first ?? "Workbench"
     let res = Bundle.main.resourceURL!
     let p = Process()
@@ -548,10 +671,120 @@ enum Helper {
       let lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
         .map { $0.hasSuffix("\r") ? String($0.dropLast()) : String($0) }
       DispatchQueue.main.async {
-        Log.shared.write("\(what): exited (\(status))")
+        if !quiet || status != 0 { Log.shared.write("\(what): exited (\(status))") }
         run.finish(.done(lines: lines, status: status))
       }
     }
+  }
+}
+
+/**
+ * A run of the bundled Workbench whose lines are answered as they come, while it still runs: `--github-signin`, which
+ * prints a `WORKBENCH_GITHUB` line for each step of a sign-in that can take 15 minutes. Its standard input stays open
+ * while it runs, and closes when the app stops it or goes away. Its other lines (Workbench's own words about what went
+ * wrong) go to the log, as the board's do; the `WORKBENCH_GITHUB` lines do not.
+ */
+final class HelperStream {
+  /// Every run under way, kept until its process has exited, whoever let go of it (main thread only).
+  private static var running: [ObjectIdentifier: HelperStream] = [:]
+  let what: String
+  private let process = Process()
+  private let input = Pipe()
+  private let output = Pipe()
+  private var buffer = Data()
+  private var exitStatus: Int32?
+  private var outputEnded = false
+  private var reported = false
+  /// Each whole line, on the main thread.
+  var onLine: ((String) -> Void)?
+  /// Once it has exited and all it printed has been read (or a second after it exited), on the main thread.
+  var onExit: ((Int32) -> Void)?
+
+  init(_ args: [String]) {
+    what = args.first ?? "Workbench"
+    let res = Bundle.main.resourceURL!
+    process.executableURL = res.appendingPathComponent("node/bin/node")
+    process.arguments = [res.appendingPathComponent("workbench/bin/workbench.mjs").path] + args
+    process.environment = Environment.forWorkbench()
+    process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = output
+  }
+
+  /** Start it; false when it could not start (said in the log). */
+  func start() -> Bool {
+    output.fileHandleForReading.readabilityHandler = { [weak self] h in
+      let data = h.availableData
+      if data.isEmpty { h.readabilityHandler = nil }   // the end: it closed its output
+      DispatchQueue.main.async { self?.take(data) }
+    }
+    process.terminationHandler = { [weak self] p in
+      let status = p.terminationStatus
+      DispatchQueue.main.async {
+        guard let self = self else { return }
+        self.exitStatus = status
+        self.reportExit(force: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.reportExit(force: true) }
+      }
+    }
+    do { try process.run() } catch {
+      output.fileHandleForReading.readabilityHandler = nil
+      Log.shared.write("\(what): could not start: \(error.localizedDescription)")
+      return false
+    }
+    HelperStream.running[ObjectIdentifier(self)] = self
+    Log.shared.write("\(what): started")
+    return true
+  }
+
+  /** Stop it: its standard input closes, then SIGTERM, and SIGKILL 3 seconds later. Nothing it says after this is heard. */
+  func stop() {
+    onLine = nil
+    onExit = nil
+    try? input.fileHandleForWriting.close()
+    guard process.isRunning else { return }
+    let p = process
+    let pid = p.processIdentifier
+    Log.shared.write("\(what): stopped")
+    p.terminate()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if p.isRunning { kill(pid, SIGKILL) } }
+  }
+
+  private func take(_ data: Data) {
+    guard !data.isEmpty else {
+      if !outputEnded {
+        outputEnded = true
+        if !buffer.isEmpty { take(line: String(decoding: buffer, as: UTF8.self)); buffer.removeAll() }
+      }
+      reportExit(force: false)
+      return
+    }
+    buffer.append(data)
+    while let nl = buffer.firstIndex(of: 0x0a) {
+      let lineData = buffer[buffer.startIndex..<nl]
+      buffer.removeSubrange(buffer.startIndex...nl)
+      take(line: String(decoding: lineData, as: UTF8.self))
+    }
+    if buffer.count > 1_000_000 { buffer.removeAll() }   // no line is that long
+  }
+
+  private func take(line raw: String) {
+    let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
+    if !line.hasPrefix("WORKBENCH_"), !line.trimmingCharacters(in: .whitespaces).isEmpty { Log.shared.write("\(what): \(line)") }
+    onLine?(line)
+  }
+
+  private func reportExit(force: Bool) {
+    guard !reported, let status = exitStatus, outputEnded || force else { return }
+    reported = true
+    output.fileHandleForReading.readabilityHandler = nil
+    Log.shared.write("\(what): exited (\(status))")
+    let done = onExit
+    onLine = nil
+    onExit = nil
+    HelperStream.running[ObjectIdentifier(self)] = nil
+    done?(status)
   }
 }
 
@@ -571,9 +804,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
   var selfTest = false
   var selfTestStarted = false
   var selfTestCode: Int32 = 0
+  /// Whether git runs, as the last check found (GitTools). Clone waits for it.
+  var git = GitTools.State.unknown
+  private var gitChecking = false
+  private var gitCheckAgain = false
+  private var gitInstalling = false
+  /// What the first window says after Install Git, in place of "Git is not installed yet. …".
+  private var gitWords: String?
+  private weak var welcomeClone: NSButton?
+  private weak var welcomeGit: NSView?
+  private weak var welcomeGitText: NSTextField?
+  private weak var welcomeInstall: NSButton?
 
   func applicationDidFinishLaunching(_ note: Notification) {
     buildMenus()
+    checkGit()
     NSApp.activate(ignoringOtherApps: true)
     let args = CommandLine.arguments
     selfTest = args.contains("--self-test")
@@ -598,6 +843,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
   func application(_ app: NSApplication, open urls: [URL]) {
     guard let url = urls.first(where: { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }) else { return }
     if launched { open(folder: url) } else { launchFolder = url }
+  }
+
+  // Back in front, after Apple's installer, say: is git there now?
+  func applicationDidBecomeActive(_ note: Notification) { checkGit() }
+
+  // A sign-in to GitHub under way stops with the app.
+  func applicationWillTerminate(_ note: Notification) { cloneSheet?.end() }
+
+  // MARK: git
+
+  /** Whether git runs, found again (one check at a time). Only a change redraws anything. */
+  func checkGit() {
+    guard !gitChecking else { gitCheckAgain = true; return }
+    gitChecking = true
+    GitTools.check { [weak self] ok in
+      guard let self = self else { return }
+      self.gitChecking = false
+      let found: GitTools.State = ok ? .ready : .missing
+      if found != self.git {
+        Log.shared.write(ok ? "git runs" : "git does not run: \(GitTools.missing)")
+        self.git = found
+        if ok { self.gitWords = nil }
+        self.showGit()
+        self.cloneSheet?.refresh()
+      }
+      if self.gitCheckAgain { self.gitCheckAgain = false; self.checkGit() }
+    }
+  }
+
+  /** Install Git: Apple's installer for its developer tools, which include git. The app checks again when it is back in front. */
+  @objc func installGit() {
+    guard !gitInstalling else { return }
+    gitInstalling = true
+    welcomeInstall?.isEnabled = false
+    GitTools.install { [weak self] opened in
+      guard let self = self else { return }
+      self.gitInstalling = false
+      self.gitWords = opened ? "Apple’s installer is open: follow its steps, then come back here."
+        : "Apple’s installer did not open. View → Show Log says why."
+      self.showGit()
+      self.checkGit()   // the tools may be there already
+    }
+  }
+
+  /** The first window's git line, Install Git and Clone Repository…, as the last check found git; in place. */
+  func showGit() {
+    welcomeClone?.isEnabled = git != .missing
+    welcomeGit?.isHidden = git != .missing
+    welcomeGitText?.stringValue = gitWords ?? GitTools.missing
+    welcomeInstall?.isEnabled = !gitInstalling
+    if let w = welcome { fitWelcome(w) }
   }
 
   // MARK: choosing a folder
@@ -726,9 +1022,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
   // MARK: cloning a repository
 
-  /** Clone Repository…: the clone sheet, over the window in front (the board, or the first window). */
+  /** Clone Repository…: the clone sheet, over the window in front (the board, or the first window). Not while git is missing. */
   @objc func showClone() {
     if let s = cloneSheet { s.host?.makeKeyAndOrderFront(nil); return }
+    guard git != .missing else { NSSound.beep(); return }   // the button and the menu item are off: the first window says why
     let host: NSWindow
     if let k = NSApp.keyWindow, k === welcome || k === boardWindow {
       host = k
@@ -803,10 +1100,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     alert(visible(sentence), info: "")
   }
 
-  // While the clone sheet is up, it is the way to open something: finish it, or cancel it, first.
+  // While the clone sheet is up, it is the way to open something: finish it, or cancel it, first. Clone Repository…
+  // waits for git.
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     if cloneSheet != nil, let action = item.action,
        [#selector(chooseFolder), #selector(openDemo), #selector(openRecent(_:))].contains(action) { return false }
+    if item.action == #selector(showClone), cloneSheet == nil, git == .missing { return false }
     return true
   }
 
@@ -999,7 +1298,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     title.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
     let sub = NSTextField(wrappingLabelWithString: "Clone a git repository, or open one, to start agents on it. Each agent works in its own copy, and you merge what you want to keep.")
     sub.textColor = .secondaryLabelColor
+    sub.preferredMaxLayoutWidth = 444
+    // Git missing: why Clone is off, and Install Git (Apple's installer). Hidden while git runs.
+    let gitIcon = NSImageView()
+    gitIcon.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
+    gitIcon.contentTintColor = .systemOrange
+    gitIcon.setContentHuggingPriority(.required, for: .horizontal)
+    let gitText = NSTextField(wrappingLabelWithString: gitWords ?? GitTools.missing)
+    gitText.preferredMaxLayoutWidth = 300
+    let install = NSButton(title: "Install Git", target: self, action: #selector(installGit))
+    install.isEnabled = !gitInstalling
+    let gitRow = NSStackView(views: [gitIcon, gitText, install])
+    gitRow.alignment = .centerY
+    gitRow.spacing = 8
+    gitRow.isHidden = git != .missing
     let clone = NSButton(title: "Clone Repository…", target: self, action: #selector(showClone))
+    clone.isEnabled = git != .missing
     let open = NSButton(title: "Open Folder…", target: self, action: #selector(chooseFolder))
     open.keyEquivalent = "\r"
     let demo = NSButton(title: "Try the Demo", target: self, action: #selector(openDemo))
@@ -1007,7 +1321,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     buttons.spacing = 8
     stack.addArrangedSubview(title)
     stack.addArrangedSubview(sub)
+    stack.addArrangedSubview(gitRow)
     stack.addArrangedSubview(buttons)
+    welcomeClone = clone
+    welcomeGit = gitRow
+    welcomeGitText = gitText
+    welcomeInstall = install
     let recents = Recents.list().filter { FileManager.default.fileExists(atPath: $0.path) }
     if !recents.isEmpty {
       let label = NSTextField(labelWithString: "Recent")
@@ -1024,8 +1343,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
       }
     }
     w.contentView = stack
+    fitWelcome(w)
     w.makeKeyAndOrderFront(nil)
     return w
+  }
+
+  /** The first window as tall as what it shows, 360 points at least, its top edge where it was. */
+  func fitWelcome(_ w: NSWindow) {
+    guard let content = w.contentView else { return }
+    content.layoutSubtreeIfNeeded()
+    let size = NSSize(width: 500, height: max(360, ceil(content.fittingSize.height)))
+    let frame = w.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+    var f = w.frame
+    guard abs(f.height - frame.height) > 0.5 else { return }
+    f.origin.y += f.height - frame.height
+    f.size = frame.size
+    w.setFrame(f, display: true)
   }
 
   @objc func openRecentButton(_ sender: NSButton) {
@@ -1135,9 +1468,9 @@ struct GitHubRepo {
 /**
  * Clone Repository…: an address, or one of the person's repositories on GitHub; the folder it goes in; then progress
  * while git works. The clone runs in the board's own Workbench process (`--clone … --into … --app`), so once it is done
- * that process is the board, and the sheet goes. A refused clone says why here, with "Connect GitHub…" when GitHub did
- * not let Workbench read the repository (`auth`); not when it did not accept this Mac's SSH key (`ssh`), which a
- * token does not mend.
+ * that process is the board, and the sheet goes. A refused clone says why here, with "Sign in to GitHub…" and "Use a
+ * token instead…" when GitHub did not let Workbench read the repository (`auth`); not when it did not accept this Mac's
+ * SSH key (`ssh`), which a sign-in for https does not mend.
  */
 final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
   weak var app: AppDelegate?
@@ -1150,11 +1483,14 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
   private let note = NSStackView()              // in the list's place while it loads, or when there is none
   private let noteSpinner = NSProgressIndicator()
   private let noteText = NSTextField(wrappingLabelWithString: "")
-  private let noteConnect = NSButton(title: "Connect GitHub…", target: nil, action: nil)
+  private let noteSignIn = NSButton(title: "Sign in to GitHub…", target: nil, action: nil)
+  private let noteToken = CloneSheet.link("Use a token instead…")
   private let folderText = NSTextField(labelWithString: "")
   private let chooseButton = NSButton(title: "Choose…", target: nil, action: nil)
   private let message = NSTextField(wrappingLabelWithString: "")
-  private let messageConnect = NSButton(title: "Connect GitHub…", target: nil, action: nil)
+  private let messageActions = NSStackView()    // beside the message after an `auth` refusal
+  private let messageSignIn = NSButton(title: "Sign in to GitHub…", target: nil, action: nil)
+  private let messageToken = CloneSheet.link("Use a token instead…")
   private let bar = NSProgressIndicator()
   private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
   private let cloneButton = NSButton(title: "Clone", target: nil, action: nil)
@@ -1164,10 +1500,21 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
   private var name = ""                 // the repository being cloned, as the sheet names it
   private var busy = false              // closing what is open, or cloning
   private var lastFailure: String?      // auth, ssh, network, exists, url, git, …
-  private var login: String?            // the GitHub account connected in this sheet
+  private var login: String?            // the GitHub account: signed in or connected in this sheet, or as Workbench says
+  private var connected = false         // GitHub is signed in or connected, as this sheet knows
   private var loads = 0
   private var ended = false
   private var connect: ConnectGitHubSheet?
+  private var signIn: SignInGitHubSheet?
+
+  /** A small button that reads like a link: "Use a token instead…". */
+  static func link(_ title: String) -> NSButton {
+    let b = NSButton(title: title, target: nil, action: nil)
+    b.isBordered = false
+    b.contentTintColor = .linkColor
+    b.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+    return b
+  }
 
   init(app: AppDelegate) {
     self.app = app
@@ -1222,12 +1569,15 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     noteText.alignment = .center
     noteText.textColor = .secondaryLabelColor
     noteText.preferredMaxLayoutWidth = 420
-    noteConnect.target = self
-    noteConnect.action = #selector(connectGitHub)
-    for v in [noteSpinner, noteText, noteConnect] as [NSView] { note.addArrangedSubview(v) }
+    noteSignIn.target = self
+    noteSignIn.action = #selector(signInToGitHub)
+    noteToken.target = self
+    noteToken.action = #selector(useToken)
+    for v in [noteSpinner, noteText, noteSignIn, noteToken] as [NSView] { note.addArrangedSubview(v) }
     note.orientation = .vertical
     note.alignment = .centerX
     note.spacing = 8
+    note.setCustomSpacing(4, after: noteSignIn)
     note.translatesAutoresizingMaskIntoConstraints = false
 
     let listBox = NSView()
@@ -1247,10 +1597,17 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     message.preferredMaxLayoutWidth = 370
     message.setContentHuggingPriority(.defaultLow, for: .horizontal)
     message.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-    messageConnect.target = self
-    messageConnect.action = #selector(connectGitHub)
-    messageConnect.isHidden = true
-    let messageRow = NSStackView(views: [message, messageConnect])
+    messageSignIn.target = self
+    messageSignIn.action = #selector(signInToGitHub)
+    messageToken.target = self
+    messageToken.action = #selector(useToken)
+    messageActions.orientation = .vertical
+    messageActions.alignment = .centerX
+    messageActions.spacing = 2
+    messageActions.setViews([messageSignIn, messageToken], in: .center)
+    messageActions.setContentHuggingPriority(.required, for: .horizontal)
+    messageActions.isHidden = true
+    let messageRow = NSStackView(views: [message, messageActions])
     messageRow.alignment = .centerY
     messageRow.spacing = 8
 
@@ -1296,7 +1653,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
       note.centerXAnchor.constraint(equalTo: listBox.centerXAnchor),
       note.centerYAnchor.constraint(equalTo: listBox.centerYAnchor),
       note.widthAnchor.constraint(lessThanOrEqualTo: listBox.widthAnchor, constant: -40),
-      messageRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 34),
+      messageRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 40),   // room for Sign in to GitHub… and its link
     ]
     for v in [addressRow, filter, listBox, folderRow, messageRow, bar, buttons] as [NSView] {
       constraints.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40))
@@ -1320,13 +1677,24 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     loadRepos()
   }
 
-  /** The sheet goes (the board opened, or the person cancelled). Nothing that arrives after this is shown. */
+  /**
+   * The sheet goes (the board opened, or the person cancelled, or the app quits). Nothing that arrives after this is
+   * shown, and a sign-in to GitHub under way stops.
+   */
   func end() {
     guard !ended else { return }
     ended = true
     connect?.end()
     connect = nil
+    signIn?.end()
+    signIn = nil
     if let parent = window.sheetParent { parent.endSheet(window) } else { window.orderOut(nil) }
+  }
+
+  /** Whether git runs changed: Clone follows it. */
+  func refresh() {
+    guard !ended else { return }
+    update()
   }
 
   // MARK: the list of repositories
@@ -1335,7 +1703,8 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
 
   private func showList(_ state: ListState) {
     noteSpinner.stopAnimation(nil)
-    noteConnect.isHidden = true
+    noteSignIn.isHidden = true
+    noteToken.isHidden = true
     note.isHidden = false
     switch state {
     case .loading:
@@ -1344,20 +1713,25 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     case .list:
       note.isHidden = true
     case .none:
-      if let login = login {
-        noteText.stringValue = "GitHub lists no repositories for \(visible(login))."
+      if connected {
+        noteText.stringValue = "GitHub lists no repositories for \(login.map(visible) ?? "your account")."
       } else {
-        noteText.stringValue = "Connect your GitHub account to choose from your repositories here."
-        noteConnect.isHidden = false
+        noteText.stringValue = "Sign in to GitHub to choose from your repositories here."
+        noteSignIn.isHidden = false
+        noteToken.isHidden = false
       }
     case .failed(let sentence):
       noteText.stringValue = sentence
-      noteConnect.isHidden = false
+      noteSignIn.isHidden = false
+      noteToken.isHidden = false
     }
     update()
   }
 
-  /** `--github-repos`, 20 seconds at most. With no GitHub account connected, the list is empty. */
+  /**
+   * `--github-repos`, 20 seconds at most. With no GitHub account signed in or connected, the list is empty; then
+   * `--github-status` tells that apart from an account with no repositories.
+   */
   private func loadRepos() {
     loads += 1
     let mine = loads
@@ -1378,7 +1752,19 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
           return GitHubRepo(fullName: name, cloneUrl: url, isPrivate: (o["private"] as? Bool) == true)
         }
         self.applyFilter()
-        self.showList(self.repos.isEmpty ? .none : .list)
+        guard self.repos.isEmpty, !self.connected else {
+          self.showList(self.repos.isEmpty ? .none : .list)
+          return
+        }
+        // Empty: no sign-in, or an account with no repositories? Workbench says which.
+        Helper.githubStatus { [weak self] s in
+          guard let self = self, !self.ended, mine == self.loads else { return }
+          if let s = s, s.signedIn {
+            self.connected = true
+            if let l = s.login { self.login = l }
+          }
+          self.showList(.none)
+        }
       case .timedOut:
         self.showList(.failed("Your repositories on GitHub did not load within 20 seconds."))
       case .failed:
@@ -1484,6 +1870,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
   }
 
   private func startClone(_ a: String, saying first: String?) {
+    if app?.git == .missing { failed(kind: "nogit", sentence: GitTools.missing); return }
     if let problem = CloneAddress.problem(a) { failed(kind: "url", sentence: problem); return }
     let fm = FileManager.default
     let place = visible((folder.path as NSString).abbreviatingWithTildeInPath)
@@ -1502,7 +1889,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     }
     name = CloneAddress.shortName(a)
     lastFailure = nil
-    messageConnect.isHidden = true
+    messageActions.isHidden = true
     busy = true
     message.stringValue = (first.map { $0 + " " } ?? "") + "Cloning \(visible(name)) into \(visible(folder.lastPathComponent))…"
     spin()
@@ -1566,7 +1953,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     busy = false
     lastFailure = kind
     message.stringValue = visible(sentence)
-    messageConnect.isHidden = kind != "auth"
+    messageActions.isHidden = kind != "auth"
     update()
     if kind == "url" { window.makeFirstResponder(address) }
   }
@@ -1579,7 +1966,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
 
   private func clearMessage() {
     message.stringValue = ""
-    messageConnect.isHidden = true
+    messageActions.isHidden = true
     lastFailure = nil
   }
 
@@ -1588,9 +1975,9 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     filter.isEnabled = !busy && !repos.isEmpty
     table.isEnabled = !busy
     chooseButton.isEnabled = !busy
-    noteConnect.isEnabled = !busy
-    messageConnect.isEnabled = !busy
-    cloneButton.isEnabled = !busy && !address.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    for b in [noteSignIn, noteToken, messageSignIn, messageToken] { b.isEnabled = !busy }
+    cloneButton.isEnabled = !busy && app?.git != .missing
+      && !address.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     if !busy {
       bar.stopAnimation(nil)
       bar.isHidden = true
@@ -1601,42 +1988,375 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
 
   @objc func cancel() { app?.cancelClone() }
 
-  // MARK: Connect GitHub…
+  // MARK: Sign in to GitHub…, or a token
 
-  /**
-   * The token sheet. Once GitHub accepts the token, the list loads again; after a clone GitHub refused (`auth`), the
-   * clone is tried again at once. The token is for https, so a github.com address over ssh is tried in its https form,
-   * which the address field then shows; so is one refused for this Mac's SSH key (`ssh`).
-   */
-  @objc func connectGitHub() {
-    guard !busy, !ended, connect == nil else { return }
+  /** Sign in to GitHub…: GitHub's own command-line tool signs the person in (SignInGitHubSheet). */
+  @objc func signInToGitHub() {
+    guard !busy, !ended, connect == nil, signIn == nil else { return }
+    let s = SignInGitHubSheet()
+    signIn = s
+    s.onEnd = { [weak self] outcome in
+      guard let self = self else { return }
+      self.signIn = nil
+      guard !self.ended else { return }
+      switch outcome {
+      case .signedIn(let login):
+        self.signedIn(login: login, sentence: login.map { "Signed in to GitHub as \($0)." } ?? "Signed in to GitHub.")
+      case .useToken:
+        self.useToken()
+      case .cancelled:
+        break
+      }
+    }
+    s.present(on: window)
+  }
+
+  /** Use a token instead…: milestone 1's token sheet (ConnectGitHubSheet), for a Mac where GitHub's tool cannot run. */
+  @objc func useToken() {
+    guard !busy, !ended, connect == nil, signIn == nil else { return }
     let c = ConnectGitHubSheet()
     connect = c
     c.onEnd = { [weak self] login, sentence in
       guard let self = self else { return }
       self.connect = nil
       guard let login = login, !self.ended else { return }
-      self.login = login
-      let a = self.address.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-      let https = CloneAddress.githubHTTPS(a)
-      let again = self.lastFailure == "auth" || (self.lastFailure == "ssh" && https != nil)
-      self.loadRepos()
-      if again, !a.isEmpty {
-        if let https = https { self.address.stringValue = https }
-        self.startClone(https ?? a, saying: visible(sentence))
-      } else {
-        self.clearMessage()
-        self.message.stringValue = visible(sentence)
-      }
+      self.signedIn(login: login, sentence: sentence)
     }
     c.present(on: window)
+  }
+
+  /**
+   * GitHub is signed in, or a token connected. The list loads again; after a clone GitHub refused (`auth`), the clone is
+   * tried again at once. Both are for https, so a github.com address over ssh is tried in its https form, which the
+   * address field then shows; so is one refused for this Mac's SSH key (`ssh`).
+   */
+  private func signedIn(login: String?, sentence: String) {
+    connected = true
+    if let login = login { self.login = login }
+    let a = address.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    let https = CloneAddress.githubHTTPS(a)
+    let again = lastFailure == "auth" || (lastFailure == "ssh" && https != nil)
+    loadRepos()
+    if again, !a.isEmpty {
+      if let https = https { address.stringValue = https }
+      startClone(https ?? a, saying: visible(sentence))
+    } else {
+      clearMessage()
+      message.stringValue = visible(sentence)
+    }
   }
 }
 
 /**
- * Connect GitHub…: a token from the person's GitHub account, given to Workbench (`--connect-github`, with the token on
- * its standard input). Workbench checks it with GitHub, keeps it in the login keychain, and gives it to git for
- * github.com. The field is emptied as the token is sent, and the app keeps no copy of it.
+ * Sign in to GitHub…: GitHub's own command-line tool, gh, signs the person in, through Workbench's `--github-signin`,
+ * which first gets gh from GitHub's releases when this Mac has none. Its `WORKBENCH_GITHUB {"phase",…}` lines drive the
+ * sheet, in whatever order they come:
+ * - `installing`: "Getting GitHub’s command-line tool…";
+ * - `code` (with `code` and `url`): "Your code: ABCD-1234", and Open GitHub, which copies the code and opens the page;
+ *   the run goes on until gh is done, and its `done` line (after git is set up to use gh) is waited for;
+ * - `terminal`: Terminal is open on the sign-in, since it could not run without it. Whether or not the run goes on,
+ *   `--github-status` is asked every 3 seconds, one at a time, for 10 minutes at most, and a sign-in through gh ends it;
+ * - `done` (with `login`), or `error` (with `sentence`).
+ * A run that ends without `done` or `error` is checked once with `--github-status`. gh keeps the sign-in: Workbench
+ * never sees the token. "Use a token instead…" ends the sheet and opens the token sheet.
+ */
+final class SignInGitHubSheet: NSObject {
+  enum Outcome { case signedIn(login: String?), useToken, cancelled }
+  private enum Phase { case starting, installing, code, terminal, done, failed }
+  /// Where GitHub's device sign-in is; a `code` line's `url` is opened only when it is a page on https://github.com.
+  static let devicePage = URL(string: "https://github.com/login/device")!
+
+  let window: NSWindow
+  private let codeRow = NSStackView()
+  private let codeText = NSTextField(labelWithString: "")
+  private let openButton = NSButton(title: "Open GitHub", target: nil, action: nil)
+  private let spinner = NSProgressIndicator()
+  private let status = NSTextField(wrappingLabelWithString: "")
+  private let tokenLink = CloneSheet.link("Use a token instead…")
+  private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+  private let againButton = NSButton(title: "Try Again", target: nil, action: nil)
+  private var phase = Phase.starting
+  private var run: HelperStream?
+  private var code = ""
+  private var page = SignInGitHubSheet.devicePage
+  private var generation = 0          // one per try: a timer, a poll or a line from an earlier try is not heard
+  private var heard = false           // this try printed a WORKBENCH_GITHUB line
+  private var ended = false
+  /// Called once, when the sheet goes.
+  var onEnd: ((Outcome) -> Void)?
+
+  override init() {
+    window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 260), styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    super.init()
+    let title = NSTextField(labelWithString: "Sign in to GitHub")
+    title.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+    let about = NSTextField(wrappingLabelWithString: "GitHub’s own command-line tool signs you in, and keeps the sign-in itself. Git in Terminal, Workbench and your agents then use it.")
+    about.preferredMaxLayoutWidth = 420
+    let codeLabel = NSTextField(labelWithString: "Your code:")
+    codeText.font = NSFont.monospacedSystemFont(ofSize: 20, weight: .semibold)
+    codeText.isSelectable = true
+    openButton.target = self
+    openButton.action = #selector(openGitHub)
+    codeRow.setViews([codeLabel, codeText], in: .leading)
+    codeRow.setViews([openButton], in: .trailing)
+    codeRow.alignment = .centerY
+    codeRow.spacing = 8
+    codeRow.isHidden = true
+    spinner.style = .spinning
+    spinner.controlSize = .small
+    spinner.isDisplayedWhenStopped = false
+    status.preferredMaxLayoutWidth = 390
+    status.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    let statusRow = NSStackView(views: [spinner, status])
+    statusRow.spacing = 6
+    statusRow.alignment = .centerY
+    tokenLink.target = self
+    tokenLink.action = #selector(useToken)
+    cancelButton.target = self
+    cancelButton.action = #selector(cancel)
+    cancelButton.keyEquivalent = "\u{1b}"
+    againButton.target = self
+    againButton.action = #selector(tryAgain)
+    let buttons = NSStackView()
+    buttons.setViews([tokenLink], in: .leading)
+    buttons.setViews([cancelButton, againButton], in: .trailing)
+    buttons.spacing = 8
+    let stack = NSStackView(views: [title, about, codeRow, statusRow, buttons])
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 10
+    stack.detachesHiddenViews = false    // the sheet keeps its size from one step to the next
+    stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+    stack.setCustomSpacing(14, after: about)
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    let content = NSView()
+    content.addSubview(stack)
+    var constraints = [
+      stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+      stack.topAnchor.constraint(equalTo: content.topAnchor),
+      stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+      stack.widthAnchor.constraint(equalToConstant: 460),
+      codeRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
+      statusRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 50),   // three lines of words
+    ]
+    for v in [about, codeRow, statusRow, buttons] as [NSView] {
+      constraints.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40))
+    }
+    NSLayoutConstraint.activate(constraints)
+    window.contentView = content
+    content.layoutSubtreeIfNeeded()
+    window.setContentSize(content.fittingSize)
+  }
+
+  func present(on parent: NSWindow) {
+    window.appearance = parent.appearance
+    parent.beginSheet(window) { _ in }
+    begin()
+  }
+
+  /** The sheet goes without a sign-in (the clone sheet went, or the app quits). */
+  func end() { close(.cancelled) }
+
+  private func close(_ outcome: Outcome) {
+    guard !ended else { return }
+    ended = true
+    generation += 1
+    run?.stop()
+    run = nil
+    spinner.stopAnimation(nil)
+    if let parent = window.sheetParent { parent.endSheet(window) } else { window.orderOut(nil) }
+    let done = onEnd
+    onEnd = nil
+    done?(outcome)
+  }
+
+  @objc func cancel() { close(.cancelled) }
+
+  @objc func useToken() { close(.useToken) }
+
+  @objc func tryAgain() {
+    guard !ended, phase == .failed else { return }
+    begin()
+  }
+
+  /**
+   * Open GitHub: the code goes on the clipboard, and GitHub's page opens in the browser, to paste it in. Only a code of
+   * plain letters, digits and signs (like WDJB-MJHT) is copied.
+   */
+  @objc func openGitHub() {
+    guard !ended, phase == .code, !code.isEmpty else { return }
+    if code.unicodeScalars.allSatisfy({ $0.value > 0x20 && $0.value < 0x7F }) {
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(code, forType: .string)
+    }
+    NSWorkspace.shared.open(page)
+  }
+
+  // MARK: a try
+
+  /** A try: `--github-signin`, its lines answered as they come. */
+  private func begin() {
+    run?.stop()
+    generation += 1
+    let gen = generation
+    heard = false
+    code = ""
+    page = SignInGitHubSheet.devicePage
+    show(.starting, "Starting the sign-in…")
+    limit(120, "The sign-in did not start within 2 minutes.")
+    let r = HelperStream(["--github-signin"])
+    r.onLine = { [weak self] line in
+      guard let self = self, gen == self.generation, !self.ended else { return }
+      self.take(line)
+    }
+    r.onExit = { [weak self] status in
+      guard let self = self, gen == self.generation, !self.ended else { return }
+      self.run = nil
+      self.exited(status)
+    }
+    run = r
+    if !r.start() {
+      run = nil
+      failed("Workbench could not start the sign-in. View → Show Log says why.")
+    }
+  }
+
+  private func take(_ line: String) {
+    guard let o = payload(line, "WORKBENCH_GITHUB") as? [String: Any], let step = o["phase"] as? String else { return }
+    heard = true
+    let sentence = (o["sentence"] as? String).flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+    switch step {
+    case "installing":
+      guard phase == .starting || phase == .installing else { return }
+      show(.installing, sentence ?? "Getting GitHub’s command-line tool…")
+      limit(600, "Getting GitHub’s command-line tool took more than 10 minutes. Check this Mac’s internet connection, then try again.")
+    case "code":
+      guard phase == .starting || phase == .installing || phase == .code,
+            let c = (o["code"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty else { return }
+      code = String(c.prefix(32))
+      page = SignInGitHubSheet.githubPage(o["url"] as? String)
+      codeText.stringValue = visible(code)
+      show(.code, "Open GitHub copies the code and opens GitHub’s page: paste it there, and approve the sign-in.")
+      limit(16 * 60, "The code has expired. Try again for a new one.")
+    case "terminal":
+      guard phase != .terminal, phase != .done, phase != .failed else { return }
+      show(.terminal, sentence ?? "Terminal is open: follow the steps there, then come back here.")
+      let gen = generation
+      let deadline = Date().addingTimeInterval(600)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.poll(gen, until: deadline) }
+    case "done":
+      guard phase != .done, phase != .failed else { return }
+      signedIn((o["login"] as? String).flatMap { $0.isEmpty ? nil : $0 }, settle: phase == .terminal)
+    case "error":
+      guard phase != .done, phase != .failed else { return }
+      failed(sentence ?? "Workbench could not sign you in to GitHub.")
+    default:
+      break
+    }
+  }
+
+  /** The run ended without `done` or `error`. After Terminal, the polls go on; otherwise Workbench is asked once. */
+  private func exited(_ status: Int32) {
+    switch phase {
+    case .terminal, .done, .failed:
+      return
+    case .starting where !heard:
+      failed("Workbench could not start the sign-in. View → Show Log says why.")
+    case .starting, .installing, .code:
+      let gen = generation
+      show(phase, "Checking the sign-in…")
+      Helper.githubStatus { [weak self] s in
+        guard let self = self, gen == self.generation, !self.ended, self.phase != .done, self.phase != .failed else { return }
+        if let s = s, s.signedIn, s.via == nil || s.via == "gh" {
+          self.signedIn(s.login, settle: false)
+        } else {
+          self.failed("The sign-in did not finish.")
+        }
+      }
+    }
+  }
+
+  /**
+   * After Terminal: `--github-status` every 3 seconds, one at a time, until it says signed in through gh, or `deadline`.
+   * A sign-in through a token Workbench keeps (`via: token`) does not count: it was there before.
+   */
+  private func poll(_ gen: Int, until deadline: Date) {
+    guard gen == generation, !ended, phase == .terminal else { return }
+    guard Date() < deadline else {
+      Log.shared.write("--github-signin: no sign-in in Terminal within 10 minutes")
+      failed("The sign-in in Terminal did not finish within 10 minutes.")
+      return
+    }
+    Helper.githubStatus(quiet: true) { [weak self] s in
+      guard let self = self, gen == self.generation, !self.ended, self.phase == .terminal else { return }
+      if let s = s, s.signedIn, s.via == nil || s.via == "gh" {
+        self.signedIn(s.login, settle: true)
+        return
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.poll(gen, until: deadline) }
+    }
+  }
+
+  /**
+   * Signed in. After Terminal, the sheet stays two seconds more: Terminal's second step, which makes git use gh, runs
+   * right after the sign-in that was seen.
+   */
+  private func signedIn(_ login: String?, settle: Bool) {
+    show(.done, login.map { "Signed in to GitHub as \($0)." } ?? "Signed in to GitHub.")
+    guard settle else { close(.signedIn(login: login)); return }
+    let gen = generation
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+      guard let self = self, gen == self.generation, !self.ended else { return }
+      self.close(.signedIn(login: login))
+    }
+  }
+
+  private func failed(_ sentence: String) {
+    generation += 1      // this try's timers, polls and lines are not heard any more
+    run?.stop()
+    run = nil
+    show(.failed, sentence)
+  }
+
+  /** Past `seconds` in the step it was set in, the try stops, with this sentence. */
+  private func limit(_ seconds: TimeInterval, _ sentence: String) {
+    let gen = generation
+    let at = phase
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+      guard let self = self, gen == self.generation, !self.ended, self.phase == at else { return }
+      Log.shared.write("--github-signin: stopped after \(Int(seconds)) s without the next step")
+      self.failed(sentence)
+    }
+  }
+
+  private func show(_ p: Phase, _ words: String) {
+    guard !ended else { return }
+    phase = p
+    status.stringValue = visible(words)
+    let waiting = p == .starting || p == .installing || p == .code || p == .terminal
+    if waiting { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+    codeRow.isHidden = p != .code
+    againButton.isHidden = p != .failed
+    tokenLink.isHidden = p == .done
+    openButton.keyEquivalent = p == .code ? "\r" : ""
+    againButton.keyEquivalent = p == .failed ? "\r" : ""
+  }
+
+  /** A `code` line's address when it is a page on https://github.com, else GitHub's device sign-in page. */
+  static func githubPage(_ s: String?) -> URL {
+    guard let s = s, let u = URL(string: s), u.scheme?.lowercased() == "https", u.host?.lowercased() == "github.com",
+          u.user == nil, u.password == nil, u.port == nil else { return devicePage }
+    return u
+  }
+}
+
+/**
+ * Use a token instead…: a token from the person's GitHub account, given to Workbench (`--connect-github`, with the
+ * token on its standard input), milestone 1's way, for a Mac where GitHub's own tool cannot run. Workbench checks it
+ * with GitHub, keeps it in the login keychain, and gives it to git for github.com. The field is emptied as the token is
+ * sent, and the app keeps no copy of it.
  */
 final class ConnectGitHubSheet: NSObject, NSTextFieldDelegate {
   static let tokenPage = URL(string: "https://github.com/settings/tokens/new?description=Workbench&scopes=repo")!
