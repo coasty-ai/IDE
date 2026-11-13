@@ -3,17 +3,23 @@
 // Codex runs one process per turn; the conversation (a "thread") lives on disk under CODEX_HOME.
 // Checked against `codex exec --help` and `codex exec resume --help` of codex-cli 0.166.0:
 //
-//   first turn:  codex exec --json -C <workspace> --sandbox workspace-write [-m <model>] -- <task>
-//   follow-up:   codex exec resume --json -c sandbox_mode="workspace-write" [-m <model>] -- <threadId> <text>
+//   first turn:  codex exec --json -C <workspace> --sandbox workspace-write <git> [-m <model>] -- <task>
+//   follow-up:   codex exec resume --json -c sandbox_mode="workspace-write" <git> [-m <model>] -- <threadId> <text>
+//   <git>:       -c sandbox_workspace_write.network_access=true
+//                -c sandbox_workspace_write.writable_roots=["<git common dir>","<worktree's git dir>"]
 //
 // - `resume` accepts neither -C nor --sandbox. So every process is spawned with its cwd set to the workspace
 //   (that is the folder a resumed turn works in), and the sandbox is set by a config override.
 // - `--` ends the options, so a task or message that begins with "-", or is a bare subcommand name such as
 //   "review", is passed as text instead of being parsed as an option.
 // - stdin is ignored: with stdin open, Codex waits for it to close before it starts.
-// - There are no permission asks: Codex works inside its own workspace-write sandbox.
+// - There are no permission asks: Codex works inside its own workspace-write sandbox. That sandbox has no network
+//   and lets Codex write only its own folder, while a worktree's git data lives in the repository's .git, outside
+//   it. So both turns turn the network on and add the repository's git folders as writable roots (see sandboxArgs),
+//   for Codex to commit, fetch, pull and push. The network is then open for anything, not only git.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
 import { withNodeOnPath, withKeys, safeMask, maskParsed, maskedTail, MASK_MARGIN } from '../claude/args.mjs';
@@ -66,14 +72,82 @@ export function buildEnv(base = process.env, agentId, keysEnv = null) {
   return withNodeOnPath(env);
 }
 
-/** Arguments for the first turn. */
-export function startArgs({ cwd, task, model }) {
-  return ['exec', '--json', '-C', cwd, '--sandbox', 'workspace-write', ...(model ? ['-m', model] : []), '--', task];
+/** A folder's real path, or null when it is not a folder that is there. */
+function realFolder(p) {
+  try {
+    const real = fs.realpathSync.native(p);
+    return fs.statSync(real).isDirectory() ? real : null;
+  } catch {
+    return null;
+  }
 }
 
-/** Arguments for a follow-up turn on an existing thread. */
-export function resumeArgs({ threadId, text, model }) {
-  return ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', ...(model ? ['-m', model] : []), '--', threadId, text];
+/**
+ * The git folders an agent's folder needs to write, as real paths, read from git's own layout (gitrepository-layout(5),
+ * git-worktree(1)) without running git:
+ * - a repository's own folder: its .git folder;
+ * - a worktree, as Workbench makes them: its .git is a file "gitdir: <path>", naming its own git folder
+ *   <common dir>/worktrees/<name> (its index, HEAD and the like), whose file "commondir" names the repository's
+ *   shared git folder, the common dir (commits, branches, tags, remotes). Both are returned, the common dir first.
+ * Anything else, or a layout that does not hold together (a worktree's git folder that is not in <common dir>/worktrees),
+ * gives [], and Codex then writes only its own folder, as before. The runner reads this once, when it is made.
+ * @returns {string[]}
+ */
+export function gitFolders(cwd) {
+  try {
+    const top = realFolder(cwd);
+    if (!top) return [];
+    const dotGit = path.join(top, '.git');
+    const st = fs.lstatSync(dotGit);
+    if (st.isDirectory()) return [dotGit];
+    if (!st.isFile()) return [];
+    // git strips the line ending, and reads a relative path from the folder the .git file is in.
+    const text = fs.readFileSync(dotGit, 'utf8').replace(/[\r\n]+$/, '');
+    if (!text.startsWith('gitdir: ') || /[\r\n]/.test(text)) return [];
+    const own = realFolder(path.resolve(top, text.slice('gitdir: '.length)));
+    if (!own) return [];
+    // "commondir" names the common dir, relative to the worktree's own git folder.
+    const named = fs.readFileSync(path.join(own, 'commondir'), 'utf8').replace(/[\r\n]+$/, '');
+    const common = named && !/[\r\n]/.test(named) ? realFolder(path.resolve(own, named)) : null;
+    if (!common || path.dirname(own) !== path.join(common, 'worktrees')) return [];
+    return [common, own];
+  } catch {
+    return [];
+  }
+}
+
+/** A TOML basic string: quotes and backslashes escaped, and every control character as \uXXXX (TOML allows none raw). */
+export function tomlString(text) {
+  return '"' + String(text).replace(/["\\\u0000-\u001f\u007f]/g, ch => (ch === '"' || ch === '\\'
+    ? '\\' + ch
+    : '\\u' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0'))) + '"';
+}
+
+/**
+ * Config overrides that let Codex do git in its workspace-write sandbox, on every turn: the network on, and the
+ * repository's git folders (gitFolders) added to the folders it may write. The keys are those of Codex's configuration
+ * reference: sandbox_workspace_write.network_access (a boolean, "Allow outbound network access inside the
+ * workspace-write sandbox") and sandbox_workspace_write.writable_roots (an array of strings, "Additional writable roots
+ * when sandbox_mode = "workspace-write""). A -c value is read as TOML, and it replaces the whole array, so writable
+ * folders from the person's own Codex config do not apply to Workbench's agents.
+ */
+export function sandboxArgs(gitDirs = []) {
+  const out = ['-c', 'sandbox_workspace_write.network_access=true'];
+  if (Array.isArray(gitDirs) && gitDirs.length) {
+    out.push('-c', `sandbox_workspace_write.writable_roots=[${gitDirs.map(tomlString).join(',')}]`);
+  }
+  return out;
+}
+
+/** Arguments for the first turn. `gitDirs`: gitFolders(cwd). */
+export function startArgs({ cwd, task, model, gitDirs = [] }) {
+  return ['exec', '--json', '-C', cwd, '--sandbox', 'workspace-write', ...sandboxArgs(gitDirs), ...(model ? ['-m', model] : []), '--', task];
+}
+
+/** Arguments for a follow-up turn on an existing thread. `gitDirs`: gitFolders(cwd), as for the first turn. */
+export function resumeArgs({ threadId, text, model, gitDirs = [] }) {
+  return ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', ...sandboxArgs(gitDirs), ...(model ? ['-m', model] : []),
+    '--', threadId, text];
 }
 
 /** Node scripts (test doubles) run with this Node, so they need no exec bit or shebang. */
@@ -202,6 +276,8 @@ export function createRunner(opts = {}) {
   const keysEnv = opts.keysEnv && typeof opts.keysEnv === 'object' ? opts.keysEnv : null;
   const hide = typeof opts.mask === 'function' ? safeMask(opts.mask) : null; // null: nothing to hide
   const mask = hide || (s => s);
+  // Read once, when the runner is made: what its turns write into these folders cannot widen the folders of its next turns.
+  const gitDirs = cwd ? gitFolders(cwd) : [];
 
   let threadId = opts.sessionId || null;
   let current = null;        // the process of the turn in progress, or null between turns
@@ -344,9 +420,9 @@ export function createRunner(opts = {}) {
   /** Start the next turn with `text`: resume the thread, or start over if there is no thread yet. */
   function followUp(text) {
     started = true;
-    if (threadId) return launch(resumeArgs({ threadId, text, model }), 'follow-up');
+    if (threadId) return launch(resumeArgs({ threadId, text, model, gitDirs }), 'follow-up');
     // The first run never got as far as starting a conversation, so begin again with the task and this message.
-    return launch(startArgs({ cwd, task: task ? `${task}\n\n${text}` : text, model }), 'new start');
+    return launch(startArgs({ cwd, task: task ? `${task}\n\n${text}` : text, model, gitDirs }), 'new start');
   }
 
   function drain() {
@@ -360,7 +436,8 @@ export function createRunner(opts = {}) {
     started = true;
     stopped = false;
     if (model) deliver({ kind: EV.MODEL, model });
-    await launch(startArgs({ cwd, task, model }), 'first turn');
+    log(gitDirs.length ? `its sandbox may also write the git folders ${gitDirs.join(' and ')}` : 'no git folders to add to its sandbox');
+    await launch(startArgs({ cwd, task, model, gitDirs }), 'first turn');
   }
 
   async function send(text) {

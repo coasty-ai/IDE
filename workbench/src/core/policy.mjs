@@ -90,11 +90,25 @@ const R = Object.freeze({
   writesFile: 'This command can write to a file.',
   runsProgram: 'This command can start other programs.',
   findDanger: 'This find command can delete files, write files or run other commands.',
-  gitOption: 'Options before the git command can change what git runs.',
-  gitSub: 'This git command can change the repository.',
-  gitBranchDelete: 'This deletes a branch.',
-  gitBranchChange: 'This renames, copies, moves or reconfigures a branch.',
+  gitOption: 'This option before the git command can point git at another repository or make it run other programs.',
+  gitNone: 'It did not say which git command to run.',
+  gitElsewhere: "It wants git to work in a folder outside the agent's own.",
+  gitUnknown: "This is not one of git's own commands, so it could be an alias or another program.",
+  gitPrograms: 'This git command starts other programs.',
+  gitRunsProgram: 'This option makes git start another program.',
+  gitAddress: 'This address makes git start another program.',
+  gitSettings: "This changes git's settings, which can make git run other programs.",
+  gitSchedule: "This changes git's settings for the whole computer and schedules tasks on it.",
+  gitSignIn: 'This reads or changes the sign-in that git keeps for you.',
+  ghSignIn: "This shows the sign-in that GitHub's command-line tool keeps for you.",
+  gitRemote: 'This push replaces or deletes what is already on the remote.',
+  gitMirror: 'This sets up a mirror of a remote: every later push to it replaces or deletes what is already there.',
+  gitOutside: "It names a place outside the agent's own folder, where git could write.",
+  gitRecords: "It names a place in git's own records, in the .git folder.",
+  gitClaude: "It names a place in a .claude folder, which holds Claude Code's own settings.",
+  gitUnsafe: "This lets git change files outside the agent's own folder.",
   gitRead: 'This git command only reads.',
+  gitAny: "Git commands that stay in the agent's own folder run without asking.",
   tests: "This runs the project's tests, checks or build.",
   testsExtra: 'Extra options for this command need your OK.',
   testsOutside: "The command points at something outside the agent's own folder.",
@@ -532,12 +546,13 @@ function climbsOut(p) {
  * null when reading `p` stays inside the agent's folder (its .git and .claude included) or one of its
  * scratch folders; otherwise an ask. `missingOk`: a path that does not exist names nothing to read, such
  * as the grep pattern "/api/users"; used for command words, never for the file tools. A missing relative
- * path that climbs out of the folder still asks (see climbsOut).
+ * path that climbs out of the folder still asks (see climbsOut). `from` is the folder a relative path is read
+ * from (git -C), inside the agent's folder; by default the agent's folder itself.
  */
-function readCheck(p, base, also, missingOk = false) {
+function readCheck(p, base, also, missingOk = false, from = base) {
   if (typeof p !== 'string' || !p.trim()) return ask(R.pathUnclear);
   if (p === '/dev/null') return null;
-  const r = resolveReal(p, base);
+  const r = resolveReal(p, from);
   if (!r.ok) return ask(r.reason, 'mayLeave'); // ~user, a missing link target: it could be anywhere
   if (placeOf(r.real, base) !== 'outside') return null;
   if (also.some(test => test(r.real))) return null;
@@ -735,12 +750,71 @@ const READ_ONLY = {
 const FIND_BAD = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-rm', '-fprint', '-fprint0', '-fprintf', '-fls']);
 const FIND_WRITES = new Set(['-fprint', '-fprint0', '-fprintf', '-fls']); // the next word is the file written
 const findDoes = opt => (opt === '-delete' || opt === '-rm' ? 'delete files' : FIND_WRITES.has(opt) ? 'write to a file' : 'run another program');
-const GIT_READ = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'blame', 'grep', 'branch']);
-// git branch: only options that list branches. Creating a branch (a plain name) is fine.
-const BRANCH_SHORT_OK = 'arvliq';
-const BRANCH_LONG_OK = new Set(['all', 'remotes', 'verbose', 'list', 'show-current', 'merged', 'no-merged', 'contains',
-  'no-contains', 'points-at', 'sort', 'format', 'color', 'no-color', 'column', 'no-column', 'ignore-case', 'abbrev',
-  'no-abbrev', 'quiet']);
+
+/**
+ * git's own commands (`git help -a`, git 2.47), which an agent may run in its own folder without asking (see judgeGit
+ * for what still asks). Any other word after `git` is an alias or another program named git-<word>, so it asks.
+ */
+const GIT_OWN = new Set([
+  'add', 'am', 'annotate', 'apply', 'archive', 'backfill', 'bisect', 'blame', 'branch', 'bugreport', 'bundle', 'cat-file',
+  'check-attr', 'check-ignore', 'check-mailmap', 'check-ref-format', 'checkout', 'checkout-index', 'cherry', 'cherry-pick',
+  'clean', 'clone', 'column', 'commit', 'commit-graph', 'commit-tree', 'config', 'count-objects', 'describe', 'diagnose',
+  'diff', 'diff-files', 'diff-index', 'diff-pairs', 'diff-tree', 'fast-export', 'fast-import', 'fetch', 'fetch-pack',
+  'fmt-merge-msg', 'for-each-ref', 'format-patch', 'fsck', 'gc', 'get-tar-commit-id', 'grep', 'hash-object', 'help', 'hook',
+  'index-pack', 'init', 'interpret-trailers', 'log', 'ls-files', 'ls-remote', 'ls-tree', 'mailinfo', 'mailsplit', 'maintenance',
+  'merge', 'merge-base', 'merge-file', 'merge-tree', 'mktag', 'mktree', 'multi-pack-index', 'mv', 'name-rev', 'notes',
+  'pack-objects', 'pack-redundant', 'pack-refs', 'patch-id', 'prune', 'prune-packed', 'pull', 'push', 'range-diff', 'read-tree',
+  'rebase', 'reflog', 'refs', 'remote', 'repack', 'replace', 'replay', 'request-pull', 'rerere', 'reset', 'restore', 'rev-list',
+  'rev-parse', 'revert', 'rm', 'send-pack', 'shortlog', 'show', 'show-branch', 'show-index', 'show-ref', 'sparse-checkout',
+  'stage', 'stash', 'status', 'stripspace', 'submodule', 'switch', 'symbolic-ref', 'tag', 'unpack-file', 'unpack-objects',
+  'update-index', 'update-ref', 'update-server-info', 'var', 'verify-commit', 'verify-pack', 'verify-tag', 'version',
+  'whatchanged', 'worktree', 'write-tree',
+]);
+/**
+ * git commands that start other programs, servers or windows, run git in other repositories, or send mail: they ask.
+ * `credential` and its helpers (credential-osxkeychain, credential-store...) work with the person's stored sign-in.
+ */
+const GIT_PROGRAMS = new Set(['archimport', 'citool', 'cvsexportcommit', 'cvsimport', 'cvsserver', 'daemon', 'difftool',
+  'filter-branch', 'for-each-repo', 'fsmonitor--daemon', 'gui', 'http-backend', 'imap-send', 'instaweb', 'merge-index',
+  'merge-one-file', 'mergetool', 'p4', 'quiltimport', 'receive-pack', 'remote-ext', 'remote-fd', 'send-email', 'shell', 'svn',
+  'upload-archive', 'upload-pack', 'web--browse']);
+/**
+ * git commands that only read. A word of theirs that names nothing (a search pattern such as "/api") is fine, as for the
+ * other read-only commands; every other git command may write, so its words are held to where git could write.
+ */
+const GIT_READ = new Set(['annotate', 'blame', 'cat-file', 'check-attr', 'check-ignore', 'check-mailmap', 'check-ref-format',
+  'cherry', 'count-objects', 'describe', 'diff', 'diff-files', 'diff-index', 'diff-pairs', 'diff-tree', 'for-each-ref',
+  'get-tar-commit-id', 'grep', 'help', 'log', 'ls-files', 'ls-remote', 'ls-tree', 'merge-base', 'name-rev', 'range-diff',
+  'rev-list', 'rev-parse', 'shortlog', 'show', 'show-branch', 'show-ref', 'status', 'var', 'verify-commit', 'verify-tag',
+  'version', 'whatchanged']);
+/** Options before the subcommand that change nothing about where git works or what it runs. -C is judged on its own. */
+const GIT_QUIET = new Set(['--no-pager', '-P', '--no-optional-locks', '--literal-pathspecs', '--glob-pathspecs',
+  '--noglob-pathspecs', '--icase-pathspecs', '--no-replace-objects', '--no-lazy-fetch', '--no-advice']);
+/** Options of a git command that make it start a program it is given, or write settings that can name one. */
+const GIT_RUNS = Object.freeze({
+  push: { long: ['receive-pack', 'exec'] }, 'send-pack': { long: ['receive-pack', 'exec'] },
+  fetch: { long: ['upload-pack'] }, pull: { long: ['upload-pack'] }, 'ls-remote': { long: ['upload-pack'] },
+  'fetch-pack': { long: ['upload-pack', 'exec'] }, archive: { long: ['exec'] },
+  clone: { short: 'uc', long: ['upload-pack', 'config', 'template'] }, init: { long: ['template'] },
+  rebase: { short: 'x', long: ['exec'] }, grep: { short: 'O', long: ['open-files-in-pager'] }, help: { short: 'w', long: ['web'] },
+});
+/** git push: options and refspecs that replace or delete what is on the remote, and the options that take a value. */
+const PUSH_REWRITES = ['force', 'force-with-lease', 'force-if-includes', 'mirror', 'delete', 'prune'];
+const PUSH_VALUES = ['repo', 'push-option', 'receive-pack', 'exec'];
+/** git config: what writes, what only reads, and the options that take a value (git 2.46 also has `git config set …`). */
+const CONFIG_WRITES = ['add', 'replace-all', 'unset', 'unset-all', 'rename-section', 'remove-section', 'edit', 'comment'];
+const CONFIG_READS = ['get', 'get-all', 'get-regexp', 'get-urlmatch', 'get-color', 'get-colorbool', 'list'];
+const CONFIG_VALUES = ['file', 'blob', 'type', 'default', 'comment', 'value', 'url'];
+const CONFIG_ACTIONS = new Set(['set', 'unset', 'rename-section', 'remove-section', 'edit']);
+/**
+ * Commands whose -m (--message) is text, never a place: the letters of options that take no value, which may stand
+ * before m in one word (`git commit -am "…"`).
+ */
+const MESSAGE_FLAGS = Object.freeze({ commit: 'apsneioqvz', tag: 'asfdvlei', merge: 'nqve', stash: 'pkuaqS', notes: 'f', 'commit-tree': '' });
+/** A web address (https://, ssh://, git://...): a place on another computer, not in this one. file:// is a path here. */
+const WEB_ADDRESS = /^(?!file:)[a-z][a-z0-9+.-]*:\/\//i;
+/** Where a git command could write, by what kind of place it is: each asks. */
+const GIT_PLACE = Object.freeze({ outside: R.gitOutside, git: R.gitRecords, claude: R.gitClaude });
 /**
  * Options `node --test` may take, from `node --help` on Node 26, and what each one's value may be (null: a
  * switch with no value). Every other option asks, among them each option that loads a module: --import,
@@ -831,11 +905,8 @@ function judgeWords(words, base, { extraAllow, also = [] }) {
     if (words.some(w => w.globLead)) return ask(R.globOption, undefined, RUN);
     return wordsStayInside(cmd, words.slice(1), base, also) || allow(R.readOnly);
   }
-  if (cmd === 'git') {
-    const v = judgeGit(argv, words, base);
-    // diff --no-index, blame --contents and friends read any file they are given.
-    return v.decision === 'allow' ? (wordsStayInside(cmd, words.slice(1), base, also) || v) : v;
-  }
+  if (cmd === 'git') return judgeGit(argv, words, base, also);
+  if (cmd === 'gh' && ghShowsSignIn(argv)) return ask(R.ghSignIn, undefined, 'see your GitHub sign-in');
   return judgeRunner(argv, words, base) || ask(R.notSafe);
 }
 
@@ -905,30 +976,224 @@ function judgeReadOnly(spec, argv, words, base) {
   return allow(R.readOnly);
 }
 
-function judgeGit(argv, words, base) {
+/**
+ * git, in the agent's own folder: any of git's own commands runs without asking (committing, branching, merging,
+ * rebasing, fetching, pulling, pushing, cloning...). What reaches past the agent's own work still asks:
+ * - options before the command that point git elsewhere or make it run programs (-c, --git-dir, --work-tree,
+ *   --exec-path...), and -C with a folder outside the agent's own (-C inside it is fine);
+ * - a word that is not one of git's own commands (an alias or another program), and the commands that start programs;
+ * - the person's stored sign-in (`git credential`, its helpers);
+ * - writing git's settings (`git config` that is not a plain read), and options that run a program they are given;
+ * - a push that replaces or deletes what is on the remote, and a remote set up as a push mirror;
+ * - a place outside the agent's folder in any word (and, for a command that can write, a place in .git or .claude).
+ * Wildcards that could turn file names into options ask, as for every command.
+ */
+function judgeGit(argv, words, base, also) {
   let i = 1;
-  // Extra: --no-pager / -P only turn the pager off. Any other option before the subcommand
-  // (-c, -C, --exec-path, --git-dir...) can change what git runs, so it asks.
-  while (argv[i] === '--no-pager' || argv[i] === '-P') i++;
+  const from = [base]; // the folders git reads relative words from: the agent's own, then each -C folder
+  for (; i < argv.length && argv[i].startsWith('-'); i++) {
+    const a = argv[i];
+    if (GIT_QUIET.has(a)) continue;
+    if (a === '--version' && i === argv.length - 1) return allow(R.gitRead);
+    if (a !== '-C' || i + 1 >= argv.length) return ask(R.gitOption, undefined, 'run a git command');
+    i++;
+    if (words[i].glob) return ask(R.globOption, undefined, RUN);
+    if (argv[i] === '') continue; // git ignores an empty -C
+    // Each -C is read from the folder the one before it led to, as git does.
+    const r = resolveReal(argv[i], from.at(-1));
+    if (!r.ok) return ask(r.reason, 'mayLeave', 'run a git command');
+    const place = placeOf(r.real, base);
+    if (place === 'outside') return ask(R.gitElsewhere, 'outside', 'run a git command');
+    if (place === 'git') return ask(R.testsGit, 'git', 'run a git command');
+    if (place === 'claude') return ask(R.testsClaude, 'claude', 'run a git command');
+    if (!r.exists) return ask(R.pathUnclear, undefined, 'run a git command');
+    from.push(r.real);
+  }
   const sub = argv[i];
-  if (!sub || sub.startsWith('-')) return ask(R.gitOption, undefined, 'run a git command');
-  if (!GIT_READ.has(sub)) return ask(R.gitSub, undefined, 'run a git command');
-  const rest = argv.slice(i + 1);
-  if (words.slice(i + 1).some(w => w.globLead)) return ask(R.globOption, undefined, RUN);
-  const out = rest.findIndex(a => longIs(a, ['output'])); // diff/log/show --output=<file>
-  if (out >= 0) return ask(R.writesFile, placeWhere(optionValue(rest, out, ''), base), 'write to a file');
-  if (sub === 'grep' && rest.some(a => shortHas(a, 'O') || longIs(a, ['open-files-in-pager']))) return ask(R.runsProgram, undefined, 'run another program');
-  if (sub === 'branch') {
-    for (const a of rest) {
-      if (a.startsWith('--')) {
-        const name = a.slice(2).split('=')[0];
-        if (!BRANCH_LONG_OK.has(name)) return ask('delete'.startsWith(name) && name ? R.gitBranchDelete : R.gitBranchChange, undefined, 'change the repository');
-      } else if (a.startsWith('-') && a.length > 1) {
-        if ([...a.slice(1)].some(ch => !BRANCH_SHORT_OK.includes(ch))) return ask(/[dD]/.test(a) ? R.gitBranchDelete : R.gitBranchChange, undefined, 'change the repository');
+  if (sub === undefined) return ask(R.gitNone, undefined, 'run a git command');
+  if (words[i].glob) return ask(R.globCommand, undefined, RUN);
+  if (/^credential(-|$)/.test(sub)) return ask(R.gitSignIn, undefined, 'use your saved sign-in');
+  if (GIT_PROGRAMS.has(sub)) return { ...ask(R.gitPrograms), say: 'wants to run another program' };
+  if (!GIT_OWN.has(sub)) return { ...ask(R.gitUnknown), say: 'wants to run a git command' };
+  const rest = words.slice(i + 1);
+  if (rest.some(w => w.globLead)) return ask(R.globOption, undefined, RUN);
+  const args = argv.slice(i + 1);
+  const v = gitOptions(sub, args);
+  if (v) return v;
+  const read = GIT_READ.has(sub) || sub === 'config'; // config gets here only when it reads
+  return gitWords(sub, args, rest, from, base, also, read) || allow(read ? R.gitRead : R.gitAny);
+}
+
+/** The asks that depend on a git command's options, not on the places it names; null when there are none. */
+function gitOptions(sub, args) {
+  // An address that makes git start a program (ext::<command>, fd::), whichever command is given it.
+  if (args.some(a => /(^|=)(ext|fd)::/i.test(a))) return { ...ask(R.gitAddress), say: 'wants to run another program' };
+  if (sub === 'config') return configWrites(args) ? ask(R.gitSettings, undefined, 'change git settings') : null;
+  if ((sub === 'push' || sub === 'send-pack') && pushRewrites(args)) return ask(R.gitRemote); // narrate says what it replaces
+  const first = args.find(a => !a.startsWith('-'));
+  // A remote set up as a push mirror (remote.<name>.mirror): every later plain push to it acts as push --mirror.
+  // `clone --mirror` sets one up for origin, and so do `remote add --mirror` and `--mirror=push` (not `=fetch`).
+  if ((sub === 'clone' && args.some(a => longIs(a, ['mirror'])))
+    || (sub === 'remote' && first === 'add' && args.some(a => longIs(a, ['mirror']) && !/=fetch$/.test(a)))) return ask(R.gitMirror);
+  const runs = GIT_RUNS[sub];
+  if (runs && args.some(a => optionIs(a, runs))) return { ...ask(R.gitRunsProgram), say: 'wants to run another program' };
+  if ((sub === 'bisect' && first === 'run') || (sub === 'submodule' && first === 'foreach')) {
+    return { ...ask(R.gitPrograms), say: 'wants to run another program' };
+  }
+  if (sub === 'maintenance' && /^(start|stop|register|unregister)$/.test(first ?? '')) {
+    return { ...ask(R.gitSchedule), say: 'wants to change git settings for this computer' };
+  }
+  if (sub === 'apply' && args.some(a => longIs(a, ['unsafe-paths']))) return ask(R.gitUnsafe, 'mayLeave');
+  return null;
+}
+
+/**
+ * Whether `git config <args>` could write. Only a plain read is not: --get and its kin, --list (-l), git 2.46's
+ * `get` and `list`, or a single name. --edit (-e) opens an editor on the settings, so it counts as a write.
+ */
+function configWrites(args) {
+  let reads = false;
+  const names = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { names.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      const name = a.slice(2).split('=')[0];
+      // git takes an abbreviation of a long option: whatever could be a write counts as one.
+      if (!name || (CONFIG_WRITES.some(n => n.startsWith(name)) && !CONFIG_READS.includes(name))) return true;
+      if (CONFIG_READS.some(n => n.startsWith(name))) reads = true;
+      else if (!a.includes('=') && CONFIG_VALUES.some(n => n.startsWith(name))) k++;
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        if (a[j] === 'e') return true; // --edit
+        if (a[j] === 'l') reads = true; // --list
+        if (a[j] === 'f') { if (j === a.length - 1) k++; break; } // --file <file>: the rest is its value
+      }
+      continue;
+    }
+    names.push(a);
+  }
+  if (CONFIG_ACTIONS.has(names[0])) return true;
+  if (names[0] === 'get' || names[0] === 'list') return false;
+  return !reads && names.length > 1;
+}
+
+/**
+ * Whether a push replaces or deletes what is on the remote: --force and its kin, --mirror, --delete (-d), --prune, or a
+ * refspec that starts with + (force) or : (delete). git takes abbreviations of long options, so they count too.
+ */
+function pushRewrites(args) {
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') return args.slice(k + 1).some(x => x.startsWith('+') || x.startsWith(':'));
+    if (a.startsWith('--')) {
+      if (longIs(a, PUSH_REWRITES)) return true;
+      if (!a.includes('=') && longIs(a, PUSH_VALUES)) k++; // its value is the next word
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        if (a[j] === 'f' || a[j] === 'd') return true;
+        if (a[j] === 'o') { if (j === a.length - 1) k++; break; } // -o <push option>
+      }
+      continue;
+    }
+    if (a.startsWith('+') || a.startsWith(':')) return true;
+  }
+  return false;
+}
+
+/** `gh auth token`, `gh auth status --show-token` (-t) and `gh auth git-credential` show the person's GitHub sign-in. */
+function ghShowsSignIn(argv) {
+  const plainWords = argv.slice(1).filter(a => !a.startsWith('-'));
+  if (plainWords[0] !== 'auth') return false;
+  if (plainWords.includes('token') || plainWords.includes('git-credential')) return true;
+  return plainWords.includes('status') && argv.some(a => /^--show-token(=|$)/.test(a) || /^-[^-]*t/.test(a));
+}
+
+/**
+ * The words of a git command that are not read piece by piece: the text of a message (-m, --message) for the commands
+ * that take one, which names no place (`text`, indexes into `args`), and web addresses (`addresses`, index -> the
+ * address). An address is checked only as a whole: taken apart at its "//" it would look like a path from the top of
+ * the disk, but as a path it is read from the agent's folder ("https:" would be a folder there), so only `..` or a link
+ * could take it out.
+ */
+function gitTextWords(sub, args) {
+  const skip = new Set();
+  const addresses = new Map();
+  const flags = Object.hasOwn(MESSAGE_FLAGS, sub) ? MESSAGE_FLAGS[sub] : null;
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') break;
+    const value = a.startsWith('--') && a.includes('=') ? a.slice(a.indexOf('=') + 1) : a;
+    if (WEB_ADDRESS.test(value)) { addresses.set(k, value); continue; }
+    if (flags === null) continue;
+    if (a.startsWith('--')) {
+      if (!longIs(a, ['message']) || a.slice(2).split('=')[0].length < 3) continue;
+      skip.add(k);
+      if (!a.includes('=')) skip.add(k + 1);
+      continue;
+    }
+    if (!/^-[^-]/.test(a)) continue;
+    // A word of short options: letters that take no value, then m and the message, here or in the next word.
+    let j = 1;
+    while (j < a.length && flags.includes(a[j])) j++;
+    if (a[j] !== 'm') continue;
+    skip.add(k);
+    if (j === a.length - 1) skip.add(k + 1);
+  }
+  return { text: skip, addresses };
+}
+
+/** The indexes of what diff's --output option writes to: its value, given with = or as the next word. */
+function outputWords(args) {
+  const out = new Set();
+  args.forEach((a, k) => {
+    if (!a.startsWith('--') || !longIs(a, ['output'])) return; // git takes --outp for --output, and so on
+    out.add(k);
+    if (!a.includes('=')) out.add(k + 1);
+  });
+  return out;
+}
+
+/**
+ * null when every word of a git command stays in the agent's folder; otherwise an ask. Each word is read from the agent's
+ * folder and from any -C folder. A command that only reads (`read`) may name what is not there, as a search pattern can.
+ * A command that can write may not name a place outside the folder even when nothing is there yet (git would make it,
+ * as `clone <address> /tmp/x` does), nor one in .git or .claude; neither may what --output writes to. Messages and web
+ * addresses name no place.
+ */
+function gitWords(sub, args, words, from, base, also, read) {
+  const { text, addresses } = gitTextWords(sub, args);
+  const outputs = read ? outputWords(args) : new Set();
+  for (let k = 0; k < words.length; k++) {
+    if (text.has(k)) continue;
+    const w = words[k];
+    if (w.glob && globClimbs(w.text)) return ask(R.readOutside, 'outside');
+    const writes = !read || outputs.has(k);
+    for (const piece of addresses.has(k) ? [addresses.get(k)] : readPieces(w)) {
+      for (const f of from) {
+        const v = writes ? gitWriteCheck(piece, f, base, outputs.has(k)) : readCheck(piece, base, also, true, f);
+        if (v) return v;
       }
     }
   }
-  return allow(R.gitRead);
+  return null;
+}
+
+/**
+ * null when git writing at `p` (read from `from`) would stay in the agent's folder, out of .git and .claude; otherwise
+ * an ask. `output`: the place is a file that --output writes, which the ask then says.
+ */
+function gitWriteCheck(p, from, base, output) {
+  if (p === '/dev/null') return null;
+  const r = resolveReal(p, from);
+  if (!r.ok) return ask(r.reason, 'mayLeave', output ? 'write to a file' : undefined);
+  const place = placeOf(r.real, base);
+  if (place === 'inside' || place === 'cwd') return null;
+  return output ? ask(R.writesFile, place, 'write to a file') : ask(GIT_PLACE[place], place);
 }
 
 /** Test runners and `node <script>`. Returns null when the command is not one of them. */
