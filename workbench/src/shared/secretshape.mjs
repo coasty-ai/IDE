@@ -36,6 +36,17 @@ const KNOWN = [
 
 /** Words of the base64 and base64url alphabets, 32 characters or more. Anything else ends a word. */
 const LONG_WORD = /[A-Za-z0-9+/_-]{32,}/g;
+/**
+ * Web addresses, with or without https://. Documents, files and pages are named in a link's path by long random ids
+ * (Google Docs and Drive, Notion), and people paste such links into tasks, so a link's path is not searched for
+ * random words. Its query (?token=…) and anything before the host are; known shapes are found anywhere.
+ */
+const LINK = /\b(?:https?:\/\/|www\.)[^\s<>"'`]+|\b(?:[A-Za-z0-9-]{1,63}\.){1,8}[A-Za-z]{2,24}\/[^\s<>"'`]*/g;
+const LINK_PARTS = /^((?:https?:\/\/)?[^/?#]*)([^?#]*)([^]*)$/;
+const withoutLinkPaths = (text) => text.replace(LINK, (link) => {
+  const m = LINK_PARTS.exec(link);
+  return m ? m[1] + ' '.repeat(m[2].length) + m[3] : link;
+});
 const HEX_RE = /^[0-9a-fA-F]+$/;
 /** A digest that names its own kind is a checksum, not a key: sha256:<hex> (Docker), sha512-<base64> (npm). */
 const DIGEST_BEFORE = /(?:sha(?:1|224|256|384|512)|md5)[:=]$/i;
@@ -52,9 +63,10 @@ const NOT_SECRET = Object.freeze({ secret: false, kind: null });
 export function looksLikeSecret(text) {
   if (typeof text !== 'string' || text.length < 16) return NOT_SECRET;
   for (const [kind, re] of KNOWN) if (re.test(text)) return { secret: true, kind };
-  for (const m of text.matchAll(LONG_WORD)) {
+  const words = withoutLinkPaths(text); // the same length, so positions still match `text`
+  for (const m of words.matchAll(LONG_WORD)) {
     const word = m[0];
-    if (DIGEST_START.test(word) || DIGEST_BEFORE.test(text.slice(Math.max(0, m.index - 7), m.index))) continue;
+    if (DIGEST_START.test(word) || DIGEST_BEFORE.test(words.slice(Math.max(0, m.index - 7), m.index))) continue;
     if (randomWord(word)) return { secret: true, kind: 'generic' };
   }
   return NOT_SECRET;

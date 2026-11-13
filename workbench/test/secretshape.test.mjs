@@ -107,6 +107,20 @@ test('long names, links, ids and digests are not keys', () => {
   }
 });
 
+test('a link’s path is not searched for random words: documents and pages are named there by long ids', () => {
+  const B64URL = `${ALNUM}-_`;
+  for (const text of [`build what this doc says: https://docs.google.com/document/d/${randomish(44, 'C', B64URL)}/edit`,
+    `the spec is at https://drive.google.com/file/d/${randomish(33, 'D', B64URL)}/view?usp=sharing`,
+    `see https://www.notion.so/Some-Title-${randomish(32, 'E', HEX)}`, `docs.google.com/spreadsheets/d/${randomish(44, 'F', B64URL)}/edit#gid=0`,
+    `www.notion.so/${randomish(32, 'G', HEX)}`, `http://localhost:3000/files/${randomish(40, 'H')}`]) {
+    assert.equal(looksLikeSecret(text).secret, false, text);
+  }
+  // A link's query and what comes before its host are still searched, and known shapes are found anywhere.
+  assert.equal(looksLikeSecret(`https://example.com/reset?token=${randomish(40, 'I')}`).kind, 'generic');
+  assert.equal(looksLikeSecret(`https://deploy:${randomish(40, 'J')}@example.com/repo.git`).kind, 'generic');
+  assert.equal(looksLikeSecret(`https://example.com/hooks/${shapes.github}`).kind, 'github');
+});
+
 test('a prefix with too little after it is not a key', () => {
   for (const text of ['what is a ghp_ token?', 'use sk-learn for the model', 'the branch sk-improve-error-handling-in-auth',
     join('AK', 'IA'), join('AK', 'IA', 'SHORT'), join('ey', 'J'), 'xoxb- tokens are for bots', 'sk_live_ keys move real money',

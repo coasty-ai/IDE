@@ -6,7 +6,7 @@
 // built from parts at run time.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -600,11 +600,17 @@ test('files: the modes hold under a permissive umask, and nothing reaches stdout
     const log = { warn: (s) => console.error(s), info: (s) => console.log(s) };
     const store = new KeyStore({ home: ${JSON.stringify(home)}, platform: 'linux', backend: 'file', log });
     const { id } = await store.add({ preset: 'stripe', values: { STRIPE_SECRET_KEY: process.env.THE_VALUE } });
+    // A second key whose file others can read, so loading has something to say on stderr.
+    const other = await store.add({ preset: 'anthropic', values: { ANTHROPIC_API_KEY: process.env.THE_OTHER } });
+    (await import('node:fs')).chmodSync(${JSON.stringify(path.join(home, '.workbench', 'keys'))} + '/' + other.id + '.json', 0o644);
     await new KeyStore({ home: ${JSON.stringify(home)}, platform: 'linux', backend: 'file', log }).load();
     console.log(JSON.stringify({ id }));`;
-  const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, THE_VALUE: STRIPE }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  const { id } = JSON.parse(out.trim().split('\n').at(-1));
-  assertNoValue(out, [STRIPE], 'stdout');
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, THE_VALUE: STRIPE, THE_OTHER: API_KEY }, encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  const { id } = JSON.parse(run.stdout.trim().split('\n').at(-1));
+  assert.match(run.stderr, /could not read ANTHROPIC_API_KEY .* because other people on this computer could read it/);
+  assertNoValue(run.stdout, [STRIPE, API_KEY], 'stdout');
+  assertNoValue(run.stderr, [STRIPE, API_KEY], 'stderr');
   assert.equal(mode(path.join(home, '.workbench')), 0o700);
   assert.equal(mode(path.join(home, '.workbench', 'keys')), 0o700);
   assert.equal(mode(path.join(home, '.workbench', 'keys', `${id}.json`)), 0o600);
