@@ -705,7 +705,9 @@ final class HelperStream {
     let res = Bundle.main.resourceURL!
     process.executableURL = res.appendingPathComponent("node/bin/node")
     process.arguments = [res.appendingPathComponent("workbench/bin/workbench.mjs").path] + args
-    process.environment = Environment.forWorkbench()
+    var env = Environment.forWorkbench()
+    env["WORKBENCH_LIFELINE"] = "1"   // this helper's standard input is kept open, and closes when the app goes away
+    process.environment = env
     process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
     process.standardInput = input
     process.standardOutput = output

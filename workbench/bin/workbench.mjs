@@ -715,7 +715,7 @@ export async function githubReposMode({ connect, say: out = say, log }) {
  * and gh's login with it. Standard input is not read.
  * @returns {Promise<number>} the exit code
  */
-export async function githubSigninMode({ connect, say: out = say, log, signals = process, lifeline = signals === process ? process.stdin : null }) {
+export async function githubSigninMode({ connect, say: out = say, log, signals = process, lifeline = signals === process && process.env.WORKBENCH_LIFELINE === '1' ? process.stdin : null }) {
   const tell = (o) => out(`WORKBENCH_GITHUB ${JSON.stringify(o)}`);
   if (!connect || typeof connect.githubSignIn !== 'function') {
     tell({ phase: 'error', sentence: 'Workbench could not sign in to GitHub. The details are in its log.' });
@@ -743,9 +743,10 @@ export async function githubSigninMode({ connect, say: out = say, log, signals =
     Promise.resolve().then(() => connect.cancelGithubSignIn?.()).catch((e) => log?.warn?.('Workbench could not stop signing in to GitHub:', e));
   };
   for (const sig of STOP_SIGNALS) signals.on?.(sig, stop);
-  // The Mac app keeps this helper's standard input open as a lifeline and closes it when it goes away, even when it
-  // crashes and sends no signal: stop gh's login then too, so it does not poll GitHub until its code runs out. Only a
-  // pipe counts: a terminal, or /dev/null (a test that ignores standard input), is not a lifeline.
+  // The Mac app keeps this helper's standard input open as a lifeline, says so with WORKBENCH_LIFELINE=1, and closes it
+  // when it goes away, even when it crashes and sends no signal: stop gh's login then too, so it does not poll GitHub
+  // until its code runs out. Without that variable a closed input means nothing (a program that runs this helper with
+  // execFile closes it at once); and only a pipe counts, never a terminal or /dev/null.
   const watched = lifeline && isPipe(lifeline) ? lifeline : null;
   if (watched) { for (const ev of ['end', 'close', 'error']) watched.on(ev, stop); watched.resume?.(); }
   try {
