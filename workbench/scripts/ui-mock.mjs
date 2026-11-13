@@ -19,10 +19,13 @@
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 //   GET  /ctl/reads                the git screen's reads: every GET of /api/git and /api/agents/:id/changes (D1)
 // The git screen's routes (D1): GET /api/git (any scenario) and GET /api/agents/:id/changes; answer "refuse" refuses them.
+// Agents & keys: the connect panel's routes, /api/connect*, in the 'connect-*' scenarios (see connectFacts below); mode
+// gains connect: { terminal, github, githubAgents, fail } and delay.connect.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { presetById } from '../src/shared/keypresets.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -117,6 +120,7 @@ export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy'
 export function scenario(name, now = Date.now()) {
   let raw = [];
   if (MERGE_SCENARIOS.includes(name)) return mergeWorld(name, now);
+  if (CONNECT_SCENARIOS.includes(name)) return connectWorld(name, now);
   if (name === 'demo' || name === 'helper' || name === 'longq' || name === 'busy' || name === 'idle') {
     raw = demo();
     if (name === 'helper' || name === 'longq' || name === 'idle') backToWork(by(raw, '399e17'), 'Running checkout tests');
@@ -550,6 +554,106 @@ function mergeWorld(name, now) {
   return st;
 }
 
+// ---------------------------------------------------------------- Agents & keys: the connect panel (/api/connect*)
+// Live repositories whose snapshot carries `connect` ({ ready, defaultAgent, agents: [{ id, name, ready }] }, at its top
+// level, as the engine sends it), and the panel's routes, answered as src/server/http.mjs answers them: { ok, sentence,
+// status } with a ConnectStatus as src/core/connect.mjs makes it, a refusal as { ok: false, sentence, status }, or
+// { error } with a 4xx code. A key's values are kept only as the key store shows them ("•••• " and the last four
+// characters, or a value that is not secret). No other scenario has `connect`, so the page shows nothing of Agents & keys
+// there, and these routes answer 404, as the demo's do.
+//   connect-none     no coding agent is ready: Claude Code is installed but not signed in, Codex is not installed, and git
+//                    has no name and email. The lid says "Connect a coding agent to start.", and the panel opens by itself
+//   connect-claude   Claude Code is ready, and new work goes to it; Codex is installed but signed out
+//   connect-nocodex  Claude Code is ready; Codex is not installed; an agent needs you
+//   connect-github   both are ready; GitHub is connected (git alone uses the token), with two keys: AWS for all
+//                    repositories and agents, and Stripe for this repository and Claude Code
+//   connect-fail     reading what is connected fails: GET /api/connect and the re-check answer 500, so the panel says so,
+//                    with Try again. An agent is ready, so the panel opens only from the top band's button
+// Sign in and Install "open Terminal": the next re-check finds the agent signed in, or installed and signed out. Through
+// POST /ctl/mode, connect: { terminal: false } answers them with the command to run instead (no Terminal); { github:
+// 'token' } refuses the token Connect GitHub sends; { githubAgents: 'token' } refuses GitHub's box ("Let agents use this
+// token") as Connect does when git cannot give the token back, with { ok: false, why: 'token', sentence } and no status;
+// { fail: true } fails every read. delay: { connect: ms } makes every answer take that long.
+const CONNECT_SCENARIOS = ['connect-none', 'connect-claude', 'connect-nocodex', 'connect-github', 'connect-fail'];
+SCENARIOS.push(...CONNECT_SCENARIOS);
+const CONNECT_REPO = { name: 'shop', root: '/Users/someone/code/shop', head: 'c0ffee1', branch: 'main', dirty: 0 };
+const INSTALLERS = { claude: 'curl -fsSL https://claude.ai/install.sh | bash', codex: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' };
+const SIGN_INS = { claude: 'claude auth login', codex: 'codex login' };
+const AGENT_KEYS = { claude: ['anthropic', ['ANTHROPIC_API_KEY']], codex: ['openai', ['OPENAI_API_KEY', 'CODEX_API_KEY']] };
+const NOT_INSTALLED = { found: false, version: null, from: null, signedIn: 'unknown', how: null };
+const andList = xs => (xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
+/** How the key store shows a secret value: "•••• " and its last 4 characters (12 or more), else "••••". */
+const maskedValue = v => { const a = Array.from(String(v)); return a.length >= 12 ? `•••• ${a.slice(-4).join('')}` : '••••'; };
+
+/** What Connect knows in a connect scenario (null in the others): the agents' facts, git, GitHub, and the keys, masked. */
+function connectFacts(name) {
+  if (!CONNECT_SCENARIOS.includes(name)) return null;
+  const claude = { id: 'claude', name: 'Claude Code', found: true, version: '2.1.322', from: 'the VS Code extension', signedIn: 'yes', how: 'your Claude subscription' };
+  const codex = { id: 'codex', name: 'Codex', found: true, version: '0.166.0', from: 'your PATH', signedIn: 'yes', how: 'your ChatGPT account' };
+  // chosen: the person's default (settings.json); pending: what Terminal is doing, which the next re-check finds done
+  const f = { agents: [claude, codex], chosen: null, git: { name: 'Sam Lee', email: 'sam@example.com' }, github: null, keys: [], fail: name === 'connect-fail', pending: new Map(), seq: 0 };
+  if (name === 'connect-none') { Object.assign(claude, { signedIn: 'no', how: null }); Object.assign(codex, NOT_INSTALLED); f.git = { name: '', email: '' }; }
+  if (name === 'connect-claude') Object.assign(codex, { signedIn: 'no', how: null });
+  if (name === 'connect-nocodex') Object.assign(codex, NOT_INSTALLED);
+  if (name === 'connect-github') {
+    f.github = { login: 'octocat', agentsUseIt: false };
+    f.keys.push({ id: 'k-aws', preset: 'aws', label: 'AWS', scope: { kind: 'all' }, agents: 'all', created: 1_800_000_000_000,
+      vars: [{ name: 'AWS_ACCESS_KEY_ID', shown: '•••• 7QXA' }, { name: 'AWS_SECRET_ACCESS_KEY', shown: '•••• 9f2b' }, { name: 'AWS_REGION', shown: 'eu-west-2' }] });
+    f.keys.push({ id: 'k-stripe', preset: 'stripe', label: 'Stripe', scope: { kind: 'repo', root: CONNECT_REPO.root }, agents: ['claude'], created: 1_800_000_060_000,
+      vars: [{ name: 'STRIPE_SECRET_KEY', shown: '•••• 4eC3' }] });
+  }
+  return f;
+}
+
+const agentReady = a => a.found && a.signedIn !== 'no';
+/** The person's choice when that agent is ready, else the first ready agent, else null (Connect's defaultAgent()). */
+const defaultAgentOf = f => (f.agents.find(a => a.id === f.chosen && agentReady(a)) || f.agents.find(agentReady) || null)?.id ?? null;
+
+/** A ConnectStatus, as Connect's status() gives it: its sentences, and each agent's buttons in the panel's order. */
+function connectStatus(f) {
+  const def = defaultAgentOf(f);
+  const nameOf = id => f.agents.find(a => a.id === id)?.name || id;
+  const agents = f.agents.map(a => {
+    const v = a.version ? ` ${a.version}` : '', ready = agentReady(a);
+    const sentence = !a.found ? `${a.name} is not installed.` : a.signedIn === 'no' ? `${a.name}${v} is installed but not signed in.`
+      : a.signedIn === 'unknown' ? `${a.name}${v} is installed, but Workbench could not check whether it is signed in.` : `${a.name}${v} is ready, signed in with ${a.how}.`;
+    const actions = [a.found && a.signedIn !== 'yes' && 'signin', !a.found && 'install', a.found && 'key', ready && a.id !== def && 'default', 'recheck'].filter(Boolean);
+    return { id: a.id, name: a.name, found: a.found, version: a.version, from: a.from, signedIn: a.signedIn, how: a.how, ready, isDefault: a.id === def, sentence, actions };
+  });
+  const g = f.git, gh = f.github;
+  const keySentence = k => `${k.label} for ${k.scope.kind === 'repo' ? (k.scope.root === CONNECT_REPO.root ? 'this repository' : `the repository at ${k.scope.root}`) : 'all repositories'}, `
+    + `given to ${k.agents === 'all' ? 'all agents' : k.agents.length ? andList(k.agents.map(nameOf)) : 'no agent'}: ${k.vars.map(x => `${x.name} ${x.shown}`).join(', ')}`;
+  return {
+    agents, defaultAgent: def, platform: 'darwin', canOpenTerminal: true,
+    git: { name: g.name, email: g.email, sentence: g.name && g.email ? `Git knows you as ${g.name}, ${g.email}.` : 'Git does not know your name and email yet.' },
+    github: gh ? { connected: true, login: gh.login, agentsUseIt: gh.agentsUseIt, sentence: `Connected to GitHub as ${gh.login}.` } : { connected: false, login: null, agentsUseIt: false, sentence: 'Not connected.' },
+    keys: f.keys.map(k => ({ ...k, vars: k.vars.map(x => ({ ...x })), sentence: keySentence(k) })),
+    ready: agents.some(a => a.ready),
+  };
+}
+/** The snapshot's `connect`, from a status: which agents can start work, and which one new work goes to. */
+const connectMetaOf = s => ({ ready: s.ready, defaultAgent: s.defaultAgent, agents: s.agents.map(a => ({ id: a.id, name: a.name, ready: a.ready })) });
+
+function connectWorld(name, now) {
+  const raw = [];
+  if (name === 'connect-claude' || name === 'connect-github' || name === 'connect-fail') {
+    raw.push({ id: 'cw1', name: 'Login page', state: 'working', machineId: 'laptop', now: 'Editing LoginForm.tsx', ageMin: 12, toolCalls: 23 });
+  }
+  if (name === 'connect-nocodex') {
+    raw.push({ id: 'cw2', name: 'Checkout fix', state: 'needs_ok', machineId: 'laptop', now: 'Running the tests', ageMin: 9, sinceMin: 1,
+      ask: { id: 'cw-p1', type: 'permission', sentence: 'Checkout fix wants to run the tests', detail: 'npm test -- --silent', why: 'The command is not on the list of safe ones.', options: ['Allow', 'Deny'], primary: 'Allow', ageMin: 1 } });
+  }
+  const st = world(raw, now);
+  const f = connectFacts(name), s = connectStatus(f);
+  st.mode = 'live';
+  st.repo = { ...CONNECT_REPO, identity: !!(f.git.name && f.git.email) };
+  st.harnesses = Object.fromEntries(s.agents.map(a => [a.id, a.ready]));
+  const n = st.agents.filter(a => !a.parentId).length;
+  st.machines = [{ ...LAPTOP, agents: n, note: n ? `${n} agent${n === 1 ? '' : 's'}` : 'idle' }];
+  st.connect = connectMetaOf(s);
+  return st;
+}
+
 /** Start the mock. Resolves to { port, close() }. */
 export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) {
   const clients = new Set();
@@ -557,6 +661,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null };
   let name = 'demo';
   let state = scenario(name);
+  let cw = connectFacts(name);   // Agents & keys: what Connect knows, in the connect scenarios (null elsewhere)
   let confirmSeq = 0;
   const confirms = new Map();
   const send = (event, data) => { const f = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`; for (const c of clients) c.write(f); };
@@ -702,6 +807,140 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     return { reply: `Merged ${a.name} into ${into}.`, focusId: a.id };
   };
 
+  // ---------------------------------------------------------------- Agents & keys: the connect panel's routes
+  // As src/server/http.mjs and src/core/connect.mjs answer them (see "Agents & keys" above startMock), in their words.
+  const NO_CONNECT_DEMO = 'The demo’s agents are simulated, so there is nothing to connect. Run Workbench on a repository to connect your own agents and keys.';
+  const NO_CONNECT = 'Agents & keys is not available in this Workbench. The details are in its log.';
+  const WENT_WRONG = 'Something went wrong in the workbench. The details are in its log.';
+  /** A fresh status; when what it says of the agents changed, open pages get a fresh snapshot, as the server sends one. */
+  const connectNow = () => {
+    const s = connectStatus(cw), meta = connectMetaOf(s);
+    if (JSON.stringify(meta) !== JSON.stringify(state.connect)) {
+      state.connect = meta;
+      state.harnesses = Object.fromEntries(s.agents.map(a => [a.id, a.ready]));
+      setTimeout(() => send('snapshot', state), 60);
+    }
+    return s;
+  };
+  const connectRoute = (method, p, b, res) => {
+    const answer = (code, o) => { res.statusCode = code; res.end(JSON.stringify(o)); };
+    if (!cw) return answer(404, { error: state.mode === 'demo' ? NO_CONNECT_DEMO : NO_CONNECT });
+    const k = mode.connect || {};
+    const done = (sentence = null, extra = {}) => answer(200, { ...extra, ok: true, sentence, status: connectNow() });
+    const no = (code, error) => answer(code, { error });
+    const text = v => (typeof v === 'string' ? v.trim() : '');
+    if (p === '/api/connect') return method !== 'GET' ? no(405, 'That method is not allowed here.') : cw.fail || k.fail ? no(500, WENT_WRONG) : done();
+    if (method !== 'POST') return no(405, 'That method is not allowed here.');
+    if (p === '/api/connect/recheck') {
+      if (cw.fail || k.fail) return no(500, WENT_WRONG);
+      // what the person did in Terminal meanwhile: signed in, or installed (and not signed in yet)
+      for (const [id, what] of cw.pending) {
+        const a = cw.agents.find(x => x.id === id);
+        if (a && what === 'install') Object.assign(a, { found: true, version: id === 'claude' ? '2.1.322' : '0.166.0', from: 'your PATH', signedIn: 'no', how: null });
+        else if (a) Object.assign(a, { signedIn: 'yes', how: id === 'claude' ? 'your Claude subscription' : 'your ChatGPT account' });
+      }
+      cw.pending.clear();
+      return done();
+    }
+    const am = /^\/api\/connect\/agents\/([^/]+)\/(install|signin|key|default)$/.exec(p);
+    if (am) {
+      const a = cw.agents.find(x => x.id === decodeURIComponent(am[1])), act = am[2];
+      if (!a) return no(404, 'Workbench does not know that agent.');
+      if (act === 'install' || act === 'signin') {
+        if (act === 'signin' && !a.found) return no(409, `${a.name} is not installed yet, so there is nothing to sign in to.`);
+        const command = act === 'install' ? INSTALLERS[a.id] : SIGN_INS[a.id];
+        if (k.terminal === false) {
+          return done(`Run this command in a terminal to ${act === 'install' ? 'install' : 'sign in to'} ${a.name}, then check again.`, { opened: false, command });
+        }
+        cw.pending.set(a.id, act);
+        return done(act === 'install' ? `Terminal is installing ${a.name}. When it finishes, come back here.`
+          : `Terminal is open for you to sign in to ${a.name}. When you are done, come back here.`, { opened: true });
+      }
+      if (act === 'key') {
+        // "Use an API key": kept for all repositories, for this agent only, in place of the one this button kept before
+        const v = text(b?.value);
+        if (!v) return no(400, 'Paste the key first.');
+        const [preset, names] = AGENT_KEYS[a.id] || ['custom', ['API_KEY']];
+        cw.keys = cw.keys.filter(x => !(x.preset === preset && x.scope.kind === 'all' && Array.isArray(x.agents) && x.agents.length === 1 && x.agents[0] === a.id));
+        cw.keys.push({ id: `k${++cw.seq}`, preset, label: presetById(preset)?.label || 'Key', scope: { kind: 'all' }, agents: [a.id], created: Date.now(),
+          vars: names.map(n => ({ name: n, shown: maskedValue(v) })) });
+        if (a.found) Object.assign(a, { signedIn: 'yes', how: 'an API key' });
+        return done(`${a.name} will use this API key from now on, and each request is billed to it.`);
+      }
+      cw.chosen = a.id;
+      return done(agentReady(a) ? `New work will go to ${a.name}.` : `New work will go to ${a.name} once it is ready.`);
+    }
+    if (p === '/api/connect/git') {
+      const n = text(b?.name), e = text(b?.email);
+      if (!n || Array.from(n).length > 100 || /[<>\p{Cc}]/u.test(n)) return no(400, 'A name for git must be 1 to 100 characters on one line, without < or >.');
+      if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(e) || e.length > 254) return no(400, 'That does not look like an email address.');
+      cw.git = { name: n, email: e };
+      return done(`Git will make your merges as ${n}, ${e}.`);
+    }
+    if (p === '/api/connect/github') {
+      if (!text(b?.token)) return no(400, 'Paste the code GitHub made for you first.');
+      if (k.github === 'token') {
+        return answer(200, { login: null, ok: false, sentence: 'GitHub did not accept that token. Check that you copied all of it, then try again.', status: connectNow() });
+      }
+      cw.github = { login: 'octocat', agentsUseIt: b.agentsUseIt === true };
+      return done('Connected to GitHub as octocat.', { login: 'octocat' });
+    }
+    if (p === '/api/connect/github/agents') {
+      // "Let agents use this token": Connect reads the token back from git, and keeps it again with the other choice
+      if (!cw.github) return no(409, 'GitHub is not connected.');
+      if (k.githubAgents === 'token') {
+        return answer(200, { ok: false, why: 'token', sentence: 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.' });
+      }
+      cw.github.agentsUseIt = b?.agentsUseIt === true;
+      return done(cw.github.agentsUseIt ? 'Agents can use your GitHub token now, as GH_TOKEN.' : 'Agents no longer get your GitHub token. Git still uses it.');
+    }
+    if (p === '/api/connect/github/disconnect') {
+      cw.github = null;
+      return done('GitHub is disconnected. The token itself still works until you delete it on GitHub.');
+    }
+    if (p === '/api/connect/keys') {
+      // which values are secret comes from the preset (a custom key's are all secret); `also` names get the same value
+      const preset = typeof b?.preset === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(b.preset) ? presetById(b.preset) : null;
+      if (!preset) return no(400, 'Workbench does not know that kind of key.');
+      if (!b.values || typeof b.values !== 'object' || Array.isArray(b.values)) return no(400, 'Fill in the key first.');
+      const values = {};
+      for (const [n, v] of Object.entries(b.values)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(n) || n === '__proto__') return no(400, 'A name may have only letters, digits and _, and may not start with a digit.');
+        if (typeof v !== 'string') return no(400, 'Each value must be text.');
+        if (v.trim()) values[n] = v.trim();
+      }
+      const fields = preset.id !== 'custom' && Array.isArray(preset.fields) ? preset.fields : null;
+      let secret = new Set(Object.keys(values));
+      if (fields) {
+        const also = f => (Array.isArray(f.also) ? f.also : []);
+        const known = new Set(fields.flatMap(f => [f.name, ...also(f)]));
+        if (Object.keys(values).some(n => !known.has(n))) return no(400, `${preset.label} keys take only ${andList(fields.map(f => f.name))}.`);
+        for (const f of fields) {
+          if (!values[f.name] && !f.optional) return no(400, `Fill in ${f.name}.`);
+          if (values[f.name]) for (const x of also(f)) if (!values[x]) values[x] = values[f.name];
+        }
+        secret = new Set(fields.filter(f => f.secret).flatMap(f => [f.name, ...also(f)]));
+      }
+      if (!Object.keys(values).length) return no(400, 'Fill in the key first.');
+      const scope = b.scope === 'repo' ? 'repo' : b.scope === 'all' || b.scope == null ? 'all' : null;
+      if (!scope) return no(400, 'Choose this repository or all repositories.');
+      const agents = b.agents === 'all' || b.agents == null ? 'all'
+        : Array.isArray(b.agents) && b.agents.length && b.agents.length <= 20 && b.agents.every(x => typeof x === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(x)) ? [...new Set(b.agents)] : null;
+      if (!agents) return no(400, 'Choose which agents get the key.');
+      const label = text(b.label) || preset.label || 'Key';
+      cw.keys.push({ id: `k${++cw.seq}`, preset: preset.id, label, scope: scope === 'repo' ? { kind: 'repo', root: CONNECT_REPO.root } : { kind: 'all' }, agents, created: Date.now(),
+        vars: Object.entries(values).map(([n, v]) => ({ name: n, shown: secret.has(n) ? maskedValue(v) : v })) });
+      return done(`Saved ${label}, for ${scope === 'repo' ? 'this repository' : 'all repositories'}.`);
+    }
+    const rm = /^\/api\/connect\/keys\/([^/]+)\/remove$/.exec(p);
+    if (rm) {
+      const before = cw.keys.length;
+      cw.keys = cw.keys.filter(x => x.id !== decodeURIComponent(rm[1]));
+      return done(cw.keys.length < before ? 'Removed the key.' : 'That key was already gone.');
+    }
+    return no(404, 'Not found.');
+  };
+
   let stepTimer = null;
   const stepTick = () => {
     const working = state.agents.filter(a => a.state === 'working' || a.state === 'starting');
@@ -721,7 +960,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       const b = body ? JSON.parse(body) : {};
       res.setHeader('content-type', 'application/json');
       if (p === '/ctl/scenario') {
-        name = b.name; state = scenario(name); confirms.clear();
+        name = b.name; state = scenario(name); cw = connectFacts(name); confirms.clear();
         if (b.push !== false) send('snapshot', state);
         res.end(JSON.stringify({ ok: true, agents: state.agents.length })); return;
       }
@@ -881,6 +1120,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         }
         return reply({ reply: 'I did not catch that. Try “start an agent to fix the flaky test”.' });
       }
+      // Agents & keys: the connect panel's routes (404 outside the connect scenarios, as in the demo)
+      if (p === '/api/connect' || p.startsWith('/api/connect/')) {
+        if (mode.delay && mode.delay.connect > 0) await new Promise(r => setTimeout(r, mode.delay.connect));
+        return connectRoute(req.method, p, json, res);
+      }
       const mm = /^\/api\/machines\/([^/]+)\/awake$/.exec(p);
       if (mm) {
         const mc = state.machines.find(x => x.id === decodeURIComponent(mm[1]));
@@ -902,7 +1146,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     if (!quiet) console.log('mock on', actual);
     resolve({
       port: actual,
-      setScenario(n) { name = n; state = scenario(n); confirms.clear(); },
+      setScenario(n) { name = n; state = scenario(n); cw = connectFacts(n); confirms.clear(); },
       close: () => new Promise(r => { clearInterval(stepTimer); for (const c of clients) c.destroy(); server.close(() => r()); }),
     });
   }));

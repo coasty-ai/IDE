@@ -77,10 +77,10 @@ export const api = {
 
 /**
  * The connect panel's requests ("Agents & keys"). Each answers { ok, sentence, status }: a refusal (ok: false) comes back
- * as it is, so the panel says its sentence and draws its status. A failure is an Error in plain words: Workbench's own
- * sentence ({ error }) is kept even when it says "token", since a GitHub token is the person's word for it here; a 401
- * still means this page's key no longer works. Keys and tokens travel only in a POST's body, never in an address, and
- * nothing here keeps or logs them.
+ * as it is, so the panel says its sentence and draws its status (when it carries one). A failure is an Error in plain
+ * words, with the HTTP status in `.status`: Workbench's own sentence ({ error }) is kept even when it says "token", since
+ * a GitHub token is the person's word for it here; a 401 still means this page's key no longer works. Keys and tokens
+ * travel only in a POST's body, never in an address, and nothing here keeps or logs them.
  */
 async function connectCall(method, path, body) {
   let res;
@@ -117,6 +117,12 @@ export const connectApi = {
   setDefault: id => connectCall('POST', agentPath(id, 'default'), {}),
   git: (name, email) => connectCall('POST', '/api/connect/git', { name, email }),
   github: (githubToken, agentsUseIt) => connectCall('POST', '/api/connect/github', { token: githubToken, agentsUseIt: agentsUseIt === true }),
+  /**
+   * "Let agents use this token (as GH_TOKEN)", once GitHub is connected: Workbench gives the token it keeps to every
+   * agent, or to none, without asking for it again. A refusal ({ ok: false, why: 'token', sentence }) comes back as it
+   * is; 409 when GitHub is not connected.
+   */
+  githubAgents: agentsUseIt => connectCall('POST', '/api/connect/github/agents', { agentsUseIt: agentsUseIt === true }),
   githubDisconnect: () => connectCall('POST', '/api/connect/github/disconnect', {}),
   addKey: ({ preset, label, values, scope, agents }) => connectCall('POST', '/api/connect/keys', { preset, label, values, scope, agents }),
   removeKey: id => connectCall('POST', `/api/connect/keys/${encodeURIComponent(id)}/remove`, {}),

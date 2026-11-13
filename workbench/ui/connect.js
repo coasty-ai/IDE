@@ -10,14 +10,14 @@
 import { connectApi } from './api.js';
 import * as presetModule from '/shared/keypresets.mjs';
 import { panelParts, customRow, addForm, statusOf, metaFromStatus, agentsOf, agentStamp, keysOf, signInNotes, agentKeyRequest,
-  gitRequest, githubRequest, newKeyRequest, MAX_NAMES } from './connectview.js';
+  gitRequest, githubRequest, githubShareRequest, githubBoxOn, newKeyRequest, MAX_NAMES } from './connectview.js';
 import { visibleControls } from './words.js';
 import { esc } from './util.js';
 
 let ctx = null, el = null;
 // Which forms are open, and the choices made in them (git's name and email as typed, the GitHub box, a new key's preset,
-// name, place and agents): never a key or a token.
-const closedForms = () => ({ keyFor: null, cmd: {}, add: null, removing: null, git: null, ghAgents: false });
+// name, place and agents, and what GitHub's box asked for while that is on its way): never a key or a token.
+const closedForms = () => ({ keyFor: null, cmd: {}, add: null, removing: null, git: null, ghAgents: false, ghShare: null });
 const st = {
   status: null,        // the last ConnectStatus shown
   error: null,         // why there is none yet, in plain words
@@ -46,6 +46,7 @@ export function setupConnect(c) {
   el = { dialog: $('connect'), title: $('connectTitle'), said: $('connectSaid'), body: $('connectBody'), close: $('connectClose'), needs: $('connectNeeds'), band: $('connectBtn') };
   el.dialog.addEventListener('pointerdown', e => { st.downOutside = outside(e); });
   el.dialog.addEventListener('click', onClick);
+  el.dialog.addEventListener('change', onChange);
   el.dialog.addEventListener('keydown', onKey);
   // Esc reaches the page's own handler first (app.js closes the panel there); this is for any other way it is cancelled
   el.dialog.addEventListener('cancel', e => { e.preventDefault(); closeConnect(); });
@@ -259,8 +260,17 @@ function onClick(e) {
   const down = st.downOutside;
   st.downOutside = false;
   if (outside(e)) { if (down) closeConnect(); return; }
-  const b = e.target.closest('button');
+  // a box whose change is on its way waits: the click (or the space bar) is undone before it changes anything
+  const t = e.target;
+  if (t instanceof HTMLInputElement && t.type === 'checkbox' && t.getAttribute('aria-disabled') === 'true') { e.preventDefault(); return; }
+  const b = t.closest('button');
   if (b && el.dialog.contains(b)) act(b);
+}
+
+/** A box that acts the moment it changes: GitHub's "Let agents use this token". */
+function onChange(e) {
+  const box = e.target;
+  if (box instanceof HTMLInputElement && box.dataset.field === 'gh-share' && el.dialog.contains(box)) shareGithub(box);
 }
 
 async function act(b) {
@@ -353,6 +363,27 @@ async function act(b) {
     case 'add-save': saveKey(); return;
     default:
   }
+}
+
+/**
+ * GitHub's "Let agents use this token (as GH_TOKEN)": sent the moment the box changes, checked first against what it was
+ * drawn for. While it is on its way the box shows what was asked, and waits. When Workbench refuses (it cannot read the
+ * token back from git) its sentence is said, and when the request fails its error is; either way the box goes back as
+ * it was, and after a failure the panel reads what is connected again.
+ */
+async function shareGithub(box) {
+  if (st.busy.has('gh-share')) { box.checked = !box.checked; return; }   // one change at a time
+  const q = githubShareRequest(st.status, box.dataset.state, box.checked);
+  if (!q) { box.checked = !box.checked; changed(); return; }
+  st.open.ghShare = q.agentsUseIt;
+  const r = await request(() => connectApi.githubAgents(q.agentsUseIt), { busyKey: 'gh-share' });
+  st.open.ghShare = null;
+  paint();
+  // the part is drawn from what Workbench says now; the box itself says it too, whichever node the keyboard is on
+  const now = partOf('gh-on')?.querySelector('[data-field="gh-share"]');
+  if (now) now.checked = githubBoxOn(st.status && st.status.github);
+  if (okAnswer(r)) recheck();
+  else if (!r) request(() => connectApi.status(), { quiet: true });
 }
 
 /** One more name and value for "Something else", added in place so what is typed in the others stays. */

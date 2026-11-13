@@ -51,6 +51,13 @@ export const PAIRS = [
   ...['card-1', 'card-2'].map(bg => ['d-del-mk', bg, 'the marks that show hidden characters in the diff and the detail (.vc text)']),
   // the git graph's traces on the board
   ...['mask-1', 'mask-2', 'mask-3'].flatMap(bg => [['g-trunk', bg, 'your branch, the gold trunk', 3], ['g-lane', bg, "an agent's lane", 3]]),
+  // Agents & keys: the connect panel, on the lid's surface (the marks on lid-3 are the lid's own pairs above), its fields
+  // and the keys warning's well; and its button in the top band, on the board's mask
+  ...['k-need', 'k-ok', 'k-work', 'k-word'].flatMap(k => ['lid-1', 'lid-2'].map(bg => [k, bg, `${k} mark on the connect panel`, 3])),
+  ...['lid-1', 'lid-2', 'lid-3', 'field'].map(bg => ['lid-focus', bg, 'a focus ring on the connect panel', 3]),
+  ['k-need', 'exact', 'the needs-you mark by the keys warning', 3],
+  ...['mask-1', 'mask-2', 'mask-3'].map(bg => ['t-ok', bg, 'the Agents & keys light when an agent is ready', 3]),
+  ...['mask-1', 'mask-2', 'mask-3'].map(bg => ['focus', bg, 'a focus ring on the board', 3]),
 ];
 
 const hex = h => { h = h.replace('#', ''); if (h.length === 3) h = [...h].map(c => c + c).join(''); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16) / 255); };

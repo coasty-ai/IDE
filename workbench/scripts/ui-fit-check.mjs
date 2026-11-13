@@ -2,7 +2,9 @@
 // scenario, window size, detail level and look, that no visible text falls outside its box, no text is clipped, nothing
 // is off-screen, and the board's boxes do not overlap. Visually hidden screen-reader text is allowed; so is the one
 // marked scroll box that holds a long command or question in full ([data-scroll]), and one-line clips whose full text is
-// elsewhere ([data-clip-ok]). Not part of npm test (it needs Chrome). No dependencies.
+// elsewhere ([data-clip-ok]). Agents & keys is an overlay and a text layer of its own: its button sits in the top band in
+// the 'connect-*' scenarios, and its panel (#connect), which opens by itself in 'connect-none', is checked at every size,
+// detail level and look there. Not part of npm test (it needs Chrome). No dependencies.
 //
 //   node scripts/ui-fit-check.mjs [--size 1280x680] [--scenario demo] [--theme ivory] [--detail more] [--view card] [--quick] [--verbose]
 //
@@ -71,7 +73,9 @@ const CHECK = String.raw`(() => {
       return { left: r.left, right: r.right, top: mid - lh / 2, bottom: mid + lh / 2, width: r.width, height: lh };
     });
     const scroll = p.closest('[data-scroll]');
-    const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail')?.id || 'board';
+    // overlays are text layers of their own: they may cover the board's words, never their own (Agents & keys, #connect,
+    // covers the whole board while it is open)
+    const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail, #connect')?.id || 'board';
     for (const r of rects) {
       if (scroll) { const s = scroll.getBoundingClientRect(); if (r.bottom < s.top || r.top > s.bottom) continue; }
       texts.push({ r, p, n, layer });
@@ -105,11 +109,18 @@ const CHECK = String.raw`(() => {
     if ((cx || ell) && e.scrollWidth > e.clientWidth + 1) out.push('clipped text: ' + label(e) + ' (' + e.scrollWidth + ' > ' + e.clientWidth + ')');
     else if (cy && e.scrollHeight > e.clientHeight + 1) out.push('clipped text: ' + label(e) + ' (' + e.scrollHeight + ' > ' + e.clientHeight + ' high)');
   }
-  // 3. nothing off-screen
+  // 3. nothing off-screen. Inside Agents & keys' scroll box (#connectBody, which holds buttons) only the part shown in the
+  //    box counts: what is scrolled out of it is not on screen
   for (const e of document.querySelectorAll('[data-box], button, .chip, .part, .hl, .mach, .more')) {
     if (sr(e) || !vis(e)) continue;
-    const r = e.getBoundingClientRect();
+    let r = e.getBoundingClientRect();
     if (r.width < 0.5 && r.height < 0.5) continue;
+    const sb = e.parentElement && e.parentElement.closest('#connect [data-scroll]');
+    if (sb) {
+      const s = sb.getBoundingClientRect();
+      r = { left: Math.max(r.left, s.left), top: Math.max(r.top, s.top), right: Math.min(r.right, s.right), bottom: Math.min(r.bottom, s.bottom) };
+      if (r.right - r.left < 0.5 || r.bottom - r.top < 0.5) continue;
+    }
     if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) out.push('off-screen: ' + label(e));
   }
   for (const t of document.querySelectorAll('#board text, #wires text, #gitBoard text, #gitGraph text')) {
@@ -124,7 +135,7 @@ const CHECK = String.raw`(() => {
   const boxes = [];
   const add = (k, e, r) => boxes.push({ k, e, r: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } });
   for (const e of document.querySelectorAll('.chip')) if (vis(e)) { const r = e.getBoundingClientRect(); add('chip', e, { left: r.left - lead, top: r.top - lead, right: r.right + lead, bottom: r.bottom + lead }); }
-  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend, #dram')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
+  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend, #connectBtn, #dram')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
   for (const e of document.querySelectorAll('#said > span:not(.sr), #said > i')) if (vis(e)) for (const r of e.getClientRects()) add('said', e, r);
   for (const e of document.querySelectorAll('#wires .pad, #wires .you, #board .you')) add(e.classList.contains('pad') ? 'pad' : 'you', e, e.getBoundingClientRect());
   const pkg = document.querySelector('#board .pkg');
@@ -139,12 +150,15 @@ const CHECK = String.raw`(() => {
     if (a.k === 'pad' && b.k === 'pad' && a.e.dataset.key && a.e.dataset.key === b.e.dataset.key) continue;
     if (ov(a.r, b.r) > 1.5) out.push('overlap: ' + label(a.e) + ' × ' + label(b.e));
   }
-  // 5. overlays: inside the window, never on the core, and never on the top band (the workbench mark opens the look menu)
-  const top = [...document.querySelectorAll('#brand, #mode, #repo, #conn, #spend')].filter(vis).map(e => [e, e.getBoundingClientRect()]);
-  for (const e of document.querySelectorAll('#card, #pop, #trayList, #look')) {
+  // 5. overlays: inside the window, never on the core, and never on the top band (the workbench mark opens the look menu;
+  //    Agents & keys has its button there). Agents & keys itself (#connect) is a modal dialog: it covers the board on
+  //    purpose, with the board inert behind it, so it has only to be inside the window
+  const top = [...document.querySelectorAll('#brand, #mode, #repo, #conn, #spend, #connectBtn')].filter(vis).map(e => [e, e.getBoundingClientRect()]);
+  for (const e of document.querySelectorAll('#card, #pop, #trayList, #look, #connect')) {
     if (!vis(e)) continue;
     const r = e.getBoundingClientRect();
     if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) out.push('off-screen: ' + label(e));
+    if (e.id === 'connect') continue;
     if (ov(r, core) > 1) out.push(e.id + ' covers the core');
     for (const [t, tr] of top) if (ov(r, tr) > 1) out.push(e.id + ' covers ' + label(t));
   }
