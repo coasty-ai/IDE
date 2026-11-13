@@ -464,6 +464,12 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
       },
     },
     { method: 'POST', re: /^\/api\/connect\/github\/disconnect$/, connect: true, run: async () => done(await connect.disconnectGithub(), 'Workbench is no longer connected to GitHub.') },
+    // GitHub through gh, GitHub's command-line tool. Sign in answers at once, with status.github.signingIn (the download,
+    // the one-time code, or Terminal), and goes on by itself; the page reads /api/connect again while it is set. Cancel
+    // stops it. Sign out answers `opened` (Terminal), and `command` when gh could not sign out and Terminal could not open.
+    { method: 'POST', re: /^\/api\/connect\/github\/signin$/, connect: true, run: async () => ghDone(await connect.githubSignIn()) },
+    { method: 'POST', re: /^\/api\/connect\/github\/signin\/cancel$/, connect: true, run: async () => ghDone(await connect.cancelGithubSignIn()) },
+    { method: 'POST', re: /^\/api\/connect\/github\/signout$/, connect: true, run: async () => ghDone(await connect.githubSignOut(), true) },
     {
       // "Let agents use this token", changed without the token: Connect reads it back from the key store. When it
       // cannot, the answer is { ok: false, why: 'token', sentence, status }; with GitHub not connected, a 409.
@@ -507,6 +513,15 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     const said = typeof r?.sentence === 'string' && r.sentence.trim() ? r.sentence.trim() : fallback;
     const status = await connect.status({ repoRoot: rootNow() });
     return { ...extra, ok: r?.ok !== false, sentence: said ?? null, status };
+  }
+  /** The answer to a GitHub-through-gh request: `why` when Connect said no; for sign-out, `opened` and any `command`. */
+  function ghDone(r, terminal = false) {
+    const extra = r?.ok === false && typeof r.why === 'string' ? { why: r.why } : {};
+    if (terminal) {
+      extra.opened = r?.opened === true;
+      if (typeof r?.command === 'string' && r.command) extra.command = r.command;
+    }
+    return done(r, null, extra);
   }
 
   // src/shared/keypresets.mjs, loaded on first use: { presetById } or null. Tests may give their own (options.keyPresets),

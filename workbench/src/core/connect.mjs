@@ -1,6 +1,7 @@
 // The connect service: which coding agents are here and signed in, the keys Workbench gives them, the person's name
-// and email for git, and GitHub. The page's Agents & keys panel shows `status()`, and its buttons call the methods
-// below through the routes in src/server/http.mjs. See ARCHITECTURE.md, "Connecting agents, keys and git".
+// and email for git, and GitHub: through GitHub's command-line tool, gh (src/core/github.mjs: Sign in to GitHub, with
+// no token), or through a token (milestone 1's "Use a token instead"). The page's Agents & keys panel shows `status()`,
+// and its buttons call the methods below through the routes in src/server/http.mjs. See ARCHITECTURE.md, "Connect".
 //
 // Nothing here returns, logs or emits a secret value, or a vendor program's own words: sentences are built from facts
 // Workbench found itself. Claude Code's sign-in is read from `claude auth status`, never from its keychain item, and the
@@ -16,7 +17,9 @@ import { buildEnv as codexEnv, codexBin } from '../adapters/codex/runner.mjs';
 import { KEY_PRESETS } from '../shared/keypresets.mjs';
 import { maskSecrets, readPrivateFile } from './keys.mjs';
 import * as workspaceModule from './workspace.mjs';
-import { openTerminal as openTerminalWindow } from './terminal.mjs';
+import { openTerminal as openTerminalWindow, openTerminalSteps as openTerminalStepsWindow } from './terminal.mjs';
+import * as githubModule from './github.mjs';
+import { GH_DEVICE_URL, GH_MIN_VERSION, LOGIN_MAX_MS, versionAtLeast } from './github.mjs';
 
 /** How long one sign-in check may take. */
 const PROBE_TIMEOUT_MS = 10_000;
@@ -255,6 +258,23 @@ async function fetchJsonWithNode(url, { headers } = {}) {
   return { status: res.status, json };
 }
 
+/** What the panel says once gh is signed in and git uses it. */
+function ghSignedIn(login) {
+  return `Signed in to GitHub as ${login}. Git in Terminal, Workbench and your agents use this sign-in.`;
+}
+
+/** Call a listener; one that throws never breaks a sign-in. */
+function callQuietly(fn, arg) {
+  try { fn(arg); } catch { /* the listener's trouble */ }
+}
+
+/** The fields of `o` named in `keys` that are not undefined. */
+function pickDefined(o, keys) {
+  const out = {};
+  for (const k of keys) if (o && o[k] !== undefined) out[k] = o[k];
+  return out;
+}
+
 function makeLog(log) {
   return (level, msg) => {
     const line = `connect: ${msg}`;
@@ -289,13 +309,19 @@ export class Connect extends EventEmitter {
    * @param {object|Function} [o.log]
    * @param {string} [o.repoRoot]   the repository Workbench works on: the first probe gives the agents its keys too
    * @param {boolean} [o.probe]      probe the agents at once (true): defaultAgent() cannot tell until a probe ends.
-   *   Pass false where no agent will be started (the CLI's --connect-github and --github-repos).
+   *   Pass false where no agent will be started (the CLI's GitHub helpers, such as --connect-github and --github-repos).
    *   Also accepted, mainly for tests: presets (the KEY_PRESETS list), probeTimeoutMs (10 000).
+   * @param {Function} [o.openTerminalSteps] ({ title, steps }) => Promise<{ opened }>, default from terminal.mjs (GitHub's
+   *   sign-in in Terminal: gh's login, then setup-git)
+   * @param {object} [o.ghModule]    src/core/github.mjs, or a stand-in for some of its functions
+   * @param {object} [o.ghOptions]   for GitHub through gh, mainly for tests: { fetchImpl, verify, osRelease, arch, tmpDir,
+   *   dirs, codeWaitMs (15 s), loginMs (15 min), terminalMs (15 min), pollMs (3 s) }
    */
   constructor({
     home = os.homedir(), platform = process.platform, env = process.env, keys, workspace = workspaceModule, adapters = {},
     flags = {}, settingsPath, openTerminal = openTerminalWindow, fetchJson = fetchJsonWithNode, log = null, repoRoot = null,
     probe = true, presets = KEY_PRESETS, probeTimeoutMs = PROBE_TIMEOUT_MS,
+    openTerminalSteps = openTerminalStepsWindow, ghModule = null, ghOptions = {},
   } = {}) {
     super();
     if (!keys || typeof keys.list !== 'function' || typeof keys.add !== 'function') throw new Error('The connect service needs the key store.');
@@ -318,6 +344,14 @@ export class Connect extends EventEmitter {
     this._current = null; // the probe under way
     this._next = null; // one more probe, queued behind it
     this._settings = this._readSettings();
+    // GitHub through gh: the sign-in under way, how the last one ended when it did not sign in, and what each gh says
+    // its version is (asked again when the file changes).
+    this.openTerminalSteps = openTerminalSteps;
+    this.gh = { ...githubModule, ...(ghModule || {}) };
+    this.ghOptions = ghOptions && typeof ghOptions === 'object' ? ghOptions : {};
+    this._ghFlow = null;
+    this._ghNote = null;
+    this._ghVersions = new Map();
     // An 'agents' listener added after a probe ended hears the last map at once (once), so the engine never misses the
     // first probe, however late it is wired.
     this.on('newListener', (event, listener) => {
@@ -371,7 +405,7 @@ export class Connect extends EventEmitter {
       platform: this.platform,
       canOpenTerminal: this.platform === 'darwin',
       git: await this._gitStatus(root),
-      github: { connected: github.connected, login: github.login, agentsUseIt: github.agentsUseIt, sentence: github.sentence },
+      github: await this._githubStatus(github),
       // A key for one repository says whether it is this one (`here`), by real paths, as envFor gives keys: the page
       // words "this repository" from that, never from folder names.
       keys: keys.filter((k) => k.id !== github.keyId).map((k) => {
@@ -773,12 +807,32 @@ export class Connect extends EventEmitter {
   }
 
   /**
+   * The person's repositories on GitHub, most recently pushed first, at most 100. Through gh when gh is signed in
+   * (ghReposOrNull: organisations' repositories too); otherwise, or when gh lists none or fails, with the token
+   * connection (_githubReposWithToken). Neither: [].
+   * @returns {Promise<{ fullName: string, cloneUrl: string, private: boolean, pushedAt: string|null }[]>}
+   */
+  async githubRepos() {
+    const pick = await this._ghPick();
+    const ghPath = pick.path || (pick.old && pick.old.path) || null;
+    if (ghPath) {
+      const cwd = this._probeFolder();
+      const st = await this.gh.ghStatus({ ghPath, env: this.env, version: pick.path ? pick.version : pick.old.version, cwd });
+      if (st.signedIn === true) {
+        const list = await this.gh.ghReposOrNull({ ghPath, env: this.env, cwd, log: (m) => this._log('warn', m) });
+        if (Array.isArray(list) && list.length) return list;
+      }
+    }
+    return this._githubReposWithToken();
+  }
+
+  /**
    * The person's repositories on GitHub, most recently pushed first (GET /user/repos?per_page=100&sort=pushed), asked
    * for with the token the key store keeps for the GitHub connection (also a token for git only, which no agent gets).
    * No connection, no token or any failure: [].
    * @returns {Promise<{ fullName: string, cloneUrl: string, private: boolean, pushedAt: string|null }[]>}
    */
-  async githubRepos() {
+  async _githubReposWithToken() {
     this._settings = this._readSettings();
     const github = this._github(await this._listKeys());
     if (!github.connected) return [];
@@ -854,6 +908,388 @@ export class Connect extends EventEmitter {
       this._log('warn', `git could not forget the GitHub sign-in${e && e.detail ? `: ${oneLine(e.detail, 300)}` : ''}`);
       return false;
     }
+  }
+
+  // ---------------------------------------------------------------- GitHub through gh
+
+  /**
+   * ConnectStatus's `github`, on its own (the Mac app's --github-status, which it may ask every few seconds): no agent
+   * is probed, nothing reaches the network, and the key store is asked (which reads the keys' values, from the keychain
+   * on a Mac) only when settings.json names a token connection. See _githubStatus.
+   */
+  async githubStatus() {
+    this._settings = this._readSettings();
+    const gh = this._settings && typeof this._settings.github === 'object' && this._settings.github ? this._settings.github : null;
+    return this._githubStatus(this._github(gh && gh.keyId ? await this._listKeys() : []));
+  }
+
+  /**
+   * GitHub as the panel shows it: through gh when gh is signed in to github.com (read from gh's own settings, no network
+   * call), else through the token connection (`token`: what _github found), else neither. Never a token.
+   * @returns {Promise<{ connected: boolean, via: 'gh'|'token'|null, login: string|null, ghInstalled: boolean,
+   *   ghVersion: string|null, ghPath: string|null, agentsUseIt: boolean, sentence: string, signingIn: object|null }>}
+   */
+  async _githubStatus(token) {
+    const pick = await this._ghPick();
+    const runPath = pick.path || (pick.old && pick.old.path) || null;
+    const st = runPath
+      ? await this.gh.ghStatus({ ghPath: runPath, env: this.env, version: pick.path ? pick.version : pick.old.version, cwd: this._probeFolder() })
+      : { signedIn: false, login: null };
+    const viaGh = st.signedIn === true && typeof st.login === 'string' && GITHUB_LOGIN.test(st.login);
+    let gitUsesIt = false;
+    if (viaGh) {
+      this._ghNote = null;
+      gitUsesIt = await this._gitUsesGh();
+    }
+    const via = viaGh ? 'gh' : token.connected ? 'token' : null;
+    let sentence;
+    if (viaGh) sentence = gitUsesIt ? ghSignedIn(st.login) : `Signed in to GitHub as ${st.login}, but git does not use this sign-in yet. Sign in to GitHub again to set that up.`;
+    else if (token.connected) sentence = token.sentence;
+    else if (this._ghNote) sentence = this._ghNote;
+    else sentence = token.sentence;
+    return {
+      connected: via !== null,
+      via,
+      login: viaGh ? st.login : token.login,
+      ghInstalled: !!pick.path,
+      ghVersion: pick.path ? pick.version : null,
+      ghPath: pick.path || null,
+      agentsUseIt: viaGh ? gitUsesIt : token.agentsUseIt,
+      sentence,
+      signingIn: this.githubSignInState(),
+    };
+  }
+
+  /** Whether git asks gh for github.com's sign-in (false, and a line in the log, when git's settings cannot be read). */
+  async _gitUsesGh() {
+    try {
+      return (await this.gh.gitUsesGh()) === true;
+    } catch (e) {
+      this._log('warn', `git's settings could not be read${e && e.detail ? `: ${oneLine(e.detail, 300)}` : ''}`);
+      return false;
+    }
+  }
+
+  /**
+   * The gh Workbench uses: `{ path, version }` of a gh that runs and is GH_MIN_VERSION or later; `old: { path, version }`
+   * when the one found first is older (or does not run): Workbench then uses its own copy in ~/.local/bin by its full
+   * path when that one will do, else none (`path: null`), and a sign-in installs it. With WORKBENCH_GH_BIN, only that
+   * program counts (`given`; `missing` when it is not there), and nothing is installed in its place.
+   */
+  async _ghPick() {
+    const env = this.env;
+    const given = typeof env.WORKBENCH_GH_BIN === 'string' && env.WORKBENCH_GH_BIN !== '' ? path.resolve(env.WORKBENCH_GH_BIN) : null;
+    const found = this.gh.ghFind(env, { home: this.home, ...(Array.isArray(this.ghOptions.dirs) ? { dirs: this.ghOptions.dirs } : {}) });
+    if (!found) return { path: null, version: null, old: null, given, missing: !!given };
+    const version = await this._ghVersionOf(found);
+    if (version && versionAtLeast(version, GH_MIN_VERSION)) return { path: found, version, old: null, given };
+    const old = { path: found, version };
+    if (given) return { path: null, version: null, old, given };
+    const own = this.gh.ghOwnPath(this.home);
+    if (own !== found && isFile(own)) {
+      const v = await this._ghVersionOf(own);
+      if (v && versionAtLeast(v, GH_MIN_VERSION)) return { path: own, version: v, old, given: null };
+    }
+    return { path: null, version: null, old, given: null };
+  }
+
+  /** What a gh program says its version is, kept until the file changes (a failure is asked again next time). */
+  async _ghVersionOf(p) {
+    let stamp;
+    try {
+      const st = fs.statSync(p);
+      stamp = `${st.ino}:${st.size}:${st.mtimeMs}`;
+    } catch {
+      return null;
+    }
+    const known = this._ghVersions.get(p);
+    if (known && known.stamp === stamp) return known.version;
+    const version = await this.gh.ghVersion({ ghPath: p, env: this.env, cwd: this._probeFolder() });
+    if (version) this._ghVersions.set(p, { stamp, version });
+    return version;
+  }
+
+  /**
+   * The sign-in under way, as ConnectStatus shows it: `{ phase: 'installing'|'code'|'terminal', code, url, since,
+   * sentence }`, with `opened: false` and `command` when Terminal could not be opened. `code` and `url` are set only
+   * once gh has printed the code (the code is not a secret: GitHub shows it too). Null when none is under way.
+   */
+  githubSignInState() {
+    const f = this._ghFlow;
+    if (!f || f.ended) return null;
+    const waiting = f.phase === 'code' && !!f.code;
+    const view = { phase: f.phase, code: waiting ? f.code : null, url: waiting ? f.url : null, since: f.since, sentence: f.sentence };
+    if (f.phase === 'terminal' && f.opened === false) Object.assign(view, { opened: false, command: f.command });
+    return view;
+  }
+
+  /**
+   * Sign in to GitHub with gh, one sign-in at a time (a second call joins the one under way):
+   * 1. gh is installed first when it is missing or older than Workbench needs (`installing`: ghInstall);
+   * 2. when gh is signed in already, git is made to use it (setup-git), and that is all;
+   * 3. gh's login runs with no terminal (`code`: the one-time code and github.com's device page, for the person to open);
+   *    when it exits 0, setup-git runs, then gh's sign-in is read again;
+   * 4. when no code comes within 15 seconds, gh asks a question, or it fails, Terminal opens on the two steps instead
+   *    (`terminal`), and Workbench reads gh's sign-in every few seconds until it is there, for 15 minutes at most.
+   * `onProgress` hears `{ phase: 'installing'|'code'|'terminal', … }` as each begins (a call that joins hears the phase
+   * under way at once), then `{ phase: 'done', login, sentence }` or `{ phase: 'error', why, sentence }`.
+   * Without `wait` the answer comes as soon as the first phase is known: `{ ok, sentence }` (the route's answer, with
+   * status.github.signingIn). With `wait` it comes when the sign-in has ended: `{ ok: true, phase: 'done', login,
+   * sentence }`, or `{ ok: false, phase: 'error', why, sentence }`, why being `cancelled`, `expired`, `terminal`, `gh`,
+   * or an install refusal's (see ghInstall).
+   */
+  async githubSignIn({ onProgress, wait = false } = {}) {
+    const flow = this._ghFlow || this._startGhFlow();
+    const listener = typeof onProgress === 'function' ? onProgress : null;
+    if (listener) {
+      flow.listeners.add(listener);
+      if (flow.phase !== 'code' || flow.code) callQuietly(listener, this._ghProgress(flow));
+    }
+    if (wait) {
+      try {
+        return await flow.promise;
+      } finally {
+        if (listener) flow.listeners.delete(listener);
+      }
+    }
+    await flow.started;
+    if (flow.outcome) {
+      const o = flow.outcome;
+      return o.ok ? { ok: true, sentence: o.sentence } : { ok: false, why: o.why, sentence: o.sentence };
+    }
+    return { ok: true, sentence: flow.sentence };
+  }
+
+  /** Stop the sign-in under way: the download, gh's login, or the wait for Terminal. */
+  async cancelGithubSignIn() {
+    const flow = this._ghFlow;
+    if (!flow || flow.ended) return { ok: true, sentence: 'No sign-in to GitHub was under way.' };
+    flow.cancelled = true;
+    try { flow.abort.abort(); } catch { /* already */ }
+    flow.stopLogin?.();
+    flow.wake?.();
+    await flow.promise;
+    return { ok: true, sentence: 'Stopped signing in to GitHub.' };
+  }
+
+  /**
+   * Sign out of GitHub: gh forgets its sign-in (`gh auth logout --hostname github.com --user <login>`, with no terminal;
+   * Terminal on gh's sign-out when that fails, on macOS), then git's settings lose what setup-git wrote, when they are
+   * exactly gh's (forgetGhGitHelper): git is then as it was before. GitHub itself still lists the sign-in until the
+   * person revokes it there, and the sentence says so. A sign-in under way is stopped first.
+   * @returns {Promise<{ ok: boolean, why?: string, opened?: boolean, command?: string, sentence: string }>}
+   */
+  async githubSignOut() {
+    if (this._ghFlow) await this.cancelGithubSignIn();
+    this._ghNote = null;
+    const pick = await this._ghPick();
+    const ghPath = pick.path || (pick.old && pick.old.path) || null;
+    const cwd = this._probeFolder();
+    const st = ghPath ? await this.gh.ghStatus({ ghPath, env: this.env, version: pick.path ? pick.version : pick.old.version, cwd }) : { signedIn: false, login: null };
+    const revoke = 'GitHub still lists this sign-in under Settings → Applications until you revoke it there.';
+    let opened = false;
+    if (ghPath && st.signedIn !== false) {
+      const out = await this.gh.ghLogout({ ghPath, env: this.env, login: st.login, cwd });
+      if (!out.ok) {
+        this._log('warn', `GitHub’s command-line tool could not sign out without Terminal: ${oneLine(out.detail, 500)}`);
+        let res = null;
+        if (this.platform === 'darwin') {
+          try {
+            res = await this.openTerminal({ title: 'Signing out of GitHub', ...this.gh.ghSignOutProgram(ghPath) });
+          } catch (e) {
+            this._log('warn', `Terminal could not be opened: ${e && e.message}`);
+          }
+        }
+        if (!(res && res.opened)) {
+          this.emit('changed');
+          return { ok: false, why: 'gh', opened: false, command: this.gh.ghSignOutCommand(ghPath), sentence: 'Workbench could not sign out of GitHub. Run this command in a terminal, then check again.' };
+        }
+        opened = true;
+      }
+    }
+    let after = '';
+    try {
+      const { kept } = await this.gh.forgetGhGitHelper();
+      if (kept && kept.length) this._log('info', `git's settings for ${kept.join(' and ')} hold helpers of the person's own, so they stay.`);
+    } catch (e) {
+      this._log('warn', `git's settings could not be changed back${e && e.detail ? `: ${oneLine(e.detail, 300)}` : ''}`);
+      after = ' Git still asks GitHub’s command-line tool for your GitHub sign-in, so git cannot reach github.com until you sign in again.';
+    }
+    this.emit('changed');
+    if (opened) return { ok: true, opened: true, sentence: `Terminal is open to sign you out of GitHub. When it is done, come back here. ${revoke}${after}` };
+    if (!ghPath || st.signedIn === false) return { ok: true, sentence: `GitHub’s command-line tool was not signed in.${after}` };
+    return { ok: true, sentence: `Signed out of GitHub. ${revoke}${after}` };
+  }
+
+  /** A new sign-in: its state, its listeners, and its promise, which never rejects. */
+  _startGhFlow() {
+    const flow = {
+      phase: 'code', code: null, url: null, opened: undefined, command: null, since: Date.now(), sentence: 'Getting ready to sign in to GitHub…',
+      listeners: new Set(), abort: new AbortController(), cancelled: false, ended: false, outcome: null, stopLogin: null, wake: null,
+    };
+    let markStarted;
+    flow.started = new Promise((resolve) => { markStarted = resolve; });
+    flow.markStarted = () => markStarted();
+    this._ghFlow = flow;
+    this._ghNote = null;
+    flow.promise = this._runGhFlow(flow)
+      .catch((e) => {
+        this._log('error', `signing in to GitHub failed: ${e && (e.stack || e.message)}`);
+        return { ok: false, phase: 'error', why: 'error', sentence: 'Workbench could not sign in to GitHub. The details are in its log.' };
+      })
+      .then((outcome) => {
+        flow.ended = true;
+        flow.outcome = outcome;
+        flow.stopLogin = null;
+        flow.wake = null;
+        if (this._ghFlow === flow) this._ghFlow = null;
+        this._ghNote = outcome.ok || outcome.why === 'cancelled' ? null : outcome.sentence;
+        const end = outcome.ok ? { phase: 'done', login: outcome.login, sentence: outcome.sentence } : { phase: 'error', why: outcome.why, sentence: outcome.sentence };
+        for (const l of [...flow.listeners]) callQuietly(l, end);
+        flow.listeners.clear();
+        flow.markStarted();
+        this.emit('changed');
+        return outcome;
+      });
+    return flow;
+  }
+
+  /** A phase begins: the flow says so, its listeners hear it, and the panel may change. */
+  _ghPhase(flow, phase, fields = {}) {
+    if (flow.ended) return;
+    Object.assign(flow, { phase, ...fields });
+    const now = this._ghProgress(flow);
+    for (const l of [...flow.listeners]) callQuietly(l, now);
+    this.emit('changed');
+  }
+
+  /** What a listener hears of the phase under way. */
+  _ghProgress(flow) {
+    if (flow.phase === 'installing') return { phase: 'installing', sentence: flow.sentence };
+    if (flow.phase === 'terminal') {
+      return flow.opened === false
+        ? { phase: 'terminal', opened: false, command: flow.command, sentence: flow.sentence }
+        : { phase: 'terminal', opened: true, sentence: flow.sentence };
+    }
+    return { phase: 'code', code: flow.code || null, url: flow.code ? flow.url : null, sentence: flow.sentence };
+  }
+
+  async _runGhFlow(flow) {
+    const o = this.ghOptions;
+    const cwd = this._probeFolder();
+    const fail = (why, sentence) => ({ ok: false, phase: 'error', why, sentence });
+    const cancelled = () => fail('cancelled', 'Stopped signing in to GitHub.');
+    const pick = await this._ghPick();
+    if (flow.cancelled) return cancelled();
+    if (pick.given && !pick.path) {
+      const given = oneLine(pick.given, 300);
+      return fail('gh', pick.missing
+        ? `GitHub’s command-line tool is not at ${given}, the path in WORKBENCH_GH_BIN.`
+        : `GitHub’s command-line tool at ${given}, the path in WORKBENCH_GH_BIN, ${pick.old && pick.old.version ? `is version ${pick.old.version}, older than Workbench needs (${GH_MIN_VERSION} or later)` : 'could not be started'}.`);
+    }
+    let ghPath = pick.path;
+    flow.ghVersion = pick.version; // known: gh's later checks need not ask it again
+    if (!ghPath) {
+      // Missing, or older than Workbench needs: Workbench gets its own copy, in ~/.local/bin, and says why.
+      const old = pick.old
+        ? ` The one at ${oneLine(pick.old.path, 300)} ${pick.old.version ? `is version ${pick.old.version}, older than Workbench needs` : 'could not be started'}, so Workbench gets its own.`
+        : '';
+      this._ghPhase(flow, 'installing', { sentence: `Getting GitHub’s command-line tool…${old}` });
+      flow.markStarted();
+      try {
+        const got = await this.gh.ghInstall({
+          home: this.home, platform: this.platform, env: this.env, signal: flow.abort.signal,
+          ...pickDefined(o, ['fetchImpl', 'verify', 'osRelease', 'arch', 'tmpDir']),
+        });
+        ghPath = got.path;
+        flow.ghVersion = got.version;
+        this._log('info', `GitHub’s command-line tool ${got.version} is now at ${got.path}.`);
+      } catch (e) {
+        if (flow.cancelled) return cancelled();
+        this._log('warn', `GitHub’s command-line tool could not be installed: ${e && e.plain ? `${e.message}${e.detail ? ` (${oneLine(e.detail, 500)})` : ''}` : (e && (e.stack || e.message))}`);
+        return fail(e && typeof e.why === 'string' ? e.why : 'install', e && e.plain === true ? e.message : 'Workbench could not get GitHub’s command-line tool. The details are in its log.');
+      }
+      if (flow.cancelled) return cancelled();
+    }
+    // Signed in already (in a terminal of the person's own, say): git is made to use it (also a gh just installed in
+    // place of another), and that is all.
+    const before = await this.gh.ghStatus({ ghPath, env: this.env, version: flow.ghVersion, cwd });
+    if (flow.cancelled) return cancelled();
+    if (before.signedIn === true) return this._ghFinish(flow, ghPath);
+    // gh's own login, with no terminal: the code shows in Workbench, and the person approves it on github.com.
+    this._ghPhase(flow, 'code', { code: null, url: null, sentence: 'Asking GitHub for a one-time code…' });
+    flow.markStarted();
+    const login = this.gh.startGhLogin({
+      ghPath, env: this.env, cwd, ...pickDefined({ codeWaitMs: o.codeWaitMs, maxMs: o.loginMs }, ['codeWaitMs', 'maxMs']),
+      onCode: ({ code }) => this._ghPhase(flow, 'code', {
+        code, url: GH_DEVICE_URL, sentence: `Your code: ${code}. Open GitHub, enter the code there, and approve the sign-in.`,
+      }),
+    });
+    flow.stopLogin = login.cancel;
+    if (flow.cancelled) login.cancel();
+    const r = await login.done;
+    flow.stopLogin = null;
+    if (flow.cancelled || r.outcome === 'cancelled') return cancelled();
+    if (r.outcome === 'done') return this._ghFinish(flow, ghPath);
+    if (r.outcome === 'expired') return fail('expired', 'The one-time code ran out before the sign-in was approved on GitHub. Sign in to GitHub again for a new code.');
+    this._log('warn', `GitHub’s command-line tool could not sign in without Terminal (${r.outcome}${r.exitCode != null ? `, exit ${r.exitCode}` : ''}): ${oneLine(r.detail, 500)}`);
+    return this._ghTerminal(flow, ghPath);
+  }
+
+  /** The fallback: Terminal on gh's login and setup-git; then gh's sign-in is read every few seconds until it is there. */
+  async _ghTerminal(flow, ghPath) {
+    const o = this.ghOptions;
+    let res = null;
+    if (this.platform === 'darwin') {
+      try {
+        res = await this.openTerminalSteps({ title: 'Signing in to GitHub', steps: this.gh.ghSignInSteps(ghPath) });
+      } catch (e) {
+        this._log('warn', `Terminal could not be opened: ${e && e.message}`);
+      }
+    }
+    if (flow.cancelled) return { ok: false, phase: 'error', why: 'cancelled', sentence: 'Stopped signing in to GitHub.' };
+    if (res && res.opened) {
+      this._ghPhase(flow, 'terminal', { opened: true, command: null, code: null, url: null, sentence: 'Terminal is open: follow the steps there, then come back.' });
+    } else {
+      this._ghPhase(flow, 'terminal', {
+        opened: false, command: this.gh.ghSignInCommand(ghPath), code: null, url: null,
+        sentence: this.platform === 'darwin' ? 'Workbench could not open Terminal. Run this command in a terminal, then come back here.' : 'Run this command in a terminal, then come back here.',
+      });
+    }
+    const until = Date.now() + (Number.isFinite(o.terminalMs) ? o.terminalMs : LOGIN_MAX_MS);
+    const every = Number.isFinite(o.pollMs) ? o.pollMs : 3000;
+    while (!flow.cancelled && Date.now() < until) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(wake, Math.max(0, Math.min(every, until - Date.now())));
+        function wake() {
+          clearTimeout(timer);
+          resolve();
+        }
+        flow.wake = wake;
+      });
+      flow.wake = null;
+      if (flow.cancelled) break;
+      const st = await this.gh.ghStatus({ ghPath, env: this.env, version: flow.ghVersion, cwd: this._probeFolder() });
+      if (st.signedIn === true) return this._ghFinish(flow, ghPath);
+    }
+    if (flow.cancelled) return { ok: false, phase: 'error', why: 'cancelled', sentence: 'Stopped signing in to GitHub.' };
+    return { ok: false, phase: 'error', why: 'terminal', sentence: 'The sign-in in Terminal did not finish. Sign in to GitHub again to try once more.' };
+  }
+
+  /** gh is signed in: setup-git (every time: it is safe to repeat, and gh may have moved), then the login, verified. */
+  async _ghFinish(flow, ghPath) {
+    const cwd = this._probeFolder();
+    const setup = await this.gh.ghSetupGit({ ghPath, env: this.env, cwd });
+    if (!setup.ok) this._log('warn', `git could not be set up to use GitHub’s command-line tool: ${oneLine(setup.detail, 500)}`);
+    const st = await this.gh.ghStatus({ ghPath, env: this.env, version: flow.ghVersion, cwd, verify: true });
+    if (st.signedIn !== true || !st.login) {
+      return { ok: false, phase: 'error', why: 'gh', sentence: 'GitHub’s command-line tool finished, but Workbench could not find the sign-in. Sign in to GitHub again.' };
+    }
+    const uses = await this._gitUsesGh();
+    return {
+      ok: true, phase: 'done', login: st.login,
+      sentence: uses ? ghSignedIn(st.login) : `Signed in to GitHub as ${st.login}, but Workbench could not make git use this sign-in. Sign in to GitHub again to try once more.`,
+    };
   }
 
   // ---------------------------------------------------------------- keys
