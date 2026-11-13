@@ -19,8 +19,9 @@
 // changes, merge and discard always name a root agent (a helper stands for its agent); agentId is null when the
 // words did not make clear which one. Merge and discard are always asked first (the engine shows a card).
 // A launch's harness is the agent the words named ("codex", "claude"), or null: the engine then gives the work to
-// the person's default agent. A start that says no work ("start an agent", "new agent") is { kind: 'start',
-// tasks: [], task: null }, and the engine asks what the agent should work on.
+// the person's default agent. A start that says no work ("start an agent", "new agent", "start codex") is { kind:
+// 'start', tasks: [], task: null, harness }, with harness the one agent the words named (else null), and the engine
+// asks what that agent should work on.
 import { clip } from '../shared/format.mjs';
 import { ENDED, LOOK } from '../shared/states.mjs';
 
@@ -1461,8 +1462,18 @@ function buildTasks(rest, noun, c) {
   return harnesses.slice(0, MAX_LAUNCH).map(harness => ({ task, harness, machine }));
 }
 
-/** A start that says no work: the engine asks what the agent should work on. */
-const NO_TASK_START = () => ({ kind: 'start', tasks: [], task: null });
+/**
+ * A start that says no work: the engine asks what the agent should work on. `harness` is the one agent the words named
+ * ("start codex", "a new codex agent", "start an agent with codex"), or null, so the engine can ask about that agent,
+ * or say why it cannot start.
+ */
+const NO_TASK_START = (harness = null) => ({ kind: 'start', tasks: [], task: null, harness });
+
+/** The one agent a start with no work names, before or after its noun ("start an agent with codex"), or null. */
+function noTaskHarness(noun, rest, c) {
+  const named = noun.harnesses.length ? noun.harnesses : [takeHarness(takeMachine(rest, c).toks).harness].filter(Boolean);
+  return named.length === 1 ? named[0] : null;
+}
 /** Words that make a bare noun phrase a request for one more agent: "new agent", "another codex agent". */
 const NEW_WORDS = new Set(['new', 'another', 'fresh', 'extra', 'more', 'second', 'separate', 'different']);
 
@@ -1476,7 +1487,7 @@ function matchStart(core, c) {
     // No verb, but a launchable noun and a clear join: "codex, write tests", "new agent to fix the login".
     if (!noun.named || !launchNoun(ws) || noun.definite) return null;
     // A new agent and nothing more: "new agent", "another codex agent". Work comes next, so ask for it.
-    if (noun.end === ws.length) return ws.some(w => NEW_WORDS.has(w)) ? { intent: NO_TASK_START(), strong: true } : null;
+    if (noun.end === ws.length) return ws.some(w => NEW_WORDS.has(w)) ? { intent: NO_TASK_START(noTaskHarness(noun, [], c)), strong: true } : null;
     const joined = core[noun.end - 1] && core[noun.end - 1].tail;
     if (!joined && !['to', 'on', 'for', 'that'].includes(ws[noun.end])) return null;
   } else if (!strongVerb && !noun.named) {
@@ -1487,7 +1498,7 @@ function matchStart(core, c) {
   // A start verb with no work after it ("start an agent", "start codex", "start", "add an agent on cloud 2"): the
   // engine asks what the agent should work on. Only a start verb with a named agent wins over a waiting question:
   // "use codex", "ask claude" or a bare "start" may well be the answer.
-  if (!tasks) return { intent: NO_TASK_START(), strong: strongVerb && noun.named };
+  if (!tasks) return { intent: NO_TASK_START(noTaskHarness(noun, core.slice(noun.end), c)), strong: strongVerb && noun.named };
   return { intent: { kind: 'start', tasks }, strong: noun.named };
 }
 

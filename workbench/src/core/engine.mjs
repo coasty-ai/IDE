@@ -151,6 +151,15 @@ function harnessName(h) {
 }
 
 /**
+ * `s` when it is one plain line fit to stand in a reply as it is: a sentence of at most 300 characters that starts
+ * with a capital or a digit, ends with a full stop, and holds no control, hidden or direction-changing character.
+ */
+function plainLine(s) {
+  const t = typeof s === 'string' ? s.trim() : '';
+  return t.length <= 300 && /^[A-Z0-9][^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]*\.$/u.test(t) ? t : null;
+}
+
+/**
  * What the engine keeps of a harness's availability (an adapter's available(), or Connect's word for it): the fields
  * in INFO_FIELDS. Nothing at all reads as not found; true or false as { ok }.
  */
@@ -835,13 +844,16 @@ export class Engine extends EventEmitter {
     return out;
   }
 
-  /** Does typed text look like a key (src/shared/secretshape.mjs)? Such text is refused before it is read or kept. */
+  /**
+   * Does typed text look like a key (src/shared/secretshape.mjs), or hold the value of one the person stored (Connect's
+   * mask changes it, whatever its shape: a password of words and digits)? Such text is refused before it is read or kept.
+   */
   _looksLikeKey(text) {
+    const t = String(text ?? '');
     try {
-      return looksLikeSecret(String(text ?? ''))?.secret === true;
-    } catch {
-      return false;
-    }
+      if (looksLikeSecret(t)?.secret === true) return true;
+    } catch { /* the mask may still know it */ }
+    return !!this._mask && this._mask(t) !== t;
   }
 
   _react(e) {
@@ -1620,11 +1632,20 @@ export class Engine extends EventEmitter {
       const h = this.deps.history.open({
         repoRoot: this.repoInfo.root, dir: this.options.historyDir || null, debounceMs: this.options.historyDebounceMs, log: this.log,
       });
-      for (const rec of h.load()) {
-        if (this.store.restore({ ...rec, work: this._restoredWork(rec) }, this._canContinue(rec))) this.earlierRecs.set(rec.id, rec);
+      let masked = false;
+      for (const saved of h.load()) {
+        // Text kept before a key was stored (or by a Workbench that hid nothing) is hidden with the keys stored now, as
+        // _apply hides an event's; ids, folders and branches stay as they are. The masked copy is the one kept, so it
+        // is the one written back.
+        const rec = this._mask ? maskValue(saved, this._mask, MASK_SKIP) : saved;
+        if (this.store.restore({ ...rec, work: this._restoredWork(rec) }, this._canContinue(rec))) {
+          this.earlierRecs.set(rec.id, rec);
+          if (rec !== saved) masked = true;
+        }
       }
       h.source(() => this._historyRecords());
       this.history = h;
+      if (masked) h.schedule(); // the file holds the keys until it is written again
     } catch (err) {
       this.log.warn('Workbench could not open its history:', err);
       this.history = null;
@@ -2054,8 +2075,11 @@ export class Engine extends EventEmitter {
     if (this._shuttingDown) throw plainError('Workbench is shutting down.');
     const text = String(task ?? '').trim();
     if (!text) throw plainError('Tell me what the agent should work on.');
-    // A key typed as a task would end up in a folder and branch name, the agent's arguments and the history.
-    if (this._looksLikeKey(text)) throw plainError(SECRET_REFUSED);
+    // A key typed as a task or a name (its shape, or a stored key's value) would end up in a folder and branch name,
+    // the agent's arguments and the history. As in command(), Agents & keys opens.
+    if (this._looksLikeKey(text) || (name != null && this._looksLikeKey(name))) {
+      throw Object.assign(plainError(SECRET_REFUSED), { openConnect: true });
+    }
     // Named in the words, or the default agent (the person's choice when it is ready, else the first ready one).
     // Refusals for want of an agent carry openConnect, so a reply made from them opens Agents & keys.
     const h = harness || this._defaultHarness();
@@ -2080,7 +2104,7 @@ export class Engine extends EventEmitter {
       if (h === 'sim') throw plainError('Simulated agents run only in the demo.');
       const mod = this.adapters[h];
       if (typeof mod?.createRunner !== 'function' || this.harnessInfo[h]?.ok === false) {
-        throw Object.assign(plainError(`${harnessName(h)} is not available on this computer.`), { openConnect: true });
+        throw Object.assign(plainError(this._cannotRunSentence(h)), { openConnect: true });
       }
       factory = (o) => mod.createRunner(o);
       const repo = await this._loadRepo();
@@ -2237,6 +2261,24 @@ export class Engine extends EventEmitter {
     if (typeof this.deps.workspace?.prepareRepo !== 'function') throw plainError('Workbench cannot read git repositories right now.');
     this.repoInfo = await this.deps.workspace.prepareRepo(String(this.repo));
     return this.repoInfo;
+  }
+
+  /**
+   * Read the person's repository again now, whether git knows their name and email included, and tell the page when
+   * what it shows changed (the store's 'repo', which the server sends as `event: repo`). For bin to call when Agents &
+   * keys saves the name and email, so Merge shows at once, not at the next 15 s refresh. A read already under way does not
+   * hold it back: of two reads, the one begun later is kept (_freshRepo). Live mode only, and it never rejects.
+   * @returns {Promise<object|null>} the repository as the page sees it now (_repoView), or null (the demo, or before start)
+   */
+  async refreshRepo() {
+    if (this.mode === 'live' && this.repoInfo?.root) {
+      try {
+        await this._freshRepo();
+      } catch (err) {
+        this.log.debug('Could not refresh the repo status:', err);
+      }
+    }
+    return this._repoView();
   }
 
   /** Every 15 s: the repository as it is now (fire and forget, one at a time). */
@@ -2789,12 +2831,15 @@ export class Engine extends EventEmitter {
     v = this.store.get(id);
     const again = this._mergeRefusal(v, { state: c.state, ownJob: true });
     if (again) return { reply: again.reply, focusId: id };
+    // The commit outlives the page: its words go through the mask too, for text kept from before a key was stored.
+    // Masked before they are cut (a key the cut splits no longer matches), and again after.
+    const m = this._mask || ((s) => s);
     let res;
     try {
       res = await this.deps.workspace.mergeWork({
         repoRoot: this.repoInfo.root, path: ws.path, branch: ws.branch, since: sinceOf(ws),
         expect: { workId: c.expect.workId, into: c.expect.into, intoHead: c.expect.intoHead },
-        message: { subject: commitSubject(v.task, `Work by ${v.name}`), body: commitBody(v.says), name: v.name },
+        message: { subject: m(commitSubject(m(v.task), `Work by ${m(v.name)}`)), body: m(commitBody(m(v.says))), name: m(v.name) },
         agentId: v.id, harness: v.harness,
       });
     } catch (err) {
@@ -3373,9 +3418,10 @@ export class Engine extends EventEmitter {
     const get = (id) => (id ? this.store.get(id) : null);
     switch (intent.kind) {
       case 'start':
-        // "start an agent" with no task comes as { kind: 'start', task: null }: the reply asks what to work on.
+        // "start an agent" with no task comes as { kind: 'start', tasks: [], task: null, harness }: the reply asks what
+        // to work on, naming the agent the words named ("start codex"), or says why that one cannot start.
         return this._proposeStart(Array.isArray(intent.tasks) ? intent.tasks
-          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : []);
+          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : [], intent.harness);
       case 'task':
         return this._proposeStart([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
       case 'help': {
@@ -3509,29 +3555,52 @@ export class Engine extends EventEmitter {
   }
 
   /**
+   * Why new work cannot start on agent `h` here. Signed out (Connect ran it, and it says it is not signed in: signedIn
+   * 'no'): Connect's own sentence for it when that is one plain line, else "<Name> is installed but not signed in.",
+   * then "Sign in in Agents & keys.". Anything else: "<Name> is not available on this computer.", and with `advice`,
+   * "Connect it in Agents & keys.".
+   */
+  _cannotRunSentence(h, { advice = false } = {}) {
+    const name = harnessName(h);
+    const info = this.mode === 'live' ? this.harnessInfo[h] : null;
+    if (info?.signedIn === 'no' && typeof this.adapters[h]?.createRunner === 'function') {
+      return `${plainLine(info.reason) || `${name} is installed but not signed in.`} Sign in in Agents & keys.`;
+    }
+    return `${name} is not available on this computer.${advice ? ' Connect it in Agents & keys.' : ''}`;
+  }
+
+  /** The reply to new work that names an agent that cannot start here. In live mode it opens Agents & keys. */
+  _cannotRunReply(h) {
+    return this.mode === 'live' && AGENT_HARNESSES.includes(h)
+      ? { reply: this._cannotRunSentence(h, { advice: true }), openConnect: true }
+      : { reply: `${harnessName(h)} is not available on this computer.` };
+  }
+
+  /**
    * A launch card for these tasks. A task whose words name no agent goes to the default agent (_defaultHarness). With no
    * agent ready, or one named that cannot run here, the reply says so and carries `openConnect`, so the page opens
-   * Agents & keys.
+   * Agents & keys. With no task, the reply asks what to work on: `named`, the agent the words named ("start codex"),
+   * is asked about by name when it can start, and is refused as a task naming it would be when it cannot.
    */
-  _proposeStart(tasks) {
+  _proposeStart(tasks, named = null) {
     const list = (Array.isArray(tasks) ? tasks : [])
       .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
       .filter(t => t.task)
       .slice(0, 8);
     let def; // looked up once, and only when a task names no agent
     const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
-    // Nothing to work on yet: with no agent ready, that comes first, since nothing could start it.
-    if (!list.length) return fallback() === null ? { reply: NO_AGENT, openConnect: true } : { reply: 'What should the agent work on?' };
+    if (!list.length) {
+      const h = AGENT_HARNESSES.includes(named) ? named : null;
+      if (h) return this._canRun(h) ? { reply: `What should ${harnessName(h)} work on?` } : this._cannotRunReply(h);
+      // Nothing to work on yet: with no agent ready, that comes first, since nothing could start it.
+      return fallback() === null ? { reply: NO_AGENT, openConnect: true } : { reply: 'What should the agent work on?' };
+    }
     for (const t of list) {
       if (!t.harness) t.harness = fallback();
       if (!t.harness) return { reply: NO_AGENT, openConnect: true };
     }
     for (const t of list) {
-      if (this._canRun(t.harness)) continue;
-      const reply = `${harnessName(t.harness)} is not available on this computer.`;
-      return this.mode === 'live' && AGENT_HARNESSES.includes(t.harness)
-        ? { reply: `${reply} Connect it in Agents & keys.`, openConnect: true }
-        : { reply };
+      if (!this._canRun(t.harness)) return this._cannotRunReply(t.harness);
     }
     const detail = this._startDetail(list);
     // Live mode has no cloud machines: launches go to the laptop, and the question should not say otherwise.
@@ -3647,7 +3716,12 @@ export class Engine extends EventEmitter {
         else started.push(v);
       } catch (err) {
         if (err?.openConnect && this.mode === 'live') openConnect = true;
-        problems.push(`I could not start the agent for “${clip(t.task, 50)}”: ${plainReason(err)}`);
+        // A task refused for holding a key (stored after the card was made) is not quoted: a reply is never masked.
+        if (err?.message === SECRET_REFUSED) {
+          if (!problems.includes(SECRET_REFUSED)) problems.push(SECRET_REFUSED);
+        } else {
+          problems.push(`I could not start the agent for “${clip(t.task, 50)}”: ${plainReason(err)}`);
+        }
       }
     }
     const parts = [];

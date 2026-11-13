@@ -1317,7 +1317,9 @@ function rows(list) {
 
 const help = { kind: 'help' };
 const connect = { kind: 'connect' };
-const noWork = { kind: 'start', tasks: [], task: null };
+const noWork = { kind: 'start', tasks: [], task: null, harness: null };
+/** A start with no work that names one agent: the engine asks what that agent should work on. */
+const noWorkFor = (harness) => ({ ...noWork, harness });
 
 test('help: the words, greetings, and the reply the engine gives them', () => {
   // Short, so it fits three lines under the DRAM at the narrowest board, and it says where agents are set up.
@@ -1388,12 +1390,16 @@ test('connect: the words open Agents & keys, and only these words whole', () => 
 test('a start with no work asks what the agent should work on; naming an agent wins over a question', () => {
   rows([
     ...['start an agent', 'Start an agent.', 'start a new agent', 'new agent', 'New agent!', 'a new agent', 'another agent', 'one more agent',
-      'a new codex agent', 'start codex', 'start claude', 'launch an agent', 'spin up an agent', 'please start an agent', 'create an agent',
-      'add a codex agent', 'get me an agent', 'start an agent on cloud 2', 'start an agent on it', 'start', 'start one']
+      'launch an agent', 'spin up an agent', 'please start an agent', 'create an agent',
+      'get me an agent', 'start an agent on cloud 2', 'start an agent on it', 'start', 'start one']
       .map(text => [text, 'none', noWork]),
+    ['a new codex agent', 'none', noWorkFor('codex')],
+    ['start codex', 'none', noWorkFor('codex')],
+    ['start claude', 'none', noWorkFor('claude')],
+    ['add a codex agent', 'none', noWorkFor('codex')],
     // A start verb with an agent named is unmistakable; a bare "start", "start one", or a weaker verb may be the answer.
     ['start an agent', 'question', noWork],
-    ['start codex', 'question', noWork],
+    ['start codex', 'question', noWorkFor('codex')],
     ['new agent', 'question', noWork],
     ['start', 'question', answer('start')],
     ['start one', 'question', answer('start one')],
@@ -1401,7 +1407,7 @@ test('a start with no work asks what the agent should work on; naming an agent w
     ['ask claude', 'question', answer('ask claude')],
     ['get me an agent', 'question', answer('get me an agent')],
     ['have codex', 'stuck', answer('have codex', '0a0b0c', 'ask-stuck')],
-    ['use codex', 'none', noWork],
+    ['use codex', 'none', noWorkFor('codex')],
     // An agent that exists, or a name alone, is no new launch.
     ['start the agent', 'none', unknown('start the agent')],
     ['codex', 'none', unknown('codex')],
@@ -1414,6 +1420,26 @@ test('a start with no work asks what the agent should work on; naming an agent w
     ['start it', 'pendingStart', { kind: 'confirm', go: true }],
   ]);
   assert.equal(describeIntent(noWork, CTX.none), 'Start an agent?');
+});
+
+test('a start with no work keeps the one agent it names, so the engine asks what that agent should work on', () => {
+  rows([
+    ['start codex', 'none', noWorkFor('codex')],
+    ['use codex', 'none', noWorkFor('codex')],
+    ['start a codex agent', 'none', noWorkFor('codex')],
+    ['new codex agent', 'none', noWorkFor('codex')],
+    ['another claude agent', 'none', noWorkFor('claude')],
+    ['start claude code', 'none', noWorkFor('claude')],
+    ['start two codex agents', 'none', noWorkFor('codex')],
+    ['spin up a codex agent on cloud 2', 'none', noWorkFor('codex')],
+    // Named after the noun, as a launch with work names it.
+    ['start an agent with codex', 'none', noWorkFor('codex')],
+    ['start an agent using claude', 'none', noWorkFor('claude')],
+    // Two agents and no work: there is no one agent to ask about.
+    ['start claude and codex', 'none', noWork],
+    ['start an agent', 'none', noWork],
+    ['start an agent on cloud 2', 'none', noWork],
+  ]);
 });
 
 test('"work on X" is work, like "fix X": its task is what comes after "work on"', () => {
