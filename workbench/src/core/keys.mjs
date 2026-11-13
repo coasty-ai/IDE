@@ -47,6 +47,8 @@ const SECRET_TOOL_TIMEOUT_MS = 60_000;
 const PROBE_TIMEOUT_MS = 10_000;
 const READ_AT_ONCE = 4;
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+/** Opening a FIFO with this returns at once, writer or not (it changes nothing for a regular file). */
+const O_NONBLOCK = fs.constants.O_NONBLOCK || 0;
 
 // ------------------------------------------------------------------ names refused
 
@@ -383,12 +385,13 @@ const fileTrouble = (code) => Object.assign(new Error(code), { code });
 
 /**
  * A file's text, or null when it does not exist. A link is never followed (ELOOP); the file must be a regular file of
- * this account's; with `secret`, nobody else may read it (EMODE).
+ * this account's (ENOTFILE: it is opened without waiting, so a FIFO never blocks); with `secret`, nobody else may read
+ * it (EMODE).
  */
 function readPrivateFile(file, { secret = false } = {}) {
   let fd;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW);
+    fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw err;
@@ -1003,14 +1006,33 @@ export class KeyStore {
     return { value };
   }
 
+  /**
+   * `clear` removes only unlocked items, and says nothing when it removed none: the item is locked, or already gone (a
+   * lookup cannot tell them apart either, since a dismissed prompt to unlock also finds nothing). So after a failed
+   * clear, search says which: an item still listed keeps the key, as a remove refused because the keyring is locked.
+   */
   async _secretToolDel(id, name) {
     const bin = this._secretTool();
     if (!bin) throw this._keyringError('remove', 'no-program', null);
-    const res = await this._run(bin, ['clear', 'service', SERVICE, 'account', account(id, name)], '', SECRET_TOOL_TIMEOUT_MS);
+    const acct = account(id, name);
+    const res = await this._run(bin, ['clear', 'service', SERVICE, 'account', acct], '', SECRET_TOOL_TIMEOUT_MS);
     if (res.code === 0) return;
-    const trouble = secretToolTrouble(res);
-    if ((await this._secretToolGet(id, name)).missing === 'not-found') return;
-    throw this._keyringError('remove', trouble, res, bin);
+    const listed = await this._secretToolListed(bin, acct);
+    if (listed === false) return;
+    const silent = !res.error && !res.timedOut && !String(res.stderr || '').trim();
+    throw this._keyringError('remove', listed && silent ? 'locked' : secretToolTrouble(res), res, bin);
+  }
+
+  /**
+   * Whether the keyring still holds this item, from `secret-tool search --all` (never --unlock: it lists items without
+   * unlocking them): true when it lists one, false when it lists none and says nothing, null when it could not tell.
+   * It prints an unlocked item's value, so what it says is only looked at here, never kept, logged or shown.
+   */
+  async _secretToolListed(bin, acct) {
+    const res = await this._run(bin, ['search', '--all', 'service', SERVICE, 'account', acct], '', SECRET_TOOL_TIMEOUT_MS);
+    if (res.error || res.timedOut) return null;
+    if (/^\[[^\]\n]+\]$/m.test(String(res.stdout || ''))) return true;
+    return String(res.stderr || '').trim() ? null : false;
   }
 
   // --------------------------------------------------------------- private files

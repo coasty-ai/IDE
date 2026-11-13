@@ -10,7 +10,7 @@
 import { connectApi } from './api.js';
 import * as presetModule from '/shared/keypresets.mjs';
 import { panelParts, customRow, addForm, statusOf, metaFromStatus, agentsOf, agentStamp, keysOf, signInNotes, agentKeyRequest,
-  gitRequest, githubRequest, githubShareRequest, githubBoxOn, newKeyRequest, MAX_NAMES } from './connectview.js';
+  gitRequest, githubRequest, githubShareRequest, githubBoxOn, newKeyRequest, keptNames, MAX_NAMES } from './connectview.js';
 import { visibleControls } from './words.js';
 import { esc } from './util.js';
 
@@ -37,7 +37,8 @@ export const connectShown = () => !!(el && el.dialog.open);
 
 /**
  * @param {object} c  { onStatus(meta) (meta.connect as the latest answer tells it), looksLikeSecret (the shared check),
- *   repoName() (the person's repository, for "this repository"), canRepo() (a key can be for this repository),
+ *   repoName() (the person's repository's name: a key for another repository of that name reads by its path; "this
+ *   repository" comes from the status alone), canRepo() (a key can be for this repository),
  *   home() (focus the lid's sentence), toLid(id) ("<Name> needs you": that agent in the lid) }
  */
 export function setupConnect(c) {
@@ -367,9 +368,9 @@ async function act(b) {
 
 /**
  * GitHub's "Let agents use this token (as GH_TOKEN)": sent the moment the box changes, checked first against what it was
- * drawn for. While it is on its way the box shows what was asked, and waits. When Workbench refuses (it cannot read the
- * token back from git) its sentence is said, and when the request fails its error is; either way the box goes back as
- * it was, and after a failure the panel reads what is connected again.
+ * drawn for. While it is on its way the box shows what was asked, and waits. When Workbench refuses (the key store could
+ * not give it the token it keeps) its sentence is said, and when the request fails its error is; either way the box
+ * goes back as it was, and after a failure the panel reads what is connected again.
  */
 async function shareGithub(box) {
   if (st.busy.has('gh-share')) { box.checked = !box.checked; return; }   // one change at a time
@@ -410,17 +411,21 @@ async function saveKey() {
   const entries = fields.length
     ? fields.map(i => ({ name: i.dataset.var, value: i.value }))
     : rows.map(r => ({ name: r.querySelector('.cn-name')?.value, value: r.querySelector('.cn-value')?.value }));
+  // a name that looks like a key (one typed into the wrong field) is dropped, and its field emptied: never kept or drawn
+  const kept = keptNames(rows.map(r => r.querySelector('.cn-name')?.value || ''), ctx.looksLikeSecret);
+  for (const row of kept.dropped) { const f = rows[row - 1]?.querySelector('.cn-name'); if (f) f.value = ''; }
   // the choices stay with the form while it saves (or if it is refused); the values do not
   Object.assign(add, {
     label: part.querySelector('[data-field="key-label"]')?.value ?? add.label,
     scope: part.querySelector('input[name="cn-scope"]:checked')?.value || 'all',
     given: part.querySelector('input[name="cn-given"]:checked')?.value || 'all',
-    names: rows.map(r => r.querySelector('.cn-name')?.value || ''),
+    names: kept.names,
   });
   // the part on the page already shows these choices: keep it (and what is typed in it) on the next paint
   const v = view();
   part._src = addForm(st.status, add, v, v.busy);
-  const q = newKeyRequest({ preset: add.preset, label: add.label, entries, scope: add.scope, given: add.given }, presets());
+  // a dropped name is refused first, by its row (entries were read before its field was emptied)
+  const q = newKeyRequest({ preset: add.preset, label: add.label, entries, scope: add.scope, given: add.given }, presets(), ctx.looksLikeSecret);
   entries.length = 0;
   if (q.error) { setSaid(q.error); return; }
   // sent: no field holds a value any more

@@ -303,8 +303,16 @@ test('a key reads as the spec says: what it is, where, who gets it, and each nam
   assert.equal(V.givenWords(['claude'], names), 'given to Claude Code');
   assert.equal(V.givenWords(['claude', 'codex'], names), 'given to Claude Code and Codex');
   assert.equal(V.givenWords([], names), 'given to no agent');
-  assert.equal(V.scopeWords({ kind: 'repo', root: '/Users/sam/shop' }, 'shop'), 'for this repository');
-  assert.equal(V.scopeWords({ kind: 'repo', root: '/Users/sam/shop/' }, 'other'), 'for the repository shop');
+  assert.equal(V.scopeWords({ kind: 'repo', root: '/Users/sam/shop', here: true }, 'shop'), 'for this repository');
+  assert.equal(V.scopeWords({ kind: 'repo', root: '/Users/sam/link-to-shop', here: true }, 'shop'), 'for this repository', 'Workbench says so');
+  assert.equal(V.scopeWords({ kind: 'repo', root: '/Users/sam/shop/', here: false }, 'other'), 'for the repository shop');
+  // "this repository" only when Workbench says so (it compares real paths, as agents get keys), never from a folder's
+  // name: the same project cloned twice is two repositories called shop, and the other one's key reads by its place
+  assert.equal(V.scopeWords({ kind: 'repo', root: '/Users/sam/Developer/shop', here: false }, 'shop'), 'for the repository at /Users/sam/Developer/shop');
+  assert.equal(V.scopeWords({ kind: 'repo', root: '/Users/sam/shop' }, 'shop'), 'for the repository at /Users/sam/shop', 'nothing said: not this one');
+  const twin = { ...AWS_KEY, scope: { kind: 'repo', root: '/Users/sam/Developer/shop', here: false } };
+  assert.equal(V.keysOf(status({ keys: [twin] }), { presets: PRESETS, repoName: 'shop' })[0].sentence,
+    'AWS for the repository at /Users/sam/Developer/shop, given to all agents: AWS_ACCESS_KEY_ID •••• 7QXA, AWS_SECRET_ACCESS_KEY •••• 9f2b');
   // removing asks first, in place
   const asking = html(status(), { open: { removing: 'k1' } });
   assert.match(asking, /Remove AWS\? Agents started from now on will not get it\./);
@@ -423,7 +431,8 @@ test('what a new key sends: its fields (also names given the same value), where,
   // the person's own names
   const custom = V.newKeyRequest({ preset: 'custom', label: 'Sentry', given: 'claude', entries: [{ name: 'SENTRY_DSN', value: 'v1' }, { name: '', value: '' }] }, PRESETS);
   assert.deepEqual(custom.body, { preset: 'custom', label: 'Sentry', values: { SENTRY_DSN: 'v1' }, scope: 'all', agents: ['claude'] });
-  assert.match(V.newKeyRequest({ preset: 'custom', label: 'X', entries: [{ name: '1BAD', value: 'v' }] }, PRESETS).error, /cannot be a variable name/);
+  assert.equal(V.newKeyRequest({ preset: 'custom', label: 'X', entries: [{ name: '1BAD', value: 'v' }] }, PRESETS).error,
+    'The variable name in row 1 can use only letters, digits and _, and must start with a letter or _.', 'the name is never repeated');
   assert.match(V.newKeyRequest({ preset: 'custom', label: 'X', entries: [{ name: '', value: 'v' }] }, PRESETS).error, /variable name/);
   assert.match(V.newKeyRequest({ preset: 'custom', label: '', entries: [{ name: 'A', value: 'v' }] }, PRESETS).error, /Name this key/);
   assert.match(V.newKeyRequest({ preset: 'custom', label: 'X', entries: [] }, PRESETS).error, /at least one/);
@@ -435,6 +444,45 @@ test('what a new key sends: its fields (also names given the same value), where,
   assert.deepEqual(V.agentKeyRequest(` ${secret} `), { value: secret });
   assert.match(V.agentKeyRequest('').error, /Fill in the key/);
   assert.match(V.agentKeyRequest('x'.repeat(2001)).error, /longer than 2,000/);
+});
+
+test('a key typed into a variable name’s field is never said, kept or drawn again: its row is named, and the name dropped', () => {
+  const proj = fake('sk-', 'proj-', 'Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh1Jk0Lz', 'Mn8Bv7Cx6');   // not a variable name ('-')
+  const ghp = fake('ghp', '_', 'Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh1Jk0Lz', 'Mn8B');             // a variable name's shape
+  const akia = fake('AK', 'IA', 'Q4R7', 'T2W9', 'X5Z8', 'C3V6');                      // so is this one
+  for (const k of [proj, ghp, akia]) assert.equal(looks(k).secret, true, 'each looks like a key');
+  const isKey = row => `The variable name in row ${row} looks like a key itself. Put the key in its value, and give it a name such as SENTRY_DSN.`;
+  const said = [];
+  for (const [entries, row] of [
+    [[{ name: proj, value: 'v' }], 1],
+    [[{ name: 'SENTRY_DSN', value: 'v1' }, { name: '', value: '' }, { name: ghp, value: '' }], 3],
+    [[{ name: '1BAD', value: 'v' }, { name: akia, value: 'a\nb' }], 2],
+  ]) {
+    const q = V.newKeyRequest({ preset: 'custom', label: 'X', entries }, PRESETS, looks);
+    assert.deepEqual(q, { error: isKey(row) }, 'said first, by its row, and nothing is sent');
+    said.push(q.error);
+  }
+  // Without the shared check, a name that cannot be a variable name is not repeated either.
+  const q = V.newKeyRequest({ preset: 'custom', label: 'X', entries: [{ name: 'GOOD', value: 'v' }, { name: proj, value: 'v' }] }, PRESETS);
+  assert.equal(q.error, 'The variable name in row 2 can use only letters, digits and _, and must start with a letter or _.');
+  said.push(q.error);
+  for (const s of said) for (const k of [proj, ghp, akia]) assert.ok(!s.includes(k.slice(0, 6)) && !s.includes(k.slice(-6)), `nothing of the key in “${s}”`);
+  // Ordinary names still go through.
+  assert.deepEqual(V.newKeyRequest({ preset: 'custom', label: 'X', entries: [{ name: 'SENTRY_DSN', value: 'v1' }] }, PRESETS, looks).body.values, { SENTRY_DSN: 'v1' });
+  // The form keeps the names it was given through keptNames: one that looks like a key is dropped, by its row.
+  const kept = V.keptNames(['SENTRY_DSN', ghp, '', ` ${proj} `, 'A'], looks);
+  assert.deepEqual(kept, { names: ['SENTRY_DSN', '', '', '', 'A'], dropped: [2, 4] });
+  const form = V.addForm(status(), { preset: 'custom', rows: 5, names: kept.names }, { presets: PRESETS });
+  for (const k of [proj, ghp]) assert.ok(!form.includes(k.slice(3, 15)), 'nothing of it is drawn again');
+  assert.match(form, /value="SENTRY_DSN"/);
+  // connect.js keeps names only through keptNames, empties the field a dropped one is in, and checks what it sends the
+  // same way.
+  const conn = read('../ui/connect.js');
+  const save = conn.slice(conn.indexOf('async function saveKey'), conn.indexOf('async function copyCommand'));
+  const at = s => save.indexOf(s);
+  assert.ok(at('keptNames(') > 0 && at('keptNames(') < at('names: kept.names'), 'a name is checked before it is kept');
+  assert.ok(at('kept.dropped') > 0 && at("value = ''") > at('kept.dropped') && at("value = ''") < at('names: kept.names'), 'its field is emptied');
+  assert.match(save, /newKeyRequest\(\{[^}]*\}, presets\(\), ctx\.looksLikeSecret\)/);
 });
 
 test('while a save is on its way, or was refused, the person’s choices stay in the form; values never do', () => {
@@ -603,12 +651,16 @@ test('the panel’s requests: their routes and bodies; a refusal comes back as i
     const r = await api.connectApi.github('x', false);
     assert.equal(r.ok, false);
     assert.equal(r.sentence, 'GitHub did not accept that token.');
-    // GitHub's box refused because git cannot give the token back: a refusal with no status, kept as it is
-    const cannot = 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.';
-    answer = { status: 200, body: { ok: false, why: 'token', sentence: cannot } };
+    // GitHub's box refused because the key store cannot give the token back: its sentence, why and a fresh status, as
+    // the route answers, kept as they are; the box goes back to what that status says
+    const cannot = 'Workbench could not read the GitHub token it keeps, so this cannot change. Disconnect GitHub, then connect it again.';
+    answer = { status: 200, body: { why: 'token', ok: false, sentence: cannot, status: status() } };
     const share = await api.connectApi.githubAgents(true);
-    assert.deepEqual(share, { ok: false, why: 'token', sentence: cannot });
-    assert.equal(V.statusOf(share), null, 'nothing to draw: the box goes back to the status the panel has');
+    assert.deepEqual(share, { why: 'token', ok: false, sentence: cannot, status: status() });
+    assert.deepEqual(V.statusOf(share), status());
+    // a refusal with no status draws nothing: the box goes back to the status the panel has
+    answer = { status: 200, body: { ok: false, why: 'token', sentence: cannot } };
+    assert.equal(V.statusOf(await api.connectApi.githubAgents(true)), null);
     // and when GitHub is not connected any more: 409, its sentence, and the status code for the panel
     answer = { status: 409, body: { error: 'GitHub is not connected.' } };
     await assert.rejects(api.connectApi.githubAgents(false), { message: 'GitHub is not connected.', status: 409 });
@@ -664,11 +716,17 @@ test('the page checks’ stand-in API answers Agents & keys as the panel reads i
     assert.equal(V.githubBoxOn(V.statusOf(r.body).github), true);
     await ctl('mode', { connect: { githubAgents: 'token' } });
     r = await call('/api/connect/github/agents', { agentsUseIt: false });
-    assert.deepEqual([r.code, Object.keys(r.body).sort()], [200, ['ok', 'sentence', 'why']], 'a refusal with no status, as the route’s contract says');
+    assert.deepEqual([r.code, Object.keys(r.body).sort()], [200, ['ok', 'sentence', 'status', 'why']], 'a refusal with a fresh status, as the route answers');
+    assert.equal(V.githubBoxOn(V.statusOf(r.body).github), true, 'and nothing changed');
     await ctl('mode', { connect: null });
     await call('/api/connect/github/disconnect', {});
     r = await call('/api/connect/github/agents', { agentsUseIt: true });
     assert.deepEqual([r.code, r.body], [409, { error: 'GitHub is not connected.' }]);
+    // a key for this repository: the stand-in marks it as Connect does (`here`), and the page words it from that
+    await ctl('scenario', { name: 'connect-github' });
+    s = V.statusOf((await call('/api/connect')).body);
+    assert.deepEqual(s.keys.map(k => k.scope), [{ kind: 'all' }, { kind: 'repo', root: '/Users/someone/code/shop', here: true }]);
+    assert.equal(V.keysOf(s, { presets: PRESETS, repoName: 'shop', looksLikeSecret: looks })[1].sentence, 'Stripe for this repository, given to Claude Code: STRIPE_SECRET_KEY •••• 4eC3');
     // no agent ready, a missing one installed through "Terminal", and a read that fails
     await ctl('scenario', { name: 'connect-none' });
     s = V.statusOf((await call('/api/connect')).body);

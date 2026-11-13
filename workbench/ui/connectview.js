@@ -175,12 +175,18 @@ function secretIn(preset, name) {
 }
 const presetOf = (presets, id) => (Array.isArray(presets) ? presets.find(p => p && p.id === id) : null) || null;
 
-/** "for all repositories", "for this repository", "for the repository shop". */
+/**
+ * "for all repositories"; "for this repository" only when the status says the key's repository is this one (`here`:
+ * Workbench compares real paths, as agents get keys), never from a folder's name; else "for the repository shop", or,
+ * when that folder has this repository's name too (the same project cloned twice), "for the repository at <its path>".
+ */
 export function scopeWords(scope, repoName) {
   if (scope && scope.kind === 'repo') {
-    const base = str(scope.root).replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
+    if (scope.here === true) return 'for this repository';
+    const root = str(scope.root).replace(/[\\/]+$/, '');
+    const base = root.split(/[\\/]/).pop() || '';
     if (!base) return 'for one repository';
-    return repoName && base === repoName ? 'for this repository' : `for the repository ${prose(base)}`;
+    return repoName && base === repoName ? `for the repository at ${prose(root)}` : `for the repository ${prose(base)}`;
   }
   if (scope && scope.kind === 'all') return 'for all repositories';
   return '';
@@ -272,22 +278,47 @@ export function githubShareRequest(status, drawn, checked) {
   return { agentsUseIt: checked === true };
 }
 
+// The person's own variable names: one that is refused is never repeated (it may be a key typed into the wrong field),
+// only its row (from 1, as the fields are numbered).
+const nameShapeWords = row => `The variable name in row ${row} can use only letters, digits and _, and must start with a letter or _.`;
+const nameIsKeyWords = row => `The variable name in row ${row} looks like a key itself. Put the key in its value, and give it a name such as SENTRY_DSN.`;
+const looksLikeKey = (text, looksLikeSecret) => !!text && keyRefusal(text, looksLikeSecret) !== null;
+
+/**
+ * The person's own variable names as the add form keeps them while its save is on its way or after a refusal
+ * ({ names }): one that looks like a key is dropped (''), so it is never kept, drawn again or said; { dropped } lists
+ * the rows (from 1) it was in, so the page can empty those fields too.
+ */
+export function keptNames(names, looksLikeSecret) {
+  const dropped = [];
+  const kept = (Array.isArray(names) ? names : []).map((n, i) => {
+    if (!looksLikeKey(str(n).trim(), looksLikeSecret)) return str(n);
+    dropped.push(i + 1);
+    return '';
+  });
+  return { names: kept, dropped };
+}
+
 /**
  * A new key from the add form: { body } for POST /api/connect/keys ({ preset, label, values, scope, agents }), or
  * { error } in plain words. `entries` are [{ name, value }] as typed (a preset's fields, or the person's own names);
- * empty optional fields are left out; a field's `also` names get the same value.
+ * empty optional fields are left out; a field's `also` names get the same value. With `looksLikeSecret` (the shared
+ * check), a name of the person's own that looks like a key is refused first, by its row.
  */
-export function newKeyRequest({ preset, label, entries, scope, given }, presets = []) {
+export function newKeyRequest({ preset, label, entries, scope, given }, presets = [], looksLikeSecret = null) {
   const p = presetOf(presets, preset);
   if (!p) return { error: 'Choose what the key is for.' };
   const values = {};
   const custom = !Array.isArray(p.fields) || !p.fields.length;
   if (custom) {
-    for (const e of entries || []) {
-      const name = String(e?.name ?? '').trim(), value = String(e?.value ?? '').trim();
+    const rows = Array.isArray(entries) ? entries : [];
+    const keyRow = rows.findIndex(e => looksLikeKey(String(e?.name ?? '').trim(), looksLikeSecret));
+    if (keyRow >= 0) return { error: nameIsKeyWords(keyRow + 1) };
+    for (let i = 0; i < rows.length; i++) {
+      const name = String(rows[i]?.name ?? '').trim(), value = String(rows[i]?.value ?? '').trim();
       if (!name && !value) continue;
       if (!name) return { error: 'Give each value a variable name.' };
-      if (!VAR_NAME.test(name)) return { error: `${cut(prose(name), 40)} cannot be a variable name. Use letters, digits and _, and start with a letter or _.` };
+      if (!VAR_NAME.test(name)) return { error: nameShapeWords(i + 1) };
       const problem = valueProblem(value, `the value of ${name}`);
       if (problem) return { error: problem };
       values[name] = value;
