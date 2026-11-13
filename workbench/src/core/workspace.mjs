@@ -2256,19 +2256,24 @@ export function cloneProgressOf(line) {
 const CLONE_ADDRESS_REFUSED = 'Workbench clones addresses like https://github.com/owner/repo or git@github.com:owner/repo.git.';
 
 /**
- * What a clone address is: `{ url, kind: 'https'|'ssh'|'scp'|'local', host, path }`. Accepted: https://host/path
- * (no user or password in it, no query), ssh://[user@]host/path, and [user@]host:path (scp-like); a file:// address
- * or an absolute path only with allowLocal (tests). Everything else is refused, as `.why` 'url' with
- * CLONE_ADDRESS_REFUSED: ext::, fd:: and the other transport::address forms, file://, http://, git://, and anything
- * starting with "-".
+ * What a clone address is: `{ url, kind: 'https'|'ssh'|'scp'|'local', host, path }`, where `url` is what git is given:
+ * the address trimmed, with its scheme in lower case (git looks for a transport named as written, and protocol.HTTPS
+ * is not protocol.https). Accepted: https://host/path (no user or password in it, no query), ssh://[user@]host/path,
+ * and [user@]host:path (scp-like); a file:// address or an absolute path only with allowLocal (tests). Everything else
+ * is refused, as `.why` 'url' with CLONE_ADDRESS_REFUSED: ext::, fd:: and the other transport::address forms, file://,
+ * http://, git://, anything starting with "-", anything with a backslash (URL reads one as "/" in https, git and curl
+ * do not: https://github.com\@evil.example/… would be checked as github.com and cloned from evil.example), and an
+ * https address with an "@" before its path, which only a user name would put there.
  */
 function cloneSource(raw, allowLocal) {
-  const url = typeof raw === 'string' ? raw.trim() : '';
+  let url = typeof raw === 'string' ? raw.trim() : '';
   const refuse = () => new Refusal('url', CLONE_ADDRESS_REFUSED);
-  if (!url || url.length > 2000 || /[\s\u0000-\u001f\u007f-\u009f]/.test(url) || url.startsWith('-')) throw refuse();
+  if (!url || url.length > 2000 || /[\s\u0000-\u001f\u007f-\u009f\\]/.test(url) || url.startsWith('-')) throw refuse();
   const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(url);
   if (scheme) {
     const kind = scheme[1].toLowerCase();
+    url = kind + url.slice(scheme[1].length);
+    if (kind === 'https' && url.slice(scheme[0].length).split('/', 1)[0].includes('@')) throw refuse();
     let u;
     try {
       u = new URL(url);
@@ -2305,11 +2310,15 @@ function validFolderName(n) {
     && Buffer.byteLength(n) <= 255;
 }
 
-/** git's words when it was refused a repository (a private one, no sign-in, a key it does not know). */
-const CLONE_AUTH = /Authentication failed|could not read (?:Username|Password)|terminal prompts disabled|Permission denied \(publickey|Repository not found|Invalid username or password|HTTP Basic: Access denied|The requested URL returned error: 40[13]|Write access to repository not granted/i;
+/** git's words when it was refused a repository (a private one, no sign-in). A key ssh would not use is CLONE_SSH_KEY. */
+const CLONE_AUTH =/Authentication failed|could not read (?:Username|Password)|terminal prompts disabled|Repository not found|Invalid username or password|HTTP Basic: Access denied|The requested URL returned error: 40[13]|Write access to repository not granted/i;
 /** git's words when it could not reach the host. Checked after CLONE_AUTH: ssh says "Could not read from remote repository" for both. */
 const CLONE_NETWORK = /Could not resolve host|Could not resolve hostname|nodename nor servname|Name or service not known|Temporary failure in name resolution|Failed to connect|Connection refused|Connection timed out|Operation timed out|Network is unreachable|No route to host|Couldn't connect to server|Connection reset|Connection closed|SSL|TLS|certificate|unable to access|early EOF|remote end hung up unexpectedly|RPC failed|The requested URL returned error: 5\d\d/i;
-const CLONE_HOST_KEY = /Host key verification failed/i;
+/**
+ * ssh's words when it would not go on with this Mac's SSH key: the server took no key of this Mac's, or this Mac does
+ * not know the server's key yet. Neither is a sign-in a GitHub token mends: that is for https addresses.
+ */
+const CLONE_SSH_KEY = /Permission denied \(publickey|Host key verification failed/i;
 const CLONE_EXISTS = /already exists and is not an empty directory/i;
 
 /**
@@ -2339,13 +2348,15 @@ function cloneFailure(e, src) {
   };
   if (e && (e.code === 'ENOENT' || e.killed)) return err('git', gitTrouble(e).message);
   if (CLONE_EXISTS.test(text)) return err('exists', 'Something is already in the folder it would go into. Choose another folder.');
+  if ((src.kind === 'ssh' || src.kind === 'scp') && CLONE_SSH_KEY.test(text)) {
+    return err('ssh', src.host === 'github.com'
+      ? 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first.'
+      : `${where} did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, make sure git can sign in to ${where} first.`);
+  }
   if (CLONE_AUTH.test(text)) {
     return err('auth', src.host === 'github.com'
       ? 'GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again.'
       : `${where} did not let Workbench read this repository. If it is private, make sure git can sign in to ${where}, then try again.`);
-  }
-  if (CLONE_HOST_KEY.test(text)) {
-    return err('auth', `SSH on this computer does not know ${where} yet, so git did not connect to it. Use its https:// address, or connect to it once with ssh in a terminal.`);
   }
   if (CLONE_NETWORK.test(text)) return err('network', `Workbench could not reach ${where}.`);
   return err('git', `Git could not clone ${clip(src.url, 120)}.`);
@@ -2354,7 +2365,8 @@ function cloneFailure(e, src) {
 /**
  * Clone a repository into a new folder.
  *
- * `url`: see cloneSource. `into`: the folder to put it in (made when missing; ~ is the home folder). `name`: the new
+ * `url`: see cloneSource. `into`: the folder to put it in, as given, spaces at its ends included (made when missing;
+ * ~ is the home folder). `name`: the new
  * folder's name, by default the last part of the address without .git; never empty, ".", ".." or holding "/". The
  * new folder must not exist, or must be an empty folder. Git runs as `git -c protocol.allow=never -c
  * protocol.https.allow=always -c protocol.ssh.allow=always [-c protocol.file.allow=always] clone --progress -- <url>
@@ -2369,10 +2381,13 @@ function cloneFailure(e, src) {
  * Workbench exit while git copies, its exit does the same.
  *
  * Refusals and failures are plain errors with `.why`: 'url' (an address Workbench does not clone from, or no folder
- * name in it), 'exists' (something is already there, or the folder cannot be made), 'auth' (refused: a private
- * repository, no sign-in; on GitHub "GitHub did not let Workbench read this repository. If it is private, connect
- * your GitHub account, then try again."), 'network' ("Workbench could not reach <host>."), 'stopped' (see `signal`)
- * or 'git' (anything else), with git's own words in `.detail`. A folder the clone made is removed again when it fails.
+ * name in it), 'exists' (something is already there, or the folder cannot be made), 'ssh' (an ssh or scp-like address
+ * ssh would not go on with: the server took no SSH key of this Mac's, or this Mac does not know the server's key; on
+ * GitHub "GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository,
+ * connect your GitHub account first."), 'auth' (refused: a private repository, no sign-in; on GitHub "GitHub did not
+ * let Workbench read this repository. If it is private, connect your GitHub account, then try again."), 'network'
+ * ("Workbench could not reach <host>."), 'stopped' (see `signal`) or 'git' (anything else), with git's own words in
+ * `.detail`. A folder the clone made is removed again when it fails.
  * @returns {Promise<{ root: string }>} the new folder's real path
  */
 export async function cloneRepo({ url, into, name, onProgress, timeoutMs = CLONE_TIMEOUT_MS, allowLocal = false, signal } = {}) {
@@ -2386,7 +2401,7 @@ export async function cloneRepo({ url, into, name, onProgress, timeoutMs = CLONE
   if (typeof into !== 'string' || !into.trim() || into.includes('\u0000')) throw new Refusal('exists', 'No folder was given to put the repository in.');
   const stopped = () => new Refusal('stopped', 'Copying the repository was stopped.');
   if (signal?.aborted) throw stopped(); // before any folder is made
-  const parent = path.resolve(expandHome(into.trim()));
+  const parent = path.resolve(expandHome(into)); // as given: a folder's name may end in a space
   if (fs.existsSync(parent) && !isFolder(parent)) throw new Refusal('exists', `${parent} is a file, not a folder.`);
   try {
     fs.mkdirSync(parent, { recursive: true });

@@ -40,7 +40,7 @@ const CLAUDE_FROM = { flag: ' (from --claude)', env: ' (from WORKBENCH_CLAUDE_BI
 /** What each part of a clone is called, in the plain progress lines. */
 const CLONE_PHASE = { counting: 'Counting what to copy', compressing: 'Packing it up', receiving: 'Copying', resolving: 'Unpacking', checkout: 'Writing the files' };
 /** The kinds of failed clone the Mac app tells apart (WORKBENCH_CLONE {"error"}). */
-const CLONE_ERRORS = new Set(['auth', 'network', 'exists', 'url', 'git']);
+const CLONE_ERRORS = new Set(['auth', 'ssh', 'network', 'exists', 'url', 'git']);
 
 export const USAGE = `Workbench launches coding agents and shows what each one is doing, in plain language.
 
@@ -206,6 +206,15 @@ function complain(text) {
 }
 
 /**
+ * Text from outside Workbench's own words (a folder's name, a path, an agent's sentence) for one printed line: control
+ * characters, line breaks included, shown as "?". A folder named "shop⏎WORKBENCH_APP {…}" could otherwise print a line
+ * of its own, which the Mac app would take for Workbench's.
+ */
+function printable(text) {
+  return String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '?');
+}
+
+/**
  * The log: warnings and errors always, info and debug with --verbose, all on stderr (the Mac app copies it into its own
  * log). `setMask(fn)` hides the person's keys in every line from then on (connect.mask).
  * @param {boolean} verbose
@@ -329,19 +338,91 @@ async function availability(mod, name) {
 /** An adapter the engine can drive: it says whether its program is here, and it starts runners. */
 const complete = (mod) => !!mod && typeof mod.available === 'function' && typeof mod.createRunner === 'function';
 
+/**
+ * What the start says of the agents (live mode), one line each, with control characters shown as "?"; then
+ * NO_AGENT when none is ready. With Agents & keys, `status` is its first check (connect.status() for this
+ * repository), and each line is that agent's own sentence, then where it was found, as the panel says it: "Claude
+ * Code 2.1.322 is ready, signed in with your Claude subscription. Found in the VS Code extension.". Ready means what
+ * it means there: the program runs, and is not known to be signed out. Without Agents & keys, `claude` and `codex`
+ * are the adapters' own available() answers: "Claude Code 2.1.322 is ready (from the VS Code extension)." or "Codex
+ * is not available: <reason>", ready when the program runs.
+ * @param {{ status?: object|null, claude?: object|null, codex?: object|null }} found
+ * @returns {string[]}
+ */
+export function agentLines({ status = null, claude = null, codex = null } = {}) {
+  const lines = [];
+  let ready;
+  if (status && typeof status === 'object' && Array.isArray(status.agents)) {
+    for (const a of status.agents) {
+      if (!a || typeof a.sentence !== 'string' || !a.sentence.trim()) continue;
+      const from = a.found === true && typeof a.from === 'string' && a.from.trim() ? ` Found in ${a.from.trim()}.` : '';
+      lines.push(`${sentence(a.sentence)}${from}`);
+    }
+    ready = status.ready === true;
+  } else {
+    const c = claude && typeof claude === 'object' ? claude : { ok: false };
+    const x = codex && typeof codex === 'object' ? codex : { ok: false };
+    lines.push(c.ok ? `Claude Code${c.version ? ` ${c.version}` : ''} is ready${CLAUDE_FROM[c.from] || ''}.` : `Claude Code is not available: ${sentence(c.reason || 'it was not found')}`);
+    lines.push(x.ok ? `Codex${x.version ? ` ${x.version}` : ''} is ready.` : `Codex is not available: ${sentence(x.reason || 'it was not found')}`);
+    ready = !!c.ok || !!x.ok;
+  }
+  if (!ready) lines.push(NO_AGENT);
+  return lines.map(printable);
+}
+
+/**
+ * Agents & keys' first check of the agents, for the repository Workbench works on, so keys kept for it count for an
+ * agent's sign-in: `connect.recheck({ repoRoot })`, then `connect.status({ repoRoot })`. Null without Connect, or when
+ * the check failed (logged): the start then asks the adapters themselves.
+ */
+async function firstCheck(connect, repoRoot, log) {
+  if (typeof connect?.recheck !== 'function' || typeof connect.status !== 'function') return null;
+  try {
+    const found = await connect.recheck({ repoRoot });
+    const where = found?.claude?.path;
+    if (typeof where === 'string' && where) log.info(`Claude Code is ${where}`);
+    const status = await connect.status({ repoRoot });
+    return status && typeof status === 'object' && Array.isArray(status.agents) ? status : null;
+  } catch (err) {
+    log.warn('Workbench could not check the agents through Agents & keys:', err);
+    return null;
+  }
+}
+
+/**
+ * Agents & keys and the engine, kept in step. 'agents' (Connect checked the agent programs again: the page asked, or
+ * came back from Terminal): which ones can start changes now (engine.setHarnesses); agents already at work are not
+ * touched. 'changed' (anything the panel shows may have changed, such as git's name and email): the engine reads the
+ * repository's facts again (engine.refreshRepo, when it has one), so the board sees a name and email saved in Agents &
+ * keys at once, not at its next refresh.
+ */
+export function wireConnect(connect, engine, log) {
+  if (typeof connect?.on !== 'function' || !engine) return;
+  connect.on('agents', (found) => {
+    if (typeof engine.setHarnesses !== 'function') return;
+    Promise.resolve().then(() => engine.setHarnesses(found)).catch((err) => log?.error?.('Workbench could not take in the agents it found:', err));
+  });
+  connect.on('changed', () => {
+    if (typeof engine.refreshRepo !== 'function') return;
+    Promise.resolve().then(() => engine.refreshRepo()).catch((err) => log?.warn?.('Workbench could not read the repository again:', err));
+  });
+}
+
 // ------------------------------------------------------------------ Agents & keys, GitHub, cloning
 
 /**
  * The key store and Agents & keys (src/core/keys.mjs, src/core/connect.mjs), with the keys read once. Either may be
  * missing or fail: Workbench then runs as before, without them, and says so in its log. From here on the log hides the
- * person's keys (connect.mask).
+ * person's keys (connect.mask). Connect checks no agent by itself (`probe: false`): the Mac app's GitHub helpers start
+ * none, so no agent program runs for nothing, and live mode runs the first check itself, for its repository
+ * (firstCheck), before anything else is made.
  * @param {object} mods     the modules loadModules gave (the workspace and the adapters), or {} for the GitHub helpers:
  *   Connect then uses its own workspace module, and has no agents to check
- * @param {{ probe?: boolean }} [o] probe: check the agents at once (live mode); false where no agent will start (the
- *   Mac app's GitHub helpers), so no agent program runs for nothing
+ * @param {{ repoRoot?: string|null }} [o] repoRoot: the repository Workbench works on (live mode), whose keys count
+ *   for the agents' sign-ins from the first check on
  * @returns {Promise<{ keys: object|null, connect: object|null }>}
  */
-async function openConnect(mods, args, log, { probe = true } = {}) {
+async function openConnect(mods, args, log, { repoRoot = null } = {}) {
   const [keysMod, connectMod] = await Promise.all([loadOptional('src/core/keys.mjs', log), loadOptional('src/core/connect.mjs', log)]);
   if (typeof keysMod?.KeyStore !== 'function' || typeof connectMod?.Connect !== 'function') return { keys: null, connect: null };
   const home = os.homedir();
@@ -361,7 +442,8 @@ async function openConnect(mods, args, log, { probe = true } = {}) {
   try {
     connect = new connectMod.Connect({
       home, platform: process.platform, env: process.env, keys, workspace: mods.workspace,
-      adapters: { claude: mods.claude, codex: mods.codex }, flags: { claude: args.claude || null }, log, probe,
+      adapters: { claude: mods.claude, codex: mods.codex }, flags: { claude: args.claude || null }, log, probe: false,
+      ...(repoRoot ? { repoRoot } : {}),
     });
   } catch (err) {
     log.warn('Workbench could not set up Agents & keys:', err);
@@ -414,8 +496,8 @@ function withoutCredentials(text, url) {
  * --clone: copy the repository into a new folder in `into`, through workspace.cloneRepo, saying how it goes: plain
  * lines, or for the Mac app (`app`) `WORKBENCH_CLONE {"phase","percent"}` lines and, once it is there,
  * `WORKBENCH_CLONE {"phase":"done","percent":100,"root"}`. A failure is a plain sentence on stderr and, for the app,
- * `WORKBENCH_CLONE {"error","sentence"}`, with error one of auth, network, exists, url and git. A user name or password
- * in the address is never printed or logged. `signal` (an AbortSignal) is passed on, for stopping git.
+ * `WORKBENCH_CLONE {"error","sentence"}`, with error one of auth, ssh, network, exists, url and git. A user name or
+ * password in the address is never printed or logged. `signal` (an AbortSignal) is passed on, for stopping git.
  * @returns {Promise<{ root: string } | { code: number }>}
  */
 export async function cloneFirst({ workspace, url, into, app = false, signal, say: out = say, complain: err = complain, log }) {
@@ -510,8 +592,10 @@ export function readLine(stream, { max = 8192, timeoutMs = 5 * 60_000 } = {}) {
 }
 
 /**
- * --connect-github: read the token, connect it (for git only: agents get it only when the person says so in Agents &
- * keys), and print `WORKBENCH_GITHUB {"ok","login","sentence"}`. The token is never printed or logged.
+ * --connect-github: read the token, connect it, and print `WORKBENCH_GITHUB {"ok","login","sentence"}`. Whether agents
+ * get the token is left as it is (no `agentsUseIt`): "Let agents use this token", when the person turned it on in
+ * Agents & keys, stays on for the new token; for a first connection, git alone uses it. The token is never printed or
+ * logged.
  * @returns {Promise<number>} the exit code: 0 when GitHub took the token
  */
 export async function connectGithubMode({ connect, readToken, say: out = say, log }) {
@@ -530,7 +614,7 @@ export async function connectGithubMode({ connect, readToken, say: out = say, lo
   try {
     let r;
     try {
-      r = await connect.connectGithub(token, { agentsUseIt: false });
+      r = await connect.connectGithub(token, { agentsUseIt: undefined }); // undefined: Connect keeps the person's choice
     } catch (e) {
       if (plainError(e)) { tell(false, null, redact(e.message.trim(), [token])); return 1; }
       log?.error?.('Connecting to GitHub failed:', redact(e?.stack || String(e), [token]));
@@ -624,7 +708,7 @@ async function main() {
   if (args.connectGithub || args.githubRepos) {
     let connect = null;
     try {
-      ({ connect } = await openConnect({}, args, log, { probe: false }));
+      ({ connect } = await openConnect({}, args, log));
     } catch (err) {
       log.warn('Workbench could not open Agents & keys:', err);
     }
@@ -686,7 +770,7 @@ async function main() {
     try {
       repo = await mods.workspace.prepareRepo(repoPath);
     } catch (err) {
-      complain(err?.message || `Workbench could not use ${repoPath} as a git repository.`);
+      complain(printable(err?.message || `Workbench could not use ${repoPath} as a git repository.`)); // it names the folder
       return 1;
     }
     if (typeof mods.workspace.gitIdentity === 'function') {
@@ -696,22 +780,24 @@ async function main() {
         log.debug('Could not read git’s name and email:', err);
       }
     }
-    ({ connect } = await openConnect(mods, args, log));
+    ({ connect } = await openConnect(mods, args, log, { repoRoot: repo.root }));
     const claude = claudeAdapter(mods.claude, args.claude);
-    const claudeInfo = await availability(claude, 'Claude Code');
-    const codexInfo = await availability(mods.codex, 'Codex');
     // Every program Workbench can drive goes to the engine, ready or not: the engine checks each one itself, and one
     // installed or signed in later, from the page, can then start without a restart (connect's 'agents' event).
     if (complete(claude)) adapters.claude = claude;
     if (complete(mods.codex)) adapters.codex = mods.codex;
-    if (claudeInfo.ok) {
-      say(`Claude Code${claudeInfo.version ? ' ' + claudeInfo.version : ''} is ready${CLAUDE_FROM[claudeInfo.from] || ''}.`);
-      if (claudeInfo.path) log.info(`Claude Code is ${claudeInfo.path}`);
-    } else {
-      say(`Claude Code is not available: ${sentence(claudeInfo.reason || 'it was not found')}`);
+    // Agents & keys' first check, for this repository, ends before the engine and the server are made: the start
+    // lines, the engine's agents and the page's first snapshot all go by it, keys kept for this repository included.
+    // Without Agents & keys, the adapters' own answers.
+    const status = await firstCheck(connect, repo.root, log);
+    let claudeInfo = null;
+    let codexInfo = null;
+    if (!status) {
+      claudeInfo = await availability(claude, 'Claude Code');
+      codexInfo = await availability(mods.codex, 'Codex');
+      if (claudeInfo.ok && claudeInfo.path) log.info(`Claude Code is ${claudeInfo.path}`);
     }
-    say(codexInfo.ok ? `Codex${codexInfo.version ? ' ' + codexInfo.version : ''} is ready.` : `Codex is not available: ${sentence(codexInfo.reason || 'it was not found')}`);
-    if (!claudeInfo.ok && !codexInfo.ok) say(NO_AGENT);
+    for (const line of agentLines(status ? { status } : { claude: claudeInfo, codex: codexInfo })) say(line);
   }
 
   const token = crypto.randomBytes(32).toString('hex');
@@ -747,12 +833,8 @@ async function main() {
     log,
   });
   for (const ev of early.splice(0)) engine.ingest(ev);
-  // Agents & keys checked the agent programs again (the page asked, or came back from Terminal): which ones can start
-  // changes now. Agents already at work are not touched.
-  connect?.on?.('agents', (found) => {
-    if (typeof engine.setHarnesses !== 'function') return;
-    Promise.resolve().then(() => engine.setHarnesses(found)).catch((err) => log.error('Workbench could not take in the agents it found:', err));
-  });
+  // Agents & keys checked the agent programs again, or saved git's name and email: the engine takes it in now.
+  wireConnect(connect, engine, log);
 
   let server = mods.createServer({ engine, store, token, hookTokenFor, connect, repoRoot: repo?.root ?? null, port: args.port, host: '127.0.0.1', rootDir: ROOT, log });
 
@@ -846,7 +928,7 @@ async function main() {
   try {
     await engine.start();
   } catch (err) {
-    complain(err?.message || 'Workbench could not start.');
+    complain(printable(err?.message || 'Workbench could not start.')); // it may name the repository's folder
     await engine.shutdown().catch(() => {});
     await server.close().catch(() => {});
     return 1;
@@ -857,7 +939,7 @@ async function main() {
   if (args.demo) {
     say('This is the demo: the agents and cloud machines are simulated, and nothing is spent.');
   } else {
-    say(`Agents work on ${repo.name || 'your repository'}, each in its own copy made from the last commit.`);
+    say(`Agents work on ${printable(repo.name) || 'your repository'}, each in its own copy made from the last commit.`);
     const dirty = Number(repo.dirty) || 0;
     if (dirty) say(`Your ${dirty} uncommitted change${dirty === 1 ? ' is' : 's are'} not included.`);
     say(`Each agent can spend up to $${(args.budget ?? DEFAULT_BUDGET_USD).toFixed(2)}.`);
