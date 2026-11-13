@@ -10,7 +10,7 @@ import {
 import {
   buildClaudeLaunch, userMessage, shellQuote, hookCommand, hookSettings, scrubEnv, sessionFolders, findClaude, claudeBin,
   newestExtensionClaude, onPath, withNodeOnPath, WORKBENCH_PROMPT, DISALLOWED_TOOLS, BRIDGE_PATH, DEFAULT_BUDGET_USD,
-  CLAUDE_NOT_FOUND, EXTENSION_FOLDERS,
+  CLAUDE_NOT_FOUND, EXTENSION_FOLDERS, withKeys, safeMask, maskParsed, maskCut, maskedTail, MASK_MARGIN,
 } from '../src/adapters/claude/args.mjs';
 import { EV } from '../src/shared/events.mjs';
 
@@ -258,6 +258,50 @@ test('the person\'s own Claude Code settings and login reach the agent; session 
   const l = buildClaudeLaunch({ name: 'A', hook: HOOK, agentId: 'abc123', env: { ...markers, ...own } });
   assert.equal(l.env.CLAUDE_CODE_OAUTH_TOKEN, 'oauth');
   for (const k of Object.keys(markers)) assert.equal(l.env[k], undefined, k);
+});
+
+test('the person’s keys reach Claude Code after the scrub, never in argv, and never in place of Workbench’s own variables', () => {
+  const value = ['fake', 'key', 'value', '0123456789'].join('-'); // made up here
+  const l = buildClaudeLaunch({
+    name: 'A', hook: HOOK, agentId: 'abc123', env: { PATH: NODE_DIR, HOME: '/h', CLAUDECODE: '1' },
+    keysEnv: {
+      WB_TEST_KEY: value, AWS_REGION: 'eu-west-1', WORKBENCH_AGENT_ID: 'other', WORKBENCH_HOOK_TOKEN: 'other', WORKBENCH_HOOK_URL: 'http://elsewhere',
+      CLAUDECODE: '1', VSCODE_PID: '9', ELECTRON_RUN_AS_NODE: '1', 'NOT A NAME': 'x', '9LIVES': 'x', NUMBER: 7, NUL: 'a\u0000b',
+    },
+  });
+  assert.deepEqual(l.env, {
+    PATH: NODE_DIR, HOME: '/h', WB_TEST_KEY: value, AWS_REGION: 'eu-west-1',
+    WORKBENCH_HOOK_URL: HOOK.url, WORKBENCH_HOOK_TOKEN: HOOK.token, WORKBENCH_AGENT_ID: 'abc123',
+  });
+  assert.ok(!JSON.stringify(l.args).includes(value), 'not in argv, nor in --settings');
+  // The rule itself: a copy, and only when there is something to add.
+  const env = { A: '1' };
+  assert.equal(withKeys(env, null), env);
+  assert.equal(withKeys(env, { WORKBENCH_X: '1', CLAUDECODE: '1' }), env);
+  assert.deepEqual(withKeys(env, { A: '2', B: '3' }), { A: '2', B: '3' });
+  assert.deepEqual(env, { A: '1' });
+  assert.deepEqual(withKeys(env, { A: '2', B: '3' }, (k) => k === 'B'), { A: '2' }, 'what the adapter’s own scrub removes');
+});
+
+test('the masking helpers: every string of parsed output, the kept end of a stream, and a mask that fails', () => {
+  const value = ['fake', 'stored', 'value', 'q'.repeat(30)].join('-'); // made up here
+  const mask = (s) => s.split(value).join('••••');
+  const obj = { a: 'short', b: ['x', `say ${value}`], c: { d: value, e: null }, n: 5 };
+  assert.equal(maskParsed(obj, mask), obj, 'in place');
+  assert.deepEqual(obj, { a: 'short', b: ['x', 'say ••••'], c: { d: '••••', e: null }, n: 5 });
+  assert.equal(maskParsed(value, mask), '••••');
+  // Nothing was dropped: masked as it is, then the last characters.
+  assert.equal(maskedTail(`a ${value} b`, { limit: 100, mask }), 'a •••• b');
+  assert.equal(maskedTail('abcdef', { limit: 3, mask }), 'def');
+  // Earlier output was dropped, and the kept part begins inside a key: that part never shows.
+  assert.equal(maskCut(`${value.slice(10)} tail\nnext ${value} line`, mask, true), 'next •••• line', 'up to the first line break');
+  assert.equal(maskCut(`${value.slice(10)}_${value}_end`, mask, true), '••••_end', 'up to the first key hidden');
+  assert.equal(maskCut('x'.repeat(MASK_MARGIN + 10), mask, true), 'x'.repeat(10), 'no line break near, nothing hidden');
+  assert.equal(maskCut(`${value.slice(10)} tail`, mask, false), `${value.slice(10)} tail`, 'nothing dropped, nothing cut');
+  // A mask that throws, or gives something else than text, hides nothing and breaks nothing.
+  assert.equal(safeMask(null)('abc'), 'abc');
+  assert.equal(safeMask(() => { throw new Error('no'); })('abcdefghij'), 'abcdefghij');
+  assert.equal(safeMask(() => 5)('abcdefghij'), 'abcdefghij');
 });
 
 test('the hook command quotes its paths for the shell', () => {
@@ -747,4 +791,44 @@ test('a relaunch is refused in plain words when the stopped turn used up the lim
   assert.equal(err?.message, 'Test agent has used its whole spending limit, so it can’t continue.');
   assert.equal(err.plain, true, 'meant for the person as it is');
   assert.equal(r.info().alive, false, 'nothing was launched');
+});
+
+test('each Claude Code process gets the person’s keys, which never decide which Claude Code runs', async (t) => {
+  const dir = scratch(t);
+  const seen = path.join(dir, 'seen.txt');
+  // A Claude Code that notes two variables of its environment, then is the stand-in.
+  const bin = program(path.join(dir, 'claude'), [
+    `if [ "$1" != "--version" ]; then printf '%s|%s\\n' "\${WB_TEST_SETTING-unset}" "\${WORKBENCH_AGENT_ID-unset}" >> ${shellQuote(seen)}; fi`,
+    `exec ${shellQuote(process.execPath)} ${shellQuote(FAKE)} "$@"`,
+  ].join('\n'));
+  const c = collector();
+  const r = makeRunner(c, {
+    env: { WORKBENCH_CLAUDE_BIN: bin },
+    keysEnv: { WB_TEST_SETTING: 'from-the-key-store', WORKBENCH_AGENT_ID: 'another-agent', WORKBENCH_CLAUDE_BIN: path.join(dir, 'elsewhere') },
+  });
+  await r.start();
+  await c.until(replyIs(/^You said: Say hello$/), 'the reply to the task');
+  await r.stop();
+  await r.send('Please continue'); // a relaunch gets them too
+  await c.until(replyIs(/^You said \(resumed /), 'the resumed reply');
+  assert.deepEqual(readFileSync(seen, 'utf8').trim().split('\n'), ['from-the-key-store|abc123', 'from-the-key-store|abc123']);
+  assert.ok(!c.events.some((e) => e.kind === EV.STATE && e.state === 'failed'), 'the stand-in found its launch as it should be');
+  await r.stop();
+});
+
+test('a mask hides the person’s keys in Claude Code’s output before it is read, and in the stderr kept for errors', async () => {
+  const value = ['fake', 'stored', 'value', 'q'.repeat(30), 'Z9W8'].join('-'); // made up here
+  const mask = (s) => s.split(value).join('•••• Z9W8').split('asked to exit').join('[hidden]');
+  const c = collector();
+  const r = makeRunner(c, { mask });
+  await r.start();
+  await c.until(replyIs(/^You said: Say hello$/), 'the first reply');
+  await r.send(`use ${value} please`);
+  const said = await c.until(replyIs(/^You said: use /), 'the reply that repeats it');
+  assert.equal(said.finalText, 'You said: use •••• Z9W8 please');
+  assert.ok(!JSON.stringify(c.events).includes(value), 'in no event');
+  await r.send('exit 3');
+  await c.until((evs) => evs.find((e) => e.kind === EV.STATE && e.state === 'failed'), 'the failure');
+  const ended = c.events.find((e) => e.kind === EV.ENDED && e.agentId === 'abc123');
+  assert.match(ended.error, /fake claude: \[hidden\] with 3/);
 });

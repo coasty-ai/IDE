@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
-import { withNodeOnPath } from '../claude/args.mjs';
+import { withNodeOnPath, withKeys, safeMask, maskParsed, maskedTail, MASK_MARGIN } from '../claude/args.mjs';
 import { createCodexParser, plainError, STOPPED_EARLY } from './parse.mjs';
 
 export const harness = 'codex';
@@ -44,17 +44,24 @@ export function codexBin(env = process.env) {
   return env.WORKBENCH_CODEX_BIN || 'codex';
 }
 
+/** Variables buildEnv removes: a key by one of these names is not given to Codex either. */
+function scrubbed(key) {
+  return CLAUDE_SESSION_VARS.test(key) || CODEX_SESSION_VARS.test(key) || WORKBENCH_SECRETS.has(key) || HOST_VARS.test(key);
+}
+
 /**
- * A copy of `base` without other sessions' variables, plus WORKBENCH_AGENT_ID. When PATH has no node, the folder of
- * the node running Workbench goes first, so the agent's `npm test` and `node --test` work.
+ * A copy of `base` without other sessions' variables, then the person's keys for this agent (`keysEnv`, see withKeys
+ * in ../claude/args.mjs), then WORKBENCH_AGENT_ID, which no key can replace. When PATH has no node, the folder of the
+ * node running Workbench goes first, so the agent's `npm test` and `node --test` work.
  */
-export function buildEnv(base = process.env, agentId) {
-  const env = {};
-  for (const [key, value] of Object.entries(base)) {
+export function buildEnv(base = process.env, agentId, keysEnv = null) {
+  let env = {};
+  for (const [key, value] of Object.entries(base || {})) {
     if (value === undefined) continue;
-    if (CLAUDE_SESSION_VARS.test(key) || CODEX_SESSION_VARS.test(key) || WORKBENCH_SECRETS.has(key) || HOST_VARS.test(key)) continue;
+    if (scrubbed(key)) continue;
     env[key] = value;
   }
+  env = withKeys(env, keysEnv, scrubbed);
   if (agentId) env.WORKBENCH_AGENT_ID = agentId;
   return withNodeOnPath(env);
 }
@@ -177,8 +184,12 @@ function errorLine(text) {
 
 /**
  * A Runner for one Codex agent (see "Runner interface" in ARCHITECTURE.md).
- * Extra options for tests: `killGraceMs` (default 3000) and `now`.
  * `sessionId` continues an existing Codex thread instead of starting a new one.
+ * `env` is the base environment (default process.env), as for the other adapters; `keysEnv` ({ NAME: value }) is the
+ * person's keys for this agent, which every turn's process gets (see buildEnv). `mask` (text -> text) hides the
+ * person's keys: every output line goes through it before the parser reads it, and so does the stderr kept for
+ * error reports.
+ * Extra options for tests: `killGraceMs` (default 3000) and `now`.
  */
 export function createRunner(opts = {}) {
   const { agentId, name = 'Codex', task = '', cwd, model } = opts;
@@ -187,6 +198,10 @@ export function createRunner(opts = {}) {
   const killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
   const log = makeLog(opts.log, agentId);
   const parser = createCodexParser({ rootId: agentId, now: clock });
+  const baseEnv = opts.env && typeof opts.env === 'object' ? opts.env : process.env;
+  const keysEnv = opts.keysEnv && typeof opts.keysEnv === 'object' ? opts.keysEnv : null;
+  const hide = typeof opts.mask === 'function' ? safeMask(opts.mask) : null; // null: nothing to hide
+  const mask = hide || (s => s);
 
   let threadId = opts.sessionId || null;
   let current = null;        // the process of the turn in progress, or null between turns
@@ -220,9 +235,11 @@ export function createRunner(opts = {}) {
     try {
       obj = JSON.parse(text);
     } catch {
-      log(`ignored a line that is not JSON: ${text.slice(0, 120)}`);
+      log(`ignored a line that is not JSON: ${mask(text).slice(0, 120)}`);
       return;
     }
+    // Keys are hidden before anything is cut short: the log's 120 characters above, the parser's and narrate()'s later.
+    if (hide) obj = maskParsed(obj, hide);
     for (const ev of parser.push(obj)) forward(p, ev);
   }
 
@@ -259,7 +276,7 @@ export function createRunner(opts = {}) {
       // A finished turn is not the end of the agent: the next message resumes the thread.
       if (code !== 0) log(`exited with ${signal || `code ${code}`} after finishing its turn`);
     } else {
-      const tail = p.stderr.trim();
+      const tail = (hide ? maskedTail(p.stderr, { truncated: p.stderrCut, limit: STDERR_KEEP, mask: hide }) : p.stderr.slice(-STDERR_KEEP)).trim();
       const reason = p.failReason || spawnReason(p.spawnError) || plainError(parser.lastError) || plainError(errorLine(tail)) || STOPPED_EARLY;
       log(`failed (${signal || `code ${code}`}): ${reason}`);
       deliver({ kind: EV.ENDED, outcome: 'error', error: tail ? `${reason}\n\n${tail}` : reason });
@@ -270,7 +287,7 @@ export function createRunner(opts = {}) {
 
   /** Spawn one Codex process. Resolves once it is running, or once a failure to start has been reported. */
   function launch(args, why) {
-    const p = { child: null, why, buf: '', stderr: '', spawned: false, stopping: false, exited: false, finalized: false, turnEnded: false, failReason: null, spawnError: null, closeTimer: null };
+    const p = { child: null, why, buf: '', stderr: '', stderrCut: false, spawned: false, stopping: false, exited: false, finalized: false, turnEnded: false, failReason: null, spawnError: null, closeTimer: null };
     p.exitedPromise = new Promise(resolve => { p.markExited = resolve; });
     current = p;
 
@@ -279,16 +296,23 @@ export function createRunner(opts = {}) {
       finalize(p, null, null);
       return Promise.resolve();
     }
-    const [file, argv] = commandFor(codexBin(), args);
+    const [file, argv] = commandFor(codexBin(baseEnv), args);
     try {
-      p.child = spawn(file, argv, { cwd, env: buildEnv(process.env, agentId), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+      p.child = spawn(file, argv, { cwd, env: buildEnv(baseEnv, agentId, keysEnv), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     } catch (err) {
       p.spawnError = err;
       finalize(p, null, null);
       return Promise.resolve();
     }
     p.child.stdout.setEncoding('utf8').on('data', chunk => onStdout(p, chunk));
-    p.child.stderr.setEncoding('utf8').on('data', chunk => { p.stderr = (p.stderr + chunk).slice(-STDERR_KEEP); });
+    p.child.stderr.setEncoding('utf8').on('data', chunk => {
+      // Kept with room to spare, so that a key at the start of what is shown can still be hidden (see maskedTail).
+      p.stderr += chunk;
+      if (p.stderr.length > STDERR_KEEP + MASK_MARGIN) {
+        p.stderr = p.stderr.slice(-(STDERR_KEEP + MASK_MARGIN));
+        p.stderrCut = true;
+      }
+    });
     p.child.on('exit', (code, signal) => {
       if (p.finalized) return;
       p.exited = true;

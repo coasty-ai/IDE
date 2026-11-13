@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { matchGlob, checkRules, runChecks, scrubEnv, killChecksSync, withNodeOnPath } from '../src/core/receipt.mjs';
+import { matchGlob, checkRules, runChecks, scrubEnv, killChecksSync, withNodeOnPath, withKeys } from '../src/core/receipt.mjs';
 
 let T;
 before(() => { T = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-receipt-')); });
@@ -140,6 +140,50 @@ test('runChecks scrubs the environment', async () => {
     }
   }
   assert.deepEqual(scrubEnv({ CLAUDECODE: '1', CLAUDE_CODE_X: '2', CLAUDE_CONFIG_DIR: 'kept', HOME: '/h' }), { CLAUDE_CONFIG_DIR: 'kept', HOME: '/h' });
+});
+
+test('the person’s keys reach the checks after the scrub, and never replace WORKBENCH_AGENT_ID', async () => {
+  const keysEnv = { WB_TEST_SETTING: 'from-the-key-store', CLAUDECODE: '1', WORKBENCH_AGENT_ID: 'not-the-agent', NOT_TEXT: 42 };
+  const out = await runChecks({
+    cwd: T, env: { PATH: process.env.PATH, WORKBENCH_AGENT_ID: 'abc123' }, keysEnv,
+    checks: [{ name: 'env', run: 'echo "${WB_TEST_SETTING-unset} ${CLAUDECODE-unset} ${WORKBENCH_AGENT_ID-unset} ${NOT_TEXT-unset}"' }],
+  });
+  assert.equal(out.results[0].tail, 'from-the-key-store unset abc123 unset');
+  // The rule itself: names that are not variable names, Workbench's own, what the scrub removes, and values that are
+  // not text or hold a NUL stay out; the environment comes back as it is when there is nothing to add.
+  const base = { A: '1' };
+  assert.equal(withKeys(base, null), base);
+  assert.equal(withKeys(base, {}), base);
+  assert.deepEqual(withKeys(base, { A: '2', B: 'x\u0000y', 'C D': 'x', '9E': 'x', WORKBENCH_HOOK_URL: 'u', CLAUDE_CODE_X: 'x', WORKBENCH_HOOK_TOKEN: 't' }), { A: '2' });
+  assert.deepEqual(base, { A: '1' }, 'never changed in place');
+});
+
+test('with a mask, a key a check prints is hidden in its tail, also where the tail is cut', async () => {
+  // A made-up value, built here, long (keys may have up to 2000 characters): only its last four characters may show.
+  const value = ['fake', 'stored', 'value', 'q'.repeat(1500), 'Z9W8'].join('-');
+  const mask = (s) => s.split(value).join('•••• Z9W8');
+  const keysEnv = { WB_TEST_VALUE: value };
+  // Filler after the value, so that the last 2048 bytes begin 20 characters before the end of the value.
+  const cut = { name: 'cut', run: `printf '%s' "$WB_TEST_VALUE"; i=0; while [ $i -lt 2028 ]; do printf _; i=$((i+1)); done` };
+  // Far more output than is kept, the value all through it, on one line: what is kept begins inside a value, and so
+  // little is left once the whole ones are masked that the cut one would show.
+  const lots = { name: 'lots', run: 'i=0; while [ $i -lt 200 ]; do printf "%s_" "$WB_TEST_VALUE"; i=$((i+1)); done' };
+  const plain = { name: 'plain', run: 'echo "the key is $WB_TEST_VALUE."' };
+
+  const without = await runChecks({ cwd: T, keysEnv, checks: [cut] });
+  assert.match(without.results[0].tail, /q-Z9W8_/, 'without a mask the cut falls inside the value');
+
+  const out = await runChecks({ cwd: T, keysEnv, mask, checks: [cut, lots, plain] });
+  const [c, l, p] = out.results.map(r => r.tail);
+  assert.equal(p, 'the key is •••• Z9W8.');
+  assert.ok(Buffer.byteLength(c) <= 2048 && Buffer.byteLength(l) <= 2048);
+  assert.match(c, /^•••• Z9W8_+$/);
+  // Only placeholders and filler: no part of the value but its last four characters.
+  assert.doesNotMatch(l, /[^•\sZ9W8_]/);
+  assert.match(l, /(•••• Z9W8_){3}$/, 'whole placeholders');
+  // A mask that fails hides nothing but breaks nothing.
+  const broken = await runChecks({ cwd: T, mask: () => { throw new Error('no'); }, checks: [{ name: 'x', run: 'echo fine' }] });
+  assert.equal(broken.results[0].tail, 'fine');
 });
 
 test('checks find node even when the PATH has none, and keep a PATH that has one as it is', async () => {

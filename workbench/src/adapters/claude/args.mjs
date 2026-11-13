@@ -218,6 +218,93 @@ export function scrubEnv(base = process.env) {
   return env;
 }
 
+/** A variable name a key may use: letters, digits and _, not starting with a digit. */
+const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/**
+ * A copy of `env` with the person's keys for this agent added (`keysEnv`: { NAME: value }, from the key store). Every
+ * adapter adds them after its scrub and before the WORKBENCH_* variables, so no key can replace the hook's address,
+ * its key or the agent's id. A key is left out when its name is not a variable name, is one of Workbench's own
+ * (WORKBENCH_*), or is one the scrub removes (`refused(name)`), or when its value is not a string or holds a NUL.
+ * Returned unchanged when there are no keys.
+ * @param {Record<string,string>} env
+ * @param {Record<string,string>|null|undefined} keysEnv
+ * @param {(name: string) => boolean} [refused]
+ */
+export function withKeys(env, keysEnv, refused = (k) => SCRUB_ENV_RE.test(k)) {
+  if (!keysEnv || typeof keysEnv !== 'object') return env;
+  let out = env;
+  for (const [k, v] of Object.entries(keysEnv)) {
+    if (!KEY_NAME_RE.test(k) || k.startsWith('WORKBENCH_') || refused(k) || typeof v !== 'string' || v.includes('\0')) continue;
+    if (out === env) out = { ...env };
+    out[k] = v;
+  }
+  return out;
+}
+
+/** How far before a kept tail of output a key may begin: keys are at most 2000 characters. */
+export const MASK_MARGIN = 2048;
+
+/** A mask (text -> text) that never throws and always gives a string; the identity when none is given. */
+export function safeMask(mask) {
+  if (typeof mask !== 'function') return (s) => s;
+  return (s) => {
+    const text = typeof s === 'string' ? s : String(s ?? '');
+    try {
+      const out = mask(text);
+      return typeof out === 'string' ? out : text;
+    } catch {
+      return text;
+    }
+  };
+}
+
+/**
+ * Hide the person's keys in output read as JSON, in place: every string of 8 or more characters (no key is shorter)
+ * goes through `mask`. Done before the parser reads the output, so a key the parser or narrate() later cuts short is
+ * never shown in part.
+ * @param {unknown} value  freshly parsed JSON
+ * @param {(s: string) => string} mask
+ * @returns {unknown} the value, with its strings masked (a string is returned masked)
+ */
+export function maskParsed(value, mask, depth = 0) {
+  if (typeof value === 'string') return value.length >= 8 ? mask(value) : value;
+  if (!value || typeof value !== 'object' || depth > 64) return value;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) value[i] = maskParsed(value[i], mask, depth + 1);
+  } else {
+    for (const k of Object.keys(value)) value[k] = maskParsed(value[k], mask, depth + 1);
+  }
+  return value;
+}
+
+/**
+ * `raw`, the kept end of some output, with the person's keys hidden. When earlier output was dropped (`truncated`),
+ * `raw` may begin inside a key that was cut, which no mask can find, so its start is left out: up to its first line
+ * break (a key holds none), or MASK_MARGIN characters when there is none that near (a cut key is shorter), but never
+ * past where the mask first hid something, since a whole key began there. receipt.mjs keeps a copy for the checks.
+ */
+export function maskCut(raw, mask, truncated) {
+  const masked = mask(raw);
+  if (!truncated) return masked;
+  const nl = raw.indexOf('\n');
+  const unsafe = nl >= 0 && nl < MASK_MARGIN ? nl + 1 : MASK_MARGIN;
+  const n = Math.min(unsafe, raw.length, masked.length);
+  let same = 0;
+  while (same < n && raw.charCodeAt(same) === masked.charCodeAt(same)) same++;
+  return masked.slice(Math.min(same, unsafe));
+}
+
+/**
+ * The last `limit` characters of output with the person's keys hidden. `raw` is the end of the output, kept with
+ * MASK_MARGIN characters to spare, so a key that reaches into what is shown is whole when it is masked; `truncated`:
+ * earlier output was dropped (see maskCut).
+ */
+export function maskedTail(raw, { truncated = false, limit, mask }) {
+  const text = maskCut(String(raw ?? ''), mask, truncated);
+  return text.length > limit ? text.slice(-limit) : text;
+}
+
 /**
  * Claude Code's own folders for one session, which its agent may read without asking (the policy's readAlso):
  * long tool results under <config dir>/projects/<key>/<session id>/, and background task output under
@@ -286,6 +373,8 @@ function budgetArg(usd) {
  * @param {string} [o.bridgePath]    hook bridge script (default: hook-bridge.mjs next to this file)
  * @param {string} [o.nodePath]      node binary for the hook (default: the running node)
  * @param {object} [o.env]           base environment (default: process.env)
+ * @param {object} [o.keysEnv]       the person's keys for this agent ({ NAME: value }): added after the scrub and before
+ *                                   the WORKBENCH_* variables (see withKeys). Never in argv or --settings.
  * @param {string} [o.bin]           the Claude Code program (default: what findClaude finds in `env`, else `claude`)
  * @returns {{ bin: string, args: string[], env: Record<string,string>, sessionId: string, resume: boolean }}
  */
@@ -335,7 +424,8 @@ export function buildClaudeLaunch(o = {}) {
   ];
   if (model) args.push('--model', String(model));
 
-  const env = withNodeOnPath(scrubEnv(base));
+  // The person's keys after the scrub, and Workbench's own variables last: no key can replace them.
+  const env = withKeys(withNodeOnPath(scrubEnv(base)), o.keysEnv);
   env.WORKBENCH_HOOK_URL = hook.url;
   env.WORKBENCH_HOOK_TOKEN = hook.token;
   env.WORKBENCH_AGENT_ID = String(agentId);

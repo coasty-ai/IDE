@@ -7,7 +7,7 @@ import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
 import {
   buildClaudeLaunch, findClaude, scrubEnv, withNodeOnPath, userMessage, sessionFolders, sessionExists,
-  DEFAULT_BUDGET_USD, DISALLOWED_TOOLS, CLAUDE_NOT_FOUND,
+  safeMask, maskParsed, maskedTail, DEFAULT_BUDGET_USD, DISALLOWED_TOOLS, CLAUDE_NOT_FOUND, MASK_MARGIN,
 } from './args.mjs';
 import { createClaudeParser } from './parse.mjs';
 
@@ -145,6 +145,10 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
  *   first message resumes it with `--resume` and the whole of `budgetUsd` (the new process has spent nothing).
  *   `claudePath` is the --claude flag: Claude Code is looked up again at each launch (findClaude in args.mjs), since
  *   the VS Code extension moves to a new folder with each update.
+ *   `keysEnv` ({ NAME: value }) is the person's keys for this agent: each process gets them after the scrub and before
+ *   the WORKBENCH_* variables. They never feed the lookup of Claude Code or of its own folders (`readAlso`).
+ *   `mask` (text -> text) hides the person's keys: every output line goes through it before the parser reads it, and
+ *   so does the stderr kept for error reports.
  *   Also accepted, mainly for tests: env (base environment), killGraceMs, now, bridgePath, nodePath, machineId.
  */
 export function createRunner(opts = {}) {
@@ -152,6 +156,9 @@ export function createRunner(opts = {}) {
   const emitFn = typeof opts.emit === 'function' ? opts.emit : () => {};
   const now = typeof opts.now === 'function' ? opts.now : Date.now;
   const baseEnv = opts.env || process.env;
+  const keysEnv = opts.keysEnv && typeof opts.keysEnv === 'object' ? opts.keysEnv : null;
+  const hide = typeof opts.mask === 'function' ? safeMask(opts.mask) : null; // null: nothing to hide
+  const mask = hide || ((s) => s);
   const claudePath = typeof opts.claudePath === 'string' ? opts.claudePath : null;
   const budgetUsd = opts.budgetUsd == null ? DEFAULT_BUDGET_USD : Number(opts.budgetUsd);
   const graceMs = opts.killGraceMs ?? STOP_GRACE_MS;
@@ -171,7 +178,8 @@ export function createRunner(opts = {}) {
   let launching = null;   // promise of a launch in progress
   let stopping = null;    // promise of a stop in progress
   let closed = null;      // resolves when the current process is fully gone and reported
-  let stderrTail = '';
+  let stderrTail = '';    // the end of stderr, with room to spare for masking (see maskedTail)
+  let stderrCut = false;  // earlier stderr was dropped
   let bin = null;         // the Claude Code program of the current process
   let toldTools = false;  // its tools were logged (once per process)
 
@@ -199,7 +207,9 @@ export function createRunner(opts = {}) {
 
   function onLine(line) {
     let obj;
-    try { obj = JSON.parse(line); } catch { log('debug', `ignored output that is not JSON: ${line.slice(0, 120)}`); return; }
+    // Keys are hidden before anything is cut short: the log's 120 characters here, the parser's and narrate()'s later.
+    try { obj = JSON.parse(line); } catch { log('debug', `ignored output that is not JSON: ${mask(line).slice(0, 120)}`); return; }
+    if (hide) obj = maskParsed(obj, hide);
     if (obj && obj.type === 'system' && obj.subtype === 'init') {
       if (obj.session_id) sessionId = String(obj.session_id);
       tellTools(obj);
@@ -242,7 +252,7 @@ export function createRunner(opts = {}) {
       : signal
         ? `Claude Code was ended unexpectedly (signal ${signal}).`
         : `Claude Code stopped with an error (exit code ${code}).`;
-    const tail = stderrTail.trim();
+    const tail = (hide ? maskedTail(stderrTail, { truncated: stderrCut, limit: STDERR_TAIL_CHARS, mask: hide }) : stderrTail.slice(-STDERR_TAIL_CHARS)).trim();
     emit({ kind: EV.ENDED, agentId, outcome: 'error', error: tail || what });
     emit({ kind: EV.STATE, agentId, state: STATE.FAILED, reason: what });
   }
@@ -264,7 +274,7 @@ export function createRunner(opts = {}) {
       const where = findClaude({ flag: claudePath, env: baseEnv });
       if (!where.path || where.reason) throw Object.assign(new Error(where.reason || CLAUDE_NOT_FOUND), { plain: true });
       const spec = buildClaudeLaunch({
-        name, model, budgetUsd: budget, hook, agentId, env: baseEnv, bin: where.path,
+        name, model, budgetUsd: budget, hook, agentId, env: baseEnv, keysEnv, bin: where.path,
         sessionId: resume ? undefined : sessionId,
         resumeSessionId: resume ? sessionId : undefined,
         bridgePath: opts.bridgePath, nodePath: opts.nodePath,
@@ -274,6 +284,7 @@ export function createRunner(opts = {}) {
       bin = spec.bin;
       toldTools = false;
       stderrTail = '';
+      stderrCut = false;
       stopRequested = false;
 
       const child = spawn(spec.bin, spec.args, {
@@ -285,7 +296,13 @@ export function createRunner(opts = {}) {
         try { onLine(line); } catch (err) { log('error', `failed to handle output: ${err.message}`); }
       }, { onTooLong: (n) => log('warn', `skipped an output line of ${n} characters`) });
       child.stdout.on('data', (c) => splitter.push(c));
-      child.stderr.on('data', (c) => { stderrTail = (stderrTail + c.toString('utf8')).slice(-STDERR_TAIL_CHARS); });
+      child.stderr.on('data', (c) => {
+        stderrTail += c.toString('utf8');
+        if (stderrTail.length > STDERR_TAIL_CHARS + MASK_MARGIN) {
+          stderrTail = stderrTail.slice(-(STDERR_TAIL_CHARS + MASK_MARGIN));
+          stderrCut = true;
+        }
+      });
       for (const s of [child.stdin, child.stdout, child.stderr]) {
         s.on('error', (err) => log('warn', `pipe error: ${err.message}`)); // EPIPE after the process has gone
       }
