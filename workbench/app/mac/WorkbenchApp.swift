@@ -804,7 +804,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
   var selfTest = false
   var selfTestStarted = false
   var selfTestCode: Int32 = 0
-  /// Whether git runs, as the last check found (GitTools). Clone waits for it.
+  /// Whether git runs, as the last check found (GitTools). Clone Repository… is on only once a check found it ready.
   var git = GitTools.State.unknown
   private var gitChecking = false
   private var gitCheckAgain = false
@@ -889,7 +889,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
   /** The first window's git line, Install Git and Clone Repository…, as the last check found git; in place. */
   func showGit() {
-    welcomeClone?.isEnabled = git != .missing
+    welcomeClone?.isEnabled = git == .ready
     welcomeGit?.isHidden = git != .missing
     welcomeGitText?.stringValue = gitWords ?? GitTools.missing
     welcomeInstall?.isEnabled = !gitInstalling
@@ -1022,10 +1022,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
   // MARK: cloning a repository
 
-  /** Clone Repository…: the clone sheet, over the window in front (the board, or the first window). Not while git is missing. */
+  /** Clone Repository…: the clone sheet, over the window in front (the board, or the first window). Only once git runs. */
   @objc func showClone() {
     if let s = cloneSheet { s.host?.makeKeyAndOrderFront(nil); return }
-    guard git != .missing else { NSSound.beep(); return }   // the button and the menu item are off: the first window says why
+    guard git == .ready else { NSSound.beep(); return }   // the button and the menu item are off: the first window says why
     let host: NSWindow
     if let k = NSApp.keyWindow, k === welcome || k === boardWindow {
       host = k
@@ -1101,11 +1101,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
   }
 
   // While the clone sheet is up, it is the way to open something: finish it, or cancel it, first. Clone Repository…
-  // waits for git.
+  // waits until a check has found that git runs.
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     if cloneSheet != nil, let action = item.action,
        [#selector(chooseFolder), #selector(openDemo), #selector(openRecent(_:))].contains(action) { return false }
-    if item.action == #selector(showClone), cloneSheet == nil, git == .missing { return false }
+    if item.action == #selector(showClone), cloneSheet == nil, git != .ready { return false }
     return true
   }
 
@@ -1313,7 +1313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     gitRow.spacing = 8
     gitRow.isHidden = git != .missing
     let clone = NSButton(title: "Clone Repository…", target: self, action: #selector(showClone))
-    clone.isEnabled = git != .missing
+    clone.isEnabled = git == .ready
     let open = NSButton(title: "Open Folder…", target: self, action: #selector(chooseFolder))
     open.keyEquivalent = "\r"
     let demo = NSButton(title: "Try the Demo", target: self, action: #selector(openDemo))
