@@ -888,9 +888,9 @@ test('cloneFirst: each failure is one plain sentence, and for the app also its k
   const refusing = (err) => ({ async cloneRepo() { throw err; } });
   const plainErr = (why, message) => Object.assign(new Error(message), { why, detail: 'fatal: Authentication failed for https://github.com/octo/secret.git/' });
   const cases = [
-    [plainErr('auth', 'GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again.'), 'auth'],
+    [plainErr('auth', 'GitHub did not let Workbench read this repository. If it is private, sign in to GitHub, then try again.'), 'auth'],
     // Refused for this Mac's SSH key: its own kind, so the Mac app offers no Connect GitHub… for it.
-    [plainErr('ssh', 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first.'), 'ssh'],
+    [plainErr('ssh', 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, sign in to GitHub first.'), 'ssh'],
     [plainErr('network', 'Workbench could not reach github.com.'), 'network'],
     [plainErr('exists', 'There is already a folder called hello in the folder you chose.'), 'exists'],
     [plainErr('url', 'Workbench can clone only https:// and ssh:// addresses, and git@host:path.'), 'url'],
@@ -1387,4 +1387,36 @@ test('the log hides the person’s keys once Agents & keys gives it the mask, an
   verbose.debug('also shown');
   verbose('and this');
   assert.deepEqual(loud, ['[workbench info] shown\n', '[workbench debug] also shown\n', '[workbench info] and this\n']);
+});
+
+test('--github-signin stops gh’s login when the Mac app’s lifeline closes, even with no signal; a non-pipe is never watched', async () => {
+  // The app keeps the helper's standard input open and closes it when it goes away (a crash sends no SIGTERM).
+  const waiting = () => {
+    let cancelled = 0;
+    let release;
+    const connect = {
+      githubSignIn: () => new Promise((resolve) => { release = resolve; }),
+      cancelGithubSignIn: async () => { cancelled++; release({ ok: false, phase: 'error', why: 'cancelled', sentence: 'Signing in to GitHub was stopped.' }); },
+    };
+    return { connect, count: () => cancelled };
+  };
+  const a = waiting();
+  const lifeline = Object.assign(new EventEmitter(), { isLifeline: true, resume() {}, pause() {} });
+  const out = [];
+  const run = githubSigninMode({ connect: a.connect, say: (s) => out.push(s), signals: new EventEmitter(), lifeline });
+  await new Promise((r) => setImmediate(r));
+  lifeline.emit('end');
+  assert.equal(await run, 1);
+  assert.ok(a.count() >= 1, 'the closed lifeline cancelled the sign-in');
+  assert.equal(lifeline.listenerCount('end'), 0, 'the lifeline is let go after the sign-in ends');
+
+  const b = waiting();
+  const notAPipe = new EventEmitter(); // no fd and no isLifeline: a terminal, /dev/null, or nothing to watch
+  const run2 = githubSigninMode({ connect: b.connect, say: () => {}, signals: new EventEmitter(), lifeline: notAPipe });
+  await new Promise((r) => setImmediate(r));
+  notAPipe.emit('end');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(b.count(), 0, 'a stream that is not a pipe is not a lifeline');
+  await b.connect.cancelGithubSignIn();
+  assert.equal(await run2, 1);
 });

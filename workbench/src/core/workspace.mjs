@@ -2350,12 +2350,12 @@ function cloneFailure(e, src) {
   if (CLONE_EXISTS.test(text)) return err('exists', 'Something is already in the folder it would go into. Choose another folder.');
   if ((src.kind === 'ssh' || src.kind === 'scp') && CLONE_SSH_KEY.test(text)) {
     return err('ssh', src.host === 'github.com'
-      ? 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first.'
+      ? 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, sign in to GitHub first.'
       : `${where} did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, make sure git can sign in to ${where} first.`);
   }
   if (CLONE_AUTH.test(text)) {
     return err('auth', src.host === 'github.com'
-      ? 'GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again.'
+      ? 'GitHub did not let Workbench read this repository. If it is private, sign in to GitHub, then try again.'
       : `${where} did not let Workbench read this repository. If it is private, make sure git can sign in to ${where}, then try again.`);
   }
   if (CLONE_NETWORK.test(text)) return err('network', `Workbench could not reach ${where}.`);
@@ -2384,8 +2384,8 @@ function cloneFailure(e, src) {
  * name in it), 'exists' (something is already there, or the folder cannot be made), 'ssh' (an ssh or scp-like address
  * ssh would not go on with: the server took no SSH key of this Mac's, or this Mac does not know the server's key; on
  * GitHub "GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository,
- * connect your GitHub account first."), 'auth' (refused: a private repository, no sign-in; on GitHub "GitHub did not
- * let Workbench read this repository. If it is private, connect your GitHub account, then try again."), 'network'
+ * sign in to GitHub first."), 'auth' (refused: a private repository, no sign-in; on GitHub "GitHub did not
+ * let Workbench read this repository. If it is private, sign in to GitHub, then try again."), 'network'
  * ("Workbench could not reach <host>."), 'stopped' (see `signal`) or 'git' (anything else), with git's own words in
  * `.detail`. A folder the clone made is removed again when it fails.
  * @returns {Promise<{ root: string }>} the new folder's real path

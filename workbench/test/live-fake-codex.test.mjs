@@ -60,6 +60,7 @@ async function setup(t, extraEnv = {}, { config = null } = {}) {
     TMPDIR: path.join(dir, 'tmp'),
     WORKBENCH_CLAUDE_BIN: FAKE,
     WORKBENCH_CODEX_BIN: CODEX_FAKE,
+    WORKBENCH_GH_BIN: path.join(dir, 'no-gh-here'), // never the machine's own gh, even read-only
     FAKE_CLAUDE_FIXTURE: '',
     FAKE_CODEX_LOG: codexLog,
     FAKE_CODEX_WRITE: MARKER,

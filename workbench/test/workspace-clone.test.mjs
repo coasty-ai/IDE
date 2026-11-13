@@ -445,10 +445,10 @@ test('cloneRepo refuses a place that is taken, and makes the folder it needs', a
 test('a clone that fails says why in plain words, with git’s own words only in .detail', async () => {
   process.env.FAKE_GIT_CLONE = 'fail';
   const into = path.join(T, 'failing');
-  const GITHUB_AUTH = 'GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again.';
+  const GITHUB_AUTH = 'GitHub did not let Workbench read this repository. If it is private, sign in to GitHub, then try again.';
   // Refused for this Mac's SSH key: no GitHub sign-in mends that (a token is for https), so it is not 'auth', and the
   // Mac app offers no Connect GitHub… for it.
-  const GITHUB_SSH = 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, connect your GitHub account first.';
+  const GITHUB_SSH = 'GitHub did not accept this Mac’s SSH key. Use the https:// address instead; for a private repository, sign in to GitHub first.';
   const NO_KEY = 'Permission denied (publickey).\r\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n';
   const cases = [
     ['https://github.com/owner/private', "remote: Repository not found.\nfatal: repository 'https://github.com/owner/private/' not found\n", 'auth', GITHUB_AUTH],
