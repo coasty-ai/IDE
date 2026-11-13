@@ -229,8 +229,40 @@ test('ghInstall refuses a gh GitHub did not sign, a link in place of the program
       plain: true, why: 'runs', message: 'The copy of GitHub’s command-line tool that was downloaded does not run on this computer, so Workbench did not install it.',
     });
   }
-  assert.equal(fs.existsSync(p.bin), false);
+  // The program is tried beside ~/.local/bin/gh under a temporary name: neither it nor a gh is left there.
+  assert.deepEqual(fs.existsSync(p.bin) ? fs.readdirSync(p.bin) : [], []);
   assert.deepEqual(fs.readdirSync(p.tmp), []);
+});
+
+test('ghInstall tries the downloaded gh where it will live, under a temporary name, never in the temporary folder (which may be noexec)', async (t) => {
+  const kinds = [HAS_UNZIP && 'darwin', HAS_TAR && 'linux'].filter(Boolean);
+  if (!kinds.length) { t.skip('needs /usr/bin/unzip or tar'); return; }
+  for (const platform of kinds) {
+    await t.test(platform, async (st) => {
+      const p = installPlace(st);
+      const ran = path.join(p.home, 'ran.txt');
+      // A gh that cannot be started from the temporary folder, as on a Linux whose /tmp is mounted noexec; it notes
+      // where it was started from.
+      const program = [
+        '#!/bin/sh',
+        `printf '%s\\n' "$0" >> '${ran}'`,
+        'case "$0" in */workbench-gh-*) echo "Permission denied" >&2; exit 126;; esac',
+        ...wrapperScript({ version: '2.104.0' }).split('\n').slice(1),
+      ].join('\n');
+      const r = await ghInstall({
+        fetchImpl: releaseFetch(fakeRelease({ platform, arch: 'arm64', program })).fetchImpl, platform, arch: 'arm64', home: p.home,
+        osRelease: '27.0.0', tmpDir: p.tmp, env: process.env, verify: async () => true,
+      });
+      assert.deepEqual(r, { path: path.join(p.bin, 'gh'), version: '2.104.0' });
+      const where = fs.readFileSync(ran, 'utf8').trim().split('\n');
+      assert.equal(where.length, 1, 'tried once');
+      assert.match(where[0], /\/\.local\/bin\/\.gh-[0-9]+-[0-9a-f]{8}\.tmp$/, 'under its temporary name beside ~/.local/bin/gh');
+      assert.equal(path.dirname(where[0]), p.bin);
+      assert.deepEqual(fs.readdirSync(p.bin), ['gh']);
+      assert.deepEqual(fs.readdirSync(p.tmp), []);
+      assert.equal(await ghVersion({ ghPath: r.path }), '2.104.0');
+    });
+  }
 });
 
 test('ghInstall refuses before any download: a computer GitHub publishes no gh for, a Mac older than macOS 13; and with no network', async (t) => {
@@ -386,6 +418,36 @@ test('startGhLogin: a gh that fails, before or after its code, or cannot be star
   assert.equal(missing.outcome, 'failed');
 });
 
+test('startGhLogin: gh giving up by itself near the end of the wait is "expired", not "failed"', async (t) => {
+  // GitHub's own end of the code can come a little before Workbench's: gh then exits 1 by itself.
+  const late = standIn(t, { FAKE_GH_LOGIN: 'deny', FAKE_GH_LOGIN_DELAY_MS: '2500' });
+  const l = await startGhLogin({ ghPath: late.gh, env: late.env, maxMs: 4000 }).done;
+  assert.deepEqual([l.outcome, l.exitCode, l.code], ['expired', 1, FAKE_CODE]);
+  // Early in the wait it is a failure, as before (the person denied it, say).
+  const early = standIn(t, { FAKE_GH_LOGIN: 'deny', FAKE_GH_LOGIN_DELAY_MS: '100' });
+  const e = await startGhLogin({ ghPath: early.gh, env: early.env, maxMs: 4000 }).done;
+  assert.deepEqual([e.outcome, e.exitCode], ['failed', 1]);
+});
+
+test('startGhLogin: Workbench’s own limit ends the wait at 14.5 minutes, before the code runs out on GitHub (15 minutes)', async (t) => {
+  const waiting = standIn(t, { FAKE_GH_LOGIN: 'wait' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let shown;
+  const codeShown = new Promise((resolve) => { shown = resolve; });
+  const login = startGhLogin({ ghPath: waiting.gh, env: waiting.env, onCode: (c) => shown(c) });
+  t.after(() => login.cancel());
+  assert.deepEqual(await codeShown, { code: FAKE_CODE, url: GH_DEVICE_URL });
+  let outcome = null;
+  login.done.then((r) => { outcome = r.outcome; });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(14 * 60_000);
+  await settle();
+  assert.equal(outcome, null, 'still waiting after 14 minutes');
+  t.mock.timers.tick(30_000);
+  await settle();
+  assert.equal(outcome, 'expired', 'stopped by 14.5 minutes');
+});
+
 // ------------------------------------------------------------------ git's helper
 
 test('setup-git makes git ask gh for github.com; forgetGhGitHelper takes out exactly what it wrote, and nothing of the person’s', async (t) => {
@@ -416,6 +478,29 @@ test('setup-git makes git ask gh for github.com; forgetGhGitHelper takes out exa
   assert.deepEqual(await forgetGhGitHelper(), { removed: [], kept: [...GH_HELPER_KEYS] });
   assert.equal(gitGlobal('--get-all', 'credential.https://github.com.helper'), 'osxkeychain');
   assert.equal(await gitUsesGh(), false);
+});
+
+test('forgetGhGitHelper also takes out what two setup-gits run at once leave (gh’s helper twice), and still nothing of the person’s', async (t) => {
+  fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '');
+  t.after(() => fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, ''));
+  const gh = '!/Users/ada/.local/bin/gh auth git-credential';
+  const set = (key, values) => {
+    try { gitGlobal('--unset-all', key); } catch { /* not there */ }
+    for (const v of values) gitGlobal('--add', key, v);
+  };
+  // Two setup-gits whose writes interleaved: the empty value, then gh's helper twice.
+  set(GH_HELPER_KEYS[0], ['', gh, gh]);
+  set(GH_HELPER_KEYS[1], ['', gh]);
+  assert.equal(await gitUsesGh(), true);
+  assert.deepEqual(await forgetGhGitHelper(), { removed: [...GH_HELPER_KEYS], kept: [] });
+  assert.equal(await gitUsesGh(), false);
+  assert.doesNotMatch(fs.readFileSync(process.env.GIT_CONFIG_GLOBAL, 'utf8'), /github\.com/);
+  // A helper of the person's own among them, or gh's helper with no empty value before it: left as it is.
+  set(GH_HELPER_KEYS[0], ['', gh, 'osxkeychain']);
+  set(GH_HELPER_KEYS[1], [gh, gh]);
+  assert.deepEqual(await forgetGhGitHelper(), { removed: [], kept: [...GH_HELPER_KEYS] });
+  assert.deepEqual(gitValues(GH_HELPER_KEYS[0]), ['', gh, 'osxkeychain']);
+  assert.deepEqual(gitValues(GH_HELPER_KEYS[1]), [gh, gh]);
 });
 
 test('isGhHelper: gh’s own helper line, its path quoted or not; nothing else', () => {

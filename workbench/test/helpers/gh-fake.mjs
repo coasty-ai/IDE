@@ -22,7 +22,8 @@
 //     silent          prints nothing, and waits
 // - `auth setup-git --hostname github.com`: writes git's global settings as gh does (an empty helper, then
 //   `!<FAKE_GH_SELF> auth git-credential`, for github.com and gist.github.com), through the git on the PATH. Fails when
-//   signed out, or with FAKE_GH_SETUP_GIT=fail.
+//   signed out, or with FAKE_GH_SETUP_GIT=fail. FAKE_GH_SETUP_GIT_PAUSE_MS: it waits that long between each host's two
+//   writes, as a slow setup-git would.
 // - `auth logout --hostname github.com [--user <login>]`: signs out; fails when signed out, for another user, or with
 //   FAKE_GH_LOGOUT=fail.
 // - `api [--hostname github.com] <path>`: FAKE_GH_REPOS (JSON text), or two repositories; exit 4 when signed out, 1 with
@@ -342,13 +343,15 @@ async function login(argv, env) {
   process.exit(0);
 }
 
-function setupGit(env, state) {
+async function setupGit(env, state) {
   if (!state.user) quit(1, 'You are not logged into any GitHub hosts. Run gh auth login to authenticate.');
   if (env.FAKE_GH_SETUP_GIT === 'fail') quit(1, 'failed to configure git credential helper: could not lock config file');
   const self = env.FAKE_GH_SELF || GH_FAKE;
   const helper = `!${/[ $\\]/.test(self) ? `'${self}'` : self} auth git-credential`;
+  const pause = Number(env.FAKE_GH_SETUP_GIT_PAUSE_MS || 0);
   for (const host of ['https://github.com', 'https://gist.github.com']) {
     execFileSync('git', ['config', '--global', '--replace-all', `credential.${host}.helper`, ''], { stdio: 'pipe' });
+    if (pause > 0) await sleep(pause);
     execFileSync('git', ['config', '--global', '--add', `credential.${host}.helper`, helper], { stdio: 'pipe' });
   }
   process.exit(0);

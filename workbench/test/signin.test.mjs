@@ -8,7 +8,7 @@
 // opens Apple's installer, and nothing reaches a network.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -503,6 +503,64 @@ test('SignIns: a program signed in before counts only by its exit 0, which needs
   });
   assert.ok(await until(() => s.state('w').phase !== 'waiting'));
   assert.deepEqual([s.state('w').phase, asked, confirmed], ['done', 0, 1]);
+});
+
+// A login program that is a launcher, as npm's `codex` is (a Node script that starts the real program as its child):
+// what it starts writes its own pid to a file, then waits (30 seconds at most).
+const STARTED = "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000); setTimeout(() => process.exit(0), 30000);";
+/** A launcher that passes SIGINT, SIGTERM and SIGHUP on to what it started, as npm's codex does. */
+const forwarding = (pidFile) => [process.execPath, ['-e',
+  "const c = require('node:child_process').spawn(process.execPath, ['-e', process.argv[1], process.argv[2]], { stdio: 'inherit' });"
+  + " for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(s, () => { try { c.kill(s); } catch {} });"
+  + ' c.on(\'exit\', (code) => process.exit(code ?? 1));',
+  STARTED, pidFile]];
+/** A launcher that passes nothing on: a shell that waits for what it started. */
+const plainShell = (pidFile) => ['/bin/sh', ['-c', '"$0" -e "$1" "$2"; exit 0', process.execPath, STARTED, pidFile]];
+
+/** Workbench, as far as this goes: a process that starts one sign-in with `launcher`, then exits once it has started. */
+async function exitWhileWaiting(t, { group, launcher }) {
+  const pidFile = path.join(scratch(t), 'started.pid');
+  const [file, args] = launcher(pidFile);
+  const workbench = [
+    'const [url, group, pidFile, file, args] = process.argv.slice(1);',
+    'const fs = await import(\'node:fs\');',
+    'const { SignIns } = await import(url);',
+    'new SignIns({ signalGroup: group === \'1\' }).start(\'x\', { file, args: JSON.parse(args), env: process.env, cwd: process.cwd(), label: \'X\' });',
+    'const ready = () => { try { return fs.readFileSync(pidFile, \'utf8\') !== \'\'; } catch { return false; } };',
+    'const every = setInterval(() => { if (ready()) { clearInterval(every); process.exit(0); } }, 20);',
+  ].join('\n');
+  const signin = new URL('../src/core/signin.mjs', import.meta.url).href;
+  const wb = spawn(process.execPath, ['--input-type=module', '-e', workbench, signin, group ? '1' : '0', pidFile, file, JSON.stringify(args)], { stdio: 'ignore' });
+  const code = await new Promise((resolve) => wb.on('exit', resolve));
+  assert.equal(code, 0);
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  t.after(() => { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } });
+  return pid;
+}
+
+test('SignIns: when Workbench exits, the whole process group of a waiting login program is killed (macOS), so what a launcher started goes too', async (t) => {
+  const pid = await exitWhileWaiting(t, { group: true, launcher: plainShell });
+  assert.ok(await gone(pid, 5000), 'what the launcher started is gone');
+});
+
+test('SignIns: where its group is not signalled (Linux), a waiting login program gets SIGTERM at exit, which a launcher passes on', async (t) => {
+  const pid = await exitWhileWaiting(t, { group: false, launcher: forwarding });
+  assert.ok(await gone(pid, 5000), 'what the launcher started is gone');
+});
+
+test('SignIns: Cancel stops the whole process group (macOS), also what a launcher that passes no signal on started', async (t) => {
+  const s = new SignIns({ signalGroup: true, stopGraceMs: 500 });
+  t.after(() => s.stopAll());
+  const pidFile = path.join(scratch(t), 'started.pid');
+  const [file, args] = plainShell(pidFile);
+  s.start('v', { file, args, env: process.env, cwd: process.env.HOME, label: 'V' });
+  assert.ok(await until(() => { try { return fs.readFileSync(pidFile, 'utf8') !== ''; } catch { return false; } }));
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  t.after(() => { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } });
+  assert.equal(s.cancel('v'), true);
+  assert.ok(await gone(pid, 4000), 'what the launcher started is gone');
+  assert.deepEqual([s.state('v').phase, s.state('v').why], ['cancelled', 'cancel']);
+  assert.equal(new SignIns().signalGroup, process.platform === 'darwin', 'the group on macOS, where the browser is never in it');
 });
 
 // ------------------------------------------------------------------ the routes
