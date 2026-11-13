@@ -129,10 +129,13 @@ export const connectApi = {
   gitInstall: () => connectCall('POST', '/api/connect/git/install', {}),
   /**
    * Sign in to GitHub through GitHub's own command-line tool, which Workbench gets first when it is missing. It answers
-   * at once; the status's `github.signingIn` then says how far it is, and the panel reads it again every 2 seconds.
+   * at once; the status's `github.signingIn` then says how far it is (where Terminal could not open, `opened: false` and
+   * the `command` to run), and the panel reads it again every 2 seconds until it ends. With gh signed in already but git
+   * not using it, Workbench only makes git use it, and answers when that is done.
    */
   githubSignIn: () => connectCall('POST', '/api/connect/github/signin', {}),
   githubSignInCancel: () => connectCall('POST', '/api/connect/github/signin/cancel', {}),
+  /** Sign out of GitHub: the answer says whether Terminal opened (`opened`), and gives the `command` to run when gh could not sign out by itself and Terminal could not open. */
   githubSignOut: () => connectCall('POST', '/api/connect/github/signout', {}),
   github: (githubToken, agentsUseIt) => connectCall('POST', '/api/connect/github', { token: githubToken, agentsUseIt: agentsUseIt === true }),
   /**

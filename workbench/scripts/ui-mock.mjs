@@ -575,7 +575,11 @@ function mergeWorld(name, now) {
 //   connect-gh-none        GitHub's command-line tool is not installed, and GitHub is not signed in: Sign in to GitHub
 //   connect-gh-installing  a sign-in to GitHub under way, getting the tool: "Getting GitHub’s command-line tool…"
 //   connect-gh-code        a sign-in to GitHub waiting for the person: "Your code: WDJB-MJHT", with Open GitHub
-//   connect-gh-signed      signed in to GitHub through the tool, as octocat: Sign out
+//   connect-gh-signed      signed in to GitHub through the tool, as octocat, and git uses that sign-in: Sign out
+//   connect-gh-nogit       signed in through the tool as octocat, but git does not use that sign-in (gh signed in in a
+//                          terminal of the person's own): Sign in to GitHub, which only makes git use it, and Sign out
+//   connect-gh-command     a sign-in to GitHub where Terminal could not open: Workbench waits, and its status carries the
+//                          command to run in a terminal, which the panel shows with Copy
 //   connect-gh-refused     the tool's download was refused (its checksum did not match): GitHub's sentence says so
 //   connect-git-missing    git is not installed (a Mac, no developer tools): Install, and no name or email to give
 //   connect-browser        Claude Code's own login waits in the browser: "Finish signing in to Claude in your browser."
@@ -584,18 +588,24 @@ function mergeWorld(name, now) {
 // signed in, or installed and signed out. Sign in alone (or { console: true }, Claude Code's Anthropic Console account)
 // is the agent's own login in the browser: it waits (`signingIn`), and the second read after it finds it signed in.
 // Sign in to GitHub gets the tool when it is missing ("installing"; the next read has the code), shows the code
-// ("code"), and the third read after the code came finds it signed in as octocat; git's Install "opens Apple's
-// installer", and the next re-check finds git. Each read (GET /api/connect, the re-check) moves a sign-in under way on by
+// ("code"), and the third read after the code came finds it signed in as octocat (the second finds gh signed in while
+// git does not use it yet, the sign-in still under way, as Connect's status is while setup-git runs); signed in
+// already but git not using it, it only makes git use it, at once. git's Install "opens Apple's installer", and the
+// next re-check finds git. Each read (GET /api/connect, the re-check) moves a sign-in under way on by
 // one step (advanceSignIns). Through POST /ctl/mode, connect: { terminal: false }
-// answers the Terminal ones with the command to run instead (no Terminal); { github: 'token' } refuses the token Connect
+// answers the Terminal ones with the command to run instead (no Terminal), GitHub's sign-in too (its status then has
+// `opened: false` and the command); { github: 'token' } refuses the token Connect
 // GitHub sends; { githubAgents: 'token' } refuses GitHub's box ("Let agents use this token") as Connect does when the key
 // store cannot give it the token it keeps, with { ok: false, why: 'token', sentence, status }, as the route answers;
 // { gh: 'refused' } refuses the tool's download, { gh: 'terminal' } falls back to Terminal (no code came), { gh: 'wait' }
-// keeps showing the code; { browser: 'fail' } makes an agent's sign-in in the browser not finish, { browser: 'wait' }
+// keeps showing the code; { signout: 'fail' } answers Sign out as Connect does when gh cannot sign out by itself and
+// Terminal cannot open ({ ok: false, why: 'gh', opened: false, command, sentence, status }, gh still signed in);
+// { browser: 'fail' } makes an agent's sign-in in the browser not finish, { browser: 'wait' }
 // keeps it waiting; { fail: true } fails every read. delay: { connect: ms } makes every answer take that long. A key
 // for one repository says whether it is this one (`here`), as Connect's status does.
 const CONNECT_SCENARIOS = ['connect-none', 'connect-claude', 'connect-nocodex', 'connect-github', 'connect-fail',
-  'connect-gh-none', 'connect-gh-installing', 'connect-gh-code', 'connect-gh-signed', 'connect-gh-refused', 'connect-git-missing', 'connect-browser', 'connect-browser-failed'];
+  'connect-gh-none', 'connect-gh-installing', 'connect-gh-code', 'connect-gh-signed', 'connect-gh-refused', 'connect-git-missing', 'connect-browser', 'connect-browser-failed',
+  'connect-gh-nogit', 'connect-gh-command'];
 /** The milestone 1.5 scenarios: no coding agent is ready in them. */
 const FIRST_RUN = new Set(CONNECT_SCENARIOS.slice(5));
 SCENARIOS.push(...CONNECT_SCENARIOS);
@@ -611,6 +621,15 @@ const SIGN_IN_SITE = { claude: 'Claude', codex: 'ChatGPT' };
 const GH_PATH = '/Users/someone/.local/bin/gh', GH_VERSION = '2.104.0', GH_CODE = 'WDJB-MJHT', GH_DEVICE = 'https://github.com/login/device';
 const GH_PHASE_WORDS = { installing: 'Getting GitHub’s command-line tool…', code: 'Open GitHub, type the code there and approve the sign-in.',
   terminal: 'Terminal is open: follow the steps there, then come back.' };
+/** Where Terminal could not open (Connect's words on a Mac), and the commands Connect gives then for that gh. */
+const GH_NO_TERMINAL = 'Workbench could not open Terminal. Run this command in a terminal, then come back here.';
+const GH_SIGN_IN_COMMAND = `${GH_PATH} auth login --hostname github.com --git-protocol https --web --scopes workflow && ${GH_PATH} auth setup-git --hostname github.com`;
+const GH_SIGN_OUT_COMMAND = `${GH_PATH} auth logout --hostname github.com`;
+/** What GitHub's part says once signed in through the tool, as Connect says it: git uses the sign-in, or not yet. */
+const ghSignedWords = (login, git) => (git ? `Signed in to GitHub as ${login}. Git in Terminal, Workbench and your agents use this sign-in.`
+  : `Signed in to GitHub as ${login}, but git does not use this sign-in yet. Sign in to GitHub again to set that up.`);
+/** A sign-in's words for its phase: in Terminal's place, the command to run. */
+const ghPhaseWords = si => (si.phase === 'terminal' && si.opened === false ? GH_NO_TERMINAL : GH_PHASE_WORDS[si.phase]);
 const GH_REFUSED = 'Workbench did not install GitHub’s command-line tool, because the download did not match the checksum GitHub publishes for it. Try again later, or use a token instead.';
 /** When the milestone 1.5 scenarios' sign-ins began: a fixed time, so a scenario's status is the same at every read. */
 const SINCE = 1_800_000_000_000;
@@ -624,11 +643,12 @@ function connectFacts(name) {
   const claude = { id: 'claude', name: 'Claude Code', found: true, version: '2.1.322', from: 'the VS Code extension', signedIn: 'yes', how: 'your Claude subscription' };
   const codex = { id: 'codex', name: 'Codex', found: true, version: '0.166.0', from: 'your PATH', signedIn: 'yes', how: 'your ChatGPT account' };
   // chosen: the person's default (settings.json); pending: what Terminal is doing, which the next re-check finds done;
-  // github: milestone 1's token; gh: GitHub's own command-line tool (installed, signed in as `login`, a sign-in under
-  // way, and what Connect said of the last one); an agent's `signing` is its own login waiting in the browser, and
-  // `failed` says one did not finish. A sign-in's `steps` are what each read does next (none: it holds still).
+  // github: milestone 1's token; gh: GitHub's own command-line tool (installed, signed in as `login`, whether git uses
+  // that sign-in, a sign-in under way, and what Connect said of the last one); an agent's `signing` is its own login
+  // waiting in the browser, and `failed` says one did not finish. A sign-in's `steps` are what each read does next
+  // (none: it holds still); GitHub's has `opened: false` once it is in Terminal's place, where Terminal could not open.
   const f = { agents: [claude, codex], chosen: null, git: { name: 'Sam Lee', email: 'sam@example.com', installed: true }, github: null,
-    gh: { installed: false, login: null, signing: null, said: null }, keys: [], fail: name === 'connect-fail', pending: new Map(), seq: 0 };
+    gh: { installed: false, login: null, git: false, signing: null, said: null }, keys: [], fail: name === 'connect-fail', pending: new Map(), seq: 0 };
   for (const a of f.agents) Object.assign(a, { signing: null, failed: false });
   if (name === 'connect-none') { Object.assign(claude, { signedIn: 'no', how: null }); Object.assign(codex, NOT_INSTALLED); f.git = { name: '', email: '', installed: true }; }
   if (name === 'connect-claude') { Object.assign(codex, { signedIn: 'no', how: null }); f.gh.installed = true; }
@@ -636,7 +656,9 @@ function connectFacts(name) {
   if (FIRST_RUN.has(name)) { Object.assign(claude, { signedIn: 'no', how: null }); Object.assign(codex, NOT_INSTALLED); }
   if (name === 'connect-gh-installing') f.gh.signing = { phase: 'installing', since: SINCE, steps: [] };
   if (name === 'connect-gh-code') Object.assign(f.gh, { installed: true, signing: { phase: 'code', code: GH_CODE, url: GH_DEVICE, since: SINCE, steps: [] } });
-  if (name === 'connect-gh-signed') Object.assign(f.gh, { installed: true, login: 'octocat' });
+  if (name === 'connect-gh-signed') Object.assign(f.gh, { installed: true, login: 'octocat', git: true });
+  if (name === 'connect-gh-nogit') Object.assign(f.gh, { installed: true, login: 'octocat', git: false });
+  if (name === 'connect-gh-command') Object.assign(f.gh, { installed: true, signing: { phase: 'terminal', opened: false, since: SINCE, steps: [] } });
   if (name === 'connect-gh-refused') f.gh.said = GH_REFUSED;
   if (name === 'connect-git-missing') f.git = { name: '', email: '', installed: false };
   if (name === 'connect-browser') claude.signing = { since: SINCE, console: false, steps: [] };
@@ -671,6 +693,10 @@ function connectStatus(f) {
   });
   const g = f.git, gh = f.github, tool = f.gh, si = tool.signing;
   const toolFacts = { ghInstalled: tool.installed, ghVersion: tool.installed ? GH_VERSION : null, ghPath: tool.installed ? GH_PATH : null };
+  // the sign-in under way, as Connect's githubSignInState() gives it, whether gh has the sign-in yet or not
+  const noTerminal = !!si && si.phase === 'terminal' && si.opened === false;
+  const signingIn = si ? { phase: si.phase, code: si.phase === 'code' ? si.code : null, url: si.phase === 'code' ? si.url : null, since: si.since, sentence: ghPhaseWords(si),
+    ...(noTerminal ? { opened: false, command: GH_SIGN_IN_COMMAND } : {}) } : null;
   const keySentence = k => `${k.label} for ${k.scope.kind === 'repo' ? (k.scope.root === CONNECT_REPO.root ? 'this repository' : `the repository at ${k.scope.root}`) : 'all repositories'}, `
     + `given to ${k.agents === 'all' ? 'all agents' : k.agents.length ? andList(k.agents.map(nameOf)) : 'no agent'}: ${k.vars.map(x => `${x.name} ${x.shown}`).join(', ')}`;
   return {
@@ -678,10 +704,8 @@ function connectStatus(f) {
     git: g.installed === false ? { name: '', email: '', installed: false, canInstall: true, sentence: 'Git is not installed yet. Apple’s developer tools include it.' }
       : { name: g.name, email: g.email, installed: true, canInstall: true, sentence: g.name && g.email ? `Git knows you as ${g.name}, ${g.email}.` : 'Git does not know your name and email yet.' },
     github: gh ? { connected: true, via: 'token', login: gh.login, ...toolFacts, agentsUseIt: gh.agentsUseIt, sentence: `Connected to GitHub as ${gh.login}.`, signingIn: null }
-      : tool.login ? { connected: true, via: 'gh', login: tool.login, ...toolFacts, agentsUseIt: false,
-        sentence: `Signed in to GitHub as ${tool.login}. Git in Terminal, Workbench and your agents use this sign-in.`, signingIn: null }
-      : { connected: false, via: null, login: null, ...toolFacts, agentsUseIt: false, sentence: tool.said || 'Not signed in to GitHub.',
-        signingIn: si ? { phase: si.phase, code: si.phase === 'code' ? si.code : null, url: si.phase === 'code' ? si.url : null, since: si.since, sentence: GH_PHASE_WORDS[si.phase] } : null },
+      : tool.login ? { connected: true, via: 'gh', login: tool.login, ...toolFacts, agentsUseIt: tool.git === true, sentence: ghSignedWords(tool.login, tool.git === true), signingIn }
+      : { connected: false, via: null, login: null, ...toolFacts, agentsUseIt: false, sentence: tool.said || 'Not signed in to GitHub.', signingIn },
     keys: f.keys.map(k => ({ ...k, scope: k.scope.kind === 'repo' ? { ...k.scope, here: k.scope.root === CONNECT_REPO.root } : { ...k.scope },
       vars: k.vars.map(x => ({ ...x })), sentence: keySentence(k) })),
     ready: agents.some(a => a.ready),
@@ -692,15 +716,18 @@ const connectMetaOf = s => ({ ready: s.ready, defaultAgent: s.defaultAgent, agen
 
 /**
  * A read of the status moves each sign-in under way on by one step: GitHub's from getting the tool to its code ('code'),
- * to Terminal ('terminal'), to signed in ('done') or to a refused download ('refused'); an agent's in the browser to
- * signed in ('done') or not finished ('fail'). 'wait' is one more read as it is. With no steps left it holds still.
+ * to Terminal ('terminal', or in its place the command, where Terminal could not open), to gh signed in while git does
+ * not use it yet ('login': setup-git still running, the sign-in still under way), to signed in ('done') or to a refused
+ * download ('refused'); an agent's in the browser to signed in ('done') or not finished ('fail'). 'wait' is one more
+ * read as it is. With no steps left it holds still.
  */
 function advanceSignIns(f) {
   const g = f.gh;
   const step = g.signing && g.signing.steps.length ? g.signing.steps.shift() : null;
   if (step === 'code') { g.installed = true; Object.assign(g.signing, { phase: 'code', code: GH_CODE, url: GH_DEVICE }); }
-  if (step === 'terminal') { g.installed = true; Object.assign(g.signing, { phase: 'terminal', code: null, url: null }); }
-  if (step === 'done') Object.assign(g, { installed: true, login: 'octocat', signing: null, said: null });
+  if (step === 'terminal') { g.installed = true; Object.assign(g.signing, { phase: 'terminal', code: null, url: null, opened: !g.signing.noTerminal }); }
+  if (step === 'login') Object.assign(g, { installed: true, login: 'octocat', git: false });
+  if (step === 'done') Object.assign(g, { installed: true, login: 'octocat', git: true, signing: null, said: null });
   if (step === 'refused') Object.assign(g, { signing: null, said: GH_REFUSED });
   for (const a of f.agents) {
     const next = a.signing && a.signing.steps.length ? a.signing.steps.shift() : null;
@@ -985,20 +1012,27 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     }
     if (p === '/api/connect/github/signin') {
       // GitHub's own command-line tool: got first when it is missing, then its sign-in, by steps (advanceSignIns). One at
-      // a time: a second press answers with the one under way.
+      // a time: a second press answers with the one under way. Signed in already but git not using it: Workbench only
+      // makes git use it (setup-git), and answers when that is done.
       const tool = cw.gh;
-      if (cw.github || tool.login) return no(409, 'GitHub is already connected.');
+      if (cw.github || (tool.login && tool.git)) return no(409, 'GitHub is already connected.');
       if (tool.signing) return done('Workbench is already signing you in to GitHub.');
+      if (tool.login) {
+        tool.git = true;
+        return done(ghSignedWords(tool.login, true));
+      }
       const how = k.gh || 'ok';
-      const after = how === 'terminal' ? ['terminal', 'wait', 'done'] : how === 'wait' ? ['code'] : ['code', 'wait', 'wait', 'done'];
+      const after = how === 'terminal' ? ['terminal', 'wait', 'done'] : how === 'wait' ? ['code'] : ['code', 'wait', 'login', 'done'];
+      const noTerminal = k.terminal === false;
       tool.said = null;
       if (!tool.installed) {
-        tool.signing = { phase: 'installing', since: Date.now(), steps: how === 'refused' ? ['refused'] : after };
+        tool.signing = { phase: 'installing', since: Date.now(), noTerminal, steps: how === 'refused' ? ['refused'] : after };
         return done(GH_PHASE_WORDS.installing);
       }
       const first = after.shift();
-      tool.signing = first === 'terminal' ? { phase: 'terminal', since: Date.now(), steps: after } : { phase: 'code', code: GH_CODE, url: GH_DEVICE, since: Date.now(), steps: after };
-      return done(GH_PHASE_WORDS[tool.signing.phase]);
+      tool.signing = first === 'terminal' ? { phase: 'terminal', opened: !noTerminal, since: Date.now(), noTerminal, steps: after }
+        : { phase: 'code', code: GH_CODE, url: GH_DEVICE, since: Date.now(), noTerminal, steps: after };
+      return done(ghPhaseWords(tool.signing));
     }
     if (p === '/api/connect/github/signin/cancel') {
       if (!cw.gh.signing) return done('Workbench was not signing you in to GitHub.');
@@ -1006,9 +1040,14 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       return done('Stopped signing in to GitHub.');
     }
     if (p === '/api/connect/github/signout') {
+      // answered with `opened` (and `command`), as the route answers it
       if (!cw.gh.login) return no(409, 'GitHub is not signed in.');
-      cw.gh.login = null;
-      return done('Signed out of GitHub. GitHub still lists this sign-in under Settings → Applications until you revoke it there.');
+      if (k.signout === 'fail') {
+        return answer(200, { why: 'gh', opened: false, command: GH_SIGN_OUT_COMMAND, ok: false,
+          sentence: 'Workbench could not sign out of GitHub. Run this command in a terminal, then check again.', status: connectNow() });
+      }
+      Object.assign(cw.gh, { login: null, git: false });
+      return done('Signed out of GitHub. GitHub still lists this sign-in under Settings → Applications until you revoke it there.', { opened: false });
     }
     if (p === '/api/connect/github') {
       if (!text(b?.token)) return no(400, 'Paste the code GitHub made for you first.');

@@ -12,7 +12,7 @@ import { connectApi } from './api.js';
 import * as presetModule from '/shared/keypresets.mjs';
 import { panelParts, customRow, addForm, statusOf, metaFromStatus, agentsOf, agentStamp, keysOf, signInNotes, agentKeyRequest,
   gitRequest, githubRequest, githubShareRequest, githubBoxOn, newKeyRequest, keptNames, MAX_NAMES, githubOf, githubState, gitOf,
-  signingInWaits, signInEnded } from './connectview.js';
+  githubCanSignIn, githubCommand, signingInWaits, signInEnded } from './connectview.js';
 import { visibleControls } from './words.js';
 import { esc } from './util.js';
 
@@ -149,6 +149,9 @@ async function request(fn, { busyKey = null, quiet = false } = {}) {
     if (s && seq > st.shownSeq) {
       const before = st.status;
       st.shownSeq = seq; st.status = s; st.error = null;
+      // GitHub's command to run (Sign out's, where Terminal could not open) was for what GitHub was when it came: once
+      // GitHub signs in or out, it goes
+      if (githubState(githubOf(before)) !== githubState(githubOf(s))) st.open.ghCmd = '';
       // sign-ins that ended since the status before: how each ended is said (unless the answer says what it did, as a
       // cancel does). When an agent's ended at all, the agents are checked again, since a status gives the last check
       // of them: one that ended may not show its outcome yet.
@@ -384,12 +387,14 @@ async function act(b) {
     }
     case 'gh-signin': {
       // GitHub's own command-line tool signs in (Workbench gets it first when it is missing): the answer comes at once,
-      // and the status then says how far it is ("Getting GitHub’s command-line tool…", the code, or Terminal)
+      // and the status then says how far it is ("Getting GitHub’s command-line tool…", the code, or Terminal, with the
+      // command to run where Terminal could not open). When gh is signed in already but git does not use it, Workbench
+      // only makes git use it, and the answer comes when that is done.
       const g = githubOf(s);
-      if (!s || githubState(g) !== b.dataset.state || g.connected || g.signingIn) { changed(); return; }
+      if (!s || githubState(g) !== b.dataset.state || !githubCanSignIn(g)) { changed(); return; }
       const r = await request(() => connectApi.githubSignIn(), { busyKey: 'gh-signin' });
       if (r && typeof r.command === 'string' && r.command.trim()) { st.open.ghCmd = r.command.trim(); paint(); }
-      if (okAnswer(r)) focusKey('gh-open');
+      if (okAnswer(r) && !focusKey('gh-open')) focusKey('gh-signout');
       return;
     }
     case 'gh-cancel': {
@@ -408,7 +413,11 @@ async function act(b) {
       const g = githubOf(s);
       if (!g.connected || g.via !== 'gh' || githubState(g) !== b.dataset.state) { changed(); return; }
       const r = await request(() => connectApi.githubSignOut(), { busyKey: 'gh-signout' });
-      if (okAnswer(r)) focusKey('gh-signin');
+      // gh could not sign out by itself and Terminal could not open: the answer carries the command to run
+      if (r && typeof r.command === 'string' && r.command.trim()) { st.open.ghCmd = r.command.trim(); paint(); }
+      // signed out: the keyboard goes to Sign in to GitHub; not while Terminal still signs gh out (its Sign in to GitHub
+      // would make git use gh again)
+      if (okAnswer(r) && !githubOf(st.status).connected) focusKey('gh-signin');
       return;
     }
     case 'gh-token-toggle': {
@@ -418,7 +427,13 @@ async function act(b) {
       if (st.open.ghToken) focusKey('gh-token');
       return;
     }
-    case 'gh-cmd-copy': copyText(st.open.ghCmd, partOf('gh-cmd')?.querySelector('code'), 'Copied. Paste it in a terminal.', 'The command is selected. Copy it, then paste it in a terminal.'); return;
+    case 'gh-cmd-copy': {
+      // the command the panel shows: the sign-in's (from the status), or Sign out's
+      const cmd = githubCommand(githubOf(s), st.open);
+      if (!cmd) { changed(); return; }
+      copyText(cmd, partOf('gh-cmd')?.querySelector('code'), 'Copied. Paste it in a terminal.', 'The command is selected. Copy it, then paste it in a terminal.');
+      return;
+    }
     case 'gh-connect': {
       const part = partOf('gh-token');
       const input = part?.querySelector('[data-field="gh-token"]');
