@@ -432,11 +432,13 @@ export function wireConnect(connect, engine, log) {
  * (firstCheck), before anything else is made.
  * @param {object} mods     the modules loadModules gave (the workspace and the adapters), or {} for the GitHub helpers:
  *   Connect then uses its own workspace module, and has no agents to check
- * @param {{ repoRoot?: string|null }} [o] repoRoot: the repository Workbench works on (live mode), whose keys count
- *   for the agents' sign-ins from the first check on
+ * @param {{ repoRoot?: string|null, loadKeys?: boolean }} [o] repoRoot: the repository Workbench works on (live mode),
+ *   whose keys count for the agents' sign-ins from the first check on. loadKeys: false for the helpers that need no
+ *   key's value (--github-signin, and --github-status, which the Mac app may run every few seconds): the keys are then
+ *   not read from the keychain at the start
  * @returns {Promise<{ keys: object|null, connect: object|null }>}
  */
-async function openConnect(mods, args, log, { repoRoot = null } = {}) {
+async function openConnect(mods, args, log, { repoRoot = null, loadKeys = true } = {}) {
   const [keysMod, connectMod] = await Promise.all([loadOptional('src/core/keys.mjs', log), loadOptional('src/core/connect.mjs', log)]);
   if (typeof keysMod?.KeyStore !== 'function' || typeof connectMod?.Connect !== 'function') return { keys: null, connect: null };
   const home = os.homedir();
@@ -447,10 +449,12 @@ async function openConnect(mods, args, log, { repoRoot = null } = {}) {
     log.warn('Workbench could not open the keys you saved:', err);
     return { keys: null, connect: null };
   }
-  try {
-    await keys.load();
-  } catch (err) {
-    log.warn('Workbench could not read the keys you saved, so agents start without them:', err);
+  if (loadKeys) {
+    try {
+      await keys.load();
+    } catch (err) {
+      log.warn('Workbench could not read the keys you saved, so agents start without them:', err);
+    }
   }
   let connect;
   try {
@@ -803,7 +807,7 @@ async function main() {
   if (args.connectGithub || args.githubRepos || args.githubSignin || args.githubStatus) {
     let connect = null;
     try {
-      ({ connect } = await openConnect({}, args, log));
+      ({ connect } = await openConnect({}, args, log, { loadKeys: !(args.githubSignin || args.githubStatus) }));
     } catch (err) {
       log.warn('Workbench could not open Agents & keys:', err);
     }

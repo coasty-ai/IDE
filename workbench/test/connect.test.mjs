@@ -1074,6 +1074,22 @@ test('GitHub through gh: the status reads gh’s own sign-in, with no network ca
   assert.deepEqual(github.calls.map((x) => x.url), ['https://api.github.com/user']);
 });
 
+test('the GitHub status alone asks the key store only when settings.json names a token connection', async (t) => {
+  ghStandIn(t);
+  const keys = new FakeKeys();
+  let listed = 0;
+  const list = keys.list.bind(keys);
+  keys.list = async () => { listed += 1; return list(); };
+  const { c } = makeConnect(t, { keys });
+  assert.equal((await c.githubStatus()).connected, false);
+  assert.equal(listed, 0, 'no token connection: no key is read (the Mac app may ask every few seconds)');
+  await c.connectGithub(GH_TOKEN);
+  listed = 0;
+  const g = await c.githubStatus();
+  assert.deepEqual([g.connected, g.via, g.login], [true, 'token', 'octo-cat']);
+  assert.equal(listed, 1);
+});
+
 test('Sign in to GitHub with gh here: the answer comes at once, the one-time code shows, and once gh is done git uses it', async (t) => {
   const s = ghStandIn(t, { FAKE_GH_LOGIN_DELAY_MS: '400', GH_TOKEN: 'person-token-not-for-gh' });
   const { c, terminals, steps } = makeConnect(t, { ghOptions: FAST });

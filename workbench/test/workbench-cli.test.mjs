@@ -1307,6 +1307,29 @@ test('the GitHub helpers run as programs with the gh stand-in: status, sign-in (
   assert.ok(await until(() => { try { process.kill(login.pid, 0); return false; } catch { return true; } }), 'gh’s login was stopped');
 });
 
+test('--github-status and --github-signin read no key’s value, unless settings.json names a token connection (then its key is looked up)', async (t) => {
+  const w = setup(t);
+  // A key kept in a private file that has gone since: reading it says so in the log. Never the keychain.
+  const id = 'k0123456789ab';
+  mkdirSync(path.join(w.home, '.workbench'), { mode: 0o700 });
+  writeFileSync(path.join(w.home, '.workbench', 'keys.json'), JSON.stringify({ version: 1, keys: [{
+    id, preset: 'github', label: 'GitHub', vars: [{ name: 'GH_TOKEN', secret: true }, { name: 'GITHUB_TOKEN', secret: true }],
+    scope: { kind: 'all' }, agents: [], kept: 'file', created: 1,
+  }] }), { mode: 0o600 });
+  const read = /could not read/;
+  const repos = await runWithInput(['--github-repos'], w.env, '');
+  assert.match(repos.stderr, read, '--github-repos reads the keys (the token may list the repositories)');
+  const status = await runWithInput(['--github-status'], w.env, '');
+  assert.equal(status.stdout, `${GH_LINE}${JSON.stringify({ signedIn: false, login: null, via: null })}\n`);
+  assert.doesNotMatch(status.stderr, read);
+  const signin = await runWithInput(['--github-signin'], w.env, '');
+  assert.equal(signin.code, 1);
+  assert.doesNotMatch(signin.stderr, read);
+  writeFileSync(path.join(w.home, '.workbench', 'settings.json'), JSON.stringify({ github: { login: 'octo-cat', keyId: id } }), { mode: 0o600 });
+  const token = await runWithInput(['--github-status'], w.env, '');
+  assert.equal(token.stdout, `${GH_LINE}${JSON.stringify({ signedIn: true, login: 'octo-cat', via: 'token' })}\n`);
+});
+
 test('--github-signin with no gh where WORKBENCH_GH_BIN says: an error line, nothing downloaded, and no agent checked', async (t) => {
   const w = setup(t);
   const marks = path.join(w.dir, 'ran.txt');

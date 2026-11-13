@@ -913,12 +913,14 @@ export class Connect extends EventEmitter {
   // ---------------------------------------------------------------- GitHub through gh
 
   /**
-   * ConnectStatus's `github`, on its own (the Mac app's --github-status): no agent is probed, and nothing reaches the
-   * network. See _githubStatus.
+   * ConnectStatus's `github`, on its own (the Mac app's --github-status, which it may ask every few seconds): no agent
+   * is probed, nothing reaches the network, and the key store is asked (which reads the keys' values, from the keychain
+   * on a Mac) only when settings.json names a token connection. See _githubStatus.
    */
   async githubStatus() {
     this._settings = this._readSettings();
-    return this._githubStatus(this._github(await this._listKeys()));
+    const gh = this._settings && typeof this._settings.github === 'object' && this._settings.github ? this._settings.github : null;
+    return this._githubStatus(this._github(gh && gh.keyId ? await this._listKeys() : []));
   }
 
   /**
