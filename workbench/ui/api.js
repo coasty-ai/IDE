@@ -1,4 +1,4 @@
-// Talking to the engine: the access key, JSON requests, and the live event stream.
+// Talking to the engine: the access key, JSON requests (the connect panel's too), and the live event stream.
 // Nothing here touches the page when the module loads, so node:test can import it.
 import { plainError } from './link.js';
 
@@ -73,6 +73,53 @@ export const api = {
   /** Read-only, for the git screen: the commit graph, and one agent's diff. */
   git: () => call('GET', '/api/git'),
   changes: (agentId) => call('GET', `/api/agents/${encodeURIComponent(agentId)}/changes`),
+};
+
+/**
+ * The connect panel's requests ("Agents & keys"). Each answers { ok, sentence, status }: a refusal (ok: false) comes back
+ * as it is, so the panel says its sentence and draws its status. A failure is an Error in plain words: Workbench's own
+ * sentence ({ error }) is kept even when it says "token", since a GitHub token is the person's word for it here; a 401
+ * still means this page's key no longer works. Keys and tokens travel only in a POST's body, never in an address, and
+ * nothing here keeps or logs them.
+ */
+async function connectCall(method, path, body) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': token || '' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new RequestError(null);
+  }
+  let data = {};
+  try { data = await res.json(); } catch { data = {}; }
+  if (res.status === 401) { onRefused?.(); throw new RequestError(401); }
+  if (!res.ok) {
+    const said = data && typeof data.error === 'string' ? data.error.trim() : data && typeof data.sentence === 'string' ? data.sentence.trim() : '';
+    const e = new Error(said && !/fetch/i.test(said) ? said
+      : res.status === 404 ? 'Agents & keys is not available in this Workbench.'
+        : res.status >= 500 ? 'Something went wrong in Workbench. Try again.' : `Workbench said no (${res.status}).`);
+    e.status = res.status;
+    throw e;
+  }
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+}
+
+const agentPath = (id, what) => `/api/connect/agents/${encodeURIComponent(id)}/${what}`;
+export const connectApi = {
+  status: () => connectCall('GET', '/api/connect'),
+  recheck: () => connectCall('POST', '/api/connect/recheck', {}),
+  install: id => connectCall('POST', agentPath(id, 'install'), {}),
+  signin: id => connectCall('POST', agentPath(id, 'signin'), {}),
+  key: (id, value) => connectCall('POST', agentPath(id, 'key'), { value }),
+  setDefault: id => connectCall('POST', agentPath(id, 'default'), {}),
+  git: (name, email) => connectCall('POST', '/api/connect/git', { name, email }),
+  github: (githubToken, agentsUseIt) => connectCall('POST', '/api/connect/github', { token: githubToken, agentsUseIt: agentsUseIt === true }),
+  githubDisconnect: () => connectCall('POST', '/api/connect/github/disconnect', {}),
+  addKey: ({ preset, label, values, scope, agents }) => connectCall('POST', '/api/connect/keys', { preset, label, values, scope, agents }),
+  removeKey: id => connectCall('POST', `/api/connect/keys/${encodeURIComponent(id)}/remove`, {}),
 };
 
 /**

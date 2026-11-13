@@ -24,6 +24,11 @@ import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEsca
 import { gitScreenWords } from './gitgraph.js';
 import { visibleText } from './diffview.js';
 import { clipToLines } from './layout.js';
+// Agents & keys: the connect panel (connect.js draws it; this file opens it, paints its light in the top band, and keeps
+// keys out of the board's input). The shared module is read as a whole: a name it lacks is never a broken page.
+import { setupConnect, openConnect, closeConnect, connectShown, connectNeeds } from './connect.js';
+import { connectMeta, bandView, keyRefusal } from './connectview.js';
+import * as secretShape from '/shared/secretshape.mjs';
 
 // The address is read once, before the key is taken out of it. Switches count only with the key (see address.js).
 const debug = debugSwitches(location.search);
@@ -35,7 +40,7 @@ const el = {
   heard: $('heard'), mic: $('mic'), to: $('to'), toText: $('toText'), toCancel: $('toCancel'), announce: $('announce'), said: $('said'),
   parts: $('parts'), machines: $('machines'), tray: $('tray'), card: $('card'), pop: $('pop'), trayList: $('trayList'), look: $('look'),
   brand: $('brand'), mode: $('mode'), repo: $('repo'), conn: $('conn'), spend: $('spend'), wires: $('wires'), board: $('board'),
-  dram: $('dram'), boardScreen: $('boardScreen'), gitScreen: $('gitScreen'), gitSay: $('gitSay'),
+  dram: $('dram'), boardScreen: $('boardScreen'), gitScreen: $('gitScreen'), gitSay: $('gitSay'), connectBtn: $('connectBtn'),
 };
 if (debug.still) el.body.classList.add('still');
 
@@ -128,6 +133,7 @@ const touch = () => { lastInputAt = performance.now(); };
 /** The person is in the middle of something in the core: hold what it shows (for up to 20 s without any input). */
 function engaged() {
   if (gitShown()) return true;   // D1: the lid keeps what it shows while the git screen is shown
+  if (connectShown()) return true;   // and while Agents & keys covers it
   if (performance.now() - lastInputAt > 20000 && !voice.listening && !el.say.value) return false;
   const ae = document.activeElement;
   return pointer.inCore || (ae && ae !== document.body && el.core.contains(ae) && ae !== el.say) || !!el.say.value || voice.listening || !!S.reply;
@@ -141,9 +147,19 @@ const keyOf = f => focusKey(f);
 let letGo = false;
 const moved = () => { letGo = true; };
 
+/**
+ * What needs the person, as model.js orders it; and when nothing does and no coding agent can start work yet
+ * (meta.connect.ready is false, outside the demo), the lid's "Connect a coding agent to start." in place of
+ * "Nothing needs you.". Without meta.connect the lid is as it always was.
+ */
+function focusNow() {
+  const f = currentFocus(), c = S.meta.connect;
+  return f.empty && c && c.ready === false && S.meta.mode !== 'demo' ? { ...f, connect: c } : f;
+}
+
 /** What the core shows now: what needs the person, unless they are busy with what is already showing. */
 function shownFocus() {
-  const want = currentFocus();
+  const want = focusNow();
   const own = letGo;
   letGo = false;
   if (!lidFocus || own || !engaged() || keyOf(want) === lidKey) return { f: want, also: false };
@@ -365,6 +381,7 @@ function renderNow(o = {}) {
   if (!el.trayList.hidden) renderTrayList();
   if (S.loaded && firstSnap) { firstSnap = false; applyDebug(); }
   gitRender();
+  if (connectShown()) connectNeeds(needsInfo());
 }
 const render = () => renderSoon();
 
@@ -415,6 +432,7 @@ function paintTop(P, linkS) {
     el.repo.title = repo.name + (repo.dirty ? `. Agents start from your last commit. ${repo.dirty} uncommitted change${repo.dirty === 1 ? ' is' : 's are'} not in their copies.` : '');
   }
   if (G) board.placeTop(G, el);
+  paintConnectBtn(P, live);
 }
 
 // ---------------------------------------------------------------- the card
@@ -491,6 +509,8 @@ async function actOn(b) {
   }
   if (act === 'unpick') { S.focusId = null; S.pinId = null; moved(); render(); return; }
   if (act === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
+  // "Connect a coding agent to start.": Connect opens Agents & keys, and sends nothing
+  if (act === 'connect') { showConnect(b); return; }
   if (act === 'confirm') {
     const id = b.dataset.confirm;
     const c = S.confirm;
@@ -506,6 +526,8 @@ async function actOn(b) {
       say(r.reply || '');
       after(r);
       moved();
+      // a start with no agent ready: "No coding agent is ready yet. Connect one in Agents & keys."
+      if (r && r.openConnect === true) showConnect(null, r.reply);
     } catch (err) {
       if (err.refused && (c.kind === 'merge' || c.kind === 'discard')) {
         // the engine took the card and said no (a merge git refused: the reason stays on the agent until it clears)
@@ -545,6 +567,8 @@ async function actOn(b) {
       const r = await api.say(a.id, b.dataset.text);
       say(r.reply || `Sent to ${a.name}.`);
       if (S.focusId === a.id) S.focusId = null;
+      // "Continue" or "Try again" with no agent ready to run it
+      if (r.openConnect === true) showConnect(null, r.reply);
     } else if (act === 'forget') {
       // an agent from an earlier run: the engine asks first, with a card like a launch's
       busy(b);
@@ -658,6 +682,8 @@ function applyPref(kind, value, { quietly = false } = {}) {
 async function submit(text) {
   text = String(text || '').trim();
   if (!text) return;
+  // A key typed or pasted here is never sent, to the engine or to an agent: the input is emptied and Agents & keys opens
+  if (refuseKey(text, true)) return;
   const b = bound || bindingNow();
   bound = null;
   el.say.value = '';
@@ -691,6 +717,7 @@ async function submit(text) {
       answeredOnce();
       say(res.reply || 'Sent.');
       if (S.focusId === r.agentId) S.focusId = null;
+      if (res.openConnect === true) showConnect(null, res.reply);
     } else {
       const shown = S.confirm && b.confirmId === S.confirm.id ? S.confirm : null;
       const res = await api.command(text, { focusId: shown ? null : (b.agentId || null), confirmId: shown ? shown.id : (b.confirmId || null), askId: shown ? null : (b.askId || null) });
@@ -707,6 +734,8 @@ async function submit(text) {
       // "what did search cleanup change": the git screen opens on that agent's branch and its diff
       // also with a merge or throw-away card still shown: the person looks at the work first, then answers the card
       if (typeof res.review === 'string' && ID_RE.test(res.review) && (!res.confirm || (shown && res.confirm.id === shown.id))) openGitOn(res.review, null);
+      // "connect", "add a key", "sign in", or work asked for with no agent ready: Agents & keys opens
+      if (res.openConnect === true) showConnect(null, res.reply);
     }
   } catch (err) { say(err.message); }
   render();
@@ -764,6 +793,9 @@ const isTextField = e => !!e && e.matches('input:not([type="radio"]):not([type="
 const isControl = e => !!e && e !== document.body && e.matches('button, a[href], input, select, textarea, [role="switch"], [tabindex="0"]');
 document.addEventListener('keydown', e => {
   touch();
+  // While Agents & keys is open the board takes no keys at all: no typing into the board's input (a key typed with a
+  // button focused must not land there), no talking, no arrows. Esc closes the panel and does nothing else.
+  if (connectShown()) { if (e.key === 'Escape') { e.preventDefault(); closeConnect(); } return; }
   if (e.key === 'Escape') { escape(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const ae = document.activeElement;
@@ -799,6 +831,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 function escape() {
+  if (connectShown()) { closeConnect(); return; }   // Agents & keys first: it covers everything else
   if (gitShown() && !voice.listening && gitEscape()) return;   // D1: the detail closes, then back to the board
   if (!el.look.hidden) { closeLook(true); return; }
   if (!el.pop.hidden) { closePop(); return; }
@@ -817,7 +850,7 @@ document.addEventListener('click', e => {
   if (!el.pop.hidden && !el.pop.contains(e.target) && !e.target.closest('.mach')) closePop();
   if (!el.trayList.hidden && !el.trayList.contains(e.target) && !el.tray.contains(e.target)) closeTray();
   if (!el.look.hidden && !el.look.contains(e.target) && !el.brand.contains(e.target)) closeLook(false);
-  if (S.pinId && !e.target.closest('#parts, #card, #core, .pop, .mach, #tray, #brand')) { S.pinId = null; render(); }
+  if (S.pinId && !e.target.closest('#parts, #card, #core, .pop, .mach, #tray, #brand, #connect, #connectBtn')) { S.pinId = null; render(); }
 });
 
 // ---------------------------------------------------------------- the look menu (the workbench mark)
@@ -958,7 +991,8 @@ function applyDebug() {
 }
 
 function onSnapshot(snap) {
-  S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd };
+  // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board
+  S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap) };
   const fresh = new Map((snap.agents || []).map(a => [a.id, a]));
   for (const id of [...S.agents.keys()]) if (!fresh.has(id)) S.agents.delete(id);
   upsert(snap.agents || []);
@@ -971,6 +1005,7 @@ function onSnapshot(snap) {
   for (const a of S.agents.values()) seenSteps.set(a.id, a.toolCalls || 0);
   if (!wasLoaded && snap.mode === 'live' && snap.repo && snap.repo.dirty) say(`Agents start from your last commit. ${snap.repo.dirty} uncommitted change${snap.repo.dirty === 1 ? ' is' : 's are'} not in their copies.`, 15000);
   render();
+  autoOpenConnect();
 }
 
 const seenSteps = new Map();
@@ -1022,8 +1057,92 @@ setInterval(() => {
   if (!el.card.hidden) renderCard(true);
   gitTick();   // the git screen's times, a word at a time
   // a held core lets go by itself once the person has been still for 20 s
-  if (S.loaded && lidKey && !lidKey.startsWith('link:') && keyOf(currentFocus()) !== lidKey && !engaged()) renderSoon();
+  if (S.loaded && lidKey && !lidKey.startsWith('link:') && keyOf(focusNow()) !== lidKey && !engaged()) renderSoon();
 }, 1000);
+
+// ---------------------------------------------------------------- Agents & keys: the panel, its light, and the key guard
+/**
+ * Text that looks like a key (the shared check, src/shared/secretshape.mjs) is never sent from the board's input or the
+ * git screen's: it is emptied, the board says why, and Agents & keys opens to take the key where it is kept safe. The
+ * text itself is not kept, said or logged. The engine checks again. True when it refused. `board` is true for the
+ * board's input (the git screen empties its own before its words arrive here).
+ */
+function refuseKey(text, board) {
+  const said = keyRefusal(text, secretShape.looksLikeSecret);
+  if (!said) return false;
+  if (board) { el.say.value = ''; el.bar.classList.remove('typed'); bound = null; }
+  say(said);
+  showConnect(null, said);
+  return true;
+}
+
+/**
+ * Open Agents & keys over whatever shows. The board's menus and card close, and voice stops: while it is open the
+ * board takes no keys and no talking. `said` is said in the panel too (the board's own line is behind it).
+ */
+function showConnect(opener = null, said = '') {
+  closePop(); closeTray(); closeLook(false);
+  if (S.pinId || S.hoverId) { S.pinId = null; S.hoverId = null; board.hideCard(); }
+  if (voice.listening) voice.cancel();
+  holding = false;
+  openConnect({ opener, said });
+  connectNeeds(needsInfo());
+}
+
+/** Once per page load, when no coding agent can start work: Agents & keys opens by itself. */
+let connectAutoOpened = false;
+function autoOpenConnect() {
+  const c = S.meta.connect;
+  if (connectAutoOpened || !c || c.ready !== false || S.meta.mode === 'demo' || linkNow() !== 'live' || connectShown()) return;
+  connectAutoOpened = true;
+  showConnect(null);
+}
+
+/** What needs the person, for the lit button at the top of the panel ("Checkout fix needs you"), or null. */
+function needsInfo() {
+  const q = needsQueue();
+  return q.length ? { id: q[0].id, name: q[0].name, more: q.length - 1 } : null;
+}
+
+/**
+ * The top band's "Agents & keys": a light (calm when an agent is ready for new work, lit when none is) and its words,
+ * ending just short of the fiducial right of the core (spend sits past it). Only with meta.connect, on a live link.
+ */
+function paintConnectBtn(P, live) {
+  const b = el.connectBtn;
+  const v = live && S.meta.mode !== 'demo' ? bandView(S.meta.connect) : null;
+  b.hidden = !v;
+  if (!v || !G) return;
+  b.style.fontSize = P.silkSub + 'px';
+  const right = G.fiducials[1][0] - 7 - 14, left = G.fiducials[0][0] + 7 + 14;
+  const draw = label => {
+    const html = `<span class="led ${v.light}" aria-hidden="true"></span><span class="lbl">${esc(label)}</span>`;
+    if (b.dataset.html !== html) { b.innerHTML = html; b.dataset.html = html; }
+  };
+  draw(v.label);
+  if (b.offsetWidth > right - left) draw(v.short);
+  b.classList.toggle('need', v.light === 'need');
+  if (b.getAttribute('aria-label') !== v.aria) b.setAttribute('aria-label', v.aria);
+  if (b.title !== v.said) b.title = v.said;
+  b.style.left = Math.round(Math.max(left, right - b.offsetWidth)) + 'px';
+  b.style.top = Math.round(G.brand.y - b.offsetHeight / 2) + 'px';
+}
+el.connectBtn.addEventListener('click', () => showConnect(el.connectBtn));
+
+setupConnect({
+  looksLikeSecret: t => secretShape.looksLikeSecret?.(t),
+  // every answer the panel gets carries a fresh status: the light and the lid follow it at once
+  onStatus: m => { if (m && S.meta.mode !== 'demo') { S.meta.connect = m; render(); } },
+  repoName: () => (S.meta.repo && S.meta.repo.name) || null,
+  canRepo: () => S.meta.mode === 'live' && !!S.meta.repo,
+  home: () => el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true }),
+  // "<Name> needs you" in the panel: that item in the lid, as picking its chip does (a card on screen is withdrawn)
+  toLid: id => {
+    if (id && S.agents.has(id)) { if (S.confirm) dropConfirm(); S.focusId = id; moved(); }
+    renderNow();
+    el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+  },
+});
 
 // ---------------------------------------------------------------- D1: the DRAM and the git screen (screen switching)
 /** The DRAM's name for screen readers (your branch, as the snapshot tells it), and whether it can open anything now. */
@@ -1053,6 +1172,8 @@ const gitAct = b => actOn(b);
 async function gitCommand(text, b = {}) {
   text = String(text || '').trim();
   if (!text) return;
+  // as on the board: a key is never sent (the git screen's input is already empty)
+  if (refuseKey(text, false)) return;
   touch();
   const words = gitScreenWords(text);
   if (words === 'back') { closeGit(); return; }
@@ -1080,6 +1201,8 @@ async function gitCommand(text, b = {}) {
     say(res.confirm && !same ? '' : (res.reply || ''));
     if (typeof res.review === 'string' && ID_RE.test(res.review) && (!res.confirm || same)) openGit({ agentId: res.review });
     moved();
+    // Agents & keys opens over the git screen too
+    if (res.openConnect === true) showConnect(null, res.reply);
   } catch (err) { say(err.message); }
   render();
 }

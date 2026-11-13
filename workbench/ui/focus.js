@@ -10,6 +10,7 @@ import { spentWords } from './numbers.js';
 import { visibleControls, clipMiddle, cutMiddle, whoAsks, headlineClass } from './words.js';
 import { esc } from './util.js';
 import { agoText } from './boardmodel.js';
+import { lidConnectWords } from './connectview.js';
 
 const mark = (shape, tone) => `<svg class="g k-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
 // "waiting 4 min": whole minutes only, so the lid does not tick every second while something waits ("asked just now" first)
@@ -87,7 +88,7 @@ const WORK_COUNT = { thrown: 'thrown away', problem: 'not merged', merged: 'merg
  */
 export function focusKey(f) {
   if (f.confirm) return 'confirm:' + f.confirm.id;
-  if (f.empty) return 'empty';
+  if (f.empty) return f.connect ? 'connect' : 'empty';
   const a = f.agent, wk = workKey(a);
   return `${a.id}|${a.state}|${a.ask ? a.ask.id : ''}${wk ? '|' + wk : ''}`;
 }
@@ -190,6 +191,15 @@ export function lidView(f, o = {}) {
     const sub = working ? `${working} agent${working === 1 ? ' is' : 's are'} working quietly.`
       : S.agents.size ? 'Say or type what you want.' : 'Say or type what you want an agent to do, for example “start an agent to fix the flaky checkout test”.';
     const asideBtn = aside.length ? quiet(`Look at ${clipShown(visibleControls(aside[0].name), 28)} now`, { act: 'pick', agent: aside[0].id }) : '';
+    if (f.connect) {
+      // No coding agent can start work yet (meta.connect.ready is false): the lid says so, with the way to connect one.
+      // Its Connect button opens Agents & keys (app.js); it acts on nothing, so the swap guard does not hold it.
+      const w = lidConnectWords(f.connect);
+      return {
+        key: 'connect', idle: false, count: w.count, say: `${w.sentence} ${w.sub}`, bind: {},
+        html: page(countLine('need', 'need', w.count), h1(w.sentence), { msg: fs.meta ? metaP(esc(w.sub)) : '', acts: big('Connect', { act: 'connect' }, true), after: asideBtn }),
+      };
+    }
     const count = aside.length ? `${aside.length} set aside` : 'All clear';
     return {
       key: 'empty', idle: true, count, say: `${count}. Nothing needs you.`, bind: {},
