@@ -614,6 +614,21 @@ class FakeConnect extends EventEmitter {
     return { ok: true, login: 'octocat', sentence: 'Connected to GitHub as octocat.' };
   }
   async disconnectGithub() { this.act('disconnectGithub'); return { ok: true }; }
+  // GitHub through gh: the answers a test sets (githubAnswers), else these.
+  async githubSignIn(...a) {
+    this.act('githubSignIn', ...a);
+    this.github = { ...this.github, signingIn: { phase: 'installing', code: null, url: null, since: 1763000000000, sentence: 'Getting GitHub’s command-line tool…' } };
+    return this.githubAnswers?.signin ?? { ok: true, sentence: 'Getting GitHub’s command-line tool…' };
+  }
+  async cancelGithubSignIn(...a) {
+    this.act('cancelGithubSignIn', ...a);
+    this.github = { ...this.github, signingIn: null };
+    return { ok: true, sentence: 'Stopped signing in to GitHub.' };
+  }
+  async githubSignOut(...a) {
+    this.act('githubSignOut', ...a);
+    return this.githubAnswers?.signout ?? { ok: true, sentence: 'Signed out of GitHub. GitHub still lists this sign-in under Settings → Applications until you revoke it there.' };
+  }
   async setGithubAgentsUseIt(on) {
     this.act('setGithubAgentsUseIt', on);
     if (this.githubAnswer) return this.githubAnswer;
@@ -878,6 +893,64 @@ test('Agents & keys: refusals come back in plain words; anything else is logged 
   assert.ok(!w.connect.calls.some(c => c[0] === 'setAgentKey' && c[2].length > 16 * 1024));
 });
 
+test('Agents & keys, GitHub through gh: Sign in answers at once with what is under way; Cancel and Sign out; the checks every route has', async (t) => {
+  const w = await connectServer(t);
+  const signin = await w.send('/api/connect/github/signin', {});
+  assert.equal(signin.status, 200);
+  assert.equal(signin.headers['cache-control'], 'no-store');
+  assert.deepEqual({ ok: signin.json.ok, sentence: signin.json.sentence, why: signin.json.why }, { ok: true, sentence: 'Getting GitHub’s command-line tool…', why: undefined });
+  assert.deepEqual(signin.json.status.github.signingIn, { phase: 'installing', code: null, url: null, since: 1763000000000, sentence: 'Getting GitHub’s command-line tool…' });
+  const cancel = await w.send('/api/connect/github/signin/cancel', {});
+  assert.deepEqual({ ok: cancel.json.ok, sentence: cancel.json.sentence, signingIn: cancel.json.status.github.signingIn }, { ok: true, sentence: 'Stopped signing in to GitHub.', signingIn: null });
+  const out = await w.send('/api/connect/github/signout', {});
+  assert.deepEqual({ ok: out.json.ok, opened: out.json.opened, command: out.json.command, sentence: out.json.sentence }, {
+    ok: true, opened: false, command: undefined, sentence: 'Signed out of GitHub. GitHub still lists this sign-in under Settings → Applications until you revoke it there.',
+  });
+  // Connect says no: ok false with its kind; a sign-out that needs the person's terminal carries the command.
+  w.connect.githubAnswers = {
+    signin: { ok: false, why: 'platform', sentence: 'GitHub does not publish its command-line tool for this kind of computer, so Workbench cannot get it. Use a token instead.' },
+    signout: { ok: false, why: 'gh', opened: false, command: '/home/ada/.local/bin/gh auth logout --hostname github.com', sentence: 'Workbench could not sign out of GitHub. Run this command in a terminal, then check again.' },
+  };
+  const refused = await w.send('/api/connect/github/signin', {});
+  assert.deepEqual({ status: refused.status, ok: refused.json.ok, why: refused.json.why, sentence: refused.json.sentence },
+    { status: 200, ok: false, why: 'platform', sentence: w.connect.githubAnswers.signin.sentence });
+  const manual = await w.send('/api/connect/github/signout', {});
+  assert.deepEqual({ ok: manual.json.ok, why: manual.json.why, opened: manual.json.opened, command: manual.json.command }, {
+    ok: false, why: 'gh', opened: false, command: '/home/ada/.local/bin/gh auth logout --hostname github.com',
+  });
+  w.connect.githubAnswers = { signout: { ok: true, opened: true, sentence: 'Terminal is open to sign you out of GitHub. When it is done, come back here.' } };
+  assert.equal((await w.send('/api/connect/github/signout', {})).json.opened, true);
+  assert.deepEqual(w.connect.calls.filter(c => c[0] !== 'status').map(c => c[0]),
+    ['githubSignIn', 'cancelGithubSignIn', 'githubSignOut', 'githubSignIn', 'githubSignOut', 'githubSignOut']);
+  // Nothing in the body is passed on: Connect is asked with nothing.
+  for (const c of w.connect.calls.filter(c => c[0] !== 'status')) assert.deepEqual(c.slice(1), [], c[0]);
+  // The same checks as every other route.
+  w.connect.calls.length = 0;
+  for (const p of ['/api/connect/github/signin', '/api/connect/github/signin/cancel', '/api/connect/github/signout']) {
+    assert.equal((await request({ at: w.at, method: 'POST', path: p, body: {}, headers: { 'Content-Type': 'application/json' } })).status, 401, p);
+    assert.equal((await w.send(p, {}, { Origin: 'http://evil.example' })).status, 403, p);
+    assert.equal((await w.send(p, '{}', { 'Content-Type': 'text/plain' })).status, 415, p);
+    assert.equal((await w.send(p, { x: 'y'.repeat(17 * 1024) })).status, 413, p);
+    const wrong = await w.get(p);
+    assert.deepEqual([wrong.status, wrong.headers.allow], [405, 'POST'], p);
+  }
+  for (const p of ['/api/connect/github/signin/now', '/api/connect/github/sign-in', '/api/connect/github/signout/cancel']) assert.equal((await w.send(p, {})).status, 404, p);
+  assert.deepEqual(w.connect.calls, []);
+});
+
+test('Agents & keys, GitHub through gh, in the demo: no connect service, so the routes say so plainly', async () => {
+  engine.mode = 'demo';
+  try {
+    for (const p of ['/api/connect/github/signin', '/api/connect/github/signin/cancel', '/api/connect/github/signout']) {
+      const res = await post(p, {});
+      assert.equal(res.status, 404, p);
+      assert.equal(res.json.error, 'The demo’s agents are simulated, so there is nothing to connect. Run Workbench on a repository to connect your own agents and keys.', p);
+    }
+  } finally {
+    delete engine.mode;
+  }
+});
+
 test('Agents & keys: who gets the GitHub token changes without the token; the refusals keep their kind, and the body is checked first', async (t) => {
   const w = await connectServer(t);
   const on = await w.send('/api/connect/github/agents', { agentsUseIt: true });
@@ -934,7 +1007,8 @@ test('Agents & keys with the real connect service and key store: a key for this 
   const ghToken = fakeKey('gh', 'p_');
   const gitCalls = [];
   const connect = new Connect({
-    home, platform: 'linux', env: { PATH: '/usr/bin:/bin', HOME: home }, keys, adapters: {}, probe: false,
+    // No gh: WORKBENCH_GH_BIN names none, so a real gh on this computer is never run.
+    home, platform: 'linux', env: { PATH: '/usr/bin:/bin', HOME: home, WORKBENCH_GH_BIN: path.join(home, 'no-gh-here') }, keys, adapters: {}, probe: false,
     workspace: {
       async gitConfigIdentity() { return { name: '', email: '' }; },
       async approveGitCredential({ username }) { gitCalls.push(['approve', username]); return { helper: true }; },

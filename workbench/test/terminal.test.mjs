@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openTerminal, terminalScript, KEEP_MS } from '../src/core/terminal.mjs';
+import { openTerminal, terminalScript, KEEP_MS, openTerminalSteps, terminalStepsScript } from '../src/core/terminal.mjs';
 
 const MODULE = new URL('../src/core/terminal.mjs', import.meta.url);
 
@@ -133,4 +133,67 @@ test('its folders are removed when Workbench exits', (t) => {
   const said = JSON.parse(execFileSync(process.execPath, [child, scripts], { encoding: 'utf8' }));
   assert.deepEqual(said, { r: { opened: true }, during: 1 });
   assert.deepEqual(fs.readdirSync(scripts), []);
+});
+
+// ------------------------------------------------------------------ a few steps in a row (GitHub's sign-in: gh's login, then setup-git)
+
+test('a few steps in a row: each word quoted, each step only when the one before it ended well, then the closing line', async (t) => {
+  const tmp = scratch(t);
+  const { calls, open } = recorder();
+  const gh = '/Users/someone/.local/bin/gh';
+  const steps = [
+    { program: '/usr/bin/env', args: ['-u', 'GH_TOKEN', '-u', 'GITHUB_TOKEN', gh, 'auth', 'login', '--hostname', 'github.com'] },
+    { program: '/usr/bin/env', args: ['-u', 'GH_TOKEN', '-u', 'GITHUB_TOKEN', gh, 'auth', 'setup-git', '--hostname', 'github.com'] },
+  ];
+  assert.deepEqual(await openTerminalSteps({ title: 'Signing in to GitHub', steps }, { platform: 'darwin', tmpDir: tmp, open, keepMs: 60_000 }), { opened: true });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].slice(0, 2), ['-a', 'Terminal']);
+  const file = calls[0][2];
+  assert.equal(path.basename(file), 'Signing in to GitHub.command');
+  assert.equal(mode(path.dirname(file)), 0o700);
+  assert.equal(mode(file), 0o700);
+  assert.equal(fs.readFileSync(file, 'utf8'), [
+    '#!/bin/sh',
+    'clear',
+    "printf '%s\\n\\n' 'Signing in to GitHub'",
+    `'/usr/bin/env' '-u' 'GH_TOKEN' '-u' 'GITHUB_TOKEN' '${gh}' 'auth' 'login' '--hostname' 'github.com' &&`,
+    `'/usr/bin/env' '-u' 'GH_TOKEN' '-u' 'GITHUB_TOKEN' '${gh}' 'auth' 'setup-git' '--hostname' 'github.com'`,
+    "printf '\\n%s\\n' 'You can close this window.'",
+    '',
+  ].join('\n'));
+  assert.equal(terminalStepsScript({ title: 'Signing in to GitHub', steps }), fs.readFileSync(file, 'utf8'));
+});
+
+test('run as Terminal runs it: the second step only after the first ended well, every word exactly as given', async (t) => {
+  const tmp = scratch(t);
+  const ran = path.join(tmp, 'ran.jsonl');
+  const step = path.join(tmp, 'step one.mjs');
+  fs.writeFileSync(step, "import fs from 'node:fs';\nfs.appendFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)) + '\\n');\nprocess.exit(process.argv[3] === 'fail' ? 1 : 0);\n");
+  const words = ["it's", '$HOME', '`date`', 'a && b', 'new\nline'];
+  const run = async (first) => {
+    fs.rmSync(ran, { force: true });
+    const { calls, open } = recorder();
+    await openTerminalSteps({ title: 'Two steps', steps: [
+      { program: process.execPath, args: [step, ran, first, ...words] },
+      { program: process.execPath, args: [step, ran, 'second'] },
+    ] }, { platform: 'darwin', tmpDir: tmp, open });
+    const printed = execFileSync('/bin/sh', [calls[0][2]], { encoding: 'utf8', env: { PATH: process.env.PATH, TERM: 'dumb' }, stdio: ['ignore', 'pipe', 'ignore'] });
+    assert.ok(printed.trimEnd().endsWith('You can close this window.'), 'the closing line comes either way');
+    return fs.readFileSync(ran, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  };
+  assert.deepEqual(await run('ok'), [['ok', ...words], ['second']]);
+  assert.deepEqual(await run('fail'), [['fail', ...words]], 'the second step does not run');
+});
+
+test('steps elsewhere than macOS: nothing written or opened; steps that cannot be passed on are refused first', async (t) => {
+  const tmp = scratch(t);
+  const { calls, open } = recorder();
+  const one = [{ program: '/usr/bin/gh', args: ['auth', 'login'] }];
+  assert.deepEqual(await openTerminalSteps({ title: 'Sign in', steps: one }, { platform: 'linux', tmpDir: tmp, open }), { opened: false });
+  const o = { platform: 'darwin', tmpDir: tmp, open };
+  for (const steps of [[], null, 'gh auth login', [{ program: '', args: [] }], [{ program: '/bin/echo', args: ['a\u0000b'] }], [{ program: '/bin/echo', args: 'x' }], Array(11).fill(one[0])]) {
+    await assert.rejects(openTerminalSteps({ title: 'x', steps }, o), { plain: true }, JSON.stringify(steps));
+  }
+  assert.equal(calls.length, 0);
+  assert.deepEqual(fs.readdirSync(tmp), []);
 });

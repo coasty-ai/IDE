@@ -4,7 +4,7 @@
 //   node bin/workbench.mjs --demo [--port 4317] [--no-open]
 //   node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
 //   node bin/workbench.mjs --clone <address> [--into <folder>] [the --repo options]
-//   node bin/workbench.mjs --connect-github | --github-repos      (for the Mac app)
+//   node bin/workbench.mjs --connect-github | --github-signin | --github-status | --github-repos      (for the Mac app)
 //
 // Wires the real modules together: store, engine, commands, policy, workspaces, receipt, machines, the key store and
 // Agents & keys (connect), the adapters and the local web server. Every agent process is stopped when Workbench exits.
@@ -41,6 +41,12 @@ const CLAUDE_FROM = { flag: ' (from --claude)', env: ' (from WORKBENCH_CLAUDE_BI
 const CLONE_PHASE = { counting: 'Counting what to copy', compressing: 'Packing it up', receiving: 'Copying', resolving: 'Unpacking', checkout: 'Writing the files' };
 /** The kinds of failed clone the Mac app tells apart (WORKBENCH_CLONE {"error"}). */
 const CLONE_ERRORS = new Set(['auth', 'ssh', 'network', 'exists', 'url', 'git']);
+/** The Mac app's helper modes, as parseArgs names them and as they are typed: each runs on its own. */
+const HELPER_FLAGS = [['connectGithub', '--connect-github'], ['githubSignin', '--github-signin'], ['githubStatus', '--github-status'], ['githubRepos', '--github-repos']];
+/** A GitHub login, and a one-time code as GitHub shapes them: nothing else reaches a WORKBENCH_GITHUB line. */
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const DEVICE_CODE = /^[A-Z0-9]{4}-[A-Z0-9]{4}$/;
+const DEVICE_URL = 'https://github.com/login/device';
 
 export const USAGE = `Workbench launches coding agents and shows what each one is doing, in plain language.
 
@@ -71,6 +77,9 @@ Options:
                       progress comes as WORKBENCH_CLONE {...} lines
   --connect-github    for the Mac app: read a GitHub token on standard input, connect it, and print
                       WORKBENCH_GITHUB {...}
+  --github-signin     for the Mac app: sign in to GitHub with GitHub's command-line tool (downloaded first when it is
+                      missing), printing WORKBENCH_GITHUB {"phase":...} lines until it is done
+  --github-status     for the Mac app: print whether GitHub is signed in, WORKBENCH_GITHUB {"signedIn",...}
   --github-repos      for the Mac app: print the connected GitHub account's repositories, WORKBENCH_GITHUB_REPOS [...]
   --event-log <file>  also write every event to this file, one JSON object per line
   --verbose           print more about what Workbench is doing
@@ -82,6 +91,7 @@ export function parseArgs(argv) {
   const out = {
     demo: false, repo: null, clone: null, into: null, connectGithub: false, githubRepos: false, budget: null, model: null, claude: null,
     port: DEFAULT_PORT, open: true, app: false, help: false, verbose: false, eventLog: null, error: null,
+    githubSignin: false, githubStatus: false,
   };
   for (let i = 0; i < argv.length && !out.error; i++) {
     const raw = argv[i];
@@ -121,6 +131,8 @@ export function parseArgs(argv) {
       }
       case '--connect-github': out.connectGithub = true; break;
       case '--github-repos': out.githubRepos = true; break;
+      case '--github-signin': out.githubSignin = true; break;
+      case '--github-status': out.githubStatus = true; break;
       case '--model': out.model = value(); break;
       case '--claude': {
         const v = value();
@@ -155,10 +167,12 @@ export function parseArgs(argv) {
     }
   }
   if (!out.error && !out.help) {
-    const helper = out.connectGithub || out.githubRepos;
-    if (out.connectGithub && out.githubRepos) out.error = 'Choose one: --connect-github or --github-repos.';
+    // The Mac app's helpers: each runs on its own.
+    const helpers = HELPER_FLAGS.filter(([key]) => out[key]).map(([, flag]) => flag);
+    const helper = helpers.length > 0;
+    if (helpers.length > 1) out.error = `Choose one: ${helpers.slice(0, -1).join(', ')} or ${helpers[helpers.length - 1]}.`;
     else if (helper && (out.demo || out.repo || out.clone)) {
-      out.error = `${out.connectGithub ? '--connect-github' : '--github-repos'} runs on its own, without --demo, --repo or --clone.`;
+      out.error = `${helpers[0]} runs on its own, without --demo, --repo or --clone.`;
     } else if (out.demo && out.repo) out.error = 'Choose one: --demo for simulated agents, or --repo for real ones.';
     else if (out.demo && out.clone) out.error = 'Choose one: --demo for simulated agents, or --clone to copy a repository and run real agents on it.';
     else if (out.repo && out.clone) out.error = 'Choose one: --repo for a repository on this computer, or --clone to copy one first.';
@@ -652,6 +666,86 @@ export async function githubReposMode({ connect, say: out = say, log }) {
   return 0;
 }
 
+/**
+ * --github-signin: sign in to GitHub with GitHub's command-line tool, through Agents & keys (connect.githubSignIn), and
+ * print each step as one `WORKBENCH_GITHUB {...}` line for the Mac app:
+ * - `{"phase":"installing"}` when gh is being downloaded first;
+ * - `{"phase":"code","code":"ABCD-1234","url":"https://github.com/login/device"}` once gh's login has a code, for the
+ *   person to enter at that address (only a code of that shape, and only that address);
+ * - `{"phase":"terminal"}` when Terminal was opened instead (`"opened":false` with `command` and `sentence` when it
+ *   could not be: elsewhere than macOS);
+ * - last, `{"phase":"done","login","sentence"}` (exit 0) or `{"phase":"error","sentence"}` (exit 1).
+ * It runs until the sign-in ends: gh's login exits, the code runs out (15 minutes), or, after Terminal, gh is signed in
+ * (read every few seconds) or 15 minutes pass. Ctrl-C, SIGTERM or SIGHUP stop it ("Stopped signing in to GitHub."),
+ * and gh's login with it. Standard input is not read.
+ * @returns {Promise<number>} the exit code
+ */
+export async function githubSigninMode({ connect, say: out = say, log, signals = process }) {
+  const tell = (o) => out(`WORKBENCH_GITHUB ${JSON.stringify(o)}`);
+  if (!connect || typeof connect.githubSignIn !== 'function') {
+    tell({ phase: 'error', sentence: 'Workbench could not sign in to GitHub. The details are in its log.' });
+    return 1;
+  }
+  let installing = false;
+  let shownCode = null;
+  let terminal = false;
+  const onProgress = (p) => {
+    if (!p || typeof p !== 'object') return;
+    if (p.phase === 'installing' && !installing) {
+      installing = true;
+      tell({ phase: 'installing' });
+    } else if (p.phase === 'code' && typeof p.code === 'string' && DEVICE_CODE.test(p.code) && p.code !== shownCode) {
+      shownCode = p.code;
+      tell({ phase: 'code', code: p.code, url: DEVICE_URL });
+    } else if (p.phase === 'terminal' && !terminal) {
+      terminal = true;
+      tell(p.opened === false
+        ? { phase: 'terminal', opened: false, command: typeof p.command === 'string' ? printable(p.command) : null, sentence: printable(p.sentence || '') }
+        : { phase: 'terminal' });
+    }
+  };
+  const stop = () => {
+    Promise.resolve().then(() => connect.cancelGithubSignIn?.()).catch((e) => log?.warn?.('Workbench could not stop signing in to GitHub:', e));
+  };
+  for (const sig of STOP_SIGNALS) signals.on?.(sig, stop);
+  try {
+    const r = await connect.githubSignIn({ onProgress, wait: true });
+    const login = typeof r?.login === 'string' && GITHUB_LOGIN.test(r.login) ? r.login : null;
+    if (r?.ok === true && login) {
+      tell({ phase: 'done', login, sentence: printable(r.sentence || `Signed in to GitHub as ${login}.`) });
+      return 0;
+    }
+    tell({ phase: 'error', sentence: printable(typeof r?.sentence === 'string' && r.sentence.trim() ? r.sentence.trim() : 'Workbench could not sign in to GitHub.') });
+    return 1;
+  } catch (e) {
+    log?.error?.('Signing in to GitHub failed:', e);
+    tell({ phase: 'error', sentence: 'Workbench could not sign in to GitHub. The details are in its log.' });
+    return 1;
+  } finally {
+    for (const sig of STOP_SIGNALS) signals.off?.(sig, stop);
+  }
+}
+
+/**
+ * --github-status: print `WORKBENCH_GITHUB {"signedIn","login","via"}` from Agents & keys (connect.githubStatus), with
+ * no agent checked and nothing sent over the network: via is "gh" (GitHub's command-line tool is signed in), "token"
+ * (the token connection) or null. Anything that fails is "not signed in" (logged).
+ * @returns {Promise<number>} always 0
+ */
+export async function githubStatusMode({ connect, say: out = say, log }) {
+  let g = null;
+  try {
+    g = connect && typeof connect.githubStatus === 'function' ? await connect.githubStatus() : null;
+  } catch (e) {
+    log?.warn?.('Workbench could not tell whether GitHub is signed in:', e);
+  }
+  const via = g && (g.via === 'gh' || g.via === 'token') ? g.via : null;
+  const signedIn = !!(g && g.connected === true && via);
+  const login = signedIn && typeof g.login === 'string' && GITHUB_LOGIN.test(g.login) ? g.login : null;
+  out(`WORKBENCH_GITHUB ${JSON.stringify({ signedIn, login, via: signedIn ? via : null })}`);
+  return 0;
+}
+
 function openBrowser(address) {
   const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? null : 'xdg-open';
   if (!cmd) {
@@ -702,10 +796,11 @@ async function main() {
   if (withLocalBin !== process.env.PATH) process.env.PATH = withLocalBin;
   const log = createLogger(args.verbose);
 
-  // The Mac app's helpers: connect GitHub with a token from standard input, or list its repositories. Then exit. They
-  // need only the key store and Agents & keys, which checks no agent for them: no other module has to load. Without
-  // them, --connect-github says it could not connect, and --github-repos lists nothing.
-  if (args.connectGithub || args.githubRepos) {
+  // The Mac app's helpers: connect GitHub with a token from standard input, sign in to GitHub with gh, say whether it
+  // is signed in, or list its repositories. Then exit. They need only the key store and Agents & keys, which checks no
+  // agent for them: no other module has to load. Without them, --connect-github and --github-signin say they could
+  // not, --github-status says not signed in, and --github-repos lists nothing.
+  if (args.connectGithub || args.githubRepos || args.githubSignin || args.githubStatus) {
     let connect = null;
     try {
       ({ connect } = await openConnect({}, args, log));
@@ -713,6 +808,8 @@ async function main() {
       log.warn('Workbench could not open Agents & keys:', err);
     }
     if (args.connectGithub) return connectGithubMode({ connect, readToken: () => readLine(process.stdin), log });
+    if (args.githubSignin) return githubSigninMode({ connect, log });
+    if (args.githubStatus) return githubStatusMode({ connect, log });
     return githubReposMode({ connect, log });
   }
 

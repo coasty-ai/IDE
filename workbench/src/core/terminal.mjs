@@ -1,7 +1,8 @@
 // A terminal window for the person, for the steps only they can do: a vendor's own sign-in (`claude auth login`,
-// `codex login`) or a vendor's installer. On macOS, Terminal opens running one program; the person answers it there,
-// and the window reports nothing back (the page checks again when it gets focus). Elsewhere nothing opens, and the
-// caller shows the command for the person to run.
+// `codex login`), a vendor's installer, or GitHub's sign-in through gh when it cannot be done without Terminal (two
+// steps: gh's login, then `gh auth setup-git`). On macOS, Terminal opens running one program, or a few in a row; the
+// person answers them there, and the window reports nothing back (the page checks again when it gets focus).
+// Elsewhere nothing opens, and the caller shows the command for the person to run.
 //
 // The program and its arguments go into a small script, every word quoted for the shell, so nothing in them is read as
 // shell syntax. The one shell line Workbench writes itself is an installer, fixed text in connect.mjs, run as
@@ -83,8 +84,44 @@ export function terminalScript({ title, program, args = [] } = {}) {
  *   for tests: the platform, the temporary folder, and the `open` to call
  * @returns {Promise<{ opened: boolean }>}
  */
-export async function openTerminal({ title, program, args = [] } = {}, { platform = process.platform, tmpDir = os.tmpdir(), open = openWithMacOS, keepMs = KEEP_MS } = {}) {
-  const script = terminalScript({ title, program, args });
+export async function openTerminal({ title, program, args = [] } = {}, opts = {}) {
+  return openScript(title, terminalScript({ title, program, args }), opts);
+}
+
+/**
+ * The script for a few steps in a row, each a program and its arguments, every word quoted as in terminalScript. A step
+ * runs only when the one before it ended well (they are joined with `&&`, Workbench's own fixed text); then the script
+ * says the window can be closed. GitHub's sign-in in Terminal is two steps: gh's login, then `gh auth setup-git`.
+ * @param {{ title: string, steps: { program: string, args?: string[] }[] }} what
+ */
+export function terminalStepsScript({ title, steps } = {}) {
+  if (!Array.isArray(steps) || !steps.length || steps.length > 10) {
+    throw Object.assign(new Error('Workbench was not told which programs to run.'), { plain: true });
+  }
+  for (const s of steps) checkProgram(s && s.program, (s && s.args) || []);
+  return [
+    '#!/bin/sh',
+    'clear',
+    `printf '%s\\n\\n' ${shellQuote(oneLine(title, 200) || 'Workbench')}`,
+    steps.map((s) => [s.program, ...(s.args || [])].map(shellQuote).join(' ')).join(' &&\n'),
+    `printf '\\n%s\\n' ${shellQuote('You can close this window.')}`,
+    '',
+  ].join('\n');
+}
+
+/**
+ * Open a terminal window running a few programs in a row (terminalStepsScript), as openTerminal runs one: the same
+ * private folder, file mode, `open -a Terminal`, clean-up, and `{ opened: false }` elsewhere than macOS.
+ * @param {{ title: string, steps: { program: string, args?: string[] }[] }} what
+ * @param {{ platform?: string, tmpDir?: string, open?: (argv: string[]) => Promise<void>, keepMs?: number }} [o]
+ * @returns {Promise<{ opened: boolean }>}
+ */
+export async function openTerminalSteps({ title, steps } = {}, opts = {}) {
+  return openScript(title, terminalStepsScript({ title, steps }), opts);
+}
+
+/** Write `script` as a private .command file and ask Terminal to open it (macOS); elsewhere `{ opened: false }`. */
+async function openScript(title, script, { platform = process.platform, tmpDir = os.tmpdir(), open = openWithMacOS, keepMs = KEEP_MS } = {}) {
   if (platform !== 'darwin') return { opened: false };
   const dir = fs.mkdtempSync(path.join(tmpDir, 'workbench-terminal-'));
   fs.chmodSync(dir, 0o700);
