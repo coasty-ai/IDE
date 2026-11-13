@@ -13,29 +13,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { scrubEnv, withNodeOnPath, onPath, shellQuote } from '../adapters/claude/args.mjs';
 import { buildEnv as codexEnv, codexBin } from '../adapters/codex/runner.mjs';
+import { KEY_PRESETS } from '../shared/keypresets.mjs';
+import { maskSecrets } from './keys.mjs';
 import * as workspaceModule from './workspace.mjs';
 import { openTerminal as openTerminalWindow } from './terminal.mjs';
-
-// The key store's own helpers (src/core/keys.mjs, src/shared/keypresets.mjs), used when they are there. Without them
-// (a checkout that does not have them yet), masking follows the same rule, written out below, and addKey treats every
-// value of an unknown preset as secret.
-const optional = (p) => p.catch((e) => {
-  if (e && e.code === 'ERR_MODULE_NOT_FOUND') return null;
-  throw e;
-});
-const keysModule = await optional(import('./keys.mjs'));
-const presetsModule = await optional(import('../shared/keypresets.mjs'));
-
-/** maskSecrets from keys.mjs: each value of 8+ characters becomes "•••• " and its last 4 (12+ characters) or "••••". */
-function maskSecretsHere(text, values) {
-  if (typeof text !== 'string' || !Array.isArray(values) || values.length === 0) return text;
-  const list = [...new Set(values.filter((v) => typeof v === 'string' && v.length >= 8))].sort((a, b) => b.length - a.length);
-  let out = text;
-  for (const v of list) if (out.includes(v)) out = out.split(v).join(v.length >= 12 ? `•••• ${v.slice(-4)}` : '••••');
-  return out;
-}
-const maskSecrets = typeof keysModule?.maskSecrets === 'function' ? keysModule.maskSecrets : maskSecretsHere;
-const KEY_PRESETS = Array.isArray(presetsModule?.KEY_PRESETS) ? presetsModule.KEY_PRESETS : [];
 
 /** How long one sign-in check may take. */
 const PROBE_TIMEOUT_MS = 10_000;
@@ -82,6 +63,20 @@ const AGENT_BY_ID = new Map(AGENTS.map((a) => [a.id, a]));
 /** A refusal the routes answer with a 4xx: a plain sentence, `.why`, and the HTTP status that fits. */
 function refusal(why, sentence, status = 400) {
   return Object.assign(new Error(sentence), { plain: true, why, sentence, status });
+}
+
+/**
+ * The HTTP status of a key store refusal, by its `.why`: what was asked for cannot be kept (400), or the place keys are
+ * kept failed (500). The key store's errors carry `.plain`, `.why` and a plain message, but no status.
+ */
+const KEY_STORE_STATUS = Object.freeze({ name: 400, value: 400, forbidden: 400, 'too-many': 400, store: 500 });
+
+/** `e` with the status its `.why` calls for, when it is a key store refusal without a status of its own. */
+function withStoreStatus(e) {
+  if (e && typeof e === 'object' && typeof e.why === 'string' && e.status === undefined && Object.hasOwn(KEY_STORE_STATUS, e.why)) {
+    e.status = KEY_STORE_STATUS[e.why];
+  }
+  return e;
 }
 
 function isFile(p) {
@@ -280,7 +275,8 @@ export class Connect extends EventEmitter {
    * @param {string} [o.home]        the home folder (settings.json lives in <home>/.workbench)
    * @param {string} [o.platform]    process.platform; only 'darwin' opens Terminal
    * @param {object} [o.env]         the environment agents are made from (process.env)
-   * @param {object} o.keys          the KeyStore (src/core/keys.mjs), loaded
+   * @param {object} o.keys          the KeyStore (src/core/keys.mjs), loaded: list, add, remove, envFor, values and
+   *   valuesOf (the GitHub connection's token is read back with it)
    * @param {object} [o.workspace]   src/core/workspace.mjs, or a stand-in
    * @param {object} [o.adapters]    { claude, codex }: the adapter modules, as the CLI loads them
    * @param {object} [o.flags]       { claude: the --claude path or null }
@@ -316,7 +312,6 @@ export class Connect extends EventEmitter {
     this._repoRoot = null;
     this._current = null; // the probe under way
     this._next = null; // one more probe, queued behind it
-    this._githubToken = null; // the token, once read in this run (never logged, never returned)
     this._settings = this._readSettings();
     // An 'agents' listener added after a probe ended hears the last map at once (once), so the engine never misses the
     // first probe, however late it is wired.
@@ -598,7 +593,7 @@ export class Connect extends EventEmitter {
     const before = await this._listKeys();
     const old = before.filter((k) => k.preset === preset && k.scope && k.scope.kind === 'all'
       && Array.isArray(k.agents) && k.agents.length === 1 && k.agents[0] === d.id);
-    await this.keys.add({ preset, label, values: Object.fromEntries(names.map((n) => [n, v])), secretNames: [...names], scope: { kind: 'all' }, agents: [d.id] });
+    await this._storeAdd({ preset, label, values: Object.fromEntries(names.map((n) => [n, v])), secretNames: [...names], scope: { kind: 'all' }, agents: [d.id] });
     for (const k of old) await this._removeQuietly(k.id);
     await this.recheck();
     return { ok: true, sentence: d.key.saved };
@@ -683,11 +678,10 @@ export class Connect extends EventEmitter {
     }
     const keys = await this._listKeys();
     const previous = this._github(keys);
-    const { id } = await this.keys.add({
+    const { id } = await this._storeAdd({
       preset: 'github', label: 'GitHub', values: { GH_TOKEN: t, GITHUB_TOKEN: t }, secretNames: ['GH_TOKEN', 'GITHUB_TOKEN'],
       scope: { kind: 'all' }, agents: agentsUseIt === true ? 'all' : [],
     });
-    this._githubToken = t;
     this._updateSettings((s) => ({ ...s, github: { login, keyId: id } }));
     if (previous.keyId && previous.keyId !== id) await this._removeQuietly(previous.keyId);
     if (previous.login && previous.login !== login) await this._forgetGitSignIn(previous.login);
@@ -715,22 +709,21 @@ export class Connect extends EventEmitter {
       const { github: _gone, ...rest } = s;
       return rest;
     });
-    this._githubToken = null;
     this.emit('changed');
     return { ok: true, sentence: 'GitHub is disconnected. The token itself still works until you delete it on GitHub.' };
   }
 
   /**
-   * The person's repositories on GitHub, most recently pushed first (GET /user/repos?per_page=100&sort=pushed): the
-   * token from this run, or the one git keeps for the login GitHub gave (`git credential fill`), since the key store
-   * gives a token for "git only" to no one. No connection, no token or any failure: [].
+   * The person's repositories on GitHub, most recently pushed first (GET /user/repos?per_page=100&sort=pushed), asked
+   * for with the token the key store keeps for the GitHub connection (also a token for git only, which no agent gets).
+   * No connection, no token or any failure: [].
    * @returns {Promise<{ fullName: string, cloneUrl: string, private: boolean, pushedAt: string|null }[]>}
    */
   async githubRepos() {
     this._settings = this._readSettings();
     const github = this._github(await this._listKeys());
     if (!github.connected) return [];
-    const token = await this._storedGithubToken(github);
+    const token = this._storedGithubToken(github);
     if (!token) {
       this._log('info', 'there is no GitHub token to list repositories with.');
       return [];
@@ -751,8 +744,8 @@ export class Connect extends EventEmitter {
 
   /**
    * "Let agents use this token": give the GitHub connection's token to every agent, or to none (git only), without
-   * asking for it again. It is read back from this run or from git (as githubRepos does), and kept again with the other
-   * choice in place of the earlier key.
+   * asking for it again. It is read back from the key store (as githubRepos does), and kept again with the other choice
+   * in place of the earlier key.
    * @returns {Promise<{ ok: boolean, why?: string, sentence: string }>}
    */
   async setGithubAgentsUseIt(on) {
@@ -762,11 +755,11 @@ export class Connect extends EventEmitter {
     if (!github.connected) throw refusal('github', 'GitHub is not connected.', 409);
     const sentence = want ? 'Agents can use your GitHub token now, as GH_TOKEN.' : 'Agents no longer get your GitHub token. Git still uses it.';
     if (github.agentsUseIt === want) return { ok: true, sentence };
-    const token = await this._storedGithubToken(github);
+    const token = this._storedGithubToken(github);
     if (!token) {
-      return { ok: false, why: 'token', sentence: 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.' };
+      return { ok: false, why: 'token', sentence: 'Workbench could not read the GitHub token it keeps, so this cannot change. Disconnect GitHub, then connect it again.' };
     }
-    const { id } = await this.keys.add({
+    const { id } = await this._storeAdd({
       preset: 'github', label: 'GitHub', values: { GH_TOKEN: token, GITHUB_TOKEN: token }, secretNames: ['GH_TOKEN', 'GITHUB_TOKEN'],
       scope: { kind: 'all' }, agents: want ? 'all' : [],
     });
@@ -776,14 +769,21 @@ export class Connect extends EventEmitter {
     return { ok: true, sentence };
   }
 
-  /** The GitHub connection's token: from this run, else the one git keeps for its login (`git credential fill`), or null. */
-  async _storedGithubToken(github) {
-    if (this._githubToken) return this._githubToken;
-    if (!github.login || typeof this.workspace.fillGitCredential !== 'function') return null;
-    const kept = await Promise.resolve(this.workspace.fillGitCredential({ host: 'github.com', username: github.login })).catch(() => null);
-    const token = kept && typeof kept.password === 'string' && kept.password ? kept.password : null;
-    if (token) this._githubToken = token;
-    return token;
+  /**
+   * The GitHub connection's token, as the key store holds it in memory (`keys.valuesOf`): GH_TOKEN, else GITHUB_TOKEN.
+   * Null when the store could not read it (a locked keychain, a missing file) or has no such key.
+   */
+  _storedGithubToken(github) {
+    if (!github.keyId || typeof this.keys.valuesOf !== 'function') return null;
+    let values = null;
+    try {
+      values = this.keys.valuesOf(github.keyId);
+    } catch (e) {
+      this._log('warn', `the GitHub token could not be read back: ${e && e.message}`);
+      return null;
+    }
+    const token = values && typeof values === 'object' ? values.GH_TOKEN || values.GITHUB_TOKEN : null;
+    return typeof token === 'string' && token ? token : null;
   }
 
   async _forgetGitSignIn(login) {
@@ -797,27 +797,32 @@ export class Connect extends EventEmitter {
   // ---------------------------------------------------------------- keys
 
   /**
-   * Add a key (Add a key in the panel): passed to the key store. `scope` is 'all', 'repo' (this repository: `repoRoot`,
-   * else the one status() was last asked about) or the store's own `{ kind, root }`. Values left empty are dropped.
-   * When `secretNames` is not given it comes from the preset (fields marked not secret, such as AWS_REGION, are shown);
-   * a field's `also` names get the same value. Unknown presets and custom keys: every value is secret. Then agents are
-   * probed again, since a key can change how an agent signs in.
+   * Add a key (Add a key in the panel): passed to the key store. `preset` is one of KEY_PRESETS (src/shared/
+   * keypresets.mjs; none given: 'custom'); any other is refused, as the store refuses it. `scope` is 'all', 'repo'
+   * (this repository: `repoRoot`, else the one status() was last asked about) or the store's own `{ kind, root }`.
+   * Values left empty are dropped. When `secretNames` is not given it comes from the preset (fields marked not secret,
+   * such as AWS_REGION, are shown); a field's `also` names get the same value, and names the preset does not list (a
+   * custom key's, which has no fields) are secret. Then agents are probed again, since a key can change how an agent
+   * signs in.
    * @returns {Promise<{ id: string }>}
    */
   async addKey({ preset, label, values, secretNames, scope, agents, repoRoot } = {}) {
+    this._noteRepo(repoRoot);
+    const presetId = preset == null ? 'custom' : preset;
+    const p = typeof presetId === 'string' ? this.presets.find((x) => x && x.id === presetId) : null;
+    if (!p) throw refusal('name', 'Workbench does not know that kind of key.', 400);
     if (!values || typeof values !== 'object' || Array.isArray(values)) throw refusal('value', 'There is nothing to save.', 400);
-    const p = typeof preset === 'string' ? this.presets.find((x) => x && x.id === preset) : null;
     const vals = {};
     for (const [k, v] of Object.entries(values)) {
       if (typeof v !== 'string') throw refusal('value', `The value for ${oneLine(k, 128)} is not text.`, 400);
       if (v.trim() !== '') vals[k] = v;
     }
     const secret = new Set(Array.isArray(secretNames) ? secretNames : []);
-    const fields = p && Array.isArray(p.fields) ? p.fields : [];
+    const fields = Array.isArray(p.fields) ? p.fields : [];
     for (const f of fields) {
       if (!f || typeof f.name !== 'string') continue;
       if (!(f.name in vals)) {
-        if (!f.optional && preset !== 'custom') throw refusal('value', `${f.name} is needed.`, 400);
+        if (!f.optional) throw refusal('value', `${f.name} is needed.`, 400);
         continue;
       }
       if (!Array.isArray(secretNames) && f.secret !== false) secret.add(f.name);
@@ -828,13 +833,14 @@ export class Connect extends EventEmitter {
       }
     }
     if (!Array.isArray(secretNames)) {
-      const known = new Set(fields.flatMap((f) => [f && f.name, ...(f && Array.isArray(f.also) ? f.also : [])]));
-      for (const name of Object.keys(vals)) if (!known.has(name)) secret.add(name); // custom keys, unknown presets
+      // The key store is always told which names are secret, so a name the preset does not list is secret here.
+      const listed = new Set(fields.flatMap((f) => [f && f.name, ...(f && Array.isArray(f.also) ? f.also : [])]));
+      for (const name of Object.keys(vals)) if (!listed.has(name)) secret.add(name);
     }
     if (!Object.keys(vals).length) throw refusal('value', 'There is nothing to save.', 400);
-    const result = await this.keys.add({
-      preset: typeof preset === 'string' ? preset : 'custom',
-      label: typeof label === 'string' && label.trim() ? label.trim() : (p && p.label) || 'Key',
+    const result = await this._storeAdd({
+      preset: p.id,
+      label: typeof label === 'string' && label.trim() ? label.trim() : p.label || 'Key',
       values: vals,
       secretNames: Object.keys(vals).filter((n) => secret.has(n)),
       scope: this._scope(scope, repoRoot),
@@ -851,9 +857,23 @@ export class Connect extends EventEmitter {
       await this.disconnectGithub();
       return { removed: true };
     }
-    const result = await this.keys.remove(id);
+    let result;
+    try {
+      result = await this.keys.remove(id);
+    } catch (e) {
+      throw withStoreStatus(e);
+    }
     await this.recheck();
     return result;
+  }
+
+  /** KeyStore.add, with the status of a refusal set by its `.why` (withStoreStatus). */
+  async _storeAdd(spec) {
+    try {
+      return await this.keys.add(spec);
+    } catch (e) {
+      throw withStoreStatus(e);
+    }
   }
 
   _scope(scope, repoRoot) {

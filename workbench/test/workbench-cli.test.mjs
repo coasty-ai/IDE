@@ -5,7 +5,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync, accessSync, existsSync, constants } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync, accessSync, existsSync, readdirSync, constants } from 'node:fs';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -14,7 +15,7 @@ import * as workspace from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
 import { Engine } from '../src/core/engine.mjs';
 // Imported, the CLI only exports its parts: it starts only when run as a program.
-import { parseArgs, createLogger, displayUrl, cloneFirst, connectGithubMode, githubReposMode, readLine } from '../bin/workbench.mjs';
+import { parseArgs, createLogger, displayUrl, cloneFirst, connectGithubMode, githubReposMode, readLine, pathWithLocalBin } from '../bin/workbench.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const BIN = fileURLToPath(new URL('../bin/workbench.mjs', import.meta.url));
@@ -29,6 +30,8 @@ const NO_AGENT = 'No coding agent is ready yet. Open the page to connect one.';
 /** Agents & keys and cloning are there: the key store (U1), the connect service and cloneRepo (U2). */
 const CONNECT_READY = existsSync(fileURLToPath(new URL('../src/core/connect.mjs', import.meta.url))) && existsSync(fileURLToPath(new URL('../src/core/keys.mjs', import.meta.url)));
 const CLONE_READY = typeof workspace.cloneRepo === 'function';
+/** What Workbench says of an address it does not clone from: the Mac app's own words, so the two read alike. */
+const ADDRESS_REFUSED = 'Workbench clones addresses like https://github.com/owner/repo or git@github.com:owner/repo.git.';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function run(args, env) {
@@ -50,11 +53,42 @@ function realGit() {
 }
 
 /**
+ * A git for the clone tests: every call goes to the real git, except `clone`, which never reaches a network. With
+ * FAKE_GIT_CLONE=local it prints two progress lines, then copies the repository FAKE_GIT_CLONE_FROM names, whatever the
+ * address says. With half, it makes half a clone (a .git folder and a file), prints a progress line, writes its process
+ * id to FAKE_GIT_PIDFILE and waits; stubborn does the same, ignoring SIGTERM, so only SIGKILL ends it.
+ */
+function fakeGitScript(git) {
+  const sh = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  return [
+    '#!/bin/sh',
+    'case " $* " in',
+    '  *" clone "*)',
+    '    for last; do :; done',
+    '    case "$FAKE_GIT_CLONE" in',
+    '      local)',
+    "        printf 'Receiving objects:  50%% (1/2)\\rReceiving objects: 100%% (2/2), done.\\n' >&2",
+    `        exec ${sh(git)} clone -q -- "$FAKE_GIT_CLONE_FROM" "$last" ;;`,
+    '      half|stubborn)',
+    "        [ \"$FAKE_GIT_CLONE\" = stubborn ] && trap '' TERM",
+    '        mkdir -p "$last/.git"; echo half > "$last/half.txt"',
+    "        printf 'Receiving objects:  10%% (1/10)\\r' >&2",
+    '        echo $$ > "$FAKE_GIT_PIDFILE"',
+    '        exec sleep 30 ;;',
+    '    esac ;;',
+    'esac',
+    `exec ${sh(git)} "$@"`,
+    '',
+  ].join('\n');
+}
+
+/**
  * A throwaway repository with one commit of `files` on the branch main, a home folder with no git name or email, and
  * an environment for the CLI: no inherited agent id or program choices, the real Codex never reachable, and a PATH
- * that holds git only (no node: Workbench must put its own in front for the agents and checks that need it).
+ * that holds git only (no node: Workbench must put its own in front for the agents and checks that need it). With
+ * `fakeGit`, that git is fakeGitScript's.
  */
-function setup(t, { files = { 'README.md': '# test\n' } } = {}) {
+function setup(t, { files = { 'README.md': '# test\n' }, fakeGit = false } = {}) {
   const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'wb-cli-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const repo = path.join(dir, 'repo');
@@ -64,7 +98,8 @@ function setup(t, { files = { 'README.md': '# test\n' } } = {}) {
   mkdirSync(home);
   mkdirSync(bin);
   mkdirSync(path.join(dir, 'tmp'));
-  symlinkSync(realGit(), path.join(bin, 'git'));
+  if (fakeGit) writeFileSync(path.join(bin, 'git'), fakeGitScript(realGit()), { mode: 0o755 });
+  else symlinkSync(realGit(), path.join(bin, 'git'));
   for (const [name, text] of Object.entries(files)) writeFileSync(path.join(repo, name), text);
   const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.name=Workbench test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', ...a], { stdio: 'pipe' }).toString().trim();
   git('init', '-q', '-b', 'main');
@@ -96,6 +131,38 @@ async function start(t, args, env) {
   if (proc.exitCode == null) proc.kill('SIGINT');
   const code = await Promise.race([exited, sleep(15_000).then(() => 'still running')]);
   return { code, out, err, lines: out.split('\n') };
+}
+
+/** Wait until `ok()` is true, for `ms` at most. */
+async function until(ok, ms = 20_000) {
+  const deadline = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > deadline) return false;
+    await sleep(25);
+  }
+  return true;
+}
+
+/** The process id the stand-in git wrote to `file`, once it has (0 when it never did). */
+async function pidIn(file, ms = 20_000) {
+  let pid = 0;
+  await until(() => {
+    try { pid = Number(readFileSync(file, 'utf8').trim()); } catch { pid = 0; }
+    return pid > 0;
+  }, ms);
+  return pid;
+}
+
+/** Whether the process has gone (and been reaped), waiting up to `ms` for it. */
+async function goneSoon(pid, ms = 5000) {
+  return until(() => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (e) {
+      return e.code === 'ESRCH';
+    }
+  }, ms);
 }
 
 /** A VS Code extension folder whose claude program says it is `version`. */
@@ -431,6 +498,11 @@ test('the options for cloning and for the Mac app’s GitHub helpers: what they 
     parseArgs(['--clone', ' https://github.com/octo/hello.git ', '--into', '/tmp/code', '--app'])),
   { clone: 'https://github.com/octo/hello.git', into: '/tmp/code', connectGithub: false, githubRepos: false, error: null });
   assert.equal(parseArgs(['--clone=git@github.com:octo/hello.git']).clone, 'git@github.com:octo/hello.git');
+  // Exactly as the Mac app runs it: no --repo, and --claude, --app and --port with --clone and --into.
+  assert.deepEqual((({ clone, into, claude, app, port, repo, open, error }) => ({ clone, into, claude, app, port, repo, open, error }))(
+    parseArgs(['--clone', 'git@github.com:octo/hello.git', '--into', '/Users/ada/Developer', '--claude', '/opt/claude/claude', '--app', '--port', '4317'])),
+  { clone: 'git@github.com:octo/hello.git', into: '/Users/ada/Developer', claude: '/opt/claude/claude', app: true, port: 4317, repo: null, open: false, error: null });
+  assert.equal(parseArgs(['--clone', 'https://github.com/octo/hello', '--into', '/tmp/x', '--app', '--port', '0']).port, 0);
   assert.equal(parseArgs(['--connect-github']).error, null);
   assert.equal(parseArgs(['--github-repos', '--app', '--verbose']).error, null);
   const cases = [
@@ -478,22 +550,190 @@ test('the Mac app’s GitHub helpers, run as programs: no GitHub connected means
   }
 });
 
-test('--clone, run as a program: an address git must not use is refused in plain words, with the line the Mac app reads, and nothing starts', async (t) => {
+test('--connect-github, run as a program: one line is read and never printed back; a refusal is WORKBENCH_GITHUB with ok false and exit 1, and no line holds the token', async (t) => {
+  const w = setup(t);
+  const token = fakeToken();
+  const NOT_A_TOKEN = 'That does not look like a GitHub token.';
+  const NONE = 'Paste a token from GitHub first.';
+  // Each is refused before GitHub is asked: nothing reaches a network. Only the first line counts, and a second line
+  // read by mistake would be refused in other words.
+  for (const [input, sentence] of [
+    [`${token} ${token.slice(-6)}\n\n`, NOT_A_TOKEN],
+    [`${'x'.repeat(300)}\r\n`, NOT_A_TOKEN],
+    [`\n${token} two\n`, NONE],
+  ]) {
+    for (const verbose of [false, true]) {
+      const r = await runWithInput(['--connect-github', ...(verbose ? ['--verbose'] : [])], w.env, input);
+      assert.equal(r.code, 1, r.stderr);
+      assert.equal(r.stdout, `WORKBENCH_GITHUB ${JSON.stringify({ ok: false, login: null, sentence })}\n`);
+      const all = r.stdout + r.stderr;
+      for (const typed of input.split(/\r?\n/).filter(Boolean)) assert.ok(!all.includes(typed), 'what was typed is never printed or logged');
+      assert.ok(!all.includes(token.slice(4, 20)), 'not even part of it');
+    }
+  }
+  assert.equal(existsSync(path.join(w.home, '.workbench', 'settings.json')), false, 'nothing was kept');
+});
+
+test('the GitHub helpers, run as programs, check no agent; --github-repos prints [] and exits 0 when the connected account’s token cannot be read', async (t) => {
+  const w = setup(t);
+  // Claude Code and Codex stand-ins that leave a mark when anything runs them.
+  const marks = path.join(w.dir, 'ran.txt');
+  const standIn = (name) => {
+    const p = path.join(w.dir, name);
+    writeFileSync(p, `#!/bin/sh\necho ${name} >> '${marks}'\nexit 1\n`, { mode: 0o755 });
+    return p;
+  };
+  const env = { ...w.env, WORKBENCH_CLAUDE_BIN: standIn('claude'), WORKBENCH_CODEX_BIN: standIn('codex') };
+  // GitHub was connected in an earlier run, and its token kept in a private file that has gone since (never the
+  // keychain: these lines say where it is, so nothing here reads the keychain).
+  const id = 'k0123456789ab';
+  mkdirSync(path.join(w.home, '.workbench'), { mode: 0o700 });
+  writeFileSync(path.join(w.home, '.workbench', 'settings.json'), JSON.stringify({ github: { login: 'octo-cat', keyId: id } }), { mode: 0o600 });
+  writeFileSync(path.join(w.home, '.workbench', 'keys.json'), JSON.stringify({ version: 1, keys: [{
+    id, preset: 'github', label: 'GitHub', vars: [{ name: 'GH_TOKEN', secret: true }, { name: 'GITHUB_TOKEN', secret: true }],
+    scope: { kind: 'all' }, agents: [], kept: 'file', created: 1,
+  }] }), { mode: 0o600 });
+  const repos = await runWithInput(['--github-repos'], env, '');
+  assert.equal(repos.code, 0, repos.stderr);
+  assert.equal(repos.stdout, 'WORKBENCH_GITHUB_REPOS []\n');
+  const connect = await runWithInput(['--connect-github'], env, '\n');
+  assert.equal(connect.code, 1, connect.stderr);
+  assert.equal(connect.stdout, `WORKBENCH_GITHUB ${JSON.stringify({ ok: false, login: null, sentence: 'Paste a token from GitHub first.' })}\n`);
+  await sleep(200); // a check started in the background would have left its mark by now
+  assert.equal(existsSync(marks), false, existsSync(marks) ? readFileSync(marks, 'utf8') : '');
+  // A live start does check them.
+  await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], env);
+  assert.ok(existsSync(marks), 'the stand-ins leave a mark when they run');
+});
+
+test('pathWithLocalBin: the agents’ installers’ folder goes at the end of PATH, once, never in front; an empty PATH is left alone', () => {
+  assert.equal(pathWithLocalBin('/usr/bin:/bin', '/Users/ada'), '/usr/bin:/bin:/Users/ada/.local/bin');
+  assert.equal(pathWithLocalBin('/Users/ada/.local/bin:/usr/bin', '/Users/ada'), '/Users/ada/.local/bin:/usr/bin', 'where the person put it, it stays');
+  assert.equal(pathWithLocalBin('/usr/bin:/Users/ada/.local/bin/', '/Users/ada'), '/usr/bin:/Users/ada/.local/bin/');
+  assert.equal(pathWithLocalBin('/usr/bin:/Users/ada/./.local/bin', '/Users/ada/'), '/usr/bin:/Users/ada/./.local/bin');
+  assert.equal(pathWithLocalBin('/usr/bin:.local/bin', '/Users/ada'), '/usr/bin:.local/bin:/Users/ada/.local/bin', 'a relative folder is another one');
+  assert.equal(pathWithLocalBin('/usr/bin:~/.local/bin', '/Users/ada'), '/usr/bin:~/.local/bin:/Users/ada/.local/bin', 'so is ~, which no program expands');
+  for (const [value, home] of [['', '/Users/ada'], [undefined, '/Users/ada'], ['/usr/bin', ''], ['/usr/bin', 'relative'], ['/usr/bin', undefined]]) {
+    assert.equal(pathWithLocalBin(value, home), value);
+  }
+});
+
+test('Workbench puts ~/.local/bin at the end of its PATH: a Claude Code installed there is found, and a git there is not used', async (t) => {
+  const w = setup(t);
+  const local = path.join(w.home, '.local', 'bin');
+  mkdirSync(local, { recursive: true });
+  writeFileSync(path.join(local, 'claude'), '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.500 (Claude Code)"; exit 0; fi\nexit 3\n', { mode: 0o755 });
+  const decoy = path.join(w.dir, 'decoy-git-ran.txt');
+  writeFileSync(path.join(local, 'git'), `#!/bin/sh\necho "$*" >> '${decoy}'\nexit 1\n`, { mode: 0o755 });
+  const r = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.lines[0], 'Claude Code 2.1.500 is ready.');
+  assert.match(r.out, /Workbench is running at http:\/\/127\.0\.0\.1:\d+\//);
+  assert.equal(existsSync(decoy), false, 'git came from the folder before it on the PATH');
+});
+
+test('--clone, run as a program: an address Workbench does not clone from is refused in the Mac app’s own words, with the line it reads, and nothing starts',{ skip: !CLONE_READY && 'needs cloneRepo in src/core/workspace.mjs (U2)' }, async (t) => {
   const w = setup(t);
   const into = path.join(w.dir, 'code');
-  for (const app of [false, true]) {
-    const r = await runWithInput(['--clone', 'ext::sh -c touch% /tmp/x', '--into', into, '--port', '0', ...(app ? ['--app'] : [])], w.env, '');
-    assert.equal(r.code, 1, r.stdout + r.stderr);
-    assert.doesNotMatch(r.stdout, /Workbench is running/);
-    const said = r.stderr.trim().split('\n').filter(l => !l.startsWith('[workbench '));
-    assert.equal(said.length, 1, r.stderr);
-    if (!CLONE_READY) assert.equal(said[0], 'This Workbench cannot clone a repository. Clone it with git, then open its folder.');
-    const line = r.stdout.split('\n').find(l => l.startsWith('WORKBENCH_CLONE '));
-    if (!app) { assert.equal(line, undefined); continue; }
-    const json = JSON.parse(line.slice('WORKBENCH_CLONE '.length));
-    assert.deepEqual(Object.keys(json), ['error', 'sentence']);
-    assert.ok(CLONE_READY ? ['url', 'git'].includes(json.error) : json.error === 'git', line);
-    assert.equal(json.sentence, said[0]);
+  // Also with a name in the address that is a word of the sentence too ("owner"): the sentence stays whole.
+  for (const address of ['ext::sh -c touch% /tmp/x', 'https://owner@github.com/owner/repo', ['https://owner', 'not-a-password@github.com/owner/repo'].join(':')]) {
+    for (const app of [false, true]) {
+      const r = await runWithInput(['--clone', address, '--into', into, '--port', '0', ...(app ? ['--app'] : [])], w.env, '');
+      assert.equal(r.code, 1, r.stdout + r.stderr);
+      assert.doesNotMatch(r.stdout, /Workbench is running/);
+      const said = r.stderr.trim().split('\n').filter(l => !l.startsWith('[workbench '));
+      assert.deepEqual(said, [ADDRESS_REFUSED], address);
+      assert.ok(!(r.stdout + r.stderr).includes('not-a-password'), 'a password in the address is never printed');
+      const line = r.stdout.split('\n').find(l => l.startsWith('WORKBENCH_CLONE '));
+      if (!app) { assert.equal(line, undefined); continue; }
+      assert.deepEqual(JSON.parse(line.slice('WORKBENCH_CLONE '.length)), { error: 'url', sentence: ADDRESS_REFUSED });
+    }
+  }
+  assert.deepEqual(readdirSync(into), [], 'nothing was cloned');
+});
+
+test('--clone as the Mac app runs it (--into, --claude, --app, a busy --port, no --repo): progress only as WORKBENCH_CLONE lines, then the new folder, which the board opens', { skip: !CLONE_READY && 'needs cloneRepo in src/core/workspace.mjs (U2)' }, async (t) => {
+  const w = setup(t, { fakeGit: true });
+  // What the stand-in git copies, whatever the address says: a bare copy of the test repository.
+  const bare = path.join(w.dir, 'hello.git');
+  execFileSync(realGit(), ['clone', '-q', '--bare', w.repo, bare], { stdio: 'pipe' });
+  const into = path.join(w.dir, 'Developer');
+  // Port 4317 is taken (here, another one): the page takes a free one rather than throw the clone away.
+  const busy = http.createServer();
+  await new Promise((resolve) => busy.listen(0, '127.0.0.1', resolve));
+  t.after(() => busy.close());
+  const taken = busy.address().port;
+  const proc = spawn(process.execPath, [BIN, '--clone', 'https://github.com/octo/hello.git', '--into', into, '--claude', FAKE, '--app', '--port', String(taken)],
+    { env: { ...w.env, FAKE_GIT_CLONE: 'local', FAKE_GIT_CLONE_FROM: bare }, stdio: ['pipe', 'pipe', 'pipe'] });
+  // The app reads standard output and standard error as one stream.
+  let both = '';
+  proc.stdout.on('data', (d) => { both += d; });
+  proc.stderr.on('data', (d) => { both += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code) => resolve(code)));
+  t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+  assert.ok(await until(() => /^WORKBENCH_APP /m.test(both) || proc.exitCode != null), both);
+  const lines = both.split('\n');
+  const json = (prefix) => lines.filter((l) => l.startsWith(prefix)).map((l) => JSON.parse(l.slice(prefix.length)));
+  const root = realpathSync(path.join(into, 'hello'));
+  // Progress, then the new folder.
+  assert.deepEqual(json('WORKBENCH_CLONE '), [{ phase: 'receiving', percent: 50 }, { phase: 'receiving', percent: 100 }, { phase: 'done', percent: 100, root }]);
+  const [ready] = json('WORKBENCH_APP ');
+  assert.deepEqual({ root: ready.root, repo: ready.repo, demo: ready.demo }, { root, repo: 'hello', demo: false });
+  assert.notEqual(new URL(ready.url).port, String(taken));
+  const at = (prefix) => lines.findIndex((l) => l.startsWith(prefix));
+  assert.ok(at('WORKBENCH_CLONE {"phase":"done"') < at('WORKBENCH_APP '));
+  // Beside those lines, no plain progress line: the app reads the first plain line after progress as "the clone is done".
+  const plain = lines.filter((l) => l && !l.startsWith('WORKBENCH_') && !l.startsWith('[workbench '));
+  assert.equal(plain[0], `Cloning https://github.com/octo/hello.git into ${into}…`);
+  assert.ok(!plain.some((l) => /%|^(Counting what to copy|Packing it up|Copying|Unpacking|Writing the files)\b/.test(l)), plain.join('\n'));
+  assert.ok(plain.includes(`Cloned https://github.com/octo/hello.git into ${root}.`), plain.join('\n'));
+  assert.ok(plain.includes('Claude Code 2.1.221 is ready (from --claude).'), plain.join('\n'));
+  assert.ok(plain.includes(`Port ${taken} is already in use, so the page took a free one.`), plain.join('\n'));
+  // The board is on the copy.
+  assert.equal(execFileSync(realGit(), ['-C', root, 'rev-parse', 'HEAD']).toString().trim(), w.git('rev-parse', 'HEAD'));
+  proc.stdin.end();
+  assert.equal(await Promise.race([exited, sleep(15_000).then(() => 'still running')]), 0, both);
+});
+
+test('--clone: SIGTERM, or the app closing standard input, while git copies ends git’s whole group, leaves no half-made folder, and exits at once', { skip: !CLONE_READY && 'needs cloneRepo in src/core/workspace.mjs (U2)' }, async (t) => {
+  const w = setup(t, { fakeGit: true });
+  const into = path.join(w.dir, 'Developer');
+  const STOPPED = 'Stopped copying the repository.';
+  const APP_GONE = 'The app closed, so Workbench stopped copying the repository.';
+  // The app's Cancel or Quit (SIGTERM); the app gone (its end of standard input closed), with a git that ignores
+  // SIGTERM; and the app's own stop, which closes standard input and sends SIGTERM at once.
+  for (const [how, mode] of [['term', 'half'], ['stdin', 'stubborn'], ['both', 'half']]) {
+    const pidfile = path.join(w.dir, `${how}.pid`);
+    const proc = spawn(process.execPath, [BIN, '--clone', `https://github.com/octo/${how}.git`, '--into', into, '--app', '--port', '0'],
+      { env: { ...w.env, FAKE_GIT_CLONE: mode, FAKE_GIT_PIDFILE: pidfile }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d; });
+    proc.stderr.on('data', (d) => { out += d; });
+    const exited = new Promise((resolve) => proc.on('exit', (code, signal) => resolve({ code, signal })));
+    t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+    // Git has begun (it writes its process id once half the folder is there), and its progress reached the app.
+    const pid = await pidIn(pidfile);
+    assert.ok(pid > 0, out);
+    t.after(() => { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } });
+    assert.ok(await until(() => /^WORKBENCH_CLONE \{"phase":"receiving","percent":10\}$/m.test(out)), out);
+    const dest = path.join(into, how);
+    assert.ok(existsSync(path.join(dest, 'half.txt')));
+    const started = Date.now();
+    if (how !== 'term') proc.stdin.end();
+    if (how !== 'stdin') proc.kill('SIGTERM');
+    const ex = await Promise.race([exited, sleep(10_000).then(() => null)]);
+    const took = Date.now() - started;
+    assert.deepEqual(ex, { code: 1, signal: null }, `${how}: ${out}`);
+    assert.ok(took < 4500, `${how}: Workbench took ${took} ms to stop`);
+    assert.equal(existsSync(dest), false, `${how}: the half-made folder is gone`);
+    assert.ok(await goneSoon(pid), `${how}: git is gone`);
+    assert.ok(statSync(into).isDirectory(), 'the folder it was put in stays');
+    // Said once, and nothing starts.
+    const said = out.split('\n').filter((l) => l && !l.startsWith('WORKBENCH_CLONE ') && !l.startsWith('[workbench '));
+    assert.equal(said[0], `Cloning https://github.com/octo/${how}.git into ${into}…`);
+    assert.deepEqual(said.slice(1), [how === 'term' ? STOPPED : how === 'stdin' ? APP_GONE : said[1]], `${how}: ${out}`);
+    assert.ok([STOPPED, APP_GONE].includes(said[1]), out);
+    assert.doesNotMatch(out, /WORKBENCH_APP|Workbench is running|WORKBENCH_CLONE \{"(error|phase":"done)/);
   }
 });
 

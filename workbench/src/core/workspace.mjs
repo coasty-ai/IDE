@@ -2107,15 +2107,25 @@ export async function fillGitCredential({ host, username } = {}) {
 
 // ---- cloning
 
-/** The process groups of clones under way, ended when Workbench exits (they run detached from the terminal). */
-const runningClones = new Set();
+/** How long git may take to stop by itself when a clone is stopped (SIGTERM, which it tidies up after), before SIGKILL. */
+const CLONE_STOP_GRACE_MS = 1000;
+/** After that SIGKILL, how long to wait for the last process holding git's output before going on without it. */
+const CLONE_STOP_WAIT_MS = 1000;
+
+/**
+ * Clones under way: the process id of each git, which leads a process group of its own, and what to remove if
+ * Workbench exits while it copies. They run detached from the terminal, so nothing else would end them.
+ */
+const runningClones = new Map();
 let clonesWatched = false;
 function watchClones() {
   if (clonesWatched) return;
   clonesWatched = true;
+  // An exit cannot wait for git to tidy up after itself: its whole group is killed at once, then what it made goes.
   process.on('exit', () => {
-    for (const pid of runningClones) {
-      try { process.kill(-pid, 'SIGTERM'); } catch { /* gone */ }
+    for (const [pid, tidy] of runningClones) {
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+      try { tidy?.(); } catch { /* what is left stays */ }
     }
   });
 }
@@ -2124,11 +2134,21 @@ function watchClones() {
  * git with an argument array (as git() runs it: core.fsmonitor=false first, the scrubbed environment), its stderr read
  * line by line as it comes (git rewrites a progress line with \r). Git runs in a process group and session of its own:
  * it has no terminal, so ssh cannot stop to ask on one, and the time limit ends the whole group (SIGTERM, then SIGKILL
- * 5 seconds later). Resolves `{ code: 0, stderr }`; rejects with an error carrying .code, .signal, .killed and .stderr
- * (the last 64 KB), or the spawn error (.code 'ENOENT' when git is missing).
+ * 5 seconds later).
+ *
+ * `signal` (an AbortSignal) stops it sooner: SIGTERM to the whole group, SIGKILL a second later if anything is left,
+ * and the promise settles once git is gone (or a second after that SIGKILL, when a process outside the group still
+ * holds git's output). `tidy` is what Workbench's exit removes when git is still running then.
+ *
+ * Resolves `{ code: 0, stderr }`; rejects with an error carrying .code, .signal, .killed and .stderr (the last 64 KB)
+ * and, when it was stopped, .stopped; or with the spawn error (.code 'ENOENT' when git is missing).
  */
-function gitStream(args, { cwd, timeout, env, onLine }) {
+function gitStream(args, { cwd, timeout, env, onLine, signal, tidy }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(Object.assign(new Error('git was stopped before it started'), { stopped: true, stderr: '' }));
+      return;
+    }
     const childEnv = gitEnv();
     for (const [k, v] of Object.entries(env || {})) {
       if (v === undefined) delete childEnv[k];
@@ -2144,15 +2164,27 @@ function gitStream(args, { cwd, timeout, env, onLine }) {
     let stderr = '';
     let pending = '';
     let killed = false;
+    let stopped = false;
     let ended = false;
-    const group = (signal) => {
-      try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch { /* gone */ } }
+    const stopTimers = [];
+    const group = (sig) => {
+      try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch { /* gone */ } }
     };
     const timer = timeout > 0 ? setTimeout(() => {
       killed = true;
       group('SIGTERM');
       setTimeout(() => group('SIGKILL'), 5000).unref?.();
     }, timeout) : null;
+    const stop = () => {
+      if (ended || stopped) return;
+      stopped = true;
+      group('SIGTERM');
+      stopTimers.push(setTimeout(() => {
+        group('SIGKILL');
+        stopTimers.push(setTimeout(() => end(null, null, 'SIGKILL'), CLONE_STOP_WAIT_MS));
+      }, CLONE_STOP_GRACE_MS));
+    };
+    signal?.addEventListener('abort', stop, { once: true });
     const line = (l) => {
       if (!l.trim()) return;
       try { onLine(l); } catch { /* a progress listener must not stop the clone */ }
@@ -2165,26 +2197,31 @@ function gitStream(args, { cwd, timeout, env, onLine }) {
       if (pending.length > 64 * 1024) pending = '';
       for (const l of parts) line(l);
     });
-    const end = (err, code, signal) => {
+    const end = (err, code, sig) => {
       if (ended) return;
       ended = true;
       if (timer) clearTimeout(timer);
+      for (const t of stopTimers) clearTimeout(t);
+      signal?.removeEventListener('abort', stop);
       if (child.pid) runningClones.delete(child.pid);
       line(pending);
       pending = '';
-      if (err) {
+      if (stopped) {
+        group('SIGKILL'); // anything of git's group still there
+        reject(Object.assign(new Error('git was stopped'), { code, signal: sig, killed, stopped: true, stderr }));
+      } else if (err) {
         err.stderr = stderr;
         reject(err);
       } else if (code === 0 && !killed) {
         resolve({ code: 0, stderr });
       } else {
-        reject(Object.assign(new Error('git clone failed'), { code, signal, killed, stderr }));
+        reject(Object.assign(new Error('git clone failed'), { code, signal: sig, killed, stderr }));
       }
     };
     child.on('error', (e) => end(e));
-    child.on('close', (code, signal) => end(null, code, signal));
+    child.on('close', (code, sig) => end(null, code, sig));
     if (child.pid) {
-      runningClones.add(child.pid);
+      runningClones.set(child.pid, typeof tidy === 'function' ? tidy : null);
       watchClones();
     }
   });
@@ -2213,16 +2250,21 @@ export function cloneProgressOf(line) {
 }
 
 /**
+ * The refusal of an address Workbench does not clone from. The Mac app's own check of an address says the same words,
+ * and neither repeats the address: it may be a key pasted into the wrong field.
+ */
+const CLONE_ADDRESS_REFUSED = 'Workbench clones addresses like https://github.com/owner/repo or git@github.com:owner/repo.git.';
+
+/**
  * What a clone address is: `{ url, kind: 'https'|'ssh'|'scp'|'local', host, path }`. Accepted: https://host/path
  * (no user or password in it, no query), ssh://[user@]host/path, and [user@]host:path (scp-like); a file:// address
- * or an absolute path only with allowLocal (tests). Everything else is refused, as `.why` 'url': ext::, fd:: and the
- * other transport::address forms, file://, http://, git://, and anything starting with "-".
+ * or an absolute path only with allowLocal (tests). Everything else is refused, as `.why` 'url' with
+ * CLONE_ADDRESS_REFUSED: ext::, fd:: and the other transport::address forms, file://, http://, git://, and anything
+ * starting with "-".
  */
 function cloneSource(raw, allowLocal) {
   const url = typeof raw === 'string' ? raw.trim() : '';
-  const refuse = () => new Refusal('url', url
-    ? `“${clip(url, 80)}” is not an address Workbench can clone. Use one like https://github.com/owner/repo or git@github.com:owner/repo.git.`
-    : 'Give the address of the repository to clone, like https://github.com/owner/repo.');
+  const refuse = () => new Refusal('url', CLONE_ADDRESS_REFUSED);
   if (!url || url.length > 2000 || /[\s\u0000-\u001f\u007f-\u009f]/.test(url) || url.startsWith('-')) throw refuse();
   const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(url);
   if (scheme) {
@@ -2270,6 +2312,21 @@ const CLONE_NETWORK = /Could not resolve host|Could not resolve hostname|nodenam
 const CLONE_HOST_KEY = /Host key verification failed/i;
 const CLONE_EXISTS = /already exists and is not an empty directory/i;
 
+/**
+ * Remove what a stopped clone made: its new folder, or, when the folder was there before (empty, as cloneRepo found
+ * it), what is in it now. Never anything else, and never the folder it was put in.
+ */
+function removeHalfMade(dest, existed) {
+  try {
+    if (!existed) {
+      fs.rmSync(dest, { recursive: true, force: true });
+      return;
+    }
+    if (!fs.lstatSync(dest).isDirectory()) return;
+    for (const entry of fs.readdirSync(dest)) fs.rmSync(path.join(dest, entry), { recursive: true, force: true });
+  } catch { /* gone already, or it cannot be removed: what is left stays */ }
+}
+
 /** The plain error for a clone that failed, with git's own words only in `.detail`. */
 function cloneFailure(e, src) {
   const text = String((e && e.stderr) || '');
@@ -2306,14 +2363,19 @@ function cloneFailure(e, src) {
  * from the terminal, within `timeoutMs` (30 minutes unless given). `onProgress({ phase, percent })` hears each change
  * of git's progress (see cloneProgressOf).
  *
+ * `signal` (an AbortSignal) stops the clone: git's whole process group is stopped (gitStream), what the clone made is
+ * removed (the new folder, or what it put in a folder that was empty), and cloneRepo rejects with `.why` 'stopped'. A
+ * clone that finished just as it was stopped is removed too, so a stop always leaves things as they were. Should
+ * Workbench exit while git copies, its exit does the same.
+ *
  * Refusals and failures are plain errors with `.why`: 'url' (an address Workbench does not clone from, or no folder
  * name in it), 'exists' (something is already there, or the folder cannot be made), 'auth' (refused: a private
  * repository, no sign-in; on GitHub "GitHub did not let Workbench read this repository. If it is private, connect
- * your GitHub account, then try again."), 'network' ("Workbench could not reach <host>.") or 'git' (anything else),
- * with git's own words in `.detail`. A folder the clone made is removed again when it fails.
+ * your GitHub account, then try again."), 'network' ("Workbench could not reach <host>."), 'stopped' (see `signal`)
+ * or 'git' (anything else), with git's own words in `.detail`. A folder the clone made is removed again when it fails.
  * @returns {Promise<{ root: string }>} the new folder's real path
  */
-export async function cloneRepo({ url, into, name, onProgress, timeoutMs = CLONE_TIMEOUT_MS, allowLocal = false } = {}) {
+export async function cloneRepo({ url, into, name, onProgress, timeoutMs = CLONE_TIMEOUT_MS, allowLocal = false, signal } = {}) {
   const src = cloneSource(url, allowLocal);
   const folderName = name == null ? cloneFolderName(src.path) : name;
   if (!validFolderName(folderName)) {
@@ -2322,6 +2384,8 @@ export async function cloneRepo({ url, into, name, onProgress, timeoutMs = CLONE
       : `“${clip(String(folderName), 40)}” cannot be the name of a folder.`);
   }
   if (typeof into !== 'string' || !into.trim() || into.includes('\u0000')) throw new Refusal('exists', 'No folder was given to put the repository in.');
+  const stopped = () => new Refusal('stopped', 'Copying the repository was stopped.');
+  if (signal?.aborted) throw stopped(); // before any folder is made
   const parent = path.resolve(expandHome(into.trim()));
   if (fs.existsSync(parent) && !isFolder(parent)) throw new Refusal('exists', `${parent} is a file, not a folder.`);
   try {
@@ -2351,11 +2415,18 @@ export async function cloneRepo({ url, into, name, onProgress, timeoutMs = CLONE
     last = p;
     onProgress({ ...p });
   };
+  const tidy = () => removeHalfMade(dest, existed);
   try {
     await outsideRepos((cwd, env) => gitStream(args, {
-      cwd, timeout: timeoutMs, env: { ...env, ...NO_ASKING, GIT_ALLOW_PROTOCOL: undefined }, onLine,
+      cwd, timeout: timeoutMs, env: { ...env, ...NO_ASKING, GIT_ALLOW_PROTOCOL: undefined }, onLine, signal, tidy,
     }));
+    if (signal?.aborted) throw Object.assign(new Error('git finished as it was stopped'), { stopped: true });
   } catch (e) {
+    if (e && e.stopped) {
+      // Git is gone (its group was ended): what it made goes, unless git found the folder taken by something else.
+      if (!CLONE_EXISTS.test(String(e.stderr || ''))) tidy();
+      throw stopped();
+    }
     const failure = cloneFailure(e, src);
     if (!existed && failure.why !== 'exists') fs.rmSync(dest, { recursive: true, force: true }); // git made it; it normally removes it itself
     throw failure;
