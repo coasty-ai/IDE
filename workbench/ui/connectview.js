@@ -253,6 +253,25 @@ export function githubRequest(token) {
   return problem ? { error: problem } : { token: v };
 }
 
+// ---------------------------------------------------------------- GitHub, connected: "Let agents use this token"
+/**
+ * A stamp of what GitHub's box was drawn for: whether agents get the token, and whose it is, its hidden characters shown
+ * as everywhere ("off" when not connected).
+ */
+export const githubStamp = gh => (gh && gh.connected === true ? `${gh.agentsUseIt === true ? 'agents' : 'git-only'}:${prose(gh.login)}` : 'off');
+/** Whether the box shows ticked: while its change is on its way, what was asked; otherwise what Workbench says. */
+export const githubBoxOn = (gh, asked = null, busy = false) => (busy && typeof asked === 'boolean' ? asked : !!gh && gh.agentsUseIt === true);
+/**
+ * What the box sends when the person changes it ({ agentsUseIt }), or null when it was drawn for something that is no
+ * longer so (GitHub disconnected, another account, the token given or taken back since): the panel then says "That
+ * changed" and puts the box back. Workbench checks again.
+ */
+export function githubShareRequest(status, drawn, checked) {
+  const gh = status && status.github && typeof status.github === 'object' ? status.github : null;
+  if (!gh || gh.connected !== true || githubStamp(gh) !== drawn) return null;
+  return { agentsUseIt: checked === true };
+}
+
 /**
  * A new key from the add form: { body } for POST /api/connect/keys ({ preset, label, values, scope, agents }), or
  * { error } in plain words. `entries` are [{ name, value }] as typed (a preset's fields, or the person's own names);
@@ -298,8 +317,9 @@ export function newKeyRequest({ preset, label, entries, scope, given }, presets 
  * The panel's parts, in order, as [{ k, html }]: each html is one element carrying data-k="<k>", so the panel can keep
  * a part that did not change (and the field someone is typing in) and replace only the others.
  * @param {object|null} status  a ConnectStatus, or null while the first one is on its way
- * @param {object} v  { open: { keyFor, cmd: { [agentId]: command }, add: { preset, rows } | null, removing }, busy: Set,
- *   presets, signIn (Map from signInNotes), looksLikeSecret, repoName, error (a sentence), canRepo }
+ * @param {object} v  { open: { keyFor, cmd: { [agentId]: command }, add: { preset, rows } | null, removing, git: { name,
+ *   email } as typed | null, ghAgents (the box in "Connect GitHub"), ghShare (what GitHub's box asked for, while that is
+ *   on its way) }, busy: Set, presets, signIn (Map from signInNotes), looksLikeSecret, repoName, error (a sentence), canRepo }
  */
 export function panelParts(status, v = {}) {
   const open = v.open || {}, busy = v.busy || new Set();
@@ -361,10 +381,13 @@ export function panelParts(status, v = {}) {
   if (gh.connected === true) {
     const login = prose(gh.login);
     const said = str(gh.sentence).trim() ? prose(gh.sentence) : login ? `Connected to GitHub as ${login}.` : 'Connected to GitHub.';
-    const who = gh.agentsUseIt === true
-      ? 'Agents get this token as GH_TOKEN. Copilot may sign in with it.'
-      : 'Only git uses this token: agents do not get it. To give it to them, disconnect, then connect again with “Let agents use this token” ticked.';
-    push('gh-on', `<div class="cn-part cn-gh" data-k="gh-on"><h4 class="cn-h4">GitHub</h4><p class="cn-line">${esc(said)}</p><p class="cn-sub">${esc(who)}</p>`
+    // whether agents get the token: the box acts at once (Workbench keeps the token, so it is not asked for again); it
+    // carries what it was drawn for, and while its change is on its way it shows what was asked, and waits
+    const sharing = busy.has('gh-share');
+    push('gh-on', `<div class="cn-part cn-gh" data-k="gh-on"><h4 class="cn-h4">GitHub</h4><p class="cn-line">${esc(said)}</p>`
+      + `<label class="cn-check"><input type="checkbox" data-field="gh-share" data-key="gh-share" data-state="${esc(githubStamp(gh))}"`
+      + `${githubBoxOn(gh, open.ghShare, sharing) ? ' checked' : ''}${sharing ? ' aria-disabled="true"' : ''}><span>Let agents use this token (as GH_TOKEN)</span></label>`
+      + '<p class="cn-sub cn-under">Copilot may sign in with it.</p>'
       + `<div class="cn-acts">${btn('Disconnect', { cn: 'gh-disconnect', key: 'gh-disconnect' }, { busy: busy.has('gh-disconnect') })}</div></div>`);
   } else {
     const said = str(gh.sentence).trim() && gh.connected === false ? prose(gh.sentence) : 'Not connected.';

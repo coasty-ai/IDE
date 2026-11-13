@@ -13,7 +13,7 @@ import { esc } from '../ui/util.js';
 import { hasHidden } from '../ui/diffview.js';
 import * as presetModule from '../src/shared/keypresets.mjs';
 import * as shape from '../src/shared/secretshape.mjs';
-import { palettes, ratio, THEMES } from '../scripts/ui-contrast.mjs';
+import { palettes, ratio, THEMES, PAIRS } from '../scripts/ui-contrast.mjs';
 
 const SHARED = fileURLToPath(new URL('../src/shared/', import.meta.url));
 const canMap = typeof nodeModule.registerHooks === 'function';
@@ -206,14 +206,87 @@ test('GitHub, not connected: a token field, the box for agents (off), Connect an
   assert.deepEqual(V.githubRequest(' abc '), { token: 'abc' });
 });
 
-test('GitHub, connected: as whom, whether agents get the token, and Disconnect', () => {
-  const on = html(status({ github: { connected: true, login: 'octo<cat>', agentsUseIt: true, sentence: '' } }));
+// GitHub, connected: "Let agents use this token (as GH_TOKEN)" acts at once, through POST /api/connect/github/agents
+const gh = (o = {}) => ({ connected: true, login: 'octocat', agentsUseIt: false, sentence: '', ...o });
+const shareBox = h => inputs(h).find(i => /data-field="gh-share"/.test(i));
+const stateOf = i => /data-state="([^"]*)"/.exec(i)?.[1];
+
+test('GitHub, connected: as whom, the box for agents ticked as Workbench says, Copilot under it, and Disconnect', () => {
+  const on = html(status({ github: gh({ login: 'octo<cat>', agentsUseIt: true }) }));
   assert.match(on, /Connected to GitHub as octo&lt;cat&gt;\./);
-  assert.match(on, /Agents get this token as GH_TOKEN\. Copilot may sign in with it\./);
+  assert.match(on, /<label class="cn-check"><input [^>]*data-field="gh-share"[^>]*><span>Let agents use this token \(as GH_TOKEN\)<\/span><\/label><p class="cn-sub cn-under">Copilot may sign in with it\.<\/p>/,
+    'the box, and under it what Copilot may do with the token');
+  const box = shareBox(on);
+  assert.match(box, /type="checkbox"/);
+  assert.match(box, /\bchecked\b/, 'agents get the token: ticked');
+  assert.doesNotMatch(box, /aria-disabled|\bname=|\bvalue=/);
+  assert.match(box, /data-key="gh-share"/, 'the keyboard stays on it when it is drawn again');
+  assert.equal(stateOf(box), esc(V.githubStamp(gh({ login: 'octo<cat>', agentsUseIt: true }))), 'it carries what it was drawn for');
   assert.ok(buttons(on).some(b => b.cn === 'gh-disconnect'));
-  assert.doesNotMatch(on, /data-field="gh-token"/);
-  const gitOnly = html(status({ github: { connected: true, login: 'octocat', agentsUseIt: false } }));
-  assert.match(gitOnly, /Only git uses this token: agents do not get it\./);
+  assert.doesNotMatch(on, /data-field="gh-token"|data-field="gh-agents"/, 'no token is asked for again');
+  assert.doesNotMatch(on, /connect again|Only git uses/, 'the box works: nothing says to disconnect and connect again');
+  const gitOnly = html(status({ github: gh() }));
+  assert.doesNotMatch(shareBox(gitOnly), /\bchecked\b/, 'git alone uses it: not ticked');
+  assert.match(gitOnly, /Let agents use this token \(as GH_TOKEN\)/);
+  assert.match(gitOnly, /Copilot may sign in with it\./);
+  // the box's stamp: whether agents get the token, and whose it is
+  assert.equal(V.githubStamp(gh()), 'git-only:octocat');
+  assert.equal(V.githubStamp(gh({ agentsUseIt: true })), 'agents:octocat');
+  for (const off of [null, {}, { connected: false, login: 'octocat', agentsUseIt: true }]) assert.equal(V.githubStamp(off), 'off');
+});
+
+test('GitHub’s box while its change is on its way shows what was asked and waits; refused or failed, it is back as it was', () => {
+  // ticked, on its way: ticked, and it waits (a click on it is undone)
+  const asked = html(status({ github: gh() }), { open: { ghShare: true }, busy: new Set(['gh-share']) });
+  assert.match(shareBox(asked), /\bchecked\b/);
+  assert.match(shareBox(asked), /aria-disabled="true"/);
+  // untick, on its way
+  const untick = html(status({ github: gh({ agentsUseIt: true }) }), { open: { ghShare: false }, busy: new Set(['gh-share']) });
+  assert.doesNotMatch(shareBox(untick), /\bchecked\b/);
+  assert.match(shareBox(untick), /aria-disabled="true"/);
+  // refused ({ ok: false, why: 'token', sentence } changes nothing) or failed: drawn from what Workbench says, as it was
+  for (const left of [null, true]) {
+    const back = html(status({ github: gh() }), { open: { ghShare: left } });
+    assert.doesNotMatch(shareBox(back), /\bchecked\b|aria-disabled/, `asked ${left}: back as it was`);
+  }
+  // taken: the fresh status says agents get it
+  assert.match(shareBox(html(status({ github: gh({ agentsUseIt: true }) }))), /\bchecked\b/);
+  assert.equal(V.githubBoxOn(gh({ agentsUseIt: true })), true);
+  assert.equal(V.githubBoxOn(gh(), true, true), true, 'what was asked, while it is on its way');
+  assert.equal(V.githubBoxOn(gh(), true, false), false, 'otherwise what Workbench says');
+  assert.equal(V.githubBoxOn(gh({ agentsUseIt: true }), null, true), true, 'nothing asked: what Workbench says');
+  assert.equal(V.githubBoxOn(null), false);
+  // the not-connected form keeps its own box (sent with Connect), off by default, and no box of this kind
+  const notYet = html(status());
+  assert.equal(shareBox(notYet), undefined);
+  assert.doesNotMatch(inputs(notYet).find(i => /data-field="gh-agents"/.test(i)), /checked/);
+});
+
+test('what GitHub’s box sends: { agentsUseIt } when it was drawn for what is so; nothing when that changed', () => {
+  const s = status({ github: gh() });
+  const drawn = V.githubStamp(s.github);
+  assert.deepEqual(V.githubShareRequest(s, drawn, true), { agentsUseIt: true });
+  assert.deepEqual(V.githubShareRequest(status({ github: gh({ agentsUseIt: true }) }), 'agents:octocat', false), { agentsUseIt: false });
+  // drawn before a change: agents given the token since, another account, GitHub disconnected, or no status at all
+  assert.equal(V.githubShareRequest(status({ github: gh({ agentsUseIt: true }) }), drawn, true), null);
+  assert.equal(V.githubShareRequest(status({ github: gh({ login: 'someone-else' }) }), drawn, true), null);
+  assert.equal(V.githubShareRequest(status(), drawn, true), null);
+  assert.equal(V.githubShareRequest(null, drawn, true), null);
+  assert.equal(V.githubShareRequest(s, undefined, true), null);
+});
+
+test('GitHub’s box is wired: a change is sent at once and checked first, a waiting box ignores clicks, and it goes back', () => {
+  const conn = read('../ui/connect.js');
+  assert.match(conn, /el\.dialog\.addEventListener\('change', onChange\)/);
+  const at = conn.indexOf('async function shareGithub(');
+  const fn = conn.slice(at, conn.indexOf('\n}\n', at));
+  assert.ok(at > 0, 'shareGithub');
+  const order = ['githubShareRequest(st.status, box.dataset.state, box.checked)', 'changed()', 'st.open.ghShare = q.agentsUseIt', 'connectApi.githubAgents(q.agentsUseIt)',
+    "busyKey: 'gh-share'", 'st.open.ghShare = null', 'githubBoxOn(st.status && st.status.github)', 'recheck()', 'connectApi.status()'];
+  let last = -1;
+  for (const s of order) { const i = fn.indexOf(s); assert.ok(i > last, `shareGithub: ${s}`); last = i; }
+  const click = conn.slice(conn.indexOf('function onClick('), conn.indexOf('\n}\n', conn.indexOf('function onClick(')));
+  assert.match(click, /t\.type === 'checkbox' && t\.getAttribute\('aria-disabled'\) === 'true'\) \{ e\.preventDefault\(\); return; \}/);
 });
 
 // ---------------------------------------------------------------- keys: the list, and how values read
@@ -512,19 +585,33 @@ test('the panel’s requests: their routes and bodies; a refusal comes back as i
     await api.connectApi.githubDisconnect();
     await api.connectApi.addKey({ preset: 'aws', label: 'AWS', values: { AWS_REGION: 'eu-west-2' }, scope: 'all', agents: 'all', extra: 'dropped' });
     await api.connectApi.removeKey('k/1');
+    await api.connectApi.githubAgents(true);
+    await api.connectApi.githubAgents('yes');
     assert.deepEqual(sent.map(r => `${r.method} ${r.path}`), [
       'GET /api/connect', 'POST /api/connect/recheck', 'POST /api/connect/agents/codex/install', 'POST /api/connect/agents/claude/signin',
       'POST /api/connect/agents/claude/key', 'POST /api/connect/agents/codex/default', 'POST /api/connect/git', 'POST /api/connect/github',
-      'POST /api/connect/github/disconnect', 'POST /api/connect/keys', 'POST /api/connect/keys/k%2F1/remove']);
+      'POST /api/connect/github/disconnect', 'POST /api/connect/keys', 'POST /api/connect/keys/k%2F1/remove',
+      'POST /api/connect/github/agents', 'POST /api/connect/github/agents']);
     assert.deepEqual(sent[4].body, { value });
     assert.deepEqual(sent[7].body, { token: 'gh-token-value', agentsUseIt: true });
     assert.deepEqual(sent[9].body, { preset: 'aws', label: 'AWS', values: { AWS_REGION: 'eu-west-2' }, scope: 'all', agents: 'all' });
+    assert.deepEqual(sent[11].body, { agentsUseIt: true }, 'GitHub’s box: whether agents get the token, and no token');
+    assert.deepEqual(sent[12].body, { agentsUseIt: false }, 'only true gives it to them');
     for (const r of sent) { assert.ok(!r.path.includes(value) && !r.path.includes('gh-token-value'), 'values never in an address'); assert.equal(r.headers['Content-Type'], 'application/json'); }
     // a refusal: its sentence and status come back, nothing thrown
     answer = { status: 200, body: { ok: false, sentence: 'GitHub did not accept that token.', status: status() } };
     const r = await api.connectApi.github('x', false);
     assert.equal(r.ok, false);
     assert.equal(r.sentence, 'GitHub did not accept that token.');
+    // GitHub's box refused because git cannot give the token back: a refusal with no status, kept as it is
+    const cannot = 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.';
+    answer = { status: 200, body: { ok: false, why: 'token', sentence: cannot } };
+    const share = await api.connectApi.githubAgents(true);
+    assert.deepEqual(share, { ok: false, why: 'token', sentence: cannot });
+    assert.equal(V.statusOf(share), null, 'nothing to draw: the box goes back to the status the panel has');
+    // and when GitHub is not connected any more: 409, its sentence, and the status code for the panel
+    answer = { status: 409, body: { error: 'GitHub is not connected.' } };
+    await assert.rejects(api.connectApi.githubAgents(false), { message: 'GitHub is not connected.', status: 409 });
     // an error keeps Workbench's own sentence, "token" and all
     answer = { status: 400, body: { error: 'That does not look like a GitHub token.' } };
     await assert.rejects(api.connectApi.github('x', false), { message: 'That does not look like a GitHub token.' });
@@ -540,6 +627,58 @@ test('the panel’s requests: their routes and bodies; a refusal comes back as i
     globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
     await assert.rejects(api.connectApi.recheck(), { message: 'Workbench isn’t answering. Is it still running?' });
   } finally { globalThis.fetch = realFetch; }
+});
+
+// ---------------------------------------------------------------- the stand-in API of the page checks (scripts/ui-mock.mjs)
+test('the page checks’ stand-in API answers Agents & keys as the panel reads it, and never sends a value back', async () => {
+  const { startMock, scenario, SCENARIOS } = await import('../scripts/ui-mock.mjs');
+  for (const name of ['connect-none', 'connect-claude', 'connect-nocodex', 'connect-github', 'connect-fail']) assert.ok(SCENARIOS.includes(name), name);
+  assert.equal(V.connectMeta(scenario('connect-none')).ready, false, 'no agent ready: the lid’s Connect, and the panel opens by itself');
+  assert.equal(V.connectMeta(scenario('connect-fail')).ready, true, 'a failed read opens only from the band, so no check meets its 500 by itself');
+  for (const name of ['demo', 'merge', 'git', 'live']) assert.equal(V.connectMeta(scenario(name)), null, `${name}: the board as it was`);
+  const mock = await startMock({ quiet: true });
+  const base = `http://127.0.0.1:${mock.port}`;
+  const ctl = (p, b) => fetch(`${base}/ctl/${p}`, { method: 'POST', body: JSON.stringify(b) }).then(r => r.json());
+  const call = (p, body) => fetch(base + p, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': 'k' },
+    body: body === undefined ? undefined : JSON.stringify(body) }).then(async r => ({ code: r.status, body: await r.json() }));
+  const sentences = s => V.agentsOf(s).map(a => `${V.agentSentence(a)} [${a.actions.join(' ')}]`);
+  try {
+    assert.equal((await call('/api/connect')).code, 404, 'the demo has nothing to connect');
+    await ctl('scenario', { name: 'connect-claude' });
+    let s = V.statusOf((await call('/api/connect')).body);
+    assert.deepEqual(sentences(s), ['Claude Code 2.1.322 is ready, signed in with your Claude subscription. [key recheck]', 'Codex 0.166.0 is installed but not signed in. [signin key recheck]']);
+    assert.deepEqual(V.metaFromStatus(s), V.connectMeta(scenario('connect-claude')), 'the snapshot says what the status says');
+    // a preset form's key, and an agent's own: listed masked, never sent back
+    const id = fake('AK', 'IA', 'Q4R7', 'T2W9', 'X5Z8', 'C3V6'), secret = fake('wJal', 'rXUtnFEMI', 'K7MDENGbPxRfi', 'CYZQ8EXAMPLE');
+    const key = fake('sk-', 'ant-', 'api03-', 'Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh1Jk0Lz');
+    let r = await call('/api/connect/keys', { preset: 'aws', label: 'AWS', values: { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, AWS_REGION: 'eu-west-2' }, scope: 'all', agents: 'all' });
+    assert.equal(r.body.sentence, 'Saved AWS, for all repositories.');
+    r = await call('/api/connect/agents/claude/key', { value: key });
+    for (const v of [id, secret, key]) assert.ok(!JSON.stringify(r.body).includes(v), 'no value comes back');
+    assert.deepEqual(V.keysOf(V.statusOf(r.body), { presets: PRESETS, repoName: 'shop', looksLikeSecret: looks }).map(k => k.sentence), [
+      `AWS for all repositories, given to all agents: AWS_ACCESS_KEY_ID •••• ${id.slice(-4)}, AWS_SECRET_ACCESS_KEY •••• ${secret.slice(-4)}, AWS_REGION eu-west-2`,
+      `Anthropic for all repositories, given to Claude Code: ANTHROPIC_API_KEY •••• ${key.slice(-4)}`]);
+    // GitHub: connected, the box given and refused as Connect refuses it, then 409 once disconnected
+    assert.equal((await call('/api/connect/github', { token: 'gh-token-value', agentsUseIt: false })).body.login, 'octocat');
+    r = await call('/api/connect/github/agents', { agentsUseIt: true });
+    assert.equal(V.githubBoxOn(V.statusOf(r.body).github), true);
+    await ctl('mode', { connect: { githubAgents: 'token' } });
+    r = await call('/api/connect/github/agents', { agentsUseIt: false });
+    assert.deepEqual([r.code, Object.keys(r.body).sort()], [200, ['ok', 'sentence', 'why']], 'a refusal with no status, as the route’s contract says');
+    await ctl('mode', { connect: null });
+    await call('/api/connect/github/disconnect', {});
+    r = await call('/api/connect/github/agents', { agentsUseIt: true });
+    assert.deepEqual([r.code, r.body], [409, { error: 'GitHub is not connected.' }]);
+    // no agent ready, a missing one installed through "Terminal", and a read that fails
+    await ctl('scenario', { name: 'connect-none' });
+    s = V.statusOf((await call('/api/connect')).body);
+    assert.deepEqual(sentences(s), ['Claude Code 2.1.322 is installed but not signed in. [signin key recheck]', 'Codex is not installed. [install recheck]']);
+    assert.equal(s.ready, false);
+    assert.equal((await call('/api/connect/agents/codex/install', {})).body.opened, true);
+    assert.match(sentences(V.statusOf((await call('/api/connect/recheck', {})).body))[1], /^Codex 0\.166\.0 is installed but not signed in\./);
+    await ctl('scenario', { name: 'connect-fail' });
+    assert.deepEqual([(await call('/api/connect')).code, (await call('/api/connect/recheck', {})).code], [500, 500]);
+  } finally { await mock.close(); }
 });
 
 test('the panel module links (its imports resolve) and touches nothing when it loads', { skip }, async () => {
@@ -580,6 +719,9 @@ test('every colour the panel and its button use clears its minimum on the surfac
     if (!(r >= min)) bad.push(`${theme}: --${fg} ${f} on --${bg} ${b} is ${r.toFixed(2)}, needs ${min}`);
   }
   assert.deepEqual(bad, []);
+  // and scripts/ui-contrast.mjs (with test/ui-contrast.test.mjs) checks every one of them too, at its minimum or more
+  const missing = pairs.filter(([fg, bg, min]) => !PAIRS.some(([f, b, , m = 4.5]) => f === fg && b === bg && m >= min)).map(([fg, bg]) => `--${fg} on --${bg}`);
+  assert.deepEqual(missing, [], 'pairs the contrast script does not check');
   // the panel's colours come only from the looks: every var() it uses is defined in each look
   const block = css.slice(css.indexOf('Agents & keys: the button in the top band'));
   for (const [, name] of block.matchAll(/var\(--([\w-]+)/g)) {

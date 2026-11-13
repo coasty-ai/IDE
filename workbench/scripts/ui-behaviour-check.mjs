@@ -2,8 +2,9 @@
 // drawn, the half-second guard after the core changes, holding the core while the person is busy with it, focus never
 // landing on an answer, failed answers that can be retried, "Look later", stepping with "next", typed words bound to the
 // ask on screen, launch questions answered by id and withdrawn when dropped, the look and detail words, the stale key,
-// rest (no motion while waiting), reduced motion, space to talk, and the keyboard rules. Prints PASS or FAIL per point,
-// then every request the page sent, with its body. Not part of npm test (it needs Chrome). No dependencies.
+// rest (no motion while waiting), reduced motion, space to talk, the keyboard rules, merging, the git screen, and Agents &
+// keys. Prints PASS or FAIL per point, then every request the page sent, with its body (a key's values shown as "••••").
+// Not part of npm test (it needs Chrome). No dependencies.
 //   node scripts/ui-behaviour-check.mjs [--only name] [--log]
 import { startMock } from './ui-mock.mjs';
 import { launch, sleep, errorsOf } from './ui-cdp.mjs';
@@ -44,7 +45,7 @@ const posts = async () => { const l = await ctl('log'); return l; };
 const clearLog = async () => { allPosts.push(...(await posts())); await ctl('clear'); };
 async function open(scenario, { still = false, theme = 'green', detail = 'calm', mode = {} } = {}) {
   await clearLog();
-  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null, ...mode });
+  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null, connect: null, ...mode });
   await ctl('scenario', { name: scenario, push: false });
   await b.ev(`(() => { try { localStorage.setItem('wb-theme', ${JSON.stringify(theme)}); localStorage.setItem('wb-detail', ${JSON.stringify(detail)}); localStorage.setItem('wb-answered', '1'); sessionStorage.removeItem('wb-later'); sessionStorage.removeItem('wb-reviewed'); } catch (e) {} return 1; })()`).catch(() => {});
   await b.goto(`${base}/?t=k${still ? '&still=1' : ''}`, 1600);
@@ -1291,6 +1292,178 @@ try {
     check(GS + 'times on the git screen move on with the clock', /· 3 min ago ·/.test(before) && /· 5 min ago ·/.test(after) && /Merged into main 4 min ago/.test(before) && /Merged into main 6 min ago/.test(after), `"${before}" → "${after}"`);
   });
 
+  // ---------------------------------------------------------------- Agents & keys (the connect panel, the 'connect-*' scenarios)
+  // In 'connect-claude' Claude Code is ready (so the panel does not open by itself) and Codex is signed out; in
+  // 'connect-none' no agent is ready; in 'connect-github' GitHub is connected and git alone uses its token. The panel
+  // opens from the top band's button with the keyboard on its title, and Esc gives the keyboard back; a key typed into the
+  // board's input is never sent; a preset form saves what it shows; no value stays in the page after Save; GitHub's box
+  // acts at once and goes back when refused. Every name starts "Agents & keys: ", so --only 'Agents & keys' runs just
+  // these. The fake keys are made from parts here, so nothing in this file looks like a real one; a check's details name
+  // what was sent, never a value.
+  const AK = 'Agents & keys: ';
+  const KEY_REFUSAL = 'That looks like a key, so it was not sent. Keys go in Agents & keys, where they are kept safe.';
+  const panelOpen = () => b.ev(`!!document.getElementById('connect')?.open`);
+  const panelSaid = () => b.ev(`document.getElementById('connectSaid')?.textContent || ''`);
+  const inPanel = sel => `#connectBody ${sel}`;
+  const fake = (...parts) => parts.join('');
+  const keyRows = () => b.ev(`[...document.querySelectorAll('#connectBody .cn-key .cn-line')].map(e => e.textContent)`);
+  const openPanel = async () => { await click('#connectBtn'); await sleep(900); };
+  /** Type into a field of the panel, as a person does: focus it, then one key at a time. */
+  const typeInto = async (sel, text) => { await b.ev(`document.querySelector(${JSON.stringify(sel)})?.focus(), 1`); await b.type(text); };
+  /** The AWS form, filled in: Add a key, AWS, its two keys and its region. */
+  const fillAws = async (id, secret) => {
+    await click(inPanel('[data-cn="add"]')); await sleep(300);
+    await click(inPanel('[data-cn="preset"][data-preset="aws"]')); await sleep(300);
+    await typeInto(inPanel('[data-var="AWS_ACCESS_KEY_ID"]'), id);
+    await typeInto(inPanel('[data-var="AWS_SECRET_ACCESS_KEY"]'), secret);
+    await typeInto(inPanel('[data-var="AWS_REGION"]'), 'eu-west-2');
+  };
+  /** Where a value could stay on the page: its markup, every field, and the page's storage. [] when it is nowhere. */
+  const valueLeft = v => b.ev(`(() => { const v = ${JSON.stringify(v)}, where = [];
+    if (document.documentElement.outerHTML.includes(v)) where.push('the markup');
+    for (const i of document.querySelectorAll('input, textarea')) if (String(i.value).includes(v)) where.push('the field ' + (i.dataset.var || i.dataset.field || i.id || i.type));
+    for (const s of [sessionStorage, localStorage]) for (let i = 0; i < s.length; i++) if (String(s.getItem(s.key(i))).includes(v)) where.push('the page’s storage');
+    return where; })()`);
+  const awsId = () => fake('AK', 'IA', 'Q4R7', 'T2W9', 'X5Z8', 'C3V6'), awsSecret = () => fake('wJal', 'rXUtnFEMI', 'K7MDENGbPxRfi', 'CYZQ8EXAMPLE');
+
+  await run(AK + 'the top band’s button opens it over the board, with the keyboard on its title, and it reads what is connected', async () => {
+    await open('connect-claude');
+    await sleep(900);
+    const btn = await b.ev(`(() => { const e = document.getElementById('connectBtn'); return e && !e.hidden ? e.getAttribute('aria-label') || '' : ''; })()`);
+    const before = await panelOpen();
+    await b.ev(`document.getElementById('connectBtn').focus(), 1`);
+    await b.key('Enter'); await sleep(900);
+    const opened = await panelOpen(), f = await b.ev(`document.activeElement?.id || ''`);
+    const rows = await b.ev(`[...document.querySelectorAll('#connectBody .cn-agent .cn-line')].map(e => e.textContent)`);
+    const p = (await posts()).filter(x => x.path.startsWith('/api/connect'));
+    check(AK + 'the top band’s button opens it over the board, with the keyboard on its title, and it reads what is connected',
+      btn === 'Agents & keys: Claude Code is ready for new work.' && !before && opened && f === 'connectTitle'
+      && rows[0] === 'Claude Code 2.1.322 is ready, signed in with your Claude subscription.' && rows[1] === 'Codex 0.166.0 is installed but not signed in.'
+      && p.some(x => x.path === '/api/connect/recheck'),
+      `button "${btn}", open ${before} → ${opened}, focus ${f}, rows ${JSON.stringify(rows)}, posts ${JSON.stringify(p.map(x => x.path))}`);
+  });
+
+  await run(AK + 'Esc closes it, and the keyboard goes back to the button that opened it (by keyboard or pointer)', async () => {
+    await open('connect-claude');
+    await sleep(900);
+    await b.ev(`document.getElementById('connectBtn').focus(), 1`);
+    await b.key('Enter'); await sleep(700);
+    const opened = await panelOpen();
+    await b.ev(`document.querySelector('#connectBody [data-cn="agent"][data-agent="codex"][data-action="recheck"]')?.focus(), 1`);
+    const inside = await b.ev(`document.getElementById('connect').contains(document.activeElement) && document.activeElement.id !== 'connectTitle'`);
+    await b.key('Escape'); await sleep(500);
+    const closed = !(await panelOpen()), f = await b.ev(`document.activeElement?.id || ''`);
+    await realClick('#connectBtn'); await sleep(700);
+    const again = await panelOpen();
+    await b.key('Escape'); await sleep(500);
+    const closed2 = !(await panelOpen()), f2 = await b.ev(`document.activeElement?.id || ''`);
+    check(AK + 'Esc closes it, and the keyboard goes back to the button that opened it (by keyboard or pointer)',
+      opened && inside && closed && f === 'connectBtn' && again && closed2 && f2 === 'connectBtn',
+      `opened ${opened}, focus inside ${inside}, closed ${closed} → ${f}; clicked ${again}, closed ${closed2} → ${f2}`);
+  });
+
+  await run(AK + 'a key typed into the board’s input is refused: nothing is sent, the input is emptied, and the panel opens to take it', async () => {
+    await open('connect-claude');
+    await sleep(900);
+    await clearLog();
+    const key = fake('sk-', 'ant-', 'api03-', 'Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh1Jk0Lz');
+    await typeInto('#say', key);
+    await b.key('Enter'); await sleep(900);
+    const p = await posts();
+    const sent = p.filter(x => x.path === '/api/command' || JSON.stringify(x.body || {}).includes(key)).map(x => x.path);
+    const input = await b.ev(`document.getElementById('say').value`);
+    const opened = await panelOpen(), inPanelWords = await panelSaid(), board = await said(), left = await valueLeft(key);
+    check(AK + 'a key typed into the board’s input is refused: nothing is sent, the input is emptied, and the panel opens to take it',
+      sent.length === 0 && input === '' && opened && inPanelWords === KEY_REFUSAL && board.includes(KEY_REFUSAL) && left.length === 0,
+      `sent ${JSON.stringify(sent)}, input emptied ${input === ''}, panel open ${opened} saying "${inPanelWords}", board "${board}", left in ${JSON.stringify(left)}`);
+  });
+
+  await run(AK + 'a preset form saves: AWS sends its preset, its fields (the region as typed), where and who; the key is listed masked', async () => {
+    await open('connect-claude');
+    await sleep(900);
+    await openPanel();
+    await clearLog();
+    const id = awsId(), secret = awsSecret();
+    await fillAws(id, secret);
+    const fields = await b.ev(`[...document.querySelectorAll('#connectBody [data-var]')].map(i => i.dataset.var + ':' + i.type).join(',')`);
+    const choices = await b.ev(`[...document.querySelectorAll('#connectBody input[type="radio"]:checked')].map(i => i.name + '=' + i.value).join(',')`);
+    await click(inPanel('[data-cn="add-save"]')); await sleep(1100);
+    const p = (await posts()).filter(x => x.path.startsWith('/api/connect'));
+    const save = p.filter(x => x.path === '/api/connect/keys'), body = save[0]?.body || {}, v = body.values || {};
+    const sentRight = save.length === 1 && body.preset === 'aws' && body.label === 'AWS' && body.scope === 'all' && body.agents === 'all'
+      && Object.keys(v).sort().join(',') === 'AWS_ACCESS_KEY_ID,AWS_REGION,AWS_SECRET_ACCESS_KEY' && v.AWS_ACCESS_KEY_ID === id && v.AWS_SECRET_ACCESS_KEY === secret && v.AWS_REGION === 'eu-west-2';
+    const rows = await keyRows(), words = await panelSaid(), formGone = !(await b.ev(`!!document.querySelector('#connectBody [data-cn="add-save"]')`));
+    const listed = `AWS for all repositories, given to all agents: AWS_ACCESS_KEY_ID •••• ${id.slice(-4)}, AWS_SECRET_ACCESS_KEY •••• ${secret.slice(-4)}, AWS_REGION eu-west-2`;
+    const after = p.map(x => x.path).lastIndexOf('/api/connect/recheck') > p.indexOf(save[0]);
+    check(AK + 'a preset form saves: AWS sends its preset, its fields (the region as typed), where and who; the key is listed masked',
+      fields === 'AWS_ACCESS_KEY_ID:password,AWS_SECRET_ACCESS_KEY:password,AWS_SESSION_TOKEN:password,AWS_REGION:text' && choices === 'cn-scope=all,cn-given=all'
+      && sentRight && words === 'Saved AWS, for all repositories.' && rows.includes(listed) && formGone && after,
+      `fields ${fields}; ${choices}; ${save.length} sent: ${JSON.stringify({ ...body, values: Object.keys(v) })}, its values as typed ${sentRight}; said "${words}"; rows ${JSON.stringify(rows)}; form closed ${formGone}; checked again after ${after}`);
+  });
+
+  await run(AK + 'no value stays in the page after Save: not in a field, the markup or the page’s storage (a preset form and an agent’s own key)', async () => {
+    await open('connect-claude');
+    await sleep(900);
+    await openPanel();
+    const id = awsId(), secret = awsSecret();
+    await fillAws(id, secret);
+    await click(inPanel('[data-cn="add-save"]')); await sleep(1100);
+    const aws = [...(await valueLeft(id)), ...(await valueLeft(secret))];
+    // "Use an API key" for Claude Code, then Save key
+    const key = fake('sk-', 'ant-', 'api03-', 'Mn7Bv6Cx5Za4Sd3Fg2Hj1Kl0Qw9Er8Ty');
+    await click(inPanel('[data-cn="agent"][data-agent="claude"][data-action="key"]')); await sleep(300);
+    await typeInto(inPanel('[data-field="agent-key"]'), key);
+    await click(inPanel('[data-cn="keysave"][data-agent="claude"]')); await sleep(1100);
+    const sent = (await posts()).filter(x => x.path === '/api/connect/agents/claude/key');
+    const own = await valueLeft(key);
+    const listed = (await keyRows()).find(t => /^Anthropic /.test(t)) || '';
+    // and once it is closed, no password field holds anything
+    await b.key('Escape'); await sleep(500);
+    const filled = await b.ev(`[...document.querySelectorAll('#connect input[type="password"]')].filter(i => i.value).length`);
+    check(AK + 'no value stays in the page after Save: not in a field, the markup or the page’s storage (a preset form and an agent’s own key)',
+      aws.length === 0 && sent.length === 1 && sent[0].body.value === key && own.length === 0
+      && listed === `Anthropic for all repositories, given to Claude Code: ANTHROPIC_API_KEY •••• ${key.slice(-4)}` && filled === 0,
+      `AWS left in ${JSON.stringify(aws)}; the agent's key sent ${sent.length}, as typed ${sent[0]?.body.value === key}, left in ${JSON.stringify(own)}; listed "${listed}"; password fields filled after closing ${filled}`);
+  });
+
+  await run(AK + 'GitHub’s box acts at once: ticking it sends { agentsUseIt: true }; a refusal is said, and the box goes back as it was', async () => {
+    await open('connect-github');
+    await sleep(900);
+    await openPanel();
+    await clearLog();
+    const box = inPanel('input[data-field="gh-share"]');
+    const before = await b.ev(`document.querySelector(${JSON.stringify(box)})?.checked ?? null`);
+    await click(box); await sleep(900);
+    const ticked = await b.ev(`document.querySelector(${JSON.stringify(box)})?.checked ?? null`), saidOn = await panelSaid();
+    // Workbench cannot read the token back from git: { ok: false, why: 'token', sentence }, with no status
+    await ctl('mode', { connect: { githubAgents: 'token' } });
+    await click(box); await sleep(900);
+    const back = await b.ev(`document.querySelector(${JSON.stringify(box)})?.checked ?? null`), saidNo = await panelSaid();
+    await ctl('mode', { connect: null });
+    const p = (await posts()).filter(x => x.path === '/api/connect/github/agents');
+    check(AK + 'GitHub’s box acts at once: ticking it sends { agentsUseIt: true }; a refusal is said, and the box goes back as it was',
+      before === false && ticked === true && saidOn === 'Agents can use your GitHub token now, as GH_TOKEN.'
+      && back === true && saidNo === 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.'
+      && p.length === 2 && JSON.stringify(p[0].body) === '{"agentsUseIt":true}' && JSON.stringify(p[1].body) === '{"agentsUseIt":false}',
+      `${before} → ${ticked} "${saidOn}" → refused: ${back} "${saidNo}"; sent ${JSON.stringify(p.map(x => x.body))}`);
+  });
+
+  await run(AK + 'with no coding agent ready it opens by itself, once, the band’s light is lit, and the lid offers Connect', async () => {
+    await open('connect-none');
+    await sleep(900);
+    const opened = await panelOpen(), lid = await h1(), lidBtn = await b.ev(`${page()}?.querySelector('[data-act="connect"]')?.textContent || ''`);
+    const lit = await b.ev(`document.getElementById('connectBtn')?.classList.contains('need') || false`);
+    await b.key('Escape'); await sleep(500);
+    const closed = !(await panelOpen());
+    await push('snapshot', await ctl('state')); await sleep(700);   // a fresh snapshot, still with no agent ready
+    const again = await panelOpen();
+    await clickIn('[data-act="connect"]'); await sleep(700);
+    const byLid = await panelOpen();
+    check(AK + 'with no coding agent ready it opens by itself, once, the band’s light is lit, and the lid offers Connect',
+      opened && lid === 'Connect a coding agent to start.' && lidBtn === 'Connect' && lit && closed && !again && byLid,
+      `opened ${opened}, lid "${lid}" [${lidBtn}], lit ${lit}, closed ${closed}, opened again by a snapshot ${again}, by the lid's Connect ${byLid}`);
+  });
+
   if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);
   else check('no script errors', true);
 } finally {
@@ -1302,11 +1475,14 @@ try {
 if (args.includes('--log') || !only) {
   console.log('\nEvery request the page sent (method, path, body):');
   const seen = new Set();
+  // Agents & keys: a key's values (value, token, and each of values) are never printed, even these fake ones
+  const hidden = body => (body && typeof body === 'object' ? { ...body, ...('value' in body ? { value: '••••' } : {}), ...('token' in body ? { token: '••••' } : {}),
+    ...(body.values && typeof body.values === 'object' ? { values: Object.fromEntries(Object.keys(body.values).map(k => [k, '••••'])) } : {}) } : body);
   for (const p of allPosts) {
     const shape = `${p.method} ${p.path.replace(/\/api\/agents\/[^/]+\//, '/api/agents/:id/').replace(/\/api\/confirm\/[^/]+/, '/api/confirm/:id').replace(/\/api\/machines\/[^/]+\//, '/api/machines/:id/')} ${JSON.stringify(Object.keys(p.body || {}).sort())} ${p.body && 'go' in p.body ? p.body.go : ''} ${p.body && p.body.confirmId ? 'confirm' : ''}`;
     if (seen.has(shape)) continue;
     seen.add(shape);
-    console.log(`  ${p.method} ${p.path} ${JSON.stringify(p.body)}`);
+    console.log(`  ${p.method} ${p.path} ${JSON.stringify(p.path.startsWith('/api/connect') ? hidden(p.body) : p.body)}`);
   }
 }
 const failed = results.filter(r => !r.ok).length;
