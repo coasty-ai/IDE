@@ -1,6 +1,7 @@
-// What the connect panel ("Agents & keys") shows, from a ConnectStatus: its rows, words and buttons, as markup. Also the
-// snapshot's meta.connect, the top band's light, how a key's values read (masked), what a new key sends, and the words
-// the board says when a key is typed into it.
+// What the connect panel ("Agents & keys") shows, from a ConnectStatus: its rows, words and buttons, as markup (agents'
+// sign-ins in the browser, git missing, GitHub signed in through its own command-line tool or with a token). Also the
+// snapshot's meta.connect, the top band's light, how a key's values read (masked), what a new key sends, what to say
+// when a sign-in ends, and the words the board says when a key is typed into it.
 // Pure: no DOM, and nothing from /shared/. The key presets and the secret check are passed in, so node:test loads this.
 //
 // Everything the server or a person wrote (names, versions, sentences, labels, variable names, logins, commands) goes
@@ -14,6 +15,12 @@ export const KEY_REFUSAL = 'That looks like a key, so it was not sent. Keys go i
 export const KEYS_WARNING = 'Agents can read the keys you give them, and so can anything they run. Give them keys that can do only what their work needs.';
 export const CHECKS_NOTE = 'Checks that Workbench runs on an agent’s work get the same keys as that agent.';
 export const GITHUB_TOKEN_PAGE = 'https://github.com/settings/tokens/new?description=Workbench&scopes=repo';
+/** Where GitHub takes a sign-in's one-time code, when Workbench was given no address of github.com's own. */
+export const GITHUB_DEVICE_PAGE = 'https://github.com/login/device';
+/** Signed in through GitHub's own command-line tool: who uses that sign-in. */
+export const GITHUB_USES = 'Git in Terminal, Workbench and your agents use this sign-in.';
+/** An agent's sign-in in the browser that did not finish (the panel then offers the sign-in in Terminal). */
+export const BROWSER_FAILED = 'The sign-in in the browser did not finish. Sign in in Terminal instead.';
 export const MASK = '••••';
 /** The most a key may hold: 20 names, and values of 2,000 characters. */
 export const MAX_NAMES = 20, MAX_VALUE = 2000;
@@ -21,8 +28,17 @@ export const MAX_NAMES = 20, MAX_VALUE = 2000;
 const AGENT_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const KEY_ID = /^[A-Za-z0-9_.:-]{1,120}$/;
 const VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const ACTIONS = ['signin', 'install', 'key', 'default', 'recheck'];
-export const ACTION_LABEL = { signin: 'Sign in', install: 'Install', key: 'Use an API key', default: 'Use for new work', recheck: 'Check again' };
+/**
+ * An agent's buttons, in the panel's order. The sign-in in Terminal is offered after a sign-in in the browser did not
+ * finish, so it comes first then; "Use your Anthropic Console account" is Claude Code's alone.
+ */
+const ACTIONS = ['signin-terminal', 'signin', 'signin-console', 'install', 'key', 'default', 'recheck'];
+export const ACTION_LABEL = { 'signin-terminal': 'Sign in in Terminal', signin: 'Sign in', 'signin-console': 'Use your Anthropic Console account', install: 'Install',
+  key: 'Use an API key instead', default: 'Use for new work', recheck: 'Check again' };
+/** The ways in: the first one a row draws is its primary button while the agent is not ready. */
+const WAYS_IN = new Set(['signin-terminal', 'signin', 'signin-console', 'install']);
+/** Whose sign-in page an agent's own login opens in the browser. */
+const SIGN_IN_SITE = { claude: 'Claude', codex: 'ChatGPT' };
 
 const str = x => (typeof x === 'string' ? x : '');
 /** Outside words as prose: line breaks, tabs and runs of spaces made one space, then every hidden character shown. */
@@ -102,14 +118,20 @@ export function statusOf(r) {
   return s && typeof s === 'object' && Array.isArray(s.agents) ? s : null;
 }
 
-/** The agents, as the panel draws them; rows whose id does not fit are dropped, and only known actions are kept. */
+/**
+ * The agents, as the panel draws them; rows whose id does not fit are dropped, and only known actions are kept
+ * ("Use your Anthropic Console account" for Claude Code only). `signingIn` is the sign-in in the browser under way
+ * ({ since, browser, sentence }), else null.
+ */
 export function agentsOf(status) {
   const list = status && Array.isArray(status.agents) ? status.agents : [];
   return list.filter(a => a && typeof a === 'object' && typeof a.id === 'string' && AGENT_ID.test(a.id)).map(a => ({
     id: a.id, name: str(a.name) || a.id, found: a.found === true, version: str(a.version), from: str(a.from),
     signedIn: ['yes', 'no', 'unknown'].includes(a.signedIn) ? a.signedIn : 'unknown', how: str(a.how), ready: a.ready === true,
     isDefault: a.isDefault === true, sentence: str(a.sentence),
-    actions: Array.isArray(a.actions) ? ACTIONS.filter(x => a.actions.includes(x)) : [],
+    signingIn: a.signingIn && typeof a.signingIn === 'object'
+      ? { since: Number.isFinite(a.signingIn.since) ? a.signingIn.since : null, browser: a.signingIn.browser === true, sentence: str(a.signingIn.sentence) } : null,
+    actions: Array.isArray(a.actions) ? ACTIONS.filter(x => a.actions.includes(x) && (x !== 'signin-console' || a.id === 'claude')) : [],
   }));
 }
 
@@ -124,22 +146,47 @@ export function agentSentence(a) {
   return `${nm}${ver} is installed, but it cannot start work yet.`;
 }
 
-/** Its light: ready (calm), installed but needing the person, or not installed. */
+/** Its light: signing in (in the browser), ready (calm), installed but needing the person, or not installed. */
 export function agentLight(a) {
+  if (a.signingIn) return { tone: 'work', shape: 'wait', words: 'signing in' };
   if (a.ready) return { tone: 'ok', shape: 'ok', words: 'ready' };
   if (a.found) return { tone: 'need', shape: 'need', words: 'needs you' };
   return { tone: 'word', shape: 'off', words: 'not installed' };
 }
 
-/** What "Use an API key" says about billing, for this agent. */
+/** What "Use an API key instead" says about billing, for this agent. */
 export function agentKeyNote(a) {
   const nm = prose(a.name);
   if (a.id === 'claude') return `${nm} will use this key instead of your Claude subscription, and each request is billed to the key.`;
   return `${nm} will use this key, and each request is billed to it.`;
 }
 
-/** A stamp of what an agent's buttons were drawn for: the page checks it before it sends, and the engine checks again. */
-export const agentStamp = a => `${a.found ? 'found' : 'missing'}-${a.signedIn}-${a.ready ? 'ready' : 'waiting'}${a.isDefault ? '-default' : ''}`;
+/**
+ * While an agent's own login waits in the browser: Workbench's sentence, else "Finish signing in to Claude in your
+ * browser." ("… to ChatGPT …" for Codex).
+ */
+export function agentWaitWords(a) {
+  if (a.signingIn && a.signingIn.sentence.trim()) return prose(a.signingIn.sentence);
+  return `Finish signing in to ${SIGN_IN_SITE[a.id] || prose(a.name)} in your browser.`;
+}
+/** A sign-in in the browser that did not finish: Workbench offers the sign-in in Terminal (signin-terminal) instead. */
+export const agentFailed = a => !a.signingIn && a.actions.includes('signin-terminal');
+/** The words for that, and the button's name: "Terminal" on a Mac, "a terminal" where Workbench cannot open one. */
+export const browserFailedWords = canTerminal => (canTerminal === false ? 'The sign-in in the browser did not finish. Sign in in a terminal instead.' : BROWSER_FAILED);
+export const actionLabel = (x, canTerminal) => (x === 'signin-terminal' && canTerminal === false ? 'Sign in in a terminal' : ACTION_LABEL[x]);
+/** What a way in does, said in its button's title. */
+export function actionTitle(x, a, canTerminal) {
+  if (x === 'signin') return `Opens ${SIGN_IN_SITE[a.id] ? `${SIGN_IN_SITE[a.id]}’s` : 'the'} sign-in page in your browser.`;
+  if (x === 'signin-console') return 'Opens the Anthropic Console’s sign-in page in your browser.';
+  if (x === 'signin-terminal' || x === 'install') return canTerminal === false ? 'Shows the command to run in a terminal.' : 'Opens Terminal, where it runs.';
+  return null;
+}
+
+/**
+ * A stamp of what an agent's buttons were drawn for (found, signed in, ready, default, and a sign-in waiting in the
+ * browser): the page checks it before it sends, and Workbench checks again.
+ */
+export const agentStamp = a => `${a.found ? 'found' : 'missing'}-${a.signedIn}-${a.ready ? 'ready' : 'waiting'}${a.isDefault ? '-default' : ''}${a.signingIn ? '-signing' : ''}`;
 
 // ---------------------------------------------------------------- keys: masked as the store gave them
 /** "•••• " and the last 4 characters of a value of 12 or more; "••••" for a shorter one. */
@@ -274,8 +321,94 @@ export const githubBoxOn = (gh, asked = null, busy = false) => (busy && typeof a
  */
 export function githubShareRequest(status, drawn, checked) {
   const gh = status && status.github && typeof status.github === 'object' ? status.github : null;
-  if (!gh || gh.connected !== true || githubStamp(gh) !== drawn) return null;
+  if (!gh || gh.connected !== true || gh.via === 'gh' || githubStamp(gh) !== drawn) return null;
   return { agentsUseIt: checked === true };
+}
+
+// ---------------------------------------------------------------- GitHub through its own command-line tool, and git
+const GH_PHASES = ['installing', 'code', 'terminal'];
+/** A one-time code as GitHub gives them ("WDJB-MJHT"): letters and digits in groups. Anything else is not shown. */
+const GH_CODE = /^[A-Za-z0-9]{2,12}(?:-[A-Za-z0-9]{2,12}){0,3}$/;
+/** github.com's own addresses only: anything else opens GitHub's device page. */
+export const githubUrl = u => (typeof u === 'string' && /^https:\/\/github\.com\/[^\s"'<>\\]*$/.test(u) ? u : GITHUB_DEVICE_PAGE);
+
+/**
+ * GitHub's part of a status, cleaned: whether it is connected, and how ('gh', signed in through GitHub's command-line
+ * tool, which keeps the sign-in; 'token', milestone 1's token, which Workbench keeps; connected with no `via` is a
+ * token), as whom, whether that tool is here, and the sign-in under way while it is not connected: { phase
+ * ('installing' | 'code' | 'terminal', or null when Workbench sent another), code (shown only when it has a code's
+ * shape), url (github.com's only), sentence }.
+ */
+export function githubOf(status) {
+  const g = status && status.github && typeof status.github === 'object' ? status.github : {};
+  const connected = g.connected === true;
+  const si = !connected && g.signingIn && typeof g.signingIn === 'object' ? g.signingIn : null;
+  const code = si && typeof si.code === 'string' && GH_CODE.test(si.code.trim()) ? si.code.trim() : '';
+  return {
+    connected, via: connected ? (g.via === 'gh' ? 'gh' : 'token') : null, login: str(g.login), agentsUseIt: g.agentsUseIt === true, sentence: str(g.sentence),
+    ghInstalled: typeof g.ghInstalled === 'boolean' ? g.ghInstalled : null,
+    signingIn: si ? { phase: GH_PHASES.includes(si.phase) ? si.phase : null, code, url: githubUrl(si.url), sentence: str(si.sentence) } : null,
+  };
+}
+/**
+ * What GitHub's buttons were drawn for: 'signing' (a sign-in under way: Cancel), 'off' (Sign in to GitHub), or how it
+ * is connected and as whom ('gh:octocat': Sign out). The page checks it before it sends.
+ */
+export const githubState = g => (g.signingIn ? 'signing' : g.connected ? `${g.via}:${prose(g.login)}` : 'off');
+/** "Signed in to GitHub as octocat. Git in Terminal, Workbench and your agents use this sign-in.", or Workbench's own. */
+export function githubSignedWords(g) {
+  if (g.sentence.trim()) return prose(g.sentence);
+  return `Signed in to GitHub${g.login ? ` as ${prose(g.login)}` : ''}. ${GITHUB_USES}`;
+}
+/** The sign-in under way, in words: Workbench's sentence for it, else the panel's own for its phase. */
+export function githubPhaseWords(si) {
+  if (si.sentence.trim() && !(si.phase === 'code' && si.code)) return prose(si.sentence);
+  if (si.phase === 'installing') return 'Getting GitHub’s command-line tool…';
+  if (si.phase === 'terminal') return 'Terminal is open: follow the steps there, then come back.';
+  if (si.phase === 'code') return si.code ? `Your code: ${si.code}` : 'Waiting for a code from GitHub…';
+  return 'Signing in to GitHub…';
+}
+/** Under the code: Workbench's sentence when it does not repeat the code, else how to use it. */
+export function githubCodeNote(si) {
+  if (si.sentence.trim() && !si.sentence.includes(si.code)) return prose(si.sentence);
+  return 'Open GitHub, type the code there and approve the sign-in. The code works for 15 minutes.';
+}
+
+/** git's part of a status: missing only when Workbench says so (installed: false); Install only where it can. */
+export function gitOf(status) {
+  const g = status && status.git && typeof status.git === 'object' ? status.git : {};
+  return { name: str(g.name), email: str(g.email), sentence: str(g.sentence), installed: g.installed !== false, canInstall: g.canInstall === true };
+}
+/** Git missing: Apple's developer tools on a Mac (Install runs Apple's installer), a package manager elsewhere. */
+export const gitMissingWords = (g, platform) => (g.canInstall || platform === 'darwin'
+  ? 'Git is not installed yet. Apple’s developer tools include it.' : 'Git is not installed yet. Install git with your package manager.');
+
+/** Whether a sign-in waits (an agent's in the browser, or GitHub's): the panel then reads the status every 2 seconds. */
+export const signingInWaits = status => !!status && (agentsOf(status).some(a => a.signingIn) || !!githubOf(status).signingIn);
+
+/**
+ * The sign-ins that ended between two statuses, and what to say about each: [{ who (an agent's id, or 'github'), ok,
+ * sentence }]. An agent signed in: "Claude Code is signed in."; one whose sign-in in the browser did not finish (it is
+ * offered the sign-in in Terminal): that sentence; GitHub signed in: its sentence; GitHub not: Workbench's sentence for
+ * it (why, when it says), else "The sign-in to GitHub did not finish.". One cancelled says nothing here: its own answer
+ * does.
+ */
+export function signInEnded(prev, next) {
+  const out = [];
+  if (!prev || !next) return out;
+  const before = new Map(agentsOf(prev).map(a => [a.id, a]));
+  for (const a of agentsOf(next)) {
+    const was = before.get(a.id);
+    if (!was || !was.signingIn || a.signingIn) continue;
+    if (a.signedIn === 'yes') out.push({ who: a.id, ok: true, sentence: `${prose(a.name)} is signed in.` });
+    else if (agentFailed(a)) out.push({ who: a.id, ok: false, sentence: browserFailedWords(next.canOpenTerminal) });
+  }
+  const g0 = githubOf(prev), g1 = githubOf(next);
+  if (g0.signingIn && !g1.signingIn) {
+    if (g1.connected) out.push({ who: 'github', ok: true, sentence: g1.via === 'gh' ? githubSignedWords(g1) : `Connected to GitHub${g1.login ? ` as ${prose(g1.login)}` : ''}.` });
+    else out.push({ who: 'github', ok: false, sentence: g1.sentence.trim() ? prose(g1.sentence) : 'The sign-in to GitHub did not finish.' });
+  }
+  return out;
 }
 
 // The person's own variable names: one that is refused is never repeated (it may be a key typed into the wrong field),
@@ -349,8 +482,9 @@ export function newKeyRequest({ preset, label, entries, scope, given }, presets 
  * a part that did not change (and the field someone is typing in) and replace only the others.
  * @param {object|null} status  a ConnectStatus, or null while the first one is on its way
  * @param {object} v  { open: { keyFor, cmd: { [agentId]: command }, add: { preset, rows } | null, removing, git: { name,
- *   email } as typed | null, ghAgents (the box in "Connect GitHub"), ghShare (what GitHub's box asked for, while that is
- *   on its way) }, busy: Set, presets, signIn (Map from signInNotes), looksLikeSecret, repoName, error (a sentence), canRepo }
+ *   email } as typed | null, ghToken (the token form shown: "Use a token instead"), ghAgents (the box in that form),
+ *   ghShare (what GitHub's box asked for, while that is on its way), ghCmd (GitHub's command to run, when Terminal could
+ *   not open) }, busy: Set, presets, signIn (Map from signInNotes), looksLikeSecret, repoName, error (a sentence), canRepo }
  */
 export function panelParts(status, v = {}) {
   const open = v.open || {}, busy = v.busy || new Set();
@@ -366,20 +500,29 @@ export function panelParts(status, v = {}) {
   push('agents-h', '<h3 class="cn-h" data-k="agents-h">Agents</h3>');
   const agents = agentsOf(status);
   if (!agents.length) push('agents-none', '<div class="cn-part" data-k="agents-none"><p class="cn-note">Workbench did not report any coding agents.</p></div>');
+  const canTerminal = status.canOpenTerminal !== false;
   for (const a of agents) {
     const light = agentLight(a);
     const stamp = agentStamp(a);
-    const firstWay = a.actions.find(x => x === 'signin' || x === 'install');
-    const buttons = a.actions.map(x => {
-      const extra = x === 'key' ? ` aria-expanded="${open.keyFor === a.id}"` : x === 'signin' || x === 'install'
-        ? ` title="${esc(status.canOpenTerminal === false ? 'Shows the command to run in a terminal.' : 'Opens Terminal, where it runs.')}"` : '';
-      return btn(ACTION_LABEL[x], { cn: 'agent', agent: a.id, action: x, state: stamp }, { pri: x === firstWay && !a.ready, busy: busy.has(`agent:${a.id}:${x}`), extra });
+    // while a sign-in waits in the browser, its ways in give way to Cancel (one sign-in at a time)
+    const shown = a.signingIn ? a.actions.filter(x => !WAYS_IN.has(x)) : a.actions;
+    const firstWay = shown.find(x => WAYS_IN.has(x));
+    const cancel = a.signingIn ? btn('Cancel', { cn: 'agent-cancel', agent: a.id, state: stamp }, { busy: busy.has(`agent-cancel:${a.id}`),
+      extra: ` aria-label="${esc(`Cancel the sign-in to ${prose(a.name)}`)}"` }) : '';
+    const buttons = cancel + shown.map(x => {
+      const title = actionTitle(x, a, canTerminal);
+      const extra = x === 'key' ? ` aria-expanded="${open.keyFor === a.id}"` : title ? ` title="${esc(title)}"` : '';
+      return btn(actionLabel(x, canTerminal), { cn: 'agent', agent: a.id, action: x, state: stamp }, { pri: x === firstWay && !a.ready, busy: busy.has(`agent:${a.id}:${x}`), extra });
     }).join('');
     const sub = [a.found && a.from ? `Found in ${prose(a.from)}.` : ''].filter(Boolean).map(esc).join(' ');
     const def = a.isDefault ? `<span class="cn-def">${mark('work', 'work')}<span>Used for new work.</span></span>` : '';
+    const said = agentSentence(a);
+    const failed = agentFailed(a) && !said.includes(browserFailedWords(canTerminal));
+    // what to do next: finish in the browser, or (that did not finish) sign in in Terminal
+    const how = a.signingIn ? `<p class="cn-note cn-step">${esc(agentWaitWords(a))}</p>` : failed ? `<p class="cn-note cn-step">${esc(browserFailedWords(canTerminal))}</p>` : '';
     push(`agent:${a.id}`, `<div class="cn-part cn-agent" data-k="agent:${esc(a.id)}">`
       + `<span class="cn-light" role="img" aria-label="${esc(light.words)}">${mark(light.shape, light.tone)}</span>`
-      + `<div class="cn-txt"><p class="cn-line">${esc(agentSentence(a))}</p>${sub || def ? `<p class="cn-sub">${sub}${sub && def ? ' ' : ''}${def}</p>` : ''}</div>`
+      + `<div class="cn-txt"><p class="cn-line">${esc(said)}</p>${sub || def ? `<p class="cn-sub">${sub}${sub && def ? ' ' : ''}${def}</p>` : ''}${how}</div>`
       + `${buttons ? `<div class="cn-acts">${buttons}</div>` : ''}</div>`);
     if (open.keyFor === a.id && a.actions.includes('key')) {
       push(`agentkey:${a.id}`, `<div class="cn-part cn-form" data-k="agentkey:${esc(a.id)}" data-enter="keysave" data-agent="${esc(a.id)}" role="group" aria-label="${esc(`An API key for ${prose(a.name)}`)}">`
@@ -398,38 +541,25 @@ export function panelParts(status, v = {}) {
 
   // Git and GitHub
   push('git-h', '<h3 class="cn-h" data-k="git-h">Git and GitHub</h3>');
-  const g = status.git && typeof status.git === 'object' ? status.git : {};
-  const gName = str(g.name), gEmail = str(g.email);
-  const gSaid = str(g.sentence).trim() ? prose(g.sentence) : gName && gEmail ? `Git knows you as ${prose(gName)}, ${prose(gEmail)}.` : 'Git does not know your name and email yet.';
-  // what the person typed stays while it is being saved (or was refused); otherwise what git has
-  const typed = open.git && typeof open.git === 'object' ? open.git : null;
-  push('git', `<div class="cn-part cn-form" data-k="git" data-enter="git" role="group" aria-label="Your name and email for git">`
-    + `<p class="cn-line">${esc(gSaid)} Merging needs these.</p><div class="cn-inrow cn-wrap">`
-    + `<label class="cn-f"><span>Name</span><input type="text" class="cn-in" ${FIELD} data-field="git-name" data-key="git-name" value="${esc(typed ? str(typed.name) : gName)}"></label>`
-    + `<label class="cn-f"><span>Email</span><input type="email" class="cn-in" ${FIELD} data-field="git-email" data-key="git-email" value="${esc(typed ? str(typed.email) : gEmail)}"></label>`
-    + btn('Save', { cn: 'git', key: 'git-save' }, { busy: busy.has('git') }) + '</div></div>');
-  const gh = status.github && typeof status.github === 'object' ? status.github : {};
-  if (gh.connected === true) {
-    const login = prose(gh.login);
-    const said = str(gh.sentence).trim() ? prose(gh.sentence) : login ? `Connected to GitHub as ${login}.` : 'Connected to GitHub.';
-    // whether agents get the token: the box acts at once (Workbench keeps the token, so it is not asked for again); it
-    // carries what it was drawn for, and while its change is on its way it shows what was asked, and waits
-    const sharing = busy.has('gh-share');
-    push('gh-on', `<div class="cn-part cn-gh" data-k="gh-on"><h4 class="cn-h4">GitHub</h4><p class="cn-line">${esc(said)}</p>`
-      + `<label class="cn-check"><input type="checkbox" data-field="gh-share" data-key="gh-share" data-state="${esc(githubStamp(gh))}"`
-      + `${githubBoxOn(gh, open.ghShare, sharing) ? ' checked' : ''}${sharing ? ' aria-disabled="true"' : ''}><span>Let agents use this token (as GH_TOKEN)</span></label>`
-      + '<p class="cn-sub cn-under">Copilot may sign in with it.</p>'
-      + `<div class="cn-acts">${btn('Disconnect', { cn: 'gh-disconnect', key: 'gh-disconnect' }, { busy: busy.has('gh-disconnect') })}</div></div>`);
+  const g = gitOf(status);
+  if (!g.installed) {
+    // nothing to name for git until it runs: what to do, and Install where Workbench can start Apple's installer
+    push('git', `<div class="cn-part cn-row" data-k="git"><span class="cn-light" role="img" aria-label="needs you">${mark('need', 'need')}</span>`
+      + `<div class="cn-txt"><p class="cn-line">${esc(gitMissingWords(g, status.platform))}</p></div>`
+      + (g.canInstall ? `<div class="cn-acts">${btn('Install', { cn: 'git-install', key: 'git-install', state: 'missing' }, { pri: true, busy: busy.has('git-install'),
+        extra: ' aria-label="Install git" title="Opens Apple’s installer for its developer tools, which include git."' })}</div>` : '')
+      + '</div>');
   } else {
-    const said = str(gh.sentence).trim() && gh.connected === false ? prose(gh.sentence) : 'Not connected.';
-    push('gh-off', `<div class="cn-part cn-gh cn-form" data-k="gh-off" data-enter="gh-connect" role="group" aria-label="Connect GitHub">`
-      + `<h4 class="cn-h4">GitHub</h4><p class="cn-line">${esc(said)}</p><div class="cn-inrow">`
-      + `<input type="password" class="cn-in" ${FIELD} data-field="gh-token" data-key="gh-token" aria-label="GitHub token" placeholder="Paste a GitHub token here">`
-      + btn('Connect', { cn: 'gh-connect', key: 'gh-connect' }, { pri: true, busy: busy.has('gh-connect') }) + '</div>'
-      + `<label class="cn-check"><input type="checkbox" data-field="gh-agents" data-key="gh-agents"${open.ghAgents === true ? ' checked' : ''}><span>Let agents use this token (as GH_TOKEN)</span></label>`
-      + '<p class="cn-sub cn-under">Copilot may sign in with it.</p>'
-      + `<p class="cn-sub"><a class="cn-link" href="${esc(GITHUB_TOKEN_PAGE)}" target="_blank" rel="noopener noreferrer">Create a token</a> on GitHub, then paste it here. Git uses it to clone and fetch your repositories.</p></div>`);
+    const gSaid = g.sentence.trim() ? prose(g.sentence) : g.name && g.email ? `Git knows you as ${prose(g.name)}, ${prose(g.email)}.` : 'Git does not know your name and email yet.';
+    // what the person typed stays while it is being saved (or was refused); otherwise what git has
+    const typed = open.git && typeof open.git === 'object' ? open.git : null;
+    push('git', `<div class="cn-part cn-form" data-k="git" data-enter="git" role="group" aria-label="Your name and email for git">`
+      + `<p class="cn-line">${esc(gSaid)} Merging needs these.</p><div class="cn-inrow cn-wrap">`
+      + `<label class="cn-f"><span>Name</span><input type="text" class="cn-in" ${FIELD} data-field="git-name" data-key="git-name" value="${esc(typed ? str(typed.name) : g.name)}"></label>`
+      + `<label class="cn-f"><span>Email</span><input type="email" class="cn-in" ${FIELD} data-field="git-email" data-key="git-email" value="${esc(typed ? str(typed.email) : g.email)}"></label>`
+      + btn('Save', { cn: 'git', key: 'git-save' }, { busy: busy.has('git') }) + '</div></div>');
   }
+  githubParts(status, open, busy).forEach(p => push(p.k, p.html));
 
   // Keys for your agents
   push('keys-h', '<h3 class="cn-h" data-k="keys-h">Keys for your agents</h3>');
@@ -448,6 +578,80 @@ export function panelParts(status, v = {}) {
   });
   if (open.add) push('add', addForm(status, open.add, v, busy));
   else push('add', `<div class="cn-part" data-k="add">${btn('Add a key', { cn: 'add', key: 'add' }, { extra: ' aria-expanded="false"' })}</div>`);
+  return parts;
+}
+
+/**
+ * GitHub's parts, as [{ k, html }]:
+ * - signed in through GitHub's command-line tool ('gh-signed'): "Signed in to GitHub as <login>. Git in Terminal,
+ *   Workbench and your agents use this sign-in." (or Workbench's sentence), and Sign out;
+ * - connected with milestone 1's token ('gh-on'): as whom, "Let agents use this token (as GH_TOKEN)" and Disconnect;
+ * - not connected ('gh-off'): Workbench's sentence (a refused install says why there), then the sign-in under way, by
+ *   its phase ("Getting GitHub’s command-line tool…"; "Your code: WDJB-MJHT" with Open GitHub and Copy the code;
+ *   "Terminal is open: …"), with Cancel, or else Sign in to GitHub; and "Use a token instead", which shows milestone
+ *   1's token form as a part of its own ('gh-token'), so a sign-in's progress never redraws a token being typed; and
+ *   the command to run ('gh-cmd') when Workbench gave one instead of opening Terminal.
+ */
+export function githubParts(status, open = {}, busy = new Set()) {
+  const gh = githubOf(status);
+  const parts = [];
+  const head = '<h4 class="cn-h4">GitHub</h4>';
+  if (gh.connected && gh.via === 'gh') {
+    parts.push({ k: 'gh-signed', html: `<div class="cn-part cn-gh" data-k="gh-signed">${head}<p class="cn-line">${esc(githubSignedWords(gh))}</p><div class="cn-acts">`
+      + `${btn('Sign out', { cn: 'gh-signout', key: 'gh-signout', state: githubState(gh) }, { busy: busy.has('gh-signout') })}</div></div>` });
+    return parts;
+  }
+  if (gh.connected) {
+    const login = prose(gh.login);
+    const said = gh.sentence.trim() ? prose(gh.sentence) : login ? `Connected to GitHub as ${login}.` : 'Connected to GitHub.';
+    // whether agents get the token: the box acts at once (Workbench keeps the token, so it is not asked for again); it
+    // carries what it was drawn for, and while its change is on its way it shows what was asked, and waits
+    const sharing = busy.has('gh-share');
+    parts.push({ k: 'gh-on', html: `<div class="cn-part cn-gh" data-k="gh-on">${head}<p class="cn-line">${esc(said)}</p>`
+      + `<label class="cn-check"><input type="checkbox" data-field="gh-share" data-key="gh-share" data-state="${esc(githubStamp(gh))}"`
+      + `${githubBoxOn(gh, open.ghShare, sharing) ? ' checked' : ''}${sharing ? ' aria-disabled="true"' : ''}><span>Let agents use this token (as GH_TOKEN)</span></label>`
+      + '<p class="cn-sub cn-under">Copilot may sign in with it.</p>'
+      + `<div class="cn-acts">${btn('Disconnect', { cn: 'gh-disconnect', key: 'gh-disconnect' }, { busy: busy.has('gh-disconnect') })}</div></div>` });
+    return parts;
+  }
+  const si = gh.signingIn;
+  let body;
+  if (si) {
+    const cancel = btn('Cancel', { cn: 'gh-cancel', key: 'gh-cancel', state: githubState(gh) }, { busy: busy.has('gh-cancel'), extra: ' aria-label="Cancel the sign-in to GitHub"' });
+    if (si.phase === 'code' && si.code) {
+      // the code is GitHub's own, shown on github.com too: not a secret. Open GitHub goes to github.com only.
+      body = `<p class="cn-line cn-codeline">Your code: <span class="cn-code">${esc(si.code)}</span></p><p class="cn-sub">${esc(githubCodeNote(si))}</p><div class="cn-acts">`
+        + `<a class="cn-btn pri" href="${esc(si.url)}" target="_blank" rel="noopener noreferrer" data-key="gh-open" title="${esc(`Opens ${si.url.slice('https://'.length)} in your browser.`)}">Open GitHub</a>`
+        + btn('Copy the code', { cn: 'gh-copy', key: 'gh-copy' }) + cancel + '</div>';
+    } else {
+      body = `<p class="cn-line cn-wait">${mark('wait', 'work')}<span>${esc(githubPhaseWords(si))}</span></p><div class="cn-acts">${cancel}</div>`;
+    }
+  } else {
+    const said = gh.sentence.trim() ? prose(gh.sentence) : 'Not signed in to GitHub.';
+    const note = gh.ghInstalled === false
+      ? 'Workbench first gets GitHub’s command-line tool from GitHub. Then you approve the sign-in on GitHub’s website: there is no token to copy.'
+      : 'You approve the sign-in on GitHub’s website: there is no token to copy.';
+    body = `<p class="cn-line">${esc(said)}</p><div class="cn-acts">${btn('Sign in to GitHub', { cn: 'gh-signin', key: 'gh-signin', state: githubState(gh) }, { pri: true, busy: busy.has('gh-signin') })}</div>`
+      + `<p class="cn-sub">${esc(note)}</p>`;
+  }
+  const tokenOpen = open.ghToken === true;
+  parts.push({ k: 'gh-off', html: `<div class="cn-part cn-gh" data-k="gh-off">${head}${body}`
+    + `<p class="cn-sub"><button type="button" class="cn-textbtn" data-cn="gh-token-toggle" data-key="gh-token-toggle" aria-expanded="${tokenOpen}">Use a token instead</button></p></div>` });
+  const cmd = typeof open.ghCmd === 'string' ? open.ghCmd.trim() : '';
+  if (cmd) {
+    parts.push({ k: 'gh-cmd', html: '<div class="cn-part cn-form" data-k="gh-cmd"><p class="cn-note">Run this in a terminal, then come back here.</p>'
+      + `<div class="cn-inrow"><code class="cn-cmd" tabindex="0" data-scroll="1">${esc(visibleControls(cmd))}</code>${btn('Copy', { cn: 'gh-cmd-copy', key: 'gh-cmd-copy' })}</div></div>` });
+  }
+  if (tokenOpen) {
+    // milestone 1's token form, as it was
+    parts.push({ k: 'gh-token', html: `<div class="cn-part cn-gh cn-form cn-tokenform" data-k="gh-token" data-enter="gh-connect" role="group" aria-label="Connect GitHub with a token">`
+      + '<div class="cn-inrow">'
+      + `<input type="password" class="cn-in" ${FIELD} data-field="gh-token" data-key="gh-token" aria-label="GitHub token" placeholder="Paste a GitHub token here">`
+      + btn('Connect', { cn: 'gh-connect', key: 'gh-connect' }, { pri: true, busy: busy.has('gh-connect') }) + '</div>'
+      + `<label class="cn-check"><input type="checkbox" data-field="gh-agents" data-key="gh-agents"${open.ghAgents === true ? ' checked' : ''}><span>Let agents use this token (as GH_TOKEN)</span></label>`
+      + '<p class="cn-sub cn-under">Copilot may sign in with it.</p>'
+      + `<p class="cn-sub"><a class="cn-link" href="${esc(GITHUB_TOKEN_PAGE)}" target="_blank" rel="noopener noreferrer">Create a token</a> on GitHub, then paste it here. Git uses it to clone and fetch your repositories.</p></div>` });
+  }
   return parts;
 }
 

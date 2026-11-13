@@ -1,8 +1,9 @@
 // The connect panel, "Agents & keys": a modal dialog over the board (and over the git screen, when words typed there
-// open it). It shows which coding agents can start work and how they sign in, git's name and email, GitHub, and the keys
-// agents get, and it acts only through the /api/connect routes. Its words, rows and buttons come from connectview.js
-// (pure); this module draws them, keeps the part someone is typing in, checks a button against what is current before
-// it sends, and sends.
+// open it). It shows which coding agents can start work and how they sign in, whether git is here and its name and
+// email, GitHub, and the keys agents get, and it acts only through the /api/connect routes. Its words, rows and buttons
+// come from connectview.js (pure); this module draws them, keeps the part someone is typing in, checks a button against
+// what is current before it sends, and sends. While a sign-in waits (an agent's in the browser, or GitHub's), it reads
+// the status every 2 seconds, and says how each one ended.
 //
 // Values a person types here (API keys, tokens) are read from their field when sent, and the field is cleared at once:
 // they are never kept in a variable that outlives the request, never said, never logged and never written into markup.
@@ -10,14 +11,18 @@
 import { connectApi } from './api.js';
 import * as presetModule from '/shared/keypresets.mjs';
 import { panelParts, customRow, addForm, statusOf, metaFromStatus, agentsOf, agentStamp, keysOf, signInNotes, agentKeyRequest,
-  gitRequest, githubRequest, githubShareRequest, githubBoxOn, newKeyRequest, keptNames, MAX_NAMES } from './connectview.js';
+  gitRequest, githubRequest, githubShareRequest, githubBoxOn, newKeyRequest, keptNames, MAX_NAMES, githubOf, githubState, gitOf,
+  signingInWaits, signInEnded } from './connectview.js';
 import { visibleControls } from './words.js';
 import { esc } from './util.js';
 
 let ctx = null, el = null;
-// Which forms are open, and the choices made in them (git's name and email as typed, the GitHub box, a new key's preset,
-// name, place and agents, and what GitHub's box asked for while that is on its way): never a key or a token.
-const closedForms = () => ({ keyFor: null, cmd: {}, add: null, removing: null, git: null, ghAgents: false, ghShare: null });
+// Which forms are open, and the choices made in them (git's name and email as typed, the token form and its box, a new
+// key's preset, name, place and agents, and what GitHub's box asked for while that is on its way), and the commands to
+// run where Terminal cannot open: never a key or a token.
+const closedForms = () => ({ keyFor: null, cmd: {}, add: null, removing: null, git: null, ghToken: false, ghAgents: false, ghShare: null, ghCmd: '' });
+/** How often the panel reads the status while a sign-in waits. */
+const POLL_MS = 2000;
 const st = {
   status: null,        // the last ConnectStatus shown
   error: null,         // why there is none yet, in plain words
@@ -27,6 +32,7 @@ const st = {
   busy: new Set(),     // buttons whose request is on its way
   checking: false, again: null, lastCheck: 0, wasReady: null, isOpen: false,
   downOutside: false,  // the pointer went down outside the panel's box (only then does a click there close it)
+  poll: null, polling: false,   // the next read while a sign-in waits, and one on its way
 };
 // The presets and the names agents sign in with come from the shared module, whatever it holds (it is U1's).
 const presets = () => (Array.isArray(presetModule.KEY_PRESETS) ? presetModule.KEY_PRESETS : []);
@@ -87,6 +93,8 @@ export function closeConnect({ toLid = false } = {}) {
 function finish({ toLid = false }) {
   if (!st.isOpen) return;
   st.isOpen = false;
+  clearTimeout(st.poll);
+  st.poll = null;
   // nothing typed here stays on the page once it closes
   for (const i of el.body.querySelectorAll('input[type="password"]')) i.value = '';
   st.open = closedForms();
@@ -136,20 +144,32 @@ async function request(fn, { busyKey = null, quiet = false } = {}) {
   try {
     const r = await fn();
     const s = statusOf(r);
-    let said = !quiet && r && typeof r.sentence === 'string' ? r.sentence : '';
+    const answered = !quiet && r && typeof r.sentence === 'string' ? r.sentence : '';
+    let ended = [], ready = '', readyId = null;
     if (s && seq > st.shownSeq) {
+      const before = st.status;
       st.shownSeq = seq; st.status = s; st.error = null;
+      // sign-ins that ended since the status before: how each ended is said (unless the answer says what it did, as a
+      // cancel does). When an agent's ended at all, the agents are checked again, since a status gives the last check
+      // of them: one that ended may not show its outcome yet.
+      ended = signInEnded(before, s);
+      const waited = new Set(agentsOf(before).filter(a => a.signingIn).map(a => a.id));
+      if (agentsOf(s).some(a => waited.has(a.id) && !a.signingIn) && connectShown()) setTimeout(() => recheck(), 0);
       const meta = metaFromStatus(s);
       if (meta) {
         // the moment an agent becomes ready, say so: the person came here to get one ready
         if (st.wasReady === false && meta.ready && connectShown()) {
           const a = meta.agents.find(x => x.id === meta.defaultAgent && x.ready) || meta.agents.find(x => x.ready);
-          said = [said, `${a ? a.name : 'A coding agent'} is ready. Close this, then say what to work on.`].filter(Boolean).join(' ');
+          readyId = a ? a.id : null;
+          ready = `${a ? a.name : 'A coding agent'} is ready. Close this, then say what to work on.`;
         }
         st.wasReady = meta.ready;
         ctx.onStatus?.(meta);
       }
     }
+    // "Claude Code is signed in." gives way to "Claude Code is ready. Close this, …", which says it and more
+    const endedWords = answered ? [] : ended.filter(x => !(x.ok && x.who === readyId)).map(x => x.sentence);
+    const said = [answered, ...endedWords, ready].filter(Boolean).join(' ');
     if (said) setSaid(said);
     return r && typeof r === 'object' ? r : {};
   } catch (err) {
@@ -159,7 +179,25 @@ async function request(fn, { busyKey = null, quiet = false } = {}) {
   } finally {
     if (busyKey) st.busy.delete(busyKey);
     paint();
+    pollSoon();
   }
+}
+
+/**
+ * While a sign-in waits (an agent's own login in the browser, or GitHub's), read the status again in 2 seconds: one
+ * timer, one read at a time, quiet, and only while the panel is open. What changed is drawn, and how a sign-in ended
+ * is said (request()). A read that failed (its error is said) stops the reading until the next answer comes, from a
+ * button or the check made when the person comes back to the page.
+ */
+function pollSoon() {
+  if (st.poll || st.polling || !connectShown() || !signingInWaits(st.status)) return;
+  st.poll = setTimeout(async () => {
+    st.poll = null;
+    if (!connectShown() || !signingInWaits(st.status)) return;
+    st.polling = true;
+    let r = null;
+    try { r = await request(() => connectApi.status(), { quiet: true }); } finally { st.polling = false; if (r) pollSoon(); }
+  }, POLL_MS);
 }
 const okAnswer = r => !!r && r.ok !== false;
 
@@ -296,9 +334,22 @@ async function act(b) {
       }
       if (action === 'recheck') { recheck({ said: true }); return; }
       if (action === 'default') { const r = await request(() => connectApi.setDefault(a.id), { busyKey: `agent:${a.id}:default` }); if (okAnswer(r)) recheck(); return; }
-      // Sign in and Install open Terminal (macOS); elsewhere the answer carries the command to run
-      const r = await request(() => (action === 'signin' ? connectApi.signin(a.id) : connectApi.install(a.id)), { busyKey: `agent:${a.id}:${action}` });
+      // the ways in, each its own request: Sign in (the agent's own login, in the browser), the Anthropic Console account
+      // (Claude Code), the sign-in in Terminal, and Install (Terminal). Where Terminal cannot open, the answer carries the
+      // command to run.
+      const send = { signin: () => connectApi.signin(a.id), 'signin-console': () => connectApi.signin(a.id, { console: true }),
+        'signin-terminal': () => connectApi.signin(a.id, { terminal: true }), install: () => connectApi.install(a.id) }[action];
+      if (!send) return;
+      const r = await request(send, { busyKey: `agent:${a.id}:${action}` });
       if (r && typeof r.command === 'string' && r.command.trim()) { st.open.cmd = { ...st.open.cmd, [a.id]: r.command.trim() }; paint(); }
+      return;
+    }
+    case 'agent-cancel': {
+      // Cancel stops the sign-in waiting in the browser, while it still waits
+      const a = agentsOf(s).find(x => x.id === agentId);
+      if (!a || !a.signingIn || agentStamp(a) !== b.dataset.state) { changed(); return; }
+      const r = await request(() => connectApi.cancelSignin(a.id), { busyKey: `agent-cancel:${a.id}` });
+      if (okAnswer(r)) focusKey(`agent:${a.id}:signin`);
       return;
     }
     case 'keycancel': st.open.keyFor = null; paint(); focusKey(`agent:${agentId}:key`); return;
@@ -314,6 +365,13 @@ async function act(b) {
       return;
     }
     case 'copy': copyCommand(agentId); return;
+    case 'git-install': {
+      // Apple's installer opens (a Mac); the panel checks again when the person comes back
+      const g = gitOf(s);
+      if (!s || g.installed || !g.canInstall) { changed(); return; }
+      await request(() => connectApi.gitInstall(), { busyKey: 'git-install' });
+      return;
+    }
     case 'git': {
       const part = partOf('git');
       const name = part?.querySelector('[data-field="git-name"]')?.value, email = part?.querySelector('[data-field="git-email"]')?.value;
@@ -324,8 +382,45 @@ async function act(b) {
       if (okAnswer(r)) { st.open.git = null; paint(); }
       return;
     }
+    case 'gh-signin': {
+      // GitHub's own command-line tool signs in (Workbench gets it first when it is missing): the answer comes at once,
+      // and the status then says how far it is ("Getting GitHub’s command-line tool…", the code, or Terminal)
+      const g = githubOf(s);
+      if (!s || githubState(g) !== b.dataset.state || g.connected || g.signingIn) { changed(); return; }
+      const r = await request(() => connectApi.githubSignIn(), { busyKey: 'gh-signin' });
+      if (r && typeof r.command === 'string' && r.command.trim()) { st.open.ghCmd = r.command.trim(); paint(); }
+      if (okAnswer(r)) focusKey('gh-open');
+      return;
+    }
+    case 'gh-cancel': {
+      if (!githubOf(s).signingIn) { changed(); return; }
+      const r = await request(() => connectApi.githubSignInCancel(), { busyKey: 'gh-cancel' });
+      if (okAnswer(r)) focusKey('gh-signin');
+      return;
+    }
+    case 'gh-copy': {
+      const si = githubOf(s).signingIn;
+      if (!si || si.phase !== 'code' || !si.code) { changed(); return; }
+      copyText(si.code, partOf('gh-off')?.querySelector('.cn-code'), 'Copied the code. Paste it on GitHub’s page.', 'The code is selected. Copy it, then paste it on GitHub’s page.');
+      return;
+    }
+    case 'gh-signout': {
+      const g = githubOf(s);
+      if (!g.connected || g.via !== 'gh' || githubState(g) !== b.dataset.state) { changed(); return; }
+      const r = await request(() => connectApi.githubSignOut(), { busyKey: 'gh-signout' });
+      if (okAnswer(r)) focusKey('gh-signin');
+      return;
+    }
+    case 'gh-token-toggle': {
+      // "Use a token instead": milestone 1's token form, for computers where GitHub's command-line tool cannot run
+      st.open.ghToken = !st.open.ghToken;
+      paint();
+      if (st.open.ghToken) focusKey('gh-token');
+      return;
+    }
+    case 'gh-cmd-copy': copyText(st.open.ghCmd, partOf('gh-cmd')?.querySelector('code'), 'Copied. Paste it in a terminal.', 'The command is selected. Copy it, then paste it in a terminal.'); return;
     case 'gh-connect': {
-      const part = partOf('gh-off');
+      const part = partOf('gh-token');
       const input = part?.querySelector('[data-field="gh-token"]');
       if (!input) { changed(); return; }
       const q = githubRequest(input.value);
@@ -334,7 +429,7 @@ async function act(b) {
       st.open.ghAgents = agentsUseIt;
       input.value = '';
       const r = await request(() => connectApi.github(q.token, agentsUseIt), { busyKey: 'gh-connect' });
-      if (okAnswer(r)) { st.open.ghAgents = false; paint(); focusKey('gh-disconnect'); recheck(); }
+      if (okAnswer(r)) { st.open.ghAgents = false; st.open.ghToken = false; paint(); focusKey('gh-disconnect'); recheck(); }
       return;
     }
     case 'gh-disconnect': {
@@ -438,12 +533,17 @@ async function saveKey() {
 async function copyCommand(agentId) {
   const cmd = st.open.cmd[agentId];
   if (!cmd) return;
+  await copyText(cmd, partOf(`agentcmd:${agentId}`)?.querySelector('code'), 'Copied. Paste it in a terminal.', 'The command is selected. Copy it, then paste it in a terminal.');
+}
+
+/** Some text shown in the panel (a command, GitHub's code) to the clipboard; where that is refused, it is selected. */
+async function copyText(text, shown, copied, selected) {
+  if (!text) return;
   try {
-    await navigator.clipboard.writeText(cmd);
-    setSaid('Copied. Paste it in a terminal.');
+    await navigator.clipboard.writeText(text);
+    setSaid(copied);
   } catch {
-    const code = partOf(`agentcmd:${agentId}`)?.querySelector('code');
-    if (code) { const r = document.createRange(); r.selectNodeContents(code); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); }
-    setSaid('The command is selected. Copy it, then paste it in a terminal.');
+    if (shown) { const r = document.createRange(); r.selectNodeContents(shown); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); }
+    setSaid(selected);
   }
 }
