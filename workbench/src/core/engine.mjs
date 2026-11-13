@@ -3510,6 +3510,8 @@ export class Engine extends EventEmitter {
         const words = String(intent.text ?? '').trim();
         // Found without its name, or with no clear break before the message: ask first ("Tell Flaky test “…”?").
         if (intent.sure === false) return this._proposeIntent({ kind: 'say', agentId: v.id, text: words });
+        // The yes to a card made before a key was stored: words that hold it now go nowhere, as in say().
+        if (this._looksLikeKey(words)) return { reply: SECRET_REFUSED, openConnect: true };
         const r = await this._say(v, words);
         return { reply: r.reply, focusId: v.id };
       }

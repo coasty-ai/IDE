@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Engine } from '../src/core/engine.mjs';
 import { Store } from '../src/core/store.mjs';
+import * as historyMod from '../src/core/history.mjs';
 import { EV } from '../src/shared/events.mjs';
 import { describeRequest } from '../src/shared/narrate.mjs';
 import { looksLikeSecret } from '../src/shared/secretshape.mjs';
@@ -56,7 +57,7 @@ class FakeConnect extends EventEmitter {
 }
 
 /** A live engine with stand-in adapters and deps. Call engine.shutdown() at the end. */
-function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = null, log = null, history = null } = {}) {
+function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = null, log = null, history = null, options = {}, repo = REPO } = {}) {
   const store = new Store(logPath ? { logPath } : {});
   const claude = adapters ? adapters.claude : fakeAdapter('claude');
   const codex = adapters ? adapters.codex : fakeAdapter('codex');
@@ -65,9 +66,9 @@ function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = n
   const notices = [];
   store.on('notice', n => notices.push(n.text));
   const engine = new Engine({
-    store, mode: 'live', repo: REPO, hook: HOOK, defaultBudgetUsd: 2,
+    store, mode: 'live', repo, hook: HOOK, defaultBudgetUsd: 2,
     adapters: adapters || { claude, codex }, machines: new FakeMachines(), deps, connect, log,
-    options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20 },
+    options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
   return { store, engine, claude, codex, deps, calls, notices, connect };
 }
@@ -415,30 +416,34 @@ test('text that holds a stored key’s value is refused like a key, though it ha
   const connect = new FakeConnect({ def: 'claude' });
   const k = live({ connect, logPath, log: (level, ...args) => logs.push([level, ...args.map(a => (a instanceof Error ? a.stack : String(a)))].join(' ')) });
   await k.engine.start();
+  const v = await k.engine.startAgent({ task: 'Fix the staging login' });
+  const runner = k.claude.runners[0];
 
-  // Before it is stored, the same words are work, and the card quotes them.
+  // Before it is stored, the same words are work, or a message, and their cards quote them.
   k.deps.commands.intent = { kind: 'task', task: words };
   const before = await k.engine.command(words);
   assert.ok(before.confirm, before.reply);
+  k.deps.commands.intent = { kind: 'say', agentId: v.id, text: `the password is ${value}`, sure: false };
+  const tell = await k.engine.command(`tell it the password is ${value}`);
+  assert.equal(tell.confirm?.kind, 'say', tell.reply);
 
   connect.values.push(value); // the person saves it in Agents & keys
   const parsed = k.calls.parse.length;
   assert.deepEqual(await k.engine.command(words), { reply: SECRET, openConnect: true });
   assert.equal(k.calls.parse.length, parsed, 'not even read as words');
 
-  // The card from before: its yes starts nothing, and the reply does not quote the task.
+  // The cards from before: their yes starts nothing and sends nothing, and the reply does not quote the words.
   const yes = await k.engine.confirm(before.confirm.id, true);
   assert.equal(yes.reply, SECRET);
   assert.equal(yes.openConnect, true);
+  assert.deepEqual(await k.engine.confirm(tell.confirm.id, true), { reply: SECRET, openConnect: true });
   // Given straight to the launch, as the task or as the agent's name.
   await assert.rejects(k.engine.startAgent({ task: words }), { message: SECRET, openConnect: true });
   await assert.rejects(k.engine.startAgent({ task: 'Fix the staging login', name: value }), { message: SECRET, openConnect: true });
-  assert.equal(k.claude.runners.length, 0, 'no runner got it');
-  assert.equal(k.calls.createWorkspace.length, 0, 'no branch or folder was named after it');
+  assert.equal(k.claude.runners.length, 1, 'no runner got it');
+  assert.equal(k.calls.createWorkspace.length, 1, 'no branch or folder was named after it');
 
   // In the reply box: as a message, or as an answer.
-  const v = await k.engine.startAgent({ task: 'Fix the staging login' });
-  const runner = k.claude.runners[0];
   assert.deepEqual(await k.engine.say(v.id, `the password is ${value}`), { ok: false, reply: SECRET, openConnect: true });
   assert.deepEqual(await k.engine.answer(v.id, { answer: value }), { ok: false, reply: SECRET, openConnect: true });
   assert.deepEqual(runner.sent, [], 'nothing reached the agent');
@@ -452,21 +457,24 @@ test('text that holds a stored key’s value is refused like a key, though it ha
 
 // ------------------------------------------------------------------ text kept from before a key was stored
 
+/** An earlier agent's history record whose words hold `value`, kept before it was stored as a key. */
+const earlierRecord = (value) => ({
+  id: 'e2e2e2', name: `Use ${value}`, task: `use ${value} to fix the staging login`, harness: 'claude', model: null, machineId: 'laptop',
+  startedAt: 1000, endedAt: 2000, state: 'checks_failed', stateReason: `It printed ${value}`, says: `I signed in with ${value}.`,
+  files: { changed: 1, adds: 1, dels: 0, list: [{ path: 'src/login.js', adds: 1, dels: 0 }] },
+  checks: { state: 'failed', results: [{ name: `sign in with ${value}`, ok: false, ms: 5 }] },
+  rules: { kept: [{ say: `Never print ${value}` }], broken: [{ say: `Keep ${value} out of the logs`, paths: [`notes/${value}.txt`] }] },
+  approvals: { auto: 0, byYou: 1, denied: 0 }, usage: {}, sessionId: 'session-2', budgetUsd: 2, turns: 1, toolCalls: 3, savedAt: 2000,
+  workspace: { path: '/wt/shop/use-e2e2e2', branch: 'workbench/use-e2e2e2', base: FAKE_BASE, since: FAKE_BASE, from: 'main' },
+  work: {
+    branch: 'workbench/use-e2e2e2', from: 'main', folder: true, merged: null, thrownAway: null,
+    problem: { why: 'conflict', sentence: `It does not merge cleanly: ${value}`, paths: [`notes/${value}.txt`], into: 'main', at: 1500 },
+  },
+});
+
 test('history restored at start is masked with the keys stored now, and goes back to the history file masked', async () => {
   const value = passphrase();
-  const rec = {
-    id: 'e2e2e2', name: `Use ${value}`, task: `use ${value} to fix the staging login`, harness: 'claude', model: null, machineId: 'laptop',
-    startedAt: 1000, endedAt: 2000, state: 'checks_failed', stateReason: `It printed ${value}`, says: `I signed in with ${value}.`,
-    files: { changed: 1, adds: 1, dels: 0, list: [{ path: 'src/login.js', adds: 1, dels: 0 }] },
-    checks: { state: 'failed', results: [{ name: `sign in with ${value}`, ok: false, ms: 5 }] },
-    rules: { kept: [{ say: `Never print ${value}` }], broken: [{ say: `Keep ${value} out of the logs`, paths: [`notes/${value}.txt`] }] },
-    approvals: { auto: 0, byYou: 1, denied: 0 }, usage: {}, sessionId: 'session-2', budgetUsd: 2, turns: 1, toolCalls: 3, savedAt: 2000,
-    workspace: { path: '/wt/shop/use-e2e2e2', branch: 'workbench/use-e2e2e2', base: FAKE_BASE, since: FAKE_BASE, from: 'main' },
-    work: {
-      branch: 'workbench/use-e2e2e2', from: 'main', folder: true, merged: null, thrownAway: null,
-      problem: { why: 'conflict', sentence: `It does not merge cleanly: ${value}`, paths: [`notes/${value}.txt`], into: 'main', at: 1500 },
-    },
-  };
+  const rec = earlierRecord(value);
   let source = null;
   let scheduled = 0;
   const history = {
@@ -505,6 +513,27 @@ test('history restored at start is masked with the keys stored now, and goes bac
   assert.equal(p.store.get('e2e2e2').says, rec.says);
   assert.equal(plainScheduled, 0);
   await p.engine.shutdown();
+});
+
+test('the history file itself loses a key stored after it was written, at the next write', async (t) => {
+  const dir = scratch(t);
+  const value = passphrase();
+  const repo = { ...REPO, root: path.join(dir, 'shop') }; // the history file is named after the real folder
+  fs.mkdirSync(repo.root);
+  const file = historyMod.historyFile(repo.root, { dir: path.join(dir, 'history') });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ version: historyMod.VERSION, repo: repo.root, agents: [earlierRecord(value)] }));
+  const h = live({
+    connect: new FakeConnect({ values: [value], def: 'claude' }), history: historyMod, repo,
+    options: { historyDir: path.join(dir, 'history'), historyDebounceMs: 10_000 },
+  });
+  await h.engine.start();
+  assert.equal(h.store.get('e2e2e2').says, 'I signed in with •••• 4817.');
+  await h.engine.shutdown();
+  const text = fs.readFileSync(file, 'utf8');
+  assert.ok(!text.includes(value), 'no longer in the file');
+  assert.equal(JSON.parse(text).agents[0].says, 'I signed in with •••• 4817.');
+  assert.equal(JSON.parse(text).agents[0].workspace.branch, 'workbench/use-e2e2e2');
 });
 
 test('a merge’s commit message hides the stored keys, even in words the agent said before the key was saved', async (t) => {
