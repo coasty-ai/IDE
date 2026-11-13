@@ -10,6 +10,7 @@ import path from 'node:path';
 import { Engine } from '../src/core/engine.mjs';
 import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
+import { describeRequest } from '../src/shared/narrate.mjs';
 import { FakeMachines, FakeSim, fakeAdapter, fakeDeps, gate, until, FAKE_BASE } from './helpers/engine-fakes.mjs';
 
 const REPO = { root: '/repos/shop', name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 0 };
@@ -421,6 +422,30 @@ test('the stored keys are hidden in every event before the store: the page, the 
     assert.ok(!text.includes(value), `no key in ${what}`);
     assert.ok(text.includes('•••• K9Q2'), `${what} shows where it was`);
   }
+});
+
+test('a permission’s detail is described with the keys hidden first, so a key the description cuts short never shows in part', async () => {
+  const value = storedValue();
+  const connect = new FakeConnect({ values: [value], def: 'claude' });
+  const t = live({ connect });
+  // As the real policy does: the detail of a tool it does not know is its input as JSON, cut at 300 characters.
+  t.deps.policy.decide = (req) => {
+    t.calls.decide.push(req);
+    return { decision: 'ask', reason: 'Unknown tool.', sentence: 'wants to use db (query)', detail: describeRequest(req.tool, req.input).detail };
+  };
+  const v = await t.engine.startAgent({ task: 'Fix the cart total' });
+  // The value starts at character 280 of the JSON, so the cut at 299 falls inside it.
+  const input = { query: `${'x'.repeat(270)}${value}` };
+  assert.ok(describeRequest('mcp__db__query', input).detail.includes(value.slice(0, 12)), 'the raw description holds part of it');
+  const answer = t.engine.hookPreToolUse(v.id, { tool_name: 'mcp__db__query', tool_input: input });
+  await until(() => t.store.get(v.id).ask?.type === 'permission');
+  assert.equal(t.calls.decide.at(-1).input.query, input.query, 'the policy judged the input as it is');
+  const ask = t.store.get(v.id).ask;
+  assert.ok(ask.detail.endsWith('•••• K9Q2"}'), ask.detail.slice(-40));
+  assert.ok(!ask.detail.includes(value.slice(0, 8)), 'no part of the value');
+  await t.engine.answer(v.id, { askId: ask.id, answer: 'Deny' });
+  await answer;
+  await t.engine.shutdown();
 });
 
 test('a mask that fails hides nothing and stops nothing, and the warning never quotes the text', async () => {
