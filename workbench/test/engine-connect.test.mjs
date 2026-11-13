@@ -9,8 +9,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { Engine } from '../src/core/engine.mjs';
 import { Store } from '../src/core/store.mjs';
+import * as historyMod from '../src/core/history.mjs';
 import { EV } from '../src/shared/events.mjs';
 import { describeRequest } from '../src/shared/narrate.mjs';
+import { looksLikeSecret } from '../src/shared/secretshape.mjs';
 import { FakeMachines, FakeSim, fakeAdapter, fakeDeps, gate, until, FAKE_BASE } from './helpers/engine-fakes.mjs';
 
 const REPO = { root: '/repos/shop', name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 0 };
@@ -23,6 +25,13 @@ const HELP = 'Say what to work on, like “fix the login bug”. Or ask “what 
 const typedKey = () => ['sk', 'ant', 'api03', `${'x'.repeat(24)}Q7Zd`].join('-');
 /** A made-up stored value an agent might print: not shaped like any key, so only the mask can find it. */
 const storedValue = () => ['stored', 'v'.repeat(20), 'K9Q2'].join('-');
+/** A made-up stored password the person might type: words and digits joined by dashes, which no key's shape matches. */
+const passphrase = () => ['maple', 'river', 'stone', 'cloud', '4817'].join('-');
+/** Codex as Connect's 'agents' event gives it when it runs but says it is not signed in. */
+const CODEX_SIGNED_OUT = Object.freeze({
+  ok: false, ready: false, found: true, signedIn: 'no', how: null, version: '0.166.0', loggedIn: false,
+  reason: 'Codex 0.166.0 is installed but not signed in.',
+});
 
 /** Connect, as the engine sees it: envFor, mask, defaultAgent, and its 'changed' event. */
 class FakeConnect extends EventEmitter {
@@ -48,7 +57,7 @@ class FakeConnect extends EventEmitter {
 }
 
 /** A live engine with stand-in adapters and deps. Call engine.shutdown() at the end. */
-function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = null, log = null, history = null } = {}) {
+function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = null, log = null, history = null, options = {}, repo = REPO } = {}) {
   const store = new Store(logPath ? { logPath } : {});
   const claude = adapters ? adapters.claude : fakeAdapter('claude');
   const codex = adapters ? adapters.codex : fakeAdapter('codex');
@@ -57,9 +66,9 @@ function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = n
   const notices = [];
   store.on('notice', n => notices.push(n.text));
   const engine = new Engine({
-    store, mode: 'live', repo: REPO, hook: HOOK, defaultBudgetUsd: 2,
+    store, mode: 'live', repo, hook: HOOK, defaultBudgetUsd: 2,
     adapters: adapters || { claude, codex }, machines: new FakeMachines(), deps, connect, log,
-    options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20 },
+    options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
   return { store, engine, claude, codex, deps, calls, notices, connect };
 }
@@ -298,6 +307,64 @@ test('“help” is answered with what to say, “connect” opens Agents & keys
   await t.engine.shutdown();
 });
 
+test('“start codex” with no task keeps the agent it names: it asks what Codex should work on, or says why Codex cannot start', async () => {
+  const codex = fakeAdapter('codex', { available: { ok: false, reason: 'Codex was not found.' } });
+  const t = live({ adapters: { claude: fakeAdapter('claude'), codex } });
+  await t.engine.start();
+  const noTask = (harness) => ({ kind: 'start', tasks: [], task: null, harness });
+  // Codex cannot run here: the same reply as work that names it, and Agents & keys opens. The follow-up never reaches
+  // another agent, because nothing asked for one.
+  t.deps.commands.intent = noTask('codex');
+  assert.deepEqual(await t.engine.command('start codex'), { reply: 'Codex is not available on this computer. Connect it in Agents & keys.', openConnect: true });
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
+  assert.deepEqual(await t.engine.command('fix the docs with codex'), { reply: 'Codex is not available on this computer. Connect it in Agents & keys.', openConnect: true });
+  // One that can run is asked about by name; no agent named, as before.
+  t.deps.commands.intent = noTask('claude');
+  assert.deepEqual(await t.engine.command('start claude'), { reply: 'What should Claude Code work on?' });
+  t.deps.commands.intent = noTask(null);
+  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should the agent work on?' });
+  // Signed out, as Connect says it: the same words as work that names it.
+  t.engine.setHarnesses({ codex: CODEX_SIGNED_OUT });
+  t.deps.commands.intent = noTask('codex');
+  assert.deepEqual(await t.engine.command('use codex'), { reply: 'Codex 0.166.0 is installed but not signed in. Sign in in Agents & keys.', openConnect: true });
+  // Signed in: asked about by name, even when Claude Code, the default, is gone meanwhile.
+  t.engine.setHarnesses({ claude: { ok: false, reason: 'Claude Code is not installed.' }, codex: { ok: true, ready: true, found: true, signedIn: 'yes', how: 'your ChatGPT account', version: '0.166.0' } });
+  assert.deepEqual(await t.engine.command('start codex'), { reply: 'What should Codex work on?' });
+  t.deps.commands.intent = noTask('claude');
+  assert.deepEqual(await t.engine.command('start claude'), { reply: 'Claude Code is not available on this computer. Connect it in Agents & keys.', openConnect: true });
+  await t.engine.shutdown();
+});
+
+test('naming an agent that is installed but signed out says so, and where to sign in, instead of “not available”', async () => {
+  const connect = new FakeConnect({ def: 'claude' });
+  const t = live({ connect });
+  await t.engine.start();
+  t.engine.setHarnesses({ codex: CODEX_SIGNED_OUT });
+  const SIGNED_OUT = 'Codex 0.166.0 is installed but not signed in. Sign in in Agents & keys.';
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
+  assert.deepEqual(await t.engine.command('fix the docs with codex'), { reply: SIGNED_OUT, openConnect: true });
+  await assert.rejects(t.engine.startAgent({ task: 'Fix the docs', harness: 'codex' }), { message: SIGNED_OUT, openConnect: true });
+  // Signed out between the card and the yes.
+  t.engine.setHarnesses({ codex: { ok: true, ready: true, found: true, signedIn: 'yes', version: '0.166.0' } });
+  const card = await t.engine.command('fix the docs with codex');
+  assert.ok(card.confirm, card.reply);
+  t.engine.setHarnesses({ codex: CODEX_SIGNED_OUT });
+  const yes = await t.engine.confirm(card.confirm.id, true);
+  assert.equal(yes.reply, `I could not start the agent for “fix the docs”: ${SIGNED_OUT}`);
+  assert.equal(yes.openConnect, true);
+  // Without a plain sentence of Connect's own about it, Workbench words it itself.
+  t.engine.setHarnesses({ codex: { ...CODEX_SIGNED_OUT, reason: 'not signed in\nrun codex login' } });
+  assert.equal((await t.engine.command('fix the docs with codex')).reply, 'Codex is installed but not signed in. Sign in in Agents & keys.');
+  t.engine.setHarnesses({ codex: { ...CODEX_SIGNED_OUT, reason: undefined } });
+  assert.equal((await t.engine.command('fix the docs with codex')).reply, 'Codex is installed but not signed in. Sign in in Agents & keys.');
+  // A program that is not there, or does not run, is still not available on this computer.
+  t.engine.setHarnesses({ codex: { ok: false, ready: false, found: false, signedIn: 'unknown', how: null, reason: 'Codex is not installed.' } });
+  assert.deepEqual(await t.engine.command('fix the docs with codex'), { reply: 'Codex is not available on this computer. Connect it in Agents & keys.', openConnect: true });
+  await assert.rejects(t.engine.startAgent({ task: 'Fix the docs', harness: 'codex' }), { message: 'Codex is not available on this computer.' });
+  assert.equal(t.codex.runners.length, 0, 'Codex never started');
+  await t.engine.shutdown();
+});
+
 // ------------------------------------------------------------------ typed keys
 
 test('a key typed into the board is never sent, parsed, kept or logged, and Agents & keys opens', async (t) => {
@@ -337,6 +404,157 @@ test('a key typed into the board is never sent, parsed, kept or logged, and Agen
   const everything = [JSON.stringify(k.store.list()), fs.readFileSync(logPath, 'utf8'), logs.join('\n'), k.notices.join('\n')].join('\n');
   assert.ok(!everything.includes(key), 'the key is nowhere');
   assert.ok(!everything.includes(key.slice(-12)), 'not even in part');
+});
+
+test('text that holds a stored key’s value is refused like a key, though it has no key’s shape: no card, runner, branch or folder', async (t) => {
+  const dir = scratch(t);
+  const logPath = path.join(dir, 'events.jsonl');
+  const logs = [];
+  const value = passphrase();
+  const words = `use ${value} to fix the staging login`;
+  assert.equal(looksLikeSecret(words).secret, false, 'only the mask can find it');
+  const connect = new FakeConnect({ def: 'claude' });
+  const k = live({ connect, logPath, log: (level, ...args) => logs.push([level, ...args.map(a => (a instanceof Error ? a.stack : String(a)))].join(' ')) });
+  await k.engine.start();
+  const v = await k.engine.startAgent({ task: 'Fix the staging login' });
+  const runner = k.claude.runners[0];
+
+  // Before it is stored, the same words are work, or a message, and their cards quote them.
+  k.deps.commands.intent = { kind: 'task', task: words };
+  const before = await k.engine.command(words);
+  assert.ok(before.confirm, before.reply);
+  k.deps.commands.intent = { kind: 'say', agentId: v.id, text: `the password is ${value}`, sure: false };
+  const tell = await k.engine.command(`tell it the password is ${value}`);
+  assert.equal(tell.confirm?.kind, 'say', tell.reply);
+
+  connect.values.push(value); // the person saves it in Agents & keys
+  const parsed = k.calls.parse.length;
+  assert.deepEqual(await k.engine.command(words), { reply: SECRET, openConnect: true });
+  assert.equal(k.calls.parse.length, parsed, 'not even read as words');
+
+  // The cards from before: their yes starts nothing and sends nothing, and the reply does not quote the words.
+  const yes = await k.engine.confirm(before.confirm.id, true);
+  assert.equal(yes.reply, SECRET);
+  assert.equal(yes.openConnect, true);
+  assert.deepEqual(await k.engine.confirm(tell.confirm.id, true), { reply: SECRET, openConnect: true });
+  // Given straight to the launch, as the task or as the agent's name.
+  await assert.rejects(k.engine.startAgent({ task: words }), { message: SECRET, openConnect: true });
+  await assert.rejects(k.engine.startAgent({ task: 'Fix the staging login', name: value }), { message: SECRET, openConnect: true });
+  assert.equal(k.claude.runners.length, 1, 'no runner got it');
+  assert.equal(k.calls.createWorkspace.length, 1, 'no branch or folder was named after it');
+
+  // In the reply box: as a message, or as an answer.
+  assert.deepEqual(await k.engine.say(v.id, `the password is ${value}`), { ok: false, reply: SECRET, openConnect: true });
+  assert.deepEqual(await k.engine.answer(v.id, { answer: value }), { ok: false, reply: SECRET, openConnect: true });
+  assert.deepEqual(runner.sent, [], 'nothing reached the agent');
+
+  await k.engine.shutdown();
+  k.store.close();
+  await until(() => fs.existsSync(logPath) && fs.readFileSync(logPath, 'utf8').includes(SECRET));
+  const everything = [JSON.stringify(k.store.list()), fs.readFileSync(logPath, 'utf8'), logs.join('\n'), k.notices.join('\n')].join('\n');
+  assert.ok(!everything.includes(value), 'the value is nowhere');
+});
+
+// ------------------------------------------------------------------ text kept from before a key was stored
+
+/** An earlier agent's history record whose words hold `value`, kept before it was stored as a key. */
+const earlierRecord = (value) => ({
+  id: 'e2e2e2', name: `Use ${value}`, task: `use ${value} to fix the staging login`, harness: 'claude', model: null, machineId: 'laptop',
+  startedAt: 1000, endedAt: 2000, state: 'checks_failed', stateReason: `It printed ${value}`, says: `I signed in with ${value}.`,
+  files: { changed: 1, adds: 1, dels: 0, list: [{ path: 'src/login.js', adds: 1, dels: 0 }] },
+  checks: { state: 'failed', results: [{ name: `sign in with ${value}`, ok: false, ms: 5 }] },
+  rules: { kept: [{ say: `Never print ${value}` }], broken: [{ say: `Keep ${value} out of the logs`, paths: [`notes/${value}.txt`] }] },
+  approvals: { auto: 0, byYou: 1, denied: 0 }, usage: {}, sessionId: 'session-2', budgetUsd: 2, turns: 1, toolCalls: 3, savedAt: 2000,
+  workspace: { path: '/wt/shop/use-e2e2e2', branch: 'workbench/use-e2e2e2', base: FAKE_BASE, since: FAKE_BASE, from: 'main' },
+  work: {
+    branch: 'workbench/use-e2e2e2', from: 'main', folder: true, merged: null, thrownAway: null,
+    problem: { why: 'conflict', sentence: `It does not merge cleanly: ${value}`, paths: [`notes/${value}.txt`], into: 'main', at: 1500 },
+  },
+});
+
+test('history restored at start is masked with the keys stored now, and goes back to the history file masked', async () => {
+  const value = passphrase();
+  const rec = earlierRecord(value);
+  let source = null;
+  let scheduled = 0;
+  const history = {
+    open: () => ({ load: () => [structuredClone(rec)], source(fn) { source = fn; }, schedule() { scheduled += 1; }, close() {}, save() {}, recordOf: () => null }),
+  };
+  const t = live({ connect: new FakeConnect({ values: [value], def: 'claude' }), history });
+  await t.engine.start();
+  const v = t.store.get('e2e2e2');
+  assert.equal(v.earlier, true);
+  assert.equal(v.name, 'Use •••• 4817');
+  assert.equal(v.task, 'use •••• 4817 to fix the staging login');
+  assert.equal(v.says, 'I signed in with •••• 4817.');
+  assert.equal(v.stateReason, 'It printed •••• 4817');
+  assert.deepEqual(v.checks.results.map(r => r.name), ['sign in with •••• 4817']);
+  assert.deepEqual(v.rules, { kept: [{ say: 'Never print •••• 4817' }], broken: [{ say: 'Keep •••• 4817 out of the logs', paths: ['notes/•••• 4817.txt'] }] });
+  assert.equal(v.work.problem.sentence, 'It does not merge cleanly: •••• 4817');
+  assert.deepEqual(v.work.problem.paths, ['notes/•••• 4817.txt']);
+  // Names of things stay as they are: its folder, its branch and its conversation.
+  assert.equal(v.workspace, '/wt/shop/use-e2e2e2');
+  assert.equal(v.work.branch, 'workbench/use-e2e2e2');
+  assert.equal(v.sessionId, 'session-2');
+  assert.ok(!JSON.stringify(t.engine.snapshot()).includes(value), 'the page never gets it');
+  // What goes back to the history file is the masked record, and it is written again soon.
+  const written = JSON.stringify(source());
+  assert.ok(!written.includes(value), written);
+  assert.ok(written.includes('•••• 4817'));
+  assert.equal(JSON.parse(written)[0].workspace.branch, 'workbench/use-e2e2e2');
+  assert.ok(scheduled >= 1, 'a write is scheduled');
+  await t.engine.shutdown();
+
+  // With nothing to hide, a record is restored as it was, and no write is scheduled for it.
+  let plainScheduled = 0;
+  const plain = { open: () => ({ load: () => [structuredClone(rec)], source() {}, schedule() { plainScheduled += 1; }, close() {}, save() {}, recordOf: () => null }) };
+  const p = live({ connect: new FakeConnect({ def: 'claude' }), history: plain });
+  await p.engine.start();
+  assert.equal(p.store.get('e2e2e2').says, rec.says);
+  assert.equal(plainScheduled, 0);
+  await p.engine.shutdown();
+});
+
+test('the history file itself loses a key stored after it was written, at the next write', async (t) => {
+  const dir = scratch(t);
+  const value = passphrase();
+  const repo = { ...REPO, root: path.join(dir, 'shop') }; // the history file is named after the real folder
+  fs.mkdirSync(repo.root);
+  const file = historyMod.historyFile(repo.root, { dir: path.join(dir, 'history') });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ version: historyMod.VERSION, repo: repo.root, agents: [earlierRecord(value)] }));
+  const h = live({
+    connect: new FakeConnect({ values: [value], def: 'claude' }), history: historyMod, repo,
+    options: { historyDir: path.join(dir, 'history'), historyDebounceMs: 10_000 },
+  });
+  await h.engine.start();
+  assert.equal(h.store.get('e2e2e2').says, 'I signed in with •••• 4817.');
+  await h.engine.shutdown();
+  const text = fs.readFileSync(file, 'utf8');
+  assert.ok(!text.includes(value), 'no longer in the file');
+  assert.equal(JSON.parse(text).agents[0].says, 'I signed in with •••• 4817.');
+  assert.equal(JSON.parse(text).agents[0].workspace.branch, 'workbench/use-e2e2e2');
+});
+
+test('a merge’s commit message hides the stored keys, even in words the agent said before the key was saved', async (t) => {
+  const dir = scratch(t);
+  const value = passphrase();
+  const connect = new FakeConnect({ def: 'claude' });
+  const m = live({ connect, deps: { folders: dir } });
+  await m.engine.start();
+  const v = await m.engine.startAgent({ task: `rotate ${value} in the config. Then tell me.`, name: `Rotate ${value}` });
+  const r = m.claude.runners[0];
+  r.emit({ kind: EV.TURN, phase: 'start' });
+  r.emit({ kind: EV.TURN, phase: 'end', finalText: `I rotated ${value} in the config.`, backgroundTasks: 0, isError: false });
+  await until(() => !['working', 'starting'].includes(m.store.get(v.id).state));
+  assert.ok(m.store.get(v.id).says.includes(value), 'said before the key was saved, so kept as it was said');
+  connect.values.push(value); // the person saves it as a key now
+  const card = await m.engine.proposeMerge(v.id);
+  assert.ok(card.confirm, card.reply);
+  await m.engine.confirm(card.confirm.id, true);
+  const msg = m.calls.mergeWork.at(-1).message;
+  assert.deepEqual(msg, { subject: 'Rotate •••• 4817 in the config', body: 'I rotated •••• 4817 in the config.', name: 'Rotate •••• 4817' });
+  await m.engine.shutdown();
 });
 
 // ------------------------------------------------------------------ keys for agents and checks

@@ -3429,6 +3429,48 @@ test('repository: identity is read at start and on every refresh, and the page h
   await t.engine.shutdown();
 });
 
+test('repository: refreshRepo() reads the identity at once and tells the page, and a read already under way does not hold it back', async () => {
+  const t = live();
+  const seen = [];
+  t.store.on('repo', r => seen.push(r));
+  t.git.identity = null;
+  await t.engine.start();
+  assert.equal(t.engine.snapshot().repo.identity, false);
+  // The 15 s refresh begins, and reads who commits just before the person saves their name and email. It is slow.
+  const slow = gate();
+  const read = t.deps.workspace.gitIdentity;
+  let n = 0;
+  t.deps.workspace.gitIdentity = async (o) => {
+    n += 1;
+    const id = await read(o);
+    if (n === 1) await slow.wait;
+    return id;
+  };
+  t.engine.tick(Date.now() + 60_000);
+  await until(() => n === 1);
+  // Agents & keys saves them, and bin asks the engine to read the repository again.
+  t.git.identity = { name: 'Test Person', email: 'test@example.com' };
+  const now = { name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2, identity: true };
+  assert.deepEqual(await t.engine.refreshRepo(), now);
+  assert.deepEqual(seen, [now], 'the page hears of it at once, not 15 s later');
+  assert.equal(t.engine.snapshot().repo.identity, true);
+  // The older read ends later, and is dropped.
+  slow.open();
+  await until(() => !t.engine._repoReading);
+  assert.equal(t.engine.snapshot().repo.identity, true);
+  // Nothing new: nobody is told. A repository git cannot read: what was known stays, and nothing is thrown.
+  assert.deepEqual(await t.engine.refreshRepo(), now);
+  t.deps.workspace.prepareRepo = async () => { throw new Error('git could not read it'); };
+  assert.deepEqual(await t.engine.refreshRepo(), now);
+  assert.deepEqual(seen, [now]);
+  await t.engine.shutdown();
+  // The demo has no repository to read.
+  const d = demo();
+  await d.engine.start();
+  assert.equal(await d.engine.refreshRepo(), null);
+  await d.engine.shutdown();
+});
+
 test('snapshot: harnessInfo.claude.version follows the version its agents’ session lines report; harnesses stay plain flags', async () => {
   const t = live();
   await t.engine.start();
