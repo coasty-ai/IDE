@@ -5,6 +5,7 @@
 //   node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
 //   node bin/workbench.mjs --clone <address> [--into <folder>] [the --repo options]
 //   node bin/workbench.mjs --connect-github | --github-repos      (for the Mac app)
+//   node bin/workbench.mjs --git-status                           (for the Mac app)
 //
 // Wires the real modules together: store, engine, commands, policy, workspaces, receipt, machines, the key store and
 // Agents & keys (connect), the adapters and the local web server. Every agent process is stopped when Workbench exits.
