@@ -1,6 +1,7 @@
 // The connect service (src/core/connect.mjs): agents, keys, git and GitHub, as the Agents & keys panel sees them.
 //
-// The key store is an in-memory stand-in with the interface of src/core/keys.mjs. Claude Code and Codex are the
+// The key store is an in-memory stand-in with the interface of src/core/keys.mjs, or the real one keeping its values in
+// private files in a temporary home folder (never the keychain). Claude Code and Codex are the
 // stand-ins in test/helpers (or small shell scripts written here), reached through the real adapters; HOME is a
 // temporary folder, so no Claude Code extension on this machine is ever found. GitHub is a `fetchJson` of these tests,
 // and git's credential store and global config are stand-ins or files here. Nothing reaches a network.
@@ -12,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Connect, claudeSignIn } from '../src/core/connect.mjs';
+import { KeyStore } from '../src/core/keys.mjs';
 import * as claudeAdapter from '../src/adapters/claude/runner.mjs';
 import * as codexAdapter from '../src/adapters/codex/runner.mjs';
 import * as workspace from '../src/core/workspace.mjs';
@@ -154,6 +156,11 @@ class FakeKeys {
 
   values() {
     return this.items.flatMap((k) => k.secretNames.map((n) => k.values[n]));
+  }
+
+  valuesOf(id) {
+    const k = this.items.find((x) => x.id === id);
+    return k ? { ...k.values } : null;
   }
 }
 
@@ -709,8 +716,8 @@ test('disconnecting GitHub removes the key and git’s sign-in; removing its key
   assert.equal(ws.calls.filter((x) => x[0] === 'reject').length, 2);
 });
 
-test('"Let agents use this token" changes without the token: it is read back from this run, or from git', async (t) => {
-  const { c, keys } = makeConnect(t);
+test('"Let agents use this token" changes without the token: it is read back from the key store, also in a later run', async (t) => {
+  const { c, keys, workspace: ws } = makeConnect(t);
   await assert.rejects(c.setGithubAgentsUseIt(true), { plain: true, why: 'github', status: 409, message: 'GitHub is not connected.' });
   await c.connectGithub(GH_TOKEN);
   const first = keys.items[0].id;
@@ -726,23 +733,27 @@ test('"Let agents use this token" changes without the token: it is read back fro
   const same = keys.items[0].id;
   assert.equal((await c.setGithubAgentsUseIt(true)).ok, true);
   assert.equal(keys.items[0].id, same);
-  // A later run reads the token from git to change it back.
-  const later = makeConnect(t, { keys, workspace: fakeWorkspace({ fill: ({ username }) => (username === 'octo-cat' ? { username, password: GH_TOKEN } : null) }) });
+  // A later run (another Connect on the same store) changes it back with the token the store keeps.
+  const later = makeConnect(t, { keys });
   assert.deepEqual(await later.c.setGithubAgentsUseIt(false), { ok: true, sentence: 'Agents no longer get your GitHub token. Git still uses it.' });
   assert.deepEqual(keys.items.map((k) => [k.preset, k.agents]), [['github', []]]);
   assert.equal(later.c.envFor({ repoRoot: null, harness: 'codex' }).GH_TOKEN, undefined);
   s = await later.c.status();
   assert.equal(s.github.agentsUseIt, false);
   assert.equal(s.github.connected, true);
-  // When git keeps nothing, it says what to do instead, and changes nothing.
-  const blind = makeConnect(t, { keys, workspace: fakeWorkspace({ fill: null }) });
+  // Git's credential helper is never asked for it.
+  assert.deepEqual([...ws.calls, ...later.workspace.calls].filter((x) => x[0] === 'fill'), []);
+  // When the store could not read the token back (a locked keychain, a missing file), it says what to do instead, and
+  // changes nothing.
+  keys.valuesOf = () => ({});
+  const blind = makeConnect(t, { keys });
   assert.deepEqual(await blind.c.setGithubAgentsUseIt(true), {
-    ok: false, why: 'token', sentence: 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.',
+    ok: false, why: 'token', sentence: 'Workbench could not read the GitHub token it keeps, so this cannot change. Disconnect GitHub, then connect it again.',
   });
   assert.deepEqual(keys.items.map((k) => k.agents), [[]]);
 });
 
-test('githubRepos lists the person’s repositories with the token from this run, or the one git keeps', async (t) => {
+test('githubRepos lists the person’s repositories with the token the key store keeps, also in a later run', async (t) => {
   const listing = [
     { full_name: 'octo-cat/app', clone_url: 'https://github.com/octo-cat/app.git', private: true, pushed_at: '2026-11-10T09:00:00Z' },
     { full_name: 'octo-cat/site', clone_url: 'https://github.com/octo-cat/site.git', private: false, pushed_at: '2026-11-01T09:00:00Z' },
@@ -766,18 +777,60 @@ test('githubRepos lists the person’s repositories with the token from this run
   await first.c.connectGithub(GH_TOKEN);
   assert.deepEqual(await first.c.githubRepos(), want);
   assert.deepEqual(first.github.calls.at(-1).url, 'https://api.github.com/user/repos?per_page=100&sort=pushed');
-  // A later run (the Mac app's --github-repos) has only what was stored: the token comes from git's credential helper.
-  const later = makeConnect(t, { keys: first.keys, github: fakeGithub(answer), workspace: fakeWorkspace({ fill: ({ username }) => (username === 'octo-cat' ? { username, password: GH_TOKEN } : null) }) });
+  assert.equal(first.github.calls.at(-1).auth, 'GH_TOKEN');
+  // A later run (the Mac app's --github-repos) has only what was stored: the token comes from the key store, also a
+  // token for git only; git's credential helper is never asked.
+  const later = makeConnect(t, { keys: first.keys, github: fakeGithub(answer) });
   assert.deepEqual(await later.c.githubRepos(), want);
-  assert.deepEqual(later.workspace.calls.filter((x) => x[0] === 'fill'), [['fill', 'github.com', 'octo-cat']]);
-  // Git keeps nothing, GitHub refuses, or cannot be reached: nothing.
-  const nothing = makeConnect(t, { keys: first.keys, github: fakeGithub(answer), workspace: fakeWorkspace({ fill: null }) });
+  assert.equal(later.github.calls.at(-1).auth, 'GH_TOKEN');
+  assert.deepEqual([...first.workspace.calls, ...later.workspace.calls].filter((x) => x[0] === 'fill'), []);
+  // GitHub refuses, or cannot be reached: nothing.
+  const refused = makeConnect(t, { keys: first.keys, github: fakeGithub(() => ({ status: 401, json: null })) });
+  assert.deepEqual(await refused.c.githubRepos(), []);
+  const offline = makeConnect(t, { keys: first.keys, github: fakeGithub(() => new Error('offline')) });
+  assert.deepEqual(await offline.c.githubRepos(), []);
+  // The store could not read the token: nothing, and GitHub is not asked.
+  first.keys.valuesOf = () => null;
+  const nothing = makeConnect(t, { keys: first.keys, github: fakeGithub(answer) });
   assert.deepEqual(await nothing.c.githubRepos(), []);
   assert.equal(nothing.github.calls.length, 0);
-  const refused = makeConnect(t, { keys: first.keys, github: fakeGithub(() => ({ status: 401, json: null })), workspace: fakeWorkspace({ fill: () => ({ password: GH_TOKEN_2 }) }) });
-  assert.deepEqual(await refused.c.githubRepos(), []);
-  const offline = makeConnect(t, { keys: first.keys, github: fakeGithub(() => new Error('offline')), workspace: fakeWorkspace({ fill: () => ({ password: GH_TOKEN }) }) });
-  assert.deepEqual(await offline.c.githubRepos(), []);
+  assert.ok(nothing.logs.some((l) => l.includes('there is no GitHub token to list repositories with')));
+});
+
+test('a later run with a key store of its own (the Mac app’s --github-repos) reads the GitHub token from that store', async (t) => {
+  const home = scratch(t);
+  // The real key store, its values in private files in this home folder.
+  const store = () => new KeyStore({ home, platform: 'linux', backend: 'file' });
+  const listing = [{ full_name: 'octo-cat/app', clone_url: 'https://github.com/octo-cat/app.git', private: true, pushed_at: '2026-11-10T09:00:00Z' }];
+  const answer = (url, headers) => {
+    if (url === 'https://api.github.com/user') return githubUser()(url, headers);
+    if (url === 'https://api.github.com/user/repos?per_page=100&sort=pushed' && headers.Authorization === `Bearer ${GH_TOKEN}`) return { status: 200, json: listing };
+    return { status: 401, json: null };
+  };
+  const first = makeConnect(t, { home, keys: store(), github: fakeGithub(answer) });
+  assert.equal((await first.c.connectGithub(GH_TOKEN)).ok, true);
+  // Another Workbench, as the Mac app starts one for the list: its own key store, loaded from the same home folder.
+  const keys = store();
+  await keys.load();
+  const later = makeConnect(t, { home, keys, github: fakeGithub(answer) });
+  assert.deepEqual(await later.c.githubRepos(), [{ fullName: 'octo-cat/app', cloneUrl: 'https://github.com/octo-cat/app.git', private: true, pushedAt: '2026-11-10T09:00:00Z' }]);
+  assert.equal(later.github.calls.at(-1).auth, 'GH_TOKEN');
+  // It also gives the token to agents without asking for it again.
+  assert.deepEqual(await later.c.setGithubAgentsUseIt(true), { ok: true, sentence: 'Agents can use your GitHub token now, as GH_TOKEN.' });
+  assert.equal(later.c.envFor({ repoRoot: null, harness: 'claude' }).GH_TOKEN, GH_TOKEN);
+  // A run whose store cannot read the value (its file has gone): no list, GitHub is not asked, and the panel says what
+  // to do instead.
+  fs.rmSync(path.join(home, '.workbench', 'keys'), { recursive: true, force: true });
+  const unreadable = store();
+  await unreadable.load();
+  const blind = makeConnect(t, { home, keys: unreadable, github: fakeGithub(answer) });
+  assert.equal((await blind.c.status()).github.connected, true);
+  assert.deepEqual(await blind.c.githubRepos(), []);
+  assert.equal(blind.github.calls.length, 0);
+  assert.deepEqual(await blind.c.setGithubAgentsUseIt(false), {
+    ok: false, why: 'token', sentence: 'Workbench could not read the GitHub token it keeps, so this cannot change. Disconnect GitHub, then connect it again.',
+  });
+  for (const run of [first, later, blind]) assert.deepEqual(run.workspace.calls.filter((x) => x[0] === 'fill'), []);
 });
 
 // ------------------------------------------------------------------ keys
@@ -819,6 +872,18 @@ test('addKey: the preset says which values are secret, also-names get the value,
   await assert.rejects(c.addKey({ preset: 'custom', values: { A: 'b' }, scope: 'elsewhere' }), { why: 'scope' });
   const fresh = makeConnect(t);
   await assert.rejects(fresh.c.addKey({ preset: 'custom', values: { A: 'b' }, scope: 'repo' }), { why: 'scope' });
+  // ... unless the key itself names the repository (the routes do), before the panel was ever asked about one.
+  await fresh.c.addKey({ preset: 'custom', values: { A_B: 'b' }, scope: 'repo', repoRoot: repo });
+  assert.deepEqual(fresh.keys.adds.at(-1).scope, { kind: 'repo', root: repo });
+  assert.match((await fresh.c.status()).keys[0].sentence, / for this repository, given to all agents: A_B ••••$/);
+  // A kind of key Workbench does not know is refused, as the key store refuses it; no preset given is a key of one's own.
+  const before = keys.adds.length;
+  await assert.rejects(c.addKey({ preset: 'nope', values: { A_B: AWS_SECRET } }), { plain: true, why: 'name', status: 400, message: 'Workbench does not know that kind of key.' });
+  await assert.rejects(c.addKey({ preset: 7, values: { A_B: AWS_SECRET } }), { why: 'name', status: 400 });
+  assert.equal(keys.adds.length, before);
+  await c.addKey({ label: 'Mine', values: { A_B: AWS_SECRET } });
+  assert.deepEqual((({ preset, secretNames }) => ({ preset, secretNames }))(keys.adds.at(-1)), { preset: 'custom', secretNames: ['A_B'] });
+  await c.removeKey(keys.items.at(-1).id);
   await assert.rejects(c.addKey({ preset: 'custom', values: { 'BAD NAME': 'b' } }), { why: 'name' });
   // Removing passes through.
   assert.deepEqual(await c.removeKey(id), { removed: true });
@@ -847,6 +912,37 @@ test('envFor gives the store’s keys for a repository and an agent, and mask hi
   const broken = makeConnect(t, { keys: Object.assign(new FakeKeys(), { envFor: () => { throw new Error('locked'); } }) });
   assert.deepEqual(broken.c.envFor({ repoRoot: repo, harness: 'claude' }), {});
   assert.ok(broken.logs.some((l) => l.includes('the keys could not be read')));
+});
+
+test('the key store’s refusals carry the status of their kind: what cannot be kept is a 400, a store that failed a 500', async (t) => {
+  // The real key store, its values in private files in a home folder of this test.
+  const home = scratch(t);
+  const keys = new KeyStore({ home, platform: 'linux', backend: 'file' });
+  const { c } = makeConnect(t, { home, keys });
+  await assert.rejects(c.addKey({ preset: 'custom', values: { PATH: '/tmp/elsewhere' } }), { plain: true, why: 'forbidden', status: 400 });
+  await assert.rejects(c.addKey({ preset: 'custom', values: { '1ABC': 'b' } }), { why: 'name', status: 400 });
+  await assert.rejects(c.addKey({ preset: 'custom', label: 'x'.repeat(81), values: { A_B: 'b' } }), { why: 'name', status: 400 });
+  await assert.rejects(c.setAgentKey('claude', 'x'.repeat(2001)), { why: 'value', status: 400 });
+  await assert.rejects(c.addKey({ preset: 'custom', values: { A_B: 'b' }, scope: { kind: 'repo', root: 'relative/folder' } }), { why: 'name', status: 400 });
+  // The place values are kept fails: a file stands where their folder goes.
+  fs.mkdirSync(path.join(home, '.workbench'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, '.workbench', 'keys'), 'not a folder\n');
+  await assert.rejects(c.addKey({ preset: 'custom', values: { A_B: 'b' } }), (e) => e.why === 'store' && e.status === 500 && e.plain === true && /^Workbench /.test(e.message));
+  await assert.rejects(c.connectGithub(GH_TOKEN), { why: 'store', status: 500 });
+  assert.equal((await c.status()).github.connected, false);
+  // The same for a stand-in's refusals: too many keys; a store that cannot remove one; and a status already there, or a
+  // kind the store does not use, is left as it is.
+  const refusing = new FakeKeys();
+  const refusal = (why, extra = {}) => Object.assign(new Error('The key store refused.'), { plain: true, why, ...extra });
+  const s = makeConnect(t, { keys: refusing });
+  refusing.add = async () => { throw refusal('too-many'); };
+  await assert.rejects(s.c.addKey({ preset: 'custom', values: { A_B: 'b' } }), { why: 'too-many', status: 400 });
+  refusing.add = async () => { throw refusal('store', { status: 503 }); };
+  await assert.rejects(s.c.setAgentKey('codex', OPENAI_KEY), { why: 'store', status: 503 });
+  refusing.add = async () => { throw refusal('elsewhere'); };
+  await assert.rejects(s.c.addKey({ preset: 'custom', values: { A_B: 'b' } }), (e) => e.why === 'elsewhere' && e.status === undefined);
+  refusing.remove = async () => { throw refusal('store'); };
+  await assert.rejects(s.c.removeKey('key-1'), { why: 'store', status: 500 });
 });
 
 test('the connect service needs a key store', () => {

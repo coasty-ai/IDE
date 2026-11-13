@@ -8,6 +8,8 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createServer } from '../src/server/http.mjs';
 import { Store } from '../src/core/store.mjs';
+import { Connect } from '../src/core/connect.mjs';
+import { KeyStore } from '../src/core/keys.mjs';
 import { EV } from '../src/shared/events.mjs';
 
 const ROOT = path.join(os.tmpdir(), `wb-http-${process.pid}-${crypto.randomBytes(3).toString('hex')}`);
@@ -612,6 +614,12 @@ class FakeConnect extends EventEmitter {
     return { ok: true, login: 'octocat', sentence: 'Connected to GitHub as octocat.' };
   }
   async disconnectGithub() { this.act('disconnectGithub'); return { ok: true }; }
+  async setGithubAgentsUseIt(on) {
+    this.act('setGithubAgentsUseIt', on);
+    if (this.githubAnswer) return this.githubAnswer;
+    this.github = { ...this.github, agentsUseIt: on === true };
+    return { ok: true, sentence: on ? 'Agents can use your GitHub token now, as GH_TOKEN.' : 'Agents no longer get your GitHub token. Git still uses it.' };
+  }
   async addKey(o) { this.act('addKey', o); return { id: 'k9f8e7' }; }
   async removeKey(id) { this.act('removeKey', id); return { removed: id === 'k1a2b3' }; }
   envFor() { return {}; }
@@ -768,13 +776,15 @@ test('Agents & keys: a new key gets its secret names from the preset, never from
   const openai = fakeKey('sk', '-proj-');
   await w.send('/api/connect/keys', { preset: 'openai', values: { OPENAI_API_KEY: openai } });
   await w.send('/api/connect/keys', { preset: 'custom', label: 'Sentry', scope: 'all', agents: 'all', values: { SENTRY_DSN: 'https://sentry.example/1', SENTRY_ENV: 'prod' } });
+  // "This repository" goes to Connect in the key store's own shape ({ kind: 'repo', root }; the store refuses the bare
+  // word), and Connect is told the repository either way.
   assert.deepEqual(w.connect.calls.filter(c => c[0] === 'addKey').map(c => c[1]), [
     { preset: 'aws', label: 'AWS', values: { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, AWS_REGION: 'eu-west-1' },
-      secretNames: ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'], scope: { kind: 'repo', root: '/work/shop' }, agents: ['claude', 'codex'] },
+      secretNames: ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'], scope: { kind: 'repo', root: '/work/shop' }, agents: ['claude', 'codex'], repoRoot: '/work/shop' },
     { preset: 'openai', label: 'OpenAI', values: { OPENAI_API_KEY: openai, CODEX_API_KEY: openai },
-      secretNames: ['OPENAI_API_KEY', 'CODEX_API_KEY'], scope: { kind: 'all' }, agents: 'all' },
+      secretNames: ['OPENAI_API_KEY', 'CODEX_API_KEY'], scope: { kind: 'all' }, agents: 'all', repoRoot: '/work/shop' },
     { preset: 'custom', label: 'Sentry', values: { SENTRY_DSN: 'https://sentry.example/1', SENTRY_ENV: 'prod' },
-      secretNames: ['SENTRY_DSN', 'SENTRY_ENV'], scope: { kind: 'all' }, agents: 'all' },
+      secretNames: ['SENTRY_DSN', 'SENTRY_ENV'], scope: { kind: 'all' }, agents: 'all', repoRoot: '/work/shop' },
   ]);
   for (const r of [added]) assert.ok(!r.text.includes(secret) && !r.text.includes(id), 'no value comes back');
   // What a preset does not take, or leaves out, is refused in plain words, before the key store hears of it.
@@ -809,13 +819,14 @@ test('Agents & keys: when the kinds of key cannot be read, every value is kept a
   const r = await w.send('/api/connect/keys', { preset: 'aws', values: { AWS_REGION: 'eu-west-1', AWS_ACCESS_KEY_ID: id } });
   assert.equal(r.status, 200);
   assert.deepEqual(w.connect.calls.find(c => c[0] === 'addKey')[1], {
-    preset: 'aws', label: 'Key', values: { AWS_REGION: 'eu-west-1', AWS_ACCESS_KEY_ID: id }, secretNames: ['AWS_REGION', 'AWS_ACCESS_KEY_ID'], scope: { kind: 'all' }, agents: 'all',
+    preset: 'aws', label: 'Key', values: { AWS_REGION: 'eu-west-1', AWS_ACCESS_KEY_ID: id }, secretNames: ['AWS_REGION', 'AWS_ACCESS_KEY_ID'], scope: { kind: 'all' }, agents: 'all', repoRoot: '/work/shop',
   });
   // The engine's repository is "this repository" when the server was given none; with neither, there is none.
   const engineRoot = await connectServer(t, { repoRoot: null });
   engineRoot.engine.repoInfo = { root: '/work/from-engine' };
   await engineRoot.send('/api/connect/keys', { preset: 'custom', scope: 'repo', values: { A_B: fakeKey('x') } });
-  assert.deepEqual(engineRoot.connect.calls.find(c => c[0] === 'addKey')[1].scope, { kind: 'repo', root: '/work/from-engine' });
+  const fromEngine = engineRoot.connect.calls.find(c => c[0] === 'addKey')[1];
+  assert.deepEqual([fromEngine.scope, fromEngine.repoRoot], [{ kind: 'repo', root: '/work/from-engine' }, '/work/from-engine']);
   const none = await connectServer(t, { repoRoot: null });
   const refused = await none.send('/api/connect/keys', { preset: 'custom', scope: 'repo', values: { A_B: fakeKey('x') } });
   assert.equal(refused.status, 400);
@@ -845,13 +856,142 @@ test('Agents & keys: refusals come back in plain words; anything else is logged 
   assert.equal(crash.json.error, 'Something went wrong in the workbench. The details are in its log.');
   assert.equal(w.lines.length, 1);
   assert.match(w.lines[0], /^Agents & keys could not do that: TypeError: Cannot read properties of undefined \(reading '••••'\)/);
-  for (const r of [refused, echoed, crash]) assert.ok(!r.text.includes(key));
+  // The place keys are kept failed (the key store's `store`, given 500 by Connect): its sentence, with that status, and
+  // a line in the log; never its detail, nor the key.
+  w.connect.fail = Object.assign(new Error(`Workbench could not save the key in your keychain, because your keychain is locked. ${key}`),
+    { plain: true, why: 'store', status: 500, detail: 'security save: locked, exit 51' });
+  const locked = await w.send('/api/connect/agents/claude/key', { value: key });
+  assert.equal(locked.status, 500);
+  assert.deepEqual(locked.json, { error: 'Workbench could not save the key in your keychain, because your keychain is locked. ••••' });
+  assert.equal(w.lines.length, 2);
+  assert.equal(w.lines[1], 'Agents & keys could not do that: Workbench could not save the key in your keychain, because your keychain is locked. ••••');
+  // A status that is not an HTTP error's is no status: a refusal with one answers 400.
+  w.connect.fail = Object.assign(new Error('That key cannot be used.'), { why: 'value', status: 302 });
+  assert.equal((await w.send('/api/connect/agents/claude/key', { value: key })).status, 400);
+  for (const r of [refused, echoed, crash, locked]) assert.ok(!r.text.includes(key));
   assert.ok(!w.lines.join('\n').includes(key));
+  assert.ok(!w.lines.join('\n').includes('exit 51'), 'the detail stays out of the log');
   // A body over 16 KB is refused before anyone reads it.
   const big = await w.send('/api/connect/agents/claude/key', { value: 'x'.repeat(17 * 1024) });
   assert.equal(big.status, 413);
   assert.equal(big.json.error, 'The request is too large. The limit is 16 KB.');
   assert.ok(!w.connect.calls.some(c => c[0] === 'setAgentKey' && c[2].length > 16 * 1024));
+});
+
+test('Agents & keys: who gets the GitHub token changes without the token; the refusals keep their kind, and the body is checked first', async (t) => {
+  const w = await connectServer(t);
+  const on = await w.send('/api/connect/github/agents', { agentsUseIt: true });
+  assert.equal(on.status, 200);
+  assert.equal(on.headers['cache-control'], 'no-store');
+  assert.deepEqual({ ok: on.json.ok, sentence: on.json.sentence, why: on.json.why, github: on.json.status.github.agentsUseIt },
+    { ok: true, sentence: 'Agents can use your GitHub token now, as GH_TOKEN.', why: undefined, github: true });
+  const off = await w.send('/api/connect/github/agents', { agentsUseIt: false });
+  assert.equal(off.json.sentence, 'Agents no longer get your GitHub token. Git still uses it.');
+  assert.deepEqual(w.connect.calls.filter(c => c[0] === 'setGithubAgentsUseIt'), [['setGithubAgentsUseIt', true], ['setGithubAgentsUseIt', false]]);
+  // Connect cannot read the token back: a 200 that says so, with its kind and a fresh status.
+  const said = 'Workbench could not read the GitHub token it keeps, so this cannot change. Disconnect GitHub, then connect it again.';
+  w.connect.githubAnswer = { ok: false, why: 'token', sentence: said };
+  const blind = await w.send('/api/connect/github/agents', { agentsUseIt: true });
+  assert.equal(blind.status, 200);
+  assert.deepEqual({ ok: blind.json.ok, why: blind.json.why, sentence: blind.json.sentence }, { ok: false, why: 'token', sentence: said });
+  assert.equal(typeof blind.json.status, 'object');
+  w.connect.githubAnswer = null;
+  // GitHub is not connected: Connect's 409, with its sentence.
+  w.connect.fail = Object.assign(new Error('GitHub is not connected.'), { plain: true, why: 'github', status: 409 });
+  const none = await w.send('/api/connect/github/agents', { agentsUseIt: true });
+  assert.equal(none.status, 409);
+  assert.deepEqual(none.json, { error: 'GitHub is not connected.' });
+  // Only true or false, and the checks of every Agents & keys route, before Connect hears of it.
+  w.connect.calls.length = 0;
+  for (const body of [{}, { agentsUseIt: 'yes' }, { agentsUseIt: 1 }, { agentsUseIt: null }, { token: fakeKey('gh', 'p_') }]) {
+    const r = await w.send('/api/connect/github/agents', body);
+    assert.equal(r.status, 400, JSON.stringify(Object.keys(body)));
+    assert.deepEqual(r.json, { error: 'Choose whether agents may use the GitHub token.' });
+  }
+  assert.equal((await w.send('/api/connect/github/agents', { agentsUseIt: true }, { Origin: 'http://evil.example' })).status, 403);
+  assert.equal((await request({ at: w.at, method: 'POST', path: '/api/connect/github/agents', body: { agentsUseIt: true }, headers: { 'Content-Type': 'application/json' } })).status, 401);
+  assert.equal((await w.send('/api/connect/github/agents', '{"agentsUseIt":true}', { 'Content-Type': 'text/plain' })).status, 415);
+  const big = await w.send('/api/connect/github/agents', { agentsUseIt: true, pad: 'x'.repeat(17 * 1024) });
+  assert.equal(big.status, 413);
+  assert.equal(big.json.error, 'The request is too large. The limit is 16 KB.');
+  const wrong = await w.get('/api/connect/github/agents');
+  assert.equal(wrong.status, 405);
+  assert.equal(wrong.headers.allow, 'POST');
+  assert.deepEqual(w.connect.calls, []);
+  // Without the connect service, it is not there, as every Agents & keys route.
+  const without = await post('/api/connect/github/agents', { agentsUseIt: true });
+  assert.equal(without.status, 404);
+  assert.equal(without.json.error, 'Agents & keys is not available in this Workbench. The details are in its log.');
+});
+
+test('Agents & keys with the real connect service and key store: a key for this repository is kept for it, and who gets the GitHub token changes without it', async (t) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-http-keys-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const repoRoot = path.join(home, 'shop');
+  fs.mkdirSync(repoRoot);
+  // Values in private files in this home folder: never the keychain. GitHub and git are stand-ins.
+  const keys = new KeyStore({ home, platform: 'linux', backend: 'file' });
+  const ghToken = fakeKey('gh', 'p_');
+  const gitCalls = [];
+  const connect = new Connect({
+    home, platform: 'linux', env: { PATH: '/usr/bin:/bin', HOME: home }, keys, adapters: {}, probe: false,
+    workspace: {
+      async gitConfigIdentity() { return { name: '', email: '' }; },
+      async approveGitCredential({ username }) { gitCalls.push(['approve', username]); return { helper: true }; },
+      async rejectGitCredential({ username }) { gitCalls.push(['reject', username]); return { ok: true }; },
+    },
+    fetchJson: async (url, { headers } = {}) => (url === 'https://api.github.com/user' && headers.Authorization === `Bearer ${ghToken}`
+      ? { status: 200, json: { login: 'octocat' } } : { status: 401, json: null }),
+  });
+  const s = new Store();
+  const e = new FakeEngine(s);
+  e.mode = 'live';
+  const lines = [];
+  const log = { info() {}, debug() {}, warn: (...a) => lines.push(a.join(' ')), error: (...a) => lines.push(a.join(' ')) };
+  const srv = createServer({ engine: e, store: s, token: TOKEN, connect, repoRoot, port: 0, rootDir: ROOT, log, options: { coalesceMs: 40, pingMs: 60_000 } });
+  const { url } = await srv.listen();
+  t.after(() => srv.close());
+  const at = Number(new URL(url).port);
+  const send = (p, body) => request({ at, method: 'POST', path: p, body, headers: auth({ 'Content-Type': 'application/json' }) });
+
+  // A key for this repository reaches the key store in its own shape, kept for the repository Workbench runs on.
+  const id = fakeKey('AK', 'IA').slice(0, 20).toUpperCase();
+  const secret = fakeKey('wJal', 'rXUtnFEMI/');
+  const added = await send('/api/connect/keys', { preset: 'aws', scope: 'repo', values: { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, AWS_REGION: 'eu-west-1' } });
+  assert.equal(added.status, 200, added.text);
+  assert.equal(added.json.sentence, 'Saved AWS, for this repository.');
+  const kept = JSON.parse(fs.readFileSync(path.join(home, '.workbench', 'keys.json'), 'utf8')).keys;
+  assert.deepEqual(kept.map(k => [k.preset, k.scope, k.agents]), [['aws', { kind: 'repo', root: repoRoot }, 'all']]);
+  assert.match(added.json.status.keys[0].sentence, /^AWS for this repository, given to all agents: AWS_ACCESS_KEY_ID •••• [^,]+, AWS_SECRET_ACCESS_KEY •••• [^,]+, AWS_REGION eu-west-1$/);
+  assert.deepEqual(connect.envFor({ repoRoot, harness: 'claude' }), { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, AWS_REGION: 'eu-west-1' });
+  assert.deepEqual(connect.envFor({ repoRoot: home, harness: 'claude' }), {}, 'not for another folder');
+
+  // Who gets the GitHub token: refused while GitHub is not connected, then changed both ways without the token.
+  const early = await send('/api/connect/github/agents', { agentsUseIt: true });
+  assert.equal(early.status, 409);
+  assert.deepEqual(early.json, { error: 'GitHub is not connected.' });
+  const gh = await send('/api/connect/github', { token: ghToken });
+  assert.deepEqual([gh.status, gh.json.login, gh.json.status.github.agentsUseIt], [200, 'octocat', false]);
+  assert.equal(connect.envFor({ repoRoot, harness: 'codex' }).GH_TOKEN, undefined, 'for git only at first');
+  const on = await send('/api/connect/github/agents', { agentsUseIt: true });
+  assert.deepEqual([on.status, on.json.ok, on.json.sentence, on.json.status.github.agentsUseIt], [200, true, 'Agents can use your GitHub token now, as GH_TOKEN.', true]);
+  assert.equal(connect.envFor({ repoRoot, harness: 'codex' }).GH_TOKEN, ghToken);
+  const off = await send('/api/connect/github/agents', { agentsUseIt: false });
+  assert.deepEqual([off.status, off.json.ok, off.json.status.github.agentsUseIt], [200, true, false]);
+  assert.equal(connect.envFor({ repoRoot, harness: 'codex' }).GH_TOKEN, undefined);
+  assert.deepEqual(gitCalls, [['approve', 'octocat']]);
+
+  // The place values are kept fails (a file where their folder goes): the key store's sentence, with a 500, and a
+  // line in the log.
+  fs.rmSync(path.join(home, '.workbench', 'keys'), { recursive: true, force: true });
+  fs.writeFileSync(path.join(home, '.workbench', 'keys'), 'not a folder\n');
+  const broken = await send('/api/connect/keys', { preset: 'custom', label: 'Sentry', values: { SENTRY_DSN: fakeKey('https://', 'sentry.example/') } });
+  assert.equal(broken.status, 500, broken.text);
+  assert.match(broken.json.error, /^Workbench (could not save the key in|does not keep keys in) .*keys/);
+  assert.deepEqual(lines, [`Agents & keys could not do that: ${broken.json.error}`]);
+  for (const r of [added, early, gh, on, off, broken]) {
+    for (const v of [id, secret, ghToken]) assert.ok(!r.text.includes(v), 'no value comes back');
+  }
 });
 
 test('Agents & keys: when what is ready changes, every page gets one fresh snapshot; nothing when nothing changed', async (t) => {

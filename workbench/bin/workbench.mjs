@@ -21,6 +21,13 @@ const DEFAULT_PORT = 4317;
 const DEFAULT_BUDGET_USD = 2;
 /** How long a clone may take before Workbench gives up on it. */
 const CLONE_TIMEOUT_MS = 30 * 60_000;
+/**
+ * How long a clone that was stopped may take to end git and remove what it made (cloneRepo needs about 2 seconds at
+ * most) before Workbench leaves anyway. Less than the 5 seconds the Mac app waits before it kills Workbench.
+ */
+const CLONE_STOP_MS = 4000;
+/** What stops a clone, as Ctrl-C does: the Mac app's Cancel and Quit send SIGTERM, a closed terminal SIGHUP. */
+const STOP_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
 /** Said instead of starting, when the variable every agent gets is set: this is an agent's own command. */
 const INSIDE_AGENT = 'Workbench is running inside an agent. It will not start real agents from there.';
@@ -161,6 +168,22 @@ export function parseArgs(argv) {
     }
   }
   return out;
+}
+
+/**
+ * PATH with ~/.local/bin at its end when it is not on it yet (even before that folder exists). Both agents' installers
+ * put their programs there, so Agents & keys' Check again finds one installed while Workbench runs, and its agents and
+ * checks can run it. Added at the end, never in front: a program PATH already finds keeps its place. An empty PATH, or
+ * a home folder that is not an absolute path, leaves PATH as it is.
+ * @param {string|undefined} pathValue
+ * @param {string} home
+ * @returns {string|undefined}
+ */
+export function pathWithLocalBin(pathValue, home) {
+  if (typeof pathValue !== 'string' || !pathValue || typeof home !== 'string' || !path.isAbsolute(home)) return pathValue;
+  const dir = path.join(home, '.local', 'bin');
+  const there = pathValue.split(path.delimiter).some((p) => p && path.isAbsolute(p) && path.resolve(p) === dir);
+  return there ? pathValue : `${pathValue}${path.delimiter}${dir}`;
 }
 
 // ------------------------------------------------------------------ output
@@ -312,9 +335,13 @@ const complete = (mod) => !!mod && typeof mod.available === 'function' && typeof
  * The key store and Agents & keys (src/core/keys.mjs, src/core/connect.mjs), with the keys read once. Either may be
  * missing or fail: Workbench then runs as before, without them, and says so in its log. From here on the log hides the
  * person's keys (connect.mask).
+ * @param {object} mods     the modules loadModules gave (the workspace and the adapters), or {} for the GitHub helpers:
+ *   Connect then uses its own workspace module, and has no agents to check
+ * @param {{ probe?: boolean }} [o] probe: check the agents at once (live mode); false where no agent will start (the
+ *   Mac app's GitHub helpers), so no agent program runs for nothing
  * @returns {Promise<{ keys: object|null, connect: object|null }>}
  */
-async function openConnect(mods, args, log) {
+async function openConnect(mods, args, log, { probe = true } = {}) {
   const [keysMod, connectMod] = await Promise.all([loadOptional('src/core/keys.mjs', log), loadOptional('src/core/connect.mjs', log)]);
   if (typeof keysMod?.KeyStore !== 'function' || typeof connectMod?.Connect !== 'function') return { keys: null, connect: null };
   const home = os.homedir();
@@ -334,7 +361,7 @@ async function openConnect(mods, args, log) {
   try {
     connect = new connectMod.Connect({
       home, platform: process.platform, env: process.env, keys, workspace: mods.workspace,
-      adapters: { claude: mods.claude, codex: mods.codex }, flags: { claude: args.claude || null }, log,
+      adapters: { claude: mods.claude, codex: mods.codex }, flags: { claude: args.claude || null }, log, probe,
     });
   } catch (err) {
     log.warn('Workbench could not set up Agents & keys:', err);
@@ -370,16 +397,17 @@ export function displayUrl(url) {
 /**
  * The text with the address as Workbench prints it, and without the password the address carried: the part after
  * "user:", or a user name alone, which is how a token is often put in an address ("https://<token>@github.com/…").
+ * Like every key Workbench hides, only one of 8 characters or more: a shorter user name ("owner", "repo") would cut
+ * ordinary words out of Workbench's own sentences, and cloneRepo refuses an address with a password before git runs.
  */
 function withoutCredentials(text, url) {
   const raw = String(url ?? '');
   const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/@\s]*)@/i.exec(raw)?.[1] || '';
   const colon = userinfo.indexOf(':');
-  const parts = (colon >= 0 ? [userinfo, userinfo.slice(colon + 1)] : [userinfo]).filter(p => p.length >= 4).sort((a, b) => b.length - a.length);
+  const parts = (colon >= 0 ? [userinfo, userinfo.slice(colon + 1)] : [userinfo]).sort((a, b) => b.length - a.length);
   let s = String(text ?? '');
   if (raw) s = s.split(raw).join(displayUrl(raw));
-  for (const p of parts) s = s.split(p).join('••••');
-  return s;
+  return redact(s, parts);
 }
 
 /**
@@ -584,7 +612,25 @@ async function main() {
     complain(INSIDE_AGENT);
     return 2;
   }
+  // Where the agents' installers put their programs, at the end of PATH: Workbench, its agents and checks, and
+  // Agents & keys' Check again then find a program installed while Workbench runs.
+  const withLocalBin = pathWithLocalBin(process.env.PATH, os.homedir());
+  if (withLocalBin !== process.env.PATH) process.env.PATH = withLocalBin;
   const log = createLogger(args.verbose);
+
+  // The Mac app's helpers: connect GitHub with a token from standard input, or list its repositories. Then exit. They
+  // need only the key store and Agents & keys, which checks no agent for them: no other module has to load. Without
+  // them, --connect-github says it could not connect, and --github-repos lists nothing.
+  if (args.connectGithub || args.githubRepos) {
+    let connect = null;
+    try {
+      ({ connect } = await openConnect({}, args, log, { probe: false }));
+    } catch (err) {
+      log.warn('Workbench could not open Agents & keys:', err);
+    }
+    if (args.connectGithub) return connectGithubMode({ connect, readToken: () => readLine(process.stdin), log });
+    return githubReposMode({ connect, log });
+  }
 
   let mods;
   try {
@@ -595,42 +641,35 @@ async function main() {
     return 1;
   }
 
-  // The Mac app's helpers: connect GitHub with a token from standard input, or list its repositories. Then exit.
-  if (args.connectGithub || args.githubRepos) {
-    const { connect } = await openConnect(mods, args, log);
-    if (args.connectGithub) return connectGithubMode({ connect, readToken: () => readLine(process.stdin), log });
-    return githubReposMode({ connect, log });
-  }
-
   // --clone: copy the repository first, then go on as --repo <its folder>. For the Mac app, standard input is the
-  // lifeline from now on: if the app goes away while git copies, Workbench stops (git, cut off, tidies its half-made
-  // folder); if it goes away after that, Workbench stops as soon as it has started (appGone, below).
+  // lifeline from now on: if it closes after the clone, Workbench stops as soon as it has started (appGone, below).
   let appGone = false;
   if (args.clone) {
-    let copying = true;
-    // Ctrl-C, or the app's Cancel (SIGTERM), while git copies: git is told to stop (cloneRepo's signal), and Workbench
-    // leaves within two seconds. Nothing starts after a clone that was stopped.
+    // A stop while git copies (Ctrl-C; the app's Cancel or Quit, which send SIGTERM and may close standard input
+    // first; a closed terminal) is said once. Git's whole process group is stopped and what it made so far is removed
+    // (cloneRepo, through the signal); then Workbench exits 1, and nothing starts. Should that take longer than
+    // CLONE_STOP_MS, Workbench leaves anyway, and its exit kills git and removes the folder (workspace.mjs).
     const stopCopying = new AbortController();
-    const cancel = () => {
+    let copying = true;
+    const stop = (said) => {
       if (!copying || stopCopying.signal.aborted) return;
+      complain(said);
       stopCopying.abort();
-      complain('Stopped copying the repository.');
-      setTimeout(() => process.exit(1), 2000);
+      setTimeout(() => process.exit(1), CLONE_STOP_MS).unref();
     };
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, cancel);
+    const cancel = () => stop('Stopped copying the repository.');
+    for (const sig of STOP_SIGNALS) process.on(sig, cancel);
     if (args.app) {
       const gone = () => {
         appGone = true;
-        if (!copying) return;
-        complain('The app closed, so Workbench stopped copying the repository.');
-        process.exit(1);
+        stop('The app closed, so Workbench stopped copying the repository.');
       };
       for (const ev of ['end', 'close', 'error']) process.stdin.on(ev, gone);
       process.stdin.resume();
     }
     const cloned = await cloneFirst({ workspace: mods.workspace, url: args.clone, into: args.into, app: args.app, signal: stopCopying.signal, log });
     copying = false;
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, cancel);
+    for (const sig of STOP_SIGNALS) process.off(sig, cancel);
     if (stopCopying.signal.aborted) return 1;
     if (!cloned.root) return cloned.code ?? 1;
     args.repo = cloned.root;

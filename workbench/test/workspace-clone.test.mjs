@@ -7,7 +7,7 @@
 // network.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,6 +23,10 @@ const savedCwd = process.cwd();
 
 /** A token-shaped value, built from parts so that no secret scanner takes this file for a leak. */
 const TOKEN = ['gho', 'NOTREAL', 'workbench', 'test', 'token', '0123456789'].join('_');
+/** What cloneRepo says of an address it does not clone from: the Mac app's own words. */
+const ADDRESS_REFUSED = 'Workbench clones addresses like https://github.com/owner/repo or git@github.com:owner/repo.git.';
+const WORKSPACE_URL = new URL('../src/core/workspace.mjs', import.meta.url).href;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let T, globalConfig, credsFile, gitLog, realGit;
 
@@ -79,6 +83,9 @@ before(() => {
     '      fail) printf \'%s\' "$FAKE_GIT_STDERR" >&2; exit "${FAKE_GIT_EXIT:-128}" ;;',
     '      made) mkdir -p "$last"; echo half > "$last/half.txt"; printf \'%s\' "$FAKE_GIT_STDERR" >&2; exit 128 ;;',
     '      hang) echo $$ > "$FAKE_GIT_PIDFILE"; exec sleep 30 ;;',
+    // Half a clone, then a wait: `stubborn` also ignores SIGTERM, so only SIGKILL ends it.
+    '      half|stubborn) [ "$FAKE_GIT_CLONE" = stubborn ] && trap \'\' TERM; mkdir -p "$last/.git"; echo half > "$last/half.txt";'
+      + ' printf \'Receiving objects:  10%% (1/10)\\r\' >&2; echo $$ > "$FAKE_GIT_PIDFILE"; exec sleep 30 ;;',
     '    esac ;;',
     'esac',
     `exec ${sh(realGit)} "$@"`,
@@ -294,11 +301,11 @@ test('cloneRepo refuses addresses it does not clone from, before git runs', asyn
     null,
     42,
   ];
-  for (const url of bad) await refused(cloneRepo({ url, into }), 'url');
+  // The words the Mac app's own check says, so the two read alike; the address is never repeated (it may be a key
+  // pasted into the wrong field).
+  for (const url of bad) await refused(cloneRepo({ url, into }), 'url', ADDRESS_REFUSED);
   assert.equal(calls().filter((l) => l.includes(' clone ')).length, 0);
   assert.equal(fs.existsSync(into), false);
-  const e = await refused(cloneRepo({ url: 'ext::sh -c x', into }), 'url');
-  assert.match(e.message, /is not an address Workbench can clone\. Use one like https:\/\/github\.com\/owner\/repo/);
 });
 
 test('cloneRepo takes https, ssh and scp-like addresses, names the folder after the repository, and runs git safely', async () => {
@@ -418,6 +425,98 @@ test('a clone that takes too long is stopped, with its whole process group', asy
     delete process.env.FAKE_GIT_CLONE;
     delete process.env.FAKE_GIT_PIDFILE;
   }
+});
+
+/** The process id the stand-in git wrote to `file`, once it has. */
+async function pidIn(file, ms = 10_000) {
+  const until = Date.now() + ms;
+  for (;;) {
+    const pid = Number(read(file).trim());
+    if (pid > 0) return pid;
+    if (Date.now() > until) throw new Error(`the stand-in git wrote no process id to ${file}`);
+    await sleep(20);
+  }
+}
+
+/** Whether the process has gone (and been reaped), waiting up to `ms` for it. */
+async function goneSoon(pid, ms = 5000) {
+  const until = Date.now() + ms;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (e) {
+      if (e.code === 'ESRCH') return true;
+      throw e;
+    }
+    if (Date.now() > until) return false;
+    await sleep(25);
+  }
+}
+
+test('a clone that is stopped ends git’s whole process group, then removes what it made', async () => {
+  const pidfile = path.join(T, 'stopped.pid');
+  const into = path.join(T, 'stopping');
+  process.env.FAKE_GIT_PIDFILE = pidfile;
+  try {
+    // Git stops when asked; git ignores SIGTERM (SIGKILL a second later); a folder that was there, empty, before.
+    for (const [mode, existing] of [['half', false], ['stubborn', false], ['half', true]]) {
+      fs.rmSync(pidfile, { force: true });
+      process.env.FAKE_GIT_CLONE = mode;
+      const name = `${mode}-${existing ? 'there' : 'new'}`;
+      const dest = path.join(into, name);
+      if (existing) fs.mkdirSync(dest, { recursive: true });
+      const stop = new AbortController();
+      const seen = [];
+      const cloning = cloneRepo({ url: `https://github.com/owner/${name}`, into, signal: stop.signal, onProgress: (p) => seen.push(p) });
+      const pid = await pidIn(pidfile);
+      assert.ok(fs.existsSync(path.join(dest, 'half.txt')), 'git had begun');
+      const started = Date.now();
+      stop.abort();
+      await refused(cloning, 'stopped', 'Copying the repository was stopped.');
+      const took = Date.now() - started;
+      assert.ok(took < 3000, `${name}: stopping took ${took} ms`);
+      if (mode === 'stubborn') assert.ok(took >= 900, `${name}: SIGKILL came after ${took} ms, not after the second git has to stop`);
+      assert.ok(await goneSoon(pid, 500), `${name}: git is gone`);
+      if (existing) assert.deepEqual(fs.readdirSync(dest), [], 'the folder that was there stays, empty as it was');
+      else assert.equal(fs.existsSync(dest), false, `${name}: the half-made folder is gone`);
+      assert.ok(fs.statSync(into).isDirectory(), 'the folder it was put in stays');
+      assert.deepEqual(seen, [{ phase: 'receiving', percent: 10 }]);
+    }
+    // Stopped before it began: git never runs, and no folder is made.
+    clearCalls();
+    const early = new AbortController();
+    early.abort();
+    await refused(cloneRepo({ url: 'https://github.com/owner/never', into: path.join(T, 'never'), signal: early.signal }), 'stopped');
+    assert.equal(calls().filter((l) => l.includes(' clone ')).length, 0);
+    assert.equal(fs.existsSync(path.join(T, 'never')), false);
+  } finally {
+    delete process.env.FAKE_GIT_CLONE;
+    delete process.env.FAKE_GIT_PIDFILE;
+  }
+});
+
+test('when Workbench exits while git copies, its exit kills git’s whole group and removes the half-made folder', async () => {
+  const pidfile = path.join(T, 'exiting.pid');
+  const into = path.join(T, 'exiting');
+  // A Workbench that exits mid-clone (as the CLI does when stopping takes too long). Git ignores SIGTERM, so only
+  // SIGKILL ends it.
+  const script = [
+    "import fs from 'node:fs';",
+    `const { cloneRepo } = await import(${JSON.stringify(WORKSPACE_URL)});`,
+    `cloneRepo({ url: 'https://github.com/owner/gone', into: ${JSON.stringify(into)} }).catch(() => {});`,
+    `const file = ${JSON.stringify(pidfile)};`,
+    "while (!(fs.existsSync(file) && fs.readFileSync(file, 'utf8').trim())) await new Promise((r) => setTimeout(r, 20));",
+    'process.exit(3);',
+  ].join('\n');
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, FAKE_GIT_CLONE: 'stubborn', FAKE_GIT_PIDFILE: pidfile }, encoding: 'utf8', timeout: 20_000,
+  });
+  assert.equal(r.status, 3, r.stderr);
+  const pid = Number(read(pidfile).trim());
+  assert.ok(pid > 0);
+  assert.ok(await goneSoon(pid), 'git is gone');
+  assert.equal(fs.existsSync(path.join(into, 'gone')), false);
+  assert.ok(fs.statSync(into).isDirectory(), 'the folder it was put in stays');
 });
 
 // ------------------------------------------------------------------ cloning: a real repository

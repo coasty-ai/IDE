@@ -435,8 +435,8 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     { method: 'POST', re: /^\/api\/machines\/([^/]+)\/awake$/, run: (b, m) => engine.setMachineAwake(id(m[1]), b.awake === true) },
     { method: 'POST', re: /^\/hook\/pretool$/, hook: true },
     // Agents & keys. Each answers { ok, sentence, status } with a fresh ConnectStatus (src/core/connect.mjs), or { error }
-    // with a plain sentence and a 4xx code. Keys come in the body only, and never go out again: not in an answer, not in
-    // the log. `status` never holds a key's value.
+    // with a plain sentence and a 4xx code (500 when the place keys are kept failed). Keys come in the body only, and
+    // never go out again: not in an answer, not in the log. `status` never holds a key's value.
     { method: 'GET', re: /^\/api\/connect$/, connect: true, run: () => done() },
     { method: 'POST', re: /^\/api\/connect\/recheck$/, connect: true, run: async () => { await connect.recheck(); return done(); } },
     {
@@ -464,6 +464,16 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
       },
     },
     { method: 'POST', re: /^\/api\/connect\/github\/disconnect$/, connect: true, run: async () => done(await connect.disconnectGithub(), 'Workbench is no longer connected to GitHub.') },
+    {
+      // "Let agents use this token", changed without the token: Connect reads it back from the key store. When it
+      // cannot, the answer is { ok: false, why: 'token', sentence, status }; with GitHub not connected, a 409.
+      method: 'POST', re: /^\/api\/connect\/github\/agents$/, connect: true,
+      run: async (b) => {
+        if (typeof b.agentsUseIt !== 'boolean') throw new HttpError(400, 'Choose whether agents may use the GitHub token.');
+        const r = await connect.setGithubAgentsUseIt(b.agentsUseIt);
+        return done(r, null, r?.ok === false && typeof r.why === 'string' ? { why: r.why } : {});
+      },
+    },
     { method: 'POST', re: /^\/api\/connect\/keys$/, connect: true, run: (b) => addKey(b) },
     {
       method: 'POST', re: /^\/api\/connect\/keys\/([^/]+)\/remove$/, connect: true,
@@ -556,14 +566,18 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
       : (Array.isArray(b.agents) && b.agents.length && b.agents.length <= 20 && b.agents.every(a => typeof a === 'string' && CONNECT_ID_RE.test(a)) ? [...new Set(b.agents)] : null);
     if (!agents) throw new HttpError(400, 'Choose which agents get the key.');
     const label = text(b.label) || (typeof preset?.label === 'string' && preset.label) || 'Key';
-    const r = await connect.addKey({ preset: presetId, label, values, secretNames, scope: scope === 'repo' ? { kind: 'repo', root } : { kind: 'all' }, agents });
+    // The key store's own shape for "this repository" ({ kind: 'repo', root }): it refuses the bare word 'repo'.
+    const r = await connect.addKey({
+      preset: presetId, label, values, secretNames, scope: scope === 'repo' ? { kind: 'repo', root } : { kind: 'all' }, agents, repoRoot: root,
+    });
     return done(r, `Saved ${label}, for ${scope === 'repo' ? 'this repository' : 'all repositories'}.`);
   }
 
   /**
    * Run an Agents & keys route. Without the connect service (the demo), a plain 404. A refusal from Connect or the key
-   * store (an error with `.why`) is a 400 with its sentence; anything else is logged, and the person reads only that
-   * something went wrong. Whatever the request carried as a key is cut out of both.
+   * store (an error with `.why`) answers its sentence with its status (400 when it has none; 500 when the place keys
+   * are kept failed, which the log notes too); anything else is logged, and the person reads only that something went
+   * wrong. Whatever the request carried as a key is cut out of all of them.
    */
   async function handleConnect(res, route, body, m) {
     if (!connect) return sendJson(res, 404, { error: engine.mode === 'demo' ? NO_CONNECT_DEMO : NO_CONNECT });
@@ -573,8 +587,10 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
       out = await route.run(body, m);
     } catch (err) {
       if (isPlainError(err)) {
-        const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 400;
-        return sendJson(res, status, { error: redact(err.message, secrets) });
+        const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 400;
+        const said = redact(err.message, secrets);
+        if (status >= 500) L.warn('Agents & keys could not do that:', said);
+        return sendJson(res, status, { error: said });
       }
       L.error('Agents & keys could not do that:', redact(err?.stack || String(err), secrets));
       return sendJson(res, 500, { error: 'Something went wrong in the workbench. The details are in its log.' });
