@@ -20,8 +20,13 @@ import { SignIns, SIGNIN_CHECK_MS, SIGNIN_TIMEOUT_MS } from './signin.mjs';
 import * as workspaceModule from './workspace.mjs';
 import { openTerminal as openTerminalWindow, openTerminalSteps as openTerminalStepsWindow } from './terminal.mjs';
 import * as githubModule from './github.mjs';
-import { GH_DEVICE_URL, GH_MIN_VERSION, LOGIN_MAX_MS, versionAtLeast } from './github.mjs';
+import { GH_DEVICE_URL, GH_HELPER_KEYS, GH_MIN_VERSION, LOGIN_MAX_MS, versionAtLeast } from './github.mjs';
 
+/**
+ * Once gh's sign-in in Terminal is there, how long Workbench waits for the setup-git step after it to make git use gh,
+ * before it runs setup-git itself: two at once can leave git's settings doubled.
+ */
+const GH_SETUP_WAIT_MS = 10_000;
 /** How long one sign-in check may take. */
 const PROBE_TIMEOUT_MS = 10_000;
 /** How long an adapter's own available() may take (the CLI gives it the same). */
@@ -405,7 +410,7 @@ export class Connect extends EventEmitter {
    *   sign-in in Terminal: gh's login, then setup-git)
    * @param {object} [o.ghModule]    src/core/github.mjs, or a stand-in for some of its functions
    * @param {object} [o.ghOptions]   for GitHub through gh, mainly for tests: { fetchImpl, verify, osRelease, arch, tmpDir,
-   *   dirs, codeWaitMs (15 s), loginMs (15 min), terminalMs (15 min), pollMs (3 s) }
+   *   dirs, codeWaitMs (15 s), loginMs (14.5 min), terminalMs (15 min), pollMs (3 s), setupWaitMs (10 s) }
    * @param {Function} [o.runProgram] runs xcode-select (git's checks and Install): (program, args, { env, cwd, timeoutMs })
    *   => Promise<{ code, stdout, stderr, timedOut, error }>; tests give a stand-in, never the real `xcode-select --install`
    * @param {number} [o.signInTimeoutMs] how long a sign-in in the browser may wait (10 minutes); for tests
@@ -455,6 +460,7 @@ export class Connect extends EventEmitter {
     this.ghOptions = ghOptions && typeof ghOptions === 'object' ? ghOptions : {};
     this._ghFlow = null;
     this._ghNote = null;
+    this._ghTerminalSignOut = null; // a sign-out left to Terminal: { login }, until a status read finds gh signed out
     this._ghVersions = new Map();
     // An 'agents' listener added after a probe ended hears the last map at once (once), so the engine never misses the
     // first probe, however late it is wired.
@@ -1212,14 +1218,20 @@ export class Connect extends EventEmitter {
    * on a Mac) only when settings.json names a token connection. See _githubStatus.
    */
   async githubStatus() {
+    return this._githubStatus(await this._githubToken());
+  }
+
+  /** The token connection (_github), with settings.json read afresh; the key store is asked only when it names one. */
+  async _githubToken() {
     this._settings = this._readSettings();
     const gh = this._settings && typeof this._settings.github === 'object' && this._settings.github ? this._settings.github : null;
-    return this._githubStatus(this._github(gh && gh.keyId ? await this._listKeys() : []));
+    return this._github(gh && gh.keyId ? await this._listKeys() : []);
   }
 
   /**
    * GitHub as the panel shows it: through gh when gh is signed in to github.com (read from gh's own settings, no network
-   * call), else through the token connection (`token`: what _github found), else neither. Never a token.
+   * call), else through the token connection (`token`: what _github found), else neither. Never a token. After a
+   * sign-out left to Terminal, the first read that finds gh signed out sets git back (_ghForgetGit).
    * @returns {Promise<{ connected: boolean, via: 'gh'|'token'|null, login: string|null, ghInstalled: boolean,
    *   ghVersion: string|null, ghPath: string|null, agentsUseIt: boolean, sentence: string, signingIn: object|null }>}
    */
@@ -1229,6 +1241,11 @@ export class Connect extends EventEmitter {
     const st = runPath
       ? await this.gh.ghStatus({ ghPath: runPath, env: this.env, version: pick.path ? pick.version : pick.old.version, cwd: this._probeFolder() })
       : { signedIn: false, login: null };
+    const signedOut = this._ghTerminalSignOut;
+    if (signedOut && st.signedIn === false) {
+      this._ghTerminalSignOut = null;
+      await this._ghForgetGit(signedOut.login, token);
+    }
     const viaGh = st.signedIn === true && typeof st.login === 'string' && GITHUB_LOGIN.test(st.login);
     let gitUsesIt = false;
     if (viaGh) {
@@ -1368,20 +1385,25 @@ export class Connect extends EventEmitter {
 
   /**
    * Sign out of GitHub: gh forgets its sign-in (`gh auth logout --hostname github.com --user <login>`, with no terminal;
-   * Terminal on gh's sign-out when that fails, on macOS), then git's settings lose what setup-git wrote, when they are
-   * exactly gh's (forgetGhGitHelper): git is then as it was before. GitHub itself still lists the sign-in until the
-   * person revokes it there, and the sentence says so. A sign-in under way is stopped first.
+   * Terminal on gh's sign-out when that fails, on macOS). Once gh is signed out, and only then, git is set back
+   * (_ghForgetGit): its settings lose what setup-git wrote, and it forgets the sign-in it keeps for that account. When gh
+   * signs out in Terminal, that comes at the first status read that finds gh signed out; when gh is still signed in
+   * after its logout (another account of the person's, which gh then makes the active one), git goes on asking gh.
+   * GitHub itself still lists the sign-in until the person revokes it there, and the sentence says so. A sign-in under
+   * way is stopped first.
    * @returns {Promise<{ ok: boolean, why?: string, opened?: boolean, command?: string, sentence: string }>}
    */
   async githubSignOut() {
     if (this._ghFlow) await this.cancelGithubSignIn();
     this._ghNote = null;
+    const earlier = this._ghTerminalSignOut;
+    this._ghTerminalSignOut = null;
     const pick = await this._ghPick();
     const ghPath = pick.path || (pick.old && pick.old.path) || null;
+    const version = pick.path ? pick.version : pick.old && pick.old.version;
     const cwd = this._probeFolder();
-    const st = ghPath ? await this.gh.ghStatus({ ghPath, env: this.env, version: pick.path ? pick.version : pick.old.version, cwd }) : { signedIn: false, login: null };
+    const st = ghPath ? await this.gh.ghStatus({ ghPath, env: this.env, version, cwd }) : { signedIn: false, login: null };
     const revoke = 'GitHub still lists this sign-in under Settings → Applications until you revoke it there.';
-    let opened = false;
     if (ghPath && st.signedIn !== false) {
       const out = await this.gh.ghLogout({ ghPath, env: this.env, login: st.login, cwd });
       if (!out.ok) {
@@ -1398,21 +1420,44 @@ export class Connect extends EventEmitter {
           this.emit('changed');
           return { ok: false, why: 'gh', opened: false, command: this.gh.ghSignOutCommand(ghPath), sentence: 'Workbench could not sign out of GitHub. Run this command in a terminal, then check again.' };
         }
-        opened = true;
+        // gh is still signed in until the person signs out there: git is set back once a status read finds it signed out.
+        this._ghTerminalSignOut = { login: st.login || null };
+        this.emit('changed');
+        return { ok: true, opened: true, sentence: `Terminal is open to sign you out of GitHub. When it is done, come back here. ${revoke}` };
+      }
+      const now = await this.gh.ghStatus({ ghPath, env: this.env, version, cwd });
+      if (now.signedIn === true) {
+        this.emit('changed');
+        const was = st.login ? `Signed out of GitHub as ${st.login}.` : 'Signed out of GitHub.';
+        return { ok: true, sentence: `${was} GitHub’s command-line tool is still signed in as ${now.login}, and git goes on using that sign-in. ${revoke}` };
       }
     }
-    let after = '';
+    const { forgot, after } = await this._ghForgetGit(st.login || (earlier && earlier.login) || null, await this._githubToken());
+    this.emit('changed');
+    if (!ghPath || st.signedIn === false) return { ok: true, sentence: `GitHub’s command-line tool was not signed in.${forgot}${after}` };
+    return { ok: true, sentence: `Signed out of GitHub.${forgot} ${revoke}${after}` };
+  }
+
+  /**
+   * gh is signed out: git's settings lose what setup-git wrote (forgetGhGitHelper), then git forgets the sign-in it
+   * keeps for `login` (`git credential reject`), now asking the helpers it had before, such as Apple's osxkeychain. That
+   * is the copy gh's own login in Terminal gave git, or one the person saved: the words say so. Git forgets nothing
+   * while gh's lines for github.com stay, nor when the token connection (`token`) is for the same account, since git
+   * keeps that token's sign-in. Failures go to the log.
+   * @returns {Promise<{ forgot: string, after: string }>} words for the answer: what git forgot, then what did not work
+   */
+  async _ghForgetGit(login, token) {
+    let kept;
     try {
-      const { kept } = await this.gh.forgetGhGitHelper();
-      if (kept && kept.length) this._log('info', `git's settings for ${kept.join(' and ')} hold helpers of the person's own, so they stay.`);
+      ({ kept } = await this.gh.forgetGhGitHelper());
     } catch (e) {
       this._log('warn', `git's settings could not be changed back${e && e.detail ? `: ${oneLine(e.detail, 300)}` : ''}`);
-      after = ' Git still asks GitHub’s command-line tool for your GitHub sign-in, so git cannot reach github.com until you sign in again.';
+      return { forgot: '', after: ' Git still asks GitHub’s command-line tool for your GitHub sign-in, so git cannot reach github.com until you sign in again.' };
     }
-    this.emit('changed');
-    if (opened) return { ok: true, opened: true, sentence: `Terminal is open to sign you out of GitHub. When it is done, come back here. ${revoke}${after}` };
-    if (!ghPath || st.signedIn === false) return { ok: true, sentence: `GitHub’s command-line tool was not signed in.${after}` };
-    return { ok: true, sentence: `Signed out of GitHub. ${revoke}${after}` };
+    if (kept && kept.length) this._log('info', `git's settings for ${kept.join(' and ')} hold helpers of the person's own, so they stay.`);
+    if (!login || (kept && kept.includes(GH_HELPER_KEYS[0])) || (token && token.connected && token.login === login)) return { forgot: '', after: '' };
+    if (await this._forgetGitSignIn(login)) return { forgot: ` Git also forgot any GitHub sign-in it kept for ${login}, even one you saved yourself.`, after: '' };
+    return { forgot: '', after: ` Git could not forget your GitHub sign-in as ${login}, so it may still use that account’s token.` };
   }
 
   /** A new sign-in: its state, its listeners, and its promise, which never rejects. */
@@ -1426,6 +1471,7 @@ export class Connect extends EventEmitter {
     flow.markStarted = () => markStarted();
     this._ghFlow = flow;
     this._ghNote = null;
+    this._ghTerminalSignOut = null; // a sign-in now: a sign-out left to Terminal earlier no longer sets git back
     flow.promise = this._runGhFlow(flow)
       .catch((e) => {
         this._log('error', `signing in to GitHub failed: ${e && (e.stack || e.message)}`);
@@ -1530,7 +1576,12 @@ export class Connect extends EventEmitter {
     return this._ghTerminal(flow, ghPath);
   }
 
-  /** The fallback: Terminal on gh's login and setup-git; then gh's sign-in is read every few seconds until it is there. */
+  /**
+   * The fallback: Terminal on gh's login and setup-git; then gh's sign-in is read every few seconds until it is there.
+   * Then Workbench waits for the steps' setup-git to make git use gh, rather than run its own at the same moment (two at
+   * once can leave git's settings doubled), and runs setup-git itself only when git does not use gh within 10 seconds
+   * (`setupWaitMs`): Terminal was closed before it, say.
+   */
   async _ghTerminal(flow, ghPath) {
     const o = this.ghOptions;
     let res = null;
@@ -1553,28 +1604,52 @@ export class Connect extends EventEmitter {
     const until = Date.now() + (Number.isFinite(o.terminalMs) ? o.terminalMs : LOGIN_MAX_MS);
     const every = Number.isFinite(o.pollMs) ? o.pollMs : 3000;
     while (!flow.cancelled && Date.now() < until) {
-      await new Promise((resolve) => {
-        const timer = setTimeout(wake, Math.max(0, Math.min(every, until - Date.now())));
-        function wake() {
-          clearTimeout(timer);
-          resolve();
-        }
-        flow.wake = wake;
-      });
-      flow.wake = null;
+      await this._ghSleep(flow, Math.min(every, until - Date.now()));
       if (flow.cancelled) break;
       const st = await this.gh.ghStatus({ ghPath, env: this.env, version: flow.ghVersion, cwd: this._probeFolder() });
-      if (st.signedIn === true) return this._ghFinish(flow, ghPath);
+      if (st.signedIn === true) {
+        const setUp = await this._ghGitSetUp(flow, Number.isFinite(o.setupWaitMs) ? o.setupWaitMs : GH_SETUP_WAIT_MS, every);
+        if (flow.cancelled) break;
+        return this._ghFinish(flow, ghPath, { setup: !setUp });
+      }
     }
     if (flow.cancelled) return { ok: false, phase: 'error', why: 'cancelled', sentence: 'Stopped signing in to GitHub.' };
     return { ok: false, phase: 'error', why: 'terminal', sentence: 'The sign-in in Terminal did not finish. Sign in to GitHub again to try once more.' };
   }
 
-  /** gh is signed in: setup-git (every time: it is safe to repeat, and gh may have moved), then the login, verified. */
-  async _ghFinish(flow, ghPath) {
+  /** Wait up to `ms`, looking every `every`, for git to ask gh for github.com's sign-in: true once it does. */
+  async _ghGitSetUp(flow, ms, every) {
+    const end = Date.now() + ms;
+    for (;;) {
+      if (await this._gitUsesGh()) return true;
+      if (flow.cancelled || Date.now() >= end) return false;
+      await this._ghSleep(flow, Math.min(every, end - Date.now()));
+    }
+  }
+
+  /** Wait `ms`, or until the sign-in is cancelled (cancelGithubSignIn wakes it). */
+  async _ghSleep(flow, ms) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(wake, Math.max(0, ms));
+      function wake() {
+        clearTimeout(timer);
+        resolve();
+      }
+      flow.wake = wake;
+    });
+    flow.wake = null;
+  }
+
+  /**
+   * gh is signed in: setup-git (every time, unless Terminal's has just run it: it is safe to repeat, and gh may have
+   * moved), then the login, verified.
+   */
+  async _ghFinish(flow, ghPath, { setup = true } = {}) {
     const cwd = this._probeFolder();
-    const setup = await this.gh.ghSetupGit({ ghPath, env: this.env, cwd });
-    if (!setup.ok) this._log('warn', `git could not be set up to use GitHub’s command-line tool: ${oneLine(setup.detail, 500)}`);
+    if (setup) {
+      const r = await this.gh.ghSetupGit({ ghPath, env: this.env, cwd });
+      if (!r.ok) this._log('warn', `git could not be set up to use GitHub’s command-line tool: ${oneLine(r.detail, 500)}`);
+    }
     const st = await this.gh.ghStatus({ ghPath, env: this.env, version: flow.ghVersion, cwd, verify: true });
     if (st.signedIn !== true || !st.login) {
       return { ok: false, phase: 'error', why: 'gh', sentence: 'GitHub’s command-line tool finished, but Workbench could not find the sign-in. Sign in to GitHub again.' };

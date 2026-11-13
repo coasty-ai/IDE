@@ -9,7 +9,7 @@
 // finish when the program exits otherwise, cannot start, asks for something to be typed (Claude Code's
 // "Paste code here >" when its localhost callback cannot be reached), or 10 minutes pass: the program is then stopped,
 // and the person signs in in Terminal instead (src/core/connect.mjs). See ARCHITECTURE.md, "Sign-in in the browser".
-import { spawn as spawnChild } from 'node:child_process';
+import { ChildProcess, spawn as spawnChild } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 
 /** How long a sign-in may wait for the person before it counts as not finished. */
@@ -59,18 +59,35 @@ function duration(ms) {
   return `${n} ${unit}${n === 1 ? '' : 's'}`;
 }
 
-/** Login programs still running: stopped when Workbench exits, so none is left waiting for a browser. */
-const live = new Set();
+/**
+ * Send `sig` to a login program: with `group`, to its whole process group (it leads one, started detached), so what a
+ * launcher started goes too (npm's `codex` is a Node script that starts the real program); else to the program alone.
+ */
+function signal(child, sig, group) {
+  if (group) {
+    try {
+      process.kill(-child.pid, sig);
+      return;
+    } catch { /* the group has gone: the program alone, below */ }
+  }
+  try { child.kill(sig); } catch { /* gone */ }
+}
+
+/**
+ * Login programs still running, each with whether its group is signalled: stopped when Workbench exits, so none is
+ * left waiting for a browser.
+ */
+const live = new Map();
 let watching = false;
 
-function keepTrack(child) {
-  live.add(child);
+function keepTrack(child, group) {
+  live.set(child, group);
   if (watching) return;
   watching = true;
+  // An exit hook cannot wait. A group is killed at once. A program alone gets SIGTERM, which a launcher passes on to
+  // what it started (a SIGKILL would end the launcher before it could).
   process.on('exit', () => {
-    for (const c of live) {
-      try { c.kill('SIGKILL'); } catch { /* gone */ }
-    }
+    for (const [c, group] of live) signal(c, group ? 'SIGKILL' : 'SIGTERM', group);
   });
 }
 
@@ -89,8 +106,11 @@ function publicState(run) {
  * the caller gave (Connect: 'browser' or 'console'). Each sign-in ends once: a program that exits after it was stopped,
  * or a check that answers late, changes nothing.
  *
- * The login program only waits for the browser, so stopping it loses nothing: SIGTERM, then SIGKILL after 2 seconds.
- * Only the program itself is stopped, never its process group: on Linux the browser it opened may be in that group.
+ * The login program only waits for the browser, so stopping it loses nothing: SIGTERM, then SIGKILL after 2 seconds;
+ * when Workbench exits, SIGKILL at once. On macOS this goes to the program's whole process group, so a launcher's own
+ * program (npm's `codex`) goes too, and the browser is never in that group (`open` hands it to launchd). Elsewhere it
+ * goes to the program alone, since on Linux the browser it opened may be in its group; there the program gets SIGTERM
+ * when Workbench exits, which a launcher passes on.
  */
 export class SignIns extends EventEmitter {
   /**
@@ -99,15 +119,20 @@ export class SignIns extends EventEmitter {
    * @param {number} [o.timeoutMs]      10 minutes
    * @param {number} [o.checkEveryMs]   2 seconds
    * @param {number} [o.stopGraceMs]    2 seconds between SIGTERM and SIGKILL
+   * @param {boolean} [o.signalGroup]   stop each program's whole process group: on macOS (tests choose)
    * @param {Function} [o.now]          Date.now
    * @param {Function} [o.log]          (level, line)
    */
-  constructor({ spawn = spawnChild, timeoutMs = SIGNIN_TIMEOUT_MS, checkEveryMs = SIGNIN_CHECK_MS, stopGraceMs = STOP_GRACE_MS, now = Date.now, log = null } = {}) {
+  constructor({
+    spawn = spawnChild, timeoutMs = SIGNIN_TIMEOUT_MS, checkEveryMs = SIGNIN_CHECK_MS, stopGraceMs = STOP_GRACE_MS,
+    signalGroup = process.platform === 'darwin', now = Date.now, log = null,
+  } = {}) {
     super();
     this._spawn = spawn;
     this.timeoutMs = timeoutMs;
     this.checkEveryMs = checkEveryMs;
     this.stopGraceMs = stopGraceMs;
+    this.signalGroup = signalGroup === true;
     this._now = now;
     this._log = typeof log === 'function' ? log : () => {};
     this._runs = new Map();
@@ -139,7 +164,7 @@ export class SignIns extends EventEmitter {
     if (current && current.phase === 'waiting') return { started: false, state: publicState(current) };
     const run = {
       id, label, mode, since: this._now(), endedAt: null, phase: 'waiting', why: null,
-      child: null, exited: false, settling: false, output: '', timers: new Set(),
+      child: null, group: false, exited: false, settling: false, output: '', timers: new Set(),
       check: typeof check === 'function' ? check : null, signedInBefore: signedInBefore === true,
       whenSignedIn: typeof whenSignedIn === 'function' ? whenSignedIn : null,
     };
@@ -153,7 +178,10 @@ export class SignIns extends EventEmitter {
       return { started: true, state: publicState(run) };
     }
     run.child = child;
-    keepTrack(child);
+    // Only a program this started (detached: it leads a group of its own) has its group signalled, and never with pid 0
+    // or 1 (Workbench's own group, or every process).
+    run.group = this.signalGroup && child instanceof ChildProcess && Number.isInteger(child.pid) && child.pid > 1;
+    keepTrack(child, run.group);
     // Nothing here keeps Workbench running: when it exits, the 'exit' hook above stops the program.
     child.unref?.();
     const read = (chunk) => {
@@ -275,10 +303,10 @@ export class SignIns extends EventEmitter {
   _kill(run) {
     const child = run.child;
     if (!child || run.exited) return;
-    try { child.kill('SIGTERM'); } catch { /* gone */ }
+    signal(child, 'SIGTERM', run.group);
     const t = setTimeout(() => {
       if (run.exited) return;
-      try { child.kill('SIGKILL'); } catch { /* gone */ }
+      signal(child, 'SIGKILL', run.group);
     }, this.stopGraceMs);
     t.unref?.();
   }

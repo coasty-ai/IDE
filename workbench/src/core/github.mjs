@@ -37,8 +37,15 @@ export const GH_REPOS_PATH = '/user/repos?per_page=100&sort=pushed&affiliation=o
 export const GH_DIRS = Object.freeze(['/opt/homebrew/bin', '/usr/local/bin']);
 /** How long gh's login may take to print the one-time code before Workbench opens Terminal instead. */
 export const CODE_WAIT_MS = 15_000;
-/** How long a one-time code lasts on GitHub. */
+/** How long a one-time code lasts on GitHub; also how long Workbench waits for a sign-in in Terminal. */
 export const LOGIN_MAX_MS = 15 * 60_000;
+/**
+ * How long Workbench waits for a code to be approved: half a minute less than it lasts, so Workbench's own limit comes
+ * before gh gives up by itself (which would read as a failure, and open Terminal).
+ */
+export const CODE_MAX_MS = LOGIN_MAX_MS - 30_000;
+/** A failure of gh's login this close to the end of the wait (at most: half the wait) is the code running out. */
+const EXPIRY_MARGIN_MS = 60_000;
 /** The git settings `gh auth setup-git` writes, for github.com and gist.github.com. */
 export const GH_HELPER_KEYS = Object.freeze(['credential.https://github.com.helper', 'credential.https://gist.github.com.helper']);
 
@@ -276,7 +283,8 @@ export async function ghStatus({ ghPath, env = process.env, version = null, veri
  * - `question`: it asked something (a line beginning "? "), so it was stopped;
  * - `no-code`: no code within `codeWaitMs` (15 s), so it was stopped;
  * - `failed`: it exited with another code, or could not be started;
- * - `expired`: the code was shown `maxMs` ago (15 minutes, as long as a code lasts), so it was stopped;
+ * - `expired`: the code was shown `maxMs` ago (14.5 minutes, half a minute less than a code lasts), so it was stopped;
+ *   or gh exited with another code by itself in the last minute of that wait (its own end of the code came first);
  * - `cancelled`: `cancel()` stopped it.
  * Only a code shaped XXXX-XXXX reaches `onCode`, with github.com's own device page; nothing else gh prints is passed on.
  * gh runs in a process group of its own, so a Ctrl-C meant for Workbench does not end it first; Workbench stops it
@@ -285,11 +293,12 @@ export async function ghStatus({ ghPath, env = process.env, version = null, veri
  *   onCode?: (c: { code: string, url: string }) => void }} o
  * @returns {{ done: Promise<{ outcome: string, code: string|null, exitCode?: number|null, detail: string }>, cancel: () => void }}
  */
-export function startGhLogin({ ghPath, env = process.env, cwd, codeWaitMs = CODE_WAIT_MS, maxMs = LOGIN_MAX_MS, onCode } = {}) {
+export function startGhLogin({ ghPath, env = process.env, cwd, codeWaitMs = CODE_WAIT_MS, maxMs = CODE_MAX_MS, onCode } = {}) {
   let resolveDone;
   const done = new Promise((r) => { resolveDone = r; });
   let child = null;
   let code = null;
+  let codeAt = 0;
   let settled = false;
   let text = '';
   let pending = '';
@@ -313,6 +322,7 @@ export function startGhLogin({ ghPath, env = process.env, cwd, codeWaitMs = CODE
       const m = CODE_RE.exec(line);
       if (m) {
         code = m[1].toUpperCase();
+        codeAt = Date.now();
         clearTimeout(codeTimer);
         maxTimer = setTimeout(() => finish('expired'), maxMs);
         maxTimer.unref?.();
@@ -345,7 +355,9 @@ export function startGhLogin({ ghPath, env = process.env, cwd, codeWaitMs = CODE
   child.on('error', (error) => finish('failed', { exitCode: null, error: error.code || error.message }));
   child.on('close', (exitCode) => {
     if (pending) look(pending, true);
-    finish(exitCode === 0 ? 'done' : 'failed', { exitCode });
+    // gh gives up by itself once GitHub says the code ran out, which can come just before Workbench's own limit.
+    const late = code !== null && Date.now() - codeAt >= maxMs - Math.min(EXPIRY_MARGIN_MS, maxMs / 2);
+    finish(exitCode === 0 ? 'done' : late ? 'expired' : 'failed', { exitCode });
   });
   codeTimer = setTimeout(() => { if (!code) finish('no-code'); }, codeWaitMs);
   codeTimer.unref?.();
@@ -495,8 +507,9 @@ export async function gitUsesGh() {
 
 /**
  * Take out what `gh auth setup-git` wrote in git's global settings, for github.com and for gist.github.com: each key
- * only when it holds exactly setup-git's two values, the empty one and gh's own. Anything the person wrote there
- * stays. A section left empty goes too. Git then asks the helpers it asked before (on a Mac, the login keychain).
+ * only when it holds exactly setup-git's values, the empty one and then gh's own (more than once when two setup-gits
+ * ran at the same moment). Anything the person wrote there stays. A section left empty goes too. Git then asks the
+ * helpers it asked before (on a Mac, the login keychain).
  * @returns {Promise<{ removed: string[], kept: string[] }>} kept: keys that held something else, left as they were
  */
 export async function forgetGhGitHelper() {
@@ -511,7 +524,7 @@ export async function forgetGhGitHelper() {
         throw gitTrouble(e, 'Git could not read its settings.');
       }
       if (!values.length) continue;
-      if (!(values.length === 2 && values[0] === '' && isGhHelper(values[1]))) {
+      if (!(values.length >= 2 && values[0] === '' && values.slice(1).every(isGhHelper))) {
         kept.push(key);
         continue;
       }
@@ -687,9 +700,10 @@ export async function codesignVerify(file) {
  * 2. The release's checksums file, then the archive for this computer, into a new private folder (0700) under the
  *    temporary folder; the archive's SHA-256 must be the checksums file's, before anything else is done with it.
  * 3. Only the program is taken out (`/usr/bin/unzip` on macOS, tar elsewhere: argument arrays): it must be a plain
- *    file. On macOS it must be signed by GitHub (codesignVerify). It must run and say the release's version.
- * 4. It is copied beside ~/.local/bin/gh under a temporary name, made 0755, then renamed onto it: an older one there
- *    is updated in place, and nothing half-written is ever at that path.
+ *    file. On macOS it must be signed by GitHub (codesignVerify).
+ * 4. It is copied beside ~/.local/bin/gh under a temporary name and made 0755. There it must run and say the
+ *    release's version (never in the temporary folder, which may not let programs run). Then it is renamed onto
+ *    ~/.local/bin/gh: an older one there is updated in place, and nothing half-written is ever at that path.
  * The temporary folder goes in every case. Refusals are plain errors with `.why`: `platform`, `macos`, `network`,
  * `github` (an answer Workbench did not expect), `checksum`, `signature`, `runs`, `disk` or `cancelled`.
  *
@@ -755,23 +769,28 @@ export async function ghInstall({
       try { signed = await verify(bin); } catch { signed = false; }
       if (!signed) throw refusal('signature', 'The copy of GitHub’s command-line tool that was downloaded is not signed by GitHub, so Workbench did not install it.');
     }
-    fs.chmodSync(bin, 0o755);
-    const ran = await ghVersion({ ghPath: bin, env, timeoutMs: 30_000, cwd: work });
-    if (ran !== version) {
-      throw refusal('runs', 'The copy of GitHub’s command-line tool that was downloaded does not run on this computer, so Workbench did not install it.',
-        `${asset.member} said version ${ran ?? 'nothing'}, the release is ${version}`);
-    }
-    progress({ phase: 'installing' });
+    // It is tried where it will live, under a temporary name: the temporary folder may not let programs run (noexec).
     const dir = path.dirname(dest);
+    const disk = (e) => refusal('disk', `Workbench could not put GitHub’s command-line tool in ${oneLine(dir, 300)}.`, `${e.code || ''} ${e.message || ''}`);
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
       tmp = path.join(dir, `.gh-${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`);
       fs.copyFileSync(bin, tmp, fs.constants.COPYFILE_EXCL);
       fs.chmodSync(tmp, 0o755);
+    } catch (e) {
+      throw disk(e);
+    }
+    const ran = await ghVersion({ ghPath: tmp, env, timeoutMs: 30_000, cwd: work });
+    if (ran !== version) {
+      throw refusal('runs', 'The copy of GitHub’s command-line tool that was downloaded does not run on this computer, so Workbench did not install it.',
+        `${asset.member} said version ${ran ?? 'nothing'}, the release is ${version}`);
+    }
+    progress({ phase: 'installing' });
+    try {
       fs.renameSync(tmp, dest);
       tmp = null;
     } catch (e) {
-      throw refusal('disk', `Workbench could not put GitHub’s command-line tool in ${oneLine(dir, 300)}.`, `${e.code || ''} ${e.message || ''}`);
+      throw disk(e);
     }
     return { path: dest, version };
   } finally {

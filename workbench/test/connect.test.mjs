@@ -7,7 +7,7 @@
 // and git's credential store and global config are stand-ins or files here. Nothing reaches a network.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -237,6 +237,7 @@ function makeConnect(t, o = {}) {
     env: o.env || process.env,
     openTerminalSteps: o.openTerminalSteps || (async (what) => { steps.push(what); return { opened: true }; }),
     ghOptions: o.ghOptions,
+    ghModule: o.ghModule,
     keys,
     workspace: ws,
     adapters: o.adapters || ADAPTERS,
@@ -992,7 +993,7 @@ async function until(ok, ms = 5000) {
 }
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 /** Short waits for the sign-in, so a test never waits the real 15 seconds or 15 minutes. */
-const FAST = { codeWaitMs: 10_000, loginMs: 15_000, terminalMs: 6000, pollMs: 40 };
+const FAST = { codeWaitMs: 10_000, loginMs: 15_000, terminalMs: 6000, pollMs: 40, setupWaitMs: 300 };
 const HAS_UNZIP = fs.existsSync('/usr/bin/unzip');
 /** The global git settings of these tests, every value of one key (an empty one too). */
 const gitValues = (key) => {
@@ -1237,6 +1238,61 @@ test('Cancel stops gh’s login; one sign-in at a time; a code that runs out say
   assert.ok(await until(() => s.calls().filter((x) => x.argv[1] === 'login').every((x) => !alive(x.pid))));
 });
 
+test('gh giving up by itself as the code runs out (GitHub’s end of it came first) says the code ran out, and opens no Terminal', async (t) => {
+  ghStandIn(t, { FAKE_GH_LOGIN: 'deny', FAKE_GH_LOGIN_DELAY_MS: '2500' });
+  const { c, steps } = makeConnect(t, { ghOptions: { ...FAST, loginMs: 4000 } });
+  const end = await c.githubSignIn({ wait: true });
+  assert.deepEqual(end, { ok: false, phase: 'error', why: 'expired', sentence: 'The one-time code ran out before the sign-in was approved on GitHub. Sign in to GitHub again for a new code.' });
+  assert.deepEqual(steps, [], 'no Terminal');
+});
+
+test('Terminal’s setup-git and Workbench’s never run at once: Workbench waits for the one in Terminal, and runs none of its own', async (t) => {
+  const s = ghStandIn(t, { FAKE_GH_LOGIN: 'fail' });
+  let inTerminal = null;
+  const { c } = makeConnect(t, {
+    ghOptions: { ...FAST, setupWaitMs: 8000 },
+    // Terminal, as the person goes through it: gh's login signs in, then its setup-git runs, slowly here (a pause
+    // between its writes), while Workbench reads gh's sign-in every 40 ms.
+    openTerminalSteps: async ({ steps }) => {
+      setTimeout(() => {
+        s.signIn('octo-cat');
+        const setup = steps[1];
+        inTerminal = new Promise((resolve) => {
+          spawn(setup.program, setup.args, { env: { ...process.env, FAKE_GH_SETUP_GIT_PAUSE_MS: '500' }, stdio: 'ignore' }).on('exit', resolve);
+        });
+      }, 100);
+      return { opened: true };
+    },
+  });
+  assert.deepEqual(await c.githubSignIn({ wait: true }), { ok: true, phase: 'done', login: 'octo-cat', sentence: SIGNED_IN });
+  assert.equal(await inTerminal, 0, 'Terminal’s setup-git worked');
+  for (const key of ['credential.https://github.com.helper', 'credential.https://gist.github.com.helper']) {
+    assert.deepEqual(gitValues(key), ['', `!${s.gh} auth git-credential`], key);
+  }
+  assert.equal(s.calls().filter((x) => x.argv[1] === 'setup-git').length, 1, 'Terminal’s alone');
+});
+
+test('while Workbench waits for Terminal’s setup-git, Cancel stops at once; when Terminal’s time runs out meanwhile, the sign-in still finishes', async (t) => {
+  const s = ghStandIn(t, { FAKE_GH_LOGIN: 'fail' });
+  // The person signs in in Terminal, and closes it before setup-git.
+  const closedEarly = async () => { setTimeout(() => s.signIn('octo-cat'), 50); return { opened: true }; };
+  const { c } = makeConnect(t, { ghOptions: { ...FAST, setupWaitMs: 20_000 }, openTerminalSteps: closedEarly });
+  await c.githubSignIn();
+  assert.ok(await until(() => s.signedInAs() === 'octo-cat'));
+  await sleep(300); // Workbench has seen the sign-in, and waits for git to use gh
+  const asked = Date.now();
+  assert.deepEqual(await c.cancelGithubSignIn(), { ok: true, sentence: 'Stopped signing in to GitHub.' });
+  assert.ok(Date.now() - asked < 2000, 'at once');
+  assert.equal(s.calls().some((x) => x.argv[1] === 'setup-git'), false);
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), []);
+  // Terminal's 400 ms run out while Workbench waits 1.2 seconds for git: it then runs setup-git itself, and is done.
+  fs.rmSync(s.state, { force: true });
+  const late = makeConnect(t, { ghOptions: { ...FAST, terminalMs: 400, setupWaitMs: 1200 }, openTerminalSteps: closedEarly });
+  assert.deepEqual(await late.c.githubSignIn({ wait: true }), { ok: true, phase: 'done', login: 'octo-cat', sentence: SIGNED_IN });
+  assert.equal(s.calls().filter((x) => x.argv[1] === 'setup-git').length, 1);
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), ['', `!${s.gh} auth git-credential`]);
+});
+
 test('a download that is refused ends the sign-in in plain words, opens nothing, and installs nothing; a download can be stopped', async (t) => {
   const bad = noGhComputer(t, { fetch: { archive: Buffer.from('not the archive') } });
   const { c, steps, terminals } = makeConnect(t, { home: bad.home, env: bad.env, platform: bad.platform, ghOptions: bad.ghOptions });
@@ -1269,23 +1325,28 @@ test('a WORKBENCH_GH_BIN that is not there: Sign in says so at once, and nothing
   assert.equal(fetched, 0);
 });
 
-test('Sign out: gh forgets the sign-in, git loses what setup-git wrote (nothing of the person’s), and GitHub still lists it', async (t) => {
+const REVOKE = 'GitHub still lists this sign-in under Settings → Applications until you revoke it there.';
+/** What Sign out adds once git's settings are back as they were: git forgot the sign-in it kept for that account. */
+const FORGOT = (login) => `Git also forgot any GitHub sign-in it kept for ${login}, even one you saved yourself.`;
+
+test('Sign out: gh forgets the sign-in, git loses what setup-git wrote (nothing of the person’s) and the sign-in it kept for that account', async (t) => {
   const s = ghStandIn(t, { GITHUB_TOKEN: 'person-token-not-for-gh' });
   s.signIn('octo-cat');
-  const { c, terminals } = makeConnect(t, { ghOptions: FAST });
+  const { c, terminals, workspace: ws } = makeConnect(t, { ghOptions: FAST });
   assert.equal((await c.githubSignIn({ wait: true })).ok, true);
   spawnSync('git', ['config', '--global', 'user.name', 'Ada'], { env: process.env });
-  const revoke = 'GitHub still lists this sign-in under Settings → Applications until you revoke it there.';
-  assert.deepEqual(await c.githubSignOut(), { ok: true, sentence: `Signed out of GitHub. ${revoke}` });
+  assert.deepEqual(await c.githubSignOut(), { ok: true, sentence: `Signed out of GitHub. ${FORGOT('octo-cat')} ${REVOKE}` });
   assert.equal(s.signedInAs(), null);
   const logout = s.calls().find((x) => x.argv[1] === 'logout');
   assert.deepEqual(logout.argv, ['auth', 'logout', '--hostname', 'github.com', '--user', 'octo-cat']);
   assert.deepEqual(logout.tokens, { GH_TOKEN: false, GITHUB_TOKEN: false });
   for (const key of ['credential.https://github.com.helper', 'credential.https://gist.github.com.helper']) assert.deepEqual(gitValues(key), [], key);
   assert.deepEqual(gitValues('user.name'), ['Ada']);
+  assert.deepEqual(ws.calls, [['reject', 'github.com', 'octo-cat']]);
   assert.equal((await c.status()).github.connected, false);
   assert.deepEqual(terminals, []);
   assert.deepEqual(await c.githubSignOut(), { ok: true, sentence: 'GitHub’s command-line tool was not signed in.' });
+  assert.equal(ws.calls.length, 1, 'no account to forget');
   // gh cannot sign out by itself: Terminal, on macOS; elsewhere, the command.
   s.signIn('octo-cat');
   assert.equal((await c.githubSignIn({ wait: true })).ok, true);
@@ -1294,10 +1355,84 @@ test('Sign out: gh forgets the sign-in, git loses what setup-git wrote (nothing 
   assert.deepEqual(await linux.c.githubSignOut(), {
     ok: false, why: 'gh', opened: false, command: ghSignOutCommand(s.gh), sentence: 'Workbench could not sign out of GitHub. Run this command in a terminal, then check again.',
   });
-  assert.deepEqual(gitValues('credential.https://github.com.helper'), ['', `!${s.gh} auth git-credential`], 'still signed in: git keeps using it');
-  assert.deepEqual(await c.githubSignOut(), { ok: true, opened: true, sentence: `Terminal is open to sign you out of GitHub. When it is done, come back here. ${revoke}` });
+  const helper = ['', `!${s.gh} auth git-credential`];
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), helper, 'still signed in: git keeps using it');
+  assert.deepEqual(await c.githubSignOut(), { ok: true, opened: true, sentence: `Terminal is open to sign you out of GitHub. When it is done, come back here. ${REVOKE}` });
   assert.deepEqual(terminals, [{ title: 'Signing out of GitHub', ...ghSignOutProgram(s.gh) }]);
+  // Until gh has signed out in Terminal, git goes on asking it and forgets nothing, also when Terminal is closed first.
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), helper);
+  assert.equal((await c.status()).github.via, 'gh');
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), helper);
+  assert.equal(ws.calls.length, 1);
+  // gh signs out in Terminal: the next look at the status sets git back, and git forgets octo-cat's sign-in, once.
+  fs.writeFileSync(s.state, '{}');
+  assert.equal((await c.status()).github.connected, false);
+  for (const key of ['credential.https://github.com.helper', 'credential.https://gist.github.com.helper']) assert.deepEqual(gitValues(key), [], key);
+  assert.deepEqual(ws.calls, [['reject', 'github.com', 'octo-cat'], ['reject', 'github.com', 'octo-cat']]);
+  await c.status();
+  assert.equal(ws.calls.length, 2);
+});
+
+test('Sign out: git forgets the copy of the sign-in it was given for that account, once gh’s lines are out of the way (real git, a file for its helper)', async (t) => {
+  const s = ghStandIn(t);
+  // git's own helper, in place of Apple's osxkeychain: a file of this test.
+  const kept = path.join(scratch(t), 'git-credentials');
+  spawnSync('git', ['config', '--global', 'credential.helper', `store --file=${kept}`], { env: process.env });
+  // gh's login in Terminal, answered yes to its git question, gives git's helper the token (a made-up one here).
+  const who = { host: 'github.com', username: 'octo-cat' };
+  await workspace.approveGitCredential({ ...who, password: 'made-up-token-from-gh' });
+  assert.equal((await workspace.fillGitCredential(who))?.password, 'made-up-token-from-gh');
+  s.signIn('octo-cat');
+  const { c } = makeConnect(t, { workspace, ghOptions: FAST });
+  assert.equal((await c.githubSignIn({ wait: true })).ok, true);
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), ['', `!${s.gh} auth git-credential`], 'git asks gh, past that copy');
+  const out = await c.githubSignOut();
   assert.deepEqual(gitValues('credential.https://github.com.helper'), []);
+  assert.equal(await workspace.fillGitCredential(who), null, 'git no longer signs in as octo-cat');
+  assert.deepEqual(gitValues('credential.helper'), [`store --file=${kept}`], 'the person’s own helper stays');
+  assert.deepEqual(out, { ok: true, sentence: `Signed out of GitHub. ${FORGOT('octo-cat')} ${REVOKE}` });
+});
+
+test('Sign out while the token connection is for the same account: git keeps that sign-in, and the answer claims nothing of it', async (t) => {
+  const s = ghStandIn(t);
+  s.signIn('octo-cat');
+  const { c, workspace: ws } = makeConnect(t, { ghOptions: FAST });
+  await c.connectGithub(GH_TOKEN);
+  assert.equal((await c.githubSignIn({ wait: true })).ok, true);
+  ws.calls.length = 0;
+  assert.deepEqual(await c.githubSignOut(), { ok: true, sentence: `Signed out of GitHub. ${REVOKE}` });
+  assert.deepEqual(ws.calls, [], 'git keeps the token’s sign-in for octo-cat');
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), []);
+  assert.equal((await c.status()).github.sentence, 'Connected to GitHub as octo-cat.');
+});
+
+test('Sign out when gh’s settings cannot be read: a logout that worked still sets git back (there is no account to forget)', async (t) => {
+  const s = ghStandIn(t);
+  s.signIn('octo-cat');
+  const { c, workspace: ws } = makeConnect(t, { ghOptions: FAST });
+  assert.equal((await c.githubSignIn({ wait: true })).ok, true);
+  setEnv(t, { FAKE_GH_CONFIG: 'broken' });
+  assert.deepEqual(await c.githubSignOut(), { ok: true, sentence: `Signed out of GitHub. ${REVOKE}` });
+  assert.deepEqual(s.calls().find((x) => x.argv[1] === 'logout').argv, ['auth', 'logout', '--hostname', 'github.com']);
+  assert.equal(s.signedInAs(), null);
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), []);
+  assert.deepEqual(ws.calls, []);
+});
+
+test('Sign out when gh is still signed in afterwards, with another account it holds: git goes on asking gh, and forgets nothing', async (t) => {
+  const s = ghStandIn(t);
+  s.signIn('octo-cat');
+  // gh holds a second account for github.com, and makes it the active one when the first signs out.
+  const ghModule = { ghLogout: async ({ login }) => { assert.equal(login, 'octo-cat'); s.signIn('other-cat'); return { ok: true }; } };
+  const { c, workspace: ws } = makeConnect(t, { ghOptions: FAST, ghModule });
+  assert.equal((await c.githubSignIn({ wait: true })).ok, true);
+  assert.deepEqual(await c.githubSignOut(), {
+    ok: true, sentence: `Signed out of GitHub as octo-cat. GitHub’s command-line tool is still signed in as other-cat, and git goes on using that sign-in. ${REVOKE}`,
+  });
+  assert.deepEqual(gitValues('credential.https://github.com.helper'), ['', `!${s.gh} auth git-credential`]);
+  assert.deepEqual(ws.calls, []);
+  const g = (await c.status()).github;
+  assert.deepEqual([g.via, g.login, g.agentsUseIt], ['gh', 'other-cat', true]);
 });
 
 test('the repository list comes through gh when gh is signed in, and from the token connection otherwise', async (t) => {
