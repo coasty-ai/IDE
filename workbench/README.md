@@ -12,15 +12,22 @@ You need Node 22 or later. There is nothing to install. Merging an agent's work 
 cd workbench
 npm run demo                       # simulated agents and machines; nothing is spent
 npm start -- --repo ~/code/myapp   # real agents on your own git repository
+npm start -- --clone https://github.com/owner/repo --into ~/Developer   # copy a repository first, then run agents on it
 ```
 
 The terminal prints a link like `http://127.0.0.1:4317/?t=…`. Open it in Chrome, which is needed for voice; it opens by itself unless you pass `--no-open`. The `t=` part is a key that only this run knows.
+
+Workbench starts even when neither Claude Code nor Codex is ready. It says "No coding agent is ready yet. Open the page to connect one.", and **Agents & keys** on the page helps you install one, sign in, or give it an API key (see "Agents & keys" below).
+
+`--clone` copies the repository into a new folder in `--into` (the current folder unless you say), showing git's progress, then runs agents on the copy. Ctrl-C while it copies stops it, and removes what it had copied. To clone a private repository, git must be able to sign in to it: connect GitHub first, in Agents & keys or in the Mac app's clone sheet.
 
 Options for real agents:
 
 | Option | Meaning |
 |---|---|
-| `--repo <path>` | the git repository agents work on (required) |
+| `--repo <path>` | the git repository agents work on (this, or `--clone`, is required) |
+| `--clone <address>` | copy this repository first, like `https://github.com/owner/repo` or `git@github.com:owner/repo.git`, then work on the copy |
+| `--into <folder>` | where `--clone` puts the copy (default: the current folder) |
 | `--budget 2` | the most each agent may spend, in US dollars (default 2) |
 | `--model <name>` | the Claude model to use, for example `sonnet` or `haiku` |
 | `--claude <path>` | the Claude Code program to run. Without it: `WORKBENCH_CLAUDE_BIN`, then `claude` on the PATH, then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor |
@@ -30,8 +37,11 @@ Options for real agents:
 
 Workbench is also a Mac app, for Apple silicon and macOS 13.5 or later. From the top of this repository, `bash workbench/app/mac/build.sh --install` (or `npm run app`) builds it and puts `Workbench.app` in your Applications folder. It also leaves `Workbench-<version>-arm64.dmg` in `workbench/dist/`, to copy to another Mac. Building needs the Xcode command line tools (`xcode-select --install`). The first build downloads Node from nodejs.org and checks it against its published checksum. To install a new build, quit the app first.
 
-- **Open it like any app.** Its first window offers Open Folder… and Try the Demo, and lists the folders you opened lately. File → Open Folder… (⌘O), File → Open Recent, and dropping a folder on its icon do the same. It starts Workbench on that git repository and shows the board in its own window. It works on one folder at a time: opening another stops the first folder's agents, after asking.
-- **Nothing else to install.** Node and npm are inside the app, so agents and checks can run `npm test` on a Mac with no Node. It still needs git, and Claude Code or Codex. It looks for Claude Code where the command does (on the PATH, then in VS Code's Claude Code extension), and also where Claude Code's installer and Homebrew put it, which an app is not told. If it finds none, it asks you where Claude Code is and remembers your answer.
+- **Open it like any app.** Its first window offers Clone Repository…, Open Folder… and Try the Demo, and lists the folders you opened lately. File → Clone Repository… (⇧⌘O), File → Open Folder… (⌘O), File → Open Recent, and dropping a folder on its icon do the same. It starts Workbench on that git repository and shows the board in its own window. It works on one folder at a time: opening another stops the first folder's agents, after asking.
+- **Clone a repository.** Paste its address, or pick one of your repositories on GitHub from the list (type to narrow it); the list appears once your GitHub account is connected. The repository goes in `~/Developer` unless you choose another folder with Choose…, and the app remembers your choice. You see git's progress ("Downloading owner/repo: 45%"), then the board on the new folder, which also goes in Open Recent. Cancel stops the clone, and what it had copied is removed.
+  - If GitHub does not let Workbench read a private repository, the sheet says so and offers **Connect GitHub…**. It asks for a token, and its link, "Create a token on GitHub", makes one on github.com with the right access. Workbench checks the token with GitHub and keeps it in your login keychain; then the clone runs again by itself.
+  - Leave your name and password out of the address: the app refuses an address that holds them, since other programs on the Mac can read the command Workbench runs. Connect GitHub instead.
+- **Nothing else to install.** Node and npm are inside the app, so agents and checks can run `npm test` on a Mac with no Node. It still needs git. It looks for Claude Code where the command does (on the PATH, then in VS Code's Claude Code extension), and also where Claude Code's installer and Homebrew put it, which an app is not told. With no Claude Code or Codex ready, the board opens anyway, and Agents & keys helps you install one or sign in.
 - **Closing the window, or quitting, stops the agents.** If any are still working, it asks first. What they did stays in their folders. If the app is closed in any other way (it crashed, say), Workbench notices and stops its agents too.
 - **A copy downloaded on another Mac** opens only after System Settings → Privacy & Security → Open Anyway, because the app is not signed by Apple. A copy you build yourself opens directly.
 - **Its log** is `~/Library/Logs/Workbench/workbench.log` (View → Show Log). What Workbench prints in a terminal goes there, such as the folders that keep an agent's work when it stops.
@@ -45,6 +55,10 @@ A circuit board. The chip in the middle is you; each agent is a chip on its own 
 - **The middle** shows one thing at a time, in one sentence, with at most two buttons. A permission always shows the exact command or file, and why it is asked. "next" (or →) steps through what is waiting.
 - **Hover a chip** (or Tab to the board and use the arrow keys) for its card: what it is doing, its helpers, its plan, time and cost. Click to pin it.
 - **Type anywhere, or hold the space bar to talk**: "start an agent to fix the flaky checkout test", "what needs me", "stop the flaky test". Anything that starts an agent asks you first. A stop naming an agent acts at once ("Continue" picks it up again), and a "yes" answers only what was on screen when you began. The exact rules are in `ARCHITECTURE.md`.
+  - "help" (or "hi", "what can you do") says what you can type. "start an agent" with nothing more asks what it should work on, and "work on the login bug" starts work as "fix the login bug" does.
+  - Work that names no agent goes to your default agent ("Use for new work" in Agents & keys), or else to the first one ready, Claude Code first. Saying "codex" or "claude" still picks one.
+- **Agents & keys**, in the top band, is where you connect coding agents and give them keys (see "Agents & keys" below). Its light is green when an agent is ready for new work, and lit amber when none is. With no agent ready, the middle says "Connect a coding agent to start." with a **Connect** button, and Agents & keys opens by itself, once. Typing "connect", "add a key", "sign in" or "connect github" opens it too, and so does asking for work when no agent is ready ("No coding agent is ready yet. Connect one in Agents & keys."). Esc closes it.
+- **Keys never go through the board's input.** Paste a key there, or in a reply to an agent, and it is not sent: the board says "That looks like a key, so it was not sent. Keys go in Agents & keys, where they are kept safe." and opens Agents & keys.
 - **The git chip** sits under you, wired to the core: a long memory chip with **git** printed on it. Click it (or Tab to it and press Enter), or type or say "git", "show git", "open git", "source control" or "show the graph", and the view travels down its wire to the **git screen**, below the board. "Back to the board" at the top left, Esc, or "back" or "board" takes you back up.
 - **The git screen** draws your branch and your agents' branches as a circuit, newest commits at the top, where the wire arrives at your branch's tip (HEAD). Your branch is the thick gold trunk. Each agent's branch is a copper trace that leaves the trunk at the commit the agent started from, and comes back with a merge commit when you merge it. Your commits are gold vias, an agent's work commits small chips with its mark, merge commits square pads. Work not merged yet waits at the top of its trace, a dashed circle marked "not merged yet · 3 files" or "working". Beside each row: the subject, then who, when and the short id. It shows the newest 200 commits; work not merged yet on a branch that starts further back than that waits at the bottom, above "Older commits are not shown here."
 - **Pick a row** (click it, or ↑ ↓ and Enter) for its detail; Esc closes it. An agent's detail shows its branch, its counts, its diff and what you can do with its work (see "Source control" below). A commit's shows who made it, when, its id, parents and branches.
@@ -70,9 +84,40 @@ Each state has its own mark and its own words, so nothing depends on colour:
 
 Screenshots of each look and view are in `docs/screens/`: the board (`board-*.png`, with the git chip) and the git screen (`git-*.png`). `node scripts/ui-shots.mjs <folder>` takes them again, along with the lid's merge views (`merge-*.png`), which are not kept in the repository so that every agent's copy of it stays smaller; the `live-*.png` shots come from an earlier real run.
 
+## Agents & keys
+
+The **Agents & keys** button in the top band opens a panel over the board with three parts.
+
+**Agents.** One row for Claude Code and one for Codex, each with a light and what Workbench found: "Claude Code 2.1.322 is ready, signed in with your Claude subscription.", "Codex is installed but not signed in.", "Codex is not installed.". Workbench asks the agents themselves (`claude auth status`, `codex login status`); it never reads their logins. Each row has only the buttons that make sense:
+
+- **Install** and **Sign in** open Terminal on a Mac, running the vendor's own installer or sign-in (`claude auth login`, `codex login`), for you to answer there. When you come back to the page, it checks again. On other systems the panel shows the command to run instead, with **Copy**. Both installers put the program in `~/.local/bin`.
+- **Use an API key** saves a key for that agent. "Claude Code will use this key instead of your Claude subscription, and each request is billed to the key." For Codex: "Codex will use this key, and each request is billed to it."
+- **Use for new work** chooses the agent new work goes to; a mark shows which one it is. Naming an agent in what you say ("… with codex") still wins.
+- **Check again** looks again, for example after you installed one or signed in from a terminal of your own.
+
+An agent connected while Workbench runs can take work at once, and agents from an earlier run that used it can be continued again. Agents already working carry on as they were.
+
+**Git and GitHub.**
+
+- Your name and email for git, with **Save**, which writes them into git's global settings. Merging needs them.
+- GitHub: paste a token (**Create a token** opens GitHub's page for one, with the right access) and press **Connect**. Workbench checks the token with GitHub, keeps it with your keys, and gives it to git's own credential helper (the login keychain, on a Mac), so git can clone and fetch your private repositories. The panel then says "Connected to GitHub as <login>.".
+- Agents get the token (as GH_TOKEN, and GITHUB_TOKEN) only when you tick "Let agents use this token (as GH_TOKEN)", before connecting or after; untick it to take it back. Copilot may sign in with it.
+- **Disconnect** makes git forget the token. The token itself still works until you delete it on GitHub.
+
+**Keys for your agents.** API keys, cloud keys and tokens that agents and their checks need, such as AWS keys for a deploy script. **Add a key** offers Anthropic, OpenAI, Gemini, AWS, Google Cloud, Azure, GitHub, Stripe, or names of your own ("Other"), then asks which repositories it is for (this one, or all) and which agents get it (all, or one).
+
+- **Agents can read the keys you give them, and so can anything they run.** The panel always says so: give them keys that can do only what their work needs, never your root or admin keys.
+- **Checks get them too.** The checks Workbench runs on an agent's work (see "Checks and rules") get the same keys as that agent, and the panel says so.
+- **Where keys are kept.** On a Mac, in your login keychain, as items named "Workbench key". On Linux, in your keyring when one is running, and otherwise in private files in `~/.workbench/keys/`. `~/.workbench/keys.json` lists what each key is, never its value. Keys never go into your repositories, Workbench's logs or its history.
+- **Workbench never shows a key again.** A secret appears as "•••• " and its last four characters, or "••••" when it is short. Settings that are not secret, such as AWS_REGION, are shown as they are. Anything an agent or a check says that holds one of your keys is shown with the key hidden the same way: on the board, in a permission's command, in errors, the event log and the history. It is not hidden in an agent's changes: you need to see a key an agent wrote into a file before you merge it.
+- A key goes to agents started after you add it; **Remove** asks first, and agents started from then on do not get it.
+- Some names cannot be keys, because they change how programs run or where they look: PATH, HOME, NODE_OPTIONS, anything starting GIT_ or WORKBENCH_, and the like. A Claude or ChatGPT subscription's own sign-in tokens cannot be keys either: sign in with Claude Code or Codex instead.
+- A key can be at most 2,000 characters, on one line (on a Mac, the keychain takes a little less: about 1,950). You can keep up to 50 keys.
+- If your keychain is locked when Workbench starts, it asks once, and says in the terminal (or the Mac app's log) which keys agents will not get.
+
 ## What is real in this prototype
 
-- **Claude Code agents are real.** Each runs the Claude Code program installed on this machine, with your own login, in its own git worktree of the repository. Worktrees start from your last commit, so uncommitted changes are not in them.
+- **Claude Code agents are real.** Each runs the Claude Code program installed on this machine, with your own login (or the API key you gave it in Agents & keys), in its own git worktree of the repository. Worktrees start from your last commit, so uncommitted changes are not in them.
   - Your personal Claude Code plugins, hooks and MCP servers are deliberately **not** loaded into these agents, and neither is your own `.claude/settings.local.json`. The repository's committed `.claude/` settings are loaded too. Agents cannot change them, but treat them like the rest of your repository's code: a committed setting can change how an agent runs. It cannot switch off the permission questions or redirect them: the workbench sets those on the command line, which outranks the repository's settings.
   - Helpers (sub-agents) appear beside their agent as they start, and settle when they finish.
   - On a machine without a browser login, such as a cloud VM, set `CLAUDE_CODE_OAUTH_TOKEN` before starting the workbench; the agents use it.
@@ -86,7 +131,7 @@ Screenshots of each look and view are in `docs/screens/`: the board (`board-*.pn
 - **When an agent finishes.** A closing "Let me know if you need anything else." is not a question: its work is checked and it is done. A real question at the end ("Should I remove the old route?") waits for your answer; "What changed?" already shows its changes, and its checks run only once it is done.
 - **Commands left running.** An agent may leave a command running when it finishes, such as a development server. Its card says "Waiting for a background command". After four quiet minutes you are asked once whether it is done: "It is done" checks its work (the command keeps running until you stop the agent or close the workbench), "Keep waiting" waits on.
 - **Might be stuck.** An agent that tries the same step three times without success, hits the same error three times close together, or goes quiet for four minutes is marked "might be stuck". The mark goes away as soon as a step works again.
-- **Codex agents are real** when Codex is installed and logged in. They run in Codex's own sandbox, so they never ask for permission. Codex does not report cost, so it shows as "not reported".
+- **Codex agents are real** when Codex is installed and signed in, with your ChatGPT account or an API key. They run in Codex's own sandbox, so they never ask for permission. Codex does not report cost, so it shows as "not reported".
 - **Your laptop's** CPU and memory are real.
 - **Cloud machines are simulated** and appear only in demo mode.
 - **Voice** uses the browser's speech recognition. In Chrome this sends the audio to Google's speech service. Typing works everywhere.
@@ -131,7 +176,7 @@ After the merge, the middle says "Search cleanup’s work is in main.", with **S
 
 One refusal is different, and says so: "Git could not finish the merge into main. Have a look at your folder before you try again." Git may have stopped part-way through updating your folder: look at it before you merge again.
 
-**Your name and email.** The workbench makes the commits as you, with the name and email in your git config. It never uses a name git guesses, nor `GIT_AUTHOR_NAME` and the like. Without them, the terminal says so when the workbench starts ("Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: …"), the git screen says "Git does not know your name and email yet, so Workbench cannot merge.", and the middle offers no Merge. Set them, and within 15 seconds Merge is offered; there is no need to restart:
+**Your name and email.** The workbench makes the commits as you, with the name and email in your git config. It never uses a name git guesses, nor `GIT_AUTHOR_NAME` and the like. Without them, the terminal says so when the workbench starts ("Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: …"), the git screen says "Git does not know your name and email yet, so Workbench cannot merge.", and the middle offers no Merge. Set them in Agents & keys (Save writes them into git's global settings), or in a terminal, and within 15 seconds Merge is offered; there is no need to restart:
 
 ```sh
 git config --global user.name "Your Name"
@@ -176,7 +221,7 @@ Put a `workbench.json` at the root of your repository and commit it:
 
 | Key | What it does |
 |---|---|
-| `checks` | Run after an agent says it is done. It becomes "done and checked" or "done, but a check failed". With no checks, it stays "says it is done". Sending the agent a new message, or stopping it, stops its checks. |
+| `checks` | Run after an agent says it is done. It becomes "done and checked" or "done, but a check failed". With no checks, it stays "says it is done". Sending the agent a new message, or stopping it, stops its checks. They get the same keys as the agent whose work they check (see "Agents & keys"), and a key in their output is hidden. |
 | `rules` | Each one is checked against the files the agent changed, including new files hidden by a `.gitignore` the agent added or changed. Those show in "What changed?" too. The merge card checks them again, against what the merge would bring in. |
 | `allow` | Adds command prefixes to the automatic approvals. |
 
@@ -208,6 +253,8 @@ Or open this folder in the Mac app (see "The Mac app"), which needs no Node on y
 - The page and its programming interface listen on `127.0.0.1` only. Every request needs the run's key, and requests from other websites are refused. A link with anything after the address except this run's key (an old link, say) opens the plain page instead; a tab without the key then asks you to open the link printed in the terminal.
 - Each agent gets its own key for asking permission, so one agent's key cannot ask in another agent's name, and it never opens the page's interface.
 - Every agent has a spending limit (`--budget`).
+- Agents can read the keys you give them, and so can anything they run: give them keys that can do only what their work needs. Workbench keeps keys out of its page, its logs, its history and the agents you did not give them to; it cannot keep an agent from its own keys. The page shows a key only as "•••• " and its last four characters, never keeps one, and never sends text that looks like a key from the board's input.
+- A key's value never goes into a command line, which other programs on the computer can read. The Mac app gives Workbench a GitHub token on its standard input, never as an argument.
 - Merge and Throw it away always ask first, and check everything again when you answer. A merge goes ahead only if the agent's work and your branch are as its card showed them; otherwise it says so and changes nothing.
 - Characters that hide text or change the order it reads in (zero-width and direction-changing characters, tag characters, a line break inside a name, and the like) show as marks, such as ⟦U+202E⟧ or ⏎, where an agent's or a repository's words appear: names, paths, branch names, questions, answers, replies, commit subjects and diffs.
 - Stopping an agent stops any checks it is running. Stopping the workbench (Ctrl-C) stops every agent it started and every check it is running. An agent still being set up at that moment is not started, and the folder made for it is removed. A merge or throw-away under way finishes first.
@@ -220,13 +267,15 @@ Or open this folder in the Mac app (see "The Mac app"), which needs no Node on y
 - After an agent brings in your branch, the file counts in the middle and on its card can include your own commits, and a rule can read as broken by them. The merge card and the diff count only what the merge would bring in.
 - Clean and smudge filters and merge drivers set in your git config still run during a merge.
 - Sessions started outside the workbench, for example `claude` in your own terminal, do not appear.
+- When git has no credential helper (common on Linux), connecting GitHub cannot let git clone private repositories, and Agents & keys says so. Set one up with `git config --global credential.helper store` or your system's keychain helper, then connect again.
+- Check again finds a program installed while the workbench runs when it is in a folder on the workbench's PATH. The workbench adds `~/.local/bin`, where both installers put their programs; for a program installed anywhere else, start the workbench again.
 - How far along an agent is cannot be measured honestly, so there is no percentage or finish time. The card shows elapsed time, steps, the agent's own plan and spend instead.
 - Voice cannot be tested automatically. Try it in Chrome.
 
 ## For developers
 
 - `ARCHITECTURE.md` is the contract between the parts.
-- `npm test` runs the tests, here or at the top of the repository. They use recorded agent output in `test/fixtures/` and never start real agents. `test/live-fake.test.mjs` runs the whole chain (the CLI, the engine, the real permission hook, the HTTP API) with a stand-in for Claude Code that replays a recorded run, merges and throw-aways against real git included.
+- `npm test` runs the tests, here or at the top of the repository. They use recorded agent output in `test/fixtures/` and never start real agents. They never touch your keychain, keyring or GitHub account either: the key store's tests run stand-ins for macOS's `security` and Linux's `secret-tool` (`test/helpers/security-fake.mjs`, `test/helpers/secret-tool-fake.mjs`), and GitHub's answers are made up in the tests. `test/live-fake.test.mjs` runs the whole chain (the CLI, the engine, the real permission hook, the HTTP API) with a stand-in for Claude Code that replays a recorded run, merges and throw-aways against real git included.
 - `scripts/demo-e2e.mjs` walks the demo through its HTTP API.
 - The page's debug switches (`static=1`, `still=1`, `pin=<agent id>`, `focus=<agent id>`) count only when the same address carries the run's `t=` key. `scripts/ui-fit-check.mjs`, `scripts/ui-behaviour-check.mjs` and `scripts/ui-shots.mjs` drive the page in headless Chrome against a stand-in API (`scripts/ui-mock.mjs`), and `scripts/ui-contrast.mjs` checks the colours of all three looks.
 - `scripts/accept-real.mjs <throwaway repo> [screenshots folder] [--keep] [--claude <path>]` does one real run with Claude Code (haiku, at most $0.50) and prints PASS or FAIL for each step, merge and throw-away included. The repository needs a branch, a committed `workbench.json` with a check and a rule, and git's name and email. The merge commit stays on its branch; unless you pass `--keep`, the agent's folder, its branch and the hidden copy go at the end. It answers Allow only to the agent's own `touch` and to a helper's command that only lists or reads files; anything else is refused, and fails a step. Its header explains how to dry-run it with the stand-in first.
