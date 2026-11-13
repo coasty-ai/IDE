@@ -7,7 +7,7 @@
 // and git's credential store and global config are stand-ins or files here. Nothing reaches a network.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1105,4 +1105,28 @@ test('the key store’s refusals carry the status of their kind: what cannot be 
 
 test('the connect service needs a key store', () => {
   assert.throws(() => new Connect({ home: process.env.HOME }), /needs the key store/);
+});
+
+test('a FIFO in place of settings.json is never waited on: Connect reads it as no settings', () => {
+  // Something running as the person (an agent's command, a test it runs) can make a FIFO where Workbench reads its
+  // settings. A plain read would wait for a writer forever and freeze Workbench, so the read runs in a child process
+  // with a time limit here: a regression fails this test instead of hanging the suite.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-connect-fifo-'));
+  try {
+    const dir = path.join(home, '.workbench');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, 'settings.json');
+    const made = spawnSync('mkfifo', [file], { encoding: 'utf8' });
+    assert.equal(made.status, 0, made.stderr);
+    const script = `import { Connect } from ${JSON.stringify(new URL('../src/core/connect.mjs', import.meta.url).href)};
+      const keys = { load: async () => ({ keys: [], missing: [] }), list: async () => [], add: async () => ({ id: 'k' }), remove: async () => ({ removed: true }), values: () => [], envFor: () => ({}) };
+      const c = new Connect({ home: ${JSON.stringify(home)}, env: { HOME: ${JSON.stringify(home)}, PATH: '/usr/bin:/bin' }, keys, adapters: {}, probe: false });
+      console.log(JSON.stringify(c._readSettings()));`;
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000, env: { ...process.env, HOME: home } });
+    assert.equal(run.signal, null, 'reading settings.json was still waiting on the FIFO after 10 seconds');
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stdout.trim().split('\n').pop(), '{}');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

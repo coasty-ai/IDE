@@ -800,3 +800,15 @@ test('the panel’s focus rings are the lid’s, which stand out on its surface 
   const band = rules.find(r => r.sel === '#connectBtn:focus-visible');
   assert.match(band.body, /var\(--focus\)/, 'the band’s button sits on the board: the board’s ring');
 });
+
+test("a new key is for this repository unless it is a model key; the person’s choice wins", () => {
+  assert.equal(V.keyScope({}, 'aws', true), 'repo');
+  assert.equal(V.keyScope({}, 'stripe', true), 'repo');
+  assert.equal(V.keyScope({}, 'custom', true), 'repo');
+  assert.equal(V.keyScope({}, 'github', true), 'repo');
+  for (const id of ['anthropic', 'openai', 'gemini']) assert.equal(V.keyScope({}, id, true), 'all');
+  assert.equal(V.keyScope({ scope: 'all' }, 'aws', true), 'all');
+  assert.equal(V.keyScope({ scope: 'repo' }, 'anthropic', true), 'repo');
+  assert.equal(V.keyScope({}, 'aws', false), 'all', 'no repository open: only all');
+  assert.equal(V.keyScope({ scope: 'repo' }, 'aws', false), 'all');
+});

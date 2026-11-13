@@ -462,6 +462,18 @@ export function customRow(i, name = '') {
  * { preset, rows, label?, scope?, given?, names? }: the choices the person made (kept while a save is on its way or
  * was refused), never a value.
  */
+/**
+ * Where a new key goes when the person has not picked: a model API key powers its agent wherever it works, so it is
+ * for all repositories; a cloud or service key (AWS, Stripe, a custom one…) is for this repository only, the least it
+ * needs. The person's own choice always wins, and with no repository open there is only "all".
+ */
+const ALL_REPOSITORIES = new Set(['anthropic', 'openai', 'gemini']);
+export function keyScope(add, presetId, canRepo) {
+  if (!canRepo) return 'all';
+  if (add && (add.scope === 'repo' || add.scope === 'all')) return add.scope;
+  return ALL_REPOSITORIES.has(presetId) ? 'all' : 'repo';
+}
+
 export function addForm(status, add, v = {}, busy = new Set()) {
   const presets = (Array.isArray(v.presets) ? v.presets : []).filter(p => p && typeof p.id === 'string' && AGENT_ID.test(p.id));
   const p = presets.find(x => x.id === add.preset) || null;
@@ -488,7 +500,7 @@ export function addForm(status, add, v = {}, busy = new Set()) {
     const agents = agentsOf(status);
     const suits = typeof add.given === 'string' && (add.given === 'all' || agents.some(a => a.id === add.given)) ? add.given
       : Array.isArray(p.agents) && p.agents.length === 1 && agents.some(a => a.id === p.agents[0]) ? p.agents[0] : 'all';
-    const repo = v.canRepo && add.scope === 'repo';
+    const repo = keyScope(add, p.id, v.canRepo) === 'repo';
     const label = typeof add.label === 'string' ? add.label : custom ? '' : prose(p.label);
     const radio = (group, value, text, on) => `<label class="cn-radio"><input type="radio" name="cn-${group}" value="${esc(value)}" data-${group}="${esc(value)}" data-key="${group}:${esc(value)}"${on ? ' checked' : ''}><span>${esc(text)}</span></label>`;
     body += `<label class="cn-f cn-label"><span>Name it</span><input type="text" class="cn-in" ${FIELD} data-field="key-label" data-key="key-label" value="${esc(label)}" placeholder="${custom ? 'for example Sentry' : ''}"></label>`;

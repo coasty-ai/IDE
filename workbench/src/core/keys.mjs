@@ -388,7 +388,7 @@ const fileTrouble = (code) => Object.assign(new Error(code), { code });
  * this account's (ENOTFILE: it is opened without waiting, so a FIFO never blocks); with `secret`, nobody else may read
  * it (EMODE).
  */
-function readPrivateFile(file, { secret = false } = {}) {
+export function readPrivateFile(file, { secret = false } = {}) {
   let fd;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);

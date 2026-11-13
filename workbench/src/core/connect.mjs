@@ -14,7 +14,7 @@ import path from 'node:path';
 import { scrubEnv, withNodeOnPath, onPath, shellQuote } from '../adapters/claude/args.mjs';
 import { buildEnv as codexEnv, codexBin } from '../adapters/codex/runner.mjs';
 import { KEY_PRESETS } from '../shared/keypresets.mjs';
-import { maskSecrets } from './keys.mjs';
+import { maskSecrets, readPrivateFile } from './keys.mjs';
 import * as workspaceModule from './workspace.mjs';
 import { openTerminal as openTerminalWindow } from './terminal.mjs';
 
@@ -1004,7 +1004,10 @@ export class Connect extends EventEmitter {
 
   _readSettings() {
     try {
-      const j = JSON.parse(fs.readFileSync(this.settingsPath, 'utf8'));
+      // read like the key store's own files: never blocks on a FIFO, refuses a link or another person's file
+      const text = readPrivateFile(this.settingsPath);
+      if (text == null) return {};
+      const j = JSON.parse(text);
       return j && typeof j === 'object' && !Array.isArray(j) ? j : {};
     } catch {
       return {};
