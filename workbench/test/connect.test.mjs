@@ -20,6 +20,7 @@ import * as workspace from '../src/core/workspace.mjs';
 
 const CLAUDE_FAKE = fileURLToPath(new URL('./helpers/claude-fake.mjs', import.meta.url));
 const CODEX_FAKE = fileURLToPath(new URL('./helpers/codex-fake.mjs', import.meta.url));
+const SECURITY_FAKE = fileURLToPath(new URL('./helpers/security-fake.mjs', import.meta.url));
 const ADAPTERS = { claude: claudeAdapter, codex: codexAdapter };
 
 // Key-shaped values, built from parts so that no secret scanner takes this file for a leak.
@@ -165,7 +166,7 @@ class FakeKeys {
 }
 
 /** A stand-in for workspace.mjs's git functions, recording each call (the token as TOKEN). */
-function fakeWorkspace({ helper = true, approveFails = false, fill = null } = {}) {
+function fakeWorkspace({ helper = true, approveFails = false, rejectFails = false, fill = null } = {}) {
   const calls = [];
   let identity = { name: '', email: '' };
   return {
@@ -185,6 +186,9 @@ function fakeWorkspace({ helper = true, approveFails = false, fill = null } = {}
     },
     async rejectGitCredential({ host, username }) {
       calls.push(['reject', host, username]);
+      if (typeof rejectFails === 'function' ? rejectFails() : rejectFails) {
+        throw Object.assign(new Error('Git could not forget your GitHub sign-in.'), { plain: true, why: 'git', detail: 'fatal: no' });
+      }
       return { ok: true };
     },
     async fillGitCredential({ host, username }) {
@@ -231,6 +235,7 @@ function makeConnect(t, o = {}) {
     adapters: o.adapters || ADAPTERS,
     flags: o.flags || { claude: null },
     settingsPath: o.settingsPath,
+    repoRoot: o.repoRoot,
     openTerminal: o.openTerminal || (async (what) => { terminals.push(what); return { opened: true }; }),
     fetchJson: gh.fetchJson,
     log: Object.assign((line) => logs.push(line), { info: (l) => logs.push(l), warn: (l) => logs.push(l), error: (l) => logs.push(l), debug: (l) => logs.push(l) }),
@@ -455,7 +460,7 @@ test('a new Connect probes the agents by itself, so the default agent is known b
   let n = 0;
   const claude = { available: async (o) => { n++; return claudeAdapter.available(o); } };
   const { c, events } = makeConnect(t, { probe: true, adapters: { claude, codex: codexAdapter } });
-  assert.equal(c.defaultAgent(), null, 'nothing is known before the first probe ends');
+  assert.equal(c.defaultAgent(), undefined, 'nothing is known before the first probe ends: the engine uses its own check');
   // Listeners put on right after making it hear the first probe.
   await new Promise((resolve) => c.once('agents', resolve));
   assert.equal(c.defaultAgent(), 'claude');
@@ -475,6 +480,27 @@ test('a new Connect probes the agents by itself, so the default agent is known b
   await c.recheck();
   assert.deepEqual(heard.map((h) => h[0]), ['on', 'once', 'on']);
   assert.equal(n, 3);
+});
+
+test('a new Connect given the repository probes with the keys kept for it', async (t) => {
+  const repo = path.join(T, 'repo');
+  const keys = new FakeKeys();
+  // The only sign-in is an OpenAI key kept for this repository, for Codex.
+  await keys.add({ preset: 'openai', label: 'OpenAI', values: { OPENAI_API_KEY: OPENAI_KEY, CODEX_API_KEY: OPENAI_KEY },
+    secretNames: ['OPENAI_API_KEY', 'CODEX_API_KEY'], scope: { kind: 'repo', root: repo }, agents: ['codex'] });
+  setEnv(t, { FAKE_CODEX_LOGIN: 'out' });
+  const missing = { available: async () => ({ ok: false, reason: 'Claude Code is not installed.' }) };
+  const adapters = { claude: missing, codex: codexAdapter };
+  const { c } = makeConnect(t, { probe: true, repoRoot: repo, keys, adapters });
+  assert.equal(c.defaultAgent(), undefined);
+  await new Promise((resolve) => c.once('agents', resolve));
+  assert.equal(c.defaultAgent(), 'codex', 'the first probe counted the key for this repository');
+  const codex = byId(await c.status(), 'codex');
+  assert.deepEqual([codex.signedIn, codex.how, codex.ready], ['yes', 'an API key', true]);
+  // Without the repository, that key is not given, and no agent is ready.
+  const elsewhere = makeConnect(t, { probe: true, keys, adapters });
+  await new Promise((resolve) => elsewhere.c.once('agents', resolve));
+  assert.equal(elsewhere.c.defaultAgent(), null);
 });
 
 test('recheck shares one probe among calls made while one runs, and each new key or removal probes again', async (t) => {
@@ -526,7 +552,7 @@ test('the default agent: the person’s choice when it is ready, else the first 
   const early = makeConnect(t);
   await early.c.setDefaultAgent('codex');
   assert.deepEqual(early.events.map((e) => e[0]), ['changed']);
-  assert.equal(early.c.defaultAgent(), null);
+  assert.equal(early.c.defaultAgent(), undefined);
 });
 
 // ------------------------------------------------------------------ install and sign in
@@ -716,6 +742,115 @@ test('disconnecting GitHub removes the key and git’s sign-in; removing its key
   assert.equal(ws.calls.filter((x) => x[0] === 'reject').length, 2);
 });
 
+test('disconnecting GitHub while the keychain stays locked keeps the connection, and says agents still get the token', async (t) => {
+  // The real key store on the `security` stand-in, as on a Mac.
+  const home = scratch(t);
+  const env = { ...process.env, FAKE_SECURITY_DB: path.join(home, 'fake-keychain.json'), FAKE_SECURITY_MODE: '' };
+  const keys = new KeyStore({ home, platform: 'darwin', securityBin: SECURITY_FAKE, env });
+  const { c, workspace: ws } = makeConnect(t, { home, keys });
+  await c.connectGithub(GH_TOKEN, { agentsUseIt: true });
+  const settingsFile = path.join(home, '.workbench', 'settings.json');
+  const connected = { connected: true, login: 'octo-cat', agentsUseIt: true, sentence: 'Connected to GitHub as octo-cat.' };
+  // The keychain is locked, and the person cancels the dialog that asks to unlock it (or there is no window).
+  env.FAKE_SECURITY_MODE = 'canceled';
+  assert.deepEqual(await c.disconnectGithub(), {
+    ok: false, why: 'store',
+    sentence: 'Workbench could not remove the key from your keychain, because your keychain was not unlocked. GitHub is still connected, and agents still get your GitHub token until it is removed. Try again.',
+  });
+  // Nothing says otherwise: the panel shows GitHub connected (with Disconnect, to try again), and agents do get it.
+  assert.deepEqual((await c.status()).github, connected);
+  assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).github.login, 'octo-cat');
+  assert.equal(c.envFor({ repoRoot: null, harness: 'claude' }).GH_TOKEN, GH_TOKEN);
+  assert.deepEqual(ws.calls.filter((x) => x[0] === 'reject'), [['reject', 'github.com', 'octo-cat']], 'git was asked to forget it first');
+  // Removing the connection's key says the same, and does not call it removed.
+  const id = JSON.parse(fs.readFileSync(settingsFile, 'utf8')).github.keyId;
+  const r = await c.removeKey(id);
+  assert.equal(r.removed, false);
+  assert.equal(r.ok, false);
+  assert.match(r.sentence, /^Workbench could not remove the key from your keychain, .* GitHub is still connected/);
+  // Unlocked, Disconnect works.
+  env.FAKE_SECURITY_MODE = '';
+  assert.deepEqual(await c.disconnectGithub(), { ok: true, sentence: 'GitHub is disconnected. The token itself still works until you delete it on GitHub.' });
+  assert.equal((await c.status()).github.connected, false);
+  assert.deepEqual(c.envFor({ repoRoot: null, harness: 'claude' }), {});
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), {});
+});
+
+test('disconnecting GitHub when git cannot forget the sign-in keeps the connection and its key, to try again', async (t) => {
+  let gitFails = true;
+  const { c, keys, workspace: ws } = makeConnect(t, { workspace: fakeWorkspace({ rejectFails: () => gitFails }) });
+  await c.connectGithub(GH_TOKEN);
+  assert.deepEqual(await c.disconnectGithub(), {
+    ok: false, why: 'git',
+    sentence: 'Git could not forget your GitHub sign-in. GitHub is still connected, and Workbench still keeps your GitHub token. Try again.',
+  });
+  assert.equal(keys.items.length, 1, 'the key is kept');
+  assert.deepEqual((await c.status()).github, { connected: true, login: 'octo-cat', agentsUseIt: false, sentence: 'Connected to GitHub as octo-cat.' });
+  await c.setGithubAgentsUseIt(true);
+  assert.equal((await c.disconnectGithub()).sentence,
+    'Git could not forget your GitHub sign-in. GitHub is still connected, and agents still get your GitHub token until it is removed. Try again.');
+  assert.equal(c.envFor({ repoRoot: null, harness: 'codex' }).GH_TOKEN, GH_TOKEN);
+  gitFails = false;
+  assert.equal((await c.disconnectGithub()).ok, true);
+  assert.deepEqual(keys.items, []);
+  assert.equal(ws.calls.filter((x) => x[0] === 'reject').length, 3);
+});
+
+test('connectGithub keeps nothing when settings.json cannot say which key is the connection’s', async (t) => {
+  const dir = scratch(t);
+  fs.writeFileSync(path.join(dir, 'not-a-folder'), '');
+  const { c, keys, workspace: ws } = makeConnect(t, { settingsPath: path.join(dir, 'not-a-folder', 'settings.json') });
+  await assert.rejects(c.connectGithub(GH_TOKEN, { agentsUseIt: true }), { plain: true, why: 'store', status: 500, message: 'Workbench could not save its settings.' });
+  assert.deepEqual(keys.items, [], 'the key just kept went again, so no agent gets a token the panel would not show');
+  assert.deepEqual(c.envFor({ repoRoot: null, harness: 'claude' }), {});
+  assert.deepEqual(ws.calls, [], 'and git was not given it');
+});
+
+test('connectGithub says when the earlier connection’s key or git sign-in could not be removed', async (t) => {
+  const { c, keys, workspace: ws } = makeConnect(t, { workspace: fakeWorkspace({ rejectFails: true }) });
+  await c.connectGithub(GH_TOKEN, { agentsUseIt: true });
+  const earlier = keys.items[0].id;
+  const remove = keys.remove;
+  keys.remove = async () => { throw Object.assign(new Error('Workbench could not remove the key from your keychain, because your keychain is locked.'), { plain: true, why: 'store' }); };
+  const r = await c.connectGithub(GH_TOKEN_2, { agentsUseIt: false });
+  assert.deepEqual(r, {
+    ok: true, login: 'other-cat',
+    sentence: 'Connected to GitHub as other-cat. Workbench could not remove the token it kept before, so agents still get it: it is listed under Keys for your agents, where you can remove it. Git could not forget your sign-in as octo-cat, so it may still use that account’s token.',
+  });
+  const s = await c.status();
+  assert.deepEqual(s.github, { connected: true, login: 'other-cat', agentsUseIt: false, sentence: 'Connected to GitHub as other-cat.' });
+  assert.deepEqual(s.keys.map((k) => [k.id, k.agents]), [[earlier, 'all']], 'the earlier key is listed, with Remove');
+  assert.deepEqual(ws.calls.filter((x) => x[0] === 'reject'), [['reject', 'github.com', 'octo-cat']]);
+  // An earlier key no agent got is still listed, so the person can remove it; the sentence says no more than that.
+  keys.remove = remove;
+  await c.removeKey(earlier);
+  keys.remove = async () => { throw Object.assign(new Error('The key store refused.'), { plain: true, why: 'store' }); };
+  const again = await c.connectGithub(GH_TOKEN_2);
+  assert.equal(again.sentence, 'Connected to GitHub as other-cat. Workbench could not remove the token it kept before: it is listed under Keys for your agents, where you can remove it.');
+});
+
+test('connectGithub without agentsUseIt keeps the choice the connection has; a first connection is for git only', async (t) => {
+  const { c, keys } = makeConnect(t);
+  const agents = () => keys.items.map((k) => k.agents);
+  await c.connectGithub(GH_TOKEN);
+  assert.deepEqual(agents(), [[]]);
+  await c.connectGithub(GH_TOKEN, { agentsUseIt: true });
+  assert.deepEqual(agents(), ['all']);
+  await c.connectGithub(GH_TOKEN);
+  assert.deepEqual(agents(), ['all'], 'left out: agents still get it');
+  await c.connectGithub(GH_TOKEN_2, {});
+  assert.deepEqual(agents(), ['all'], 'also for another account');
+  await c.connectGithub(GH_TOKEN, { agentsUseIt: false });
+  assert.deepEqual(agents(), [[]]);
+  await c.connectGithub(GH_TOKEN);
+  assert.deepEqual(agents(), [[]], 'left out: still git only');
+  // A later run (another Connect on the same settings and store) keeps it too.
+  await c.connectGithub(GH_TOKEN, { agentsUseIt: true });
+  const later = makeConnect(t, { keys });
+  await later.c.connectGithub(GH_TOKEN);
+  assert.deepEqual(agents(), ['all']);
+});
+
 test('"Let agents use this token" changes without the token: it is read back from the key store, also in a later run', async (t) => {
   const { c, keys, workspace: ws } = makeConnect(t);
   await assert.rejects(c.setGithubAgentsUseIt(true), { plain: true, why: 'github', status: 409, message: 'GitHub is not connected.' });
@@ -889,6 +1024,29 @@ test('addKey: the preset says which values are secret, also-names get the value,
   assert.deepEqual(await c.removeKey(id), { removed: true });
   assert.deepEqual(await c.removeKey('no-such-key'), { removed: false });
   assert.equal((await c.status()).keys.length, 2);
+});
+
+test('status says whether a key kept for one repository is this one, by its real path, never by its folder’s name', async (t) => {
+  // The same project cloned twice: both folders are called shop.
+  const base = scratch(t);
+  const here = path.join(base, 'Projects', 'shop');
+  const there = path.join(base, 'Developer', 'shop');
+  for (const d of [here, there]) fs.mkdirSync(d, { recursive: true });
+  const link = path.join(base, 'shop-link');
+  fs.symlinkSync(here, link);
+  const { c, keys } = makeConnect(t);
+  await c.addKey({ preset: 'aws', values: { AWS_ACCESS_KEY_ID: AWS_ID, AWS_SECRET_ACCESS_KEY: AWS_SECRET }, scope: { kind: 'repo', root: there }, agents: 'all' });
+  await c.addKey({ preset: 'custom', label: 'Mine', values: { MY_KEY: AWS_SECRET }, scope: { kind: 'repo', root: here } });
+  await c.addKey({ preset: 'custom', label: 'Everywhere', values: { ANY_KEY: AWS_SECRET } });
+  let s = await c.status({ repoRoot: here });
+  assert.deepEqual(s.keys.map((k) => k.scope), [{ kind: 'repo', root: there, here: false }, { kind: 'repo', root: here, here: true }, { kind: 'all' }]);
+  assert.equal(s.keys[0].sentence, `AWS for the repository at ${there}, given to all agents: AWS_ACCESS_KEY_ID •••• 7QXA, AWS_SECRET_ACCESS_KEY •••• 9f2b`);
+  assert.match(s.keys[1].sentence, /^Mine for this repository, /);
+  assert.deepEqual(c.envFor({ repoRoot: here, harness: 'claude' }), { MY_KEY: AWS_SECRET, ANY_KEY: AWS_SECRET }, 'as agents get them');
+  // The same repository by another path is still this one; the store's own entries are never changed.
+  s = await c.status({ repoRoot: link });
+  assert.deepEqual(s.keys.map((k) => k.scope.here), [false, true, undefined]);
+  assert.ok(keys.items.every((k) => !('here' in k.scope)));
 });
 
 test('envFor gives the store’s keys for a repository and an agent, and mask hides every stored secret', async (t) => {

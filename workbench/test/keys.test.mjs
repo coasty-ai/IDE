@@ -547,6 +547,44 @@ test('keyring: a locked keyring is a plain sentence, and a key keeps reading fro
   assert.deepEqual(later.store.envFor({}), { STRIPE_SECRET_KEY: STRIPE });
 });
 
+test('keyring: a value a locked keyring keeps is not forgotten: the key stays listed, so it can be removed once unlocked', async (t) => {
+  const home = tmpHome(t);
+  const w = keyringStore(home);
+  const { id } = await w.store.add({ preset: 'stripe', values: { STRIPE_SECRET_KEY: STRIPE } });
+  const acct = `${id}/STRIPE_SECRET_KEY`;
+  const search = () => runProgram(SECRET_TOOL, ['search', '--all', 'service', SERVICE, 'account', acct], { env: w.env });
+  // The stand-in's search, as secret-tool's: an unlocked item comes with its value, a locked one without.
+  const open = await search();
+  assert.equal(open.code, 0);
+  assert.match(open.stdout, /^\[\/1\]\nlabel = .*\nsecret = /);
+  assert.ok(open.stdout.includes(STRIPE), 'search prints an unlocked item’s value, so Workbench never keeps or logs what it says');
+  // The keyring locks (KeePassXC on idle, say), and the person dismisses the prompt to unlock it: clear removes nothing
+  // and says nothing, and a lookup says nothing either, just as when the value is gone.
+  w.env.FAKE_SECRET_TOOL_MODE = 'dismissed';
+  const shut = await search();
+  assert.match(shut.stdout, /^\[\/1\]\nlabel = /);
+  assert.ok(!shut.stdout.includes(STRIPE));
+  const err = await refused(w.store.remove(id), 'store');
+  assert.equal(err.message, 'Workbench could not remove the key from your keyring, because your keyring is locked.');
+  assert.equal(w.items().length, 1, 'the value is still in the keyring');
+  assert.deepEqual((await w.store.list()).map(k => k.id), [id], 'and the key is still listed, so it can be tried again');
+  assert.equal(w.store.envFor({}).STRIPE_SECRET_KEY, STRIPE);
+  const asked = w.seen().map(s => s.argv);
+  assert.deepEqual(asked.at(-1), ['search', '--all', 'service', SERVICE, 'account', acct], 'it asked search, which never unlocks');
+  assert.ok(!asked.some(a => a.includes('--unlock')));
+  assertNoValue(`${errorText(err)}\n${w.lines.join('\n')}`, [STRIPE], 'the error and the log');
+  // Unlocked again, the key goes.
+  w.env.FAKE_SECRET_TOOL_MODE = '';
+  assert.deepEqual(await w.store.remove(id), { removed: true });
+  assert.deepEqual(w.items(), []);
+  // A value already gone from the keyring counts as removed: clear finds nothing (exit 1, silent), and search lists nothing.
+  const gone = await w.store.add({ preset: 'stripe', values: { STRIPE_SECRET_KEY: STRIPE } });
+  fs.writeFileSync(w.env.FAKE_SECRET_TOOL_DB, JSON.stringify({ items: [] }));
+  assert.deepEqual(await w.store.remove(gone.id), { removed: true });
+  assert.deepEqual(await w.store.list(), []);
+  assertNoValue(w.lines.join('\n'), [STRIPE], 'the log');
+});
+
 // ------------------------------------------------------------------ private files
 
 test('files: a 0600 file per key in a 0700 folder, read back, and removed', async (t) => {
@@ -615,6 +653,45 @@ test('files: the modes hold under a permissive umask, and nothing reaches stdout
   assert.equal(mode(path.join(home, '.workbench', 'keys')), 0o700);
   assert.equal(mode(path.join(home, '.workbench', 'keys', `${id}.json`)), 0o600);
   assert.equal(mode(path.join(home, '.workbench', 'keys.json')), 0o600);
+});
+
+test('files: a FIFO in place of keys.json or a value file is never waited on: it is set aside, or not read', async (t) => {
+  // Something running as the person (an agent's command, a test it runs) can make a FIFO where Workbench reads. Opening
+  // one with no writer would block the whole of Workbench, so each load runs in a child with a time limit.
+  const home = tmpHome(t);
+  const { store } = fileStore(home);
+  const { id } = await store.add({ preset: 'stripe', values: { STRIPE_SECRET_KEY: STRIPE } });
+  const dir = path.join(home, '.workbench');
+  const fifo = (file) => {
+    fs.rmSync(file, { force: true });
+    const made = spawnSync('mkfifo', [file], { encoding: 'utf8' });
+    assert.equal(made.status, 0, made.stderr);
+    assert.ok(fs.lstatSync(file).isFIFO());
+  };
+  const load = () => {
+    const script = `
+      import { KeyStore } from ${JSON.stringify(KEYS_MODULE)};
+      const log = { warn: (s) => console.error(s), info: () => {} };
+      const store = new KeyStore({ home: ${JSON.stringify(home)}, platform: 'linux', backend: 'file', log });
+      console.log(JSON.stringify(await store.load()));`;
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(run.signal, null, 'loading the keys was still waiting on the FIFO after 10 seconds');
+    assert.equal(run.status, 0, run.stderr);
+    return { result: JSON.parse(run.stdout.trim()), said: run.stderr };
+  };
+  // A value file: that key's value is missing, by name.
+  fifo(path.join(dir, 'keys', `${id}.json`));
+  let r = load();
+  assert.deepEqual(r.result, { keys: 1, missing: 1 });
+  assert.match(r.said, /could not read STRIPE_SECRET_KEY from its private files in .*, because it is not a plain file, so agents will not get it\./);
+  // keys.json: set aside as damaged, and a new list is started.
+  fifo(path.join(dir, 'keys.json'));
+  r = load();
+  assert.deepEqual(r.result, { keys: 0, missing: 0 });
+  assert.match(r.said, /was damaged, so it was set aside as keys\.json\.damaged/);
+  assert.equal(fs.existsSync(path.join(dir, 'keys.json')), false);
+  assert.ok(fs.lstatSync(path.join(dir, 'keys.json.damaged')).isFIFO());
+  assertNoValue(r.said, [STRIPE], 'what loading said');
 });
 
 // ------------------------------------------------------------------ keys.json

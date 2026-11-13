@@ -216,11 +216,14 @@ function actionsFor(a, isDefault) {
   return list;
 }
 
-/** "AWS for all repositories, given to all agents: AWS_ACCESS_KEY_ID •••• 7QXA, AWS_SECRET_ACCESS_KEY •••• 9f2b" */
-function keySentence(k, repoRoot) {
+/**
+ * "AWS for all repositories, given to all agents: AWS_ACCESS_KEY_ID •••• 7QXA, AWS_SECRET_ACCESS_KEY •••• 9f2b". A key for
+ * one repository reads "this repository" when its scope says `here` (status() compares real paths).
+ */
+function keySentence(k) {
   const label = oneLine(k.label, 80) || 'A key';
   const scope = k.scope && k.scope.kind === 'repo'
-    ? (sameFolder(k.scope.root, repoRoot) ? 'this repository' : `the repository at ${oneLine(k.scope.root, 300)}`)
+    ? (k.scope.here === true ? 'this repository' : `the repository at ${oneLine(k.scope.root, 300)}`)
     : 'all repositories';
   const agents = k.agents === 'all' ? 'all agents'
     : Array.isArray(k.agents) && k.agents.length ? listWords(k.agents.map(agentName)) : 'no agent';
@@ -284,14 +287,15 @@ export class Connect extends EventEmitter {
    * @param {Function} [o.openTerminal] ({ title, program, args }) => Promise<{ opened }>, default from terminal.mjs
    * @param {Function} [o.fetchJson] (url, { headers }) => Promise<{ status, json }>, default fetch
    * @param {object|Function} [o.log]
-   * @param {boolean} [o.probe]      probe the agents at once (true): defaultAgent() knows nothing until a probe ends.
+   * @param {string} [o.repoRoot]   the repository Workbench works on: the first probe gives the agents its keys too
+   * @param {boolean} [o.probe]      probe the agents at once (true): defaultAgent() cannot tell until a probe ends.
    *   Pass false where no agent will be started (the CLI's --connect-github and --github-repos).
    *   Also accepted, mainly for tests: presets (the KEY_PRESETS list), probeTimeoutMs (10 000).
    */
   constructor({
     home = os.homedir(), platform = process.platform, env = process.env, keys, workspace = workspaceModule, adapters = {},
-    flags = {}, settingsPath, openTerminal = openTerminalWindow, fetchJson = fetchJsonWithNode, log = null, probe = true,
-    presets = KEY_PRESETS, probeTimeoutMs = PROBE_TIMEOUT_MS,
+    flags = {}, settingsPath, openTerminal = openTerminalWindow, fetchJson = fetchJsonWithNode, log = null, repoRoot = null,
+    probe = true, presets = KEY_PRESETS, probeTimeoutMs = PROBE_TIMEOUT_MS,
   } = {}) {
     super();
     if (!keys || typeof keys.list !== 'function' || typeof keys.add !== 'function') throw new Error('The connect service needs the key store.');
@@ -310,6 +314,7 @@ export class Connect extends EventEmitter {
     this._log = makeLog(log);
     this._agents = null; // id -> what the last probe found
     this._repoRoot = null;
+    this._noteRepo(repoRoot); // before the first probe, so it counts the keys kept for this repository
     this._current = null; // the probe under way
     this._next = null; // one more probe, queued behind it
     this._settings = this._readSettings();
@@ -367,7 +372,12 @@ export class Connect extends EventEmitter {
       canOpenTerminal: this.platform === 'darwin',
       git: await this._gitStatus(root),
       github: { connected: github.connected, login: github.login, agentsUseIt: github.agentsUseIt, sentence: github.sentence },
-      keys: keys.filter((k) => k.id !== github.keyId).map((k) => ({ ...k, sentence: keySentence(k, root) })),
+      // A key for one repository says whether it is this one (`here`), by real paths, as envFor gives keys: the page
+      // words "this repository" from that, never from folder names.
+      keys: keys.filter((k) => k.id !== github.keyId).map((k) => {
+        const scope = k.scope && k.scope.kind === 'repo' ? { ...k.scope, here: sameFolder(k.scope.root, root) } : k.scope;
+        return { ...k, scope, sentence: keySentence({ ...k, scope }) };
+      }),
       ready: agents.some((a) => a.ready),
     };
   }
@@ -423,9 +433,13 @@ export class Connect extends EventEmitter {
     return out;
   }
 
-  /** The agent new work goes to: the person's choice when it is ready, else the first ready one, else null. */
+  /**
+   * The agent new work goes to: the person's choice when it is ready, else the first ready one, else null. Undefined
+   * until the first probe has ended: Connect cannot tell yet, and the engine then uses its own check.
+   */
   defaultAgent() {
-    const ready = (id) => !!(this._agents && this._agents[id] && this._agents[id].ready);
+    if (!this._agents) return undefined;
+    const ready = (id) => !!(this._agents[id] && this._agents[id].ready);
     const chosen = this._settings && this._settings.defaultAgent;
     if (typeof chosen === 'string' && AGENT_BY_ID.has(chosen) && ready(chosen)) return chosen;
     for (const d of AGENTS) if (ready(d.id)) return d.id;
@@ -654,11 +668,13 @@ export class Connect extends EventEmitter {
 
   /**
    * Connect GitHub with a token: GitHub says whose it is (GET /user), then it is kept in the key store (GH_TOKEN and
-   * GITHUB_TOKEN; for every agent when `agentsUseIt`, else for none: git only) and given to git's credential helper for
-   * github.com, so git can clone private repositories. A token GitHub does not accept is not kept.
+   * GITHUB_TOKEN; for every agent when `agentsUseIt`, else for none: git only; left out, as the connection has it now,
+   * and git only for a first connection) and given to git's credential helper for github.com, so git can clone private
+   * repositories. A token GitHub does not accept is not kept, nor one settings.json cannot record as the connection's.
+   * An earlier connection's key or git sign-in that cannot be removed is said in the sentence.
    * @returns {Promise<{ ok: boolean, login?: string, why?: string, sentence: string }>}
    */
-  async connectGithub(token, { agentsUseIt = false } = {}) {
+  async connectGithub(token, { agentsUseIt } = {}) {
     const t = typeof token === 'string' ? token.trim() : '';
     if (!t || t.length > 255 || /[\s\u0000-\u001f\u007f]/.test(t)) throw refusal('value', 'That does not look like a GitHub token.', 400);
     let res;
@@ -676,15 +692,37 @@ export class Connect extends EventEmitter {
       this._log('warn', `GitHub answered ${Number(status) || 'something'} when asked whose the token is.`);
       return { ok: false, why: 'github', sentence: 'GitHub gave an answer Workbench did not expect, so the token was not kept.' };
     }
+    this._settings = this._readSettings();
     const keys = await this._listKeys();
     const previous = this._github(keys);
+    const share = agentsUseIt === undefined ? previous.agentsUseIt === true : agentsUseIt === true;
     const { id } = await this._storeAdd({
       preset: 'github', label: 'GitHub', values: { GH_TOKEN: t, GITHUB_TOKEN: t }, secretNames: ['GH_TOKEN', 'GITHUB_TOKEN'],
-      scope: { kind: 'all' }, agents: agentsUseIt === true ? 'all' : [],
+      scope: { kind: 'all' }, agents: share ? 'all' : [],
     });
-    this._updateSettings((s) => ({ ...s, github: { login, keyId: id } }));
-    if (previous.keyId && previous.keyId !== id) await this._removeQuietly(previous.keyId);
-    if (previous.login && previous.login !== login) await this._forgetGitSignIn(previous.login);
+    try {
+      this._updateSettings((s) => ({ ...s, github: { login, keyId: id } }));
+    } catch (e) {
+      // Nothing would say this key is the connection's: it goes again, rather than reach agents as a key of its own.
+      try {
+        await this.keys.remove(id);
+      } catch (gone) {
+        this._log('warn', `the GitHub token just kept could not be removed again: ${gone && gone.message}`);
+      }
+      throw e;
+    }
+    const after = [];
+    if (previous.keyId && previous.keyId !== id) {
+      try {
+        await this.keys.remove(previous.keyId);
+      } catch (e) {
+        this._log('warn', `the GitHub token kept before could not be removed: ${e && e.message}`);
+        after.push(`Workbench could not remove the token it kept before${previous.agentsUseIt ? ', so agents still get it' : ''}: it is listed under Keys for your agents, where you can remove it.`);
+      }
+    }
+    if (previous.login && previous.login !== login && !(await this._forgetGitSignIn(previous.login))) {
+      after.push(`Git could not forget your sign-in as ${previous.login}, so it may still use that account’s token.`);
+    }
     let kept = null;
     try {
       kept = await this.workspace.approveGitCredential({ host: 'github.com', username: login, password: t });
@@ -695,16 +733,37 @@ export class Connect extends EventEmitter {
     let sentence = `Connected to GitHub as ${login}.`;
     if (!kept) sentence += ' Git could not keep the token, so cloning private repositories may not work.';
     else if (kept.helper === false) sentence += ' Git on this computer has nowhere to keep sign-ins, so it cannot use the token to clone private repositories.';
+    for (const more of after) sentence += ` ${more}`;
     return { ok: true, login, sentence };
   }
 
-  /** Disconnect GitHub: git forgets the sign-in, and the key goes. The token itself still works until it is deleted. */
+  /**
+   * Disconnect GitHub: git forgets the sign-in, then the key goes, then settings.json forgets the connection. The token
+   * itself still works until it is deleted on GitHub. Git goes first, so whatever fails, the key is still there and the
+   * panel shows GitHub connected, with Disconnect to try again: the answer is then `{ ok: false, why: 'git'|'store',
+   * sentence }`, saying what is still kept.
+   * @returns {Promise<{ ok: boolean, why?: string, sentence: string }>}
+   */
   async disconnectGithub() {
+    this._settings = this._readSettings();
     const github = this._github(await this._listKeys());
-    const gh = this._settings && this._settings.github;
-    if (gh && gh.keyId) await this._removeQuietly(gh.keyId);
+    const gh = this._settings.github && typeof this._settings.github === 'object' ? this._settings.github : null;
     const login = github.login || (gh && typeof gh.login === 'string' && GITHUB_LOGIN.test(gh.login) ? gh.login : null);
-    if (login) await this._forgetGitSignIn(login);
+    const kept = github.agentsUseIt
+      ? 'GitHub is still connected, and agents still get your GitHub token until it is removed.'
+      : 'GitHub is still connected, and Workbench still keeps your GitHub token.';
+    if (login && !(await this._forgetGitSignIn(login))) {
+      return { ok: false, why: 'git', sentence: `Git could not forget your GitHub sign-in. ${kept} Try again.` };
+    }
+    if (gh && gh.keyId) {
+      try {
+        await this.keys.remove(gh.keyId);
+      } catch (e) {
+        this._log('warn', `the GitHub token could not be removed: ${e && e.message}`);
+        const why = e && e.plain === true && typeof e.message === 'string' && e.message.trim() ? e.message.trim() : 'Workbench could not remove your GitHub token.';
+        return { ok: false, why: 'store', sentence: `${why} ${kept} Try again.` };
+      }
+    }
     this._updateSettings((s) => {
       const { github: _gone, ...rest } = s;
       return rest;
@@ -786,11 +845,14 @@ export class Connect extends EventEmitter {
     return typeof token === 'string' && token ? token : null;
   }
 
+  /** Git forgets the sign-in for this login: true when it did, false (and a line in the log) when it could not. */
   async _forgetGitSignIn(login) {
     try {
       await this.workspace.rejectGitCredential({ host: 'github.com', username: login });
+      return true;
     } catch (e) {
       this._log('warn', `git could not forget the GitHub sign-in${e && e.detail ? `: ${oneLine(e.detail, 300)}` : ''}`);
+      return false;
     }
   }
 
@@ -850,12 +912,15 @@ export class Connect extends EventEmitter {
     return result;
   }
 
-  /** Remove a key. The GitHub connection's key disconnects GitHub. */
+  /**
+   * Remove a key. The GitHub connection's key disconnects GitHub; when that fails, the answer is disconnectGithub's
+   * refusal with `removed: false`.
+   */
   async removeKey(id) {
     const gh = this._readSettings().github;
     if (gh && gh.keyId === id) {
-      await this.disconnectGithub();
-      return { removed: true };
+      const r = await this.disconnectGithub();
+      return r && r.ok === false ? { removed: false, ...r } : { removed: true };
     }
     let result;
     try {

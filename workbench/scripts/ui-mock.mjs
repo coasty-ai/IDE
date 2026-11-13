@@ -572,8 +572,9 @@ function mergeWorld(name, now) {
 // Sign in and Install "open Terminal": the next re-check finds the agent signed in, or installed and signed out. Through
 // POST /ctl/mode, connect: { terminal: false } answers them with the command to run instead (no Terminal); { github:
 // 'token' } refuses the token Connect GitHub sends; { githubAgents: 'token' } refuses GitHub's box ("Let agents use this
-// token") as Connect does when git cannot give the token back, with { ok: false, why: 'token', sentence } and no status;
-// { fail: true } fails every read. delay: { connect: ms } makes every answer take that long.
+// token") as Connect does when the key store cannot give it the token it keeps, with { ok: false, why: 'token', sentence,
+// status }, as the route answers; { fail: true } fails every read. delay: { connect: ms } makes every answer take that
+// long. A key for one repository says whether it is this one (`here`), as Connect's status does.
 const CONNECT_SCENARIOS = ['connect-none', 'connect-claude', 'connect-nocodex', 'connect-github', 'connect-fail'];
 SCENARIOS.push(...CONNECT_SCENARIOS);
 const CONNECT_REPO = { name: 'shop', root: '/Users/someone/code/shop', head: 'c0ffee1', branch: 'main', dirty: 0 };
@@ -627,7 +628,8 @@ function connectStatus(f) {
     agents, defaultAgent: def, platform: 'darwin', canOpenTerminal: true,
     git: { name: g.name, email: g.email, sentence: g.name && g.email ? `Git knows you as ${g.name}, ${g.email}.` : 'Git does not know your name and email yet.' },
     github: gh ? { connected: true, login: gh.login, agentsUseIt: gh.agentsUseIt, sentence: `Connected to GitHub as ${gh.login}.` } : { connected: false, login: null, agentsUseIt: false, sentence: 'Not connected.' },
-    keys: f.keys.map(k => ({ ...k, vars: k.vars.map(x => ({ ...x })), sentence: keySentence(k) })),
+    keys: f.keys.map(k => ({ ...k, scope: k.scope.kind === 'repo' ? { ...k.scope, here: k.scope.root === CONNECT_REPO.root } : { ...k.scope },
+      vars: k.vars.map(x => ({ ...x })), sentence: keySentence(k) })),
     ready: agents.some(a => a.ready),
   };
 }
@@ -886,10 +888,10 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       return done('Connected to GitHub as octocat.', { login: 'octocat' });
     }
     if (p === '/api/connect/github/agents') {
-      // "Let agents use this token": Connect reads the token back from git, and keeps it again with the other choice
+      // "Let agents use this token": Connect reads the token from the key store, and keeps it again with the other choice
       if (!cw.github) return no(409, 'GitHub is not connected.');
       if (k.githubAgents === 'token') {
-        return answer(200, { ok: false, why: 'token', sentence: 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.' });
+        return answer(200, { why: 'token', ok: false, sentence: 'Workbench cannot read the GitHub token back from git, so this cannot change. Disconnect GitHub, then connect it again.', status: connectNow() });
       }
       cw.github.agentsUseIt = b?.agentsUseIt === true;
       return done(cw.github.agentsUseIt ? 'Agents can use your GitHub token now, as GH_TOKEN.' : 'Agents no longer get your GitHub token. Git still uses it.');
