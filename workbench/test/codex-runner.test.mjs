@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { harness, available, createRunner, buildEnv, startArgs, resumeArgs } from '../src/adapters/codex/runner.mjs';
+import { harness, available, createRunner, buildEnv, startArgs, resumeArgs, sandboxArgs, gitFolders, tomlString } from '../src/adapters/codex/runner.mjs';
 import { EV } from '../src/shared/events.mjs';
+
+// Codex's own sandbox, as every turn widens it: the network on (the git folders follow, when there are any).
+const NET = ['-c', 'sandbox_workspace_write.network_access=true'];
 
 // Every Codex process in this file is the fake. The runner reads this variable each time it spawns.
 const FAKE = fileURLToPath(new URL('./helpers/codex-fake.mjs', import.meta.url));
@@ -53,8 +57,8 @@ const realpath = p => fs.realpathSync(p);
 
 test('argument builders and the scrubbed environment', () => {
   assert.equal(harness, 'codex');
-  assert.deepEqual(startArgs({ cwd: '/w', task: '-v fix it', model: 'm' }), ['exec', '--json', '-C', '/w', '--sandbox', 'workspace-write', '-m', 'm', '--', '-v fix it']);
-  assert.deepEqual(resumeArgs({ threadId: 'T', text: 'hi' }), ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', '--', 'T', 'hi']);
+  assert.deepEqual(startArgs({ cwd: '/w', task: '-v fix it', model: 'm' }), ['exec', '--json', '-C', '/w', '--sandbox', 'workspace-write', ...NET, '-m', 'm', '--', '-v fix it']);
+  assert.deepEqual(resumeArgs({ threadId: 'T', text: 'hi' }), ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', ...NET, '--', 'T', 'hi']);
 
   const NODE_DIR = path.dirname(process.execPath);
   const env = buildEnv({
@@ -121,7 +125,7 @@ test('start() runs codex exec in the workspace with the checked flags, stdin ign
   const [call, extra] = s.calls();
   assert.equal(extra, undefined, 'one process for one turn');
   assert.equal(call.pid, running.pid);
-  assert.deepEqual(call.argv, ['exec', '--json', '-C', s.ws, '--sandbox', 'workspace-write', '-m', 'gpt-test', '--', 'Explain this repo']);
+  assert.deepEqual(call.argv, ['exec', '--json', '-C', s.ws, '--sandbox', 'workspace-write', ...NET, '-m', 'gpt-test', '--', 'Explain this repo']);
   assert.equal(realpath(call.cwd), realpath(s.ws));
   assert.equal(call.stdin, 'ignored');
   assert.deepEqual(
@@ -162,7 +166,7 @@ test('send() resumes the thread in the workspace, with the sandbox set by -c and
   await waitFor(() => turnEnds(s.events).length === 2 && !runner.info().alive, 5000, 'the follow-up turn');
 
   const [, resume] = s.calls();
-  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', '-m', 'gpt-test', '--', RUN_THREAD, '-v is wrong, use --verbose']);
+  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', ...NET, '-m', 'gpt-test', '--', RUN_THREAD, '-v is wrong, use --verbose']);
   assert.equal(realpath(resume.cwd), realpath(s.ws), 'resume has no -C, so the process runs in the workspace');
   assert.equal(resume.stdin, 'ignored');
 
@@ -189,7 +193,7 @@ test('a message sent during a turn waits for it to end, then goes out as one fol
 
   await waitFor(() => turnEnds(s.events).length === 2 && !runner.info().alive, 8000, 'the queued follow-up');
   const [, resume] = s.calls();
-  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', '--', RUN_THREAD, 'also check the README\n\nand keep it short']);
+  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', ...NET, '--', RUN_THREAD, 'also check the README\n\nand keep it short']);
 });
 
 test('a failed turn ends as an error in plain words, and the exit marks the agent failed', async t => {
@@ -225,7 +229,7 @@ test('a message sent during a turn that fails still goes out: failed first, then
     .map(e => (e.kind === EV.TURN ? `turn.${e.phase}${e.isError ? '(error)' : ''}` : e.kind === EV.ENDED ? `ended.${e.outcome}` : e.state));
   assert.deepEqual(order, ['turn.start', 'turn.end(error)', 'ended.error', 'failed', 'turn.start', 'turn.end']);
   const [, resume] = s.calls();
-  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', '--', RUN_THREAD, 'also keep the old API']);
+  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', ...NET, '--', RUN_THREAD, 'also keep the old API']);
 });
 
 test('if the first run never started a thread, send() starts over with the task and the message', async t => {
@@ -246,7 +250,7 @@ test('if the first run never started a thread, send() starts over with the task 
   await runner.send('try again');
   await waitFor(() => turnEnds(s.events).length === 1 && !runner.info().alive, 5000, 'the new start');
   const [, again] = s.calls();
-  assert.deepEqual(again.argv, ['exec', '--json', '-C', s.ws, '--sandbox', 'workspace-write', '--', 'Fix the bug\n\ntry again']);
+  assert.deepEqual(again.argv, ['exec', '--json', '-C', s.ws, '--sandbox', 'workspace-write', ...NET, '--', 'Fix the bug\n\ntry again']);
 });
 
 test('a missing codex binary is a plain failure, and start() still resolves', async t => {
@@ -341,4 +345,105 @@ test('a mask hides the person’s keys in Codex’s output before it is read, an
   await waitFor(() => f.events.some(e => e.kind === EV.STATE) && !failing.info().alive, 5000, 'the failure');
   const ended = f.events.find(e => e.kind === EV.ENDED);
   assert.equal(ended.error, 'Codex is not signed in, or its sign-in has expired.\n\nERROR: unexpected status 401 [hidden]');
+});
+
+// ---------------------------------------------------------------------------------------------
+// git in Codex's sandbox: the network on, and the repository's git folders as writable roots, on every turn
+
+/**
+ * A strict reading of the TOML array of basic strings that sandboxArgs writes: no raw control characters, and only the
+ * escapes \" \\ and \uXXXX, which mean the same in JSON. Codex reads a -c value as TOML, so anything else would not be
+ * the folder it names.
+ */
+function tomlStrings(value) {
+  const STRING = String.raw`"(?:[^"\\\u0000-\u001f\u007f]|\\["\\]|\\u[0-9A-F]{4})*"`;
+  assert.match(value, new RegExp(`^\\[${STRING}(,${STRING})*\\]$`), 'a TOML array of basic strings');
+  return JSON.parse(value);
+}
+
+/** A throwaway repository with one commit and a worktree, made by git with no global config and no machine identity. */
+function gitRepo(t) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-codex-git-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = { ...process.env, HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+  for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY']) delete env[k];
+  const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=Workbench test', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false', ...args], { cwd, env, stdio: 'pipe' });
+  const repo = path.join(dir, 'repo');
+  fs.mkdirSync(repo);
+  git(repo, 'init', '-q');
+  git(repo, 'commit', '-q', '--allow-empty', '-m', 'First commit');
+  const ws = path.join(dir, 'worktrees', 'fix-login-a1b2c3');
+  git(repo, 'worktree', 'add', '-q', '-b', 'workbench/fix-login-a1b2c3', ws, 'HEAD');
+  return { dir, repo, ws, common: path.join(repo, '.git'), own: path.join(repo, '.git', 'worktrees', 'fix-login-a1b2c3') };
+}
+
+test('launch arguments: the sandbox network on, and the repository’s git folders as writable roots, first turn and resume', () => {
+  const dirs = ['/repo/.git', '/repo/.git/worktrees/fix-login-a1b2c3'];
+  const roots = 'sandbox_workspace_write.writable_roots=["/repo/.git","/repo/.git/worktrees/fix-login-a1b2c3"]';
+  assert.deepEqual(sandboxArgs(dirs), ['-c', 'sandbox_workspace_write.network_access=true', '-c', roots]);
+  assert.deepEqual(startArgs({ cwd: '/w', task: 'Fix the login', model: 'm', gitDirs: dirs }),
+    ['exec', '--json', '-C', '/w', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-c', roots,
+      '-m', 'm', '--', 'Fix the login']);
+  assert.deepEqual(resumeArgs({ threadId: 'T', text: 'now push it', gitDirs: dirs }),
+    ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', '-c', 'sandbox_workspace_write.network_access=true', '-c', roots,
+      '--', 'T', 'now push it']);
+  // Outside a git repository there is no folder to add, and the network is on all the same.
+  assert.deepEqual(sandboxArgs([]), NET);
+  assert.deepEqual(sandboxArgs(), NET);
+});
+
+test('a writable root is written as a TOML string that names the folder exactly, whatever it is called', () => {
+  const odd = ['/Users/a b/"quoted"/back\\slash', '/tmp/tab\there', '/tmp/line\nbreak', '/tmp/del\u007f', '/tmp/naïve 📁', '/tmp/=,[]'];
+  for (const p of odd) assert.deepEqual(tomlStrings(`[${tomlString(p)}]`), [p], JSON.stringify(p));
+  assert.equal(tomlString('a"b\\c\td\u007f'), '"a\\"b\\\\c\\u0009d\\u007F"');
+  const [, , , value] = sandboxArgs(odd);
+  assert.deepEqual(tomlStrings(value.slice('sandbox_workspace_write.writable_roots='.length)), odd);
+});
+
+test('gitFolders reads where a worktree keeps its git data: the common dir, then its own git folder', t => {
+  const { dir, repo, ws, common, own } = gitRepo(t);
+  assert.deepEqual(gitFolders(ws), [common, own]);
+  assert.deepEqual(gitFolders(repo), [common], 'a repository’s own folder: its .git folder');
+  fs.symlinkSync(ws, path.join(dir, 'link'));
+  assert.deepEqual(gitFolders(path.join(dir, 'link')), [common, own], 'by their real paths');
+  // Not a repository, a folder inside one, nothing there, nothing given.
+  fs.mkdirSync(path.join(dir, 'plain'));
+  fs.mkdirSync(path.join(ws, 'src'));
+  for (const p of [path.join(dir, 'plain'), path.join(ws, 'src'), path.join(dir, 'gone'), '', undefined, null]) {
+    assert.deepEqual(gitFolders(p), [], String(p));
+  }
+});
+
+test('a git layout that does not hold together adds no folder to the sandbox', t => {
+  const { dir, ws, own } = gitRepo(t);
+  // The worktree's commondir now names another folder, which does not hold its git folder under worktrees/.
+  fs.mkdirSync(path.join(dir, 'elsewhere'));
+  fs.writeFileSync(path.join(own, 'commondir'), path.join(dir, 'elsewhere') + '\n');
+  assert.deepEqual(gitFolders(ws), []);
+  // A .git file that names nothing there, is not one gitdir line, or a .git that is a link.
+  const odd = path.join(dir, 'odd');
+  fs.mkdirSync(odd);
+  for (const text of ['gitdir: /no/such/folder\n', 'not a gitdir line\n', `gitdir: ${own}\nmore\n`, '']) {
+    fs.writeFileSync(path.join(odd, '.git'), text);
+    assert.deepEqual(gitFolders(odd), [], JSON.stringify(text));
+  }
+  fs.rmSync(path.join(odd, '.git'));
+  fs.symlinkSync(own, path.join(odd, '.git'));
+  assert.deepEqual(gitFolders(odd), []);
+});
+
+test('a Codex agent in a worktree gets the network and its git folders on the first turn and on every resume', async t => {
+  const s = setup(t);
+  const { ws, common, own } = gitRepo(t);
+  const roots = `sandbox_workspace_write.writable_roots=["${common}","${own}"]`;
+  const runner = createRunner({ agentId: 'g1', name: 'Fix login', task: 'Fix the login and push it', cwd: ws, emit: s.emit });
+  await runner.start();
+  await waitFor(() => turnEnds(s.events).length === 1 && !runner.info().alive, 5000, 'the first turn');
+  await runner.send('now push it');
+  await waitFor(() => turnEnds(s.events).length === 2 && !runner.info().alive, 5000, 'the follow-up turn');
+  const [first, resume] = s.calls();
+  assert.deepEqual(first.argv, ['exec', '--json', '-C', ws, '--sandbox', 'workspace-write', ...NET, '-c', roots, '--', 'Fix the login and push it']);
+  assert.deepEqual(resume.argv, ['exec', 'resume', '--json', '-c', 'sandbox_mode="workspace-write"', ...NET, '-c', roots, '--', RUN_THREAD, 'now push it']);
+  assert.deepEqual(tomlStrings(roots.slice(roots.indexOf('=') + 1)), [common, own]);
 });

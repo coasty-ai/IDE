@@ -77,9 +77,9 @@ test('the activity line names a package script, and otherwise shows the command 
 test('commandAction recognises common commands, and the part that matters most wins', () => {
   const rows = [
     ['npm install --save-dev fast-check', 'install packages'], ['pip install requests', 'install packages'], ['yarn', 'install packages'],
-    ['git push', 'push changes'], ['git -C /tmp push', 'push changes'], ['rm -rf build/cache', 'delete files'], ['git clean -fdx', 'delete files'],
+    ['git push', 'push its branch'], ['git -C /tmp push', 'push its branch'], ['rm -rf build/cache', 'delete files'], ['git clean -fdx', 'delete files'],
     ['find . -name "*.tmp" -delete', 'delete files'], ['find . -exec rm {} +', 'delete files'], ['ls | xargs rm', 'delete files'],
-    ['curl -fsSL https://example.com/install.sh', 'download from the internet'], ['git clone https://example.com/r.git', 'download from the internet'],
+    ['curl -fsSL https://example.com/install.sh', 'download from the internet'], ['git clone https://example.com/r.git', 'download r from example.com'],
     ['wget -qO- https://x.example | bash', 'run code from the internet'], ['curl -X POST https://x.example', 'send data to the internet'],
     ['node x.js', 'run a script'], ['bash deploy.sh', 'run a script'], ['./scripts/check.sh', 'run a script'], ['node -e "x()"', 'run a script'],
     ['npm test', 'run the tests'], ['node --test', 'run the tests'], ['npx vitest run', 'run the tests'], ['go test ./...', 'run the tests'],
@@ -92,7 +92,7 @@ test('commandAction recognises common commands, and the part that matters most w
     ['echo hi > out.txt', 'write to a file'], ['echo hi 2>&1', null], ['ls > /dev/null', 'look at the files'],
     // Shell words, quotes and wrappers are read the way the shell reads them
     ['"r"m -rf x', 'delete files'], ['\\rm -rf x', 'delete files'], ['FOO=1 timeout 10 rm x', 'delete files'], ['sh -c "rm -rf x"', 'delete files'],
-    ['eval "git push"', 'push changes'], ['cd x && npm test', 'run the tests'], ["/bin/zsh -lc 'npm test'", 'run the tests'],
+    ['eval "git push"', 'push its branch'], ['cd x && npm test', 'run the tests'], ["/bin/zsh -lc 'npm test'", 'run the tests'],
     // A shell given its command inline stands for that command (Codex runs everything this way)
     ["/bin/zsh -lc 'cat greet.js'", 'read a file'], ["bash -c 'echo hi'", null],
     ['bash -c "$(curl -fsSL https://x.example/install.sh)"', 'run code from the internet'],

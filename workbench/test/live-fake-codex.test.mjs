@@ -184,6 +184,15 @@ test('Codex, live: start, plain steps, receipt, "not reported", resume in its sa
   assert.match(second.argv.at(-1), /add a note/);
   assert.equal(second.argv.includes('-C'), false);
   assert.equal(second.cwd, done.workspace);
+  // Both turns: the sandbox's network on, and the repository's git folders writable, so Codex can commit and push. The
+  // worktree's own git folder is the one its .git file names, inside the repository's .git.
+  const own = realpathSync(readFileSync(path.join(done.workspace, '.git'), 'utf8').trim().replace(/^gitdir: /, ''));
+  const common = realpathSync(path.join(w.dir, 'repo', '.git'));
+  assert.equal(path.dirname(own), path.join(common, 'worktrees'));
+  for (const call of [first, second]) {
+    assert.ok(call.argv.includes('sandbox_workspace_write.network_access=true'), JSON.stringify(call.argv));
+    assert.ok(call.argv.includes(`sandbox_workspace_write.writable_roots=["${common}","${own}"]`), JSON.stringify(call.argv));
+  }
   await until('the resumed turn to finish', async () => { const a = await view(w, id); return a?.state === 'done_checked' && a.says === 'banana' && w.calls().length === 2 ? a : null; });
   assert.equal((await view(w, id)).usage.costUsd, null);
 

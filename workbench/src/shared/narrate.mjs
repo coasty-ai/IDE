@@ -121,7 +121,11 @@ const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh
 const RUNS_CODE = new Set([...SHELLS, 'source', '.', 'eval', 'node', 'python', 'python2', 'python3', 'perl', 'ruby',
   'php', 'deno', 'bun', 'tsx', 'ts-node', 'osascript', 'Rscript', 'lua', 'awk', 'gawk', 'pwsh']);
 const PACKAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
-const GIT_LOOK = new Set(['status', 'diff', 'log', 'show', 'blame', 'grep', 'ls-files', 'rev-parse', 'shortlog', 'describe']);
+const GIT_LOOK = new Set(['status', 'diff', 'log', 'show', 'blame', 'grep', 'ls-files', 'rev-parse', 'shortlog', 'describe',
+  'annotate', 'cat-file', 'cherry', 'count-objects', 'diff-files', 'diff-index', 'diff-tree', 'for-each-ref', 'ls-remote', 'ls-tree',
+  'merge-base', 'name-rev', 'range-diff', 'rev-list', 'show-branch', 'show-ref', 'verify-commit', 'verify-tag', 'whatchanged']);
+/** Options before git's command that take the next word as their value. */
+const GIT_VALUE_OPTS = /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--super-prefix|--attr-source)$/;
 
 /**
  * One simple command: its program (without a folder), the words after it, and what git or a package tool is asked
@@ -148,7 +152,7 @@ function simpleCommand(words, writes) {
     let j = 0;
     while (j < c.args.length && c.args[j].startsWith('-')) {
       if (!/^(--no-pager|-P|--paginate|--no-optional-locks)$/.test(c.args[j])) c.gitOpts = true;
-      if (c.args[j] === '-C' || c.args[j] === '-c') j++;
+      if (GIT_VALUE_OPTS.test(c.args[j])) j++;
       j++;
     }
     c.sub = c.args[j] || '';
@@ -219,32 +223,211 @@ const isUpload = c => (c.prog === 'curl' && c.args.some((a, k) => /^-[a-zA-Z]*[d
 const DOWNLOADERS = new Set(['curl', 'wget', 'aria2c', 'http', 'https', 'xh']);
 /** git branch that deletes, renames, copies or reconfigures a branch, rather than listing them. */
 const branchChange = c => c.subArgs.some(a => /^(-[a-zA-Z]*[dDmMcCfu]|--(delete|move|copy|force|set-upstream|unset-upstream|edit-description))/.test(a));
+/** git commands that only look: the readers, and the listing forms of branch, stash, remote, worktree, tag and reflog. */
+const gitLooks = c => GIT_LOOK.has(c.sub) || (c.sub === 'branch' && !branchChange(c))
+  || (c.sub === 'stash' && /^(list|show)$/.test(c.subArgs[0] || ''))
+  || (c.sub === 'remote' && (!c.subArgs.length || /^(-v|--verbose|show|get-url)$/.test(c.subArgs[0])))
+  || (c.sub === 'worktree' && c.subArgs[0] === 'list')
+  || (c.sub === 'tag' && (!c.subArgs.length || /^(-l|--list|-n\d*)$/.test(c.subArgs[0])))
+  || (c.sub === 'reflog' && (!c.subArgs.length || c.subArgs[0] === 'show'));
+
+// ---------------------------------------------------------------------------------------------
+// git's words: what a push, pull, fetch or clone names, read from the command alone (never from the repository).
+
+/** A name a command gives, fit for a sentence: hidden characters become spaces, and a long one is clipped. */
+const said = (s, n = 40) => clip(String(s).replace(HIDDEN_CHARS, ' ').replace(/\s+/g, ' ').trim(), n);
+
+/** A long option, or the start of one (git takes `--forc` for `--force`): whether it names one of `list`. */
+const longOf = (name, list) => !!name && list.some(n => n.startsWith(name));
+
+/**
+ * The words of a git command that are not options or their values. `values`: the options that take the next word, by
+ * their whole names (so --recurse-submodules, which takes none, is not read as --recurse-submodules-default).
+ */
+function gitOperands(args, values = {}) {
+  const out = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { out.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      if (!a.includes('=') && (values.long || []).includes(a.slice(2))) k++;
+      continue;
+    }
+    if (a.startsWith('-') && a.length > 1) {
+      const at = [...a.slice(1)].findIndex(ch => (values.short || '').includes(ch));
+      if (at >= 0 && at === a.length - 2) k++; // a short option that takes a value, last in its word: the next word
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+/** The computer an address names, or null for a folder on this one: https://host/…, ssh://…, user@host:path. */
+function addressOf(word) {
+  const w = String(word);
+  const url = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:?#]+)(?::\d*)?(\/[^?#]*)?/i.exec(w);
+  if (url) return { host: url[1], path: url[2] || '' };
+  const scp = /^(?:[^@/:]+@)?([^/:]+):(?!\/\/)(.*)$/.exec(w);
+  return scp && !/^[./~]/.test(w) ? { host: scp[1], path: scp[2] } : null;
+}
+
+/** Where a remote is, in words: GitHub for github.com, the computer's name for another address, else the remote's own name. */
+function remoteWords(word) {
+  const at = addressOf(word);
+  if (!at) return said(word);
+  return /^(www\.)?github\.com$/i.test(at.host) ? 'GitHub' : said(at.host.toLowerCase());
+}
+
+/** The branch or tag a refspec names: main for refs/heads/main or main:main, its branch for HEAD, old for :old. */
+function refWord(spec) {
+  const s = String(spec).replace(/^\+/, '');
+  const at = s.indexOf(':');
+  let src = at < 0 ? s : s.slice(0, at);
+  if (!src && at >= 0) src = s.slice(at + 1); // ":old" deletes old
+  if (!src || src === 'HEAD' || src === '@') return 'its branch';
+  return said(src.replace(/^refs\/(heads|tags|remotes)\//, ''), 32);
+}
+
+const listNames = names => {
+  const u = [...new Set(names)];
+  return u.length === 1 ? u[0] : u.length === 2 ? `${u[0]} and ${u[1]}` : `${u.length} branches`;
+};
+
+/** git push: whether it replaces (force, mirror) or deletes (delete, prune, a :refspec), and what it names. */
+function readPush(args) {
+  const p = { force: false, delete: false, mirror: false, prune: false, all: false, tags: false, ops: [] };
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { p.ops.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      const name = a.slice(2).split('=')[0];
+      if (longOf(name, ['force', 'force-with-lease', 'force-if-includes'])) p.force = true;
+      else if (longOf(name, ['delete'])) p.delete = true;
+      else if (longOf(name, ['mirror'])) p.mirror = true;
+      else if (longOf(name, ['prune'])) p.prune = true;
+      else if (name === 'all' || name === 'branches') p.all = true;
+      else if (name === 'tags') p.tags = true;
+      else if (!a.includes('=') && longOf(name, ['repo', 'push-option', 'receive-pack', 'exec'])) k++;
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        if (a[j] === 'f') p.force = true;
+        if (a[j] === 'd') p.delete = true;
+        if (a[j] === 'o') { if (j === a.length - 1) k++; break; } // -o <push option>
+      }
+      continue;
+    }
+    p.ops.push(a);
+  }
+  const [remote, ...refs] = p.ops;
+  if (p.ops.some(r => r.startsWith('+'))) p.force = true;
+  if (refs.some(r => r.startsWith(':'))) p.delete = true;
+  return { ...p, remote, refs };
+}
+
+/** "Pushing main to origin", "Pushing its branch to GitHub", "Replacing main on origin", "Deleting old on origin". */
+function pushWords(c) {
+  const p = readPush(c.subArgs);
+  const remote = p.remote ? remoteWords(p.remote) : '';
+  const names = p.refs.map(refWord);
+  if (p.delete || p.prune) {
+    const what = p.delete && names.length ? listNames(names) : 'branches';
+    const on = ` on ${remote || 'the remote'}`;
+    return { does: `delete ${what}${on}`, doing: `Deleting ${what}${on}` };
+  }
+  const what = p.mirror ? 'everything' : names.length ? listNames(names) : p.all ? 'every branch' : p.tags ? 'its tags' : 'its branch';
+  if (p.force || p.mirror) {
+    const on = ` on ${remote || 'the remote'}`;
+    return { does: `replace ${what}${on}`, doing: `Replacing ${what}${on}` };
+  }
+  const to = remote ? ` to ${remote}` : '';
+  return { does: `push ${what}${to}`, doing: `Pushing ${what}${to}` };
+}
+
+const FETCH_VALUES = ['depth', 'deepen', 'shallow-since', 'shallow-exclude', 'jobs', 'upload-pack', 'server-option',
+  'negotiation-tip', 'refmap', 'filter', 'submodule-prefix', 'recurse-submodules-default'];
+
+/** "Bringing in main from origin", "Bringing in changes". */
+function pullWords(c) {
+  const [remote, ...refs] = gitOperands(c.subArgs, { short: 'sXjo', long: [...FETCH_VALUES, 'strategy', 'strategy-option'] });
+  const what = refs.length ? listNames(refs.map(refWord)) : 'changes';
+  const from = remote ? ` from ${remoteWords(remote)}` : '';
+  return { does: `bring in ${what}${from}`, doing: `Bringing in ${what}${from}` };
+}
+
+/** "Downloading new commits from origin", "… from every remote". */
+function fetchWords(c) {
+  const [remote] = gitOperands(c.subArgs, { short: 'jo', long: FETCH_VALUES });
+  const from = remote ? ` from ${remoteWords(remote)}` : c.subArgs.includes('--all') ? ' from every remote' : '';
+  return { does: `download new commits${from}`, doing: `Downloading new commits${from}` };
+}
+
+/** "Downloading owner/repo from GitHub", "Downloading repo from gitlab.com"; a folder on this computer is copied. */
+function cloneWords(c) {
+  const [source] = gitOperands(c.subArgs, { short: 'objuc', long: ['origin', 'branch', 'upload-pack', 'reference', 'reference-if-able',
+    'separate-git-dir', 'depth', 'shallow-since', 'shallow-exclude', 'jobs', 'config', 'template', 'filter', 'server-option',
+    'bundle-uri', 'ref-format', 'revision'] });
+  if (!source) return null;
+  const at = addressOf(source);
+  if (!at) return { does: 'copy a repository', doing: 'Copying a repository' };
+  const github = /^(www\.)?github\.com$/i.test(at.host);
+  const where = github ? 'GitHub' : said(at.host.toLowerCase());
+  const parts = at.path.split('/').filter(Boolean).map(s => s.replace(/\.git$/i, ''));
+  const name = (github ? parts.slice(-2).join('/') : parts.at(-1)) || '';
+  const what = name ? said(name) : 'a repository';
+  return { does: `download ${what} from ${where}`, doing: `Downloading ${what} from ${where}` };
+}
+
+/** git config that only reads (words only: the permission policy decides this for itself). */
+function configReads(args) {
+  let reads = false;
+  const names = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { names.push(...args.slice(k + 1)); break; }
+    if (/^--(add|replace-all|unset|unset-all|rename-section|remove-section|edit|comment)(=|$)/.test(a) || /^-[a-z]*e/.test(a)) return false;
+    if (/^--(get|list)/.test(a) || /^-[a-z]*l/.test(a)) { reads = true; continue; }
+    if (/^--(file|blob|type|default|value|url)$/.test(a) || /^-[a-z]*f$/.test(a)) { k++; continue; }
+    if (!a.startsWith('-')) names.push(a);
+  }
+  if (/^(set|unset|rename-section|remove-section|edit)$/.test(names[0] || '')) return false;
+  return reads || names[0] === 'get' || names[0] === 'list' || names.length <= 1;
+}
 
 /** A download and something that runs code, anywhere in the same command line. */
 const FROM_INTERNET = ['run code from the internet', 'Running code from the internet'];
 
 /**
  * What one simple command does, most important first: each command gets the first entry it matches.
- * Each entry: [does, doing, test, routine]. Routine entries only ever describe a whole command line when
- * every other part of it is routine too, or does nothing (see commandAction).
+ * Each entry: [does, doing, test, routine, words]. Routine entries only ever describe a whole command line when
+ * every other part of it is routine too, or does nothing (see commandAction). `words` (optional) puts what the
+ * command names into the sentence ("push main to origin"); without it, or when it has nothing, does and doing stand.
  */
 const ACTIONS = [
   ['run a command with administrator rights', 'Running a command with administrator rights', c => ['sudo', 'doas', 'su', 'pkexec'].includes(c.prog)],
   ['send data to the internet', 'Sending data to the internet', isUpload],
   ['connect to another computer', 'Connecting to another computer', c => ['ssh', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'socat', 'telnet', 'ftp', 'mosh'].includes(c.prog)
     || (c.prog === 'rsync' && c.args.some(a => /^[^-/][^/]*:/.test(a)))],
+  ['use your saved sign-in', 'Using your saved sign-in', c => c.prog === 'git' && /^credential(-|$)/.test(c.sub)],
   ['delete files', 'Deleting files', c => ['rm', 'rmdir', 'unlink', 'shred', 'srm', 'trash'].includes(c.prog)
     || (c.prog === 'git' && /^(clean|rm)$/.test(c.sub)) || (c.prog === 'find' && c.args.includes('-delete'))],
-  ['push changes', 'Pushing changes', c => c.prog === 'git' && c.sub === 'push'],
+  ['push changes', 'Pushing changes', c => c.prog === 'git' && c.sub === 'push', false, pushWords],
   ['publish a package', 'Publishing a package', c => ([...PACKAGERS, 'cargo'].includes(c.prog) && c.sub === 'publish')
     || (c.prog === 'twine' && c.sub === 'upload') || (c.prog === 'gem' && c.sub === 'push')],
   ['install packages', 'Installing packages', isInstall],
   ['run a package from the internet', 'Running a package from the internet', c => { const t = packageTool(c); return !!t && !(isTest(t) || isLint(t) || isBuild(t)); }],
-  ['download from the internet', 'Downloading from the internet', c => DOWNLOADERS.has(c.prog) || (c.prog === 'git' && /^(clone|fetch|pull)$/.test(c.sub))],
+  ['bring in changes', 'Bringing in changes', c => c.prog === 'git' && c.sub === 'pull', false, pullWords],
+  ['download a repository', 'Downloading a repository', c => c.prog === 'git' && c.sub === 'clone', false, cloneWords],
+  ['download new commits', 'Downloading new commits', c => c.prog === 'git' && c.sub === 'fetch', false, fetchWords],
+  ['download from the internet', 'Downloading from the internet', c => DOWNLOADERS.has(c.prog)],
   ['save its changes in git', 'Saving its changes in git', c => c.prog === 'git' && c.sub === 'commit'],
   ['run a git command', 'Running a git command', c => c.prog === 'git' && c.gitOpts], // -C, -c, --git-dir...
-  ['change git settings', 'Changing git settings', c => c.prog === 'git' && c.sub === 'config'],
-  ['change the repository', 'Changing the repository', c => c.prog === 'git' && !!c.sub && !GIT_LOOK.has(c.sub) && (c.sub !== 'branch' || branchChange(c))],
+  ['change git settings', 'Changing git settings', c => c.prog === 'git' && c.sub === 'config' && !configReads(c.subArgs)],
+  ['write files from the repository', 'Writing files from the repository', c => c.prog === 'git'
+    && (c.sub === 'archive' || c.sub === 'format-patch' || (c.sub === 'bundle' && c.subArgs[0] === 'create'))],
+  ['change the repository', 'Changing the repository', c => c.prog === 'git' && !!c.sub && c.sub !== 'config' && !gitLooks(c)],
   ['run the tests', 'Running the tests', c => isTest(c) || (!!packageTool(c) && isTest(packageTool(c))), true],
   ['check the code style', 'Checking the code style', c => isLint(c) || (!!packageTool(c) && isLint(packageTool(c))), true],
   ['build the project', 'Building the project', c => isBuild(c) || (!!packageTool(c) && isBuild(packageTool(c))), true],
@@ -259,7 +442,8 @@ const ACTIONS = [
   ['create a file', 'Creating a file', c => c.prog === 'touch'],
   ['create a link', 'Creating a link', c => c.prog === 'ln'],
   ['open something on this computer', 'Opening something on this computer', c => c.prog === 'open' || c.prog === 'xdg-open'],
-  ['check what changed', 'Checking what changed', c => c.prog === 'git' && (GIT_LOOK.has(c.sub) || (c.sub === 'branch' && !branchChange(c))), true],
+  ["check git's settings", "Checking git's settings", c => c.prog === 'git' && c.sub === 'config', true], // one that only reads
+  ['check what changed', 'Checking what changed', c => c.prog === 'git' && gitLooks(c), true],
   ['compare files', 'Comparing files', c => ['diff', 'cmp', 'comm'].includes(c.prog), true],
   ['look at the files', 'Looking at the files', c => ['ls', 'find', 'tree', 'fd', 'du', 'stat', 'file'].includes(c.prog) || (c.prog === 'rg' && c.args.includes('--files')), true],
   ['search the code', 'Searching the code', c => ['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack'].includes(c.prog), true],
@@ -293,7 +477,11 @@ export function commandAction(command, vouch) {
   let main = -1; // the most important entry that is not routine
   let routine = -1; // the most important routine entry
   let unknown = false; // a part these words cannot name
-  const note = k => { if (ACTIONS[k][3]) { if (routine < 0 || k < routine) routine = k; } else if (main < 0 || k < main) main = k; };
+  const named = new Map(); // entry -> the first part it describes, for its words
+  const note = (k, c) => {
+    if (c && !named.has(k)) named.set(k, c);
+    if (ACTIONS[k][3]) { if (routine < 0 || k < routine) routine = k; } else if (main < 0 || k < main) main = k;
+  };
   for (const c of cmds) {
     if (c.empty) {
       if (vouch) { unknown = true; if (c.writes) note(WRITES); }
@@ -302,7 +490,7 @@ export function commandAction(command, vouch) {
     const k = ACTIONS.findIndex(([, , test]) => test(c));
     if (k >= 0) {
       if (ACTIONS[k][3] && vouch && !vouch(c)) unknown = true;
-      else note(k);
+      else note(k, c);
     } else if (c.inline) {
       if (vouch && !vouch(c)) unknown = true;
     } else if (!NOOPS.has(c.prog)) unknown = true;
@@ -311,7 +499,11 @@ export function commandAction(command, vouch) {
   // "npm test; rm -rf ~" deletes files, and "npm test && ./deploy.sh" runs a script. A routine word such as
   // "run the tests" speaks for the line only when nothing else in it needs naming.
   const k = main >= 0 ? main : unknown ? -1 : routine;
-  return k >= 0 ? { does: ACTIONS[k][0], doing: ACTIONS[k][1], routine: !!ACTIONS[k][3] } : null;
+  if (k < 0) return null;
+  const [does, doing, , everyday, words] = ACTIONS[k];
+  let own = null; // the words of what this command names, if its entry has them
+  if (words && named.has(k)) { try { own = words(named.get(k)); } catch { own = null; } }
+  return { does: own?.does ?? does, doing: own?.doing ?? doing, routine: !!everyday };
 }
 
 /**
@@ -474,6 +666,7 @@ const PAST = [
   [/^Starting\b/, 'Started'], [/^Waiting\b/, 'Waited'], [/^Deleting\b/, 'Deleted'], [/^Downloading\b/, 'Downloaded'],
   [/^Connecting\b/, 'Connected'], [/^Publishing\b/, 'Published'], [/^Changing\b/, 'Changed'], [/^Moving\b/, 'Moved'],
   [/^Copying\b/, 'Copied'], [/^Creating\b/, 'Created'], [/^Opening\b/, 'Opened'], [/^Comparing\b/, 'Compared'],
+  [/^Bringing in\b/, 'Brought in'], [/^Replacing\b/, 'Replaced'],
 ];
 
 /** "Running the tests" -> "Ran the tests", for steps that are finished. Other text is left alone. */
