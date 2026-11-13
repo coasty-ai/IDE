@@ -15,6 +15,7 @@ import { scrubEnv, withNodeOnPath, onPath, shellQuote } from '../adapters/claude
 import { buildEnv as codexEnv, codexBin } from '../adapters/codex/runner.mjs';
 import { KEY_PRESETS } from '../shared/keypresets.mjs';
 import { maskSecrets, readPrivateFile } from './keys.mjs';
+import { SignIns, SIGNIN_CHECK_MS, SIGNIN_TIMEOUT_MS } from './signin.mjs';
 import * as workspaceModule from './workspace.mjs';
 import { openTerminal as openTerminalWindow } from './terminal.mjs';
 
@@ -31,8 +32,9 @@ const FROM_WORDS = { flag: 'the path given with --claude', path: 'your PATH', vs
 /**
  * The agents Workbench drives, in the order "the first ready agent" goes through. Each has its vendor's installer (a
  * fixed shell line, run in Terminal as `/bin/sh -c <line>`: the one shell line besides workbench.json's checks), the
- * arguments of its own sign-in, the key preset "Use an API key" saves, and how to probe it. Agents spoken to over ACP
- * join this list later.
+ * arguments of its own sign-in in Terminal (`signin`) and in the browser (`browser`, and `console` for Claude Code's
+ * Anthropic Console account: src/core/signin.mjs), with the site the person signs in to, the key preset "Use an API key"
+ * saves, and how to probe it. Agents spoken to over ACP join this list later.
  */
 const AGENTS = [
   {
@@ -40,6 +42,8 @@ const AGENTS = [
     name: 'Claude Code',
     installer: 'curl -fsSL https://claude.ai/install.sh | bash',
     signin: ['auth', 'login'],
+    browser: { args: ['auth', 'login', '--claudeai'], site: 'Claude' },
+    console: { args: ['auth', 'login', '--console'], site: 'your Anthropic Console account' },
     key: {
       preset: 'anthropic', label: 'Anthropic', names: ['ANTHROPIC_API_KEY'],
       saved: 'Claude Code will use this API key from now on, and each request is billed to it.',
@@ -51,6 +55,8 @@ const AGENTS = [
     name: 'Codex',
     installer: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh',
     signin: ['login'],
+    browser: { args: ['login'], site: 'ChatGPT' },
+    console: null,
     key: {
       preset: 'openai', label: 'OpenAI', names: ['OPENAI_API_KEY', 'CODEX_API_KEY'],
       saved: 'Codex will use this API key from now on, and each request is billed to it.',
@@ -216,6 +222,90 @@ function actionsFor(a, isDefault) {
   return list;
 }
 
+// ---------------------------------------------------------------- the sign-in in the browser, and git itself
+
+/** "The sign-in in the browser did not finish. Sign in in Terminal instead." (outside macOS: "in a terminal"). */
+function signInFallback(platform) {
+  return `The sign-in in the browser did not finish. Sign in in ${platform === 'darwin' ? 'Terminal' : 'a terminal'} instead.`;
+}
+
+/** "Finish signing in to Claude in your browser." (… to your Anthropic Console account …, … to ChatGPT …) */
+function waitingSentence(d, mode) {
+  const how = mode === 'console' && d.console ? d.console : d.browser;
+  return `Finish signing in to ${how.site} in your browser.`;
+}
+
+/** How long each of git's checks may take (`xcode-select -p`, `git --version`). */
+const GIT_CHECK_MS = 5000;
+/** How long `xcode-select --install` may take to open Apple's installer. */
+const GIT_INSTALL_MS = 15_000;
+/** How long status() trusts a check that found git, before it looks again (one that did not find it, never). */
+const GIT_KNOWN_MS = 60_000;
+const XCODE_SELECT = '/usr/bin/xcode-select';
+/** Apple's stand-in for git: until Apple's developer tools are installed, running it opens Apple's installer. */
+const APPLE_GIT = '/usr/bin/git';
+const GIT_MISSING_MAC = 'Git is not installed yet. Apple’s developer tools include it.';
+const GIT_MISSING_ELSEWHERE = 'Git is not installed yet. Install git with your package manager.';
+
+function isAppleGit(p) {
+  if (p === APPLE_GIT) return true;
+  try {
+    return fs.realpathSync.native(p) === APPLE_GIT;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether git can run here, and what to say when it cannot. On a Mac, /usr/bin/git is Apple's stand-in until Apple's
+ * developer tools are installed, and running it then opens Apple's installer: so when that is the git on the PATH (or
+ * there is none), `xcode-select -p` is asked first, and git runs only when it says the tools are there. Another git
+ * first on the PATH (Homebrew's) is asked directly, and so is git elsewhere: `git --version`, through workspace.mjs's
+ * git(). Each has 5 seconds. Agents & keys and the CLI's --git-status use this.
+ * @param {object} [o]
+ * @param {string} [o.platform]
+ * @param {object} [o.env]        whose PATH is looked in
+ * @param {Function} [o.run]      runs xcode-select: (program, args, { env, cwd, timeoutMs }) => Promise<{ code, stdout,
+ *   stderr, timedOut, error }>
+ * @param {Function|null} [o.runGit] workspace.mjs's git(); null for a stand-in workspace without one: git then counts as
+ *   installed, and nothing runs
+ * @param {string} [o.cwd]        where the programs run
+ * @param {Function} [o.log]      (level, line)
+ * @returns {Promise<{ installed: boolean, canInstall: boolean, version: string|null, sentence: string }>} canInstall:
+ *   Workbench can start git's installer (Apple's, on a Mac)
+ */
+export async function gitPresence({ platform = process.platform, env = process.env, run = runQuick, runGit = workspaceModule.git, cwd = os.tmpdir(), log = null } = {}) {
+  const say = typeof log === 'function' ? log : () => {};
+  const mac = platform === 'darwin';
+  const missing = { installed: false, canInstall: mac, version: null, sentence: mac ? GIT_MISSING_MAC : GIT_MISSING_ELSEWHERE };
+  if (typeof runGit !== 'function') return { installed: true, canInstall: false, version: null, sentence: 'Git is installed.' };
+  if (mac) {
+    const first = onPath('git', env && env.PATH);
+    if (!first || isAppleGit(first)) {
+      let r;
+      try {
+        r = await run(XCODE_SELECT, ['-p'], { env, cwd, timeoutMs: GIT_CHECK_MS });
+      } catch (error) {
+        r = { code: null, error };
+      }
+      const noXcodeSelect = !!(r && r.error && r.error.code === 'ENOENT'); // not a Mac after all: git is asked directly
+      if (!noXcodeSelect && (!r || r.timedOut || r.error || r.code !== 0)) {
+        say('info', 'git cannot run yet: Apple’s developer tools are not installed (xcode-select -p did not find them).');
+        return missing;
+      }
+    }
+  }
+  let r;
+  try {
+    r = await runGit(['--version'], { cwd, timeout: GIT_CHECK_MS });
+  } catch (e) {
+    say('info', `git could not be run (${(e && (e.code || e.signal)) || 'it failed'}).`);
+    return missing;
+  }
+  const m = /git version (\d{1,4}\.\d{1,4}(?:\.\d{1,6})?)/.exec(String((r && r.stdout) || ''));
+  return { installed: true, canInstall: false, version: m ? m[1] : null, sentence: m ? `Git ${m[1]} is installed.` : 'Git is installed.' };
+}
+
 /**
  * "AWS for all repositories, given to all agents: AWS_ACCESS_KEY_ID •••• 7QXA, AWS_SECRET_ACCESS_KEY •••• 9f2b". A key for
  * one repository reads "this repository" when its scope says `here` (status() compares real paths).
@@ -291,11 +381,16 @@ export class Connect extends EventEmitter {
    * @param {boolean} [o.probe]      probe the agents at once (true): defaultAgent() cannot tell until a probe ends.
    *   Pass false where no agent will be started (the CLI's --connect-github and --github-repos).
    *   Also accepted, mainly for tests: presets (the KEY_PRESETS list), probeTimeoutMs (10 000).
+   * @param {Function} [o.runProgram] runs xcode-select (git's checks and Install): (program, args, { env, cwd, timeoutMs })
+   *   => Promise<{ code, stdout, stderr, timedOut, error }>; tests give a stand-in, never the real `xcode-select --install`
+   * @param {number} [o.signInTimeoutMs] how long a sign-in in the browser may wait (10 minutes); for tests
+   * @param {number} [o.signInCheckMs]   how often the agent is asked whether it is signed in meanwhile (2 seconds)
    */
   constructor({
     home = os.homedir(), platform = process.platform, env = process.env, keys, workspace = workspaceModule, adapters = {},
     flags = {}, settingsPath, openTerminal = openTerminalWindow, fetchJson = fetchJsonWithNode, log = null, repoRoot = null,
     probe = true, presets = KEY_PRESETS, probeTimeoutMs = PROBE_TIMEOUT_MS,
+    runProgram = runQuick, signInTimeoutMs = SIGNIN_TIMEOUT_MS, signInCheckMs = SIGNIN_CHECK_MS,
   } = {}) {
     super();
     if (!keys || typeof keys.list !== 'function' || typeof keys.add !== 'function') throw new Error('The connect service needs the key store.');
@@ -313,6 +408,15 @@ export class Connect extends EventEmitter {
     this.probeTimeoutMs = probeTimeoutMs;
     this._log = makeLog(log);
     this._agents = null; // id -> what the last probe found
+    // Signing in in the browser (src/core/signin.mjs): its state lives there, not in what a probe found, which each
+    // probe replaces. Starts under way (one at a time per agent), and the agents whose browser sign-in that did not
+    // finish the person took to Terminal since. Git's own presence: the last check that found it, trusted a minute.
+    this._runProgram = typeof runProgram === 'function' ? runProgram : runQuick;
+    this._signIns = new SignIns({ timeoutMs: signInTimeoutMs, checkEveryMs: signInCheckMs, log: this._log });
+    this._signIns.on('change', () => this.emit('changed'));
+    this._signInStarts = new Map();
+    this._signInTerminal = new Set();
+    this._gitKnown = null;
     this._repoRoot = null;
     this._noteRepo(repoRoot); // before the first probe, so it counts the keys kept for this repository
     this._current = null; // the probe under way
@@ -358,10 +462,10 @@ export class Connect extends EventEmitter {
     const agents = AGENTS.map((d) => {
       const a = this._agents[d.id];
       const isDefault = def === d.id;
-      return {
+      return this._withSignIn(d, a, {
         id: d.id, name: d.name, found: a.found, version: a.version, from: a.runs || a.found ? FROM_WORDS[a.from] || a.fromWords || null : null,
         signedIn: a.signedIn, how: a.how, ready: a.ready, isDefault, sentence: a.sentence, actions: actionsFor(a, isDefault),
-      };
+      });
     });
     const github = this._github(keys);
     const root = repoRoot || this._repoRoot;
@@ -466,7 +570,7 @@ export class Connect extends EventEmitter {
     if (!a.found && (a.from === 'flag' || a.from === 'env') && typeof safe.reason === 'string') a.missing = oneLine(safe.reason.replace(/\s*It said:[\s\S]*$/, ''), 300);
     if (a.from === 'env') a.fromWords = 'WORKBENCH_CLAUDE_BIN';
     if (!a.runs || !p) return this._finish(a);
-    const env = { ...withNodeOnPath(scrubEnv(this.env)), ...this._keyEnv(repoRoot, 'claude') };
+    const env = this._agentEnv('claude', repoRoot);
     const r = await runQuick(p, ['auth', 'status'], { env, cwd: this._probeFolder(), timeoutMs: this.probeTimeoutMs });
     if (r.timedOut) this._log('warn', 'Claude Code took too long to say whether it is signed in.');
     else if (r.error) this._log('warn', `Claude Code could not be asked whether it is signed in (${r.error.code || 'error'}).`);
@@ -487,7 +591,7 @@ export class Connect extends EventEmitter {
       ? await within(mod.available({ env: this.env, timeoutMs: 5000 }), AVAILABLE_TIMEOUT_MS, { ok: false, reason: 'Codex did not answer in time.' })
       : { ok: false, reason: 'Codex support could not be loaded.' };
     const safe = info && typeof info === 'object' ? info : { ok: !!info };
-    const env = { ...codexEnv(this.env), ...this._keyEnv(repoRoot, 'codex') };
+    const env = this._agentEnv('codex', repoRoot);
     const bin = codexBin(this.env);
     const given = typeof this.env.WORKBENCH_CODEX_BIN === 'string' && this.env.WORKBENCH_CODEX_BIN !== '';
     const p = bin.includes('/') ? (isFile(path.resolve(bin)) ? path.resolve(bin) : null) : onPath(bin, env.PATH);
@@ -525,6 +629,15 @@ export class Connect extends EventEmitter {
     return os.tmpdir();
   }
 
+  /**
+   * The environment an agent of this kind gets, for its sign-in checks and its login program: Claude Code's scrubbed
+   * one with node on the PATH, or Codex's own (buildEnv), plus the keys the key store gives that agent in `repoRoot`.
+   */
+  _agentEnv(id, repoRoot = this._repoRoot) {
+    if (id === 'codex') return { ...codexEnv(this.env), ...this._keyEnv(repoRoot, 'codex') };
+    return { ...withNodeOnPath(scrubEnv(this.env)), ...this._keyEnv(repoRoot, 'claude') };
+  }
+
   _finish(a) {
     const out = { signedIn: 'unknown', how: null, version: null, path: null, from: null, ...a };
     out.ready = !!out.runs && out.signedIn !== 'no';
@@ -545,10 +658,16 @@ export class Connect extends EventEmitter {
    * there. On macOS → `{ ok, opened: true, sentence }`; elsewhere, or when Terminal could not be opened →
    * `{ ok, opened: false, command, sentence }`, the command for the person to run. Refuses an unknown agent or action,
    * and signing in to an agent that is not installed.
+   *
+   * Signing in in Terminal is also the way on when a sign-in in the browser did not finish ("Sign in in Terminal"): a
+   * browser sign-in still waiting for this agent stops first (Codex's login listens on one fixed port). With
+   * `console: true` Claude Code signs in with an Anthropic Console account (`claude auth login --console`); left out, as
+   * the last browser sign-in that did not finish did.
    * @param {string} id
    * @param {'install'|'signin'} action
+   * @param {{ console?: boolean }} [o]
    */
-  async agentAction(id, action) {
+  async agentAction(id, action, { console: useConsole } = {}) {
     const d = this._agent(id);
     if (action !== 'install' && action !== 'signin') throw refusal('action', 'Workbench does not know that action.', 400);
     let program;
@@ -563,11 +682,17 @@ export class Connect extends EventEmitter {
     } else {
       const a = (await this._known())[d.id];
       if (!a || !a.runs || !a.path) throw refusal('not-installed', `${d.name} is not installed yet, so there is nothing to sign in to.`, 409);
-      [program, args] = commandFor(a.path, d.signin);
+      await this._signInStarts.get(d.id)?.catch(() => {});
+      this._signIns.cancel(d.id);
+      const last = this._signIns.state(d.id);
+      const inConsole = !!d.console && (useConsole === true || (useConsole === undefined && !!last && last.mode === 'console' && last.phase !== 'done'));
+      const words = inConsole ? d.console.args : d.signin;
+      [program, args] = commandFor(a.path, words);
       title = `Signing in to ${d.name}`;
       // Terminal's shell has the person's own PATH, so it is given the program's full path; the command shown uses the
       // bare name when that is how Workbench found it too.
-      command = commandLine(a.from === 'path' ? [path.basename(a.path), ...d.signin] : [program, ...args]);
+      command = commandLine(a.from === 'path' ? [path.basename(a.path), ...words] : [program, ...args]);
+      this._signInTerminal.add(d.id);
     }
     if (this.platform === 'darwin') {
       let res = null;
@@ -623,16 +748,185 @@ export class Connect extends EventEmitter {
     return { ok: true, sentence: ready ? `New work will go to ${d.name}.` : `New work will go to ${d.name} once it is ready.` };
   }
 
+  // ---------------------------------------------------------------- signing in in the browser
+
+  /**
+   * Sign in to an agent in the browser, with no Terminal and no key: its vendor's own login program runs in the
+   * background (src/core/signin.mjs): Claude Code's `claude auth login --claudeai`, or with `console: true`
+   * `claude auth login --console` (an Anthropic Console account, billed per request); Codex's `codex login`. It runs
+   * as the sign-in check does: the program the probe found, the environment an agent of that kind gets, from the home
+   * folder. It opens the person's browser, and keeps what it receives itself.
+   *
+   * Answers at once: `{ ok: true, waiting: true, since, sentence }` ("Finish signing in to Claude in your browser.").
+   * Only one runs per agent: a second press answers the one under way. A program that could not start answers
+   * `{ ok: false, waiting: false, why: 'start', sentence }`. Refused: an unknown agent (404), `console` for an agent
+   * without an Anthropic Console sign-in (400), an agent that is not installed (409).
+   * @param {string} id
+   * @param {{ console?: boolean }} [o]
+   */
+  async agentSignIn(id, { console: useConsole = false } = {}) {
+    const d = this._agent(id);
+    if (useConsole === true && !d.console) throw refusal('action', `${d.name} has no Anthropic Console sign-in.`, 400);
+    const waiting = this._signInWaiting(d);
+    if (waiting) return waiting;
+    // Registered before the first await, so two quick presses start one program.
+    let starting = this._signInStarts.get(d.id);
+    if (!starting) {
+      starting = this._startSignIn(d, useConsole === true).finally(() => this._signInStarts.delete(d.id));
+      this._signInStarts.set(d.id, starting);
+    }
+    return starting;
+  }
+
+  async _startSignIn(d, inConsole) {
+    const a = (await this._known())[d.id];
+    if (!a || !a.runs || !a.path) throw refusal('not-installed', `${d.name} is not installed yet, so there is nothing to sign in to.`, 409);
+    const how = inConsole ? d.console : d.browser;
+    const [file, args] = commandFor(a.path, how.args);
+    this._signInTerminal.delete(d.id);
+    this._log('info', `${d.name} is signing in in the browser: ${commandLine([path.basename(a.path), ...how.args])}`);
+    const { state } = this._signIns.start(d.id, {
+      file, args, env: this._agentEnv(d.id), cwd: this._probeFolder(), mode: inConsole ? 'console' : 'browser', label: d.name,
+      signedInBefore: a.signedIn === 'yes',
+      check: () => this._signedInNow(d, a.path),
+      whenSignedIn: () => this.recheck(),
+    });
+    if (state.phase === 'waiting') return this._signInWaiting(d);
+    return { ok: false, waiting: false, why: state.why, sentence: signInFallback(this.platform) };
+  }
+
+  /** The answer for a sign-in that waits, or null. */
+  _signInWaiting(d) {
+    const s = this._signIns.state(d.id);
+    if (!s || s.phase !== 'waiting') return null;
+    return { ok: true, waiting: true, since: s.since, sentence: waitingSentence(d, s.mode) };
+  }
+
+  /**
+   * Whether the agent says it is signed in now: `claude auth status` (its JSON, as the probe reads it) or
+   * `codex login status` (exit 0), with the agent's environment, from the home folder. 'unknown' when it cannot tell.
+   */
+  async _signedInNow(d, program) {
+    const r = await runQuick(program, d.id === 'claude' ? ['auth', 'status'] : ['login', 'status'], {
+      env: this._agentEnv(d.id), cwd: this._probeFolder(), timeoutMs: this.probeTimeoutMs,
+    });
+    if (r.timedOut || r.error) return 'unknown';
+    if (d.id === 'claude') return claudeSignIn(jsonIn(r.stdout)).signedIn;
+    return r.code === 0 ? 'yes' : r.code === 1 ? 'no' : 'unknown';
+  }
+
+  /**
+   * The sign-in in the browser for this agent: null when none ran since Workbench started, else `{ phase, waiting,
+   * console, since, endedAt, why, sentence }`. phase is 'waiting', 'done', 'failed' or 'cancelled' (signin.mjs says
+   * why one failed: 'exit', 'input', 'timeout' or 'start').
+   */
+  agentSignInState(id) {
+    const d = this._agent(id);
+    const s = this._signIns.state(d.id);
+    if (!s) return null;
+    const sentence = {
+      waiting: waitingSentence(d, s.mode),
+      done: `${d.name} is signed in.`,
+      failed: signInFallback(this.platform),
+      cancelled: `Workbench stopped the sign-in to ${d.name}.`,
+    }[s.phase];
+    return { phase: s.phase, waiting: s.phase === 'waiting', console: s.mode === 'console', since: s.since, endedAt: s.endedAt, why: s.why, sentence };
+  }
+
+  /**
+   * Cancel: stop the sign-in in the browser that waits for this agent (its program is stopped). Answers `{ ok: true,
+   * stopped, sentence }`, also when none was waiting.
+   */
+  async cancelAgentSignIn(id) {
+    const d = this._agent(id);
+    await this._signInStarts.get(d.id)?.catch(() => {}); // one being started is stopped once it has started
+    const stopped = this._signIns.cancel(d.id);
+    return {
+      ok: true, stopped,
+      sentence: stopped ? `Workbench stopped the sign-in to ${d.name}.` : `No sign-in to ${d.name} is under way.`,
+    };
+  }
+
+  /**
+   * An agent's row with its sign-in in the browser: `signingIn` while one waits (and no Sign in button then); after
+   * one that did not finish, while the agent is not signed in, "Sign in in Terminal" (`signin-terminal`) and, for a
+   * failure the person has not taken to Terminal yet, the fallback sentence. Claude Code's row offers its Anthropic
+   * Console sign-in (`signin-console`) wherever it offers Sign in.
+   */
+  _withSignIn(d, a, row) {
+    const s = this._signIns.state(d.id);
+    const waiting = !!s && s.phase === 'waiting';
+    const unfinished = !waiting && !!s && (s.phase === 'failed' || s.phase === 'cancelled') && a.signedIn !== 'yes';
+    let { actions, sentence } = row;
+    if (waiting) actions = actions.filter((x) => x !== 'signin');
+    else {
+      const more = [...(d.console ? ['signin-console'] : []), ...(unfinished ? ['signin-terminal'] : [])];
+      actions = actions.flatMap((x) => (x === 'signin' ? ['signin', ...more] : [x]));
+      if (unfinished && s.phase === 'failed' && actions.includes('signin') && !this._signInTerminal.has(d.id)) sentence = signInFallback(this.platform);
+    }
+    return { ...row, sentence, actions, signingIn: waiting ? { since: s.since, browser: true, sentence: waitingSentence(d, s.mode) } : null };
+  }
+
   // ---------------------------------------------------------------- git and GitHub
 
-  /** Save the person's name and email in git's global config. */
+  /** Save the person's name and email in git's global config. Refused (409) while git is not installed. */
   async setGitIdentity({ name, email } = {}) {
+    const tools = await this._gitTools();
+    if (!tools.installed) throw refusal('git-missing', tools.sentence, 409);
     const saved = await this.workspace.setGitIdentity({ name, email });
     this.emit('changed');
     return { ok: true, sentence: `Git will make your merges as ${saved.name}, ${saved.email}.` };
   }
 
+  /**
+   * Git as the panel shows it: `{ name, email, installed, canInstall, sentence }`. While git cannot run (gitPresence),
+   * its sentence says so ("Git is not installed yet. Apple’s developer tools include it.", or outside macOS "… Install
+   * git with your package manager."), `canInstall` is true on a Mac (Install: installGitTools), and git is not asked
+   * for a name and email: on a Mac that would open Apple's installer each time the panel looks.
+   */
   async _gitStatus(repoRoot) {
+    const tools = await this._gitTools();
+    if (!tools.installed) return { name: '', email: '', installed: false, canInstall: tools.canInstall, sentence: tools.sentence };
+    return { ...(await this._gitIdentityStatus(repoRoot)), installed: true, canInstall: false };
+  }
+
+  /** Whether git can run here (gitPresence), with this Connect's platform, environment and programs. */
+  async _gitTools({ fresh = false } = {}) {
+    const known = this._gitKnown;
+    if (!fresh && known && known.installed && Date.now() - known.at < GIT_KNOWN_MS) return known.found;
+    const found = await gitPresence({
+      platform: this.platform, env: this.env, run: this._runProgram, cwd: this._probeFolder(), log: this._log,
+      runGit: typeof this.workspace?.git === 'function' ? this.workspace.git : null,
+    });
+    this._gitKnown = { installed: found.installed, at: Date.now(), found };
+    return found;
+  }
+
+  /**
+   * Install git: on a Mac, Apple's developer tools, which include it. `xcode-select --install` (an argument array)
+   * opens Apple's own installer, which the person answers; the panel checks again when it gets focus. Answers `{ ok,
+   * sentence }`: "Git is installed already." when it is (nothing runs); elsewhere `{ ok: false, why: 'platform',
+   * sentence: 'Git is not installed yet. Install git with your package manager.' }`; and when Apple's installer could
+   * not be opened, `{ ok: false, why: 'install', sentence }` (xcode-select's own words go to the log).
+   */
+  async installGitTools() {
+    const before = await this._gitTools({ fresh: true });
+    if (before.installed) return { ok: true, sentence: 'Git is installed already.' };
+    if (this.platform !== 'darwin') return { ok: false, why: 'platform', sentence: GIT_MISSING_ELSEWHERE };
+    const r = await this._runProgram(XCODE_SELECT, ['--install'], { env: this.env, cwd: this._probeFolder(), timeoutMs: GIT_INSTALL_MS });
+    if (r && !r.error && !r.timedOut && r.code === 0) {
+      this._log('info', 'Apple’s installer for its developer tools (and git) was opened.');
+      this.emit('changed');
+      return { ok: true, sentence: 'Apple’s installer is open. Follow its steps; when it has finished, git is ready.' };
+    }
+    const said = oneLine(`${(r && r.stderr) || ''} ${(r && r.stdout) || ''}`, 300);
+    this._log('warn', `Apple’s installer could not be opened (${r && r.timedOut ? 'it took too long' : r && r.error ? r.error.code || 'it failed' : `exit ${r && r.code}`})${said ? `: ${said}` : ''}`);
+    const after = await this._gitTools({ fresh: true });
+    if (after.installed) return { ok: true, sentence: 'Git is installed already.' };
+    return { ok: false, why: 'install', sentence: 'Workbench could not open Apple’s installer. Run xcode-select --install in Terminal, then check again.' };
+  }
+
+  async _gitIdentityStatus(repoRoot) {
     let who;
     try {
       who = await this.workspace.gitConfigIdentity();

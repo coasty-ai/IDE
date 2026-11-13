@@ -8,6 +8,22 @@
 //   and a short list of tools.
 // - `auth status` prints FAKE_CLAUDE_AUTH (JSON, as `claude auth status` does) and exits 0 when its `loggedIn` is true,
 //   else 1. Unset, it is signed in with a Claude subscription. Text that is not JSON is printed as it is (exit 1).
+//   When FAKE_CLAUDE_AUTH_FILE names a file that exists (the sign-in `auth login` keeps), it prints that file instead.
+// - `auth login [--claudeai | --console]` behaves as Claude Code 2.1.322's does with no terminal (read from its own
+//   text, never run): unknown options, or --console with --claudeai, exit 1. It prints "Opening browser to sign in…",
+//   "If the browser didn't open, visit: <address>" (a terminal link) and "Paste code here if prompted > ", then, after
+//   FAKE_CLAUDE_LOGIN_DELAY_MS (default 0), as FAKE_CLAUDE_LOGIN says:
+//     ok (default)    keeps the sign-in in FAKE_CLAUDE_AUTH_FILE (a Claude subscription, or with --console a Console
+//                     account's key), prints "Login successful." and exits 0
+//     fail            prints "Login failed: …" on stderr and exits 1
+//     ok-unsaved      exits 0 with "Login successful." but keeps nothing
+//     signed-in-stay  keeps the sign-in, then goes on running, as if it never ended by itself
+//     wait            waits, as for a browser nobody answers; stubborn: the same, ignoring SIGTERM
+//     paste           prints instead what Claude Code prints when its localhost callback cannot be reached ("… paste
+//                     the code shown.", "Paste code here > ") and waits for a code
+//   A waiting one ends by itself after 20 seconds (exit 9). FAKE_CLAUDE_LOGIN_LOG=<file> gets one JSON line per call:
+//   { argv, pid, cwd, stdin ('null', 'pipe', 'tty', …), terminal (it could open /dev/tty), env: which of
+//   CLAUDECODE, WORKBENCH_CLAUDE_BIN, WORKBENCH_AGENT_ID and ANTHROPIC_API_KEY it has }.
 // - Otherwise it checks the launch flags and environment the workbench must pass, and exits 3 with a reason
 //   on stderr when one is wrong. Then it reads stream-json user messages on stdin, one per line:
 //     * the first message replays FAKE_CLAUDE_FIXTURE (a file in test/fixtures/) with its session id,
@@ -39,10 +55,11 @@
 //       workbench describes the command itself), and their recorded output with none;
 //     * FAKE_CLAUDE_DELAY_MS=<ms> waits that long after each line;
 //     * later messages wait until the replay is over.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, fstatSync, openSync, closeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
+import tty from 'node:tty';
 
 const argv = process.argv.slice(2);
 const env = process.env;
@@ -55,13 +72,92 @@ if (argv.length === 0) {
   if (env.FAKE_CLAUDE_VERSION === 'hang') setInterval(() => {}, 1000);
   else { process.stdout.write(`${VERSION} (Claude Code)\n`); process.exit(0); }
 } else if (argv[0] === 'auth' && argv[1] === 'status') {
-  const text = env.FAKE_CLAUDE_AUTH || '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}';
+  const kept = env.FAKE_CLAUDE_AUTH_FILE && existsSync(env.FAKE_CLAUDE_AUTH_FILE) ? readFileSync(env.FAKE_CLAUDE_AUTH_FILE, 'utf8').trim() : null;
+  const text = kept || env.FAKE_CLAUDE_AUTH || '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}';
   let loggedIn = false;
   try { loggedIn = JSON.parse(text).loggedIn === true; } catch { /* not JSON: printed as it is */ }
   process.stdout.write(`${text}\n`);
   process.exitCode = loggedIn ? 0 : 1;
+} else if (argv[0] === 'auth' && argv[1] === 'login') {
+  authLogin();
 } else {
   main();
+}
+
+/** What standard input is: 'null' (/dev/null), 'tty', 'pipe', 'other' or 'closed'. */
+function stdinKind() {
+  try {
+    const st = fstatSync(0);
+    if (tty.isatty(0)) return 'tty';
+    if (st.isCharacterDevice()) return 'null';
+    if (st.isFIFO() || st.isSocket()) return 'pipe';
+    return 'other';
+  } catch {
+    return 'closed';
+  }
+}
+
+/** Whether this process has a terminal of its own to ask in (/dev/tty opens). */
+function hasTerminal() {
+  try {
+    closeSync(openSync('/dev/tty', 'r'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `claude auth login`, as described above. */
+function authLogin() {
+  const flags = argv.slice(2);
+  const unknown = flags.find((f) => !['--claudeai', '--console', '--sso'].includes(f));
+  if (unknown) {
+    process.stderr.write(`error: unknown option '${unknown}'\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (flags.includes('--console') && flags.includes('--claudeai')) {
+    process.stderr.write('Error: --console and --claudeai cannot be used together.\n');
+    process.exitCode = 1;
+    return;
+  }
+  const mode = env.FAKE_CLAUDE_LOGIN || 'ok';
+  if (mode === 'stubborn') process.on('SIGTERM', () => {}); // before the log line, so a test that read it can stop it
+  if (env.FAKE_CLAUDE_LOGIN_LOG) {
+    const seen = Object.fromEntries(['CLAUDECODE', 'WORKBENCH_CLAUDE_BIN', 'WORKBENCH_AGENT_ID', 'ANTHROPIC_API_KEY'].map((k) => [k, k in env]));
+    appendFileSync(env.FAKE_CLAUDE_LOGIN_LOG, `${JSON.stringify({ argv, pid: process.pid, cwd: process.cwd(), stdin: stdinKind(), terminal: hasTerminal(), env: seen })}\n`);
+  }
+  const url = 'https://claude.ai/oauth/authorize?code=true&client_id=fake-client&state=fake-state-not-a-secret';
+  const say = (text) => process.stdout.write(text);
+  const stay = () => {
+    setInterval(() => {}, 1000);
+    setTimeout(() => process.exit(9), 20_000).unref();
+  };
+  if (mode === 'paste') {
+    say("The browser can't return the sign-in to Claude Code automatically. After you sign in, paste the code shown.\n");
+    say(`Sign in at: ${url}\n`);
+    say('Paste code here > ');
+    return stay();
+  }
+  say('Opening browser to sign in…\n');
+  say(`If the browser didn't open, visit: \u001b]8;;${url}\u0007${url}\u001b]8;;\u0007\n`);
+  say('Paste code here if prompted > ');
+  if (mode === 'wait' || mode === 'stubborn') return stay();
+  setTimeout(() => {
+    if (mode === 'fail') {
+      say('\n');
+      process.stderr.write('Login failed: the sign-in was refused.\n', () => process.exit(1));
+      return;
+    }
+    if (mode !== 'ok-unsaved' && env.FAKE_CLAUDE_AUTH_FILE) {
+      writeFileSync(env.FAKE_CLAUDE_AUTH_FILE, flags.includes('--console')
+        ? '{"loggedIn":false,"authMethod":"api_key","apiProvider":"firstParty","apiKeySource":"/login managed key"}\n'
+        : '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\n');
+    }
+    if (mode === 'signed-in-stay') return stay();
+    say('Login successful.\n');
+    process.stdout.write('', () => process.exit(0));
+  }, Number(env.FAKE_CLAUDE_LOGIN_DELAY_MS) || 0);
 }
 
 function main() {

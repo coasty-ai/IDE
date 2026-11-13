@@ -11,7 +11,14 @@
 //                        fail-first: the first `exec` starts its turn, waits FAKE_CODEX_DELAY_MS, then fails as
 //                        `fail` does; `exec resume` replays normally (FAKE_CODEX_MODE applies to every call)
 //   FAKE_CODEX_DELAY_MS  pause between replayed lines (default 0)
-//   FAKE_CODEX_LOGIN     in (default) | out | apikey, for `login status`
+//   FAKE_CODEX_LOGIN     in (default) | out | apikey, for `login status`; FAKE_CODEX_LOGIN_FILE, when that file exists,
+//                        holds the mode instead (the sign-in `login` keeps)
+//   FAKE_CODEX_SIGNIN    `codex login`, with no terminal: it says it started its local login server and the address to
+//                        open, then after FAKE_CODEX_SIGNIN_DELAY_MS (default 0): ok (default: keeps "in" in
+//                        FAKE_CODEX_LOGIN_FILE, "Successfully logged in", exit 0) | fail (exit 1) | ok-unsaved (exit 0,
+//                        keeps nothing) | signed-in-stay (keeps it, goes on running) | wait (waits for a browser
+//                        nobody answers) | input (asks for a code to be typed, and waits). It records the call in
+//                        FAKE_CODEX_LOG, with `terminal`: whether it could open /dev/tty
 //   FAKE_CODEX_VERSION   hang: `--version` never answers
 //   FAKE_CODEX_WRITE     replay: before the turn's last line, write this file (relative, in the working folder)
 //                        with the text "written by the fake codex\n"; on `exec resume` too
@@ -93,6 +100,42 @@ function stayAlive() {
   setTimeout(() => process.exit(0), SELF_DESTRUCT_MS).unref();
 }
 
+/** Whether this process has a terminal of its own to ask in (/dev/tty opens). */
+function hasTerminal() {
+  try {
+    fs.closeSync(fs.openSync('/dev/tty', 'r'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `codex login`, as FAKE_CODEX_SIGNIN says (see the top of this file). A waiting one ends by itself (exit 9). */
+async function login() {
+  record({ terminal: hasTerminal() });
+  const mode = env.FAKE_CODEX_SIGNIN || 'ok';
+  const wait = () => {
+    setInterval(() => {}, 1000);
+    setTimeout(() => process.exit(9), SELF_DESTRUCT_MS).unref();
+  };
+  if (mode === 'input') {
+    await write(process.stdout, 'Enter the code shown in your browser: ');
+    return wait();
+  }
+  await write(process.stderr, 'Starting local login server on http://localhost:1455.\nIf your browser did not open, navigate to this URL to authenticate:\n\n'
+    + 'https://auth.openai.com/oauth/authorize?response_type=code&client_id=fake-client&state=fake-state-not-a-secret\n');
+  if (mode === 'wait') return wait();
+  await sleep(Number(env.FAKE_CODEX_SIGNIN_DELAY_MS) || 0);
+  if (mode === 'fail') {
+    await write(process.stderr, 'Error logging in: the sign-in was refused\n');
+    process.exitCode = 1;
+    return;
+  }
+  if (mode !== 'ok-unsaved' && env.FAKE_CODEX_LOGIN_FILE) fs.writeFileSync(env.FAKE_CODEX_LOGIN_FILE, 'in\n');
+  if (mode === 'signed-in-stay') return wait();
+  await write(process.stderr, 'Successfully logged in\n');
+}
+
 async function run({ resume, parsed }) {
   const mode = env.FAKE_CODEX_MODE || 'replay';
   const threadId = resume ? parsed.positionals[0] : null;
@@ -150,10 +193,12 @@ async function main() {
     return write(process.stdout, 'codex-cli 0.166.0\n');
   }
   if (args[0] === 'login' && args[1] === 'status') {
-    const mode = env.FAKE_CODEX_LOGIN || 'in';
+    const kept = env.FAKE_CODEX_LOGIN_FILE && fs.existsSync(env.FAKE_CODEX_LOGIN_FILE) ? fs.readFileSync(env.FAKE_CODEX_LOGIN_FILE, 'utf8').trim() : '';
+    const mode = kept || env.FAKE_CODEX_LOGIN || 'in';
     if (mode === 'out') { process.exitCode = 1; return write(process.stderr, 'Not logged in\n'); }
     return write(process.stderr, mode === 'apikey' ? 'Logged in using an API key - sk-proj-***ABCDE\n' : 'Logged in using ChatGPT\n');
   }
+  if (args[0] === 'login' && args.length === 1) return login();
   if (args[0] !== 'exec') return usageError(`unrecognized subcommand '${args[0] ?? ''}'`);
 
   const resume = args[1] === 'resume';

@@ -717,7 +717,7 @@ test('Agents & keys: each route calls the connect service with what the page sen
   const install = await w.send('/api/connect/agents/codex/install', {});
   assert.deepEqual({ ok: install.json.ok, opened: install.json.opened, sentence: install.json.sentence, command: install.json.command },
     { ok: true, opened: true, sentence: 'Terminal is installing Codex.', command: undefined });
-  const signin = await w.send('/api/connect/agents/codex/signin', {});
+  const signin = await w.send('/api/connect/agents/codex/signin', { terminal: true }); // in Terminal; without it, in the browser
   assert.deepEqual({ opened: signin.json.opened, command: signin.json.command, sentence: signin.json.sentence },
     { opened: false, command: 'codex login', sentence: 'Run this in a terminal to sign in to Codex.' });
   const keyed = await w.send('/api/connect/agents/claude/key', { value: `  ${key}\n` });

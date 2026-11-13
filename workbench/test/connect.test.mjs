@@ -266,12 +266,12 @@ test('a Claude Code that is signed in and a Codex that is signed in are both rea
   assert.deepEqual(byId(s, 'claude'), {
     id: 'claude', name: 'Claude Code', found: true, version: '2.1.322', from: 'WORKBENCH_CLAUDE_BIN', signedIn: 'yes',
     how: 'your Claude subscription', ready: true, isDefault: true,
-    sentence: 'Claude Code 2.1.322 is ready, signed in with your Claude subscription.', actions: ['key', 'recheck'],
+    sentence: 'Claude Code 2.1.322 is ready, signed in with your Claude subscription.', actions: ['key', 'recheck'], signingIn: null,
   });
   assert.deepEqual(byId(s, 'codex'), {
     id: 'codex', name: 'Codex', found: true, version: '0.166.0', from: 'WORKBENCH_CODEX_BIN', signedIn: 'yes',
     how: 'your ChatGPT account', ready: true, isDefault: false,
-    sentence: 'Codex 0.166.0 is ready, signed in with your ChatGPT account.', actions: ['key', 'default', 'recheck'],
+    sentence: 'Codex 0.166.0 is ready, signed in with your ChatGPT account.', actions: ['key', 'default', 'recheck'], signingIn: null,
   });
   assert.equal(s.defaultAgent, 'claude');
   assert.equal(s.ready, true);
@@ -314,7 +314,7 @@ test('claudeSignIn reads the JSON in Claude Code’s own order: a cloud provider
 test('Claude Code signed out, on an API key, on a cloud provider, or giving an answer Workbench cannot read', async (t) => {
   const cases = [
     ['{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}', 'no', null, false,
-      'Claude Code 2.1.322 is installed but not signed in.', ['signin', 'key', 'recheck']],
+      'Claude Code 2.1.322 is installed but not signed in.', ['signin', 'signin-console', 'key', 'recheck']],
     ['{"loggedIn":false,"authMethod":"api_key","apiProvider":"firstParty","apiKeySource":"ANTHROPIC_API_KEY"}', 'yes', 'an API key', true,
       'Claude Code 2.1.322 is ready, signed in with an API key.', ['key', 'recheck']],
     ['{"loggedIn":false,"authMethod":"third_party","apiProvider":"bedrock"}', 'yes', 'a cloud provider', true,
@@ -322,9 +322,9 @@ test('Claude Code signed out, on an API key, on a cloud provider, or giving an a
     [`{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"${EMAIL}","orgName":"Example Org Name","orgId":"org-123","subscriptionType":"max"}`,
       'yes', 'your Claude subscription', true, 'Claude Code 2.1.322 is ready, signed in with your Claude subscription.', ['key', 'recheck']],
     ['this is not JSON', 'unknown', null, true,
-      'Claude Code 2.1.322 is installed, but Workbench could not check whether it is signed in.', ['signin', 'key', 'recheck']],
+      'Claude Code 2.1.322 is installed, but Workbench could not check whether it is signed in.', ['signin', 'signin-console', 'key', 'recheck']],
     ['{"something":"else"}', 'unknown', null, true,
-      'Claude Code 2.1.322 is installed, but Workbench could not check whether it is signed in.', ['signin', 'key', 'recheck']],
+      'Claude Code 2.1.322 is installed, but Workbench could not check whether it is signed in.', ['signin', 'signin-console', 'key', 'recheck']],
   ];
   for (const [auth, signedIn, how, ready, sentence, actions] of cases) {
     process.env.FAKE_CLAUDE_AUTH = auth;
@@ -632,10 +632,10 @@ test('git: the name and email git has, saved with Save, and a repository’s own
   const real = makeConnect(t, { workspace });
   fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '');
   let s = await real.c.status();
-  assert.deepEqual(s.git, { name: '', email: '', sentence: 'Git does not know your name and email yet.' });
+  assert.deepEqual(s.git, { name: '', email: '', installed: true, canInstall: false, sentence: 'Git does not know your name and email yet.' });
   assert.deepEqual(await real.c.setGitIdentity({ name: 'Ada Lovelace', email: 'ada@example.org' }), { ok: true, sentence: 'Git will make your merges as Ada Lovelace, ada@example.org.' });
   s = await real.c.status();
-  assert.deepEqual(s.git, { name: 'Ada Lovelace', email: 'ada@example.org', sentence: 'Git knows you as Ada Lovelace, ada@example.org.' });
+  assert.deepEqual(s.git, { name: 'Ada Lovelace', email: 'ada@example.org', installed: true, canInstall: false, sentence: 'Git knows you as Ada Lovelace, ada@example.org.' });
   await assert.rejects(real.c.setGitIdentity({ name: 'Ada', email: 'not an address' }), { plain: true, why: 'email' });
   assert.ok(real.events.some((e) => e[0] === 'changed'));
   // No global name or email, but the repository has its own.
@@ -652,7 +652,7 @@ test('git: the name and email git has, saved with Save, and a repository’s own
   assert.equal(s.git.sentence, 'This repository has its own name and email for git. Save yours here to use them everywhere.');
   // git that cannot be read is said plainly.
   const broken = makeConnect(t, { workspace: { ...fakeWorkspace(), gitConfigIdentity: async () => { throw Object.assign(new Error('Git could not read'), { plain: true, detail: 'fatal: bad config line 1' }); } } });
-  assert.deepEqual((await broken.c.status()).git, { name: '', email: '', sentence: 'Workbench could not read git’s settings.' });
+  assert.deepEqual((await broken.c.status()).git, { name: '', email: '', installed: true, canInstall: false, sentence: 'Workbench could not read git’s settings.' });
 });
 
 // ------------------------------------------------------------------ GitHub
