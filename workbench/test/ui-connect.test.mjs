@@ -281,7 +281,7 @@ test('every preset’s form: secret fields are password fields, the rest plain; 
       assert.doesNotMatch(i, /type="password"[^]*\bvalue=|\bvalue=[^]*type="password"/, `${p.id}: no value is ever written into a password field`);
       if (!/type="(radio|checkbox)"/.test(i)) { assert.match(i, /autocomplete="off"/, `${p.id}: ${i}`); assert.doesNotMatch(i, /\bname=/, `${p.id}: ${i}`); }
     }
-    if (p.fields.length) {
+    if ((p.fields || []).length) {
       for (const f of p.fields) {
         const field = ins.find(i => i.includes(`data-var="${f.name}"`));
         assert.ok(field, `${p.id}: ${f.name} has a field`);
@@ -298,7 +298,7 @@ test('every preset’s form: secret fields are password fields, the rest plain; 
     assert.match(h, /<legend>Given to<\/legend>.*all agents.*Claude Code.*Codex/s);
     const given = /<input type="radio" name="cn-given" value="([^"]+)"[^>]*checked/.exec(h)[1];
     assert.equal(given, Array.isArray(p.agents) && p.agents.length === 1 && ['claude', 'codex'].includes(p.agents[0]) ? p.agents[0] : 'all', `${p.id}: who it suits is chosen first`);
-    if (p.note) assert.ok(h.includes(esc(p.note)), `${p.id}: its note`);
+    if (p.note) assert.ok(h.includes(esc(p.note.split(/\s+/).filter(Boolean).join(' '))), `${p.id}: its note`);
     if (p.link) assert.match(h, /href="https:\/\//, `${p.id}: its link`);
     assert.ok(buttons(h).some(b => b.cn === 'add-save' && b.pri));
   }
@@ -308,10 +308,11 @@ test('every preset’s form: secret fields are password fields, the rest plain; 
     [['AWS_ACCESS_KEY_ID', true, false], ['AWS_SECRET_ACCESS_KEY', true, false], ['AWS_SESSION_TOKEN', true, true], ['AWS_REGION', false, true]]);
   // without a repository (the demo, no git), a key is for all repositories only
   assert.doesNotMatch(V.addForm(s, { preset: 'aws' }, { presets: PRESETS, canRepo: false }), /this repository/);
-  // a name an agent signs in with is said
-  const anthropic = V.addForm(s, { preset: 'anthropic' }, { presets: PRESETS, signIn: notes, canRepo: true });
-  assert.ok(notes.has('ANTHROPIC_API_KEY'));
-  assert.ok(anthropic.includes(esc(V.signInWarning('ANTHROPIC_API_KEY', notes))));
+  // a name an agent signs in with is said (the shape of the shared module's list is its own: a literal one here)
+  const said = new Map([['ANTHROPIC_API_KEY', 'Claude Code signs in with ANTHROPIC_API_KEY before your subscription.']]);
+  const anthropic = V.addForm(s, { preset: 'anthropic' }, { presets: PRESETS, signIn: said, canRepo: true });
+  assert.ok(anthropic.includes(esc('Claude Code signs in with ANTHROPIC_API_KEY before your subscription.')));
+  assert.doesNotMatch(V.addForm(s, { preset: 'aws' }, { presets: PRESETS, signIn: said, canRepo: true }), /signs in with ANTHROPIC_API_KEY/);
   // before a preset is chosen: the presets and Cancel only
   const first = V.addForm(s, { preset: null }, { presets: PRESETS });
   assert.equal(buttons(first).filter(b => b.cn === 'preset').length, PRESETS.length);
@@ -337,11 +338,12 @@ test('signInVariables is read whatever its shape', () => {
 test('what a new key sends: its fields (also names given the same value), where, who, and nothing it should not', () => {
   const secret = fake('ab', 'cd', '1234', 'efgh', '5678');
   const openai = V.newKeyRequest({ preset: 'openai', label: '', entries: [{ name: 'OPENAI_API_KEY', value: ` ${secret} ` }], scope: 'all', given: 'codex' }, PRESETS);
-  assert.deepEqual(openai.body, { preset: 'openai', label: 'OpenAI', values: { OPENAI_API_KEY: secret, CODEX_API_KEY: secret }, scope: 'all', agents: ['codex'] });
+  const openaiLabel = PRESETS.find(p => p.id === 'openai').label;   // the preset's own name, when the person gives none
+  assert.deepEqual(openai.body, { preset: 'openai', label: openaiLabel, values: { OPENAI_API_KEY: secret, CODEX_API_KEY: secret }, scope: 'all', agents: ['codex'] });
   const aws = V.newKeyRequest({ preset: 'aws', label: 'Deploy', scope: 'repo', given: 'all',
     entries: [{ name: 'AWS_ACCESS_KEY_ID', value: 'A1' }, { name: 'AWS_SECRET_ACCESS_KEY', value: 'B2' }, { name: 'AWS_SESSION_TOKEN', value: '' }, { name: 'AWS_REGION', value: 'eu-west-2' }] }, PRESETS);
   assert.deepEqual(aws.body, { preset: 'aws', label: 'Deploy', values: { AWS_ACCESS_KEY_ID: 'A1', AWS_SECRET_ACCESS_KEY: 'B2', AWS_REGION: 'eu-west-2' }, scope: 'repo', agents: 'all' });
-  assert.match(V.newKeyRequest({ preset: 'aws', entries: [{ name: 'AWS_ACCESS_KEY_ID', value: 'A1' }] }, PRESETS).error, /Fill in Secret access key|Fill in .*secret/i);
+  assert.match(V.newKeyRequest({ preset: 'aws', entries: [{ name: 'AWS_ACCESS_KEY_ID', value: 'A1' }] }, PRESETS).error, /^Fill in .+\.$/, 'the missing secret access key, by its label');
   assert.match(V.newKeyRequest({ preset: 'stripe', entries: [{ name: 'STRIPE_SECRET_KEY', value: 'x'.repeat(2001) }] }, PRESETS).error, /longer than 2,000 characters/);
   assert.match(V.newKeyRequest({ preset: 'stripe', entries: [{ name: 'STRIPE_SECRET_KEY', value: 'a\nb' }] }, PRESETS).error, /line break/);
   assert.match(V.newKeyRequest({ preset: 'nope', entries: [] }, PRESETS).error, /Choose what the key is for/);

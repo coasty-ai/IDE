@@ -25,7 +25,8 @@ const st = {
   opener: null,        // where the keyboard goes back to
   open: closedForms(), // which forms are open (never anything typed in them)
   busy: new Set(),     // buttons whose request is on its way
-  checking: false, lastCheck: 0, wasReady: null, isOpen: false,
+  checking: false, again: null, lastCheck: 0, wasReady: null, isOpen: false,
+  downOutside: false,  // the pointer went down outside the panel's box (only then does a click there close it)
 };
 // The presets and the names agents sign in with come from the shared module, whatever it holds (it is U1's).
 const presets = () => (Array.isArray(presetModule.KEY_PRESETS) ? presetModule.KEY_PRESETS : []);
@@ -43,6 +44,7 @@ export function setupConnect(c) {
   ctx = c;
   const $ = id => document.getElementById(id);
   el = { dialog: $('connect'), title: $('connectTitle'), said: $('connectSaid'), body: $('connectBody'), close: $('connectClose'), needs: $('connectNeeds'), band: $('connectBtn') };
+  el.dialog.addEventListener('pointerdown', e => { st.downOutside = outside(e); });
   el.dialog.addEventListener('click', onClick);
   el.dialog.addEventListener('keydown', onKey);
   // Esc reaches the page's own handler first (app.js closes the panel there); this is for any other way it is cancelled
@@ -159,18 +161,27 @@ async function request(fn, { busyKey = null, quiet = false } = {}) {
 }
 const okAnswer = r => !!r && r.ok !== false;
 
-/** Check the agents again (their programs and how they are signed in). One at a time. */
+/**
+ * Check the agents again (their programs and how they are signed in). One at a time: one asked for while another is on
+ * its way (a key saved during the check made on opening, say) runs as soon as that one ends, so what it changed shows.
+ */
 async function recheck({ said = false } = {}) {
-  if (st.checking) return;
-  st.checking = true;
-  st.lastCheck = Date.now();
   const asked = 'Checking your agents again…';
   if (said) setSaid(asked);
+  if (st.checking) { st.again = st.again || { said: false }; st.again.said = st.again.said || said; return; }
+  st.checking = true;
+  st.lastCheck = Date.now();
   try {
     await request(() => connectApi.recheck(), { quiet: !said });
     // an answer with no sentence of its own: the rows say what was found
-    if (said && el.said.textContent === asked) setSaid('Checked again.');
-  } finally { st.checking = false; paint(); }
+    if (said && el.said.textContent === asked && !st.again) setSaid('Checked again.');
+  } finally {
+    st.checking = false;
+    paint();
+    const again = st.again;
+    st.again = null;
+    if (again && connectShown()) recheck(again);
+  }
 }
 function recheckSoon() { if (connectShown() && !st.checking && Date.now() - st.lastCheck > 3000) recheck(); }
 
@@ -235,12 +246,19 @@ function onKey(e) {
   act(b);
 }
 
+/** Is this pointer event on the dimmed board around the panel (the dialog's backdrop), not on the panel itself? */
+function outside(e) {
+  if (e.target !== el.dialog) return false;
+  const r = el.dialog.getBoundingClientRect();
+  return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+}
+
 function onClick(e) {
-  // a click outside the panel's box (on the dimmed board) closes it
-  if (e.target === el.dialog) {
-    const r = el.dialog.getBoundingClientRect();
-    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) { closeConnect(); return; }
-  }
+  // a click outside the panel's box closes it, when it also began there (selecting text in a field and letting go
+  // past the panel's edge does not)
+  const down = st.downOutside;
+  st.downOutside = false;
+  if (outside(e)) { if (down) closeConnect(); return; }
   const b = e.target.closest('button');
   if (b && el.dialog.contains(b)) act(b);
 }
