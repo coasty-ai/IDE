@@ -7,7 +7,8 @@
 // agents, as on Ctrl-C. Nothing here talks to the agents: the page does that, exactly as in a browser.
 //
 // The clone sheet signs the person in to GitHub with GitHub's own command-line tool (`--github-signin`), or takes a
-// token instead. The first window says when git is not installed yet, and opens Apple's installer for it.
+// token instead. The first window says when git is not installed yet, and opens Apple's installer for it, or when
+// Xcode's license has not been accepted yet; a folder opens only once git runs.
 //
 // Testing without clicks: `Workbench --repo <folder>` or `Workbench --demo` opens it at once; `--self-test` loads
 // the board, writes what it found to the log and to standard output, and quits.
@@ -295,32 +296,56 @@ enum Environment {
  * Workbench's PATH (Homebrew's, say) counts too, since that is the one Workbench runs.
  */
 enum GitTools {
-  enum State { case unknown, ready, missing }
-
-  static let missing = "Git is not installed yet. Apple’s developer tools include it."
-
   /**
-   * The check, off the main thread, 5 seconds at most for each program; `done` gets the answer on the main thread. Call
-   * it on the main thread.
+   * What the last check found: no answer yet, git runs, git is not installed (Apple's installer brings it), or Xcode is
+   * there, with git, but its license has not been accepted yet, so its git does not run (and Apple's installer cannot
+   * change that).
    */
-  static func check(_ done: @escaping (Bool) -> Void) {
-    let env = Environment.forWorkbench()
-    DispatchQueue.global(qos: .utility).async {
-      let ok = runs(env)
-      DispatchQueue.main.async { done(ok) }
+  enum State {
+    case unknown, ready, missing, license
+
+    /// Why git does not run, in words; nil while it runs, or before a check has ended.
+    var sentence: String? {
+      switch self {
+      case .missing: return GitTools.missing
+      case .license: return GitTools.license
+      case .unknown, .ready: return nil
+      }
     }
   }
 
-  private static func runs(_ env: [String: String]) -> Bool {
+  static let missing = "Git is not installed yet. Apple’s developer tools include it."
+  static let license = "Xcode’s license has not been accepted yet. Open Terminal and run sudo xcodebuild -license, or open Xcode once."
+
+  /**
+   * The check, off the main thread, 5 seconds at most for each program; `done` gets the answer on the main thread, with
+   * what Apple's git said when it did not run (for the log). Call it on the main thread.
+   */
+  static func check(_ done: @escaping (State, String?) -> Void) {
+    let env = Environment.forWorkbench()
+    DispatchQueue.global(qos: .utility).async {
+      let found = runs(env)
+      DispatchQueue.main.async { done(found.state, found.said) }
+    }
+  }
+
+  private static func runs(_ env: [String: String]) -> (state: State, said: String?) {
+    var license: String?   // Apple's git did not run, for Xcode's license: what it said
     if let p = run("/usr/bin/xcode-select", ["-p"], env: env), p.status == 0 {
       let dir = p.output.trimmingCharacters(in: .whitespacesAndNewlines)
       if dir.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: dir + "/usr/bin/git"),
-         run("/usr/bin/git", ["--version"], env: env)?.status == 0 {
-        return true
+         let g = run("/usr/bin/git", ["--version"], env: env) {
+        if g.status == 0 { return (.ready, nil) }
+        // Until Xcode's license is accepted, Apple's git exits 69 and says so.
+        if g.status == 69 || g.output.range(of: "license", options: .caseInsensitive) != nil {
+          let said = g.output.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+          license = "/usr/bin/git --version exited (\(g.status))\(said.isEmpty ? "" : ": \(said)")"
+        }
       }
     }
-    guard let first = firstOnPath("git", env), first != "/usr/bin/git" else { return false }
-    return run(first, ["--version"], env: env)?.status == 0
+    let notRunning: (state: State, said: String?) = license.map { (.license, $0) } ?? (.missing, nil)
+    guard let first = firstOnPath("git", env), first != "/usr/bin/git" else { return notRunning }
+    return run(first, ["--version"], env: env)?.status == 0 ? (.ready, nil) : notRunning
   }
 
   /** The program Workbench would run by this name: the first on its PATH, with links followed. */
@@ -813,6 +838,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
   private var gitInstalling = false
   /// What the first window says after Install Git, in place of "Git is not installed yet. …".
   private var gitWords: String?
+  /// A folder to open once a check has found that git runs (open(folder:) while it was not known to).
+  private var openOnceGitRuns: URL?
   private weak var welcomeClone: NSButton?
   private weak var welcomeGit: NSView?
   private weak var welcomeGitText: NSTextField?
@@ -855,20 +882,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
   // MARK: git
 
-  /** Whether git runs, found again (one check at a time). Only a change redraws anything. */
+  /**
+   * Whether git runs, found again (one check at a time). Only a change redraws anything. A folder waiting for the
+   * answer (`openOnceGitRuns`) opens once git runs; when it does not, and no newer check is due, it is refused in words.
+   */
   func checkGit() {
     guard !gitChecking else { gitCheckAgain = true; return }
     gitChecking = true
-    GitTools.check { [weak self] ok in
+    GitTools.check { [weak self] found, said in
       guard let self = self else { return }
       self.gitChecking = false
-      let found: GitTools.State = ok ? .ready : .missing
       if found != self.git {
-        Log.shared.write(ok ? "git runs" : "git does not run: \(GitTools.missing)")
+        Log.shared.write(found == .ready ? "git runs" : "git does not run: \(found.sentence ?? "")\(said.map { " (\($0))" } ?? "")")
         self.git = found
-        if ok { self.gitWords = nil }
+        if found != .missing { self.gitWords = nil }
         self.showGit()
         self.cloneSheet?.refresh()
+      }
+      if let folder = self.openOnceGitRuns, found == .ready || !self.gitCheckAgain {
+        self.openOnceGitRuns = nil
+        if found == .ready { self.open(folder: folder) } else { self.cannotOpen(folder) }
       }
       if self.gitCheckAgain { self.gitCheckAgain = false; self.checkGit() }
     }
@@ -889,13 +922,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
   }
 
-  /** The first window's git line, Install Git and Clone Repository…, as the last check found git; in place. */
+  /**
+   * The first window's git line, Install Git and Clone Repository…, as the last check found git; in place. Install Git
+   * is there only while git is not installed: Apple's installer cannot accept Xcode's license.
+   */
   func showGit() {
     welcomeClone?.isEnabled = git == .ready
-    welcomeGit?.isHidden = git != .missing
-    welcomeGitText?.stringValue = gitWords ?? GitTools.missing
+    welcomeGit?.isHidden = git.sentence == nil
+    welcomeGitText?.stringValue = gitLine
+    welcomeGitText?.preferredMaxLayoutWidth = git == .missing ? 300 : 400
+    welcomeInstall?.isHidden = git != .missing
     welcomeInstall?.isEnabled = !gitInstalling
     if let w = welcome { fitWelcome(w) }
+  }
+
+  /// The first window's words about git: why Clone Repository… is off, or what Install Git did.
+  private var gitLine: String { git == .missing ? (gitWords ?? GitTools.missing) : (git.sentence ?? "") }
+
+  /**
+   * A folder was not opened, since git does not run: why, as the first window says it, with Install Git while git is not
+   * installed. Nothing that was open closes.
+   */
+  func cannotOpen(_ folder: URL) {
+    let why = git.sentence ?? GitTools.missing
+    let message = "Workbench could not open \(visible(folder.lastPathComponent))."
+    Log.shared.write("alert: \(message) \(why)")
+    if selfTest { print("SELF-TEST FAILED: \(message) \(why)"); fflush(stdout); exit(1) }
+    if boardWindow == nil, welcome?.isVisible != true { showWelcome() }   // at launch, nothing else is open
+    let offer = git == .missing
+    let a = NSAlert()
+    a.messageText = message
+    a.informativeText = why
+    if offer {
+      a.addButton(withTitle: "Install Git")
+      a.addButton(withTitle: "Cancel")
+    }
+    if a.runModal() == .alertFirstButtonReturn, offer, git == .missing { installGit() }
   }
 
   // MARK: choosing a folder
@@ -920,8 +982,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
   @objc func clearRecents() { Recents.clear(); rebuildRecent(); if let w = welcome, w.isVisible { showWelcome() } }
 
-  /** Open a folder (nil: the demo). If Workbench is running on another one, it is stopped first, after asking. */
+  /**
+   * Open a folder (nil: the demo). If Workbench is running on another one, it is stopped first, after asking. A folder
+   * needs git: until a check has found that git runs, a check that starts now decides first (checkGit), and when git
+   * does not run, the folder is not opened (cannotOpen) and what is open stays open.
+   */
   func open(folder: URL?) {
+    openOnceGitRuns = nil                    // a folder still waiting for git gives way to this one
+    if let folder = folder, git != .ready, !isOpen(folder) {
+      openOnceGitRuns = folder
+      checkGit()
+      return
+    }
     if cloneSheet != nil { cancelClone() }   // a folder dropped on the icon while the clone sheet was up
     if let engine = engine, engine.process.isRunning {
       let same = folder.map { engine.folder?.standardizedFileURL.path == $0.standardizedFileURL.path } ?? engine.isDemo
@@ -937,6 +1009,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     } else {
       start(folder.map { .repo($0) } ?? .demo)
     }
+  }
+
+  /** Whether Workbench runs on this folder now. */
+  private func isOpen(_ folder: URL) -> Bool {
+    guard let e = engine, e.process.isRunning else { return false }
+    return e.folder?.standardizedFileURL.path == folder.standardizedFileURL.path
   }
 
   func start(_ target: Target, port: Int = 4317, forClone: Bool = false) {
@@ -1301,19 +1379,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     let sub = NSTextField(wrappingLabelWithString: "Clone a git repository, or open one, to start agents on it. Each agent works in its own copy, and you merge what you want to keep.")
     sub.textColor = .secondaryLabelColor
     sub.preferredMaxLayoutWidth = 444
-    // Git missing: why Clone is off, and Install Git (Apple's installer). Hidden while git runs.
+    // Git missing, or Xcode's license not accepted yet: why Clone is off, and, for missing git, Install Git (Apple's
+    // installer). Hidden while git runs.
     let gitIcon = NSImageView()
     gitIcon.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
     gitIcon.contentTintColor = .systemOrange
     gitIcon.setContentHuggingPriority(.required, for: .horizontal)
-    let gitText = NSTextField(wrappingLabelWithString: gitWords ?? GitTools.missing)
-    gitText.preferredMaxLayoutWidth = 300
+    let gitText = NSTextField(wrappingLabelWithString: gitLine)
+    gitText.preferredMaxLayoutWidth = git == .missing ? 300 : 400   // beside Install Git, or on its own
     let install = NSButton(title: "Install Git", target: self, action: #selector(installGit))
     install.isEnabled = !gitInstalling
     let gitRow = NSStackView(views: [gitIcon, gitText, install])
+    install.isHidden = git != .missing
     gitRow.alignment = .centerY
     gitRow.spacing = 8
-    gitRow.isHidden = git != .missing
+    gitRow.isHidden = git.sentence == nil
     let clone = NSButton(title: "Clone Repository…", target: self, action: #selector(showClone))
     clone.isEnabled = git == .ready
     let open = NSButton(title: "Open Folder…", target: self, action: #selector(chooseFolder))
@@ -1617,7 +1697,6 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     bar.isIndeterminate = false
     bar.minValue = 0
     bar.maxValue = 100
-    bar.isHidden = true
 
     cancelButton.target = self
     cancelButton.action = #selector(cancel)
@@ -1634,6 +1713,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     stack.alignment = .leading
     stack.spacing = 10
     stack.detachesHiddenViews = false    // the sheet keeps its size when the progress bar comes and goes
+    bar.isHidden = true                  // only now: hidden before the line above, it would leave the stack (as in SignInGitHubSheet)
     stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
     stack.setCustomSpacing(16, after: addressRow)
     stack.setCustomSpacing(6, after: listTitle)
@@ -1872,7 +1952,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
   }
 
   private func startClone(_ a: String, saying first: String?) {
-    if app?.git == .missing { failed(kind: "nogit", sentence: GitTools.missing); return }
+    if let why = app?.git.sentence { failed(kind: "nogit", sentence: why); return }
     if let problem = CloneAddress.problem(a) { failed(kind: "url", sentence: problem); return }
     let fm = FileManager.default
     let place = visible((folder.path as NSString).abbreviatingWithTildeInPath)
@@ -1978,7 +2058,7 @@ final class CloneSheet: NSObject, NSSearchFieldDelegate, NSTableViewDataSource, 
     table.isEnabled = !busy
     chooseButton.isEnabled = !busy
     for b in [noteSignIn, noteToken, messageSignIn, messageToken] { b.isEnabled = !busy }
-    cloneButton.isEnabled = !busy && app?.git != .missing
+    cloneButton.isEnabled = !busy && app?.git.sentence == nil
       && !address.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     if !busy {
       bar.stopAnimation(nil)
@@ -2074,12 +2154,17 @@ final class SignInGitHubSheet: NSObject {
   private let openButton = NSButton(title: "Open GitHub", target: nil, action: nil)
   private let spinner = NSProgressIndicator()
   private let status = NSTextField(wrappingLabelWithString: "")
+  private let commandRow = NSStackView()        // under the words, only while there is a command to run
+  private let commandText = NSTextField(wrappingLabelWithString: "")
+  private let copyButton = NSButton(title: "Copy", target: nil, action: nil)
+  private weak var stack: NSStackView?
   private let tokenLink = CloneSheet.link("Use a token instead…")
   private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
   private let againButton = NSButton(title: "Try Again", target: nil, action: nil)
   private var phase = Phase.starting
   private var run: HelperStream?
   private var code = ""
+  private var command = ""            // what to run in a terminal, when Workbench could not open Terminal
   private var page = SignInGitHubSheet.devicePage
   private var generation = 0          // one per try: a timer, a poll or a line from an earlier try is not heard
   private var heard = false           // this try printed a WORKBENCH_GITHUB line
@@ -2104,7 +2189,6 @@ final class SignInGitHubSheet: NSObject {
     codeRow.setViews([openButton], in: .trailing)
     codeRow.alignment = .centerY
     codeRow.spacing = 8
-    codeRow.isHidden = true
     spinner.style = .spinning
     spinner.controlSize = .small
     spinner.isDisplayedWhenStopped = false
@@ -2113,6 +2197,14 @@ final class SignInGitHubSheet: NSObject {
     let statusRow = NSStackView(views: [spinner, status])
     statusRow.spacing = 6
     statusRow.alignment = .centerY
+    commandText.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    commandText.isSelectable = true
+    commandText.preferredMaxLayoutWidth = 340
+    copyButton.target = self
+    copyButton.action = #selector(copyCommand)
+    commandRow.setViews([commandText, copyButton], in: .leading)
+    commandRow.alignment = .firstBaseline
+    commandRow.spacing = 8
     tokenLink.target = self
     tokenLink.action = #selector(useToken)
     cancelButton.target = self
@@ -2124,14 +2216,21 @@ final class SignInGitHubSheet: NSObject {
     buttons.setViews([tokenLink], in: .leading)
     buttons.setViews([cancelButton, againButton], in: .trailing)
     buttons.spacing = 8
-    let stack = NSStackView(views: [title, about, codeRow, statusRow, buttons])
+    let stack = NSStackView(views: [title, about, codeRow, statusRow, commandRow, buttons])
     stack.orientation = .vertical
     stack.alignment = .leading
     stack.spacing = 10
     stack.detachesHiddenViews = false    // the sheet keeps its size from one step to the next
+    // Hidden only now. A view already hidden when the stack is told to keep hidden views is taken out of it then (as
+    // macOS 27 does), and its width constraint below could not be made.
+    codeRow.isHidden = true
+    // The command takes room only while it is there (showCommand); then the sheet grows to fit it. It is in none of
+    // the constraints below.
+    stack.setVisibilityPriority(.notVisible, for: commandRow)
     stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
     stack.setCustomSpacing(14, after: about)
     stack.translatesAutoresizingMaskIntoConstraints = false
+    self.stack = stack
     let content = NSView()
     content.addSubview(stack)
     var constraints = [
@@ -2196,6 +2295,13 @@ final class SignInGitHubSheet: NSObject {
     NSWorkspace.shared.open(page)
   }
 
+  /** Copy: the command to run in a terminal goes on the clipboard, exactly as the sheet shows it (through visible()). */
+  @objc func copyCommand() {
+    guard !ended, phase == .terminal, !command.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(visible(command), forType: .string)
+  }
+
   // MARK: a try
 
   /** A try: `--github-signin`, its lines answered as they come. */
@@ -2205,6 +2311,7 @@ final class SignInGitHubSheet: NSObject {
     let gen = generation
     heard = false
     code = ""
+    command = ""
     page = SignInGitHubSheet.devicePage
     show(.starting, "Starting the sign-in…")
     limit(120, "The sign-in did not start within 2 minutes.")
@@ -2244,7 +2351,12 @@ final class SignInGitHubSheet: NSObject {
       limit(16 * 60, "The code has expired. Try again for a new one.")
     case "terminal":
       guard phase != .terminal, phase != .done, phase != .failed else { return }
-      show(.terminal, sentence ?? "Terminal is open: follow the steps there, then come back here.")
+      // Terminal could not open (`opened: false`): the command to run in a terminal of the person's own, under the words.
+      let unopened = (o["opened"] as? Bool) == false
+      command = unopened ? ((o["command"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") : ""
+      commandText.stringValue = visible(command)
+      show(.terminal, sentence ?? (!unopened ? "Terminal is open: follow the steps there, then come back here."
+        : "Workbench could not open Terminal." + (command.isEmpty ? "" : " Run this command in a terminal, then come back here.")))
       let gen = generation
       let deadline = Date().addingTimeInterval(600)
       DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.poll(gen, until: deadline) }
@@ -2340,10 +2452,26 @@ final class SignInGitHubSheet: NSObject {
     let waiting = p == .starting || p == .installing || p == .code || p == .terminal
     if waiting { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
     codeRow.isHidden = p != .code
+    showCommand(p == .terminal && !command.isEmpty)
     againButton.isHidden = p != .failed
     tokenLink.isHidden = p == .done
     openButton.keyEquivalent = p == .code ? "\r" : ""
     againButton.keyEquivalent = p == .failed ? "\r" : ""
+  }
+
+  /** The command and its Copy take room only while they show: the sheet grows for them, its top edge where it was. */
+  private func showCommand(_ on: Bool) {
+    guard let stack = stack, let content = window.contentView else { return }
+    let want: NSStackView.VisibilityPriority = on ? .mustHold : .notVisible
+    guard stack.visibilityPriority(for: commandRow) != want else { return }
+    stack.setVisibilityPriority(want, for: commandRow)
+    content.layoutSubtreeIfNeeded()
+    let size = window.frameRect(forContentRect: NSRect(origin: .zero, size: content.fittingSize)).size
+    var f = window.frame
+    guard abs(f.height - size.height) > 0.5 else { return }
+    f.origin.y += f.height - size.height
+    f.size = size
+    window.setFrame(f, display: true)
   }
 
   /** A `code` line's address when it is a page on https://github.com, else GitHub's device sign-in page. */
