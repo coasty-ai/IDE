@@ -10,7 +10,7 @@
 //   say { agentId, text }   status { agentId? }     spend                sleep / wake { machineIds }
 //   sleep_idle              forget { agentIds }     continue { agentId }
 //   changes { agentId }     merge { agentId, into? }                     discard { agentId }
-//   confirm { go }          unknown { text }
+//   confirm { go }          help                    connect              unknown { text }
 // Extra fields some intents carry: askId (allow, deny, answer), text (deny: the person's words, such as
 // "no, use the staging database"), conditional (deny: a yes that came with conditions, "yes but only in the
 // tests folder"; text is the whole reply), sure: false (stop, say: the words found the agent but did not name
@@ -18,6 +18,9 @@
 // "main" or "master" or their current branch by name; left out for "my branch"). An allow never carries words.
 // changes, merge and discard always name a root agent (a helper stands for its agent); agentId is null when the
 // words did not make clear which one. Merge and discard are always asked first (the engine shows a card).
+// A launch's harness is the agent the words named ("codex", "claude"), or null: the engine then gives the work to
+// the person's default agent. A start that says no work ("start an agent", "new agent") is { kind: 'start',
+// tasks: [], task: null }, and the engine asks what the agent should work on.
 import { clip } from '../shared/format.mjs';
 import { ENDED, LOOK } from '../shared/states.mjs';
 
@@ -1425,8 +1428,9 @@ function emptyTask(toks) {
 }
 
 /**
- * Build the start tasks from the words after the noun phrase.
- * @returns {{ task: string, harness: string, machine: string }[] | null}
+ * Build the start tasks from the words after the noun phrase. A harness is the agent the words named, or null when
+ * they named none: the engine then gives the work to the person's default agent.
+ * @returns {{ task: string, harness: string|null, machine: string }[] | null}
  */
 function buildTasks(rest, noun, c) {
   const mach = takeMachine(rest, c);
@@ -1445,17 +1449,22 @@ function buildTasks(rest, noun, c) {
     const first = tidy(spanText(toks.slice(0, k)));
     const second = tidy(spanText(toks.slice(k + 2 + h.len)));
     if (!first || !second) break;
-    const h1 = noun.harnesses[0] || har.harness || 'claude';
+    const h1 = noun.harnesses[0] || har.harness || null;
     return [{ task: first, harness: h1, machine }, { task: second, harness: h.harness, machine }];
   }
 
   if (!toks.length || emptyTask(toks)) return null;
   const task = tidy(spanText(toks));
   if (!task) return null;
-  let harnesses = noun.harnesses.length ? noun.harnesses : [har.harness || 'claude'];
+  let harnesses = noun.harnesses.length ? noun.harnesses : [har.harness || null];
   if (harnesses.length === 1 && noun.count > 1) harnesses = new Array(Math.min(noun.count, MAX_LAUNCH)).fill(harnesses[0]);
   return harnesses.slice(0, MAX_LAUNCH).map(harness => ({ task, harness, machine }));
 }
+
+/** A start that says no work: the engine asks what the agent should work on. */
+const NO_TASK_START = () => ({ kind: 'start', tasks: [], task: null });
+/** Words that make a bare noun phrase a request for one more agent: "new agent", "another codex agent". */
+const NEW_WORDS = new Set(['new', 'another', 'fresh', 'extra', 'more', 'second', 'separate', 'different']);
 
 function matchStart(core, c) {
   const ws = core.map(t => t.w);
@@ -1466,6 +1475,8 @@ function matchStart(core, c) {
   if (!v) {
     // No verb, but a launchable noun and a clear join: "codex, write tests", "new agent to fix the login".
     if (!noun.named || !launchNoun(ws) || noun.definite) return null;
+    // A new agent and nothing more: "new agent", "another codex agent". Work comes next, so ask for it.
+    if (noun.end === ws.length) return ws.some(w => NEW_WORDS.has(w)) ? { intent: NO_TASK_START(), strong: true } : null;
     const joined = core[noun.end - 1] && core[noun.end - 1].tail;
     if (!joined && !['to', 'on', 'for', 'that'].includes(ws[noun.end])) return null;
   } else if (!strongVerb && !noun.named) {
@@ -1473,8 +1484,73 @@ function matchStart(core, c) {
   }
   if (noun.hasNoun && noun.definite && !noun.harnesses.length) return null; // "start the agent" refers to one that exists
   const tasks = buildTasks(core.slice(noun.end), noun, c);
-  if (!tasks) return null;
+  // A start verb with no work after it ("start an agent", "start codex", "start", "add an agent on cloud 2"): the
+  // engine asks what the agent should work on. Only a named agent wins over a waiting question.
+  if (!tasks) return { intent: NO_TASK_START(), strong: noun.named };
   return { intent: { kind: 'start', tasks }, strong: noun.named };
+}
+
+// Help, and connecting agents and keys ---------------------------------------------------------
+
+/**
+ * What "help" gets: what to say, and where agents are set up. Short, so it fits three lines under the DRAM at the
+ * narrowest board. The engine answers the `help` intent with it.
+ */
+export const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
+
+/** A greeting and nothing more: "hi", "hello there", "hey workbench", "good morning". */
+const GREETING = new Set(['hi', 'hello', 'hey', 'hiya', 'howdy', 'yo', 'greetings', 'morning', 'afternoon', 'evening']);
+const GREETING_FILL = new Set(['there', 'workbench', 'again', 'everyone', 'everybody', 'all', 'folks', 'good', 'oh', 'okay', 'so', 'well', 'and']);
+/** Asking what Workbench can do, said whole (after "please", "can you" and the like are dropped). */
+const HELP_PHRASES = new Set(['help', 'help me', 'i need help', 'need help', 'get help', 'what can you do', 'what can you do for me',
+  'what do you do', 'what can i do', 'what can i say', 'what can i ask', 'what can i type', 'what do i say', 'what should i say',
+  'what do i do', 'how does this work', 'how does it work', 'how does workbench work', 'how do i use this', 'how do i use it',
+  'how do i use workbench', 'how do i start', 'how do i begin', 'what is this', 'what is workbench', 'commands',
+  'what are the commands', 'list the commands']);
+
+/**
+ * "help", "hi", "what can you do", "how does this work". Weak: while the focused agent (or its one waiting helper) asks
+ * something, the words are about that ask, and keep their old meaning (the answer, or what exactly a permission asks).
+ * On a card they settle nothing, and the card stays with its own hint.
+ */
+function matchHelp(core, base, c) {
+  const all = base.map(t => t.w);
+  const greeting = all.every(w => GREETING.has(w) || GREETING_FILL.has(w)) && all.some(w => GREETING.has(w));
+  if (!greeting && !HELP_PHRASES.has(core.map(t => t.w).join(' '))) return null;
+  if (c.pendingConfirm) return { intent: { kind: 'unknown' }, strong: true };
+  if (hasAsk(c.asker)) return null;
+  return { intent: { kind: 'help' }, strong: false };
+}
+
+// The things a person connects: an agent program, GitHub or git, and keys.
+const C_DET = '(?:(?:my|your|our|the|a|an|some|new|more|another|other) )*';
+const C_AGENT = '(?:(?:claude|claud|clawed|clod)(?: code)?|cloud code|claudes|codex(?: cli)?|codecs|codexes|code x|(?:coding )?agents?)(?: account| subscription)?';
+const C_GITHUB = '(?:github|git hub|git)(?: account)?';
+const C_KEYS = '(?:(?:api|aws|amazon|anthropic|openai|gemini|google|gcp|azure|github|stripe|cloud|access|secret) ){0,2}(?:keys?|tokens?|credentials?|secrets?)';
+/** Words that open Agents & keys and say what for: strong, they win over a waiting question. */
+const CONNECT_STRONG = [
+  /^(?:(?:open|show|show me|go to|take me to|bring up|pull up) )?(?:the )?agents and (?:api )?keys(?: (?:panel|page|screen|settings))?$/,
+  new RegExp(`^connect (?:to |with |up )?${C_DET}(?:${C_AGENT}|${C_GITHUB}|${C_KEYS})$`),
+  new RegExp(`^(?:set up|setup) ${C_DET}(?:${C_AGENT}|${C_GITHUB}|${C_KEYS}|workbench)$`),
+  new RegExp(`^(?:(?:sign|log) (?:in|on)|signin|login)(?: (?:to|into|with|on))? ${C_DET}(?:${C_AGENT}|${C_GITHUB}|chatgpt|openai|anthropic)(?: account)?$`),
+  new RegExp(`^(?:sign|log) into ${C_DET}(?:${C_AGENT}|${C_GITHUB}|chatgpt|openai|anthropic)(?: account)?$`),
+  new RegExp(`^add ${C_DET}${C_KEYS}$`),
+];
+/** The same, said bare: weak, so while a question waits they are the answer ("agents" may well be one). */
+const CONNECT_WEAK = /^(?:connect|set up|setup|(?:sign|log) (?:in|on)|signin|login|agents|keys|api keys?)$/;
+/** "how do I connect github", "where do I add a key": the question is the request. */
+const CONNECT_FRAME = /^(?:how|where) (?:do|can|should) (?:i|we) /;
+
+/**
+ * "connect", "set up", "add a key", "sign in", "connect github", "agents", "agents and keys", "api key": open Agents &
+ * keys. Only these words whole: "connect the form to the api", "set up codex to fix the login" and "add a key to the
+ * config" keep their old meaning.
+ */
+function matchConnect(core) {
+  const s = core.map(t => t.w).join(' ').replace(/&/g, ' and ').replace(/-/g, ' ').replace(/\s+/g, ' ').trim().replace(CONNECT_FRAME, '');
+  if (CONNECT_STRONG.some(re => re.test(s))) return { intent: { kind: 'connect' }, strong: true };
+  if (CONNECT_WEAK.test(s)) return { intent: { kind: 'connect' }, strong: false };
+  return null;
 }
 
 // Work requests without a start verb ----------------------------------------------------------
@@ -1494,21 +1570,28 @@ const WORK_VERBS = new Set(['add', 'fix', 'write', 'rewrite', 'create', 'build',
   'study', 'analyze', 'analyse', 'evaluate', 'assess', 'explore', 'search', 'locate', 'identify', 'prevent', 'avoid', 'get',
   'bring', 'teach', 'shorten', 'lengthen', 'split', 'combine', 'dedupe', 'deduplicate', 'untangle', 'fill', 'draw', 'build']);
 
+/**
+ * A work request with no start verb: "fix the login redirect", and "work on the login bug", whose task is what comes
+ * after "work on" ("the login bug"), as for "start an agent working on the login bug".
+ */
 function matchTask(core, c) {
-  if (core.length < 2 || !WORK_VERBS.has(core[0].w)) return null;
-  if (emptyTask(core.slice(1))) return null; // "fix it", "do that"
+  let words = core;
+  if (core.length > 2 && core[0].w === 'work' && core[1].w === 'on') words = core.slice(2);
+  else if (core.length < 2 || !WORK_VERBS.has(core[0].w)) return null;
+  if (emptyTask(words === core ? core.slice(1) : words)) return null; // "fix it", "do that", "work on it"
   const last = core[core.length - 1].raw;
   if (/\?["'”’]*$/.test(last)) return null; // a question, not a request
   // An explicit harness or machine makes it a launch: "fix the login redirect using codex".
-  const mach = takeMachine(core, c);
+  const mach = takeMachine(words, c);
   const har = takeHarness(mach.toks);
   if (mach.machine || har.harness) {
     const task = tidy(spanText(har.toks));
     if (task && !emptyTask(har.toks)) {
-      return { kind: 'start', tasks: [{ task, harness: har.harness || 'claude', machine: mach.machine || laptopId(c) }] };
+      return { kind: 'start', tasks: [{ task, harness: har.harness || null, machine: mach.machine || laptopId(c) }] };
     }
   }
-  return { kind: 'task', task: tidy(spanText(core)) };
+  const task = tidy(spanText(words));
+  return task ? { kind: 'task', task } : null;
 }
 
 // Answers -------------------------------------------------------------------------------------
@@ -1582,7 +1665,7 @@ function parse(said, c) {
   }
   // 3. Commands. While a question waits, only unmistakable commands win over an answer.
   const core = stripTrailing(stripPolite(stripSoft(base)));
-  const found = matchCommand(core, c);
+  const found = matchCommand(core, c, base);
   // Words about the card on screen that it cannot act on ("show me the changes" on a card that does not say whose work
   // it is): the card stays, with its hint.
   if (found && found.intent.kind === 'unknown') return { kind: 'unknown', text: said };
@@ -1603,13 +1686,16 @@ function parse(said, c) {
   return { kind: 'unknown', text: said };
 }
 
-function matchCommand(core, c) {
+function matchCommand(core, c, base = core) {
   if (!core.length) return null;
   const ws = core.map(t => t.w);
   if (matchStopAll(ws)) return { intent: { kind: 'stop_all' }, strong: true };
-  // Changes, merge and throw-away come before status: "what did search cleanup change" and "show search cleanup's
-  // changes" were status questions, and still are when they name no agent.
-  return matchMachines(core, c)
+  // Help and Agents & keys take only their own words whole, so they come first: "open agents and keys" would be a
+  // launch of "keys", and "connect github" work. Changes, merge and throw-away come before status: "what did search
+  // cleanup change" and "show search cleanup's changes" were status questions, and still are when they name no agent.
+  return matchHelp(core, base, c)
+    || matchConnect(core)
+    || matchMachines(core, c)
     || matchStop(core, c)
     || matchForget(core, c)
     || matchContinue(core, c)
@@ -1644,11 +1730,18 @@ function machineName(id, c) {
   return m && m.name ? m.name : String(id);
 }
 
-/** "Claude and Codex", "two Claude agents", "Claude". */
+/**
+ * "Claude and Codex", "two Claude agents", "Claude". No harness (none was named; the engine picks the person's default
+ * agent): "an agent", "two agents".
+ */
 function whoStarts(harnesses) {
   const counts = new Map();
-  for (const h of harnesses) counts.set(h, (counts.get(h) || 0) + 1);
+  for (const raw of harnesses) {
+    const h = raw || null;
+    counts.set(h, (counts.get(h) || 0) + 1);
+  }
   return joinAnd([...counts].map(([h, n]) => {
+    if (h == null) return n === 1 ? 'an agent' : `${NUM_WORD[n] || n} agents`;
     const name = HARNESS_NAME[h] || String(h);
     if (h === 'sim') return n === 1 ? 'a simulated agent' : `${NUM_WORD[n] || n} simulated agents`;
     return n === 1 ? name : `${NUM_WORD[n] || n} ${name} agents`;
@@ -1670,9 +1763,9 @@ function describeStart(tasks, c) {
   const sameMachine = machines.every(m => m === machines[0]);
   const where = sameMachine ? placePhrase(machines[0], ts.length, c) : '';
   if (ts.every(t => t.task === ts[0].task)) {
-    return `Start ${whoStarts(ts.map(t => t.harness || 'claude'))} on ${quote(ts[0].task)}${where}?`;
+    return `Start ${whoStarts(ts.map(t => t.harness))} on ${quote(ts[0].task)}${where}?`;
   }
-  const parts = ts.map((t, k) => `${whoStarts([t.harness || 'claude'])} on ${quote(t.task)}${sameMachine ? '' : placePhrase(machines[k], 1, c)}`);
+  const parts = ts.map((t, k) => `${whoStarts([t.harness])} on ${quote(t.task)}${sameMachine ? '' : placePhrase(machines[k], 1, c)}`);
   return `Start ${joinAnd(parts)}${where}?`;
 }
 
@@ -1687,7 +1780,7 @@ export function describeIntent(intent, ctx) {
   const machines = ids => (Array.isArray(ids) && ids.length ? joinAnd(ids.map(id => machineName(id, c))) : 'that machine');
   switch (it.kind) {
     case 'start': return describeStart(it.tasks, c);
-    case 'task': return describeStart([{ task: it.task, harness: 'claude', machine: null }], c);
+    case 'task': return describeStart([{ task: it.task, harness: typeof it.harness === 'string' ? it.harness : null, machine: null }], c);
     case 'stop': return Array.isArray(it.agentIds) && it.agentIds.length ? `Stop ${names(it.agentIds)}?` : 'Stop an agent? It is not clear which one.';
     case 'stop_all': return 'Stop every agent?';
     case 'forget': return Array.isArray(it.agentIds) && it.agentIds.length ? `Forget ${names(it.agentIds)}?` : 'Forget an agent? It is not clear which one.';
@@ -1710,6 +1803,8 @@ export function describeIntent(intent, ctx) {
     case 'wake': return `Wake ${machines(it.machineIds)}?`;
     case 'sleep_idle': return 'Put the idle machines to sleep?';
     case 'confirm': return it.go ? 'Go ahead?' : 'Cancel?';
+    case 'help': return 'Show what you can say?';
+    case 'connect': return 'Open Agents & keys?';
     default: return `Not sure what ${quote(it.text)} means.`;
   }
 }

@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { createServer } from '../src/server/http.mjs';
 import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
@@ -97,13 +98,13 @@ after(async () => {
 });
 
 /** A raw request: the path and headers go out exactly as given. */
-function request({ method = 'GET', path: p = '/', headers = {}, body = null, host = null } = {}) {
+function request({ method = 'GET', path: p = '/', headers = {}, body = null, host = null, at = port } = {}) {
   return new Promise((resolve, reject) => {
-    const h = { Host: host ?? `127.0.0.1:${port}`, ...headers };
+    const h = { Host: host ?? `127.0.0.1:${at}`, ...headers };
     let data = body;
     if (body != null && typeof body !== 'string' && !Buffer.isBuffer(body)) data = JSON.stringify(body);
     if (data != null) h['Content-Length'] = Buffer.byteLength(data);
-    const req = http.request({ host: '127.0.0.1', port, method, path: p, headers: h, agent: false }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port: at, method, path: p, headers: h, agent: false }, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
@@ -565,6 +566,318 @@ test('close() removes the store listeners', async () => {
   assert.throws(() => createServer({ engine: new FakeEngine(s), store: s, token: 'short' }), /32 random bytes/);
 });
 
+// ------------------------------------------------------------------ Agents & keys
+
+/** A key-shaped value made at run time, so no fixture looks like a real key to a scanner. */
+const fakeKey = (...parts) => [...parts, crypto.randomBytes(16).toString('hex')].join('');
+
+/** A stand-in for src/core/connect.mjs: records calls, never holds a value in what it reports. */
+class FakeConnect extends EventEmitter {
+  constructor() {
+    super();
+    this.calls = [];
+    this.fail = null; // an error the next action throws
+    this.github = { connected: false, login: null, agentsUseIt: false, sentence: 'Not connected.' };
+  }
+  act(name, ...args) {
+    this.calls.push([name, ...args]);
+    if (this.fail) { const e = this.fail; this.fail = null; throw e; }
+  }
+  async status(o) {
+    this.calls.push(['status', o]);
+    return {
+      agents: [
+        { id: 'claude', name: 'Claude Code', found: true, version: '2.1.322', from: 'your PATH', signedIn: 'yes', how: 'your Claude subscription', ready: true, isDefault: true,
+          sentence: 'Claude Code 2.1.322 is ready, signed in with your Claude subscription.', actions: ['key', 'recheck', 'default'] },
+        { id: 'codex', name: 'Codex', found: false, version: null, from: null, signedIn: 'unknown', how: null, ready: false, isDefault: false, sentence: 'Codex is not installed.', actions: ['install', 'recheck'] },
+      ],
+      defaultAgent: 'claude', platform: 'darwin', canOpenTerminal: true,
+      git: { name: 'Ada Lovelace', email: 'ada@example.invalid', sentence: 'Merging needs these.' },
+      github: this.github,
+      keys: [{ id: 'k1a2b3', preset: 'aws', label: 'AWS', vars: [{ name: 'AWS_ACCESS_KEY_ID', shown: '•••• 7QXA' }], scope: { kind: 'all' }, agents: 'all', created: 1, sentence: 'AWS for all repositories, given to all agents.' }],
+      ready: true,
+    };
+  }
+  async recheck() { this.act('recheck'); }
+  async agentAction(id, action) {
+    this.act('agentAction', id, action);
+    return action === 'install' ? { opened: true, sentence: 'Terminal is installing Codex.' } : { command: 'codex login', sentence: 'Run this in a terminal to sign in to Codex.' };
+  }
+  async setAgentKey(id, value) { this.act('setAgentKey', id, value); return { ok: true, sentence: 'Claude Code will use this key instead of your Claude subscription, and each request is billed to the key.' }; }
+  async setDefaultAgent(id) { this.act('setDefaultAgent', id); return { ok: true, sentence: 'New work goes to Claude Code.' }; }
+  async setGitIdentity(o) { this.act('setGitIdentity', o); }
+  async connectGithub(token, o) {
+    this.act('connectGithub', token, o);
+    this.github = { connected: true, login: 'octocat', agentsUseIt: !!o?.agentsUseIt, sentence: 'Connected to GitHub as octocat.' };
+    return { ok: true, login: 'octocat', sentence: 'Connected to GitHub as octocat.' };
+  }
+  async disconnectGithub() { this.act('disconnectGithub'); return { ok: true }; }
+  async addKey(o) { this.act('addKey', o); return { id: 'k9f8e7' }; }
+  async removeKey(id) { this.act('removeKey', id); return { removed: id === 'k1a2b3' }; }
+  envFor() { return {}; }
+  mask(t) { return t; }
+}
+
+/** The presets of src/shared/keypresets.mjs that the route needs, as the spec gives them. */
+const FAKE_PRESETS = {
+  presetById(id) {
+    return {
+      aws: { id: 'aws', label: 'AWS', fields: [
+        { name: 'AWS_ACCESS_KEY_ID', secret: true }, { name: 'AWS_SECRET_ACCESS_KEY', secret: true },
+        { name: 'AWS_SESSION_TOKEN', secret: true, optional: true }, { name: 'AWS_REGION', secret: false, optional: true }] },
+      openai: { id: 'openai', label: 'OpenAI', fields: [{ name: 'OPENAI_API_KEY', secret: true, also: ['CODEX_API_KEY'] }] },
+      custom: { id: 'custom', label: 'Custom', fields: [] },
+    }[id] ?? null;
+  },
+};
+
+/** A Workbench with Agents & keys: its own server, engine, connect and log. */
+async function connectServer(t, { presets = FAKE_PRESETS, mode = 'live', repoRoot = '/work/shop' } = {}) {
+  const s = new Store();
+  const e = new FakeEngine(s);
+  e.mode = mode;
+  e.connectSummary = { ready: false, defaultAgent: null };
+  const snapshot = e.snapshot.bind(e);
+  e.snapshot = () => ({ ...snapshot(), connect: e.connectSummary });
+  const connect = new FakeConnect();
+  const lines = [];
+  const log = { info() {}, debug() {}, warn: (...a) => lines.push(a.join(' ')), error: (...a) => lines.push(a.join(' ')) };
+  // presets: a stand-in for src/shared/keypresets.mjs, or null for "it could not be read".
+  const srv = createServer({ engine: e, store: s, token: TOKEN, connect, repoRoot, port: 0, rootDir: ROOT, log,
+    options: { coalesceMs: 40, pingMs: 60_000, keyPresets: presets } });
+  const { url } = await srv.listen();
+  t.after(() => srv.close());
+  const at = Number(new URL(url).port);
+  const send = (p, body, headers = {}) => request({ at, method: 'POST', path: p, body, headers: auth({ 'Content-Type': 'application/json', ...headers }) });
+  const get = (p, headers = auth()) => request({ at, path: p, headers });
+  return { srv, engine: e, connect, lines, at, send, get };
+}
+
+test('Agents & keys: without the connect service (the demo), every route says so plainly', async () => {
+  assert.equal((await request({ path: '/api/connect' })).status, 401, 'the token first');
+  const r = await request({ path: '/api/connect', headers: auth() });
+  assert.equal(r.status, 404);
+  assert.equal(r.json.error, 'Agents & keys is not available in this Workbench. The details are in its log.');
+  engine.mode = 'demo';
+  try {
+    for (const [method, p] of [['GET', '/api/connect'], ['POST', '/api/connect/recheck'], ['POST', '/api/connect/keys'], ['POST', '/api/connect/agents/claude/key']]) {
+      const res = method === 'GET' ? await request({ path: p, headers: auth() }) : await post(p, { value: 'x' });
+      assert.equal(res.status, 404, p);
+      assert.equal(res.json.error, 'The demo’s agents are simulated, so there is nothing to connect. Run Workbench on a repository to connect your own agents and keys.', p);
+    }
+  } finally {
+    delete engine.mode;
+  }
+});
+
+test('Agents & keys: the status, a re-check, and the token, method and origin checks every route has', async (t) => {
+  const w = await connectServer(t);
+  const r = await w.get('/api/connect');
+  assert.equal(r.status, 200);
+  assert.equal(r.headers['cache-control'], 'no-store');
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.sentence, null);
+  assert.equal(r.json.status.agents[0].sentence, 'Claude Code 2.1.322 is ready, signed in with your Claude subscription.');
+  assert.deepEqual(w.connect.calls, [['status', { repoRoot: '/work/shop' }]], 'the status of the repository Workbench runs on');
+  assert.equal((await w.get(`/api/connect?t=${TOKEN}`, {})).status, 200, 'a GET may carry the key in the address');
+  // A re-check probes again, then answers with what is connected now.
+  w.connect.calls.length = 0;
+  const again = await w.send('/api/connect/recheck', {});
+  assert.equal(again.status, 200);
+  assert.deepEqual(w.connect.calls.map(c => c[0]), ['recheck', 'status']);
+  assert.equal(again.json.status.ready, true);
+  // The same checks as every other route.
+  assert.equal((await w.get('/api/connect', {})).status, 401);
+  assert.equal((await w.get('/api/connect', { 'X-Workbench-Token': hookTokenFor('abc123') })).status, 401, 'a hook token never opens /api');
+  assert.equal((await request({ at: w.at, method: 'POST', path: `/api/connect/recheck?t=${TOKEN}`, body: {}, headers: { 'Content-Type': 'application/json' } })).status, 401);
+  assert.equal((await w.send('/api/connect/recheck', {}, { Origin: 'http://evil.example' })).status, 403);
+  assert.equal((await w.send('/api/connect/recheck', '{"a":1}', { 'Content-Type': 'text/plain' })).status, 415);
+  const wrong = await w.get('/api/connect/recheck');
+  assert.equal(wrong.status, 405);
+  assert.equal(wrong.headers.allow, 'POST');
+  assert.equal((await w.send('/api/connect', {})).status, 405);
+  for (const p of ['/api/connect/agents/claude/uninstall', '/api/connect/agents/Claude/install', '/api/connect/agents/a%2Fb/key', '/api/connect/agents/-x/default',
+    '/api/connect/keys/a:b/remove', '/api/connect/nothing']) {
+    assert.equal((await w.send(p, {})).status, 404, p);
+  }
+});
+
+test('Agents & keys: each route calls the connect service with what the page sent, and answers with a fresh status', async (t) => {
+  const w = await connectServer(t);
+  const key = fakeKey('sk', '-ant-', 'api03-');
+  const ghToken = fakeKey('gh', 'p_');
+  const install = await w.send('/api/connect/agents/codex/install', {});
+  assert.deepEqual({ ok: install.json.ok, opened: install.json.opened, sentence: install.json.sentence, command: install.json.command },
+    { ok: true, opened: true, sentence: 'Terminal is installing Codex.', command: undefined });
+  const signin = await w.send('/api/connect/agents/codex/signin', {});
+  assert.deepEqual({ opened: signin.json.opened, command: signin.json.command, sentence: signin.json.sentence },
+    { opened: false, command: 'codex login', sentence: 'Run this in a terminal to sign in to Codex.' });
+  const keyed = await w.send('/api/connect/agents/claude/key', { value: `  ${key}\n` });
+  assert.equal(keyed.status, 200);
+  assert.equal(keyed.json.sentence, 'Claude Code will use this key instead of your Claude subscription, and each request is billed to the key.');
+  await w.send('/api/connect/agents/claude/default', { value: 'ignored' });
+  const git = await w.send('/api/connect/git', { name: '  Ada Lovelace ', email: 'ada@example.invalid' });
+  assert.equal(git.json.sentence, 'Git now has your name and email.', 'a plain sentence when Connect gives none');
+  await w.send('/api/connect/git', { name: { toString: 'x' }, email: ['a'] });
+  const gh = await w.send('/api/connect/github', { token: ghToken, agentsUseIt: 'yes' });
+  assert.deepEqual({ login: gh.json.login, sentence: gh.json.sentence, github: gh.json.status.github },
+    { login: 'octocat', sentence: 'Connected to GitHub as octocat.', github: { connected: true, login: 'octocat', agentsUseIt: false, sentence: 'Connected to GitHub as octocat.' } });
+  await w.send('/api/connect/github', { token: ghToken, agentsUseIt: true });
+  const off = await w.send('/api/connect/github/disconnect', {});
+  assert.equal(off.json.sentence, 'Workbench is no longer connected to GitHub.');
+  const gone = await w.send('/api/connect/keys/k1a2b3/remove', {});
+  assert.equal(gone.json.sentence, 'Removed the key.');
+  assert.equal((await w.send('/api/connect/keys/k000000/remove', {})).json.sentence, 'That key was already gone.');
+  assert.deepEqual(w.connect.calls.filter(c => c[0] !== 'status'), [
+    ['agentAction', 'codex', 'install'],
+    ['agentAction', 'codex', 'signin'],
+    ['setAgentKey', 'claude', key],
+    ['setDefaultAgent', 'claude'],
+    ['setGitIdentity', { name: 'Ada Lovelace', email: 'ada@example.invalid' }],
+    ['setGitIdentity', { name: '', email: '' }],
+    ['connectGithub', ghToken, { agentsUseIt: false }],
+    ['connectGithub', ghToken, { agentsUseIt: true }],
+    ['disconnectGithub'],
+    ['removeKey', 'k1a2b3'],
+    ['removeKey', 'k000000'],
+  ]);
+  // Every action answered with the status as it is after it.
+  assert.equal(w.connect.calls.filter(c => c[0] === 'status').length, 11);
+  // A key or a token missing: refused before Connect hears of it.
+  w.connect.calls.length = 0;
+  for (const [p, body, said] of [['/api/connect/agents/claude/key', {}, 'Paste the key first.'], ['/api/connect/agents/claude/key', { value: '   ' }, 'Paste the key first.'],
+    ['/api/connect/agents/claude/key', { value: 42 }, 'Paste the key first.'], ['/api/connect/github', { agentsUseIt: true }, 'Paste the code GitHub made for you first.']]) {
+    const r = await w.send(p, body);
+    assert.equal(r.status, 400, p);
+    assert.equal(r.json.error, said, p);
+  }
+  assert.deepEqual(w.connect.calls, []);
+});
+
+test('Agents & keys: a new key gets its secret names from the preset, never from the page, and "this repository" from Workbench', async (t) => {
+  const w = await connectServer(t);
+  const id = fakeKey('AK', 'IA').slice(0, 20).toUpperCase();
+  const secret = fakeKey('wJal', 'rXUtnFEMI/');
+  const added = await w.send('/api/connect/keys', {
+    preset: 'aws', label: 'AWS', scope: 'repo', root: '/somewhere/else', agents: ['claude', 'codex', 'claude'],
+    values: { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: ` ${secret}\n`, AWS_SESSION_TOKEN: '', AWS_REGION: 'eu-west-1' },
+    secretNames: [],
+  });
+  assert.equal(added.status, 200);
+  assert.equal(added.json.sentence, 'Saved AWS, for this repository.');
+  const openai = fakeKey('sk', '-proj-');
+  await w.send('/api/connect/keys', { preset: 'openai', values: { OPENAI_API_KEY: openai } });
+  await w.send('/api/connect/keys', { preset: 'custom', label: 'Sentry', scope: 'all', agents: 'all', values: { SENTRY_DSN: 'https://sentry.example/1', SENTRY_ENV: 'prod' } });
+  assert.deepEqual(w.connect.calls.filter(c => c[0] === 'addKey').map(c => c[1]), [
+    { preset: 'aws', label: 'AWS', values: { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, AWS_REGION: 'eu-west-1' },
+      secretNames: ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'], scope: { kind: 'repo', root: '/work/shop' }, agents: ['claude', 'codex'] },
+    { preset: 'openai', label: 'OpenAI', values: { OPENAI_API_KEY: openai, CODEX_API_KEY: openai },
+      secretNames: ['OPENAI_API_KEY', 'CODEX_API_KEY'], scope: { kind: 'all' }, agents: 'all' },
+    { preset: 'custom', label: 'Sentry', values: { SENTRY_DSN: 'https://sentry.example/1', SENTRY_ENV: 'prod' },
+      secretNames: ['SENTRY_DSN', 'SENTRY_ENV'], scope: { kind: 'all' }, agents: 'all' },
+  ]);
+  for (const r of [added]) assert.ok(!r.text.includes(secret) && !r.text.includes(id), 'no value comes back');
+  // What a preset does not take, or leaves out, is refused in plain words, before the key store hears of it.
+  w.connect.calls.length = 0;
+  for (const [body, said] of [
+    [{ preset: 'aws', values: { AWS_ACCESS_KEY_ID: id } }, 'Fill in AWS_SECRET_ACCESS_KEY.'],
+    [{ preset: 'aws', values: { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, PATH: '/tmp' } }, 'AWS keys take only AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN and AWS_REGION.'],
+    [{ preset: 'nope', values: { A_B: secret } }, 'Workbench does not know that kind of key.'],
+    [{ preset: 'Bad Preset!', values: { A_B: secret } }, 'Choose what kind of key this is.'],
+    [{ preset: 'custom', values: [secret] }, 'Fill in the key first.'],
+    [{ preset: 'custom', values: { A_B: '  ' } }, 'Fill in the key first.'],
+    [{ preset: 'custom', values: { A_B: 7 } }, 'Each value must be text.'],
+    [{ preset: 'custom', values: { '1ABC': secret } }, 'A name may have only letters, digits and _, and may not start with a digit.'],
+    [{ preset: 'custom', values: { 'A B': secret } }, 'A name may have only letters, digits and _, and may not start with a digit.'],
+    [{ preset: 'custom', values: JSON.parse(`{"__proto__": "${secret}"}`) }, 'A name may have only letters, digits and _, and may not start with a digit.'],
+    [{ preset: 'custom', values: { A_B: secret }, scope: 'everywhere' }, 'Choose this repository or all repositories.'],
+    [{ preset: 'custom', values: { A_B: secret }, agents: [] }, 'Choose which agents get the key.'],
+    [{ preset: 'custom', values: { A_B: secret }, agents: ['claude', '../x'] }, 'Choose which agents get the key.'],
+    [{ preset: 'custom', values: { A_B: secret }, agents: 'some' }, 'Choose which agents get the key.'],
+  ]) {
+    const r = await w.send('/api/connect/keys', body);
+    assert.equal(r.status, 400, JSON.stringify(body.values));
+    assert.equal(r.json.error, said);
+    assert.ok(!r.text.includes(secret));
+  }
+  assert.deepEqual(w.connect.calls, []);
+});
+
+test('Agents & keys: when the kinds of key cannot be read, every value is kept as a secret; with no repository, a key is for all of them', async (t) => {
+  const id = 'AKIA' + crypto.randomBytes(8).toString('hex').toUpperCase();
+  const w = await connectServer(t, { presets: null });
+  const r = await w.send('/api/connect/keys', { preset: 'aws', values: { AWS_REGION: 'eu-west-1', AWS_ACCESS_KEY_ID: id } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(w.connect.calls.find(c => c[0] === 'addKey')[1], {
+    preset: 'aws', label: 'Key', values: { AWS_REGION: 'eu-west-1', AWS_ACCESS_KEY_ID: id }, secretNames: ['AWS_REGION', 'AWS_ACCESS_KEY_ID'], scope: { kind: 'all' }, agents: 'all',
+  });
+  // The engine's repository is "this repository" when the server was given none; with neither, there is none.
+  const engineRoot = await connectServer(t, { repoRoot: null });
+  engineRoot.engine.repoInfo = { root: '/work/from-engine' };
+  await engineRoot.send('/api/connect/keys', { preset: 'custom', scope: 'repo', values: { A_B: fakeKey('x') } });
+  assert.deepEqual(engineRoot.connect.calls.find(c => c[0] === 'addKey')[1].scope, { kind: 'repo', root: '/work/from-engine' });
+  const none = await connectServer(t, { repoRoot: null });
+  const refused = await none.send('/api/connect/keys', { preset: 'custom', scope: 'repo', values: { A_B: fakeKey('x') } });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.json.error, 'Workbench is not working on a repository, so the key can only be for all repositories.');
+  assert.ok(!none.connect.calls.some(c => c[0] === 'addKey'));
+  assert.deepEqual(none.connect.calls.filter(c => c[0] === 'status'), []);
+  assert.deepEqual((await none.get('/api/connect')).json.ok, true);
+  assert.deepEqual(none.connect.calls.find(c => c[0] === 'status'), ['status', { repoRoot: null }]);
+});
+
+test('Agents & keys: refusals come back in plain words; anything else is logged without the key, and the person reads only that it failed', async (t) => {
+  const w = await connectServer(t);
+  const key = fakeKey('sk', '-ant-', 'api03-');
+  // A refusal from Connect or the key store: its sentence, never its detail.
+  w.connect.fail = Object.assign(new Error('That key is longer than 2000 characters, so Workbench cannot keep it.'), { why: 'value', detail: 'security: SecKeychainItemCreateFromContent: The specified item already exists.' });
+  const refused = await w.send('/api/connect/agents/claude/key', { value: key });
+  assert.equal(refused.status, 400);
+  assert.deepEqual(refused.json, { error: 'That key is longer than 2000 characters, so Workbench cannot keep it.' });
+  // A refusal that repeats what was sent: the key is cut out.
+  w.connect.fail = Object.assign(new Error(`GitHub did not accept ${key}.`), { why: 'github' });
+  const echoed = await w.send('/api/connect/github', { token: key });
+  assert.equal(echoed.json.error, 'GitHub did not accept ••••.');
+  // A crash: a generic sentence for the person, and a log line without the key.
+  w.connect.fail = new TypeError(`Cannot read properties of undefined (reading '${key}')`);
+  const crash = await w.send('/api/connect/agents/claude/key', { value: key });
+  assert.equal(crash.status, 500);
+  assert.equal(crash.json.error, 'Something went wrong in the workbench. The details are in its log.');
+  assert.equal(w.lines.length, 1);
+  assert.match(w.lines[0], /^Agents & keys could not do that: TypeError: Cannot read properties of undefined \(reading '••••'\)/);
+  for (const r of [refused, echoed, crash]) assert.ok(!r.text.includes(key));
+  assert.ok(!w.lines.join('\n').includes(key));
+  // A body over 16 KB is refused before anyone reads it.
+  const big = await w.send('/api/connect/agents/claude/key', { value: 'x'.repeat(17 * 1024) });
+  assert.equal(big.status, 413);
+  assert.equal(big.json.error, 'The request is too large. The limit is 16 KB.');
+  assert.ok(!w.connect.calls.some(c => c[0] === 'setAgentKey' && c[2].length > 16 * 1024));
+});
+
+test('Agents & keys: when what is ready changes, every page gets one fresh snapshot; nothing when nothing changed', async (t) => {
+  const w = await connectServer(t);
+  const sse = await openSse(`/api/stream?t=${TOKEN}`, w.at);
+  try {
+    assert.deepEqual((await sse.next('snapshot')).data.connect, { ready: false, defaultAgent: null });
+    // A re-check found Claude Code: Connect says so twice in a burst; pages hear once.
+    w.engine.connectSummary = { ready: true, defaultAgent: 'claude' };
+    w.connect.emit('agents', { claude: { ok: true }, codex: { ok: false } });
+    w.connect.emit('changed');
+    assert.deepEqual((await sse.next('snapshot')).data.connect, { ready: true, defaultAgent: 'claude' });
+    await new Promise(r => setTimeout(r, 150));
+    assert.equal(sse.pending.filter(e => e.event === 'snapshot').length, 0, 'one snapshot for the burst');
+    // A key was added: nothing the board shows changed, so no snapshot.
+    w.connect.emit('changed');
+    await new Promise(r => setTimeout(r, 150));
+    assert.equal(sse.pending.filter(e => e.event === 'snapshot').length, 0);
+  } finally {
+    sse.close();
+  }
+  await w.srv.close();
+  assert.equal(w.connect.listenerCount('agents'), 0);
+  assert.equal(w.connect.listenerCount('changed'), 0);
+});
+
 // ------------------------------------------------------------------ helpers
 
 async function waitFor(fn, timeout = 2000) {
@@ -576,10 +889,10 @@ async function waitFor(fn, timeout = 2000) {
 }
 
 /** A tiny SSE client that records events and comments. */
-function openSse(p) {
+function openSse(p, at = port) {
   return new Promise((resolve, reject) => {
     const events = [];
-    const req = http.request({ host: '127.0.0.1', port, path: p, agent: false, headers: { Host: `127.0.0.1:${port}`, Accept: 'text/event-stream' } }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port: at, path: p, agent: false, headers: { Host: `127.0.0.1:${at}`, Accept: 'text/event-stream' } }, (res) => {
       let buf = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => {

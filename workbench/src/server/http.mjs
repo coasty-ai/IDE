@@ -1,7 +1,8 @@
 // The local web server: the UI files, a JSON API, a Server-Sent Events stream, and the
 // PreToolUse hook endpoint. It listens on 127.0.0.1 only and checks, on every request it must:
 // the Host header, a 32-byte token compared in constant time (on the hook route, also the asking
-// agent's own hook token), and for POSTs the Origin, the JSON content type and a 64 KB body limit.
+// agent's own hook token), and for POSTs the Origin, the JSON content type and a 64 KB body limit
+// (16 KB on the Agents & keys routes, which carry keys: never echoed, never logged, never in a URL).
 // A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
 import http from 'node:http';
 import fs from 'node:fs';
@@ -12,6 +13,12 @@ import { fileURLToPath } from 'node:url';
 import { STATE } from '../shared/states.mjs';
 
 const MAX_BODY = 64 * 1024;
+const MAX_CONNECT_BODY = 16 * 1024; // Agents & keys: a few keys of at most 2000 characters each
+const CONNECT_ID_RE = /^[a-z][a-z0-9-]{0,39}$/; // an agent or a key preset, as Workbench names them
+const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/; // a variable's name (the key store refuses the dangerous ones)
+/** What the Agents & keys routes answer when this Workbench has no connect service. */
+const NO_CONNECT_DEMO = 'The demo’s agents are simulated, so there is nothing to connect. Run Workbench on a repository to connect your own agents and keys.';
+const NO_CONNECT = 'Agents & keys is not available in this Workbench. The details are in its log.';
 const DRAIN_LIMIT = 1024 * 1024;   // read and discard at most this much of an oversized body
 const SSE_MAX_BUFFER = 8 * 1024 * 1024;
 const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -85,6 +92,34 @@ function makeLog(log) {
   };
 }
 
+/** Every string of 8 or more characters a request carried as a key, so no answer or log line can repeat one. */
+function secretsIn(body) {
+  const out = [];
+  const add = (v) => { if (typeof v === 'string' && v.trim().length >= 8) out.push(v, v.trim()); };
+  add(body?.value);
+  add(body?.token);
+  if (body?.values && typeof body.values === 'object') for (const v of Object.values(body.values)) add(v);
+  return [...new Set(out)].sort((a, b) => b.length - a.length);
+}
+
+/** "A, B and C". */
+function joinAnd(parts) {
+  return parts.length <= 1 ? parts.join('') : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/** The text with each of `secrets` replaced by "••••". */
+function redact(text, secrets) {
+  let s = String(text ?? '');
+  for (const v of secrets) s = s.split(v).join('••••');
+  return s;
+}
+
+/** An error whose message is a plain sentence for the person: ours, or a connect or key-store refusal (`.why`). */
+function isPlainError(err) {
+  return !!err && typeof err.message === 'string' && err.message.trim() !== ''
+    && (err instanceof HttpError || typeof err.why === 'string' || err.plain === true || err.expose === true);
+}
+
 /**
  * @param {object} opts
  * @param {object} opts.engine     the Engine (or a fake with the same methods)
@@ -92,14 +127,18 @@ function makeLog(log) {
  * @param {string} opts.token      32 random bytes as hex; needed by every /api and /hook route
  * @param {(agentId: string) => string} [opts.hookTokenFor] each agent's own hook token (64 hex characters); it opens
  *        /hook/pretool for that one agent only, and never /api
+ * @param {object} [opts.connect]  the connect service (src/core/connect.mjs) for the Agents & keys routes; without it
+ *        (the demo) they answer 404 with a plain sentence
+ * @param {string} [opts.repoRoot] the repository's folder, for keys kept for "this repository" (else the engine's)
  * @param {number} [opts.port]     0 picks a free port
  * @param {string} [opts.host]     always 127.0.0.1
  * @param {string} [opts.rootDir]  folder that holds ui/ and src/shared/
  * @param {object} [opts.log]
- * @param {object} [opts.options]  { coalesceMs = 250, pingMs = 15000, requestTimeoutMs, checkIntervalMs } (tests shorten these)
+ * @param {object} [opts.options]  { coalesceMs = 250, pingMs = 15000, requestTimeoutMs, checkIntervalMs } (tests shorten these),
+ *        and keyPresets: a stand-in for src/shared/keypresets.mjs ({ presetById }), for tests
  * @returns {{ listen(): Promise<{ url: string }>, close(): Promise<void>, readonly url: string|null, readonly port: number|null }}
  */
-export function createServer({ engine, store, token, hookTokenFor = null, port = 4317, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
+export function createServer({ engine, store, token, hookTokenFor = null, connect = null, repoRoot = null, port = 4317, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
   if (!engine) throw new Error('The server needs the engine.');
   if (typeof token !== 'string' || !/^[0-9a-f]{64}$/i.test(token)) {
     throw new Error('The server token must be 32 random bytes written as hex.');
@@ -145,12 +184,13 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     return boundPort != null && (h === `127.0.0.1:${boundPort}` || h === `localhost:${boundPort}`);
   }
 
-  /** Read the body as JSON: at most 64 KB, an object, or empty (treated as {}). */
-  function readJson(req) {
+  /** Read the body as JSON: at most `limit` bytes (64 KB unless the route says less), an object, or empty (treated as {}). */
+  function readJson(req, limit = MAX_BODY) {
     return new Promise((resolve, reject) => {
+      const tooLarge = () => new HttpError(413, `The request is too large. The limit is ${Math.round(limit / 1024)} KB.`);
       const declared = Number(req.headers['content-length']);
       if (Number.isFinite(declared) && declared > DRAIN_LIMIT) {
-        reject(new HttpError(413, 'The request is too large. The limit is 64 KB.'));
+        reject(tooLarge());
         req.resume();
         return;
       }
@@ -159,11 +199,11 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
       let tooBig = false;
       req.on('data', (chunk) => {
         size += chunk.length;
-        if (size > MAX_BODY) {
+        if (size > limit) {
           // Keep reading so the client gets the 413 instead of a reset connection.
           tooBig = true;
           if (size > DRAIN_LIMIT) {
-            reject(new HttpError(413, 'The request is too large. The limit is 64 KB.'));
+            reject(tooLarge());
             req.destroy();
           }
           return;
@@ -171,7 +211,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
         chunks.push(chunk);
       });
       req.on('end', () => {
-        if (tooBig) return reject(new HttpError(413, 'The request is too large. The limit is 64 KB.'));
+        if (tooBig) return reject(tooLarge());
         const text = Buffer.concat(chunks).toString('utf8').trim();
         if (!text) return resolve({});
         let body;
@@ -300,6 +340,30 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     store.on('removed', onRemoved);
     store.on('repo', onRepo);
   }
+  // Agents & keys found an agent, or lost one, or the default changed: the snapshot's harnesses and connect summary say
+  // so (the top band's light, the lid). Every page gets a fresh snapshot, once per burst, and only when they changed.
+  let connectTimer = null;
+  let connectSeen = null; // those parts of the last snapshot a page was sent
+  const connectPart = (snap) => {
+    try { return JSON.stringify([snap?.harnesses ?? null, snap?.harnessInfo ?? null, snap?.connect ?? null, snap?.meta?.connect ?? null]); } catch { return null; }
+  };
+  const onConnect = () => {
+    if (!clients.size || connectTimer) return;
+    connectTimer = setTimeout(() => {
+      connectTimer = null;
+      let snap;
+      try { snap = engine.snapshot(); } catch (err) { L.error('Snapshot failed:', err); return; }
+      const seen = connectPart(snap);
+      if (seen !== null && seen === connectSeen) return;
+      connectSeen = seen;
+      broadcast('snapshot', snap);
+    }, coalesceMs);
+    connectTimer.unref?.();
+  };
+  if (connect?.on) {
+    connect.on('agents', onConnect);
+    connect.on('changed', onConnect);
+  }
 
   function openStream(req, res) {
     req.socket.setTimeout(0);
@@ -314,6 +378,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     let snap;
     try { snap = engine.snapshot(); } catch (err) { L.error('Snapshot failed:', err); snap = {}; }
     res.write('retry: 2000\n\n' + frame('snapshot', snap));
+    connectSeen = connectPart(snap);
     clients.add(res);
     if (!pingTimer) {
       pingTimer = setInterval(() => { for (const c of clients) write(c, ': ping\n\n'); }, pingMs);
@@ -369,7 +434,154 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/stop$/, run: (b, m) => engine.stop(id(m[1])) },
     { method: 'POST', re: /^\/api\/machines\/([^/]+)\/awake$/, run: (b, m) => engine.setMachineAwake(id(m[1]), b.awake === true) },
     { method: 'POST', re: /^\/hook\/pretool$/, hook: true },
+    // Agents & keys. Each answers { ok, sentence, status } with a fresh ConnectStatus (src/core/connect.mjs), or { error }
+    // with a plain sentence and a 4xx code. Keys come in the body only, and never go out again: not in an answer, not in
+    // the log. `status` never holds a key's value.
+    { method: 'GET', re: /^\/api\/connect$/, connect: true, run: () => done() },
+    { method: 'POST', re: /^\/api\/connect\/recheck$/, connect: true, run: async () => { await connect.recheck(); return done(); } },
+    {
+      // Terminal, running the vendor's own installer or sign-in (macOS); elsewhere the command, for the page to show.
+      method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/(install|signin)$/, connect: true,
+      run: async (b, m) => {
+        const r = await connect.agentAction(agentId(m[1]), m[2]);
+        return done(r, null, { opened: r?.opened === true, ...(typeof r?.command === 'string' && r.command ? { command: r.command } : {}) });
+      },
+    },
+    {
+      method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/key$/, connect: true,
+      run: async (b, m) => done(await connect.setAgentKey(agentId(m[1]), secret(b.value, 'Paste the key first.'))),
+    },
+    { method: 'POST', re: /^\/api\/connect\/agents\/([^/]+)\/default$/, connect: true, run: async (b, m) => done(await connect.setDefaultAgent(agentId(m[1]))) },
+    {
+      method: 'POST', re: /^\/api\/connect\/git$/, connect: true,
+      run: async (b) => done(await connect.setGitIdentity({ name: text(b.name), email: text(b.email) }), 'Git now has your name and email.'),
+    },
+    {
+      method: 'POST', re: /^\/api\/connect\/github$/, connect: true,
+      run: async (b) => {
+        const r = await connect.connectGithub(secret(b.token, 'Paste the code GitHub made for you first.'), { agentsUseIt: b.agentsUseIt === true });
+        return done(r, null, { login: typeof r?.login === 'string' && r.login ? r.login : null });
+      },
+    },
+    { method: 'POST', re: /^\/api\/connect\/github\/disconnect$/, connect: true, run: async () => done(await connect.disconnectGithub(), 'Workbench is no longer connected to GitHub.') },
+    { method: 'POST', re: /^\/api\/connect\/keys$/, connect: true, run: (b) => addKey(b) },
+    {
+      method: 'POST', re: /^\/api\/connect\/keys\/([^/]+)\/remove$/, connect: true,
+      run: async (b, m) => {
+        const r = await connect.removeKey(id(m[1]));
+        return done(r, r?.removed === false ? 'That key was already gone.' : 'Removed the key.');
+      },
+    },
   ];
+
+  // ------------------------------------------------------------ Agents & keys
+
+  /** The repository whose keys "this repository" means: the one Workbench was started on. Null in the demo. */
+  const rootNow = () => (typeof repoRoot === 'string' && repoRoot ? repoRoot : (typeof engine.repoInfo?.root === 'string' ? engine.repoInfo.root : null));
+  /** An agent's id from the address: claude, codex, … Connect refuses one it does not know. */
+  const agentId = (s) => {
+    const v = id(s);
+    if (!CONNECT_ID_RE.test(v)) throw new HttpError(404, 'Not found.');
+    return v;
+  };
+  /** Text from a body, or '' for anything else: an object is never turned into "[object Object]". */
+  const text = (v) => (typeof v === 'string' ? v.trim() : '');
+  /** A key from a body, trimmed (a pasted key often brings a line break with it). */
+  const secret = (v, missing) => {
+    const t = text(v);
+    if (!t) throw new HttpError(400, missing);
+    return t;
+  };
+  /** The answer to an Agents & keys request: what Connect said, and what is connected now. */
+  async function done(r = null, fallback = null, extra = {}) {
+    const said = typeof r?.sentence === 'string' && r.sentence.trim() ? r.sentence.trim() : fallback;
+    const status = await connect.status({ repoRoot: rootNow() });
+    return { ...extra, ok: r?.ok !== false, sentence: said ?? null, status };
+  }
+
+  // src/shared/keypresets.mjs, loaded on first use: { presetById } or null. Tests may give their own (options.keyPresets),
+  // or null for "it could not be read".
+  let presets = options.keyPresets === null ? null
+    : (typeof options.keyPresets?.presetById === 'function' ? options.keyPresets : undefined);
+  async function keyPresets() {
+    if (presets === undefined) {
+      presets = await import('../shared/keypresets.mjs').then((mod) => (typeof mod.presetById === 'function' ? mod : null), (err) => {
+        L.warn('Workbench could not load its kinds of key, so every value is kept as a secret:', err?.message || err);
+        return null;
+      });
+    }
+    return presets;
+  }
+
+  /**
+   * POST /api/connect/keys { preset, label, values, scope: 'all'|'repo', agents: 'all'|[ids] }. Which values are secret
+   * comes from the preset, never from the page: a field the preset marks secret, and every value of a custom key (or of
+   * any key, when the presets cannot be read). A preset's `also` names get the same value ("OPENAI_API_KEY, also
+   * CODEX_API_KEY"). Values are trimmed, and empty ones are left out. "This repository" is the one Workbench runs on.
+   */
+  async function addKey(b) {
+    const presetId = typeof b.preset === 'string' && CONNECT_ID_RE.test(b.preset) ? b.preset : null;
+    if (!presetId) throw new HttpError(400, 'Choose what kind of key this is.');
+    if (!b.values || typeof b.values !== 'object' || Array.isArray(b.values)) throw new HttpError(400, 'Fill in the key first.');
+    const values = {};
+    for (const [name, v] of Object.entries(b.values)) {
+      if (!KEY_NAME_RE.test(name) || name === '__proto__') throw new HttpError(400, 'A name may have only letters, digits and _, and may not start with a digit.');
+      if (typeof v !== 'string') throw new HttpError(400, 'Each value must be text.');
+      if (v.trim()) values[name] = v.trim();
+    }
+    const mod = await keyPresets();
+    const preset = mod ? mod.presetById(presetId) : null;
+    if (mod && !preset) throw new HttpError(400, 'Workbench does not know that kind of key.');
+    let secretNames = Object.keys(values);
+    const fields = preset && presetId !== 'custom' && Array.isArray(preset.fields) ? preset.fields : null;
+    if (fields) {
+      const alsoOf = (f) => (Array.isArray(f.also) ? f.also : []);
+      const known = new Set(fields.flatMap(f => [f.name, ...alsoOf(f)]));
+      if (Object.keys(values).some(n => !known.has(n))) {
+        throw new HttpError(400, `${preset.label || 'Those'} keys take only ${joinAnd(fields.map(f => f.name))}.`);
+      }
+      for (const f of fields) {
+        const v = values[f.name];
+        if (!v && !f.optional) throw new HttpError(400, `Fill in ${f.name}.`);
+        if (v) for (const also of alsoOf(f)) if (!values[also]) values[also] = v;
+      }
+      secretNames = fields.filter(f => f.secret).flatMap(f => [f.name, ...alsoOf(f)]).filter(n => n in values);
+    }
+    if (!Object.keys(values).length) throw new HttpError(400, 'Fill in the key first.');
+    const scope = b.scope === 'repo' ? 'repo' : (b.scope === 'all' || b.scope == null ? 'all' : null);
+    if (!scope) throw new HttpError(400, 'Choose this repository or all repositories.');
+    const root = rootNow();
+    if (scope === 'repo' && !root) throw new HttpError(400, 'Workbench is not working on a repository, so the key can only be for all repositories.');
+    const agents = b.agents === 'all' || b.agents == null ? 'all'
+      : (Array.isArray(b.agents) && b.agents.length && b.agents.length <= 20 && b.agents.every(a => typeof a === 'string' && CONNECT_ID_RE.test(a)) ? [...new Set(b.agents)] : null);
+    if (!agents) throw new HttpError(400, 'Choose which agents get the key.');
+    const label = text(b.label) || (typeof preset?.label === 'string' && preset.label) || 'Key';
+    const r = await connect.addKey({ preset: presetId, label, values, secretNames, scope: scope === 'repo' ? { kind: 'repo', root } : { kind: 'all' }, agents });
+    return done(r, `Saved ${label}, for ${scope === 'repo' ? 'this repository' : 'all repositories'}.`);
+  }
+
+  /**
+   * Run an Agents & keys route. Without the connect service (the demo), a plain 404. A refusal from Connect or the key
+   * store (an error with `.why`) is a 400 with its sentence; anything else is logged, and the person reads only that
+   * something went wrong. Whatever the request carried as a key is cut out of both.
+   */
+  async function handleConnect(res, route, body, m) {
+    if (!connect) return sendJson(res, 404, { error: engine.mode === 'demo' ? NO_CONNECT_DEMO : NO_CONNECT });
+    const secrets = secretsIn(body);
+    let out;
+    try {
+      out = await route.run(body, m);
+    } catch (err) {
+      if (isPlainError(err)) {
+        const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 400;
+        return sendJson(res, status, { error: redact(err.message, secrets) });
+      }
+      L.error('Agents & keys could not do that:', redact(err?.stack || String(err), secrets));
+      return sendJson(res, 500, { error: 'Something went wrong in the workbench. The details are in its log.' });
+    }
+    if (out && typeof out.sentence === 'string') out.sentence = redact(out.sentence, secrets);
+    return sendJson(res, 200, out ?? {});
+  }
 
   async function handleApi(req, res, url) {
     const pathname = url.pathname;
@@ -398,7 +610,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
       const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
       if (type !== 'application/json') return sendJson(res, 415, { error: 'Send JSON, with Content-Type: application/json.' });
       try {
-        body = await readJson(req);
+        body = await readJson(req, route.connect ? MAX_CONNECT_BODY : MAX_BODY);
       } catch (err) {
         if (err.status === 413) res.setHeader('Connection', 'close');
         return sendError(res, err);
@@ -411,6 +623,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
       return handleHook(req, res, body);
     }
     const m = pathname.match(route.re);
+    if (route.connect) return handleConnect(res, route, body, m);
     const result = await route.run(body, m);
     sendJson(res, 200, result ?? {});
   }
@@ -491,6 +704,9 @@ export function createServer({ engine, store, token, hookTokenFor = null, port =
     store?.off?.('repo', onRepo);
     store?.off?.('machines', onMachines);
     store?.off?.('notice', onNotice);
+    connect?.off?.('agents', onConnect);
+    connect?.off?.('changed', onConnect);
+    clearTimeout(connectTimer);
     clearTimeout(flushTimer);
     clearInterval(pingTimer);
     for (const ac of hookAborts) ac.abort();

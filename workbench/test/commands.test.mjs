@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCommand, describeIntent } from '../src/core/commands.mjs';
+import { parseCommand, describeIntent, HELP_REPLY } from '../src/core/commands.mjs';
 import { nameFromTask } from '../src/shared/narrate.mjs';
 
 // A small world like the demo seed. Asks sit on the agents, as in AgentView.
@@ -123,7 +123,8 @@ const NAMED = {
     pendingConfirm: { id: 'c11', kind: 'merge', agentId: 'ab0002' } },
 };
 
-const start = (...tasks) => ({ kind: 'start', tasks: tasks.map(([task, harness = 'claude', machine = 'laptop']) => ({ task, harness, machine })) });
+// A launch's harness is the agent the words named, or null: then the engine gives the work to the person's default agent.
+const start = (...tasks) => ({ kind: 'start', tasks: tasks.map(([task, harness = null, machine = 'laptop']) => ({ task, harness, machine })) });
 const allow = { kind: 'allow', agentId: 'a1b2c3', askId: 'ask-perm' };
 const deny = { kind: 'deny', agentId: 'a1b2c3', askId: 'ask-perm' };
 const answer = (text, agentId = 'd4e5f6', askId = 'ask-q') => ({ kind: 'answer', agentId, askId, text });
@@ -209,8 +210,8 @@ const TABLE = [
   ['start an agent that will write the release notes', 'none', start(['write the release notes'])],
   ['get codex to clean up the search index on cloud 3', 'none', start(['clean up the search index', 'codex', 'cloud-3'])],
   ['start claude in the cloud to fix the login', 'none', start(['fix the login', 'claude', 'cloud'])],
-  ['start an agent on a cloud machine to fix the login', 'none', start(['fix the login', 'claude', 'cloud'])],
-  ['start claude on the parser and codex on the docs', 'none', start(['the parser'], ['the docs', 'codex'])],
+  ['start an agent on a cloud machine to fix the login', 'none', start(['fix the login', null, 'cloud'])],
+  ['start claude on the parser and codex on the docs', 'none', start(['the parser', 'claude'], ['the docs', 'codex'])],
   ['ask codex to write tests for the parser', 'none', start(['write tests for the parser', 'codex'])],
   ['i want codex to write tests for the parser', 'none', start(['write tests for the parser', 'codex'])],
   ['fix the login redirect using codex', 'none', start(['fix the login redirect', 'codex'])],
@@ -324,7 +325,7 @@ const TABLE = [
   ['go ahead', 'none', { kind: 'unknown', text: 'go ahead' }],
   ['cancel', 'onboarding', { kind: 'unknown', text: 'cancel' }],
   ['fix it', 'none', { kind: 'unknown', text: 'fix it' }],
-  ['start codex', 'none', { kind: 'unknown', text: 'start codex' }],
+  ['start the agent', 'none', { kind: 'unknown', text: 'start the agent' }], // one that exists: no new launch
   ['why is the build slow', 'none', { kind: 'unknown', text: 'why is the build slow' }],
   ['', 'none', { kind: 'unknown', text: '' }],
   ['um uh', 'none', { kind: 'unknown', text: 'um uh' }],
@@ -510,7 +511,7 @@ test('a short reply goes to the helper that waits when its root is focused', () 
 
 test('the default machine is the laptop from ctx, or "laptop" when there is none', () => {
   const custom = { agents: [], machines: [{ id: 'mbp', name: 'Your laptop', kind: 'laptop' }] };
-  assert.deepEqual(parseCommand('start an agent to fix the login', custom), start(['fix the login', 'claude', 'mbp']));
+  assert.deepEqual(parseCommand('start an agent to fix the login', custom), start(['fix the login', null, 'mbp']));
   assert.deepEqual(parseCommand('start an agent to fix the login', {}), start(['fix the login']));
 });
 
@@ -526,18 +527,24 @@ test('parseCommand never throws on odd input', () => {
 });
 
 test('describeIntent writes plain confirm sentences', () => {
-  assert.equal(describeIntent(start(['fix the flaky checkout test']), CTX.none), 'Start Claude on “fix the flaky checkout test”?');
+  assert.equal(describeIntent(start(['fix the flaky checkout test', 'claude']), CTX.none), 'Start Claude on “fix the flaky checkout test”?');
+  // No agent named: the engine gives the work to the person's default agent, and names it on its own card.
+  assert.equal(describeIntent(start(['fix the flaky checkout test']), CTX.none), 'Start an agent on “fix the flaky checkout test”?');
+  assert.equal(describeIntent(start(['the parser bug'], ['the parser bug']), CTX.none), 'Start two agents on “the parser bug”?');
+  assert.equal(describeIntent(start(['the parser'], ['the docs', 'codex']), CTX.none), 'Start an agent on “the parser” and Codex on “the docs”?');
   assert.equal(describeIntent(start(['the checkout bug', 'claude', 'cloud'], ['the checkout bug', 'codex', 'cloud']), CTX.none),
     'Start Claude and Codex on “the checkout bug”, each on a cloud machine?');
   // straight from parsing, and without any context at all
   assert.equal(describeIntent(parseCommand('start Claude and Codex on the checkout bug, each on its own cloud machine', CTX.none), CTX.none),
     'Start Claude and Codex on “the checkout bug”, each on a cloud machine?');
-  assert.equal(describeIntent(start(['fix the flaky checkout test'])), 'Start Claude on “fix the flaky checkout test”?');
+  assert.equal(describeIntent(start(['fix the flaky checkout test', 'claude'])), 'Start Claude on “fix the flaky checkout test”?');
   assert.equal(describeIntent(start(['the parser bug', 'codex'], ['the parser bug', 'codex']), CTX.none), 'Start two Codex agents on “the parser bug”?');
-  assert.equal(describeIntent(start(['the parser'], ['the docs', 'codex']), CTX.none), 'Start Claude on “the parser” and Codex on “the docs”?');
+  assert.equal(describeIntent(start(['the parser', 'claude'], ['the docs', 'codex']), CTX.none), 'Start Claude on “the parser” and Codex on “the docs”?');
   assert.equal(describeIntent(start(['clean up the search index', 'codex', 'cloud-3']), CTX.none), 'Start Codex on “clean up the search index” on Cloud 3?');
   assert.equal(describeIntent(start(['fix the login', 'claude', 'cloud']), CTX.none), 'Start Claude on “fix the login” on a cloud machine?');
-  assert.equal(describeIntent({ kind: 'task', task: 'fix the login redirect' }, CTX.none), 'Start Claude on “fix the login redirect”?');
+  assert.equal(describeIntent({ kind: 'task', task: 'fix the login redirect' }, CTX.none), 'Start an agent on “fix the login redirect”?');
+  assert.equal(describeIntent({ kind: 'help' }), 'Show what you can say?');
+  assert.equal(describeIntent({ kind: 'connect' }), 'Open Agents & keys?');
   assert.equal(describeIntent({ kind: 'stop', agentIds: ['0a0b0c', 'd4e5f6'] }, CTX.none), 'Stop Flaky test and Search cleanup?');
   assert.equal(describeIntent({ kind: 'stop_all' }), 'Stop every agent?');
   assert.equal(describeIntent({ kind: 'say', agentId: 'd4e5f6', text: 'keep the old route' }, CTX.none), 'Tell Search cleanup “keep the old route”?');
@@ -559,7 +566,7 @@ test('describeIntent writes plain confirm sentences', () => {
 test('a stop verb that matches no agent is a work request; a name still stops at once', () => {
   assert.deepEqual(parseCommand('stop the flaky test from timing out', { agents: [] }), { kind: 'task', task: 'stop the flaky test from timing out' });
   assert.equal(describeIntent(parseCommand('stop the flaky test from timing out', { agents: [] }), { agents: [] }),
-    'Start Claude on “stop the flaky test from timing out”?');
+    'Start an agent on “stop the flaky test from timing out”?');
   assert.deepEqual(parseCommand('stop it', { agents: [] }), { kind: 'stop', agentIds: [] });
   assert.deepEqual(parseCommand('stop', { agents: [] }), { kind: 'stop', agentIds: [] });
   assert.deepEqual(parseCommand('stop the onboarding agent', CTX.none), { kind: 'stop', agentIds: ['7a8b9c'] });
@@ -1176,7 +1183,7 @@ test('"stop an agent to fix the login" is a launch, not a stop of "Login fix"; "
     { id: 'c0dec0', name: 'Codex adapter', task: 'Fix the codex adapter', state: 'working', kind: 'agent' },
   ] };
   assert.deepEqual(parseCommand('stop an agent to fix the login', world), task('stop an agent to fix the login'));
-  assert.equal(describeIntent(parseCommand('stop an agent to fix the login', world), world), 'Start Claude on “stop an agent to fix the login”?');
+  assert.equal(describeIntent(parseCommand('stop an agent to fix the login', world), world), 'Start an agent on “stop an agent to fix the login”?');
   assert.deepEqual(parseCommand('stop someone to fix the login', world), task('stop someone to fix the login'));
   assert.deepEqual(parseCommand('stop codex to fix the login', world), task('stop codex to fix the login'));
   assert.notEqual(parseCommand('forget an agent to fix the login', world).kind, 'forget');
@@ -1294,4 +1301,141 @@ test('the source-control words stay fast on long dictation and never throw', () 
   }
   // A focus the list does not have is passed on as it is (the engine says it cannot find it), as "stop it" does.
   assert.deepEqual(parseCommand('merge it', { focusId: 'zz' }), merge('zz'));
+});
+
+// ------------------------------------------------------------------ help, Agents & keys, a start with no work, "work on"
+
+/** Check rows of [words, context name, expected intent], and report every miss at once. */
+function rows(list) {
+  const failures = [];
+  for (const [text, ctxName, expected] of list) {
+    const got = parseCommand(text, ctxOf(ctxName));
+    try { assert.deepEqual(got, expected); } catch { failures.push(`${JSON.stringify(text)} [${ctxName}]\n    expected ${JSON.stringify(expected)}\n    got      ${JSON.stringify(got)}`); }
+  }
+  assert.equal(failures.length, 0, '\n' + failures.join('\n'));
+}
+
+const help = { kind: 'help' };
+const connect = { kind: 'connect' };
+const noWork = { kind: 'start', tasks: [], task: null };
+
+test('help: the words, greetings, and the reply the engine gives them', () => {
+  // Short, so it fits three lines under the DRAM at the narrowest board, and it says where agents are set up.
+  assert.equal(HELP_REPLY, 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.');
+  const said = ['help', 'Help!', 'help me', 'help?', 'can you help', 'please help', 'I need help', 'hi', 'Hello', 'hey', 'hello there',
+    'Hi again', 'hey workbench', 'um hi', 'good morning', 'what can you do', 'What can you do?', 'what can I say', 'how does this work',
+    'How does this work?', 'so how does it work', 'what is this', 'commands'];
+  rows(said.flatMap(text => [[text, 'none', help], [text, 'onboarding', help], [text, 'invoice', help]]));
+  rows([
+    // While a question or a stuck ask waits, the words are its answer.
+    ['help', 'question', answer('help')],
+    ['how does this work', 'question', answer('how does this work')],
+    ['hi', 'stuck', answer('hi', '0a0b0c', 'ask-stuck')],
+    // At a permission they are about the request: a question gets what exactly it asks for.
+    ['what do i do', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
+    ['how does this work?', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
+    ['help', 'permission', unknown('help')],
+    // On a card they settle nothing: the card stays, with its own hint.
+    ['help', 'pendingStart', unknown('help')],
+    ['hi', 'pendingMerge', unknown('hi')],
+    ['what can you do', 'pendingDiscardOf', unknown('what can you do')],
+    // Words that only begin like help, or greet and then ask, keep their meaning.
+    ['help me fix the login bug', 'none', task('fix the login bug')],
+    ['hey workbench what is happening', 'none', { kind: 'status' }],
+    ['hi, what needs me', 'none', { kind: 'status', needsMe: true }],
+    ['how is help pages doing', 'none', { kind: 'status', agentId: '4d5e6f' }],
+    ['stop help pages', 'none', { kind: 'stop', agentIds: ['4d5e6f'] }],
+  ]);
+});
+
+test('connect: the words open Agents & keys, and only these words whole', () => {
+  const weak = ['connect', 'Connect.', 'set up', 'setup', 'sign in', 'sign-in', 'log in', 'login', 'agents', 'Agents?', 'keys', 'api key', 'API keys'];
+  const strong = ['connect github', 'Connect GitHub', 'connect to github', 'connect my GitHub account', 'connect git hub', 'connect claude',
+    'connect claude code', 'connect codex', 'connect a coding agent', 'connect my agents', 'connect my keys', 'connect an api key',
+    'set up claude', 'set up claude code', 'setup codex', 'set up an agent', 'set up git', 'set up github', 'set up my keys', 'set up workbench',
+    'sign in to github', 'sign in to Claude', 'sign into codex', 'log in with github', 'log into my github account', 'sign in to chatgpt',
+    'add a key', 'add keys', 'add an API key', 'add my aws keys', 'add AWS access keys', 'add a github token', 'add a new key', 'add some secrets',
+    'agents and keys', 'Agents & keys', 'agents & api keys', 'open agents and keys', 'show me agents & keys', 'go to the agents and keys panel',
+    'please connect github', 'can you connect github', 'okay so connect github please', 'how do I connect github?', 'where do i add a key',
+    'how can i sign in to claude'];
+  rows([...weak, ...strong].flatMap(text => [[text, 'none', connect], [text, 'onboarding', connect], [text, 'permission', connect], [text, 'pendingStart', connect]]));
+  rows([
+    // Bare, they may be the answer to a question: then they are. Said with what to connect, they open Agents & keys.
+    ...weak.map(text => [text, 'question', answer(text)]),
+    ['connect github', 'question', connect],
+    ['agents and keys', 'question', connect],
+    ['add a key', 'stuck', connect],
+    // Work that starts with the same verbs stays work, and a launch stays a launch.
+    ['connect the form to the API', 'none', task('connect the form to the API')],
+    ['connect the database', 'none', task('connect the database')],
+    ['connect github to slack', 'none', task('connect github to slack')],
+    ['set up the ci pipeline', 'none', task('set up the ci pipeline')],
+    ['set up codex to fix the login', 'none', start(['fix the login', 'codex'])],
+    ['add a key to the config', 'none', task('add a key to the config')],
+    ['add an api key field to the settings page', 'none', task('add an api key field to the settings page')],
+    ['log in page is broken', 'none', task('log in page is broken')],
+    ['fix the sign in page', 'none', task('fix the sign in page')],
+    ['start an agent to add keys to the vault', 'none', start(['add keys to the vault'])],
+  ]);
+});
+
+test('a start with no work asks what the agent should work on; naming an agent wins over a question', () => {
+  rows([
+    ...['start an agent', 'Start an agent.', 'start a new agent', 'new agent', 'New agent!', 'a new agent', 'another agent', 'one more agent',
+      'a new codex agent', 'start codex', 'start claude', 'launch an agent', 'spin up an agent', 'please start an agent', 'create an agent',
+      'add a codex agent', 'get me an agent', 'start an agent on cloud 2', 'start an agent on it', 'start', 'start one']
+      .map(text => [text, 'none', noWork]),
+    // Named, it is unmistakable; a bare "start" or "start one" may be the answer.
+    ['start an agent', 'question', noWork],
+    ['new agent', 'question', noWork],
+    ['start', 'question', answer('start')],
+    ['start one', 'question', answer('start one')],
+    // An agent that exists, or a name alone, is no new launch.
+    ['start the agent', 'none', unknown('start the agent')],
+    ['codex', 'none', unknown('codex')],
+    ['agent', 'none', unknown('agent')],
+    ['the new agent', 'none', unknown('the new agent')],
+    // With work, it is the launch it always was; "start it" still answers a launch card.
+    ['start an agent to fix the login', 'none', start(['fix the login'])],
+    ['new agent: fix the login page', 'none', start(['fix the login page'])],
+    ['start over', 'none', start(['over'])],
+    ['start it', 'pendingStart', { kind: 'confirm', go: true }],
+  ]);
+  assert.equal(describeIntent(noWork, CTX.none), 'Start an agent?');
+});
+
+test('"work on X" is work, like "fix X": its task is what comes after "work on"', () => {
+  rows([
+    ['work on the login bug', 'none', task('the login bug')],
+    ['Work on the login bug.', 'none', task('the login bug')],
+    ['please work on the docs', 'none', task('the docs')],
+    ["let's work on the flaky test", 'none', task('the flaky test')],
+    ['can you work on fixing the parser', 'none', task('fixing the parser')],
+    // The same words after a start: one task text either way.
+    ['start an agent working on the login bug', 'none', start(['the login bug'])],
+    // An agent or a machine named makes it a launch.
+    ['work on the login bug using codex', 'none', start(['the login bug', 'codex'])],
+    ['work on the parser on cloud 2', 'none', start(['the parser', null, 'cloud-2'])],
+    // Nothing to work on, or a question waiting: as for other work.
+    ['work on it', 'none', unknown('work on it')],
+    ['work on', 'none', unknown('work on')],
+    ['work on the login bug', 'question', answer('work on the login bug')],
+    ['work queue', 'dogNone', unknown('work queue')],
+  ]);
+});
+
+test('no launch names Claude unless the words do: the engine gives the rest to the default agent', () => {
+  rows([
+    ['start an agent to fix the login', 'none', start(['fix the login', null])],
+    ['fix the login redirect on cloud 2', 'none', start(['fix the login redirect', null, 'cloud-2'])],
+    ['start two agents on the parser bug', 'none', start(['the parser bug', null], ['the parser bug', null])],
+    ['start claude on the parser', 'none', start(['the parser', 'claude'])],
+    ['start codex on the parser', 'none', start(['the parser', 'codex'])],
+    ['fix the login redirect using claude code', 'none', start(['fix the login redirect', 'claude'])],
+    ['start an agent on the parser and codex on the docs', 'none', start(['the parser'], ['the docs', 'codex'])],
+  ]);
+  for (const text of ['start an agent to fix the login', 'fix the login on cloud 2', 'spin up three agents to look into the memory leak']) {
+    const intent = parseCommand(text, CTX.none);
+    for (const t of intent.tasks || []) assert.equal(t.harness, null, text);
+  }
 });
