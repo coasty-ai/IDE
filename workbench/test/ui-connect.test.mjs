@@ -134,8 +134,8 @@ test('every agent state has its own sentence, made from the facts when Workbench
 test('an agent row draws exactly the actions Workbench lists, each bound to the agent and the facts it was drawn for', () => {
   const h = html(status({ agents: [agent(), CODEX_OUT, { ...CODEX_MISSING, id: 'gemini', name: 'Gemini CLI', actions: ['install', 'teleport', 'recheck'] }] }));
   const of = id => buttons(h).filter(b => b.cn === 'agent' && b.agent === id);
-  assert.deepEqual(of('claude').map(b => b.label), ['Use an API key', 'Check again']);
-  assert.deepEqual(of('codex').map(b => b.label), ['Sign in', 'Use an API key', 'Use for new work', 'Check again'], 'in the panel’s order');
+  assert.deepEqual(of('claude').map(b => b.label), ['Use an API key instead', 'Check again']);
+  assert.deepEqual(of('codex').map(b => b.label), ['Sign in', 'Use an API key instead', 'Use for new work', 'Check again'], 'in the panel’s order');
   assert.deepEqual(of('gemini').map(b => b.label), ['Install', 'Check again'], 'an action it does not know is not drawn; the list is not two agents long');
   for (const b of of('codex')) {
     assert.equal(b.state, V.agentStamp(V.agentsOf({ agents: [CODEX_OUT] })[0]), 'the facts it was drawn for');
@@ -168,12 +168,83 @@ test('"Use an API key" opens a password field that says who pays; never a name, 
   assert.equal(buttons(h).find(b => b.action === 'key' && b.agent === 'claude') && /aria-expanded="true"/.test(h), true);
 });
 
-test('where Terminal cannot open, the command to run is shown with Copy', () => {
-  const h = html(status({ canOpenTerminal: false }), { open: { cmd: { codex: 'codex login' } } });
+test('where Terminal cannot open, the command to run is shown with Copy; the ways into Terminal say which they do', () => {
+  const failed = { ...CODEX_OUT, actions: ['signin-terminal', 'signin', 'key', 'recheck'] };
+  const h = html(status({ canOpenTerminal: false, agents: [agent(), failed, { ...CODEX_MISSING, id: 'gemini', name: 'Gemini CLI' }] }), { open: { cmd: { codex: 'codex login' } } });
   assert.match(h, /<code class="cn-cmd"[^>]*>codex login<\/code>/);
   assert.ok(buttons(h).some(b => b.cn === 'copy' && b.agent === 'codex'));
-  assert.match(h, /title="Shows the command to run in a terminal\."/);
-  assert.match(html(status()), /title="Opens Terminal, where it runs\."/);
+  const title = (src, agentId, action) => new RegExp(`data-agent="${agentId}" data-action="${action}"[^>]*title="([^"]*)"`).exec(src)?.[1];
+  assert.equal(title(h, 'codex', 'signin-terminal'), 'Shows the command to run in a terminal.');
+  assert.equal(title(h, 'gemini', 'install'), 'Shows the command to run in a terminal.');
+  assert.equal(buttons(h).find(b => b.action === 'signin-terminal').label, 'Sign in in a terminal', 'no Terminal here: a terminal of the person’s own');
+  const mac = html(status({ agents: [agent(), failed, { ...CODEX_MISSING, id: 'gemini', name: 'Gemini CLI' }] }));
+  assert.equal(title(mac, 'codex', 'signin-terminal'), 'Opens Terminal, where it runs.');
+  assert.equal(title(mac, 'gemini', 'install'), 'Opens Terminal, where it runs.');
+  assert.equal(buttons(mac).find(b => b.action === 'signin-terminal').label, 'Sign in in Terminal');
+  // Sign in itself opens the browser, wherever Workbench runs
+  for (const src of [h, mac]) assert.equal(title(src, 'codex', 'signin'), 'Opens ChatGPT’s sign-in page in your browser.');
+});
+
+// ---------------------------------------------------------------- agents signing in in the browser (milestone 1.5)
+const CLAUDE_OUT = agent({ signedIn: 'no', how: null, ready: false, isDefault: false, actions: ['signin', 'signin-console', 'key', 'recheck'] });
+const row = (h, id) => { const at = h.indexOf(`data-k="agent:${id}"`); return h.slice(at, h.indexOf('data-k=', at + 10)); };
+
+test('Claude Code signed out: Sign in (its browser), "Use your Anthropic Console account" and "Use an API key instead"', () => {
+  const h = html(status({ agents: [CLAUDE_OUT, { ...CODEX_OUT, actions: ['signin', 'signin-console', 'key', 'recheck'] }], ready: false }));
+  const of = id => buttons(h).filter(b => b.cn === 'agent' && b.agent === id);
+  assert.deepEqual(of('claude').map(b => b.label), ['Sign in', 'Use your Anthropic Console account', 'Use an API key instead', 'Check again']);
+  assert.deepEqual(of('claude').map(b => b.pri), [true, false, false, false], 'Sign in is the way in');
+  assert.deepEqual(of('codex').map(b => b.label), ['Sign in', 'Use an API key instead', 'Check again'], 'the Anthropic Console account is Claude Code’s alone');
+  assert.ok(of('claude').every(b => b.state === V.agentStamp(V.agentsOf({ agents: [CLAUDE_OUT] })[0])), 'each carries what it was drawn for');
+  assert.match(row(h, 'claude'), /data-action="signin"[^>]*title="Opens Claude’s sign-in page in your browser\."/);
+  assert.match(row(h, 'claude'), /data-action="signin-console"[^>]*title="Opens the Anthropic Console’s sign-in page in your browser\."/);
+  assert.match(row(h, 'codex'), /data-action="signin"[^>]*title="Opens ChatGPT’s sign-in page in your browser\."/);
+  assert.equal(V.actionTitle('signin', { id: 'goose', name: 'goose' }, true), 'Opens the sign-in page in your browser.');
+  assert.doesNotMatch(h, /Opens Terminal/, 'nothing here opens Terminal');
+  assert.equal(V.ACTION_LABEL.key, 'Use an API key instead');
+});
+
+test('a sign-in waiting in the browser: its words, the waiting light, Cancel, and no other way in until it ends', () => {
+  const waiting = { ...CLAUDE_OUT, signingIn: { since: 1_800_000_000_000, browser: true, sentence: '' } };
+  const s = status({ agents: [waiting, { ...CODEX_OUT, signingIn: { since: 1, browser: true, sentence: '' } }, { ...CODEX_OUT, id: 'goose', name: 'goose', signingIn: { since: 1 } }], ready: false });
+  const h = html(s);
+  assert.match(row(h, 'claude'), /<p class="cn-note cn-step">Finish signing in to Claude in your browser\.<\/p>/);
+  assert.match(row(h, 'codex'), /Finish signing in to ChatGPT in your browser\./);
+  assert.match(row(h, 'goose'), /Finish signing in to goose in your browser\./);
+  const said = V.agentsOf(status({ agents: [{ ...waiting, signingIn: { since: 1, browser: true, sentence: 'Finish signing in to Claude in your browser.\n It opened.' } }] }))[0];
+  assert.equal(V.agentWaitWords(said), 'Finish signing in to Claude in your browser. It opened.', 'Workbench’s own sentence first');
+  const [a] = V.agentsOf(s);
+  assert.deepEqual(V.agentLight(a), { tone: 'work', shape: 'wait', words: 'signing in' });
+  assert.match(row(h, 'claude'), /aria-label="signing in"><svg class="g k-work"[^>]*><use href="#g-wait"\/>/);
+  const of = buttons(row(h, 'claude'));
+  assert.deepEqual(of.map(b => b.label), ['Cancel', 'Use an API key instead', 'Check again'], 'one sign-in at a time: no Sign in while one waits');
+  const cancel = of[0];
+  assert.deepEqual([cancel.cn, cancel.agent, cancel.state, cancel.pri], ['agent-cancel', 'claude', V.agentStamp(a), false]);
+  assert.match(row(h, 'claude'), /aria-label="Cancel the sign-in to Claude Code"/);
+  assert.notEqual(V.agentStamp(a), V.agentStamp({ ...a, signingIn: null }), 'a button drawn while it waited is stale once it ended');
+  assert.equal((row(h, 'claude').match(/class="cn-line"/g) || []).length, 1, 'one sentence per agent: the page checks read it');
+  assert.equal(V.signingInWaits(s), true);
+  assert.equal(V.signingInWaits(status()), false);
+  assert.equal(V.signingInWaits(null), false);
+  // busy while its cancel is on its way
+  assert.equal(buttons(row(html(s, { busy: new Set(['agent-cancel:claude']) }), 'claude'))[0].disabled, true);
+});
+
+test('a sign-in in the browser that did not finish: the panel says so and offers the sign-in in Terminal first', () => {
+  const failed = { ...CLAUDE_OUT, actions: ['signin-terminal', 'signin', 'signin-console', 'key', 'recheck'] };
+  const h = html(status({ agents: [failed, CODEX_MISSING], ready: false }));
+  assert.match(row(h, 'claude'), /<p class="cn-note cn-step">The sign-in in the browser did not finish\. Sign in in Terminal instead\.<\/p>/);
+  assert.equal(V.BROWSER_FAILED, 'The sign-in in the browser did not finish. Sign in in Terminal instead.');
+  const of = buttons(row(h, 'claude'));
+  assert.deepEqual(of.map(b => b.label), ['Sign in in Terminal', 'Sign in', 'Use your Anthropic Console account', 'Use an API key instead', 'Check again']);
+  assert.deepEqual(of.map(b => b.pri), [true, false, false, false, false], 'the sign-in in Terminal is the way in now');
+  assert.equal(V.agentFailed(V.agentsOf({ agents: [failed] })[0]), true);
+  assert.equal(V.agentFailed(V.agentsOf({ agents: [{ ...failed, signingIn: { since: 1 } }] })[0]), false, 'a new sign-in waits: not failed');
+  // where Workbench cannot open Terminal, a terminal of the person's own
+  assert.match(html(status({ agents: [failed], canOpenTerminal: false })), /Sign in in a terminal instead\./);
+  // Workbench's sentence that says it already is not said twice
+  const told = html(status({ agents: [{ ...failed, sentence: `Claude Code is installed but not signed in. ${V.BROWSER_FAILED}` }] }));
+  assert.equal(told.split('did not finish').length - 1, 1);
 });
 
 // ---------------------------------------------------------------- git and GitHub
@@ -188,9 +259,22 @@ test('git: the name and email git has, and Save; Merging needs these', () => {
   assert.match(V.gitRequest('Sam', 'not an address').error, /does not look right/);
 });
 
-test('GitHub, not connected: a token field, the box for agents (off), Connect and the page that makes a token', () => {
-  const h = html(status());
-  assert.match(h, /<h4 class="cn-h4">GitHub<\/h4><p class="cn-line">Not connected\.<\/p>/);
+test('GitHub, not connected: Sign in to GitHub first; "Use a token instead" shows milestone 1’s token form, as it was', () => {
+  const folded = html(status());
+  assert.match(folded, /<h4 class="cn-h4">GitHub<\/h4><p class="cn-line">Not signed in to GitHub\.<\/p>/, 'no sentence from Workbench: the panel’s own');
+  assert.match(html(status({ github: { connected: false, login: null, agentsUseIt: false, sentence: 'Not connected.' } })), /<p class="cn-line">Not connected\.<\/p>/, 'Workbench’s own sentence first');
+  const signIn = buttons(folded).find(b => b.cn === 'gh-signin');
+  assert.deepEqual([signIn.label, signIn.pri, signIn.state], ['Sign in to GitHub', true, 'off'], 'the main button, carrying what it was drawn for');
+  assert.equal(inputs(folded).some(i => /data-field="gh-(token|agents)"/.test(i)), false, 'the token form is folded away');
+  const toggle = buttons(folded).find(b => b.cn === 'gh-token-toggle');
+  assert.equal(toggle.label, 'Use a token instead');
+  assert.match(folded, /data-cn="gh-token-toggle"[^>]*aria-expanded="false"/);
+  assert.equal(buttons(folded).filter(b => b.pri).filter(b => /^gh-/.test(b.cn)).length, 1, 'one main button for GitHub');
+  const h = html(status(), { open: { ghToken: true } });
+  assert.match(h, /data-cn="gh-token-toggle"[^>]*aria-expanded="true"/);
+  const parts = V.panelParts(status(), { presets: PRESETS, open: { ghToken: true } }).map(p => p.k);
+  assert.ok(parts.indexOf('gh-token') === parts.indexOf('gh-off') + 1, 'the form is a part of its own, under GitHub’s: a sign-in’s progress never redraws a token being typed');
+  assert.ok(buttons(h).some(b => b.cn === 'gh-signin'), 'Sign in to GitHub stays');
   const token = inputs(h).find(i => /data-field="gh-token"/.test(i));
   assert.match(token, /type="password"/);
   assert.match(token, /autocomplete="off"/);
@@ -257,7 +341,7 @@ test('GitHub’s box while its change is on its way shows what was asked and wai
   assert.equal(V.githubBoxOn(gh({ agentsUseIt: true }), null, true), true, 'nothing asked: what Workbench says');
   assert.equal(V.githubBoxOn(null), false);
   // the not-connected form keeps its own box (sent with Connect), off by default, and no box of this kind
-  const notYet = html(status());
+  const notYet = html(status(), { open: { ghToken: true } });
   assert.equal(shareBox(notYet), undefined);
   assert.doesNotMatch(inputs(notYet).find(i => /data-field="gh-agents"/.test(i)), /checked/);
 });
@@ -287,6 +371,187 @@ test('GitHub’s box is wired: a change is sent at once and checked first, a wai
   for (const s of order) { const i = fn.indexOf(s); assert.ok(i > last, `shareGithub: ${s}`); last = i; }
   const click = conn.slice(conn.indexOf('function onClick('), conn.indexOf('\n}\n', conn.indexOf('function onClick(')));
   assert.match(click, /t\.type === 'checkbox' && t\.getAttribute\('aria-disabled'\) === 'true'\) \{ e\.preventDefault\(\); return; \}/);
+});
+
+// ---------------------------------------------------------------- git missing, and GitHub through its own tool (milestone 1.5)
+/** One part of the panel's markup, by its key ('' when it is not drawn). */
+const part = (h, k) => {
+  const at = h.indexOf(`data-k="${k}"`);
+  if (at < 0) return '';
+  const end = h.indexOf('data-k=', at + 10);
+  return h.slice(at, end < 0 ? undefined : end);
+};
+const ghOff = (o = {}) => ({ connected: false, via: null, login: null, ghInstalled: false, ghVersion: null, ghPath: null, agentsUseIt: false, sentence: '', signingIn: null, ...o });
+const signing = (o = {}) => ghOff({ signingIn: { phase: 'installing', code: null, url: null, since: 1_800_000_000_000, sentence: '', ...o } });
+
+test('git missing: what to do, and Install where Workbench can start Apple’s installer; no name and email to give', () => {
+  const mac = html(status({ git: { name: '', email: '', installed: false, canInstall: true, sentence: 'Workbench could not read git’s settings.' } }));
+  const git = part(mac, 'git');
+  assert.match(git, /<p class="cn-line">Git is not installed yet\. Apple’s developer tools include it\.<\/p>/, 'the panel’s own words, whatever else the status says');
+  assert.match(git, /aria-label="needs you"/);
+  const install = buttons(git);
+  assert.deepEqual(install.map(b => [b.cn, b.label, b.pri, b.state]), [['git-install', 'Install', true, 'missing']]);
+  assert.match(git, /aria-label="Install git"/, 'its name says what it installs, and starts with its label');
+  assert.match(git, /title="Opens Apple’s installer for its developer tools, which include git\."/);
+  assert.doesNotMatch(mac, /data-field="git-(name|email)"|Merging needs these/, 'git cannot keep a name and email until it runs');
+  // elsewhere: a package manager, and no button
+  const linux = html(status({ platform: 'linux', canOpenTerminal: false, git: { name: '', email: '', installed: false, canInstall: false, sentence: '' } }));
+  assert.match(part(linux, 'git'), /Git is not installed yet\. Install git with your package manager\./);
+  assert.equal(buttons(part(linux, 'git')).length, 0);
+  // a Mac where Workbench cannot start the installer: Apple's words, no button
+  const noButton = html(status({ git: { installed: false, canInstall: false } }));
+  assert.match(part(noButton, 'git'), /Apple’s developer tools include it\./);
+  assert.equal(buttons(part(noButton, 'git')).length, 0);
+  // git here, or a status that does not say: the name and email, as before
+  for (const g of [{ name: 'Sam Lee', email: 'sam@example.com', installed: true, canInstall: true, sentence: '' }, { name: 'Sam Lee', email: 'sam@example.com', sentence: '' }]) {
+    const h = html(status({ git: g }));
+    assert.match(h, /Git knows you as Sam Lee, sam@example\.com\. Merging needs these\./);
+    assert.ok(!buttons(h).some(b => b.cn === 'git-install'));
+  }
+  assert.deepEqual(V.gitOf({ git: { installed: false } }), { name: '', email: '', sentence: '', installed: false, canInstall: false });
+  assert.equal(V.gitOf({}).installed, true, 'missing only when Workbench says so');
+});
+
+test('Sign in to GitHub says what happens: Workbench gets GitHub’s command-line tool first when it is not here', () => {
+  const missing = part(html(status({ github: ghOff() })), 'gh-off');
+  assert.match(missing, /Workbench first gets GitHub’s command-line tool from GitHub\. Then you approve the sign-in on GitHub’s website: there is no token to copy\./);
+  for (const ghInstalled of [true, null, undefined]) {
+    const here = part(html(status({ github: ghOff({ ghInstalled }) })), 'gh-off');
+    assert.match(here, /<p class="cn-sub">You approve the sign-in on GitHub’s website: there is no token to copy\.<\/p>/, String(ghInstalled));
+  }
+});
+
+test('a sign-in to GitHub under way, by its phase: getting the tool, the code with Open GitHub, or Terminal; Cancel in each', () => {
+  // getting the tool
+  const installing = part(html(status({ github: signing() })), 'gh-off');
+  assert.match(installing, /<p class="cn-line cn-wait"><svg class="g k-work"[^>]*><use href="#g-wait"\/><\/svg><span>Getting GitHub’s command-line tool…<\/span><\/p>/);
+  assert.deepEqual(buttons(installing).map(b => [b.cn, b.label]), [['gh-cancel', 'Cancel'], ['gh-token-toggle', 'Use a token instead']], 'no second sign-in while one is under way');
+  assert.equal(buttons(installing)[0].state, 'signing');
+  assert.match(installing, /aria-label="Cancel the sign-in to GitHub"/);
+  assert.match(part(html(status({ github: signing({ sentence: 'Getting GitHub’s command-line tool… 40%' }) })), 'gh-off'), /Getting GitHub’s command-line tool… 40%/, 'Workbench’s own words first');
+  // Terminal, when no code came
+  const terminal = part(html(status({ github: signing({ phase: 'terminal' }) })), 'gh-off');
+  assert.match(terminal, /<span>Terminal is open: follow the steps there, then come back\.<\/span>/);
+  assert.deepEqual(buttons(terminal).map(b => b.cn), ['gh-cancel', 'gh-token-toggle']);
+  // the code: GitHub's own (it shows it too), with Open GitHub on github.com, Copy the code and Cancel
+  const code = part(html(status({ github: signing({ phase: 'code', code: 'WDJB-MJHT', url: 'https://github.com/login/device' }) })), 'gh-off');
+  assert.match(code, /<p class="cn-line cn-codeline">Your code: <span class="cn-code">WDJB-MJHT<\/span><\/p>/);
+  assert.match(code, /<p class="cn-sub">Open GitHub, type the code there and approve the sign-in\. The code works for 15 minutes\.<\/p>/);
+  assert.match(code, /<a class="cn-btn pri" href="https:\/\/github\.com\/login\/device" target="_blank" rel="noopener noreferrer" data-key="gh-open" title="Opens github\.com\/login\/device in your browser\.">Open GitHub<\/a>/);
+  assert.deepEqual(buttons(code).map(b => [b.cn, b.label]), [['gh-copy', 'Copy the code'], ['gh-cancel', 'Cancel'], ['gh-token-toggle', 'Use a token instead']]);
+  // Workbench's sentence goes under the code, unless it only says the code again
+  assert.match(part(html(status({ github: signing({ phase: 'code', code: 'WDJB-MJHT', sentence: 'Type it on GitHub.' }) })), 'gh-off'), /<p class="cn-sub">Type it on GitHub\.<\/p>/);
+  assert.match(part(html(status({ github: signing({ phase: 'code', code: 'WDJB-MJHT', sentence: 'Your code: WDJB-MJHT.' }) })), 'gh-off'), /The code works for 15 minutes\./);
+  // Open GitHub goes to github.com only; a code that is not a code's shape is not shown
+  for (const url of ['https://evil.example/login/device', 'http://github.com/login/device', 'javascript:alert(1)', 'https://github.com.evil.example/x', null, 'https://github.com/x" onclick="y']) {
+    const h = part(html(status({ github: signing({ phase: 'code', code: 'WDJB-MJHT', url }) })), 'gh-off');
+    assert.match(h, /href="https:\/\/github\.com\/login\/device"/, String(url));
+  }
+  assert.equal(V.githubUrl('https://github.com/login/device?user_code=WDJB-MJHT'), 'https://github.com/login/device?user_code=WDJB-MJHT');
+  for (const bad of ['<b>x</b>', 'WDJB MJHT', '', 'a'.repeat(40), `WDJB${U(0x202e)}MJHT`]) {
+    const h = part(html(status({ github: signing({ phase: 'code', code: bad }) })), 'gh-off');
+    assert.doesNotMatch(h, /cn-code|gh-open|<b>/, JSON.stringify(bad));
+    assert.match(h, /Waiting for a code from GitHub…/);
+  }
+  // another phase Workbench may add: its sentence, else plain words
+  assert.match(part(html(status({ github: signing({ phase: 'later' }) })), 'gh-off'), /Signing in to GitHub…/);
+  // the panel reads the status again while any of these is under way, and not once GitHub is connected
+  assert.equal(V.signingInWaits(status({ github: signing() })), true);
+  assert.equal(V.signingInWaits(status({ github: { ...signing(), connected: true, via: 'gh', login: 'octocat' } })), false);
+});
+
+test('signed in through GitHub’s command-line tool: who uses the sign-in, and Sign out; no token, no box', () => {
+  const gh = { connected: true, via: 'gh', login: 'octocat', ghInstalled: true, ghVersion: '2.104.0', ghPath: '/Users/sam/.local/bin/gh', agentsUseIt: false, sentence: '', signingIn: null };
+  const h = html(status({ github: gh }));
+  const signed = part(h, 'gh-signed');
+  assert.match(signed, /<p class="cn-line">Signed in to GitHub as octocat\. Git in Terminal, Workbench and your agents use this sign-in\.<\/p>/);
+  assert.deepEqual(buttons(signed).map(b => [b.cn, b.label, b.state]), [['gh-signout', 'Sign out', 'gh:octocat']]);
+  assert.doesNotMatch(h, /data-field="gh-(share|token|agents)"|gh-token-toggle|gh-disconnect|Sign in to GitHub/);
+  assert.match(html(status({ github: { ...gh, sentence: 'Signed in to GitHub as octocat.\nWorkbench uses its own copy of the tool.' } })), /Signed in to GitHub as octocat\. Workbench uses its own copy of the tool\./, 'Workbench’s own sentence first');
+  assert.match(html(status({ github: { ...gh, login: null } })), /Signed in to GitHub\. Git in Terminal, Workbench and your agents use this sign-in\./);
+  assert.equal(V.githubShareRequest(status({ github: gh }), V.githubStamp(gh), true), null, 'no token to give agents here');
+  assert.equal(V.githubState(V.githubOf(status({ github: gh }))), 'gh:octocat');
+});
+
+test('a refused install says why, in Workbench’s words, and Sign in to GitHub and the token are offered again', () => {
+  const refused = 'Workbench did not install GitHub’s command-line tool, because the download did not match the checksum GitHub publishes for it.';
+  const h = part(html(status({ github: ghOff({ sentence: refused }) })), 'gh-off');
+  assert.ok(h.includes(`<p class="cn-line">${esc(refused)}</p>`));
+  assert.deepEqual(buttons(h).map(b => b.cn), ['gh-signin', 'gh-token-toggle']);
+});
+
+test('GitHub’s part of a status is read field by field: a token connection without `via`, nothing guessed', () => {
+  assert.deepEqual(V.githubOf({}), { connected: false, via: null, login: '', agentsUseIt: false, sentence: '', ghInstalled: null, signingIn: null });
+  assert.equal(V.githubOf({ github: { connected: true, login: 'octocat' } }).via, 'token', 'milestone 1’s connection');
+  assert.equal(V.githubOf({ github: { connected: true, via: 'gh' } }).via, 'gh');
+  assert.equal(V.githubOf({ github: { connected: false, via: 'gh' } }).via, null);
+  assert.equal(V.githubOf({ github: { connected: true, via: 'gh', signingIn: { phase: 'code' } } }).signingIn, null, 'connected: nothing under way');
+  assert.equal(V.githubOf({ github: { signingIn: { phase: 'code', code: ' WDJB-MJHT ' } } }).signingIn.code, 'WDJB-MJHT');
+  assert.equal(V.githubState(V.githubOf({ github: { connected: true, login: `oct${U(0x202e)}o` } })), 'token:oct⟦U+202E⟧o');
+  assert.equal(V.githubState(V.githubOf({})), 'off');
+  assert.equal(V.githubState(V.githubOf({ github: signing() })), 'signing');
+  // milestone 1's token view is as it was, whatever the tool's facts
+  const token = html(status({ github: { connected: true, via: 'token', login: 'octocat', ghInstalled: true, agentsUseIt: true, sentence: '' } }));
+  assert.match(token, /Connected to GitHub as octocat\./);
+  assert.ok(buttons(token).some(b => b.cn === 'gh-disconnect'));
+  assert.match(shareBox(token), /\bchecked\b/);
+});
+
+test('where Workbench gave a command for GitHub instead of opening Terminal, the panel shows it with Copy', () => {
+  const h = html(status(), { open: { ghCmd: `gh auth login --hostname github.com${U(0x200b)}` } });
+  const cmd = part(h, 'gh-cmd');
+  assert.match(cmd, /Run this in a terminal, then come back here\./);
+  assert.match(cmd, /<code class="cn-cmd" tabindex="0" data-scroll="1">gh auth login --hostname github\.com⟦U\+200B⟧<\/code>/);
+  assert.ok(buttons(cmd).some(b => b.cn === 'gh-cmd-copy'));
+  assert.equal(part(html(status()), 'gh-cmd'), '');
+});
+
+test('what is said when a sign-in ends: signed in, not finished (then Terminal), or GitHub’s own words; a cancel says nothing here', () => {
+  const waitingClaude = { ...CLAUDE_OUT, signingIn: { since: 1, browser: true, sentence: '' } };
+  const before = status({ agents: [waitingClaude, { ...CODEX_OUT, signingIn: { since: 1 } }], github: signing({ phase: 'code', code: 'WDJB-MJHT' }) });
+  // Claude Code signed in, Codex's did not finish, GitHub signed in through the tool
+  const after = status({ agents: [{ ...CLAUDE_OUT, signedIn: 'yes', how: 'your Claude subscription', ready: true }, { ...CODEX_OUT, actions: ['signin-terminal', 'signin', 'key', 'recheck'] }],
+    github: { connected: true, via: 'gh', login: 'octocat', sentence: '' } });
+  assert.deepEqual(V.signInEnded(before, after), [
+    { who: 'claude', ok: true, sentence: 'Claude Code is signed in.' },
+    { who: 'codex', ok: false, sentence: V.BROWSER_FAILED },
+    { who: 'github', ok: true, sentence: 'Signed in to GitHub as octocat. Git in Terminal, Workbench and your agents use this sign-in.' },
+  ]);
+  // cancelled: nothing (the cancel's own answer says so); still waiting: nothing
+  assert.deepEqual(V.signInEnded(before, status({ agents: [CLAUDE_OUT, CODEX_OUT], github: ghOff() })), [
+    { who: 'github', ok: false, sentence: 'The sign-in to GitHub did not finish.' }]);
+  assert.deepEqual(V.signInEnded(before, before), []);
+  // GitHub refused, in Workbench's words; a terminal of the person's own where Terminal cannot open
+  const refused = V.signInEnded(before, status({ canOpenTerminal: false, agents: [CLAUDE_OUT, { ...CODEX_OUT, actions: ['signin-terminal', 'key'] }], github: ghOff({ sentence: 'Workbench could not reach GitHub.' }) }));
+  assert.deepEqual(refused.map(x => x.sentence), ['The sign-in in the browser did not finish. Sign in in a terminal instead.', 'Workbench could not reach GitHub.']);
+  // nothing before (the first status), or nothing waited
+  assert.deepEqual(V.signInEnded(null, after), []);
+  assert.deepEqual(V.signInEnded(status(), after), []);
+});
+
+test('the panel reads the status every 2 seconds while a sign-in waits, one read at a time, only while it is open', () => {
+  const conn = read('../ui/connect.js');
+  assert.match(conn, /const POLL_MS = 2000;/);
+  const poll = conn.slice(conn.indexOf('function pollSoon('), conn.indexOf('\n}\n', conn.indexOf('function pollSoon(')));
+  assert.match(poll, /if \(st\.poll \|\| st\.polling \|\| !connectShown\(\) \|\| !signingInWaits\(st\.status\)\) return;/);
+  assert.match(poll, /setTimeout\(async \(\) => \{/);
+  assert.match(poll, /request\(\(\) => connectApi\.status\(\), \{ quiet: true \}\)/, 'GET /api/connect, quietly: never the slower re-check');
+  assert.doesNotMatch(poll, /recheck/);
+  assert.match(poll, /finally \{ st\.polling = false; if \(r\) pollSoon\(\); \}/, 'a read that failed does not repeat every 2 seconds');
+  const req = conn.slice(conn.indexOf('async function request('), conn.indexOf('\n}\n', conn.indexOf('async function request(')));
+  assert.ok(req.indexOf('pollSoon()') > req.indexOf('finally'), 'after every answer, whichever it was');
+  assert.match(req, /signInEnded\(before, s\)/);
+  assert.match(req, /answered \? \[\] :/, 'an answer’s own words come first');
+  // an agent's sign-in that ended at all (its outcome in this status or not) has the agents checked again, once
+  assert.match(req, /const waited = new Set\(agentsOf\(before\)\.filter\(a => a\.signingIn\)\.map\(a => a\.id\)\);\n\s+if \(agentsOf\(s\)\.some\(a => waited\.has\(a\.id\) && !a\.signingIn\) && connectShown\(\)\) setTimeout\(\(\) => recheck\(\), 0\);/);
+  const fin = conn.slice(conn.indexOf('function finish('), conn.indexOf('\n}\n', conn.indexOf('function finish(')));
+  assert.match(fin, /clearTimeout\(st\.poll\);/, 'closing the panel stops reading');
+  // every way in sends its own request; the token form is read from its own part
+  for (const s of ["signin: () => connectApi.signin(a.id)", "'signin-console': () => connectApi.signin(a.id, { console: true })",
+    "'signin-terminal': () => connectApi.signin(a.id, { terminal: true })", 'install: () => connectApi.install(a.id)', 'connectApi.cancelSignin(a.id)',
+    'connectApi.githubSignIn()', 'connectApi.githubSignInCancel()', 'connectApi.githubSignOut()', 'connectApi.gitInstall()', "const part = partOf('gh-token');"]) {
+    assert.ok(conn.includes(s), s);
+  }
 });
 
 // ---------------------------------------------------------------- keys: the list, and how values read
@@ -501,7 +766,7 @@ test('while a save is on its way, or was refused, the person’s choices stay in
   assert.match(custom, /value="&lt;x&gt;"/);
   for (const i of inputs(custom).filter(x => /type="password"/.test(x))) assert.doesNotMatch(i, /\bvalue=/);
   // git's fields keep what was typed until git has it; the GitHub box keeps its tick
-  const typed = html(s, { open: { git: { name: 'New Name', email: 'new@example.com' }, ghAgents: true } });
+  const typed = html(s, { open: { git: { name: 'New Name', email: 'new@example.com' }, ghToken: true, ghAgents: true } });
   assert.match(typed, /data-field="git-name"[^>]*value="New Name"/);
   assert.match(typed, /data-field="gh-agents"[^>]*checked/);
 });
@@ -554,6 +819,20 @@ test('everything Workbench or a person wrote is escaped, and hidden characters a
   assert.match(h, /⟦U\+202E⟧/);
   assert.match(h, /⟦U\+200B⟧/);
   assert.doesNotMatch(h, /BAD/, 'a variable name that does not fit is dropped, never guessed');
+  // milestone 1.5's words: a sign-in's sentences, GitHub's sign-in and its code, its login, git missing, a command
+  const later = [
+    status({ agents: [{ ...CLAUDE_OUT, name: evil, signingIn: { since: 1, browser: true, sentence: `Finish ${evil}` } }, { ...CODEX_OUT, name: evil, actions: ['signin-terminal', 'key'] }],
+      git: { installed: false, canInstall: true, sentence: evil }, github: signing({ phase: 'code', code: evil, url: `https://github.com/${evil}`, sentence: evil }) }),
+    status({ github: signing({ phase: 'terminal', sentence: `Terminal ${evil}` }) }),
+    status({ github: { connected: true, via: 'gh', login: evil, sentence: '' } }),
+    status({ github: ghOff({ sentence: `Refused ${evil}` }) }),
+  ];
+  for (const x of later) {
+    const m = html(x, { open: { ghCmd: `gh auth login ${evil}`, ghToken: true } });
+    assert.doesNotMatch(m, /<img|onerror=alert\(1\)>/);
+    assert.equal(hasHidden(m), false);
+    assert.match(m, /⟦U\+202E⟧/);
+  }
 });
 
 // ---------------------------------------------------------------- the board's key guard
@@ -635,16 +914,32 @@ test('the panel’s requests: their routes and bodies; a refusal comes back as i
     await api.connectApi.removeKey('k/1');
     await api.connectApi.githubAgents(true);
     await api.connectApi.githubAgents('yes');
+    // milestone 1.5: the agents' own logins (in the browser, the Anthropic Console account, in Terminal) and Cancel,
+    // git's installer, and GitHub through its own command-line tool
+    await api.connectApi.signin('claude', { console: true });
+    await api.connectApi.signin('codex', { terminal: true });
+    await api.connectApi.signin('codex', { console: 'yes', terminal: 1 });
+    await api.connectApi.cancelSignin('claude');
+    await api.connectApi.gitInstall();
+    await api.connectApi.githubSignIn();
+    await api.connectApi.githubSignInCancel();
+    await api.connectApi.githubSignOut();
     assert.deepEqual(sent.map(r => `${r.method} ${r.path}`), [
       'GET /api/connect', 'POST /api/connect/recheck', 'POST /api/connect/agents/codex/install', 'POST /api/connect/agents/claude/signin',
       'POST /api/connect/agents/claude/key', 'POST /api/connect/agents/codex/default', 'POST /api/connect/git', 'POST /api/connect/github',
       'POST /api/connect/github/disconnect', 'POST /api/connect/keys', 'POST /api/connect/keys/k%2F1/remove',
-      'POST /api/connect/github/agents', 'POST /api/connect/github/agents']);
+      'POST /api/connect/github/agents', 'POST /api/connect/github/agents',
+      'POST /api/connect/agents/claude/signin', 'POST /api/connect/agents/codex/signin', 'POST /api/connect/agents/codex/signin',
+      'POST /api/connect/agents/claude/signin/cancel', 'POST /api/connect/git/install', 'POST /api/connect/github/signin',
+      'POST /api/connect/github/signin/cancel', 'POST /api/connect/github/signout']);
+    assert.deepEqual(sent[3].body, {}, 'Sign in alone: the agent’s own login, in the browser');
     assert.deepEqual(sent[4].body, { value });
     assert.deepEqual(sent[7].body, { token: 'gh-token-value', agentsUseIt: true });
     assert.deepEqual(sent[9].body, { preset: 'aws', label: 'AWS', values: { AWS_REGION: 'eu-west-2' }, scope: 'all', agents: 'all' });
     assert.deepEqual(sent[11].body, { agentsUseIt: true }, 'GitHub’s box: whether agents get the token, and no token');
     assert.deepEqual(sent[12].body, { agentsUseIt: false }, 'only true gives it to them');
+    assert.deepEqual(sent.slice(13, 16).map(r => r.body), [{ console: true }, { terminal: true }, {}], 'only the flags that are true');
+    for (const r of sent.slice(16)) assert.deepEqual(r.body, {}, r.path);
     for (const r of sent) { assert.ok(!r.path.includes(value) && !r.path.includes('gh-token-value'), 'values never in an address'); assert.equal(r.headers['Content-Type'], 'application/json'); }
     // a refusal: its sentence and status come back, nothing thrown
     answer = { status: 200, body: { ok: false, sentence: 'GitHub did not accept that token.', status: status() } };
@@ -730,12 +1025,108 @@ test('the page checks’ stand-in API answers Agents & keys as the panel reads i
     // no agent ready, a missing one installed through "Terminal", and a read that fails
     await ctl('scenario', { name: 'connect-none' });
     s = V.statusOf((await call('/api/connect')).body);
-    assert.deepEqual(sentences(s), ['Claude Code 2.1.322 is installed but not signed in. [signin key recheck]', 'Codex is not installed. [install recheck]']);
+    assert.deepEqual(sentences(s), ['Claude Code 2.1.322 is installed but not signed in. [signin signin-console key recheck]', 'Codex is not installed. [install recheck]']);
     assert.equal(s.ready, false);
     assert.equal((await call('/api/connect/agents/codex/install', {})).body.opened, true);
     assert.match(sentences(V.statusOf((await call('/api/connect/recheck', {})).body))[1], /^Codex 0\.166\.0 is installed but not signed in\./);
     await ctl('scenario', { name: 'connect-fail' });
     assert.deepEqual([(await call('/api/connect')).code, (await call('/api/connect/recheck', {})).code], [500, 500]);
+  } finally { await mock.close(); }
+});
+
+test('the stand-in API’s milestone 1.5 scenarios hold still, and its sign-ins move on one step per read, as the panel reads them', async () => {
+  const { startMock, scenario, SCENARIOS } = await import('../scripts/ui-mock.mjs');
+  const FIRST_RUN = ['connect-gh-none', 'connect-gh-installing', 'connect-gh-code', 'connect-gh-signed', 'connect-gh-refused', 'connect-git-missing', 'connect-browser', 'connect-browser-failed'];
+  for (const name of FIRST_RUN) {
+    assert.ok(SCENARIOS.includes(name), name);
+    assert.equal(V.connectMeta(scenario(name)).ready, false, `${name}: no agent ready, so the panel opens by itself and the fit check lays it out`);
+  }
+  const mock = await startMock({ quiet: true });
+  const base = `http://127.0.0.1:${mock.port}`;
+  const ctl = (p, b) => fetch(`${base}/ctl/${p}`, { method: 'POST', body: JSON.stringify(b) }).then(r => r.json());
+  const call = (p, body) => fetch(base + p, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': 'k' },
+    body: body === undefined ? undefined : JSON.stringify(body) }).then(async r => ({ code: r.status, body: await r.json() }));
+  const read = async () => V.statusOf((await call('/api/connect')).body);
+  const gh = s => V.githubOf(s);
+  const claude = s => V.agentsOf(s).find(a => a.id === 'claude');
+  try {
+    // each scenario, as the panel draws it, and the same at every read
+    const seen = {};
+    for (const name of FIRST_RUN) {
+      await ctl('scenario', { name });
+      const s = await read();
+      assert.deepEqual(await read(), s, `${name} holds still`);
+      seen[name] = s;
+    }
+    assert.deepEqual([gh(seen['connect-gh-none']).connected, gh(seen['connect-gh-none']).ghInstalled, gh(seen['connect-gh-none']).signingIn], [false, false, null]);
+    assert.equal(gh(seen['connect-gh-installing']).signingIn.phase, 'installing');
+    assert.deepEqual([gh(seen['connect-gh-code']).signingIn.phase, gh(seen['connect-gh-code']).signingIn.code, gh(seen['connect-gh-code']).signingIn.url], ['code', 'WDJB-MJHT', V.GITHUB_DEVICE_PAGE]);
+    assert.deepEqual([gh(seen['connect-gh-signed']).via, gh(seen['connect-gh-signed']).login], ['gh', 'octocat']);
+    assert.match(gh(seen['connect-gh-refused']).sentence, /did not match the checksum/);
+    assert.deepEqual(V.gitOf(seen['connect-git-missing']), { name: '', email: '', sentence: 'Git is not installed yet. Apple’s developer tools include it.', installed: false, canInstall: true });
+    assert.equal(V.agentWaitWords(claude(seen['connect-browser'])), 'Finish signing in to Claude in your browser.');
+    assert.equal(V.agentFailed(claude(seen['connect-browser-failed'])), true);
+    assert.equal(V.signingInWaits(seen['connect-gh-code']) && V.signingInWaits(seen['connect-browser']) && !V.signingInWaits(seen['connect-gh-none']), true);
+    // Sign in to GitHub: the tool first, then the code, then signed in through it; one at a time
+    await ctl('scenario', { name: 'connect-gh-none' });
+    let r = await call('/api/connect/github/signin', {});
+    assert.deepEqual([r.body.ok, r.body.sentence, gh(V.statusOf(r.body)).signingIn.phase], [true, 'Getting GitHub’s command-line tool…', 'installing']);
+    assert.match((await call('/api/connect/github/signin', {})).body.sentence, /already signing you in/);
+    const phases = [];
+    for (let i = 0; i < 4; i++) { const g = gh(await read()); phases.push(g.signingIn ? g.signingIn.phase : `${g.via}:${g.login}`); }
+    assert.deepEqual(phases, ['code', 'code', 'code', 'gh:octocat']);
+    r = await call('/api/connect/github/signout', {});
+    assert.equal(r.body.sentence, 'Signed out of GitHub. GitHub still lists this sign-in under Settings → Applications until you revoke it there.');
+    assert.equal(gh(V.statusOf(r.body)).connected, false);
+    assert.equal(gh(V.statusOf(r.body)).ghInstalled, true, 'the tool stays');
+    // installed already: the code at once; Cancel stops it
+    r = await call('/api/connect/github/signin', {});
+    assert.equal(gh(V.statusOf(r.body)).signingIn.phase, 'code');
+    r = await call('/api/connect/github/signin/cancel', {});
+    assert.deepEqual([r.body.sentence, gh(V.statusOf(r.body)).signingIn], ['Stopped signing in to GitHub.', null]);
+    // a refused download, and the Terminal fallback
+    await ctl('scenario', { name: 'connect-gh-none' });
+    await ctl('mode', { connect: { gh: 'refused' } });
+    await call('/api/connect/github/signin', {});
+    const refused = await read();
+    assert.deepEqual([gh(refused).signingIn, gh(refused).connected], [null, false]);
+    assert.match(gh(refused).sentence, /^Workbench did not install GitHub’s command-line tool/);
+    assert.deepEqual(V.signInEnded(seen['connect-gh-installing'], refused), [{ who: 'github', ok: false, sentence: gh(refused).sentence }], 'the panel says why');
+    await ctl('scenario', { name: 'connect-gh-none' });
+    await ctl('mode', { connect: { gh: 'terminal' } });
+    await call('/api/connect/github/signin', {});
+    assert.equal(gh(await read()).signingIn.phase, 'terminal');
+    await ctl('mode', { connect: null });
+    // an agent's own login in the browser: it waits, then is signed in; one that does not finish offers Terminal
+    await ctl('scenario', { name: 'connect-gh-none' });
+    r = await call('/api/connect/agents/claude/signin', {});
+    assert.deepEqual([r.body.waiting, claude(V.statusOf(r.body)).signingIn !== null], [true, true]);
+    assert.match(r.body.sentence, /Claude’s sign-in page/);
+    assert.match((await call('/api/connect/agents/claude/signin', {})).body.sentence, /already waiting/);
+    assert.notEqual(claude(await read()).signingIn, null);
+    const done = await read();
+    assert.deepEqual([claude(done).signingIn, claude(done).signedIn, claude(done).ready], [null, 'yes', true]);
+    assert.equal((await call('/api/connect/agents/codex/signin', { console: true })).code, 409, 'Codex is not installed here');
+    await ctl('scenario', { name: 'connect-browser-failed' });
+    assert.deepEqual(claude(await read()).actions, ['signin-terminal', 'signin', 'signin-console', 'key', 'recheck']);
+    r = await call('/api/connect/agents/claude/signin', { terminal: true });
+    assert.equal(r.body.opened, true);
+    assert.equal(claude(V.statusOf((await call('/api/connect/recheck', {})).body)).signedIn, 'yes', 'Terminal, then the re-check');
+    await ctl('scenario', { name: 'connect-browser' });
+    await ctl('mode', { connect: { browser: 'fail' } });
+    r = await call('/api/connect/agents/claude/signin/cancel', {});
+    assert.deepEqual([r.body.sentence, claude(V.statusOf(r.body)).signingIn], ['Stopped the sign-in to Claude Code.', null]);
+    await call('/api/connect/agents/claude/signin', { console: true });
+    await read();
+    assert.equal(V.agentFailed(claude(await read())), true);
+    await ctl('mode', { connect: null });
+    // git: Install "opens Apple's installer", and the re-check finds git
+    await ctl('scenario', { name: 'connect-git-missing' });
+    assert.equal((await call('/api/connect/git', { name: 'Sam', email: 'sam@example.com' })).code, 409);
+    r = await call('/api/connect/git/install', {});
+    assert.equal(r.body.opened, true);
+    assert.equal(V.gitOf(V.statusOf((await call('/api/connect/recheck', {})).body)).installed, true);
+    assert.equal((await call('/api/connect/git/install', {})).code, 409);
   } finally { await mock.close(); }
 });
 
@@ -799,6 +1190,15 @@ test('the panel’s focus rings are the lid’s, which stand out on its surface 
   assert.doesNotMatch(css, /#connect[^{]*\.pop\b|class="pop/, 'not a menu: menus use the card’s focus colour');
   const band = rules.find(r => r.sel === '#connectBtn:focus-visible');
   assert.match(band.body, /var\(--focus\)/, 'the band’s button sits on the board: the board’s ring');
+});
+
+test('nothing in the panel moves while a sign-in waits: its marks are still, as everything at rest is', () => {
+  const css = read('../ui/app.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = css.slice(css.indexOf('#connectBtn {'));
+  assert.ok(block.length > 1000);
+  assert.doesNotMatch(block, /\binfinite\b|animation-iteration-count/);
+  // the code's well, Open GitHub (a link drawn as a button) and the token form's link use the looks' own colours
+  for (const sel of ['#connect .cn-code', '#connect a.cn-btn', '#connect .cn-textbtn', '#connect .cn-row', '#connect .cn-wait']) assert.ok(block.includes(`${sel} {`), sel);
 });
 
 test("a new key is for this repository unless it is a model key; the person’s choice wins", () => {

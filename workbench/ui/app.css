@@ -833,4 +833,22 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #connect .cn-key .cn-line { flex: 1; min-width: 0; }
 #connect .cn-key .cn-acts { flex: none; margin-top: 0; }
 #connect .cn-err .cn-btn { margin-top: 8px; }
+/* an agent's next step while it signs in (finish in the browser; or, when that did not finish, sign in in Terminal) */
+#connect .cn-step { font-weight: 600; }
+/* git missing: a row like an agent's, its light, its words and Install */
+#connect .cn-row { display: grid; grid-template-columns: 12px minmax(0, 1fr); gap: 2px 10px; align-items: start; padding: 6px 0 4px; }
+#connect .cn-row .cn-acts { grid-column: 2; }
+/* GitHub: a sign-in under way, with the waiting mark (still, as everything at rest is); GitHub's one-time code in the
+   exact command's well; Open GitHub, a link drawn as the lid's button */
+#connect .cn-wait { display: flex; align-items: center; gap: 8px; }
+#connect .cn-wait svg.g { flex: none; width: 11px; height: 11px; }
+#connect .cn-codeline { margin: 4px 0 2px; }
+#connect .cn-code { display: inline-block; margin-left: 4px; padding: 2px 10px; border-radius: 4px; background: var(--exact); color: var(--exact-ink);
+  font: 600 calc(var(--l-h1m, 16px) + 2px)/1.3 "JetBrains Mono", monospace; letter-spacing: 2px; user-select: all; }
+#connect a.cn-btn { display: inline-flex; align-items: center; text-decoration: none; }
+/* "Use a token instead": a quiet button that reads as a link, and milestone 1's token form under it */
+#connect .cn-textbtn { padding: 0; margin: 0; border: 0; background: none; font: inherit; color: var(--lid-ink-2); cursor: pointer;
+  text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--lid-rule); }
+#connect .cn-textbtn:hover { color: var(--lid-ink); }
+#connect .cn-tokenform { margin-left: 2px; padding-left: 12px; border-left: 2px solid var(--lid-rule); }
 @media (max-width: 520px) { #connect .cn-key { flex-direction: column; gap: 4px; } #connect .cn-inrow:not(.cn-wrap) { flex-wrap: wrap; } }

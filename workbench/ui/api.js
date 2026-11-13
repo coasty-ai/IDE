@@ -112,10 +112,28 @@ export const connectApi = {
   status: () => connectCall('GET', '/api/connect'),
   recheck: () => connectCall('POST', '/api/connect/recheck', {}),
   install: id => connectCall('POST', agentPath(id, 'install'), {}),
-  signin: id => connectCall('POST', agentPath(id, 'signin'), {}),
+  /**
+   * An agent's own login. With nothing, it runs in the background and opens the person's browser (the answer's status
+   * has that agent's `signingIn`); `{ console: true }` is Claude Code's Anthropic Console account; `{ terminal: true }`
+   * opens Terminal on it instead (the answer may carry the `command` to run where Terminal cannot open). Only the flags
+   * that are true are sent.
+   */
+  signin: (id, { console: viaConsole = false, terminal = false } = {}) =>
+    connectCall('POST', agentPath(id, 'signin'), { ...(viaConsole === true ? { console: true } : {}), ...(terminal === true ? { terminal: true } : {}) }),
+  /** Stop an agent's sign-in in the browser. */
+  cancelSignin: id => connectCall('POST', agentPath(id, 'signin/cancel'), {}),
   key: (id, value) => connectCall('POST', agentPath(id, 'key'), { value }),
   setDefault: id => connectCall('POST', agentPath(id, 'default'), {}),
   git: (name, email) => connectCall('POST', '/api/connect/git', { name, email }),
+  /** Install git (on a Mac, Apple's own installer for its developer tools opens). */
+  gitInstall: () => connectCall('POST', '/api/connect/git/install', {}),
+  /**
+   * Sign in to GitHub through GitHub's own command-line tool, which Workbench gets first when it is missing. It answers
+   * at once; the status's `github.signingIn` then says how far it is, and the panel reads it again every 2 seconds.
+   */
+  githubSignIn: () => connectCall('POST', '/api/connect/github/signin', {}),
+  githubSignInCancel: () => connectCall('POST', '/api/connect/github/signin/cancel', {}),
+  githubSignOut: () => connectCall('POST', '/api/connect/github/signout', {}),
   github: (githubToken, agentsUseIt) => connectCall('POST', '/api/connect/github', { token: githubToken, agentsUseIt: agentsUseIt === true }),
   /**
    * "Let agents use this token (as GH_TOKEN)", once GitHub is connected: Workbench gives the token it keeps to every
