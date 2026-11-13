@@ -121,9 +121,14 @@ const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh
 const RUNS_CODE = new Set([...SHELLS, 'source', '.', 'eval', 'node', 'python', 'python2', 'python3', 'perl', 'ruby',
   'php', 'deno', 'bun', 'tsx', 'ts-node', 'osascript', 'Rscript', 'lua', 'awk', 'gawk', 'pwsh']);
 const PACKAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+/**
+ * git commands that only look: the same list as the permission policy's GIT_READ, which this file cannot import (the page
+ * loads it as it is). test/narrate.test.mjs keeps the two in step.
+ */
 const GIT_LOOK = new Set(['status', 'diff', 'log', 'show', 'blame', 'grep', 'ls-files', 'rev-parse', 'shortlog', 'describe',
   'annotate', 'cat-file', 'cherry', 'count-objects', 'diff-files', 'diff-index', 'diff-tree', 'for-each-ref', 'ls-remote', 'ls-tree',
-  'merge-base', 'name-rev', 'range-diff', 'rev-list', 'show-branch', 'show-ref', 'verify-commit', 'verify-tag', 'whatchanged']);
+  'merge-base', 'name-rev', 'range-diff', 'rev-list', 'show-branch', 'show-ref', 'verify-commit', 'verify-tag', 'whatchanged',
+  'check-attr', 'check-ignore', 'check-mailmap', 'check-ref-format', 'diff-pairs', 'get-tar-commit-id', 'help', 'var', 'version']);
 /** Options before git's command that take the next word as their value. */
 const GIT_VALUE_OPTS = /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--super-prefix|--attr-source)$/;
 
@@ -272,21 +277,39 @@ function addressOf(word) {
   return scp && !/^[./~]/.test(w) ? { host: scp[1], path: scp[2] } : null;
 }
 
-/** Where a remote is, in words: GitHub for github.com, the computer's name for another address, else the remote's own name. */
+/**
+ * Where a remote is, in words: GitHub for an address on github.com, the computer's name for another address, and
+ * anything else as a name, "the remote “origin”": the agent chooses a remote's name, so a remote it calls "GitHub" must
+ * not read as GitHub. Curly quotes in the name become straight ones, so it cannot close its own quote ("x” on GitHub").
+ */
 function remoteWords(word) {
   const at = addressOf(word);
-  if (!at) return said(word);
+  if (!at) return `the remote “${said(word, 32).replace(/[“-‟″‶]/g, '"')}”`;
   return /^(www\.)?github\.com$/i.test(at.host) ? 'GitHub' : said(at.host.toLowerCase());
 }
 
-/** The branch or tag a refspec names: main for refs/heads/main or main:main, its branch for HEAD, old for :old. */
+/** A branch or tag as a refspec names it: main for refs/heads/main, its branch for HEAD (or @, or nothing). */
+const refName = r => (!r || r === 'HEAD' || r === '@' ? 'its branch' : said(r.replace(/^refs\/(heads|tags|remotes)\//, ''), 32));
+
+/** The branch or tag a pull's refspec brings in, its source: main for refs/heads/main or main:main, old for :old. */
 function refWord(spec) {
   const s = String(spec).replace(/^\+/, '');
   const at = s.indexOf(':');
   let src = at < 0 ? s : s.slice(0, at);
   if (!src && at >= 0) src = s.slice(at + 1); // ":old" deletes old
-  if (!src || src === 'HEAD' || src === '@') return 'its branch';
-  return said(src.replace(/^refs\/(heads|tags|remotes)\//, ''), 32);
+  return refName(src);
+}
+
+/**
+ * A push refspec: what it sends (`from`, null for ":old", which deletes old) and the branch or tag it changes on the
+ * remote (`to`): its destination, or the source's own name when it names none. HEAD:main sends its branch to main.
+ */
+function pushRef(spec) {
+  const s = String(spec).replace(/^\+/, '');
+  const at = s.indexOf(':');
+  const src = at < 0 ? s : s.slice(0, at);
+  const dst = at < 0 ? '' : s.slice(at + 1);
+  return { from: src ? refName(src) : null, to: dst ? said(dst.replace(/^refs\/(heads|tags|remotes)\//, ''), 32) : refName(src) };
 }
 
 const listNames = names => {
@@ -327,11 +350,16 @@ function readPush(args) {
   return { ...p, remote, refs };
 }
 
-/** "Pushing main to origin", "Pushing its branch to GitHub", "Replacing main on origin", "Deleting old on origin". */
+/**
+ * "Pushing main to the remote “origin”", "Pushing its branch to GitHub", "Pushing its branch to main on GitHub" (HEAD:main),
+ * "Replacing main on the remote “origin”", "Deleting old on GitHub". A refspec is named by the branch it changes on the
+ * remote, its destination: `push --force origin HEAD:main` replaces main, whatever is sent onto it.
+ */
 function pushWords(c) {
   const p = readPush(c.subArgs);
   const remote = p.remote ? remoteWords(p.remote) : '';
-  const names = p.refs.map(refWord);
+  const refs = p.refs.map(pushRef);
+  const names = refs.map(r => r.to);
   if (p.delete || p.prune) {
     const what = p.delete && names.length ? listNames(names) : 'branches';
     const on = ` on ${remote || 'the remote'}`;
@@ -341,6 +369,11 @@ function pushWords(c) {
   if (p.force || p.mirror) {
     const on = ` on ${remote || 'the remote'}`;
     return { does: `replace ${what}${on}`, doing: `Replacing ${what}${on}` };
+  }
+  // One branch sent onto a branch of another name: both are named.
+  const [one] = refs;
+  if (refs.length === 1 && one.from && one.from !== one.to && remote) {
+    return { does: `push ${one.from} to ${one.to} on ${remote}`, doing: `Pushing ${one.from} to ${one.to} on ${remote}` };
   }
   const to = remote ? ` to ${remote}` : '';
   return { does: `push ${what}${to}`, doing: `Pushing ${what}${to}` };
