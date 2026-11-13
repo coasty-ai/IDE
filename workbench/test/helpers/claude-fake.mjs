@@ -6,6 +6,8 @@
 // - `--version` prints a version: FAKE_CLAUDE_VERSION when set (it hangs with FAKE_CLAUDE_VERSION=hang), else 2.1.221.
 //   Its system/init lines report the same version, the --permission-mode it was given (or FAKE_CLAUDE_PERMISSION_MODE)
 //   and a short list of tools.
+// - `auth status` prints FAKE_CLAUDE_AUTH (JSON, as `claude auth status` does) and exits 0 when its `loggedIn` is true,
+//   else 1. Unset, it is signed in with a Claude subscription. Text that is not JSON is printed as it is (exit 1).
 // - Otherwise it checks the launch flags and environment the workbench must pass, and exits 3 with a reason
 //   on stderr when one is wrong. Then it reads stream-json user messages on stdin, one per line:
 //     * the first message replays FAKE_CLAUDE_FIXTURE (a file in test/fixtures/) with its session id,
@@ -52,6 +54,12 @@ if (argv.length === 0) {
 } else if (argv.includes('--version')) {
   if (env.FAKE_CLAUDE_VERSION === 'hang') setInterval(() => {}, 1000);
   else { process.stdout.write(`${VERSION} (Claude Code)\n`); process.exit(0); }
+} else if (argv[0] === 'auth' && argv[1] === 'status') {
+  const text = env.FAKE_CLAUDE_AUTH || '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}';
+  let loggedIn = false;
+  try { loggedIn = JSON.parse(text).loggedIn === true; } catch { /* not JSON: printed as it is */ }
+  process.stdout.write(`${text}\n`);
+  process.exitCode = loggedIn ? 0 : 1;
 } else {
   main();
 }

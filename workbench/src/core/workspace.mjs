@@ -1922,3 +1922,443 @@ function normAllow(a) {
   if (!isText(a, 500) || /[\u0000-\u001f]/.test(a)) return null;
   return a.trim().replace(/\s+/g, ' ');
 }
+
+// ---------------------------------------------------------------------------------------------
+// Connecting: the person's name and email for git, the GitHub sign-in git keeps, and cloning a repository.
+//
+// These run git from a new empty folder outside every repository, with GIT_CEILING_DIRECTORIES so git looks no
+// further up. A repository's own config, which an agent can change, could otherwise name a credential helper (a
+// program git runs) or point git elsewhere. Nothing here asks the person anything through git: no terminal prompt
+// (GIT_TERMINAL_PROMPT=0, from git()) and no askpass program (an empty GIT_ASKPASS stops git from looking for one,
+// SSH_ASKPASS goes, and Git Credential Manager is told never to ask), so a refusal comes back at once as an error.
+
+const CLONE_TIMEOUT_MS = 30 * 60_000;
+const CREDENTIAL_TIMEOUT_MS = 15_000;
+/** Variables for git commands that reach a server or a credential helper (see above). */
+const NO_ASKING = { GIT_ASKPASS: '', SSH_ASKPASS: undefined, SSH_ASKPASS_REQUIRE: undefined, GCM_INTERACTIVE: 'never' };
+/** Characters a name or email for git may not hold: control, line-separator and direction-changing ones, and < >. */
+const NOT_PRINTABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069<>]/;
+const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]+$/;
+/** A GitHub user name: letters, digits and single dashes, at most 39 characters. */
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const CREDENTIAL_HOSTS = new Set(['github.com']);
+
+/** A plain error from a git command that failed, its words only in `.detail`; `.why` is 'git'. */
+function gitFailed(e, sentence, secret = null) {
+  const trouble = gitTrouble(e);
+  const err = new Error(trouble ? trouble.message : sentence);
+  err.plain = true;
+  err.why = 'git';
+  err.sentence = err.message;
+  let detail = String((e && (e.stderr || e.message)) || '').trim();
+  if (secret) detail = detail.split(secret).join('••••'); // a credential helper could echo what it was given
+  if (detail) err.detail = detail;
+  return err;
+}
+
+/** `fn(cwd, env)` run from a new empty folder outside every repository (removed afterwards). */
+async function outsideRepos(fn) {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-git-')));
+  try {
+    return await fn(dir, { GIT_CEILING_DIRECTORIES: path.dirname(dir) });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The person's own name and email for git, from the global config (the file GIT_CONFIG_GLOBAL names when it is set,
+ * else ~/.gitconfig and ~/.config/git/config). Unset ones are ''.
+ * @returns {Promise<{ name: string, email: string }>}
+ */
+export async function gitConfigIdentity() {
+  return outsideRepos(async (cwd, env) => {
+    const read = async (key) => {
+      try {
+        const r = await git(['config', '--global', '--get', key], { cwd, env, okCodes: [1] });
+        return r.code === 0 ? String(r.stdout).replace(/\r?\n$/, '') : '';
+      } catch (e) {
+        throw gitFailed(e, 'Git could not read your name and email from its settings.');
+      }
+    };
+    const name = await read('user.name');
+    const email = await read('user.email');
+    return { name, email };
+  });
+}
+
+/**
+ * Save the person's name and email in git's global config (`git config --global --replace-all user.name|user.email`).
+ * The name: 1 to 100 printable characters on one line, without < or >. The email: shaped like an address, at most 254
+ * characters. Both are trimmed. Refusals are plain errors with `.why` 'name' or 'email'.
+ * @param {{ name: string, email: string }} who
+ * @returns {Promise<{ name: string, email: string }>} what was saved
+ */
+export async function setGitIdentity({ name, email } = {}) {
+  const n = typeof name === 'string' ? name.trim() : '';
+  const m = typeof email === 'string' ? email.trim() : '';
+  if (!n || [...n].length > 100 || NOT_PRINTABLE.test(n)) {
+    throw new Refusal('name', 'A name for git must be 1 to 100 characters on one line, without < or >.');
+  }
+  if (!m || m.length > 254 || NOT_PRINTABLE.test(m) || !EMAIL_RE.test(m)) {
+    throw new Refusal('email', 'That does not look like an email address.');
+  }
+  await outsideRepos(async (cwd, env) => {
+    for (const [key, value] of [['user.name', n], ['user.email', m]]) {
+      try {
+        await git(['config', '--global', '--replace-all', key, value], { cwd, env });
+      } catch (e) {
+        throw gitFailed(e, 'Git could not save your name and email.');
+      }
+    }
+  });
+  return { name: n, email: m };
+}
+
+/** The lines `git credential` reads on stdin. Every field is checked: a line break would start another field. */
+function credentialInput({ host, username, password }, withPassword) {
+  if (!CREDENTIAL_HOSTS.has(host)) throw new Refusal('host', 'Workbench gives git a sign-in for github.com only.');
+  if (typeof username !== 'string' || !GITHUB_LOGIN.test(username)) throw new Refusal('username', 'That is not a GitHub user name.');
+  let text = `protocol=https\nhost=${host}\nusername=${username}\n`;
+  if (withPassword) {
+    if (typeof password !== 'string' || !password || password.length > 1000 || /[\r\n\u0000]/.test(password)) {
+      throw new Refusal('password', 'That token cannot be given to git.');
+    }
+    text += `password=${password}\n`;
+  }
+  return `${text}\n`;
+}
+
+/** Whether git has a credential helper for https://github.com: the last value git finds is not the empty reset. */
+async function hasCredentialHelper(cwd, env) {
+  try {
+    const r = await git(['config', '--get-urlmatch', 'credential.helper', 'https://github.com'], { cwd, env, okCodes: [1] });
+    return r.code === 0 && String(r.stdout).trim() !== '';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Give git a sign-in to keep: `git credential approve`, with the fields on stdin, never in argv. Git hands it to the
+ * person's credential helpers (on a Mac usually the login keychain); with no helper set, nothing is kept.
+ * @param {{ host: 'github.com', username: string, password: string }} cred
+ * @returns {Promise<{ helper: boolean }>} helper: git has a credential helper that keeps it
+ */
+export async function approveGitCredential({ host, username, password } = {}) {
+  const input = credentialInput({ host, username, password }, true);
+  return outsideRepos(async (cwd, env) => {
+    const quiet = { ...env, ...NO_ASKING };
+    try {
+      await git(['credential', 'approve'], { cwd, env: quiet, input, timeout: CREDENTIAL_TIMEOUT_MS });
+    } catch (e) {
+      throw gitFailed(e, 'Git could not keep your GitHub sign-in.', password);
+    }
+    return { helper: await hasCredentialHelper(cwd, quiet) };
+  });
+}
+
+/**
+ * Make git forget a sign-in: `git credential reject`, with the fields on stdin.
+ * @param {{ host: 'github.com', username: string }} cred
+ * @returns {Promise<{ ok: true }>}
+ */
+export async function rejectGitCredential({ host, username } = {}) {
+  const input = credentialInput({ host, username }, false);
+  await outsideRepos(async (cwd, env) => {
+    try {
+      await git(['credential', 'reject'], { cwd, env: { ...env, ...NO_ASKING }, input, timeout: CREDENTIAL_TIMEOUT_MS });
+    } catch (e) {
+      throw gitFailed(e, 'Git could not forget your GitHub sign-in.');
+    }
+  });
+  return { ok: true };
+}
+
+/**
+ * The sign-in git keeps for this host and user (`git credential fill`, fields on stdin), or null when it keeps none:
+ * git then exits 128, since it may not ask. Never rejects. The password is never logged.
+ * @param {{ host: 'github.com', username: string }} cred
+ * @returns {Promise<{ username: string, password: string } | null>}
+ */
+export async function fillGitCredential({ host, username } = {}) {
+  let input;
+  try {
+    input = credentialInput({ host, username }, false);
+  } catch {
+    return null;
+  }
+  return outsideRepos(async (cwd, env) => {
+    let r;
+    try {
+      r = await git(['credential', 'fill'], { cwd, env: { ...env, ...NO_ASKING }, input, timeout: CREDENTIAL_TIMEOUT_MS });
+    } catch {
+      return null;
+    }
+    const fields = {};
+    for (const line of String(r.stdout).split('\n')) {
+      const i = line.indexOf('=');
+      if (i > 0 && !(line.slice(0, i) in fields)) fields[line.slice(0, i)] = line.slice(i + 1);
+    }
+    if (fields.host !== host || !fields.password || (fields.username && fields.username !== username)) return null;
+    return { username, password: fields.password };
+  });
+}
+
+// ---- cloning
+
+/** The process groups of clones under way, ended when Workbench exits (they run detached from the terminal). */
+const runningClones = new Set();
+let clonesWatched = false;
+function watchClones() {
+  if (clonesWatched) return;
+  clonesWatched = true;
+  process.on('exit', () => {
+    for (const pid of runningClones) {
+      try { process.kill(-pid, 'SIGTERM'); } catch { /* gone */ }
+    }
+  });
+}
+
+/**
+ * git with an argument array (as git() runs it: core.fsmonitor=false first, the scrubbed environment), its stderr read
+ * line by line as it comes (git rewrites a progress line with \r). Git runs in a process group and session of its own:
+ * it has no terminal, so ssh cannot stop to ask on one, and the time limit ends the whole group (SIGTERM, then SIGKILL
+ * 5 seconds later). Resolves `{ code: 0, stderr }`; rejects with an error carrying .code, .signal, .killed and .stderr
+ * (the last 64 KB), or the spawn error (.code 'ENOENT' when git is missing).
+ */
+function gitStream(args, { cwd, timeout, env, onLine }) {
+  return new Promise((resolve, reject) => {
+    const childEnv = gitEnv();
+    for (const [k, v] of Object.entries(env || {})) {
+      if (v === undefined) delete childEnv[k];
+      else childEnv[k] = v;
+    }
+    let child;
+    try {
+      child = spawn('git', [...GIT_SAFE_CONFIG, ...args], { cwd, env: childEnv, detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let stderr = '';
+    let pending = '';
+    let killed = false;
+    let ended = false;
+    const group = (signal) => {
+      try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch { /* gone */ } }
+    };
+    const timer = timeout > 0 ? setTimeout(() => {
+      killed = true;
+      group('SIGTERM');
+      setTimeout(() => group('SIGKILL'), 5000).unref?.();
+    }, timeout) : null;
+    const line = (l) => {
+      if (!l.trim()) return;
+      try { onLine(l); } catch { /* a progress listener must not stop the clone */ }
+    };
+    child.stdout.on('data', () => {}); // clone writes nothing there; drain it anyway
+    child.stderr.setEncoding('utf8').on('data', (chunk) => {
+      stderr = (stderr + chunk).slice(-64 * 1024);
+      const parts = (pending + chunk).split(/[\r\n]/);
+      pending = parts.pop();
+      if (pending.length > 64 * 1024) pending = '';
+      for (const l of parts) line(l);
+    });
+    const end = (err, code, signal) => {
+      if (ended) return;
+      ended = true;
+      if (timer) clearTimeout(timer);
+      if (child.pid) runningClones.delete(child.pid);
+      line(pending);
+      pending = '';
+      if (err) {
+        err.stderr = stderr;
+        reject(err);
+      } else if (code === 0 && !killed) {
+        resolve({ code: 0, stderr });
+      } else {
+        reject(Object.assign(new Error('git clone failed'), { code, signal, killed, stderr }));
+      }
+    };
+    child.on('error', (e) => end(e));
+    child.on('close', (code, signal) => end(null, code, signal));
+    if (child.pid) {
+      runningClones.add(child.pid);
+      watchClones();
+    }
+  });
+}
+
+/** git's progress lines for a clone, and the phase each one is. Lines from the server start with "remote: ". */
+const CLONE_PHASES = [
+  [/^(?:remote:\s*)?(?:Enumerating|Counting) objects:\s+(?:(\d{1,3})%)?/, 'counting'],
+  [/^(?:remote:\s*)?Compressing objects:\s+(\d{1,3})%/, 'compressing'],
+  [/^Receiving objects:\s+(\d{1,3})%/, 'receiving'],
+  [/^Resolving deltas:\s+(\d{1,3})%/, 'resolving'],
+  [/^(?:Updating|Checking out) files:\s+(\d{1,3})%/, 'checkout'],
+];
+
+/**
+ * One line of git's clone progress as `{ phase, percent }`, or null for any other line. `phase` is 'counting',
+ * 'compressing', 'receiving', 'resolving' or 'checkout'; `percent` is 0 to 100, or null when git gave none.
+ */
+export function cloneProgressOf(line) {
+  const l = String(line ?? '').trim();
+  for (const [re, phase] of CLONE_PHASES) {
+    const m = re.exec(l);
+    if (m) return { phase, percent: m[1] == null ? null : Math.min(100, Number(m[1])) };
+  }
+  return null;
+}
+
+/**
+ * What a clone address is: `{ url, kind: 'https'|'ssh'|'scp'|'local', host, path }`. Accepted: https://host/path
+ * (no user or password in it, no query), ssh://[user@]host/path, and [user@]host:path (scp-like); a file:// address
+ * or an absolute path only with allowLocal (tests). Everything else is refused, as `.why` 'url': ext::, fd:: and the
+ * other transport::address forms, file://, http://, git://, and anything starting with "-".
+ */
+function cloneSource(raw, allowLocal) {
+  const url = typeof raw === 'string' ? raw.trim() : '';
+  const refuse = () => new Refusal('url', url
+    ? `“${clip(url, 80)}” is not an address Workbench can clone. Use one like https://github.com/owner/repo or git@github.com:owner/repo.git.`
+    : 'Give the address of the repository to clone, like https://github.com/owner/repo.');
+  if (!url || url.length > 2000 || /[\s\u0000-\u001f\u007f-\u009f]/.test(url) || url.startsWith('-')) throw refuse();
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(url);
+  if (scheme) {
+    const kind = scheme[1].toLowerCase();
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      throw refuse();
+    }
+    if (kind === 'https' || kind === 'ssh') {
+      const host = u.hostname.toLowerCase();
+      if (!host || host.startsWith('-') || u.password || (kind === 'https' && u.username) || u.username.startsWith('-')
+        || !/[^/]/.test(u.pathname) || u.search || u.hash) throw refuse();
+      return { url, kind, host, path: u.pathname };
+    }
+    if (kind === 'file' && allowLocal && !u.search && !u.hash) return { url, kind: 'local', host: null, path: u.pathname };
+    throw refuse();
+  }
+  if (url.includes('::')) throw refuse();
+  const scp = /^(?:([A-Za-z0-9._][A-Za-z0-9._-]*)@)?([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):(.+)$/.exec(url);
+  if (scp && !scp[3].startsWith('-') && /[^/]/.test(scp[3])) return { url, kind: 'scp', host: scp[2].toLowerCase(), path: scp[3] };
+  if (allowLocal && path.isAbsolute(url)) return { url, kind: 'local', host: null, path: url };
+  throw refuse();
+}
+
+/** The folder name git would pick: the last part of the address's path, without a trailing / or .git. */
+function cloneFolderName(p) {
+  let s = String(p).replace(/\/+$/, '');
+  if (/\/\.git$/i.test(s)) s = s.slice(0, -5).replace(/\/+$/, '');
+  let base = s.slice(s.lastIndexOf('/') + 1);
+  if (/\.git$/i.test(base)) base = base.slice(0, -4);
+  return base;
+}
+
+function validFolderName(n) {
+  return typeof n === 'string' && n !== '' && n !== '.' && n !== '..' && !n.includes('/') && !/[\u0000-\u001f\u007f]/.test(n)
+    && Buffer.byteLength(n) <= 255;
+}
+
+/** git's words when it was refused a repository (a private one, no sign-in, a key it does not know). */
+const CLONE_AUTH = /Authentication failed|could not read (?:Username|Password)|terminal prompts disabled|Permission denied \(publickey|Repository not found|Invalid username or password|HTTP Basic: Access denied|The requested URL returned error: 40[13]|Write access to repository not granted/i;
+/** git's words when it could not reach the host. Checked after CLONE_AUTH: ssh says "Could not read from remote repository" for both. */
+const CLONE_NETWORK = /Could not resolve host|Could not resolve hostname|nodename nor servname|Name or service not known|Temporary failure in name resolution|Failed to connect|Connection refused|Connection timed out|Operation timed out|Network is unreachable|No route to host|Couldn't connect to server|Connection reset|Connection closed|SSL|TLS|certificate|unable to access|early EOF|remote end hung up unexpectedly|RPC failed|The requested URL returned error: 5\d\d/i;
+const CLONE_HOST_KEY = /Host key verification failed/i;
+const CLONE_EXISTS = /already exists and is not an empty directory/i;
+
+/** The plain error for a clone that failed, with git's own words only in `.detail`. */
+function cloneFailure(e, src) {
+  const text = String((e && e.stderr) || '');
+  const where = src.host || 'that repository';
+  const err = (why, sentence) => {
+    const out = new Refusal(why, sentence);
+    const detail = text.trim() || String((e && e.message) || '').trim();
+    if (detail) out.detail = detail;
+    return out;
+  };
+  if (e && (e.code === 'ENOENT' || e.killed)) return err('git', gitTrouble(e).message);
+  if (CLONE_EXISTS.test(text)) return err('exists', 'Something is already in the folder it would go into. Choose another folder.');
+  if (CLONE_AUTH.test(text)) {
+    return err('auth', src.host === 'github.com'
+      ? 'GitHub did not let Workbench read this repository. If it is private, connect your GitHub account, then try again.'
+      : `${where} did not let Workbench read this repository. If it is private, make sure git can sign in to ${where}, then try again.`);
+  }
+  if (CLONE_HOST_KEY.test(text)) {
+    return err('auth', `SSH on this computer does not know ${where} yet, so git did not connect to it. Use its https:// address, or connect to it once with ssh in a terminal.`);
+  }
+  if (CLONE_NETWORK.test(text)) return err('network', `Workbench could not reach ${where}.`);
+  return err('git', `Git could not clone ${clip(src.url, 120)}.`);
+}
+
+/**
+ * Clone a repository into a new folder.
+ *
+ * `url`: see cloneSource. `into`: the folder to put it in (made when missing; ~ is the home folder). `name`: the new
+ * folder's name, by default the last part of the address without .git; never empty, ".", ".." or holding "/". The
+ * new folder must not exist, or must be an empty folder. Git runs as `git -c protocol.allow=never -c
+ * protocol.https.allow=always -c protocol.ssh.allow=always [-c protocol.file.allow=always] clone --progress -- <url>
+ * <folder>` (file only with allowLocal, for tests; GIT_ALLOW_PROTOCOL in Workbench's environment is taken away, since
+ * it would override those settings), from a folder outside every repository, with no prompts (see above), detached
+ * from the terminal, within `timeoutMs` (30 minutes unless given). `onProgress({ phase, percent })` hears each change
+ * of git's progress (see cloneProgressOf).
+ *
+ * Refusals and failures are plain errors with `.why`: 'url' (an address Workbench does not clone from, or no folder
+ * name in it), 'exists' (something is already there, or the folder cannot be made), 'auth' (refused: a private
+ * repository, no sign-in; on GitHub "GitHub did not let Workbench read this repository. If it is private, connect
+ * your GitHub account, then try again."), 'network' ("Workbench could not reach <host>.") or 'git' (anything else),
+ * with git's own words in `.detail`. A folder the clone made is removed again when it fails.
+ * @returns {Promise<{ root: string }>} the new folder's real path
+ */
+export async function cloneRepo({ url, into, name, onProgress, timeoutMs = CLONE_TIMEOUT_MS, allowLocal = false } = {}) {
+  const src = cloneSource(url, allowLocal);
+  const folderName = name == null ? cloneFolderName(src.path) : name;
+  if (!validFolderName(folderName)) {
+    throw new Refusal('url', name == null
+      ? `Workbench could not tell what to call the folder for ${clip(src.url, 80)}.`
+      : `“${clip(String(folderName), 40)}” cannot be the name of a folder.`);
+  }
+  if (typeof into !== 'string' || !into.trim() || into.includes('\u0000')) throw new Refusal('exists', 'No folder was given to put the repository in.');
+  const parent = path.resolve(expandHome(into.trim()));
+  if (fs.existsSync(parent) && !isFolder(parent)) throw new Refusal('exists', `${parent} is a file, not a folder.`);
+  try {
+    fs.mkdirSync(parent, { recursive: true });
+  } catch {
+    throw new Refusal('exists', `Workbench could not make the folder ${parent}.`);
+  }
+  if (!isFolder(parent)) throw new Refusal('exists', `Workbench could not make the folder ${parent}.`);
+  const dest = path.join(parent, folderName);
+  let existed = false;
+  try {
+    const st = fs.lstatSync(dest);
+    existed = true;
+    if (!st.isDirectory() || fs.readdirSync(dest).length > 0) {
+      throw new Refusal('exists', `There is already something at ${dest}. Choose another folder, or move it away first.`);
+    }
+  } catch (e) {
+    if (e instanceof Refusal) throw e;
+    if (e.code !== 'ENOENT') throw new Refusal('exists', `Workbench could not look at ${dest}.`);
+  }
+  const args = ['-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always',
+    ...(src.kind === 'local' ? ['-c', 'protocol.file.allow=always'] : []), 'clone', '--progress', '--', src.url, dest];
+  let last = null;
+  const onLine = (l) => {
+    const p = cloneProgressOf(l);
+    if (!p || typeof onProgress !== 'function' || (last && last.phase === p.phase && last.percent === p.percent)) return;
+    last = p;
+    onProgress({ ...p });
+  };
+  try {
+    await outsideRepos((cwd, env) => gitStream(args, {
+      cwd, timeout: timeoutMs, env: { ...env, ...NO_ASKING, GIT_ALLOW_PROTOCOL: undefined }, onLine,
+    }));
+  } catch (e) {
+    const failure = cloneFailure(e, src);
+    if (!existed && failure.why !== 'exists') fs.rmSync(dest, { recursive: true, force: true }); // git made it; it normally removes it itself
+    throw failure;
+  }
+  return { root: fs.realpathSync.native(dest) };
+}
