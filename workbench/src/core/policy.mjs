@@ -62,7 +62,7 @@ const R = Object.freeze({
   fileInside: "The file is inside the agent's own folder.",
   fileOutside: "The file is outside the agent's own folder.",
   fileFolder: "That is the agent's own folder, not a file in it.",
-  fileGit: "The file is part of git's own records, in the .git folder.",
+  fileGit: "The file is part of git's own records, in the .git folder or a folder laid out like it.",
   fileLinked: 'The file is also linked from another place on disk.',
   fileClaude: 'Files in a .claude folder change how Claude Code itself runs, so agents may not change them.',
   fileMcp: 'The .mcp.json file connects Claude Code to other services, so agents may not change it.',
@@ -93,6 +93,14 @@ const R = Object.freeze({
   gitOption: 'This option before the git command can point git at another repository or make it run other programs.',
   gitNone: 'It did not say which git command to run.',
   gitElsewhere: "It wants git to work in a folder outside the agent's own.",
+  gitOtherRepo: 'Git would work in another repository there, whose settings can make git run other programs.',
+  gitSeparate: "This keeps git's records for a repository in a separate folder, and moves them there when the repository is already set up.",
+  gitInitAgain: "This sets up again a repository whose records are outside the agent's own folder, which can change its settings.",
+  gitReflog: "This deletes git's record of earlier commits, which is how work that no branch holds any more can be brought back.",
+  gitPrune: 'This deletes commits that no branch holds any more, so they could never be brought back.',
+  gitBranchGone: "This deletes a branch other than the agent's own, with git's record of where it has been.",
+  gitRefGone: "This deletes a branch, tag or other name for a commit, with git's record of where it has been.",
+  gitWorktreeGone: "This removes another working copy of the repository, or git's records of one, with any work in it that is not committed.",
   gitUnknown: "This is not one of git's own commands, so it could be an alias or another program.",
   gitPrograms: 'This git command starts other programs.',
   gitRunsProgram: 'This option makes git start another program.',
@@ -104,7 +112,7 @@ const R = Object.freeze({
   gitRemote: 'This push replaces or deletes what is already on the remote.',
   gitMirror: 'This sets up a mirror of a remote: every later push to it replaces or deletes what is already there.',
   gitOutside: "It names a place outside the agent's own folder, where git could write.",
-  gitRecords: "It names a place in git's own records, in the .git folder.",
+  gitRecords: "It names a place in git's own records, in the .git folder or a folder laid out like it.",
   gitClaude: "It names a place in a .claude folder, which holds Claude Code's own settings.",
   gitUnsafe: "This lets git change files outside the agent's own folder.",
   gitRead: 'This git command only reads.',
@@ -112,13 +120,13 @@ const R = Object.freeze({
   tests: "This runs the project's tests, checks or build.",
   testsExtra: 'Extra options for this command need your OK.',
   testsOutside: "The command points at something outside the agent's own folder.",
-  testsGit: "The command points into git's own records, in the .git folder.",
+  testsGit: "The command points into git's own records, in the .git folder or a folder laid out like it.",
   testsClaude: "The command points into a .claude folder, which holds Claude Code's own settings.",
   testsOption: 'This test command uses an option that can delete files, upload results or run other programs.',
   codeAddress: 'Part of this command is an address (data:, file: or a web address) that could be loaded and run as code.',
   nodeInside: "The script is inside the agent's own folder.",
   nodeOutside: "The script is outside the agent's own folder.",
-  nodeGit: "The script is part of git's own records, in the .git folder.",
+  nodeGit: "The script is part of git's own records, in the .git folder or a folder laid out like it.",
   nodeClaude: "The script is in a .claude folder, which holds Claude Code's own settings.",
   nodeMissing: "The script is not a file in the agent's own folder.",
   nodeOption: 'This node command uses an option that can run code it was not given as a file.',
@@ -437,7 +445,10 @@ function claudeSetting(rel) {
   return rel.split('/').some(seg => { const s = seg.toLowerCase(); return s === '.claude' || s === '.mcp.json'; });
 }
 
-/** Where a real path sits relative to the agent's real folder: 'cwd', 'inside', 'git', 'claude' or 'outside'. */
+/**
+ * Where a real path sits relative to the agent's real folder: 'cwd', 'inside', 'git', 'claude' or 'outside'. git's records
+ * are a .git folder at any depth, and any folder laid out like one (gitRecordsAt), with everything in them.
+ */
 function placeOf(real, baseReal) {
   if (real === baseReal) return 'cwd';
   const prefix = baseReal.endsWith('/') ? baseReal : baseReal + '/';
@@ -445,7 +456,42 @@ function placeOf(real, baseReal) {
   const rel = real.slice(prefix.length);
   if (claudeSetting(rel)) return 'claude'; // before .git: a .claude folder is refused at any depth
   // Case-insensitive: on a default macOS disk ".GIT/config" is the same file as ".git/config".
-  return rel.split('/').some(seg => seg.toLowerCase() === '.git') ? 'git' : 'inside';
+  const segs = rel.split('/');
+  if (segs.some(seg => seg.toLowerCase() === '.git')) return 'git';
+  for (let k = 1; k <= segs.length; k++) if (gitRecordsAt(prefix + segs.slice(0, k).join('/'))) return 'git';
+  return 'inside';
+}
+
+/** Whether something is at `p` (a link to something missing counts). Anything but "not there" counts, to stay careful. */
+function present(p) {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch (e) {
+    return !(e && (e.code === 'ENOENT' || e.code === 'ENOTDIR'));
+  }
+}
+
+/**
+ * A folder laid out as git's records, which git takes for a repository: HEAD, with objects and refs (a bare repository, or
+ * the records `--separate-git-dir` put there), or with a commondir file (a worktree's own records). Its settings and hooks
+ * make git run programs just as those in .git do.
+ */
+function gitRecordsAt(dir) {
+  return present(dir + '/HEAD') && ((present(dir + '/objects') && present(dir + '/refs')) || present(dir + '/commondir'));
+}
+
+/**
+ * Whether git working in `dir`, a folder inside the agent's, would find a repository other than the agent's own: a folder
+ * on its way up to the agent's folder has a .git of its own (a folder, or a file that points anywhere), or is laid out
+ * as git's records.
+ */
+function otherRepository(dir, base) {
+  const prefix = base.endsWith('/') ? base : base + '/';
+  for (let d = dir; d.startsWith(prefix); d = path.dirname(d)) {
+    if (present(d + '/.git') || gitRecordsAt(d)) return true;
+  }
+  return false;
 }
 
 /** For a sentence: where a path a command writes or deletes sits ('outside', 'git', 'claude'), if anywhere special. */
@@ -781,8 +827,9 @@ const GIT_PROGRAMS = new Set(['archimport', 'citool', 'cvsexportcommit', 'cvsimp
 /**
  * git commands that only read. A word of theirs that names nothing (a search pattern such as "/api") is fine, as for the
  * other read-only commands; every other git command may write, so its words are held to where git could write.
+ * narrate.mjs keeps its own copy (GIT_LOOK: the page loads that file), held in step by test/narrate.test.mjs.
  */
-const GIT_READ = new Set(['annotate', 'blame', 'cat-file', 'check-attr', 'check-ignore', 'check-mailmap', 'check-ref-format',
+export const GIT_READ = new Set(['annotate', 'blame', 'cat-file', 'check-attr', 'check-ignore', 'check-mailmap', 'check-ref-format',
   'cherry', 'count-objects', 'describe', 'diff', 'diff-files', 'diff-index', 'diff-pairs', 'diff-tree', 'for-each-ref',
   'get-tar-commit-id', 'grep', 'help', 'log', 'ls-files', 'ls-remote', 'ls-tree', 'merge-base', 'name-rev', 'range-diff',
   'rev-list', 'rev-parse', 'shortlog', 'show', 'show-branch', 'show-ref', 'status', 'var', 'verify-commit', 'verify-tag',
@@ -913,24 +960,26 @@ function judgeWords(words, base, { extraAllow, also = [] }) {
 /**
  * Every piece of a word that could name a path; a piece with a wildcard stands for the folder it searches.
  * The parts of a value are split on = : and , except that the slashes right after "scheme:" in a web address
- * (the "//" of "http://") are not a path of their own.
+ * (the "//" of "http://") are not a path of their own. A piece that starts with "-" is an option only while it has no
+ * "/": git and the system read "--/../x" (a word, or a value as in --prefix=--/../x) as a path through a folder named
+ * "--", which git makes itself.
  */
 function readPieces(w) {
   const t = w.text;
   const out = new Set();
   const add = s => {
-    if (!s || s.startsWith('-')) return;
+    if (!s || (s.startsWith('-') && !s.includes('/'))) return;
     if (w.glob && /[*?[^#]/.test(s)) s = globFolder(s);
     if (s) out.add(s);
   };
   // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail.
   if (/^-[^-]/.test(t)) for (let k = 2; k < t.length; k++) add(t.slice(k));
-  add(t);
   const parts = t.split(/([=:,])/);
   for (let i = 0; i < parts.length; i += 2) {
     if (parts[i - 1] === ':' && /^\/+$/.test(parts[i])) continue;
     add(parts[i]);
   }
+  add(t); // after its parts, so an ask names where an option's value leads, not a folder named "--prefix=--"
   return out;
 }
 
@@ -980,12 +1029,16 @@ function judgeReadOnly(spec, argv, words, base) {
  * git, in the agent's own folder: any of git's own commands runs without asking (committing, branching, merging,
  * rebasing, fetching, pulling, pushing, cloning...). What reaches past the agent's own work still asks:
  * - options before the command that point git elsewhere or make it run programs (-c, --git-dir, --work-tree,
- *   --exec-path...), and -C with a folder outside the agent's own (-C inside it is fine);
+ *   --exec-path...), and -C with a folder outside the agent's own (-C inside it is fine), or one where git would find
+ *   another repository, whose settings act as -c does;
  * - a word that is not one of git's own commands (an alias or another program), and the commands that start programs;
  * - the person's stored sign-in (`git credential`, its helpers);
  * - writing git's settings (`git config` that is not a plain read), and options that run a program they are given;
  * - a push that replaces or deletes what is on the remote, and a remote set up as a push mirror;
- * - a place outside the agent's folder in any word (and, for a command that can write, a place in .git or .claude).
+ * - a place outside the agent's folder in any word (and, for a command that can write, a place in .git or .claude);
+ * - init and clone that keep a repository's records in a separate folder, and init that would set up again a repository
+ *   whose records are outside the folder (gitRecordsMove);
+ * - what destroys what no fetch can bring back (gitForGood).
  * Wildcards that could turn file names into options ask, as for every command.
  */
 function judgeGit(argv, words, base, also) {
@@ -1015,13 +1068,17 @@ function judgeGit(argv, words, base, also) {
   if (/^credential(-|$)/.test(sub)) return ask(R.gitSignIn, undefined, 'use your saved sign-in');
   if (GIT_PROGRAMS.has(sub)) return { ...ask(R.gitPrograms), say: 'wants to run another program' };
   if (!GIT_OWN.has(sub)) return { ...ask(R.gitUnknown), say: 'wants to run a git command' };
+  // In a folder of its own, git looks for its repository from there up: it may find another one before the agent's.
+  const at = from.at(-1);
+  if (at !== base && otherRepository(at, base)) return ask(R.gitOtherRepo, undefined, 'run a git command');
   const rest = words.slice(i + 1);
   if (rest.some(w => w.globLead)) return ask(R.globOption, undefined, RUN);
   const args = argv.slice(i + 1);
   const v = gitOptions(sub, args);
   if (v) return v;
   const read = GIT_READ.has(sub) || sub === 'config'; // config gets here only when it reads
-  return gitWords(sub, args, rest, from, base, also, read) || allow(read ? R.gitRead : R.gitAny);
+  return gitWords(sub, args, rest, from, base, also, read) || gitRecordsMove(sub, args, at, base) || gitForGood(sub, args, base)
+    || allow(read ? R.gitRead : R.gitAny);
 }
 
 /** The asks that depend on a git command's options, not on the places it names; null when there are none. */
@@ -1103,6 +1160,126 @@ function pushRewrites(args) {
     if (a.startsWith('+') || a.startsWith(':')) return true;
   }
   return false;
+}
+
+/** git init's options that take a value, which may be the next word. */
+const INIT_VALUES = ['template', 'separate-git-dir', 'initial-branch', 'object-format', 'ref-format'];
+
+/**
+ * init and clone that would put a repository's records where the agent's folder does not keep them apart, null when
+ * neither does. `--separate-git-dir` keeps them in a folder of their own, which edits do not treat as git's records
+ * unless it is laid out like them already; run in a repository that is there already, init moves all its records there,
+ * and from the agent's own folder that is the person's whole repository. And init that would set up again a repository
+ * whose records are elsewhere: the folder it names (or, naming none, the one it runs in, `at`) has a .git file, as a
+ * worktree has (the agent's own folder too), or a .git that leads outside. That holds with --bare too, which a later
+ * --no-bare takes back. The places it names are judged as for any git command that writes, before this.
+ */
+function gitRecordsMove(sub, args, at, base) {
+  if (sub !== 'init' && sub !== 'clone') return null;
+  if (args.some(a => longIs(a, ['separate-git-dir']))) return ask(R.gitSeparate);
+  if (sub !== 'init') return null;
+  const dirs = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { dirs.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      if (!a.includes('=') && longIs(a, INIT_VALUES)) k++; // its value is the next word
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      if (a.indexOf('b') === a.length - 1) k++; // -b <branch> (also -qb <branch>); in -bmain the name follows b
+      continue;
+    }
+    dirs.push(a);
+  }
+  for (const d of dirs.length ? dirs : ['.']) {
+    const r = resolveReal(d, at);
+    if (r.ok && r.exists && initsElsewhere(r.real, base)) return ask(R.gitInitAgain, 'outside');
+  }
+  return null;
+}
+
+/** Whether git init in folder `dir` would set up records outside it: its .git is a file (pointing anywhere) or leads out. */
+function initsElsewhere(dir, base) {
+  if (!present(dir + '/.git')) return false; // nothing there yet: a new repository, in the folder
+  try {
+    const real = fs.realpathSync.native(dir + '/.git');
+    return !fs.statSync(real).isDirectory() || placeOf(real, base) === 'outside';
+  } catch {
+    return true; // a link to something missing, or a .git that cannot be read
+  }
+}
+
+/**
+ * What destroys what no fetch can bring back, null for anything else: git's record of earlier commits (reflog expire,
+ * delete and drop), the commits no branch holds (gc --prune with any value, prune), a branch other than the agent's own
+ * with its record (branch -d or -D: Workbench names the agent's branch workbench/<its folder's name>), any of git's names
+ * for a commit (update-ref -d, or a new value of all zeros, which deletes too), and other working copies of the
+ * repository with their uncommitted work (worktree remove and prune: git finds a working copy by the end of its path, so
+ * the words cannot show whose it is). An agent's own work needs none of them.
+ */
+function gitForGood(sub, args, base) {
+  const first = args.find(a => !a.startsWith('-'));
+  if (sub === 'reflog' && /^(expire|delete|drop)$/.test(first ?? '')) return { ...ask(R.gitReflog), say: "wants to delete git's record of earlier commits" };
+  if (sub === 'prune' || (sub === 'gc' && args.some(a => longIs(a, ['prune'])))) {
+    return { ...ask(R.gitPrune), say: 'wants to delete commits that no branch holds' };
+  }
+  if (sub === 'update-ref' && refDeletes(args)) return { ...ask(R.gitRefGone), say: 'wants to delete a branch, tag or other name for a commit' };
+  const gone = sub === 'branch' ? branchDeletes(args) : null;
+  if (gone && (gone.remotes || gone.names.some(n => n !== 'workbench/' + path.basename(base)))) {
+    return { ...ask(R.gitBranchGone), say: 'wants to delete a branch that is not its own' };
+  }
+  if (sub === 'worktree' && first === 'remove') return { ...ask(R.gitWorktreeGone), say: 'wants to remove another working copy of the repository' };
+  if (sub === 'worktree' && first === 'prune') return { ...ask(R.gitWorktreeGone), say: "wants to remove git's records of other working copies" };
+  return null;
+}
+
+/**
+ * git branch that deletes (-d, -D, --delete): the names it deletes, and whether they are remote-tracking branches (-r).
+ * null when it deletes nothing. Every other word counts as a name (the value of --sort, say), and so does a lone "-".
+ */
+function branchDeletes(args) {
+  let deletes = false;
+  let remotes = false;
+  const names = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { names.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      if (longIs(a, ['delete'])) deletes = true;
+      else if (longIs(a, ['remotes'])) remotes = true;
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (const ch of a.slice(1)) {
+        if (ch === 'u' || ch === 't') break; // -u <upstream>, -t<mode>: the rest is its value
+        if (ch === 'd' || ch === 'D') deletes = true;
+        if (ch === 'r') remotes = true;
+      }
+      continue;
+    }
+    names.push(a);
+  }
+  return deletes ? { names, remotes } : null;
+}
+
+/** Whether git update-ref deletes: -d, or a new value of all zeros (`update-ref <ref> 000…`), which git takes as "delete". */
+function refDeletes(args) {
+  const operands = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) continue; // --stdin, --no-deref, --create-reflog...: none takes a value
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        if (a[j] === 'd') return true;
+        if (a[j] === 'm') { if (j === a.length - 1) k++; break; } // -m <reason>
+      }
+      continue;
+    }
+    operands.push(a);
+  }
+  return /^(0{40}|0{64})$/.test(operands[1] ?? '');
 }
 
 /** `gh auth token`, `gh auth status --show-token` (-t) and `gh auth git-credential` show the person's GitHub sign-in. */
@@ -1366,12 +1543,15 @@ function runnerArgs(words, base, bad) {
   return allow(R.tests);
 }
 
-/** Every piece of a word that could name a path: the word, `--opt=<value>`, `-c<value>`, `a:b,c`. */
+/**
+ * Every piece of a word that could name a path: the word, `--opt=<value>`, `-c<value>`, `a:b,c`. As in readPieces, a
+ * piece that starts with "-" but has a "/" is a path too (`--outputFile=--/../x`).
+ */
 function pathPieces(w) {
   let t = w.text;
   if (w.glob) t = t.slice(0, t.search(/[*?[^#]/)); // only the literal text before a wildcard is known
   const out = new Set();
-  const add = s => { if (s && !s.startsWith('-')) out.add(s); };
+  const add = s => { if (s && (!s.startsWith('-') || s.includes('/'))) out.add(s); };
   if (/^-[^-]/.test(t)) add(t.slice(2));
   add(t);
   for (const part of t.split(/[=:,]/)) add(part);

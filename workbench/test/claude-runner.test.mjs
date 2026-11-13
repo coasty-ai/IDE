@@ -136,7 +136,7 @@ test('buildClaudeLaunch builds the verified command line', () => {
   ]);
   assert.equal(l.sessionId, sid);
   assert.equal(l.resume, false);
-  assert.equal(WORKBENCH_PROMPT, 'You are running inside Workbench, which shows your progress to a person in plain language. Work only inside the current folder. If you need a decision from the person, end your turn with one short, clear question. When you finish, begin your final message with one plain sentence, understandable by someone who does not write code, saying what you did. When you use git, run one git command at a time, with no && or ; and no heredoc, and give a commit message as plain text after -m, or in a file in this folder with -F.');
+  assert.equal(WORKBENCH_PROMPT, 'You are running inside Workbench, which shows your progress to a person in plain language. Work only inside the current folder. If you need a decision from the person, end your turn with one short, clear question. When you finish, begin your final message with one plain sentence, understandable by someone who does not write code, saying what you did. When you use git, run one git command at a time, with no && or ; and no heredoc. Give a commit message as plain text after -m, with one -m for each paragraph, and keep backticks and the characters ( ) $ < > | & ; { } \\ out of it, since they make the command wait for the person to allow it.');
   assert.equal(DISALLOWED_TOOLS, OFF);
   assert.equal(DISALLOWED_TOOLS.split(' ').length, 16);
   // Claude Code 2.1.322's new tools reach past the agent: other sessions, claude.ai, the plugin library, the app.
