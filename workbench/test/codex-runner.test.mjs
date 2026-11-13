@@ -297,3 +297,48 @@ test('stop() falls back to SIGKILL when Codex ignores SIGTERM', async t => {
   assert.deepEqual(s.events.filter(e => e.kind === EV.ENDED).map(e => e.outcome), ['stopped']);
   assert.ok(!s.events.some(e => e.kind === EV.STATE));
 });
+
+test('the person’s keys reach Codex after the scrub and before WORKBENCH_AGENT_ID, which no key replaces', () => {
+  const NODE_DIR = path.dirname(process.execPath);
+  const env = buildEnv({ PATH: NODE_DIR, HOME: '/h', CLAUDECODE: '1' }, 'a1b2c3', {
+    WB_TEST_KEY: 'from-the-key-store', WORKBENCH_AGENT_ID: 'another', WORKBENCH_HOOK_TOKEN: 'x', CODEX_THREAD_ID: 't',
+    CLAUDECODE: '1', VSCODE_PID: '1', WORKBENCH_CODEX_BIN: '/x/codex', 'NOT A NAME': 'x', NUMBER: 7,
+  });
+  assert.deepEqual(env, { PATH: NODE_DIR, HOME: '/h', WB_TEST_KEY: 'from-the-key-store', WORKBENCH_AGENT_ID: 'a1b2c3' });
+  assert.deepEqual(buildEnv({ PATH: NODE_DIR }, 'a1', null), { PATH: NODE_DIR, WORKBENCH_AGENT_ID: 'a1' });
+});
+
+test('every Codex turn gets the person’s keys, from the same base environment as the other agents (opts.env)', async t => {
+  const s = setup(t, { CODEX_API_KEY: undefined, CODEX_HOME: undefined });
+  const codexHome = path.join(s.dir, 'codex-home');
+  const runner = createRunner({
+    agentId: 'k1', name: 'Explain repo', task: 'Explain this repo', cwd: s.ws, emit: s.emit,
+    env: { ...process.env, CODEX_HOME: codexHome },
+    keysEnv: { CODEX_API_KEY: ['made', 'up', 'for', 'this', 'test'].join('-') },
+  });
+  await runner.start();
+  await waitFor(() => turnEnds(s.events).length === 1 && !runner.info().alive, 5000, 'the first turn');
+  await runner.send('and the docs');
+  await waitFor(() => turnEnds(s.events).length === 2 && !runner.info().alive, 5000, 'the follow-up turn');
+  const calls = s.calls();
+  assert.deepEqual(calls.map(c => c.env.CODEX_API_KEY), [true, true]);
+  assert.deepEqual(calls.map(c => c.codexHome), [codexHome, codexHome]);
+  assert.deepEqual(calls.map(c => c.agentId), ['k1', 'k1']);
+});
+
+test('a mask hides the person’s keys in Codex’s output before it is read, and in the stderr kept for errors', async t => {
+  const s = setup(t);
+  const mask = (text) => text.split('repository').join('[hidden]');
+  const runner = createRunner({ agentId: 'm2', name: 'Explain repo', task: 'Explain this repo', cwd: s.ws, emit: s.emit, mask });
+  await runner.start();
+  await waitFor(() => turnEnds(s.events).length === 1 && !runner.info().alive, 5000, 'the first turn');
+  assert.match(turnEnds(s.events)[0].finalText, /^The \[hidden\] contains/);
+  assert.ok(!JSON.stringify(s.events).includes('repository'), 'in no event');
+
+  const f = setup(t, { FAKE_CODEX_MODE: 'fail' });
+  const failing = createRunner({ agentId: 'm3', name: 'Fix bug', task: 'Fix the bug', cwd: f.ws, emit: f.emit, mask: (text) => text.split('Unauthorized').join('[hidden]') });
+  await failing.start();
+  await waitFor(() => f.events.some(e => e.kind === EV.STATE) && !failing.info().alive, 5000, 'the failure');
+  const ended = f.events.find(e => e.kind === EV.ENDED);
+  assert.equal(ended.error, 'Codex is not signed in, or its sign-in has expired.\n\nERROR: unexpected status 401 [hidden]');
+});

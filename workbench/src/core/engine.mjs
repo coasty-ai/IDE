@@ -4,6 +4,9 @@
 // Dependencies are injected so the engine can be tested with fakes:
 //   adapters: { claude?, codex?, sim? }   claude/codex are runner modules, sim is a Simulator instance
 //   deps:     { policy, commands, workspace, receipt, history? }
+//   connect:  optional, the Connect service (src/core/connect.mjs): the person's keys for agents and checks
+//             (envFor), hiding those keys (mask), and the default agent (defaultAgent). Absent: no keys, nothing
+//             hidden, and new work goes to the first agent that is ready.
 // This file must not import those modules directly. Each git function it uses (snapshotWork, workDiff, mergeWork,
 // discardWork, gitGraph, gitIdentity, ...) is checked with typeof first, so an older workspace module gives a plain
 // refusal instead of a crash.
@@ -15,6 +18,7 @@ import { EV } from '../shared/events.mjs';
 import { STATE, ENDED, ACTIVE, DONE, NEEDS_YOU } from '../shared/states.mjs';
 import { nameFromTask, firstSentence, extractQuestion, plain, describeRequest, quotable } from '../shared/narrate.mjs';
 import { money, spentAmount, duration, clip } from '../shared/format.mjs';
+import { looksLikeSecret } from '../shared/secretshape.mjs';
 import { StuckDetector } from './stuck.mjs';
 
 const MIN = 60_000;
@@ -34,6 +38,25 @@ const DEFAULTS = Object.freeze({
 });
 const DEFAULT_CONFIG = Object.freeze({ checks: [], rules: [], allow: [] });
 const HARNESS_NAMES = { claude: 'Claude Code', codex: 'Codex', sim: 'A simulated agent' };
+// The real coding agents, in the order a default is picked when the person has chosen none: every harness but the
+// simulator. A new kind of agent joins by its name in HARNESS_NAMES.
+const AGENT_HARNESSES = Object.freeze(Object.keys(HARNESS_NAMES).filter(h => h !== 'sim'));
+// What is kept of an adapter's available() answer, or of Connect's: no other field (an account's email, say) reaches
+// the snapshot.
+const INFO_FIELDS = ['ok', 'version', 'reason', 'path', 'from', 'loggedIn', 'signedIn', 'how', 'ready', 'simulated'];
+const NO_AGENT = 'No coding agent is ready yet. Connect one in Agents & keys.';
+const SECRET_REFUSED = 'That looks like a key, so it was not sent. Keys go in Agents & keys, where they are kept safe.';
+const CONNECT_REPLY = 'Opening Agents & keys.';
+// A variable name a key may use, and the names the engine never passes on as a key, whatever the key store allowed:
+// Workbench's own, and those that decide which programs run, as whom, and where Claude Code keeps its sessions (the
+// permission check reads those folders).
+const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const KEY_REFUSED_RE = /^(WORKBENCH_.*|PATH|HOME|USER|LOGNAME|SHELL|NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|CLAUDE_CONFIG_DIR|CLAUDE_CODE_TMPDIR)$/;
+// Fields of an event that the engine and the page read back as names of things (ids, folders, branches, kinds): never
+// masked, so a key that happens to match one cannot change what it points at.
+const MASK_SKIP = new Set(['kind', 'agentId', 'parentId', 'rootId', 'id', 'askId', 'toolUseId', 'taskId', 'sessionId',
+  'harness', 'model', 'machineId', 'workspace', 'branch', 'from', 'base', 'since', 'head', 'path', 'state', 'type',
+  'phase', 'toolKind', 'outcome', 'mode', 'ts']);
 // After the person stops an agent, these late events from its process are still useful.
 const AFTER_STOP_OK = new Set([EV.USAGE, EV.ENDED, EV.SESSION, EV.MODEL]);
 // States after which an agent cannot use the answer to a held request: they go through at once.
@@ -66,6 +89,8 @@ const LOOKS_GOOD_RE = /^(looks good|look good|lgtm|great|thanks|thank you|good|f
 // The lid's "Not now" on work that can be merged: the agent stays as it is, and the reply does not sound like approval.
 const NOT_NOW_RE = /^not now[.!]*$/i;
 const HELP = 'I did not catch that. Try “start an agent to fix the login bug”, “what needs me”, or “stop everything”.';
+// The answer to "help", "hi" or "what can you do": short enough for three lines under the DRAM on the narrowest board.
+const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
 
 /** How a state reads after an agent's name: "Checkout fix needs your OK". */
@@ -115,8 +140,55 @@ function joinAnd(items) {
   return `${a.slice(0, -1).join(', ')} and ${a[a.length - 1]}`;
 }
 
+function joinOr(items) {
+  const a = items.filter(Boolean);
+  if (a.length <= 1) return a.join('');
+  return `${a.slice(0, -1).join(', ')} or ${a[a.length - 1]}`;
+}
+
 function harnessName(h) {
   return HARNESS_NAMES[h] || 'That kind of agent';
+}
+
+/**
+ * What the engine keeps of a harness's availability (an adapter's available(), or Connect's word for it): the fields
+ * in INFO_FIELDS. Nothing at all reads as not found; true or false as { ok }.
+ */
+function harnessInfoOf(res, h) {
+  if (res == null) return { ok: false, reason: `${harnessName(h)} was not found on this computer.` };
+  if (typeof res !== 'object') return { ok: !!res };
+  const out = {};
+  for (const f of INFO_FIELDS) if (res[f] !== undefined) out[f] = res[f];
+  return out;
+}
+
+/**
+ * `value` with every string of 8 or more characters (no stored key is shorter) passed through `mask`, at any depth,
+ * except fields named in `skip`. Copies only what changes: the value itself comes back when nothing did.
+ */
+function maskValue(value, mask, skip = null, depth = 0) {
+  if (typeof value === 'string') return value.length >= 8 ? mask(value) : value;
+  if (!value || typeof value !== 'object' || depth > 12) return value;
+  let out = value;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const m = maskValue(value[i], mask, skip, depth + 1);
+      if (m !== value[i]) {
+        if (out === value) out = value.slice();
+        out[i] = m;
+      }
+    }
+    return out;
+  }
+  for (const k of Object.keys(value)) {
+    if (skip && skip.has(k)) continue;
+    const m = maskValue(value[k], mask, skip, depth + 1);
+    if (m !== value[k]) {
+      if (out === value) out = { ...value };
+      out[k] = m;
+    }
+  }
+  return out;
 }
 
 /** What "do it" does to a confirm card: "start it", "stop them", "send it", "merge it", "throw it away". */
@@ -359,8 +431,11 @@ export class Engine extends EventEmitter {
    * @param {{ url: string|null, tokenFor: (agentId: string) => string }} o.hook  where Claude Code's PreToolUse hook
    *        posts, and each agent's own hook token; the object is read at each launch, so the URL can be filled in
    *        after the server listens
+   * @param {object|null} [o.connect]  the Connect service, or null: envFor({ repoRoot, harness }) gives the keys an
+   *        agent (and the checks of its work) get, mask(text) hides the stored keys in everything the engine applies,
+   *        and defaultAgent() says where new work goes.
    */
-  constructor({ store, mode = 'demo', repo = null, hook = null, defaultBudgetUsd = 2, defaultModel = null, adapters = {}, machines = null, deps = {}, log = null, options = {} } = {}) {
+  constructor({ store, mode = 'demo', repo = null, hook = null, defaultBudgetUsd = 2, defaultModel = null, adapters = {}, machines = null, deps = {}, connect = null, log = null, options = {} } = {}) {
     super();
     if (!store) throw new Error('The engine needs a store.');
     this.store = store;
@@ -373,6 +448,9 @@ export class Engine extends EventEmitter {
     this.adapters = adapters || {};
     this.machines = machines;
     this.deps = deps || {};
+    this.connect = connect && typeof connect === 'object' ? connect : null;
+    // Hides the person's stored keys in text: for the runners, the checks and every event applied. Null without one.
+    this._mask = typeof this.connect?.mask === 'function' ? (s) => this._maskText(s) : null;
     this.log = makeLog(log);
     this.options = { ...DEFAULTS, ...options };
     this.now = typeof options.now === 'function' ? options.now : Date.now;
@@ -389,7 +467,8 @@ export class Engine extends EventEmitter {
     this.confirms = new Map();  // confirmId -> a launch, stop or message waiting for "yes"
     this.stopped = new Set();   // agents the person stopped; late events from them are filtered
     this.stopAsked = new Set(); // live helpers whose root was asked to stop them: no more tools, but their events count
-    this.harnessInfo = { claude: null, codex: null, sim: null };
+    this.harnessInfo = Object.fromEntries([...AGENT_HARNESSES, 'sim'].map(h => [h, null]));
+    this._told = new Set();      // harnesses Connect has said can or cannot start (setHarnesses): its word stands
     this._timers = [];
     this._started = false;
     this._shuttingDown = false;
@@ -428,7 +507,7 @@ export class Engine extends EventEmitter {
       this._openHistory();
     } else {
       const ok = !!this.adapters.sim;
-      this.harnessInfo = { claude: { ok, simulated: true }, codex: { ok, simulated: true }, sim: { ok } };
+      this.harnessInfo = { ...Object.fromEntries(AGENT_HARNESSES.map(h => [h, { ok, simulated: true }])), sim: { ok } };
     }
     this._started = true;
     if (this.mode === 'demo') {
@@ -567,7 +646,8 @@ export class Engine extends EventEmitter {
    */
   ingest(ev) {
     if (!ev || typeof ev !== 'object' || typeof ev.kind !== 'string') return;
-    let e = { ...ev, ts: Number.isFinite(ev.ts) ? ev.ts : this.now() };
+    // The person's stored keys are hidden first, so nothing below (the store, the receipt, listeners) sees them.
+    let e = this._maskEvent({ ...ev, ts: Number.isFinite(ev.ts) ? ev.ts : this.now() });
     if (e.kind === EV.SAYS && e.text != null) e.text = plain(e.text);
     if (e.kind === EV.SESSION) this._noteVersion(e);
     if (e.kind === EV.USAGE && e.mode === 'set') e = this._withEarlierSpend(e);
@@ -575,7 +655,7 @@ export class Engine extends EventEmitter {
       if (!AFTER_STOP_OK.has(e.kind)) return;
       if (e.kind === EV.ENDED) e = { ...e, outcome: 'stopped', error: null };
     }
-    this._apply([e]);
+    this._apply([e], { masked: true });
     try {
       this._react(e);
     } catch (err) {
@@ -598,13 +678,16 @@ export class Engine extends EventEmitter {
 
   /**
    * Apply events to the store and feed them to the stuck detector. No held permission request may leave the view:
-   * see _waitForHeld and _keepHeldVisible.
-   * @param {{ held?: boolean }} [opts]  held: the batch shows or settles held requests itself (_hold, _resolveHeld)
+   * see _waitForHeld and _keepHeldVisible. Every text field is masked first (the person's stored keys), so the store,
+   * the event log, history and the page never hold a key.
+   * @param {{ held?: boolean, masked?: boolean }} [opts]  held: the batch shows or settles held requests itself
+   *   (_hold, _resolveHeld); masked: ingest() has masked it already
    */
-  _apply(events, { held = false } = {}) {
+  _apply(events, { held = false, masked = false } = {}) {
     let list = (Array.isArray(events) ? events : [events])
       .filter(Boolean)
       .map(e => (Number.isFinite(e.ts) ? e : { ...e, ts: this.now() }));
+    if (!masked && this._mask) list = list.map(e => this._maskEvent(e));
     if (!held && this.held.size) list = this._waitForHeld(list);
     if (!list.length) return;
     this.store.apply(list);
@@ -693,6 +776,72 @@ export class Engine extends EventEmitter {
   _notice(text, agentId = null) {
     if (!text) return;
     this._apply([{ kind: EV.NOTICE, text, ...(agentId ? { agentId } : {}) }]);
+  }
+
+  // ================================================================ keys
+
+  /** Text with the person's stored keys hidden (Connect's mask), or as it is when there is nothing to hide. */
+  _maskText(s) {
+    if (typeof s !== 'string' || s.length < 8 || !this._mask) return s;
+    try {
+      const out = this.connect.mask(s);
+      return typeof out === 'string' ? out : s;
+    } catch {
+      // Never the text, nor what the mask said about it; and once, not for every text.
+      if (!this._maskFailed) this.log.warn('Could not hide the stored keys in a text, so it is shown as it is.');
+      this._maskFailed = true;
+      return s;
+    }
+  }
+
+  /** An event with the person's stored keys hidden in its text fields (not in ids, folders or branches: MASK_SKIP). */
+  _maskEvent(e) {
+    return this._mask ? maskValue(e, this._mask, MASK_SKIP) : e;
+  }
+
+  /**
+   * The person's keys for an agent of this harness working on this repository ({ NAME: value }, from Connect's key
+   * store), or null: none without Connect, and none in the demo. A name the engine never passes on (KEY_REFUSED_RE),
+   * and a value that is not a string, are left out. The same keys go to the checks of that agent's work.
+   */
+  _keysFor(harness) {
+    const c = this.connect;
+    if (this.mode !== 'live' || typeof c?.envFor !== 'function') return null;
+    let env = null;
+    try {
+      env = c.envFor({ repoRoot: this.repoInfo?.root ?? null, harness });
+    } catch (err) {
+      this.log.warn('Could not read the keys for an agent, so it gets none:', err?.message ?? 'unknown error');
+      return null;
+    }
+    if (!env || typeof env !== 'object') return null;
+    const out = {};
+    for (const [k, v] of Object.entries(env)) {
+      if (KEY_NAME_RE.test(k) && !KEY_REFUSED_RE.test(k) && typeof v === 'string' && !v.includes('\0')) out[k] = v;
+    }
+    return out;
+  }
+
+  /**
+   * The options a live runner gets for the person's keys, when there are any: `keysEnv`, its keys (see _keysFor), and
+   * `mask`, which hides every stored key in its output before that output is read.
+   */
+  _runnerKeys(harness) {
+    if (this.mode !== 'live') return {};
+    const out = {};
+    const keys = this._keysFor(harness);
+    if (keys) out.keysEnv = keys;
+    if (this._mask) out.mask = this._mask;
+    return out;
+  }
+
+  /** Does typed text look like a key (src/shared/secretshape.mjs)? Such text is refused before it is read or kept. */
+  _looksLikeKey(text) {
+    try {
+      return looksLikeSecret(String(text ?? ''))?.secret === true;
+    } catch {
+      return false;
+    }
   }
 
   _react(e) {
@@ -819,8 +968,11 @@ export class Engine extends EventEmitter {
           try {
             // The checks run the agent's own code (its package.json, its tests), so they carry its marker as its shell
             // does: a Workbench or an acceptance run started from a check then refuses, as it would in the agent.
+            // They get the keys that agent gets (added after the scrub), and their output is masked before it is cut.
             const env = { ...process.env, WORKBENCH_AGENT_ID: agentId };
-            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal, env }));
+            const keys = this._keysFor(run.harness);
+            const more = { ...(keys ? { keysEnv: keys } : {}), ...(this._mask ? { mask: this._mask } : {}) };
+            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal, env, ...more }));
             const done = running.then(() => {}, () => {});
             run.checksDone = done;
             done.then(() => { if (run.checksDone === done) run.checksDone = null; });
@@ -1090,7 +1242,10 @@ export class Engine extends EventEmitter {
       return hookResponse('deny', 'Workbench could not check this request, so it said no.');
     }
     if (stoppedHelper()) return hookResponse('deny', 'The person stopped this helper.'); // stopped while it was checked
-    const described = describeRequest(tool, input);
+    // The policy judged the request as it is. What the person is shown is described from it with the stored keys
+    // hidden first, since a description cuts long inputs short and a key cut in two can no longer be found.
+    const shownInput = this._mask ? maskValue(input, this._mask) : input;
+    const described = describeRequest(tool, shownInput);
     const sentence = `${asker.name} ${d?.sentence || described.sentence}`;
     if (d?.decision === 'allow') {
       this._apply([{ kind: EV.APPROVAL, agentId: asker.id, how: 'auto', decision: 'allow', sentence }]);
@@ -1107,7 +1262,8 @@ export class Engine extends EventEmitter {
     const askerNow = this.store.get(asker.id);
     if (asker.parentId && (!askerNow || ENDED.has(askerNow.state))) return hookResponse('deny', 'The helper is no longer running.');
     const why = typeof d.reason === 'string' && d.reason.trim() ? clip(d.reason, 300) : null;
-    return this._hold({ asker, root, sentence, detail: d.detail ?? described.detail, why, signal });
+    const detail = shownInput !== input ? described.detail : (d.detail ?? described.detail);
+    return this._hold({ asker, root, sentence, detail, why, signal });
   }
 
   /** The runner's info(), or null when it has none or it fails. */
@@ -1251,7 +1407,10 @@ export class Engine extends EventEmitter {
    * a finished agent takes "Looks good" or a follow-up, and any other agent a message.
    */
   async answer(agentId, { askId = null, answer } = {}) {
-    const out = await this._answer(agentId, askId, answer);
+    // Typed in the reply box: a key goes nowhere, as in command().
+    const out = answer != null && this._looksLikeKey(String(answer).trim())
+      ? { ok: false, reply: SECRET_REFUSED, openConnect: true }
+      : await this._answer(agentId, askId, answer);
     this._notice(out.reply, agentId);
     return out;
   }
@@ -1572,6 +1731,7 @@ export class Engine extends EventEmitter {
         emit: (ev) => this.ingest(ev),
         hook: this.mode === 'live' && rec.harness === 'claude' ? { url: this.hook?.url ?? null, token: this._hookToken(v.id) } : null,
         log: this.log, harness: rec.harness, machineId: v.machineId,
+        ...this._runnerKeys(rec.harness),
       });
       this.runs.set(v.id, run);
       this.stopped.delete(v.id);
@@ -1683,7 +1843,10 @@ export class Engine extends EventEmitter {
   /** Send an agent a message: a hint while it works, or a follow-up once it is done. */
   async say(agentId, text) {
     const v = this.store.get(agentId);
-    const out = v ? await this._say(v, String(text ?? '').trim()) : { ok: false, reply: 'I can’t find that agent.' };
+    const words = String(text ?? '').trim();
+    // Typed in the reply box: a key goes nowhere (it would reach the agent's input, its arguments and the history).
+    const out = this._looksLikeKey(words) ? { ok: false, reply: SECRET_REFUSED, openConnect: true }
+      : v ? await this._say(v, words) : { ok: false, reply: 'I can’t find that agent.' };
     this._notice(out.reply, agentId);
     return out;
   }
@@ -1891,8 +2054,13 @@ export class Engine extends EventEmitter {
     if (this._shuttingDown) throw plainError('Workbench is shutting down.');
     const text = String(task ?? '').trim();
     if (!text) throw plainError('Tell me what the agent should work on.');
-    const h = harness || 'claude';
-    if (!HARNESS_NAMES[h]) throw plainError('I don’t know that kind of agent. Choose Claude Code or Codex.');
+    // A key typed as a task would end up in a folder and branch name, the agent's arguments and the history.
+    if (this._looksLikeKey(text)) throw plainError(SECRET_REFUSED);
+    // Named in the words, or the default agent (the person's choice when it is ready, else the first ready one).
+    // Refusals for want of an agent carry openConnect, so a reply made from them opens Agents & keys.
+    const h = harness || this._defaultHarness();
+    if (!h) throw Object.assign(plainError(NO_AGENT), { openConnect: true });
+    if (!HARNESS_NAMES[h]) throw plainError(`I don’t know that kind of agent. Choose ${joinOr(AGENT_HARNESSES.map(harnessName))}.`);
     const mdl = model ? String(model).trim() : (this.defaultModel || null);
     if (mdl && !MODEL_RE.test(mdl)) throw plainError('That model name does not look right.');
     const budget = Number.isFinite(+budgetUsd) && +budgetUsd > 0 ? +budgetUsd : this.defaultBudgetUsd;
@@ -1912,7 +2080,7 @@ export class Engine extends EventEmitter {
       if (h === 'sim') throw plainError('Simulated agents run only in the demo.');
       const mod = this.adapters[h];
       if (typeof mod?.createRunner !== 'function' || this.harnessInfo[h]?.ok === false) {
-        throw plainError(`${harnessName(h)} is not available on this computer.`);
+        throw Object.assign(plainError(`${harnessName(h)} is not available on this computer.`), { openConnect: true });
       }
       factory = (o) => mod.createRunner(o);
       const repo = await this._loadRepo();
@@ -1963,6 +2131,7 @@ export class Engine extends EventEmitter {
         log: this.log,
         harness: h,
         machineId: mach,
+        ...this._runnerKeys(h), // live only: the person's keys for this agent, and the mask that hides them
       });
       await run.runner.start();
     } catch (err) {
@@ -2132,30 +2301,116 @@ export class Engine extends EventEmitter {
     return { name: r.name ?? null, head: r.head ?? null, branch: r.branch ?? null, dirty: r.dirty ?? 0, identity };
   }
 
+  /**
+   * At start in live mode: ask each agent's adapter whether it can run here, so no adapter is taken as ready untested.
+   * An agent Connect has already said something of (setHarnesses), before or while this runs, keeps Connect's word:
+   * it is newer, and knows about signing in.
+   */
   async _checkHarnesses() {
-    for (const h of ['claude', 'codex']) {
+    this.harnessInfo.sim = { ok: false, reason: 'Simulated agents run only in the demo.' };
+    for (const h of AGENT_HARNESSES) {
+      if (this._told.has(h)) continue;
       const mod = this.adapters[h];
+      let info;
       if (!mod) {
-        this.harnessInfo[h] = { ok: false, reason: `${harnessName(h)} was not found on this computer.` };
-        continue;
+        info = { ok: false, reason: `${harnessName(h)} was not found on this computer.` };
+      } else {
+        try {
+          const res = typeof mod.available === 'function' ? await withTimeout(mod.available(), this.options.availableTimeoutMs) : { ok: true };
+          info = harnessInfoOf(res, h);
+        } catch (err) {
+          info = { ok: false, reason: plainReason(err) };
+        }
       }
+      if (!this._told.has(h)) this.harnessInfo[h] = info;
+    }
+  }
+
+  /**
+   * Which agent programs can start now, as Connect found them: { claude: info, codex: info } (its 'agents' event), each
+   * as the adapter's available() gives it ({ ok, version?, reason?, ... }, Codex's with loggedIn). Live mode only.
+   * New work and continued earlier agents go by it from now on, and so does the snapshot's `connect`; agents already
+   * running are untouched. An agent missing from the map keeps what was known of it. Earlier agents of an agent whose
+   * availability changed are told again whether they can continue. The engine can start only an agent whose adapter
+   * it was given (`adapters`), whatever the map says.
+   * @returns {boolean} whether the map was taken
+   */
+  setHarnesses(map) {
+    if (this.mode !== 'live' || !map || typeof map !== 'object') return false;
+    const changed = [];
+    for (const h of AGENT_HARNESSES) {
+      if (!Object.prototype.hasOwnProperty.call(map, h)) continue;
+      const before = this.harnessInfo[h];
+      const info = harnessInfoOf(map[h], h);
+      this.harnessInfo[h] = info;
+      this._told.add(h);
+      if ((before?.ok !== false) !== (info.ok !== false)) changed.push(h);
+    }
+    if (changed.length) this._recheckEarlier(changed);
+    return true;
+  }
+
+  /** Earlier agents of these harnesses: can they continue now? (Their program may have come, or gone.) */
+  _recheckEarlier(harnesses) {
+    for (const [id, rec] of this.earlierRecs) {
+      if (!harnesses.includes(rec.harness) || this._resuming.has(id) || !this.store.get(id)?.earlier) continue;
       try {
-        const res = typeof mod.available === 'function' ? await withTimeout(mod.available(), this.options.availableTimeoutMs) : { ok: true };
-        this.harnessInfo[h] = res && typeof res === 'object' ? res : { ok: !!res };
+        this.store.markContinue(id, this._canContinue(rec));
       } catch (err) {
-        this.harnessInfo[h] = { ok: false, reason: plainReason(err) };
+        this.log.warn(`Could not check whether ${id} can continue:`, err);
       }
     }
-    this.harnessInfo.sim = { ok: false, reason: 'Simulated agents run only in the demo.' };
+  }
+
+  /** Can new work start on this harness, and is its program not known to be signed out? */
+  _ready(h) {
+    if (!this._canRun(h)) return false;
+    if (this.mode === 'demo') return true;
+    const info = this.harnessInfo[h];
+    return !(info && (info.ready === false || info.loggedIn === false || info.signedIn === 'no'));
+  }
+
+  /**
+   * Where new work goes when the words name no agent, or null when no agent is ready. With Connect: its default agent
+   * (the person's choice when that one is ready, else the first ready one), when this engine can start it; if Connect
+   * says none is ready, none is. Without Connect, or when Connect names an agent this engine has no adapter for: the
+   * first ready agent, Claude Code first. The demo's agents are simulated: the first harness it can run.
+   */
+  _defaultHarness() {
+    if (this.mode !== 'demo' && typeof this.connect?.defaultAgent === 'function') {
+      let d;
+      try {
+        d = this.connect.defaultAgent();
+      } catch (err) {
+        this.log.warn('Could not tell which agent is the default:', err?.message ?? 'unknown error');
+      }
+      if (d === null) return null;
+      if (typeof d === 'string' && AGENT_HARNESSES.includes(d) && this._canRun(d)) return d;
+    }
+    return AGENT_HARNESSES.find(h => this._ready(h)) || null;
+  }
+
+  /**
+   * The snapshot's `connect`: { ready, defaultAgent, agents: [{ id, name, ready }] }. `ready`: new work that names no
+   * agent would start (on `defaultAgent`); each agent's `ready`: work can start on it. Worked out by the same rule that
+   * picks the agent for new work, so the page's light and a start never disagree.
+   */
+  _connectMeta() {
+    const def = this._defaultHarness();
+    return {
+      ready: def !== null,
+      defaultAgent: def,
+      agents: AGENT_HARNESSES.map(h => ({ id: h, name: harnessName(h), ready: def !== null && (h === def || this._ready(h)) })),
+    };
   }
 
   _harnessFlags() {
     if (this.mode === 'demo') {
       const ok = !!this.adapters.sim;
-      return { claude: ok, codex: ok, sim: ok };
+      return { ...Object.fromEntries(AGENT_HARNESSES.map(h => [h, ok])), sim: ok };
     }
     const ok = (h) => !!this.adapters[h] && this.harnessInfo[h]?.ok !== false;
-    return { claude: ok('claude'), codex: ok('codex'), sim: false };
+    return { ...Object.fromEntries(AGENT_HARNESSES.map(h => [h, ok(h)])), sim: false };
   }
 
   // ================================================================ source control: changes, the graph, merge, throw away
@@ -3018,6 +3273,11 @@ export class Engine extends EventEmitter {
     let out;
     if (!t) {
       out = { reply: 'Type or say what you would like to do.' };
+    } else if (this._looksLikeKey(t)) {
+      // A key typed into the board goes nowhere: it is not read, kept, logged or quoted back, and the page opens Agents
+      // & keys. A card on screen stays, as for words not caught.
+      const shown = this._shownConfirm(confirmId);
+      out = { reply: SECRET_REFUSED, openConnect: true, ...(shown && !shown.gone ? { confirm: this._card(shown) } : {}) };
     } else {
       const ctx = this._commandContext(focusId, confirmId);
       const shown = ctx.pendingConfirm;
@@ -3113,9 +3373,19 @@ export class Engine extends EventEmitter {
     const get = (id) => (id ? this.store.get(id) : null);
     switch (intent.kind) {
       case 'start':
-        return this._proposeStart(intent.tasks);
+        // "start an agent" with no task comes as { kind: 'start', task: null }: the reply asks what to work on.
+        return this._proposeStart(Array.isArray(intent.tasks) ? intent.tasks
+          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : []);
       case 'task':
         return this._proposeStart([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
+      case 'help': {
+        // The parser's own words for it when it has them (commands.mjs HELP_REPLY), else the same words kept here.
+        const words = this.deps.commands?.HELP_REPLY;
+        return { reply: typeof words === 'string' && words.trim() ? words.trim() : HELP_REPLY };
+      }
+      case 'connect':
+        // "connect", "add a key", "sign in", "agents": the page opens Agents & keys.
+        return { reply: CONNECT_REPLY, openConnect: true };
       case 'answer':
       case 'allow':
       case 'deny': {
@@ -3238,14 +3508,30 @@ export class Engine extends EventEmitter {
     return h !== 'sim' && !!this.adapters[h] && this.harnessInfo[h]?.ok !== false;
   }
 
+  /**
+   * A launch card for these tasks. A task whose words name no agent goes to the default agent (_defaultHarness). With no
+   * agent ready, or one named that cannot run here, the reply says so and carries `openConnect`, so the page opens
+   * Agents & keys.
+   */
   _proposeStart(tasks) {
     const list = (Array.isArray(tasks) ? tasks : [])
-      .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : 'claude', machine: t?.machine || null }))
+      .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
       .filter(t => t.task)
       .slice(0, 8);
-    if (!list.length) return { reply: 'What should the agent work on?' };
+    let def; // looked up once, and only when a task names no agent
+    const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
+    // Nothing to work on yet: with no agent ready, that comes first, since nothing could start it.
+    if (!list.length) return fallback() === null ? { reply: NO_AGENT, openConnect: true } : { reply: 'What should the agent work on?' };
     for (const t of list) {
-      if (!this._canRun(t.harness)) return { reply: `${harnessName(t.harness)} is not available on this computer.` };
+      if (!t.harness) t.harness = fallback();
+      if (!t.harness) return { reply: NO_AGENT, openConnect: true };
+    }
+    for (const t of list) {
+      if (this._canRun(t.harness)) continue;
+      const reply = `${harnessName(t.harness)} is not available on this computer.`;
+      return this.mode === 'live' && AGENT_HARNESSES.includes(t.harness)
+        ? { reply: `${reply} Connect it in Agents & keys.`, openConnect: true }
+        : { reply };
     }
     const detail = this._startDetail(list);
     // Live mode has no cloud machines: launches go to the laptop, and the question should not say otherwise.
@@ -3351,6 +3637,7 @@ export class Engine extends EventEmitter {
     const used = new Set();
     const started = [];
     const problems = [];
+    let openConnect = false; // an agent was gone by the time of the yes: Agents & keys is where to bring it back
     for (const t of c.tasks) {
       try {
         const machineId = await this._pickMachine(t.machine, used);
@@ -3359,13 +3646,14 @@ export class Engine extends EventEmitter {
         if (v.state === STATE.FAILED) problems.push(`${v.name} could not start. ${v.stateReason || ''}`.trim());
         else started.push(v);
       } catch (err) {
+        if (err?.openConnect && this.mode === 'live') openConnect = true;
         problems.push(`I could not start the agent for “${clip(t.task, 50)}”: ${plainReason(err)}`);
       }
     }
     const parts = [];
     if (started.length) parts.push(`Started ${joinAnd(started.map(v => v.name))}.`);
     parts.push(...problems);
-    return { reply: parts.join(' '), agentIds: started.map(v => v.id) };
+    return { reply: parts.join(' '), agentIds: started.map(v => v.id), ...(openConnect ? { openConnect: true } : {}) };
   }
 
   /** Demo only: 'cloud' picks a free cloud machine (waking one if needed); live is always the laptop. */
@@ -3580,6 +3868,10 @@ export class Engine extends EventEmitter {
       repo: this._repoView(),
       harnesses: this._harnessFlags(),
       harnessInfo: { ...this.harnessInfo },
+      // Live, with Connect: which agents can take new work, and the default one ({ ready, defaultAgent, agents:
+      // [{ id, name, ready }] }), for the page's Agents & keys light, its lid and its opening by itself. Without it
+      // (the demo, or no Connect) the page shows nothing of Agents & keys.
+      ...(this.mode === 'live' && this.connect ? { connect: this._connectMeta() } : {}),
       agents: s.agents,
       machines: s.machines,
       spendTodayUsd: s.spendTodayUsd,
