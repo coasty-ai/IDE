@@ -1354,7 +1354,8 @@ test('connect: the words open Agents & keys, and only these words whole', () => 
     'connect claude code', 'connect codex', 'connect a coding agent', 'connect my agents', 'connect my keys', 'connect an api key',
     'set up claude', 'set up claude code', 'setup codex', 'set up an agent', 'set up git', 'set up github', 'set up my keys', 'set up workbench',
     'sign in to github', 'sign in to Claude', 'sign into codex', 'log in with github', 'log into my github account', 'sign in to chatgpt',
-    'add a key', 'add keys', 'add an API key', 'add my aws keys', 'add AWS access keys', 'add a github token', 'add a new key', 'add some secrets',
+    'add a key', 'add keys', 'add an API key', 'add my aws keys', 'add AWS access keys', 'add a github token', 'add a new key', 'add stripe secrets',
+    'add google cloud credentials',
     'agents and keys', 'Agents & keys', 'agents & api keys', 'open agents and keys', 'show me agents & keys', 'go to the agents and keys panel',
     'please connect github', 'can you connect github', 'okay so connect github please', 'how do I connect github?', 'where do i add a key',
     'how can i sign in to claude'];
@@ -1372,6 +1373,11 @@ test('connect: the words open Agents & keys, and only these words whole', () => 
     ['set up the ci pipeline', 'none', task('set up the ci pipeline')],
     ['set up codex to fix the login', 'none', start(['fix the login', 'codex'])],
     ['add a key to the config', 'none', task('add a key to the config')],
+    // Tokens, credentials and secrets are keys only with whose they are: alone they are work in a parser or an auth module.
+    ['add a token', 'none', task('add a token')],
+    ['add some secrets', 'none', task('add some secrets')],
+    ['add credentials', 'none', task('add credentials')],
+    ['add tokens to the lexer', 'none', task('add tokens to the lexer')],
     ['add an api key field to the settings page', 'none', task('add an api key field to the settings page')],
     ['log in page is broken', 'none', task('log in page is broken')],
     ['fix the sign in page', 'none', task('fix the sign in page')],
@@ -1385,11 +1391,17 @@ test('a start with no work asks what the agent should work on; naming an agent w
       'a new codex agent', 'start codex', 'start claude', 'launch an agent', 'spin up an agent', 'please start an agent', 'create an agent',
       'add a codex agent', 'get me an agent', 'start an agent on cloud 2', 'start an agent on it', 'start', 'start one']
       .map(text => [text, 'none', noWork]),
-    // Named, it is unmistakable; a bare "start" or "start one" may be the answer.
+    // A start verb with an agent named is unmistakable; a bare "start", "start one", or a weaker verb may be the answer.
     ['start an agent', 'question', noWork],
+    ['start codex', 'question', noWork],
     ['new agent', 'question', noWork],
     ['start', 'question', answer('start')],
     ['start one', 'question', answer('start one')],
+    ['use codex', 'question', answer('use codex')],
+    ['ask claude', 'question', answer('ask claude')],
+    ['get me an agent', 'question', answer('get me an agent')],
+    ['have codex', 'stuck', answer('have codex', '0a0b0c', 'ask-stuck')],
+    ['use codex', 'none', noWork],
     // An agent that exists, or a name alone, is no new launch.
     ['start the agent', 'none', unknown('start the agent')],
     ['codex', 'none', unknown('codex')],

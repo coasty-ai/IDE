@@ -523,13 +523,28 @@ test('cloneFirst: progress in plain lines, or WORKBENCH_CLONE lines for the app;
     `Cloned https://github.com/octo/hello.git into ${path.join(into, 'hello')}.`,
   ]);
   assert.ok(!plain.join('\n').includes('secret-value'), 'a password in the address is never printed');
+  // For the app: every change as a WORKBENCH_CLONE line, and at the end the new folder (phase done), before any plain line.
   const app = [];
   await cloneFirst({ workspace: fake, url: 'git@github.com:octo/hello.git', into, app: true, say: (s) => app.push(s), complain: (s) => app.push(`ERR ${s}`) });
   assert.deepEqual(app.filter(l => l.startsWith('WORKBENCH_CLONE ')).map(l => JSON.parse(l.slice(16))), [
     { phase: 'counting', percent: 10 }, { phase: 'counting', percent: 100 }, { phase: 'receiving', percent: 3 }, { phase: 'receiving', percent: 30 },
     { phase: 'receiving', percent: 31 }, { phase: 'receiving', percent: 100 }, { phase: 'resolving', percent: 100 }, { phase: 'checkout', percent: 100 },
+    { phase: 'done', percent: 100, root: path.join(into, 'hello') },
   ]);
   assert.equal(app[0], `Cloning git@github.com:octo/hello.git into ${into}…`);
+  assert.deepEqual(app.slice(1).filter(l => !l.startsWith('WORKBENCH_CLONE ')), [`Cloned git@github.com:octo/hello.git into ${path.join(into, 'hello')}.`]);
+  assert.ok(app.indexOf(app.find(l => l.includes('"done"'))) < app.length - 1, 'the done line comes before the last plain line');
+  // A stop the person asked for (Ctrl-C, the app's Cancel) reaches git as cloneRepo's signal, and fails quietly.
+  const stop = new AbortController();
+  let seen = null;
+  const quiet = [];
+  const stopped = await cloneFirst({
+    workspace: { async cloneRepo(o) { seen = o.signal; stop.abort(); throw new Error('git was stopped'); } },
+    url: 'https://github.com/octo/hello', into, app: true, signal: stop.signal, say: (s) => quiet.push(s), complain: (s) => quiet.push(`ERR ${s}`),
+  });
+  assert.deepEqual(stopped, { code: 1 });
+  assert.equal(seen, stop.signal);
+  assert.deepEqual(quiet, [`Cloning https://github.com/octo/hello into ${into}…`]);
   // No --into: the current folder.
   await cloneFirst({ workspace: fake, url: 'https://github.com/octo/hello', say: () => {}, complain: () => {} });
   assert.equal(calls.at(-1).into, process.cwd());
@@ -557,6 +572,24 @@ test('cloneFirst: each failure is one plain sentence, and for the app also its k
     assert.deepEqual(JSON.parse(out.at(-1).slice('WORKBENCH_CLONE '.length)), { error: kind, sentence: err.message });
     assert.ok(!(out.join('\n') + said.join('\n')).includes('fatal:'), 'the words of git itself are not shown');
   }
+  // A refusal that repeats an address with a password in it: the address as Workbench prints it, and no password,
+  // on the screen, in the line for the app, or in the log.
+  const pass = `pw-${Date.now().toString(36)}-secret`;
+  const withPass = `https://octo:${pass}@github.com/octo/secret.git`;
+  const outs = [];
+  const logs = [];
+  const quoting = refusing(Object.assign(new Error(`Workbench does not clone ${withPass}: leave the password out.`), { why: 'url', detail: `fatal: could not read ${withPass}` }));
+  assert.deepEqual(await cloneFirst({ workspace: quoting, url: withPass, into: dir, app: true, say: (s) => outs.push(s), complain: (s) => outs.push(s),
+    log: { debug: (...a) => logs.push(a.join(' ')), error: (...a) => logs.push(a.join(' ')) } }), { code: 1 });
+  assert.equal(outs.at(-2), 'Workbench does not clone https://github.com/octo/secret.git: leave the password out.');
+  assert.equal(JSON.parse(outs.at(-1).slice(16)).sentence, 'Workbench does not clone https://github.com/octo/secret.git: leave the password out.');
+  assert.ok(logs.length && !logs.join('\n').includes(pass) && !outs.join('\n').includes(pass));
+  // A token put in the address as the user name, quoted on its own: cut out too.
+  const tok = fakeToken();
+  const said2 = [];
+  await cloneFirst({ workspace: refusing(Object.assign(new Error(`GitHub refused ${tok}.`), { why: 'auth' })), url: `https://${tok}@github.com/octo/secret.git`, into: dir,
+    say: () => {}, complain: (s) => said2.push(s), log: { debug() {} } });
+  assert.deepEqual(said2, ['GitHub refused ••••.']);
   // Anything else: the words of git itself go to the log only.
   const said = [];
   const logged = [];
@@ -633,6 +666,15 @@ test('--connect-github: the token is read once, connected for git only, and neve
   assert.equal(logged.length, 1);
   assert.match(logged[0], /^Connecting to GitHub failed: TypeError: bad header ••••/);
   assert.ok(!JSON.stringify(lines).includes(token) && !logged.join('\n').includes(token));
+  // Connect logs through the same log. Until the token is kept, the mask of Agents & keys does not know it, so the token
+  // is cut out of those lines too; afterwards the log is masked as before.
+  const written = [];
+  const shared = createLogger(false, (l) => written.push(l));
+  shared.setMask((text) => text.replace('stored-value-123', '••••'));
+  const chatty = { async connectGithub(t) { shared.warn('GitHub answered 401 for', t, 'and stored-value-123'); return { ok: false, sentence: 'GitHub did not accept that token.' }; } };
+  assert.equal(await connectGithubMode({ connect: chatty, readToken: async () => token, say: () => {}, log: shared }), 1);
+  shared.warn('later:', token, 'stored-value-123');
+  assert.deepEqual(written, ['[workbench warn] GitHub answered 401 for •••• and ••••\n', `[workbench warn] later: ${token} ••••\n`]);
 });
 
 test('--github-repos: the connected account’s repositories, in the shape the Mac app reads; none when anything fails', async () => {

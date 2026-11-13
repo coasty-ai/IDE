@@ -1485,8 +1485,9 @@ function matchStart(core, c) {
   if (noun.hasNoun && noun.definite && !noun.harnesses.length) return null; // "start the agent" refers to one that exists
   const tasks = buildTasks(core.slice(noun.end), noun, c);
   // A start verb with no work after it ("start an agent", "start codex", "start", "add an agent on cloud 2"): the
-  // engine asks what the agent should work on. Only a named agent wins over a waiting question.
-  if (!tasks) return { intent: NO_TASK_START(), strong: noun.named };
+  // engine asks what the agent should work on. Only a start verb with a named agent wins over a waiting question:
+  // "use codex", "ask claude" or a bare "start" may well be the answer.
+  if (!tasks) return { intent: NO_TASK_START(), strong: strongVerb && noun.named };
   return { intent: { kind: 'start', tasks }, strong: noun.named };
 }
 
@@ -1526,7 +1527,9 @@ function matchHelp(core, base, c) {
 const C_DET = '(?:(?:my|your|our|the|a|an|some|new|more|another|other) )*';
 const C_AGENT = '(?:(?:claude|claud|clawed|clod)(?: code)?|cloud code|claudes|codex(?: cli)?|codecs|codexes|code x|(?:coding )?agents?)(?: account| subscription)?';
 const C_GITHUB = '(?:github|git hub|git)(?: account)?';
-const C_KEYS = '(?:(?:api|aws|amazon|anthropic|openai|gemini|google|gcp|azure|github|stripe|cloud|access|secret) ){0,2}(?:keys?|tokens?|credentials?|secrets?)';
+// Keys: "keys", "an API key", "secret keys"; tokens, credentials and secrets only with whose they are ("a github token",
+// "aws credentials"), since "add a token" alone is work in a parser.
+const C_KEYS = '(?:(?:aws|amazon|anthropic|openai|gemini|google(?: cloud)?|gcp|azure|github|stripe|cloud)(?: (?:api|access|secret))? (?:keys?|tokens?|credentials?|secrets?)|(?:(?:api|access|secret) )?keys?)';
 /** Words that open Agents & keys and say what for: strong, they win over a waiting question. */
 const CONNECT_STRONG = [
   /^(?:(?:open|show|show me|go to|take me to|bring up|pull up) )?(?:the )?agents and (?:api )?keys(?: (?:panel|page|screen|settings))?$/,

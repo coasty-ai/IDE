@@ -206,7 +206,17 @@ export function createLogger(verbose, write = (line) => process.stderr.write(lin
   log.warn = (...args) => out('warn', args);
   log.error = (...args) => out('error', args);
   log.setMask = (fn) => { mask = typeof fn === 'function' ? fn : null; };
+  log.getMask = () => mask;
   return log;
+}
+
+/** A mask that does what `mask` does (when there is one, and it works), then cuts out `secret` too. */
+function alsoHiding(mask, secret) {
+  return (text) => {
+    let s = text;
+    try { if (mask) s = mask(s); } catch { /* the secret is still cut out below */ }
+    return redact(s, [secret]);
+  };
 }
 
 // ------------------------------------------------------------------ modules
@@ -358,27 +368,46 @@ export function displayUrl(url) {
 }
 
 /**
+ * The text with the address as Workbench prints it, and without the password the address carried: the part after
+ * "user:", or a user name alone, which is how a token is often put in an address ("https://<token>@github.com/…").
+ */
+function withoutCredentials(text, url) {
+  const raw = String(url ?? '');
+  const userinfo = /^[a-z][a-z0-9+.-]*:\/\/([^/@\s]*)@/i.exec(raw)?.[1] || '';
+  const colon = userinfo.indexOf(':');
+  const parts = (colon >= 0 ? [userinfo, userinfo.slice(colon + 1)] : [userinfo]).filter(p => p.length >= 4).sort((a, b) => b.length - a.length);
+  let s = String(text ?? '');
+  if (raw) s = s.split(raw).join(displayUrl(raw));
+  for (const p of parts) s = s.split(p).join('••••');
+  return s;
+}
+
+/**
  * --clone: copy the repository into a new folder in `into`, through workspace.cloneRepo, saying how it goes: plain
- * lines, or for the Mac app (`app`) `WORKBENCH_CLONE {"phase","percent"}` lines. A failure is a plain sentence on stderr
- * and, for the app, `WORKBENCH_CLONE {"error","sentence"}`, with error one of auth, network, exists, url and git.
+ * lines, or for the Mac app (`app`) `WORKBENCH_CLONE {"phase","percent"}` lines and, once it is there,
+ * `WORKBENCH_CLONE {"phase":"done","percent":100,"root"}`. A failure is a plain sentence on stderr and, for the app,
+ * `WORKBENCH_CLONE {"error","sentence"}`, with error one of auth, network, exists, url and git. A user name or password
+ * in the address is never printed or logged. `signal` (an AbortSignal) is passed on, for stopping git.
  * @returns {Promise<{ root: string } | { code: number }>}
  */
-export async function cloneFirst({ workspace, url, into, app = false, say: out = say, complain: err = complain, log }) {
+export async function cloneFirst({ workspace, url, into, app = false, signal, say: out = say, complain: err = complain, log }) {
   const folder = typeof into === 'string' && into ? into.replace(/^~(?=$|\/)/, os.homedir()) : process.cwd();
   const where = path.resolve(folder);
-  const fail = (kind, sentence) => {
+  const fail = (kind, said) => {
+    const sentence = withoutCredentials(said, url);
     err(sentence);
     if (app) out(`WORKBENCH_CLONE ${JSON.stringify({ error: CLONE_ERRORS.has(kind) ? kind : 'git', sentence })}`);
     return { code: 1 };
   };
   if (typeof workspace?.cloneRepo !== 'function') return fail('git', 'This Workbench cannot clone a repository. Clone it with git, then open its folder.');
+  const shownWhere = where.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?');
   try {
     fs.mkdirSync(where, { recursive: true });
   } catch (e) {
     log?.warn?.('Could not make the folder for the copy:', e);
-    return fail('git', `Workbench could not make the folder ${where}.`);
+    return fail('git', `Workbench could not make the folder ${shownWhere}.`);
   }
-  out(`Cloning ${displayUrl(url)} into ${where}…`);
+  out(`Cloning ${displayUrl(url)} into ${shownWhere}…`);
   let last = null;
   const onProgress = (p) => {
     const phase = typeof p?.phase === 'string' && Object.hasOwn(CLONE_PHASE, p.phase) ? p.phase : null;
@@ -398,18 +427,22 @@ export async function cloneFirst({ workspace, url, into, app = false, say: out =
   };
   let res;
   try {
-    res = await workspace.cloneRepo({ url, into: where, onProgress, timeoutMs: CLONE_TIMEOUT_MS });
+    res = await workspace.cloneRepo({ url, into: where, onProgress, timeoutMs: CLONE_TIMEOUT_MS, ...(signal ? { signal } : {}) });
   } catch (e) {
+    if (signal?.aborted) return { code: 1 }; // stopped on purpose: whoever stopped it has said so
+    // The log gets git's own words, but never a user name or password from the address.
+    const detail = withoutCredentials([e?.message, typeof e?.detail === 'string' ? e.detail : ''].filter(Boolean).join(' '), url);
     if (plainError(e)) {
-      log?.debug?.('The clone failed:', e);
+      log?.debug?.('The clone failed:', detail);
       return fail(e.why, e.message.trim());
     }
-    log?.error?.('The clone failed:', e);
+    log?.error?.('The clone failed:', detail);
     return fail('git', `Git could not clone ${displayUrl(url)}. The details are in Workbench’s log.`);
   }
   const root = typeof res?.root === 'string' && res.root ? res.root : null;
   if (!root) return fail('git', `Git could not clone ${displayUrl(url)}. The details are in Workbench’s log.`);
-  out(`Cloned ${displayUrl(url)} into ${root}.`);
+  if (app) out(`WORKBENCH_CLONE ${JSON.stringify({ phase: 'done', percent: 100, root })}`);
+  out(`Cloned ${displayUrl(url)} into ${root.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?')}.`);
   return { root };
 }
 
@@ -460,21 +493,32 @@ export async function connectGithubMode({ connect, readToken, say: out = say, lo
   token = typeof token === 'string' ? token.trim() : '';
   if (!token) { tell(false, null, 'Paste a token from GitHub first.'); return 1; }
   if (!connect) { tell(false, null, 'Workbench could not connect to GitHub. The details are in its log.'); return 1; }
-  let r;
+  // Until the token is kept, Agents & keys' own mask does not know it: everything printed or logged meanwhile, by
+  // Workbench or by Connect (it logs through the same log), has it cut out as well.
+  const prior = hide;
+  const priorLog = typeof log?.getMask === 'function' ? log.getMask() : null;
+  hide = alsoHiding(prior, token);
+  log?.setMask?.(alsoHiding(priorLog, token));
   try {
-    r = await connect.connectGithub(token, { agentsUseIt: false });
-  } catch (e) {
-    if (plainError(e)) { tell(false, null, redact(e.message.trim(), [token])); return 1; }
-    log?.error?.('Connecting to GitHub failed:', redact(e?.stack || String(e), [token]));
-    tell(false, null, 'Workbench could not connect to GitHub. The details are in its log.');
-    return 1;
+    let r;
+    try {
+      r = await connect.connectGithub(token, { agentsUseIt: false });
+    } catch (e) {
+      if (plainError(e)) { tell(false, null, redact(e.message.trim(), [token])); return 1; }
+      log?.error?.('Connecting to GitHub failed:', redact(e?.stack || String(e), [token]));
+      tell(false, null, 'Workbench could not connect to GitHub. The details are in its log.');
+      return 1;
+    }
+    const login = typeof r?.login === 'string' && r.login ? r.login : null;
+    const ok = r?.ok !== false && !!login;
+    const said = typeof r?.sentence === 'string' && r.sentence.trim() ? r.sentence.trim()
+      : (ok ? `Connected to GitHub as ${login}.` : 'GitHub did not accept that token.');
+    tell(ok, ok ? login : null, redact(said, [token]));
+    return ok ? 0 : 1;
+  } finally {
+    hide = prior;
+    log?.setMask?.(priorLog);
   }
-  const login = typeof r?.login === 'string' && r.login ? r.login : null;
-  const ok = r?.ok !== false && !!login;
-  const said = typeof r?.sentence === 'string' && r.sentence.trim() ? r.sentence.trim()
-    : (ok ? `Connected to GitHub as ${login}.` : 'GitHub did not accept that token.');
-  tell(ok, ok ? login : null, redact(said, [token]));
-  return ok ? 0 : 1;
 }
 
 /**
@@ -564,6 +608,16 @@ async function main() {
   let appGone = false;
   if (args.clone) {
     let copying = true;
+    // Ctrl-C, or the app's Cancel (SIGTERM), while git copies: git is told to stop (cloneRepo's signal), and Workbench
+    // leaves within two seconds. Nothing starts after a clone that was stopped.
+    const stopCopying = new AbortController();
+    const cancel = () => {
+      if (!copying || stopCopying.signal.aborted) return;
+      stopCopying.abort();
+      complain('Stopped copying the repository.');
+      setTimeout(() => process.exit(1), 2000);
+    };
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, cancel);
     if (args.app) {
       const gone = () => {
         appGone = true;
@@ -574,8 +628,10 @@ async function main() {
       for (const ev of ['end', 'close', 'error']) process.stdin.on(ev, gone);
       process.stdin.resume();
     }
-    const cloned = await cloneFirst({ workspace: mods.workspace, url: args.clone, into: args.into, app: args.app, log });
+    const cloned = await cloneFirst({ workspace: mods.workspace, url: args.clone, into: args.into, app: args.app, signal: stopCopying.signal, log });
     copying = false;
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(sig, cancel);
+    if (stopCopying.signal.aborted) return 1;
     if (!cloned.root) return cloned.code ?? 1;
     args.repo = cloned.root;
   }
