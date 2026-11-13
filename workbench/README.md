@@ -93,7 +93,7 @@ The **Agents & keys** button in the top band opens a panel over the board with t
 - **Install** and **Sign in** open Terminal on a Mac, running the vendor's own installer or sign-in (`claude auth login`, `codex login`), for you to answer there. When you come back to the page, it checks again. On other systems the panel shows the command to run instead, with **Copy**. Both installers put the program in `~/.local/bin`.
 - **Use an API key** saves a key for that agent. "Claude Code will use this key instead of your Claude subscription, and each request is billed to the key." For Codex: "Codex will use this key, and each request is billed to it."
 - **Use for new work** chooses the agent new work goes to; a mark shows which one it is. Naming an agent in what you say ("… with codex") still wins.
-- **Check again** asks again.
+- **Check again** looks again, for example after you installed one or signed in from a terminal of your own.
 
 An agent connected while Workbench runs can take work at once, and agents from an earlier run that used it can be continued again. Agents already working carry on as they were.
 
@@ -101,7 +101,7 @@ An agent connected while Workbench runs can take work at once, and agents from a
 
 - Your name and email for git, with **Save**, which writes them into git's global settings. Merging needs them.
 - GitHub: paste a token (**Create a token** opens GitHub's page for one, with the right access) and press **Connect**. Workbench checks the token with GitHub, keeps it with your keys, and gives it to git's own credential helper (the login keychain, on a Mac), so git can clone and fetch your private repositories. The panel then says "Connected to GitHub as <login>.".
-- Agents get the token, as GH_TOKEN, only when you tick "Let agents use this token (as GH_TOKEN)", before connecting or after. Copilot may sign in with it.
+- Agents get the token (as GH_TOKEN, and GITHUB_TOKEN) only when you tick "Let agents use this token (as GH_TOKEN)", before connecting or after; untick it to take it back. Copilot may sign in with it.
 - **Disconnect** makes git forget the token. The token itself still works until you delete it on GitHub.
 
 **Keys for your agents.** API keys, cloud keys and tokens that agents and their checks need, such as AWS keys for a deploy script. **Add a key** offers Anthropic, OpenAI, Gemini, AWS, Google Cloud, Azure, GitHub, Stripe, or names of your own ("Other"), then asks which repositories it is for (this one, or all) and which agents get it (all, or one).
