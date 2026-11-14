@@ -160,7 +160,7 @@ const TABLE = [
   ['yes', 'pending', { kind: 'confirm', go: true }],
   ['cancel', 'pending', { kind: 'confirm', go: false }],
   ['never mind', 'pending', { kind: 'confirm', go: false }],
-  ['the checkout bug', 'none', { kind: 'unknown', text: 'the checkout bug' }],
+  ['the checkout bug', 'none', { kind: 'status', agentId: 'a1b2c3' }], // an agent at work's words, and nothing more
 
   // --- Typed with punctuation and capitals
   ['Start Claude and Codex on the checkout bug, each on its own cloud machine.', 'none',
@@ -326,7 +326,7 @@ const TABLE = [
   ['cancel', 'onboarding', { kind: 'unknown', text: 'cancel' }],
   ['fix it', 'none', { kind: 'unknown', text: 'fix it' }],
   ['start the agent', 'none', { kind: 'unknown', text: 'start the agent' }], // one that exists: no new launch
-  ['why is the build slow', 'none', { kind: 'unknown', text: 'why is the build slow' }],
+  ['why is the build slow', 'none', { kind: 'task', task: 'why is the build slow' }], // a question is work, as a prompt
   ['', 'none', { kind: 'unknown', text: '' }],
   ['um uh', 'none', { kind: 'unknown', text: 'um uh' }],
 ];
@@ -349,8 +349,8 @@ test('unresolved references still give the intent, with no agent', () => {
   // ...except a stop verb with words that match no agent: that is work, with the whole sentence as its task.
   assert.deepEqual(parseCommand('stop the frobnicator', CTX.none), { kind: 'task', task: 'stop the frobnicator' });
   assert.deepEqual(parseCommand('tell it to hurry up', CTX.none), { kind: 'say', agentId: null, text: 'hurry up' });
-  // A name that matches nothing is not sent anywhere, not even to the focused agent.
-  assert.deepEqual(parseCommand('tell the frobnicator to hurry up', CTX.onboarding), { kind: 'unknown', text: 'tell the frobnicator to hurry up' });
+  // A name that matches nothing is not sent anywhere, not even to the focused agent: the words are new work, asked first.
+  assert.deepEqual(parseCommand('tell the frobnicator to hurry up', CTX.onboarding), { kind: 'task', task: 'tell the frobnicator to hurry up' });
   assert.deepEqual(parseCommand('what is the frobnicator doing', CTX.none), { kind: 'status' });
   assert.deepEqual(parseCommand('stop it', CTX.none), { kind: 'stop', agentIds: [] });
   // A machine that does not exist: no ids, so the engine can say it found nothing.
@@ -754,7 +754,7 @@ test('the new words never take over work, answers or replies to a permission', (
     ['discard', 'invoice', unknown('discard')], // throwing away needs an object
     ['throw away', 'invoice', unknown('throw away')],
     ['throw away the old logs', 'none', unknown('throw away the old logs')],
-    ['throw an error when the token expires', 'none', unknown('throw an error when the token expires')],
+    ['throw an error when the token expires', 'none', task('throw an error when the token expires')], // "throw" throws away only with "away" or "out"
     ['scrap the old parser', 'none', unknown('scrap the old parser')],
     // "scrap that" is never mind ("scratch that"), even with an agent in the centre; "scrap it" asks to throw its work away.
     ['scrap that', 'invoice', unknown('scrap that')],
@@ -769,10 +769,10 @@ test('the new words never take over work, answers or replies to a permission', (
     ['show the error on the login page', 'dogNone', { kind: 'status', agentId: 'ee0005' }],
     ['show the changes to the login page', 'none', task('show the changes to the login page')],
     ['review the changes', 'none', task('review the changes')],
-    ['diff the two config files', 'none', unknown('diff the two config files')],
-    ['diff the two config files', 'dogNone', unknown('diff the two config files')],
-    ['what does it change', 'invoice', unknown('what does it change')],
-    ['what will it change', 'invoice', unknown('what will it change')],
+    ['diff the two config files', 'none', task('diff the two config files')],
+    ['diff the two config files', 'dogNone', task('diff the two config files')],
+    ['what does it change', 'invoice', { kind: 'status', agentId: '1a2b3c' }], // a short question about "it": the agent in the centre
+    ['what will it change', 'invoice', { kind: 'status', agentId: '1a2b3c' }],
     ['what is changing', 'invoice', unknown('what is changing')],
     ['what did you change', 'invoice', { kind: 'status' }],
     ['the changes', 'invoice', unknown('the changes')],
@@ -865,8 +865,8 @@ test('merge and throw-away name the agent: dogfood names, same-named twins, earl
     // A name said alone is a name, not a command: its words keep their old meaning.
     ['merge command', 'dogNone', task('merge command')],
     ['merge config', 'dogNone', task('merge config')],
-    ['diff viewer', 'dogNone', unknown('diff viewer')],
-    ['git screen', 'dogNone', unknown('git screen')],
+    ['diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }], // a name said alone: how that agent is doing
+    ['git screen', 'dogNone', { kind: 'status', agentId: 'cc0003' }],
     ['show diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }],
     ['open the diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }],
     ['show the git screen', 'dogNone', { kind: 'status', agentId: 'cc0003' }],
@@ -928,13 +928,14 @@ test('words that two names share, and that are neither one\'s whole name, name n
   assert.deepEqual(configAgents.map(a => a.name), ['Update config files', 'Split config files per', 'Fix login page error']);
   const answerCf = text => answer(text, 'cf0003', 'ask-cf');
   checkRows([
-    // Nothing waits: work stays work, and words that were nothing stay nothing. Never "Which one do you mean?".
+    // Nothing waits: work stays work, words about throwing work away that name no agent stay nothing, and other words
+    // that say something are work. Never “Which one do you mean?”.
     ['merge the config files', 'configNone', task('merge the config files')],
     ['merge config files', 'configNone', task('merge config files')],
     ['discard the config files', 'configNone', unknown('discard the config files')],
     ['trash the config files', 'configNone', unknown('trash the config files')],
     ['throw away the config files', 'configNone', unknown('throw away the config files')],
-    ['diff the config files', 'configNone', unknown('diff the config files')],
+    ['diff the config files', 'configNone', task('diff the config files')],
     ['show me the config files changes', 'configNone', { kind: 'status', agentId: 'cf0001' }], // as before these words
     // A question waits: the words are its answer.
     ['merge the config files', 'configQuestion', answerCf('merge the config files')],
@@ -1458,7 +1459,7 @@ test('"work on X" is work, like "fix X": its task is what comes after "work on"'
     ['work on it', 'none', unknown('work on it')],
     ['work on', 'none', unknown('work on')],
     ['work on the login bug', 'question', answer('work on the login bug')],
-    ['work queue', 'dogNone', unknown('work queue')],
+    ['work queue', 'dogNone', { kind: 'status', agentId: '220009' }], // its name alone: how it is doing
   ]);
 });
 
@@ -1476,4 +1477,177 @@ test('no launch names Claude unless the words do: the engine gives the rest to t
     const intent = parseCommand(text, CTX.none);
     for (const t of intent.tasks || []) assert.equal(t.harness, null, text);
   }
+});
+
+// ------------------------------------------------------------------ free text is work
+
+test('anything else that says something is work, as a prompt is to a coding agent; words that say nothing are not', () => {
+  checkRows([
+    // What people type to a coding agent: problems, wants, questions, labels, a link.
+    ['the login page is broken', 'none', task('the login page is broken')],
+    ['There is a bug in the checkout flow.', 'none', task('There is a bug in the checkout flow')],
+    ['tests are failing in CI', 'none', task('tests are failing in CI')],
+    ['the app crashes when I click save', 'none', task('the app crashes when I click save')],
+    ['I want a dark mode toggle', 'none', task('I want a dark mode toggle')],
+    ['I need a function that sorts users by age', 'none', task('I need a function that sorts users by age')],
+    ['why does the build fail?', 'none', task('why does the build fail?')],
+    ['how do I run the tests?', 'none', task('how do I run the tests?')],
+    ['can you explain how the engine works?', 'none', task('explain how the engine works?')],
+    ['Hello! Can you help me build a website?', 'none', task('build a website?')],
+    ['what does this repo do?', 'none', task('what does this repo do?')], // one word of work, in a question
+    ['go through the code and find bugs', 'none', task('go through the code and find bugs')],
+    ['dark mode for the settings page', 'none', task('dark mode for the settings page')],
+    ['new feature: export to pdf', 'none', task('new feature: export to pdf')],
+    ['bug: login redirect loops', 'none', task('bug: login redirect loops')],
+    ['todo app in react', 'none', task('todo app in react')],
+    ['https://github.com/acme/shop/issues/12', 'none', task('https://github.com/acme/shop/issues/12')],
+    ['the login page is broken', 'onboarding', task('the login page is broken')], // an agent in the centre, asking nothing
+    ['um so the login page is like broken', 'none', task('the login page is like broken')], // spoken
+    // Said to an agent by name: that agent.
+    ['claude fix the readme', 'none', start(['fix the readme', 'claude'])],
+    ['claude code fix the readme', 'none', start(['fix the readme', 'claude'])],
+    ['codex: why is the build slow?', 'none', start(['why is the build slow?', 'codex'])],
+    ['codex, the login page is broken', 'none', start(['the login page is broken', 'codex'])],
+    ['Claude Code, please add tests', 'none', start(['add tests', 'claude'])],
+    // Words that say nothing, or only about an agent, are not work.
+    ['ok', 'none', unknown('ok')],
+    ['thanks', 'none', unknown('thanks')],
+    ['thank you so much', 'none', unknown('thank you so much')],
+    ['sounds good', 'none', unknown('sounds good')],
+    ['makes sense', 'none', unknown('makes sense')],
+    ['never mind', 'none', unknown('never mind')],
+    ['good job', 'none', unknown('good job')],
+    ['go ahead', 'none', unknown('go ahead')],
+    ['keep going', 'none', unknown('keep going')],
+    ['is anyone there', 'none', unknown('is anyone there')],
+    ['can you hear me', 'none', unknown('can you hear me')],
+    ['readme', 'none', unknown('readme')], // one word is not enough
+    ['ok but not on main', 'none', unknown('ok but not on main')],
+    ['claude is stuck', 'none', unknown('claude is stuck')], // the agent's name is no work
+    ['claude code is stuck', 'none', unknown('claude code is stuck')],
+    ['claude, stop', 'none', { kind: 'stop', agentIds: [] }], // the words after the name are a command: which one is not clear
+    ['what is changing', 'invoice', unknown('what is changing')], // a thin question, with an agent in the centre: about it
+    ['scrap the old parser', 'none', unknown('scrap the old parser')], // throw-away words start nothing
+    ['forget an agent to fix the login', 'dogNone', unknown('forget an agent to fix the login')],
+    // An agent's name, or an agent at work's words, and nothing more: how it is doing.
+    ['onboarding', 'none', { kind: 'status', agentId: '7a8b9c' }],
+    ['search cleanup', 'none', task('search cleanup')], // a name that starts with a work verb stays work, as before
+    ['diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }], // ended, but named
+    // Something waits: the words are for it, as before.
+    ['the login page is broken', 'pending', unknown('the login page is broken')], // a card keeps its hint
+    ['the login page is broken', 'permission', unknown('the login page is broken')], // a permission waits
+    ['the login page is broken', 'question', answer('the login page is broken')], // a question waits: the answer
+  ]);
+  // A word said twice is still one word (with no agent whose words it could be).
+  assert.deepEqual(parseCommand('testing testing', { agents: [] }), unknown('testing testing'));
+});
+
+// ------------------------------------------------------------------ what a sweep of real prompts found
+
+/** Agents named as the engine names them from free text, as a person's board has them after a few launches. */
+const sweptAgents = [
+  fromTask('Stop the checkout test from timing out', { id: 'e5f005', state: 'maybe_stuck' }),
+  fromTask('Clean up the search route handlers', { id: 's3c003', state: 'done_checked' }),
+  fromTask('tests are failing in CI', { id: 'b00002', state: 'working' }),
+  fromTask('Fix the menu on mobile', { id: 'm00001', state: 'working' }),
+  fromTask('Update the user profile page', { id: 'u6a006', state: 'done_claimed' }),
+  fromTask('memory leak in the websocket handler', { id: 'b00007', state: 'working' }),
+];
+const SWEPT = {
+  W: { agents: sweptAgents, machines, harnesses, focusId: null },
+  Wdone: { agents: sweptAgents, machines, harnesses, focusId: 's3c003' },
+  empty: { agents: [], machines, harnesses, focusId: null },
+};
+const sweptRows = rows => {
+  const failures = [];
+  for (const [text, ctxName, expected] of rows) {
+    const got = parseCommand(text, SWEPT[ctxName] || ctxOf(ctxName));
+    try { assert.deepEqual(got, expected); } catch { failures.push(`${JSON.stringify(text)} [${ctxName}]\n    expected ${JSON.stringify(expected)}\n    got      ${JSON.stringify(got)}`); }
+  }
+  assert.equal(failures.length, 0, '\n' + failures.join('\n'));
+};
+
+test('reports, wants and questions are work, not a stop, a message or a status of an agent they only share a word with', () => {
+  sweptRows([
+    ['prod is down', 'empty', task('prod is down')],
+    ["the server won't start", 'empty', task("the server won't start")],
+    ['can we have tabs?', 'empty', task('can we have tabs?')],
+    ['it would be nice to have tabs', 'none', task('it would be nice to have tabs')],
+    ['What does this repo do?', 'invoice', task('What does this repo do?')], // an agent in the centre does not change that
+    ['fix the constructor in the user class', 'empty', task('fix the constructor in the user class')], // no lookup through the prototype
+    ['修复登录错误', 'empty', task('修复登录错误')], // a script written without spaces
+    ['fix the 登录 bug', 'empty', task('fix the 登录 bug')],
+    ['исправь ошибку входа на сайте', 'empty', task('исправь ошибку входа на сайте')],
+    ['right panel is empty on mobile', 'empty', task('right panel is empty on mobile')], // the person's words, as typed
+    ['the tests pass now', 'empty', task('the tests pass now')],
+    ['login 🐛 is back', 'empty', task('login 🐛 is back')],
+    ['yeah the tests are failing', 'empty', task('the tests are failing')],
+    ['throw an error when the config is missing', 'none', task('throw an error when the config is missing')],
+    ['stop the tests from failing', 'W', task('stop the tests from failing')], // never a stop of "Tests are failing"
+    ['tell the user their session expired instead of a blank page', 'W', task('tell the user their session expired instead of a blank page')],
+    ['warn the user when their password is weak', 'W', task('warn the user when their password is weak')],
+    ['tell me why the build is slow', 'none', task('tell me why the build is slow')],
+    ['tell me why the tests fail', 'none', task('tell me why the tests fail')],
+    ['can you tell me why the build is slow?', 'none', task('can you tell me why the build is slow?')], // the person's words: "tell" is no work verb
+    ['we should tell people when a merge fails', 'dogNone', task('tell people when a merge fails')],
+    ['how are errors handled in the api?', 'W', task('how are errors handled in the api?')],
+    ['is the login page broken?', 'none', task('is the login page broken?')],
+    ['is the login page working?', 'none', task('is the login page working?')],
+    ['where is the config loaded', 'empty', task('where is the config loaded')],
+    ['where is the login handler', 'none', task('where is the login handler')],
+    ['is the build broken?', 'empty', task('is the build broken?')],
+    ['what is this function doing?', 'empty', task('what is this function doing?')],
+    ['where are the tests?', 'Wdone', task('where are the tests?')],
+    ['open the diff viewer in a split pane', 'dogNone', task('open the diff viewer in a split pane')],
+    ['show a spinner while the invoice export runs', 'none', task('show a spinner while the invoice export runs')],
+    ['add build status', 'none', task('add build status')],
+    ['check this out https://github.com/acme/shop/issues/12', 'none', task('check this out https://github.com/acme/shop/issues/12')],
+    ['never mind, fix the checkout bug', 'none', task('fix the checkout bug')],
+    ['forget it just fix the checkout bug', 'none', task('fix the checkout bug')], // never a forget of Checkout fix
+    ['scrap that and fix the login bug', 'none', task('fix the login bug')],
+    // An agent named, first or last, takes the work, as with a work verb.
+    ['codex why is the build slow', 'empty', start(['why is the build slow', 'codex'])],
+    ['the login page is broken using codex', 'empty', start(['the login page is broken', 'codex'])],
+    ['the login page is broken, codex', 'empty', start(['the login page is broken', 'codex'])],
+    ['codex add csv export', 'question', start(['add csv export', 'codex'])], // wins over a waiting question
+    ['claude fix the login bug', 'question', start(['fix the login bug', 'claude'])],
+    ['new agent for this', 'none', { kind: 'start', tasks: [], task: null, harness: null }], // still asks what to work on
+  ]);
+});
+
+test('commands keep their meaning after a reaction, said twice, or said to an agent by name; never-minds and asides start nothing', () => {
+  const stop = (...agentIds) => ({ kind: 'stop', agentIds });
+  sweptRows([
+    ['wait, stop everything', 'question', { kind: 'stop_all' }], // an emergency stop wins over a waiting question
+    ['stop all my agents', 'none', { kind: 'stop_all' }],
+    ['stop the agents', 'question', { kind: 'stop_all' }],
+    ['stop working', 'onboarding', stop('7a8b9c')],
+    ['stop stop stop', 'question', stop('d4e5f6')],
+    ['yeah stop it', 'stuck', stop('0a0b0c')],
+    ['claude, stop', 'stuck', stop('0a0b0c')],
+    ['cool, stop the flaky test', 'none', stop('0a0b0c')],
+    ['looks good, merge it', 'Wdone', merge('s3c003')],
+    ['stop them', 'W', stop()], // which ones is not clear: never one picked by its spelling ("the menu")
+    ['stop checkout test?', 'W', { kind: 'status', agentId: 'e5f005' }], // a question about the agent of that name
+    ['forget it', 'question', answer('forget it')], // never mind, said to the question
+    ['is it done yet?', 'onboarding', { kind: 'status', agentId: '7a8b9c' }],
+    ["what's waiting for me?", 'onboarding', { kind: 'status', needsMe: true }],
+    ['which agents are done?', 'onboarding', { kind: 'status' }],
+    ['what do you mean?', 'empty', unknown('what do you mean?')],
+    ["what's next?", 'empty', unknown("what's next?")],
+    ['let me think', 'empty', unknown('let me think')],
+    ['why is nothing happening', 'empty', unknown('why is nothing happening')],
+    ['thanks, that fixed it', 'invoice', unknown('thanks, that fixed it')],
+    ['great job on the login fix', 'empty', unknown('great job on the login fix')],
+  ]);
+  // At a permission: a question that starts with "don't" asks; a "don't" keeps its words, so the agent hears the no
+  assert.deepEqual(parseCommand("don't we already have a linter?", CTX.permission), { kind: 'status', agentId: 'a1b2c3' });
+  assert.deepEqual(parseCommand("don't use the production database", CTX.permission),
+    { kind: 'deny', agentId: 'a1b2c3', askId: 'ask-perm', text: "don't use the production database" });
+});
+
+test('a task that is a question gets no second question mark on its card', () => {
+  assert.equal(describeIntent(task('why does the build fail?'), CTX.none), 'Start an agent on “why does the build fail?”');
+  assert.equal(describeIntent(start(['why is the build slow?', 'codex']), CTX.none), 'Start Codex on “why is the build slow?”');
+  assert.equal(describeIntent(task('the login page is broken'), CTX.none), 'Start an agent on “the login page is broken”?');
 });

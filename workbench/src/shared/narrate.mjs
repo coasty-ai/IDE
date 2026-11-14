@@ -753,14 +753,29 @@ export function describeRequest(tool, input = {}) {
   }
 }
 
-const FILLER = /^(please|pls|can you|could you|would you|i want you to|i need you to|go and|try to|help me|let's|lets)\s+/i;
+const FILLER = /^(please|pls|can you|could you|would you|i want you to|i need you to|go and|try to|help me|let's|lets|there's|there is|there are|i want|i need|i would like|i'd like|we need|we should|it would be nice to have|it would be nice if|can we have|can we)\s+/i;
+/** A label in front of the work: "bug: login redirect loops", "feat: export to csv". */
+const LABEL = /^(?:new )?(?:bug|bugs|feature|feat|fix|todo|to do|issue|chore|task|idea|request|question)\s*:\s*/i;
+/** Named by what a link points to: "Shop issue 12" for github.com/acme/shop/issues/12, else "Link to example.com". */
+function linkName(t) {
+  if (!/^https?:\/\/\S+$/i.test(t)) return null;
+  let u;
+  try { u = new URL(t); } catch { return null; }
+  const m = /^\/[^/]+\/([^/]+)\/(issues|pull|pulls|merge_requests)\/(\d+)/.exec(u.pathname);
+  if (m) return cap(clip(`${m[1]} ${m[2] === 'issues' ? 'issue' : 'pull request'} ${m[3]}`, 30));
+  return cap(clip(`Link to ${u.hostname.replace(/^www\./, '')}`, 30));
+}
 const STOP = new Set(['the', 'a', 'an', 'my', 'our', 'this', 'that', 'some', 'please', 'just', 'quickly', 'really']);
-const TRAILING = new Set(['and', 'or', 'to', 'for', 'of', 'with', 'in', 'on', 'at', 'by', 'from', 'so', 'then', 'that', 'the', 'a', 'an']);
+const TRAILING = new Set(['and', 'or', 'to', 'for', 'of', 'with', 'in', 'on', 'at', 'by', 'from', 'so', 'then', 'that', 'the', 'a', 'an',
+  'when', 'if', 'while', 'because', 'i', 'we', 'you', 'it', 'is', 'are', 'my', 'our']);
 
 /** A short name for an agent from its task: "Fix the flaky checkout test" -> "Fix flaky checkout test". */
 export function nameFromTask(task, maxWords = 4) {
-  let t = String(task || '').replace(/[`"“”'’]/g, '').replace(/\s+/g, ' ').trim();
-  for (let k = 0; k < 3; k++) t = t.replace(FILLER, '');
+  // Quotes go only at the edges of words: "doesn't" and "there's" keep their apostrophe.
+  let t = String(task || '').replace(/(^|\s)[`"“”'‘’]+/g, '$1').replace(/[`"“”'‘’]+(?=\s|$)/g, '').replace(/[`"“”]/g, '').replace(/\s+/g, ' ').trim();
+  const link = linkName(t);
+  if (link) return link;
+  for (let k = 0; k < 3; k++) t = t.replace(FILLER, '').replace(LABEL, '');
   const words = t.split(' ').filter(w => w && !STOP.has(w.toLowerCase()));
   const picked = [];
   for (const w of words) {

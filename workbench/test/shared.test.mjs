@@ -180,6 +180,18 @@ test('nameFromTask makes short names', () => {
   assert.equal(nameFromTask('please can you write tests for the parser module and the lexer'), 'Write tests for parser');
   assert.equal(nameFromTask('List repository files and explain greet.js'), 'List repository files');
   assert.equal(nameFromTask(''), 'New task');
+  // Free text, as people type it to a coding agent: apostrophes stay, openers and labels go, a link names what it is.
+  assert.equal(nameFromTask("there's a typo in the readme"), 'Typo in readme');
+  assert.equal(nameFromTask("the login page doesn't load"), "Login page doesn't load");
+  assert.equal(nameFromTask('I want a dark mode toggle'), 'Dark mode toggle');
+  assert.equal(nameFromTask('it would be nice to have tabs'), 'Tabs');
+  assert.equal(nameFromTask('bug: login redirect loops'), 'Login redirect loops');
+  assert.equal(nameFromTask('new feature: export to pdf'), 'Export to pdf');
+  assert.equal(nameFromTask('the app crashes when I click save'), 'App crashes');
+  assert.equal(nameFromTask('https://github.com/acme/shop/issues/12'), 'Shop issue 12');
+  assert.equal(nameFromTask('https://github.com/acme/shop/pull/7'), 'Shop pull request 7');
+  assert.equal(nameFromTask('https://www.example.com/some/page'), 'Link to example.com');
+  assert.equal(nameFromTask('“Fix the readme”'), 'Fix readme');
 });
 
 test('extractQuestion finds a closing question only', () => {

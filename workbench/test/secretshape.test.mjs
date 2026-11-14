@@ -148,3 +148,16 @@ test('secretshape.mjs is pure: the page loads it as it is', () => {
   assert.ok(!/from\s+['"]node:/.test(text) && !/import\(\s*['"]node:/.test(text), 'no node: imports');
   assert.ok(!/\b(?:Buffer|process|require)\b/.test(text.replace(/\/\/.*$/gm, '')), 'nothing only Node has');
 });
+
+test('a password in a link is a key; a word that only holds its place is not', () => {
+  const pw = join('hun', 'ter', '2Qx', '9z');
+  for (const t of [join('https://deploy:', pw, '@git.example.com/acme/shop.git'), join('clone https://me:', pw, '@github.com/acme/shop'),
+    join('use postgres://app:', pw, '@db.internal:5432/shop for the tests')]) {
+    assert.equal(looksLikeSecret(t).secret, true, t.replace(pw, '<pw>'));
+  }
+  for (const t of ['use postgres://user:password@localhost/db in the tests', 'use postgres://user:${PW}@localhost/db',
+    'use mysql://root:<password>@localhost/app', 'ssh://git@github.com/acme/shop.git', 'git@github.com:acme/shop.git',
+    'https://github.com/acme/shop/issues/12', 'https://user@example.com/path']) {
+    assert.equal(looksLikeSecret(t).secret, false, t);
+  }
+});

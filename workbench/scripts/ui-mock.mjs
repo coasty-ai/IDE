@@ -1290,7 +1290,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           const need = state.agents.filter(a => ['needs_ok', 'question', 'maybe_stuck', 'checks_failed'].includes(a.state));
           return reply({ reply: need.length ? `${need.length} thing${need.length === 1 ? '' : 's'} need${need.length === 1 ? 's' : ''} you.` : 'Nothing needs you.', focusId: need[0]?.id });
         }
-        return reply({ reply: 'I did not catch that. Try “start an agent to fix the flaky test”.' });
+        return reply({ reply: 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.' });
       }
       // Agents & keys: the connect panel's routes (404 outside the connect scenarios, as in the demo)
       if (p === '/api/connect' || p.startsWith('/api/connect/')) {

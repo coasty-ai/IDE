@@ -1501,7 +1501,7 @@ test('command: "yes" confirms the pending launch through the commands module', a
   const out = await t.engine.command('have codex write tests for the parser and claude fix it');
   assert.match(out.reply, /^Start 2 agents: Codex on “write tests for the parser” and Claude Code on “fix the parser”\?$/);
   // Without the card's id, nothing is shown, so nothing waits for a yes: the newest confirm is never picked.
-  assert.equal((await t.engine.command('yes')).reply, 'I did not catch that. Try “start an agent to fix the login bug”, “what needs me”, or “stop everything”.');
+  assert.equal((await t.engine.command('yes')).reply, 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.');
   assert.equal(t.calls.parse[1].ctx.pendingConfirm, null);
   const yes = await t.engine.command('yes', { confirmId: out.confirm.id }); // the page sends the card it shows
   assert.equal(t.calls.parse[2].ctx.pendingConfirm.id, out.confirm.id);
@@ -3676,3 +3676,22 @@ test('repository: a workspace module that cannot tell who commits leaves identit
 });
 
 // ------------------------------------------------------------------ end of the source-control tests
+
+test('words not caught say what to type; while a permission waits in the centre, they say so; a no keeps its “don’t”', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  assert.equal((await t.engine.command('ok')).reply, 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.');
+  const { id } = await started(t);
+  const pending = t.engine.hookPreToolUse(id, rootPayload);
+  await until(() => t.store.get(id).ask);
+  const askId = t.store.get(id).ask.id;
+  const r = await t.engine.command('the login page is broken', { focusId: id, askId });
+  assert.equal(r.reply, 'Fix login redirect is waiting for your OK. Say “yes” or “no” to it first.');
+  assert.equal(await settled(pending), false, 'still held');
+  // The agent hears the no as it was said, "don't" and all.
+  await t.engine.command("don't use the production database", { focusId: id, askId });
+  const out = await pending;
+  assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(out.hookSpecificOutput.permissionDecisionReason, "The person said no, and added: don't use the production database");
+  await t.engine.shutdown();
+});

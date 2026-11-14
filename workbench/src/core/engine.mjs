@@ -88,7 +88,7 @@ const DENY_LABEL_RE = /^deny$/i;
 const LOOKS_GOOD_RE = /^(looks good|look good|lgtm|great|thanks|thank you|good|fine|ok|okay|all good)[.!]*$/i;
 // The lid's "Not now" on work that can be merged: the agent stays as it is, and the reply does not sound like approval.
 const NOT_NOW_RE = /^not now[.!]*$/i;
-const HELP = 'I did not catch that. Try “start an agent to fix the login bug”, “what needs me”, or “stop everything”.';
+const HELP = 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.';
 // The answer to "help", "hi" or "what can you do": short enough for three lines under the DRAM on the narrowest board.
 const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
@@ -3537,9 +3537,21 @@ export class Engine extends EventEmitter {
         // habit finds nothing to answer, rather than whatever asks next.
         return r.agentIds?.length && !r.focusId ? { ...r, focusId: r.agentIds[0] } : r;
       }
-      default:
-        return { reply: HELP };
+      default: {
+        // With a request for permission in the centre, words that are no answer say so, not the general hint.
+        const asking = this._permissionInFocus(focusId);
+        return { reply: asking ? `${asking.name} is waiting for your OK. Say “yes” or “no” to it first.` : HELP };
+      }
     }
+  }
+
+  /** The agent in the centre, or its one helper, when it waits for permission; else null. */
+  _permissionInFocus(focusId) {
+    const v = focusId ? this.store.get(focusId) : null;
+    if (!v) return null;
+    if (v.ask?.type === 'permission') return v;
+    const helpers = this.store.list().filter(a => (a.parentId === v.id || a.rootId === v.id) && a.ask?.type === 'permission');
+    return helpers.length === 1 ? helpers[0] : null;
   }
 
   _permissionTarget(id) {
@@ -3619,7 +3631,7 @@ export class Engine extends EventEmitter {
     if (!sentence) {
       const label = (t) => (this.mode === 'demo' ? `a simulated ${harnessName(t.harness)}` : harnessName(t.harness));
       sentence = list.length === 1
-        ? `Start ${label(list[0])} on “${clip(list[0].task, 90)}”?`
+        ? `Start ${label(list[0])} on “${clip(list[0].task, 90)}”${/\?$/.test(clip(list[0].task, 90)) ? '' : '?'}`
         : `Start ${list.length} agents: ${joinAnd(list.map(t => `${label(t)} on “${clip(t.task, 50)}”`))}?`;
     }
     return this._newConfirm({ kind: 'start', tasks: list, sentence, detail });
@@ -3768,7 +3780,7 @@ export class Engine extends EventEmitter {
       return { reply: this._describe(v), focusId: v.id };
     }
     const all = this.store.list();
-    if (!all.length) return { reply: 'No agents yet. Say “start an agent to …” to begin.' };
+    if (!all.length) return { reply: 'No agents yet. Say what to work on to begin.' };
     // An earlier agent waits on nobody, and neither does a failed check on work that is settled (merged with nothing new
     // since, or thrown away), as the page's needsPerson has it.
     const needs = all.filter(v => !v.earlier && NEEDS_YOU.has(v.state) && !(v.state === STATE.CHECKS_FAILED && workSettled(v)));
