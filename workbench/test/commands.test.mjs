@@ -1609,8 +1609,10 @@ test('reports, wants and questions are work, not a stop, a message or a status o
     ['codex why is the build slow', 'empty', start(['why is the build slow', 'codex'])],
     ['the login page is broken using codex', 'empty', start(['the login page is broken', 'codex'])],
     ['the login page is broken, codex', 'empty', start(['the login page is broken', 'codex'])],
-    ['codex add csv export', 'question', start(['add csv export', 'codex'])], // wins over a waiting question
-    ['claude fix the login bug', 'question', start(['fix the login bug', 'claude'])],
+    ['codex add csv export', 'none', start(['add csv export', 'codex'])],
+    // While a question waits, words that open with an agent's program are its answer ("claude keep the old route")
+    ['codex add csv export', 'question', answer('codex add csv export')],
+    ['claude keep the old route', 'question', answer('claude keep the old route')],
     ['new agent for this', 'none', { kind: 'start', tasks: [], task: null, harness: null }], // still asks what to work on
   ]);
 });
@@ -1623,7 +1625,7 @@ test('commands keep their meaning after a reaction, said twice, or said to an ag
     ['stop the agents', 'question', { kind: 'stop_all' }],
     ['stop working', 'onboarding', stop('7a8b9c')],
     ['stop stop stop', 'question', stop('d4e5f6')],
-    ['yeah stop it', 'stuck', stop('0a0b0c')],
+    ['yeah stop it', 'stuck', answer('Stop it', '0a0b0c', 'ask-stuck')], // its own "Stop it", which the engine acts on
     ['claude, stop', 'stuck', stop('0a0b0c')],
     ['cool, stop the flaky test', 'none', stop('0a0b0c')],
     ['looks good, merge it', 'Wdone', merge('s3c003')],
@@ -1650,4 +1652,122 @@ test('a task that is a question gets no second question mark on its card', () =>
   assert.equal(describeIntent(task('why does the build fail?'), CTX.none), 'Start an agent on “why does the build fail?”');
   assert.equal(describeIntent(start(['why is the build slow?', 'codex']), CTX.none), 'Start Codex on “why is the build slow?”');
   assert.equal(describeIntent(task('the login page is broken'), CTX.none), 'Start an agent on “the login page is broken”?');
+});
+
+// ------------------------------------------------------------------ what a second sweep found
+
+const pair = [
+  { id: '0a0b0c', name: 'Flaky test', task: 'Fix the flaky checkout test', state: 'working', kind: 'agent', harness: 'claude' },
+  { id: '7a8b9c', name: 'Onboarding', task: 'Improve the onboarding flow', state: 'working', kind: 'agent', harness: 'claude' },
+];
+const stopAsker = { id: 'd4e5f6', name: 'Search cleanup', task: 'Clean up the search route handlers', state: 'question', kind: 'agent', harness: 'claude',
+  ask: { id: 'ask-q', type: 'question', sentence: 'The old dev server is still running on port 3000. Should I stop it?', options: [] } };
+const voiceAgents = [
+  fromTask('fix the login bug', { id: 'v00001', state: 'working' }),
+  fromTask('make the save button close the dialog', { id: 'v00002', state: 'question', ask: { id: 'ask-v', type: 'question', sentence: 'Should the save button also close the dialog?', options: [] } }),
+];
+Object.assign(SWEPT, {
+  pair: { agents: pair, machines, harnesses, focusId: null },
+  pairFocus: { agents: pair, machines, harnesses, focusId: '7a8b9c' },
+  stopQ: { agents: [stopAsker], machines, harnesses, focusId: 'd4e5f6' },
+  optionsQ: { agents: [{ ...stopAsker, ask: { id: 'ask-o', type: 'question', sentence: '要继续吗？', options: ['是', '否'] } }], machines, harnesses, focusId: 'd4e5f6' },
+  voice: { agents: voiceAgents, machines, harnesses, focusId: null },
+  voiceQ: { agents: voiceAgents, machines, harnesses, focusId: 'v00002' },
+});
+
+test('never-minds take back, praise praises, and an answer is never turned around', () => {
+  sweptRows([
+    ['never mind, I fixed it', 'none', unknown('never mind, I fixed it')], // a reason, not a request
+    ['never mind, it works now', 'none', unknown('never mind, it works now')],
+    ['never mind the login bug', 'none', unknown('never mind the login bug')],
+    ['never mind the warnings, just fix the errors', 'none', task('fix the errors')],
+    ['ignore my last message', 'none', unknown('ignore my last message')],
+    ['cancel that deploy job', 'none', task('cancel that deploy job')], // "that" belongs to the job
+    ['cancel that onboarding agent', 'none', { kind: 'stop', agentIds: ['7a8b9c'] }],
+    ['forget that invoice export', 'none', { kind: 'forget', agentIds: ['1a2b3c'] }],
+    ['nice work on the parser', 'none', unknown('nice work on the parser')],
+    ['good work on the docs', 'none', unknown('good work on the docs')],
+    ['great work on the login fix', 'Wdone', unknown('great work on the login fix')],
+    ['yes, add tests too', 'pending', unknown('yes, add tests too')], // the card stays: no other launch in its place
+    ['yes, stop it', 'stopQ', answer('yes, stop it')], // the answer to "Should I stop it?", not a stop of the one asking
+    ['否', 'optionsQ', answer('否', 'd4e5f6', 'ask-o')], // never the first option because both lose their letters
+    ['好的', 'empty', unknown('好的')], ['谢谢', 'empty', unknown('谢谢')], ['muchas gracias', 'empty', unknown('muchas gracias')],
+    ['that fixed it', 'empty', unknown('that fixed it')], ['this is annoying', 'empty', unknown('this is annoying')],
+    ["it's stuck", 'onboarding', { kind: 'status', agentId: '7a8b9c' }],
+    ['why did that fail?', 'onboarding', { kind: 'status', agentId: '7a8b9c' }],
+    ['please fix it', 'onboarding', unknown('please fix it')],
+    ['testing one two three', 'empty', unknown('testing one two three')],
+  ]);
+});
+
+test('stops said in a hurry stop; a name before a command gives the command; a name before a remark is no launch', () => {
+  const stop = (...agentIds) => ({ kind: 'stop', agentIds });
+  sweptRows([
+    ['hold on, stop everything', 'none', { kind: 'stop_all' }],
+    ['stop, stop everything', 'onboarding', { kind: 'stop_all' }],
+    ['stop everything stop everything', 'none', { kind: 'stop_all' }],
+    ['stop all claude agents', 'none', { kind: 'stop_all' }],
+    ['shut it down', 'onboarding', stop('7a8b9c')],
+    ['kill kill kill', 'onboarding', stop('7a8b9c')],
+    ['claude make it stop', 'onboarding', stop('7a8b9c')],
+    ['no, stop it', 'onboarding', stop('7a8b9c')],
+    ['hang on, stop the onboarding', 'onboarding', stop('7a8b9c')],
+    ["stop, it's deleting the wrong files", 'pairFocus', stop('7a8b9c')], // after the comma comes why
+    ['can you stop the flaky test?', 'pair', stop('0a0b0c')],
+    ['stop the onboarding agent from running', 'none', stop('7a8b9c')],
+    ['we need to pause onboarding', 'none', { kind: 'stop', agentIds: ['7a8b9c'], sure: false }], // a want is asked first
+    ['claude stop', 'stuck', stop('0a0b0c')],
+    ['claude, stop the flaky test', 'none', stop('0a0b0c')],
+    ['claude: what needs me?', 'none', { kind: 'status', needsMe: true }],
+    ['Flaky test: stop', 'none', stop('0a0b0c')],
+    ['Onboarding: use the new copy on step 2', 'none', { kind: 'say', agentId: '7a8b9c', text: 'use the new copy on step 2', sure: false }],
+    ['tell onboarding the copy is final', 'none', { kind: 'say', agentId: '7a8b9c', text: 'the copy is final', sure: false }],
+    ['claude is stuck', 'none', unknown('claude is stuck')], ["codex isn't installed", 'empty', unknown("codex isn't installed")],
+    ['claude and codex fix the login bug', 'empty', start(['fix the login bug', 'claude'], ['fix the login bug', 'codex'])],
+    ['codex is there a memory leak in the worker', 'empty', start(['is there a memory leak in the worker', 'codex'])],
+    ['codex，修复登录错误', 'empty', start(['修复登录错误', 'codex'])],
+    ['use codex instead', 'none', { kind: 'start', tasks: [], task: null, harness: 'codex' }],
+    ['nah, throw it away', 'invoice', { kind: 'discard', agentId: '1a2b3c' }],
+    ['good job! merge it into main', 'invoice', merge('1a2b3c', 'main')],
+    ['approve and merge', 'Wdone', merge('s3c003')],
+    ['good morning! what needs me?', 'none', { kind: 'status', needsMe: true }],
+    ['claude keep the old route', 'question', answer('claude keep the old route')],
+    ['scrap that and fix the login bug', 'voiceQ', answer('scrap that and fix the login bug', 'v00002', 'ask-v')],
+  ]);
+});
+
+test('questions about an agent said loosely find it; questions about code and the person\'s words stay work', () => {
+  sweptRows([
+    ['is the parser agent running?', 'none', { kind: 'status', agentId: '9f9f9f' }],
+    ['check on the login one', 'voice', { kind: 'status', agentId: 'v00001' }],
+    ['whats the login one doing', 'voiceQ', { kind: 'status', agentId: 'v00001' }], // about another agent: not the answer
+    ["how's the export?", 'none', { kind: 'status', agentId: '1a2b3c' }],
+    ['tell me what checkout fix is doing', 'none', { kind: 'status', agentId: 'a1b2c3' }],
+    ['why did invoice export fail?', 'none', { kind: 'status', agentId: '1a2b3c' }],
+    ['is the login bug fixed yet', 'voice', { kind: 'status', agentId: 'v00001' }],
+    ['how are my agents?', 'none', { kind: 'status' }],
+    ['is claude still running?', 'onboarding', { kind: 'status' }],
+    ['wat needs me', 'none', { kind: 'status', needsMe: true }],
+    ['what do I type here', 'empty', { kind: 'help' }],
+    ['does the signup form need my email?', 'empty', task('does the signup form need my email?')],
+    ['how is shipping cost calculated?', 'empty', task('how is shipping cost calculated?')],
+    ['open the login page in a modal', 'dogNone', task('open the login page in a modal')],
+    ['add an agents page to the dashboard', 'none', task('add an agents page to the dashboard')],
+    ['error in claude code extension', 'empty', task('error in claude code extension')],
+    ['the tests pass locally but fail in CI', 'empty', task('the tests pass locally but fail in CI')],
+    ['No error is shown when the upload fails', 'empty', task('No error is shown when the upload fails')],
+    ['no emails are being sent', 'empty', task('no emails are being sent')],
+    ['check if the deploy is ok', 'empty', task('check if the deploy is ok')],
+    ['use === instead of == in the validator', 'empty', task('use === instead of == in the validator')],
+    ['Hey there! Could you please fix the readme?', 'empty', task('fix the readme?')],
+    ['love it! can we also get tabs?', 'empty', task('can we also get tabs?')],
+    ['thanks! also the footer is broken', 'empty', task('also the footer is broken')],
+    ['site down', 'empty', task('site down')],
+  ]);
+  // At a permission, words that only start like a yes are no reply; a "don't," with a reason is a no that carries it
+  assert.deepEqual(parseCommand('allow users to export their data as CSV', CTX.permission), unknown('allow users to export their data as CSV'));
+  assert.deepEqual(parseCommand('go to the login page and it shows a 500', CTX.permission), unknown('go to the login page and it shows a 500'));
+  assert.deepEqual(parseCommand("don't, it deletes the database", CTX.permission),
+    { kind: 'deny', agentId: 'a1b2c3', askId: 'ask-perm', text: "don't, it deletes the database" });
+  assert.deepEqual(parseCommand('claude, allow it', CTX.permission), { kind: 'allow', agentId: 'a1b2c3', askId: 'ask-perm' });
 });

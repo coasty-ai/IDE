@@ -33,8 +33,8 @@ const KNOWN = [
   ['jwt', new RegExp(`${START}eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}`)],
   ['generic', new RegExp(`${START}(?:glpat-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{36})`)],
   // A password in a link (https://deploy:<password>@git.example.com/…): a key, wherever it is. A word that only holds its
-  // place ("user:password@", "user:${PW}@") is not one.
-  ['generic', /(?<![A-Za-z0-9])[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:(?!(?:password|passwd|pass|pwd|pw|secret|token|x+|\*+|<[^>\s]*>|\$\{[^}\s]*\}|\{[^}\s]*\}|\$[A-Za-z_]+)@)[^\s/@]{4,}@/i],
+  // place ("user:password@", "user:${PW}@"), a local default ("postgres:postgres@", "root:root@") is not one.
+  ['generic', /(?<![A-Za-z0-9])[a-z][a-z0-9+.-]*:\/\/([^\s/@:?#]+):(?!\1@)(?!(?:password|passwd|pass|pwd|pw|secret|token|postgres|root|admin|guest|test|dev|local|example|changeme|x+|\*+|<[^>\s]*>|\$\{[^}\s]*\}|\{[^}\s]*\}|\$[A-Za-z_]+)@)[^\s/@?#]{4,}@/i],
 ];
 
 /** Words of the base64 and base64url alphabets, 32 characters or more. Anything else ends a word. */
