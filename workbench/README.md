@@ -129,7 +129,7 @@ An agent connected while Workbench runs can take work at once, and agents from a
 - A key can be at most 2,000 characters, on one line (on a Mac, the keychain takes a little less: about 1,950). You can keep up to 50 keys.
 - If your keychain is locked when Workbench starts, it asks once, and says in the terminal (or the Mac app's log) which keys agents will not get.
 
-## What is real in this prototype
+## What is real
 
 - **Claude Code agents are real.** Each runs the Claude Code program installed on this machine, with your own login (or the API key you gave it in Agents & keys), in its own git worktree of the repository. Worktrees start from your last commit, so uncommitted changes are not in them.
   - Your personal Claude Code plugins, hooks and MCP servers are deliberately **not** loaded into these agents, and neither is your own `.claude/settings.local.json`. The repository's committed `.claude/` settings are loaded too. Agents cannot change them, but treat them like the rest of your repository's code: a committed setting can change how an agent runs. It cannot switch off the permission questions or redirect them: the workbench sets those on the command line, which outranks the repository's settings.
@@ -269,7 +269,7 @@ Or open this folder in the Mac app (see "The Mac app"), which needs no Node on y
 
 - The page and its programming interface listen on `127.0.0.1` only. Every request needs the run's key, and requests from other websites are refused. A link with anything after the address except this run's key (an old link, say) opens the plain page instead; a tab without the key then asks you to open the link printed in the terminal.
 - Each agent gets its own key for asking permission, so one agent's key cannot ask in another agent's name, and it never opens the page's interface.
-- Every agent has a spending limit (`--budget`). Only you can raise it, one limit at a time, with the button the middle shows when an agent reaches its own.
+- Every Claude Code agent has a spending limit (`--budget`). Only you can raise it, one limit at a time, with the button the middle shows when an agent reaches its own. Codex reports no cost, so Codex agents have no limit, and their launch card says so.
 - Agents can read the keys you give them, and so can anything they run: give them keys that can do only what their work needs. Workbench keeps keys out of its page, its logs, its history and the agents you did not give them to; it cannot keep an agent from its own keys. The page shows a key only as "•••• " and its last four characters, never keeps one, and never sends text that looks like a key from the board's input.
 - A key's value never goes into a command line, which other programs on the computer can read. The Mac app gives Workbench a GitHub token on its standard input, never as an argument.
 - Merge and Throw it away always ask first, and check everything again when you answer. A merge goes ahead only if the agent's work and your branch are as its card showed them; otherwise it says so and changes nothing.

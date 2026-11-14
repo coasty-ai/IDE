@@ -3731,7 +3731,12 @@ export class Engine extends EventEmitter {
       const where = cloud ? (many ? 'Each one gets its own cloud machine.' : 'It runs on a cloud machine.') : (many ? 'They run on your laptop.' : 'It runs on your laptop.');
       return `This is the demo: the agents are simulated and nothing is spent. ${where}`;
     }
-    const parts = [`${many ? 'Each one' : 'It'} can spend up to ${money(this.defaultBudgetUsd)}.`];
+    // Codex reports no cost, so a Codex agent has no spending limit; Claude Code's is the run's default.
+    const codex = list.filter(t => t.harness === 'codex').length;
+    const limit = money(this.defaultBudgetUsd);
+    const parts = [codex === 0 ? `${many ? 'Each one' : 'It'} can spend up to ${limit}.`
+      : codex === list.length ? `Codex reports no cost, so ${many ? 'they have' : 'it has'} no spending limit.`
+        : `Each Claude Code agent can spend up to ${limit}. Codex reports no cost, so it has no spending limit.`];
     const repo = this.repoInfo;
     if (repo) {
       parts.push(`${many ? 'Each works' : 'It works'} in its own copy of ${repo.name || 'the repository'}, made from the last commit.`);

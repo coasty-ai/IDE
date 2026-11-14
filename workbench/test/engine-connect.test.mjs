@@ -104,6 +104,21 @@ test('without Connect, new work goes to the first agent that is ready, Claude Co
   await both.engine.shutdown();
 });
 
+test('a launch card says what each agent may spend: Claude Code its limit, Codex none, since Codex reports no cost', async () => {
+  const t = live();
+  await t.engine.start();
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
+  assert.match((await t.engine.command('codex fix the docs')).confirm.detail, /^Codex reports no cost, so it has no spending limit\. /);
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }] };
+  assert.match((await t.engine.command('claude fix the docs')).confirm.detail, /^It can spend up to \$2\.00\. /);
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }, { task: 'fix the tests', harness: 'claude' }] };
+  assert.match((await t.engine.command('claude fix the docs and the tests')).confirm.detail, /^Each one can spend up to \$2\.00\. /);
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }, { task: 'fix the tests', harness: 'codex' }] };
+  assert.match((await t.engine.command('claude fix the docs and codex the tests')).confirm.detail,
+    /^Each Claude Code agent can spend up to \$2\.00\. Codex reports no cost, so it has no spending limit\. /);
+  await t.engine.shutdown();
+});
+
 test('--model is the Claude model: a Codex agent starts with its own model, and a model named for one launch reaches that agent', async () => {
   // Workbench started with --model haiku once gave Codex `-m haiku` too, and every Codex agent failed as it started.
   const t = live({ defaultModel: 'haiku' });
