@@ -664,6 +664,14 @@ test('git: the name and email git has, saved with Save, and a repository’s own
   fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '');
   s = await real.c.status({ repoRoot: repo });
   assert.equal(s.git.sentence, 'This repository has its own name and email for git. Save yours here to use them everywhere.');
+  // A global name and email, and the repository's own: merges there use the repository's, so the panel says both.
+  fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '[user]\n\tname = Ada Lovelace\n\temail = ada@example.org\n');
+  s = await real.c.status({ repoRoot: repo });
+  assert.equal(s.git.sentence, 'In this repository git knows you as Repo Name, repo@example.org, and merges here use that. Everywhere else: Ada Lovelace, ada@example.org.');
+  assert.equal(s.git.name, 'Ada Lovelace', 'the form still holds the global name, which Save changes');
+  execFileSync('git', ['config', 'user.name', 'Ada Lovelace'], { cwd: repo });
+  execFileSync('git', ['config', 'user.email', 'ada@example.org'], { cwd: repo });
+  assert.equal((await real.c.status({ repoRoot: repo })).git.sentence, 'Git knows you as Ada Lovelace, ada@example.org.', 'the same in both says it once');
   // git that cannot be read is said plainly.
   const broken = makeConnect(t, { workspace: { ...fakeWorkspace(), gitConfigIdentity: async () => { throw Object.assign(new Error('Git could not read'), { plain: true, detail: 'fatal: bad config line 1' }); } } });
   assert.deepEqual((await broken.c.status()).git, { name: '', email: '', installed: true, canInstall: false, sentence: 'Workbench could not read git’s settings.' });

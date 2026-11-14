@@ -1000,13 +1000,17 @@ export class Connect extends EventEmitter {
     }
     const name = typeof who?.name === 'string' ? who.name : '';
     const email = typeof who?.email === 'string' ? who.email : '';
+    // What a merge in this repository uses: its own config's name and email when it has them, else the global ones.
+    let here = null;
+    if (repoRoot && typeof this.workspace.gitIdentity === 'function') {
+      try { here = await this.workspace.gitIdentity({ repoRoot }); } catch { here = null; }
+    }
+    const own = here && typeof here.name === 'string' && typeof here.email === 'string' && (here.name !== name || here.email !== email);
     let sentence;
-    if (name && email) sentence = `Git knows you as ${oneLine(name, 100)}, ${oneLine(email, 254)}.`;
+    if (name && email && own) {
+      sentence = `In this repository git knows you as ${oneLine(here.name, 100)}, ${oneLine(here.email, 254)}, and merges here use that. Everywhere else: ${oneLine(name, 100)}, ${oneLine(email, 254)}.`;
+    } else if (name && email) sentence = `Git knows you as ${oneLine(name, 100)}, ${oneLine(email, 254)}.`;
     else {
-      let here = null;
-      if (repoRoot && typeof this.workspace.gitIdentity === 'function') {
-        try { here = await this.workspace.gitIdentity({ repoRoot }); } catch { here = null; }
-      }
       if (here) sentence = 'This repository has its own name and email for git. Save yours here to use them everywhere.';
       else if (name) sentence = 'Git knows your name but not your email yet.';
       else if (email) sentence = 'Git knows your email but not your name yet.';
