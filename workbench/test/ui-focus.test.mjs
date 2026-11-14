@@ -260,6 +260,12 @@ test('a Claude Code agent stopped at its spending limit: "Give it $2.00 more" in
     assert.equal(allButtons(v.html).filter(b => b.cls.startsWith('big')).length, 2, `${tag}: at most two answers`);
     assert.equal(labelled(v.html, 'Review the changes').cls, 'quiet', `${tag}: its work can still be looked at`);
   }
+  // Its process may exit with an error after the turn that reached the limit: the line under the sentence still says
+  // why it stopped, in the engine's words, never the exit code or what the process printed.
+  const exited = show(lidView, S, limited({ error: 'fake claude: asked to exit with 1', stateReason: 'Claude Code stopped with an error (exit code 1).' }));
+  assert.match(exited.html, /<p class="meta">It reached its spending limit\.<\/p>/);
+  assert.doesNotMatch(exited.html, /exit code|asked to exit/);
+  assert.ok(labelled(exited.html, 'Give it $2.00 more'));
   // The amount is the run's own limit (--budget), as the page writes money.
   S.meta.defaultBudgetUsd = 5;
   assert.ok(labelled(show(lidView, S, limited()).html, 'Give it $5.00 more'));

@@ -66,6 +66,8 @@ const branchTitle = (words, b) => (Array.from(String(b)).length > 16 ? ` title="
 
 /** The count line of an engine card follows what it is about. */
 const CARD_COUNT = { merge: 'Before it merges', discard: 'Before it is thrown away', forget: 'Before it is forgotten' };
+/** Why an agent at its spending limit stopped, in the engine's words (its reason for Claude Code's error_max_budget_usd). */
+const LIMIT_REASON = 'It reached its spending limit.';
 
 /**
  * Where a root's work went, when that is what the lid is about: thrown away, a merge that did not go through, merged
@@ -405,11 +407,12 @@ export function lidView(f, o = {}) {
     }
     case 'failed': {
       sentence = `${nm} stopped with an error.`;
-      msg += metaP(esc(clipShown(prose(a.error || a.stateReason || 'The agent exited unexpectedly.'), fs.meta ? 120 : 70)));
       // A Claude Code agent stopped by its spending limit: "Try again" would find none of it left, so it is given the run's
-      // limit once more (the engine checks again) and continues where it left off.
+      // limit once more (the engine checks again) and continues where it left off. The line under the sentence says why it
+      // stopped in the engine's words, also when its process then exited with an error of its own.
       const budget = S.meta.defaultBudgetUsd;
       const atLimit = a.atLimit === true && a.harness === 'claude' && S.meta.mode === 'live' && budget > 0;
+      msg += metaP(esc(clipShown(prose(atLimit ? LIMIT_REASON : (a.error || a.stateReason || 'The agent exited unexpectedly.')), fs.meta ? 120 : 70)));
       acts = a.parentId ? big('Back', { act: 'parent', ...id }, true)
         : (atLimit ? big(`Give it ${money(budget)} more`, { act: 'raise', ...st }, true) : big('Try again', { act: 'fix', ...st, text: 'Please try again.' }, true))
           + big('Dismiss', { act: 'reviewed', ...st });
