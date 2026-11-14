@@ -2085,7 +2085,9 @@ export class Engine extends EventEmitter {
     const h = harness || this._defaultHarness();
     if (!h) throw Object.assign(plainError(NO_AGENT), { openConnect: true });
     if (!HARNESS_NAMES[h]) throw plainError(`I don’t know that kind of agent. Choose ${joinOr(AGENT_HARNESSES.map(harnessName))}.`);
-    const mdl = model ? String(model).trim() : (this.defaultModel || null);
+    // --model (defaultModel) names a Claude model, so only Claude Code agents get it: Codex given `-m haiku` cannot
+    // start. A model named for this launch goes to whichever agent it was named for.
+    const mdl = model ? String(model).trim() : (h === 'claude' ? this.defaultModel || null : null);
     if (mdl && !MODEL_RE.test(mdl)) throw plainError('That model name does not look right.');
     const budget = Number.isFinite(+budgetUsd) && +budgetUsd > 0 ? +budgetUsd : this.defaultBudgetUsd;
     const agentName = clip(String(name || '').replace(/^[-\s]+/, '').trim(), 40) || nameFromTask(text).replace(/^[-\s]+/, '') || 'New task';

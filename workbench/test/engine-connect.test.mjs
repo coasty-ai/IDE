@@ -57,7 +57,7 @@ class FakeConnect extends EventEmitter {
 }
 
 /** A live engine with stand-in adapters and deps. Call engine.shutdown() at the end. */
-function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = null, log = null, history = null, options = {}, repo = REPO } = {}) {
+function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = null, log = null, history = null, options = {}, repo = REPO, defaultModel = null } = {}) {
   const store = new Store(logPath ? { logPath } : {});
   const claude = adapters ? adapters.claude : fakeAdapter('claude');
   const codex = adapters ? adapters.codex : fakeAdapter('codex');
@@ -66,7 +66,7 @@ function live({ connect = null, adapters = null, deps: depOpts = {}, logPath = n
   const notices = [];
   store.on('notice', n => notices.push(n.text));
   const engine = new Engine({
-    store, mode: 'live', repo, hook: HOOK, defaultBudgetUsd: 2,
+    store, mode: 'live', repo, hook: HOOK, defaultBudgetUsd: 2, defaultModel,
     adapters: adapters || { claude, codex }, machines: new FakeMachines(), deps, connect, log,
     options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
@@ -102,6 +102,21 @@ test('without Connect, new work goes to the first agent that is ready, Claude Co
   await both.engine.start();
   assert.equal((await both.engine.startAgent({ task: 'Fix the cart total' })).harness, 'claude');
   await both.engine.shutdown();
+});
+
+test('--model is the Claude model: a Codex agent starts with its own model, and a model named for one launch reaches that agent', async () => {
+  // Workbench started with --model haiku once gave Codex `-m haiku` too, and every Codex agent failed as it started.
+  const t = live({ defaultModel: 'haiku' });
+  await t.engine.start();
+  await t.engine.startAgent({ task: 'Fix the cart total', harness: 'codex' });
+  assert.equal(t.codex.runners[0].opts.model, null);
+  await t.engine.startAgent({ task: 'Fix the cart total', harness: 'claude' });
+  assert.equal(t.claude.runners[0].opts.model, 'haiku');
+  await t.engine.startAgent({ task: 'Fix the docs', harness: 'codex', model: 'gpt-5.5' });
+  assert.equal(t.codex.runners[1].opts.model, 'gpt-5.5');
+  await t.engine.startAgent({ task: 'Fix the docs', harness: 'claude', model: 'sonnet' });
+  assert.equal(t.claude.runners[1].opts.model, 'sonnet');
+  await t.engine.shutdown();
 });
 
 test('with no agent ready, a start says so and opens Agents & keys', async () => {

@@ -29,7 +29,7 @@ Options for real agents:
 | `--clone <address>` | copy this repository first, like `https://github.com/owner/repo` or `git@github.com:owner/repo.git`, then work on the copy |
 | `--into <folder>` | where `--clone` puts the copy (default: the current folder) |
 | `--budget 2` | the most each agent may spend, in US dollars (default 2) |
-| `--model <name>` | the Claude model to use, for example `sonnet` or `haiku` |
+| `--model <name>` | the Claude model to use, for example `sonnet` or `haiku`. Codex agents keep Codex's own model |
 | `--claude <path>` | the Claude Code program to run. Without it: `WORKBENCH_CLAUDE_BIN`, then `claude` on the PATH, then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor |
 | `--port 4317` | where the page is served (`0` picks a free port) |
 

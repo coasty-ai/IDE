@@ -330,6 +330,8 @@ export function createRunner(opts);         // opts: { agentId, name, task, cwd,
 ```js
 export class Engine extends EventEmitter {
   constructor({ store, mode, repo, hook, defaultBudgetUsd, defaultModel, adapters, machines, deps, connect, log, options })
+  // defaultModel: the CLI's --model, a Claude model. Only Claude Code agents get it; Codex (and the simulator) start with
+  //        their own unless a launch names a model itself (Codex given `-m haiku` cannot start).
   // hook: { url, tokenFor(agentId) }  where the hook posts, and each agent's own hook token. Read at each launch;
   //        a live Claude Code runner gets { url, token: tokenFor(id) } (null when tokenFor is missing or fails, and
   //        Claude Code then refuses to start); every other runner gets hook: null.

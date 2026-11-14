@@ -68,7 +68,7 @@ Options:
   --clone <address>   copy this repository first, like https://github.com/owner/repo or git@github.com:owner/repo.git
   --into <folder>     where --clone puts the copy (default: the current folder)
   --budget <usd>      the most each agent may spend, in US dollars (default 2)
-  --model <name>      the model to ask for
+  --model <name>      the model Claude Code agents ask for, like sonnet or haiku (Codex keeps its own)
   --claude <path>     the Claude Code program to run. Without it: WORKBENCH_CLAUDE_BIN, then claude on the
                       PATH, then the newest Claude Code extension in VS Code or Cursor
   --port <n>          the port for the web page (default 4317; 0 picks a free one)
