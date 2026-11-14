@@ -1350,6 +1350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
   // Like other Mac apps, it stays open with no window; its Dock icon brings back the board, or the welcome window.
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+  // Restored window state is read with secure coding on every macOS the app runs on (macOS warns at launch otherwise).
+  func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
+
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
     if let w = boardWindow { w.makeKeyAndOrderFront(nil); return false }
     if !flag { showWelcome(); return false }
