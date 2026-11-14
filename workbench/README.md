@@ -1,4 +1,6 @@
-# Workbench (prototype)
+# Workbench
+
+This is an early release: "Limits", below, says what is not in it yet.
 
 A place to run coding agents and see, in plain language, what each one and its helpers are doing. You answer what they need by typing or talking. When an agent is done, you look at its changes, then merge them into your branch or throw them away.
 
@@ -274,8 +276,9 @@ Or open this folder in the Mac app (see "The Mac app"), which needs no Node on y
 - Characters that hide text or change the order it reads in (zero-width and direction-changing characters, tag characters, a line break inside a name, and the like) show as marks, such as ⟦U+202E⟧ or ⏎, where an agent's or a repository's words appear: names, paths, branch names, questions, answers, replies, commit subjects and diffs.
 - Stopping an agent stops any checks it is running. Stopping the workbench (Ctrl-C) stops every agent it started and every check it is running. An agent still being set up at that moment is not started, and the folder made for it is removed. A merge or throw-away under way finishes first.
 
-## Limits (first prototype)
+## Limits
 
+- Not in this release yet: choosing the Claude model in the Mac app (the command line has `--model`), a file view, a pull or push button, real cloud machines (the demo only simulates them), Windows, and the Mac app on Intel Macs.
 - Only agents started by the workbench come back (see “Earlier agents” above). Their helpers, plans and step lists are not kept, and an agent that was working when the workbench closed comes back stopped.
 - Until you merge it or throw it away, each agent's work stays on your computer after the workbench stops, in its own folder under `~/.workbench/worktrees/`, on a branch named `workbench/<task>-<id>`; the terminal lists them when the workbench stops. The changes may not be committed. Folders where an agent changed nothing are removed with their branches, and so are merged agents that changed nothing since, unless you press Ctrl-C twice: then the workbench stops without tidying up, every folder stays, and the terminal lists them all. Throw it away removes a folder and its branch for you. For a folder the workbench no longer shows (an agent you forgot, say), remove it yourself: `git worktree remove <folder>`, then `git branch -D workbench/<task>-<id>`.
 - A second Ctrl-C (or 12 seconds) during a merge stops waiting for it. Git still finishes the merge, but the workbench does not record it; the next Merge says the work is already in your branch.

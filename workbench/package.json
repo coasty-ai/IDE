@@ -1,6 +1,6 @@
 {
   "name": "workbench",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Launch coding agents, see what each one and its helpers are doing in plain language, and answer what they need.",
   "type": "module",
