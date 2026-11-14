@@ -1378,7 +1378,7 @@ try {
       `sent ${JSON.stringify(sent)}, input emptied ${input === ''}, panel open ${opened} saying "${inPanelWords}", board "${board}", left in ${JSON.stringify(left)}`);
   });
 
-  await run(AK + 'a preset form saves: AWS sends its preset, its fields (the region as typed), where and who; the key is listed masked', async () => {
+  await run(AK + 'a preset form saves: AWS sends its preset, its fields (the region as typed), where (this repository, a service key’s default) and who; the key is listed masked', async () => {
     await open('connect-claude');
     await sleep(900);
     await openPanel();
@@ -1390,14 +1390,14 @@ try {
     await click(inPanel('[data-cn="add-save"]')); await sleep(1100);
     const p = (await posts()).filter(x => x.path.startsWith('/api/connect'));
     const save = p.filter(x => x.path === '/api/connect/keys'), body = save[0]?.body || {}, v = body.values || {};
-    const sentRight = save.length === 1 && body.preset === 'aws' && body.label === 'AWS' && body.scope === 'all' && body.agents === 'all'
+    const sentRight = save.length === 1 && body.preset === 'aws' && body.label === 'AWS' && body.scope === 'repo' && body.agents === 'all'
       && Object.keys(v).sort().join(',') === 'AWS_ACCESS_KEY_ID,AWS_REGION,AWS_SECRET_ACCESS_KEY' && v.AWS_ACCESS_KEY_ID === id && v.AWS_SECRET_ACCESS_KEY === secret && v.AWS_REGION === 'eu-west-2';
     const rows = await keyRows(), words = await panelSaid(), formGone = !(await b.ev(`!!document.querySelector('#connectBody [data-cn="add-save"]')`));
-    const listed = `AWS for all repositories, given to all agents: AWS_ACCESS_KEY_ID •••• ${id.slice(-4)}, AWS_SECRET_ACCESS_KEY •••• ${secret.slice(-4)}, AWS_REGION eu-west-2`;
+    const listed = `AWS for this repository, given to all agents: AWS_ACCESS_KEY_ID •••• ${id.slice(-4)}, AWS_SECRET_ACCESS_KEY •••• ${secret.slice(-4)}, AWS_REGION eu-west-2`;
     const after = p.map(x => x.path).lastIndexOf('/api/connect/recheck') > p.indexOf(save[0]);
-    check(AK + 'a preset form saves: AWS sends its preset, its fields (the region as typed), where and who; the key is listed masked',
-      fields === 'AWS_ACCESS_KEY_ID:password,AWS_SECRET_ACCESS_KEY:password,AWS_SESSION_TOKEN:password,AWS_REGION:text' && choices === 'cn-scope=all,cn-given=all'
-      && sentRight && words === 'Saved AWS, for all repositories.' && rows.includes(listed) && formGone && after,
+    check(AK + 'a preset form saves: AWS sends its preset, its fields (the region as typed), where (this repository, a service key’s default) and who; the key is listed masked',
+      fields === 'AWS_ACCESS_KEY_ID:password,AWS_SECRET_ACCESS_KEY:password,AWS_SESSION_TOKEN:password,AWS_REGION:text' && choices === 'cn-scope=repo,cn-given=all'
+      && sentRight && words === 'Saved AWS, for this repository.' && rows.includes(listed) && formGone && after,
       `fields ${fields}; ${choices}; ${save.length} sent: ${JSON.stringify({ ...body, values: Object.keys(v) })}, its values as typed ${sentRight}; said "${words}"; rows ${JSON.stringify(rows)}; form closed ${formGone}; checked again after ${after}`);
   });
 
