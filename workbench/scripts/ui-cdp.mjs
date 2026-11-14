@@ -34,8 +34,13 @@ export async function launch({ width = 1440, height = 900, dpr = 1 } = {}) {
   };
   await send('Page.enable'); await send('Runtime.enable'); await send('Log.enable');
   await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: dpr, mobile: false });
-  const keyCode = k => (k === ' ' ? 32 : k === 'Tab' ? 9 : k === 'Enter' ? 13 : k === 'Escape' ? 27 : k === 'ArrowRight' ? 39 : k === 'ArrowLeft' ? 37 : k === 'ArrowDown' ? 40 : k === 'ArrowUp' ? 38 : k.length === 1 ? k.toUpperCase().charCodeAt(0) : 0);
-  const code = k => (k === ' ' ? 'Space' : k.length === 1 ? (/[a-z]/i.test(k) ? 'Key' + k.toUpperCase() : '') : k);
+  // Windows key codes for punctuation, as Chrome expects them: a character's own code would name another key ('.' is
+  // 46, which is Delete, so a typed "a.b" became "ab"). Anything else typed as text gets 0, which only inserts it.
+  const PUNCT = { '.': [190, 'Period'], ',': [188, 'Comma'], '-': [189, 'Minus'], '=': [187, 'Equal'], '/': [191, 'Slash'], ';': [186, 'Semicolon'],
+    "'": [222, 'Quote'], '`': [192, 'Backquote'], '[': [219, 'BracketLeft'], ']': [221, 'BracketRight'], '\\': [220, 'Backslash'] };
+  const keyCode = k => (k === ' ' ? 32 : k === 'Tab' ? 9 : k === 'Enter' ? 13 : k === 'Escape' ? 27 : k === 'ArrowRight' ? 39 : k === 'ArrowLeft' ? 37 : k === 'ArrowDown' ? 40 : k === 'ArrowUp' ? 38
+    : PUNCT[k] ? PUNCT[k][0] : k.length === 1 && /[a-z0-9]/i.test(k) ? k.toUpperCase().charCodeAt(0) : 0);
+  const code = k => (k === ' ' ? 'Space' : PUNCT[k] ? PUNCT[k][1] : k.length === 1 ? (/[a-z]/i.test(k) ? 'Key' + k.toUpperCase() : /[0-9]/.test(k) ? 'Digit' + k : '') : k);
   const b = {
     send, ev, pid: proc.pid,
     on: fn => listeners.push(fn),

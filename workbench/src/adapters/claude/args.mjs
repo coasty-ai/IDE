@@ -411,8 +411,8 @@ export function buildClaudeLaunch(o = {}) {
     // (and, in a worktree, is read from the person's main checkout).
     '--setting-sources', 'project',
     // A defaultMode in a settings file cannot turn off Claude Code's own refusal to change protected files.
-    // 2.1.322's --help lists "manual" instead, but "default" is still accepted (it is the name "manual" stands for),
-    // and 2.1.221 knows only "default".
+    // The --help of 2.1.221 and of 2.1.323 lists "manual" for it; both still accept "default", the name "manual"
+    // stands for (checked against both programs' option parsers).
     '--permission-mode', 'default',
     '--strict-mcp-config',
     '--disallowedTools', DISALLOWED_TOOLS,

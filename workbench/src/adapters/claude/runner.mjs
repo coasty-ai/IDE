@@ -202,7 +202,7 @@ export function createRunner(opts = {}) {
     log('info', `Claude Code ${version}${mode ? ` (permission mode ${mode})` : ''} offers ${tools.length} tools: ${tools.join(' ') || 'none'}`);
     const off = tools.filter((t) => DISALLOWED.has(t));
     if (off.length) log('warn', `Claude Code offers tools Workbench turned off for its agents: ${off.join(' ')}`);
-    // "manual" is the name 2.1.322's --help gives the default mode.
+    // "manual" is the name the --help of 2.1.221 and later gives the default mode.
     if (mode && mode !== 'default' && mode !== 'manual') log('warn', `Claude Code runs this agent in permission mode ${mode}, not the default mode Workbench asked for.`);
   }
 
