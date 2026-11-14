@@ -33,8 +33,9 @@ const DISALLOWED = new Set(DISALLOWED_TOOLS.split(' '));
 /**
  * Is Claude Code here? Finds it (see findClaude in args.mjs: `claudePath` is the --claude flag), then runs
  * `<path> --version` with a 5 second timeout.
- * @returns {Promise<{ ok: boolean, version?: string, path?: string, from?: 'flag'|'env'|'path'|'vscode', reason?: string }>}
- *   `path` and `from` say which Claude Code it found and how, also when that one cannot be used
+ * @returns {Promise<{ ok: boolean, version?: string, path?: string, from?: 'flag'|'env'|'path'|'vscode', reason?: string, timedOut?: true }>}
+ *   `path` and `from` say which Claude Code it found and how, also when that one cannot be used; `timedOut` when
+ *   `--version` did not answer within `timeoutMs`
  */
 export async function available({ env = process.env, timeoutMs = 5000, claudePath } = {}) {
   const where = findClaude({ flag: claudePath, env });
@@ -45,7 +46,7 @@ export async function available({ env = process.env, timeoutMs = 5000, claudePat
       if (err) {
         if (err.code === 'ENOENT') return resolve({ ok: false, reason: `Claude Code could not be started: ${where.path} was not found.`, ...found });
         if (err.code === 'EACCES') return resolve({ ok: false, reason: 'Claude Code could not be run: permission was refused.', ...found });
-        if (err.killed) return resolve({ ok: false, reason: 'Claude Code did not answer when asked for its version.', ...found });
+        if (err.killed) return resolve({ ok: false, timedOut: true, reason: 'Claude Code did not answer when asked for its version.', ...found });
         const said = firstLine(stderr);
         return resolve({ ok: false, reason: 'Claude Code could not be started.' + (said ? ' It said: ' + said : ''), ...found });
       }

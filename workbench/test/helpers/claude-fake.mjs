@@ -3,7 +3,8 @@
 // It never talks to a network and never spends anything.
 //
 // - With no arguments it exits 0 at once (the test runner may load every file under test/).
-// - `--version` prints a version: FAKE_CLAUDE_VERSION when set (it hangs with FAKE_CLAUDE_VERSION=hang), else 2.1.221.
+// - `--version` prints a version: FAKE_CLAUDE_VERSION when set (it hangs with FAKE_CLAUDE_VERSION=hang, and fails with
+//   FAKE_CLAUDE_VERSION=fail: a line on stderr, exit 1), else 2.1.221.
 //   Its system/init lines report the same version, the --permission-mode it was given (or FAKE_CLAUDE_PERMISSION_MODE)
 //   and a short list of tools.
 // - `auth status` prints FAKE_CLAUDE_AUTH (JSON, as `claude auth status` does) and exits 0 when its `loggedIn` is true,
@@ -63,13 +64,14 @@ import tty from 'node:tty';
 
 const argv = process.argv.slice(2);
 const env = process.env;
-const VERSION = env.FAKE_CLAUDE_VERSION && env.FAKE_CLAUDE_VERSION !== 'hang' ? env.FAKE_CLAUDE_VERSION : '2.1.221';
+const VERSION = env.FAKE_CLAUDE_VERSION && env.FAKE_CLAUDE_VERSION !== 'hang' && env.FAKE_CLAUDE_VERSION !== 'fail' ? env.FAKE_CLAUDE_VERSION : '2.1.221';
 
 if (argv.length === 0) {
   // Started with no arguments, as `node --test test/` does with every file under test/: nothing to do.
   process.exit(0);
 } else if (argv.includes('--version')) {
   if (env.FAKE_CLAUDE_VERSION === 'hang') setInterval(() => {}, 1000);
+  else if (env.FAKE_CLAUDE_VERSION === 'fail') { process.stderr.write('fake: could not start\n'); process.exit(1); }
   else { process.stdout.write(`${VERSION} (Claude Code)\n`); process.exit(0); }
 } else if (argv[0] === 'auth' && argv[1] === 'status') {
   const kept = env.FAKE_CLAUDE_AUTH_FILE && existsSync(env.FAKE_CLAUDE_AUTH_FILE) ? readFileSync(env.FAKE_CLAUDE_AUTH_FILE, 'utf8').trim() : null;

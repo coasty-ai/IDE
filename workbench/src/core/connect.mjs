@@ -29,8 +29,14 @@ import { GH_DEVICE_URL, GH_HELPER_KEYS, GH_MIN_VERSION, LOGIN_MAX_MS, versionAtL
 const GH_SETUP_WAIT_MS = 10_000;
 /** How long one sign-in check may take. */
 const PROBE_TIMEOUT_MS = 10_000;
-/** How long an adapter's own available() may take (the CLI gives it the same). */
-const AVAILABLE_TIMEOUT_MS = 15_000;
+/** How long an adapter's own available() may take here, `--version` included (the CLI's check without Agents & keys gives it 15 seconds). */
+const AVAILABLE_TIMEOUT_MS = 30_000;
+/**
+ * How long an agent's `--version` may take inside available(). A program just updated is scanned by macOS the first
+ * times it runs, and a busy Mac is slower still: 5 seconds (the adapters' own default) was not enough, and one slow
+ * check made the agent "could not be started", so that every launch was refused.
+ */
+const VERSION_TIMEOUT_MS = 20_000;
 const GITHUB_API = 'https://api.github.com';
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const VERSION_RE = /^\d{1,4}\.\d{1,4}\.\d{1,6}(?:[-+][0-9A-Za-z.-]{1,40})?$/;
@@ -419,7 +425,7 @@ export class Connect extends EventEmitter {
   constructor({
     home = os.homedir(), platform = process.platform, env = process.env, keys, workspace = workspaceModule, adapters = {},
     flags = {}, settingsPath, openTerminal = openTerminalWindow, fetchJson = fetchJsonWithNode, log = null, repoRoot = null,
-    probe = true, presets = KEY_PRESETS, probeTimeoutMs = PROBE_TIMEOUT_MS,
+    probe = true, presets = KEY_PRESETS, probeTimeoutMs = PROBE_TIMEOUT_MS, versionTimeoutMs = VERSION_TIMEOUT_MS,
     openTerminalSteps = openTerminalStepsWindow, ghModule = null, ghOptions = {},
     runProgram = runQuick, signInTimeoutMs = SIGNIN_TIMEOUT_MS, signInCheckMs = SIGNIN_CHECK_MS,
   } = {}) {
@@ -437,6 +443,7 @@ export class Connect extends EventEmitter {
     this.fetchJson = fetchJson;
     this.presets = Array.isArray(presets) ? presets : [];
     this.probeTimeoutMs = probeTimeoutMs;
+    this.versionTimeoutMs = versionTimeoutMs;
     this._log = makeLog(log);
     this._agents = null; // id -> what the last probe found
     // Signing in in the browser (src/core/signin.mjs): its state lives there, not in what a probe found, which each
@@ -551,7 +558,24 @@ export class Connect extends EventEmitter {
         this._log('warn', `checking ${d.name} failed: ${e && e.message}`);
         return this._finish({ id: d.id, name: d.name, found: false, runs: false, info: { ok: false }, missing: `Workbench could not check ${d.name}.` });
       })));
-      this._agents = Object.fromEntries(found.map((a) => [a.id, a]));
+      // A program that ran at the last check, is still a file, and now did not answer in time (it was slow, or the Mac
+      // busy: a program just updated is scanned by macOS the first times it runs) keeps that last check, so one slow
+      // answer does not refuse every launch. Only a timeout: a program that failed, or is gone, is what this check says.
+      const before = this._agents || {};
+      const kept = found.map((a) => {
+        const was = before[a.id];
+        const where = a.path || (was && was.path);
+        if (a.runs || !was || !was.runs || !(a.info && a.info.timedOut === true) || !where || !isFile(where)) return a;
+        this._log('warn', `${a.name} did not answer in time; Workbench keeps its last check (${was.sentence})`);
+        return { ...was, stale: true };
+      });
+      // When an agent stops being ready, or is ready again, the log says so and why: launches follow it.
+      for (const a of kept) {
+        const was = before[a.id];
+        if (was && was.ready && !a.ready) this._log('warn', `${a.name} was ready and is not now: ${a.sentence}`);
+        else if (was && !was.ready && a.ready) this._log('warn', `${a.name} is ready again: ${a.sentence}`);
+      }
+      this._agents = Object.fromEntries(kept.map((a) => [a.id, a]));
       const map = this._agentsMap();
       this.emit('agents', map);
       this.emit('changed');
@@ -597,8 +621,8 @@ export class Connect extends EventEmitter {
     const d = AGENT_BY_ID.get('claude');
     const mod = this.adapters.claude;
     const info = mod && typeof mod.available === 'function'
-      ? await within(mod.available({ env: this.env, claudePath: this.flags.claude || undefined }), AVAILABLE_TIMEOUT_MS,
-        { ok: false, reason: 'Claude Code did not answer in time.' })
+      ? await within(mod.available({ env: this.env, claudePath: this.flags.claude || undefined, timeoutMs: this.versionTimeoutMs }), AVAILABLE_TIMEOUT_MS,
+        { ok: false, timedOut: true, reason: 'Claude Code did not answer in time.' })
       : { ok: false, reason: 'Claude Code support could not be loaded.' };
     const safe = info && typeof info === 'object' ? info : { ok: !!info };
     const p = typeof safe.path === 'string' && safe.path ? safe.path : null;
@@ -628,7 +652,7 @@ export class Connect extends EventEmitter {
     const d = AGENT_BY_ID.get('codex');
     const mod = this.adapters.codex;
     const info = mod && typeof mod.available === 'function'
-      ? await within(mod.available({ env: this.env, timeoutMs: 5000 }), AVAILABLE_TIMEOUT_MS, { ok: false, reason: 'Codex did not answer in time.' })
+      ? await within(mod.available({ env: this.env, timeoutMs: this.versionTimeoutMs }), AVAILABLE_TIMEOUT_MS, { ok: false, timedOut: true, reason: 'Codex did not answer in time.' })
       : { ok: false, reason: 'Codex support could not be loaded.' };
     const safe = info && typeof info === 'object' ? info : { ok: !!info };
     const env = this._agentEnv('codex', repoRoot);

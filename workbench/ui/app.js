@@ -95,6 +95,9 @@ let leaveTimer = null;
 // ---------------------------------------------------------------- notices and the hint under the core
 let notice = null, noticeTimer = null;
 const hintDone = () => { try { return localStorage.getItem('wb-answered') === '1'; } catch { return false; } };
+/** How long a reply stays: one that refused or could not start work stays 30 s (9 s was easy to miss), the others 9 s. */
+const REFUSED_RE = /\b(could not start|cannot start|not available|not ready|not signed in|could not be started|did not answer)\b/i;
+function lasting(r) { return r && typeof r.reply === 'string' && (r.openConnect === true || REFUSED_RE.test(r.reply)) ? 30000 : 9000; }
 function say(text, ms = 9000) {
   // A reply or notice can name an agent's branch or paths, which the agent chose: characters that hide text or change the
   // order it reads in show by their code (⟦U+202E⟧) here and on the git screen. Line breaks, tabs and runs of spaces
@@ -523,7 +526,7 @@ async function actOn(b) {
     try {
       const r = await api.confirm(id, go);
       if (S.confirm && S.confirm.id === id) S.confirm = null;
-      say(r.reply || '');
+      say(r.reply || '', lasting(r));
       after(r);
       moved();
       // a start with no agent ready: "No coding agent is ready yet. Connect one in Agents & keys."
@@ -730,7 +733,7 @@ async function submit(text) {
       if (res.confirm || res.focusId || shown) moved();
       if (b.askId && !res.confirm) answeredOnce();
       // a new launch question in the core already says it; anything else is said under the core
-      say(res.confirm && (!shown || res.confirm.id !== shown.id) ? '' : (res.reply || ''));
+      say(res.confirm && (!shown || res.confirm.id !== shown.id) ? '' : (res.reply || ''), lasting(res));
       // "what did search cleanup change": the git screen opens on that agent's branch and its diff
       // also with a merge or throw-away card still shown: the person looks at the work first, then answers the card
       if (typeof res.review === 'string' && ID_RE.test(res.review) && (!res.confirm || (shown && res.confirm.id === shown.id))) openGitOn(res.review, null);

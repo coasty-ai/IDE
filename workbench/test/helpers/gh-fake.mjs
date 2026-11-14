@@ -333,7 +333,11 @@ async function login(argv, env) {
     await say('? Authenticate Git with your GitHub credentials? (Y/n) ');
     return waitForever();
   }
-  await say(`! First copy your one-time code: ${env.FAKE_GH_CODE || FAKE_CODE}\nOpen this URL to continue in your web browser: https://github.com/login/device\n`);
+  // What gh 2.104.0 printed with no terminal on the owner's Mac (2026-11-13): the code in brackets, "copied to
+  // clipboard". FAKE_GH_CODE_LINE=first-copy prints the form gh uses in a terminal instead.
+  const code = env.FAKE_GH_CODE || FAKE_CODE;
+  const line = env.FAKE_GH_CODE_LINE === 'first-copy' ? `! First copy your one-time code: ${code}` : `! One-time code (${code}) copied to clipboard`;
+  await say(`${line}\nOpen this URL to continue in your web browser: https://github.com/login/device\n`);
   if (mode === 'wait') return waitForever();
   await sleep(delay);
   if (mode === 'deny') quit(1, 'failed to authenticate via web browser: The user has denied your application access.');

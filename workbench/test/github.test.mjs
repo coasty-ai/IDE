@@ -568,3 +568,15 @@ test('the steps for Terminal: gh through env -u GH_TOKEN -u GITHUB_TOKEN, the lo
   assert.equal(ghSignInCommand(gh), `${gh} auth login --hostname github.com --git-protocol https --web --scopes workflow && ${gh} auth setup-git --hostname github.com`);
   assert.equal(ghSignOutCommand("/home/Ada O'Neil/.local/bin/gh"), "'/home/Ada O'\\''Neil/.local/bin/gh' auth logout --hostname github.com");
 });
+
+test('the one-time code is read in both of the forms gh prints: with no terminal, and in a terminal', async (t) => {
+  // gh 2.104.0 with no terminal (as Workbench runs it) printed "! One-time code (B2C1-9080) copied to clipboard" on the
+  // owner's Mac, and the old pattern, which knew only "…your one-time code: ABCD-1234", missed it: no code was shown.
+  for (const [form, extra] of [['no terminal', {}], ['terminal', { FAKE_GH_CODE_LINE: 'first-copy' }]]) {
+    const s = standIn(t, { FAKE_GH_CODE: 'B2C1-9080', ...extra });
+    const codes = [];
+    const r = await startGhLogin({ ghPath: s.gh, env: s.env, onCode: (c) => codes.push(c.code) }).done;
+    assert.equal(r.outcome, 'done', form);
+    assert.deepEqual(codes, ['B2C1-9080'], form);
+  }
+});

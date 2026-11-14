@@ -1615,3 +1615,42 @@ test('a FIFO in place of settings.json is never waited on: Connect reads it as n
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('a re-check where the program did not answer in time keeps the last check; one where it failed does not; the log says when readiness changes', async () => {
+  // On the owner's Mac a freshly updated Claude Code, on a busy machine, could take longer than 5 seconds to print its
+  // version: one such re-check made it "could not be started", and every launch was refused.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-connect-slow-'));
+  try {
+    const keys = { load: async () => ({ keys: [], missing: [] }), list: async () => [], add: async () => ({ id: 'k' }), remove: async () => ({ removed: true }), values: () => [], envFor: () => ({}) };
+    const env = { HOME: home, PATH: process.env.PATH, WORKBENCH_CLAUDE_BIN: CLAUDE_FAKE, WORKBENCH_CODEX_BIN: path.join(home, 'no-codex'), WORKBENCH_GH_BIN: path.join(home, 'no-gh') };
+    const logs = [];
+    const log = { info: () => {}, debug: () => {}, warn: (l) => logs.push(l), error: (l) => logs.push(l) };
+    // Codex is not installed here (its own adapter reads the test process's environment, which has the Codex stand-in)
+    const codex = { available: async () => ({ ok: false, loggedIn: null, reason: 'Codex is not installed.' }) };
+    const c = new Connect({ home, env, keys, log, adapters: { claude: claudeAdapter, codex }, probe: false, versionTimeoutMs: 400, fetchJson: async () => ({ status: 599, json: null }) });
+    const first = await c.recheck({});
+    assert.equal(first.claude.ok, true, 'the first check finds Claude Code ready');
+
+    env.FAKE_CLAUDE_VERSION = 'hang'; // the next one does not answer in time
+    const second = await c.recheck({});
+    assert.equal(second.claude.ok, true, 'a slow answer keeps the last check');
+    assert.equal(c.defaultAgent(), 'claude');
+    assert.ok(logs.some((l) => /^connect: Claude Code did not answer in time; Workbench keeps its last check \(Claude Code 2\.1\.221 is ready/.test(l)), logs.join('\n'));
+    assert.ok(!logs.some((l) => /was ready and is not now/.test(l)));
+
+    env.FAKE_CLAUDE_VERSION = 'fail'; // one that fails is what the check says, however it was before
+    const third = await c.recheck({});
+    assert.equal(third.claude.ok, false, 'a program that failed is not kept');
+    assert.equal(c.defaultAgent(), null);
+    assert.ok(logs.some((l) => /^connect: Claude Code was ready and is not now: Claude Code /.test(l)), logs.join('\n'));
+
+    env.FAKE_CLAUDE_VERSION = 'hang'; // and a slow answer after a failure keeps nothing: there is no good check to keep
+    assert.equal((await c.recheck({})).claude.ok, false);
+
+    delete env.FAKE_CLAUDE_VERSION;
+    assert.equal((await c.recheck({})).claude.ok, true);
+    assert.ok(logs.some((l) => /^connect: Claude Code is ready again: Claude Code 2\.1\.221 is ready/.test(l)), logs.join('\n'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

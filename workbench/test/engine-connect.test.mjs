@@ -678,3 +678,23 @@ test('a mask that fails hides nothing and stops nothing, and the warning never q
   assert.ok(!logs.some(l => /cart total now|mask broke/.test(l)));
   await t.engine.shutdown();
 });
+
+test('a yes that starts nothing goes to the log, with the reason the person was given, and so does a yes for a question that has gone', async () => {
+  const logs = [];
+  const t = live({ log: (level, ...args) => logs.push([level, ...args.map(String)].join(' ')) });
+  await t.engine.start();
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
+  const card = await t.engine.command('codex fix the docs');
+  t.engine.setHarnesses({ codex: { ok: false, reason: 'Codex is not installed.' } });
+  const yes = await t.engine.confirm(card.confirm.id, true);
+  assert.equal(yes.reply, 'I could not start the agent for “fix the docs”: Codex is not available on this computer.');
+  assert.ok(logs.includes(`warn After a yes to a launch question, 0 of 1 started. ${yes.reply}`), logs.join('\n'));
+  // the same card again, and one that never was: nothing is done, and the log says so
+  assert.equal((await t.engine.confirm(card.confirm.id, true)).reply, 'That request is no longer waiting. Ask again if you still want it.');
+  assert.ok(logs.includes('warn A yes came for a question that was no longer waiting, so nothing was done.'));
+  // a no for a question that has gone is not a launch that failed: nothing more is logged
+  const before = logs.length;
+  await t.engine.confirm('no-such-card', false);
+  assert.equal(logs.length, before);
+  await t.engine.shutdown();
+});

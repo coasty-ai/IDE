@@ -51,7 +51,9 @@ export const GH_HELPER_KEYS = Object.freeze(['credential.https://github.com.help
 
 const VERSION_RE = /^\d{1,4}\.\d{1,4}\.\d{1,6}$/;
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
-const CODE_RE = /one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Za-z0-9-])/i;
+// gh prints the code two ways: in a terminal "! First copy your one-time code: ABCD-1234", and with no terminal (as
+// Workbench runs it) "! One-time code (ABCD-1234) copied to clipboard", as gh 2.104.0 did on the owner's Mac.
+const CODE_RE = /one-time code(?::\s*|\s*\(\s*)([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Za-z0-9-])/i;
 const TAG_RE = /^https:\/\/github\.com\/cli\/cli\/releases\/tag\/v(\d{1,4}\.\d{1,4}\.\d{1,6})$/;
 /** How each of gh's commands is timed. */
 const QUICK_MS = 10_000;

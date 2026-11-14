@@ -3676,6 +3676,8 @@ export class Engine extends EventEmitter {
     const c = this.confirms.get(String(confirmId ?? ''));
     if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) {
       if (c) this.confirms.delete(c.id);
+      // a yes that did nothing is in the log, so "I pressed Do it and nothing happened" can be answered from it
+      if (go) this.log.warn('A yes came for a question that was no longer waiting, so nothing was done.');
       return { reply: GONE };
     }
     this.confirms.delete(c.id);
@@ -3729,6 +3731,8 @@ export class Engine extends EventEmitter {
     const parts = [];
     if (started.length) parts.push(`Started ${joinAnd(started.map(v => v.name))}.`);
     parts.push(...problems);
+    // the page shows the reply for a while only: a launch that started nothing, or not all, is in the log too
+    if (problems.length) this.log.warn(`After a yes to a launch question, ${started.length} of ${c.tasks.length} started. ${problems.join(' ')}`);
     return { reply: parts.join(' '), agentIds: started.map(v => v.id), ...(openConnect ? { openConnect: true } : {}) };
   }
 

@@ -217,7 +217,7 @@ export async function available({ timeoutMs = 5000 } = {}) {
     runQuick(bin, ['login', 'status'], env, timeoutMs),
   ]);
   if (ver.error) return { ok: false, loggedIn: null, reason: spawnReason(ver.error) };
-  if (ver.timedOut) return { ok: false, loggedIn: null, reason: 'Codex did not answer when asked for its version.' };
+  if (ver.timedOut) return { ok: false, loggedIn: null, timedOut: true, reason: 'Codex did not answer when asked for its version.' };
   if (ver.code !== 0) return { ok: false, loggedIn: null, reason: 'Codex is installed but did not start properly.' };
   const text = `${ver.stdout}\n${ver.stderr}`.trim();
   const version = (/\d+\.\d+\.\d+[\w.+-]*/.exec(text) || [text.split('\n')[0]])[0] || undefined;
