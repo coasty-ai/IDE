@@ -19,6 +19,8 @@
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 //   GET  /ctl/reads                the git screen's reads: every GET of /api/git and /api/agents/:id/changes (D1)
 // The git screen's routes (D1): GET /api/git (any scenario) and GET /api/agents/:id/changes; answer "refuse" refuses them.
+// The spending limit: POST /api/agents/:id/raise-limit, answered as the engine does in short (see the 'limit' scenario);
+// answer "refuse" refuses it.
 // Agents & keys: the connect panel's routes, /api/connect*, in the 'connect-*' scenarios (see connectFacts below); mode
 // gains connect: { terminal, github, githubAgents, fail, gh, browser } and delay.connect.
 import http from 'node:http';
@@ -63,7 +65,7 @@ function view(o, now) {
     id: o.id, parentId: o.parentId || null, rootId: o.rootId || o.parentId || o.id, depth: o.parentId ? 1 : 0,
     name: o.name, task: o.task || o.name, harness: o.harness || 'claude', kind: o.parentId ? 'helper' : 'agent',
     helperType: o.helperType || null, model: o.model || (o.parentId ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-5'),
-    machineId: o.machineId || 'laptop', state: o.state || 'working', stateReason: null,
+    machineId: o.machineId || 'laptop', state: o.state || 'working', stateReason: o.stateReason || null, atLimit: !!o.atLimit,
     stateSince: now - (o.sinceMin ?? 2) * MIN, now: o.now || 'Reading checkout.ts', thinking: !!o.thinking,
     startedAt: started, endedAt: o.endedMin != null ? now - o.endedMin * MIN : null, lastEventAt: now - 5000,
     turns: o.turns ?? 1, toolCalls: o.toolCalls ?? o.calls ?? 12, toolKinds: o.toolKinds || {},
@@ -120,6 +122,7 @@ export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy'
 export function scenario(name, now = Date.now()) {
   let raw = [];
   if (MERGE_SCENARIOS.includes(name)) return mergeWorld(name, now);
+  if (name === 'limit') return limitWorld(now);
   if (CONNECT_SCENARIOS.includes(name)) return connectWorld(name, now);
   if (name === 'demo' || name === 'helper' || name === 'longq' || name === 'busy' || name === 'idle') {
     raw = demo();
@@ -551,6 +554,26 @@ function mergeWorld(name, now) {
   st.repo = repo;
   const n = st.agents.filter(a => !a.parentId && !a.earlier && ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(a.state)).length;
   st.machines = [{ ...LAPTOP, agents: n, note: n ? `${n} agent${n === 1 ? '' : 's'}` : 'idle' }];
+  return st;
+}
+
+// ---------------------------------------------------------------- the spending limit (POST /api/agents/:id/raise-limit)
+//   limit   live, on main: Checkout fix, a Claude Code agent stopped at its spending limit with its work not merged yet,
+//           comes first ("Give it $2.00 more" and Dismiss); Parser tests, a Codex agent that failed for another reason,
+//           keeps "Try again"; Docs site is still working
+SCENARIOS.push('limit');
+function limitWorld(now) {
+  const work = (slug, id) => ({ branch: `workbench/${slug}-${id}`, from: 'main', folder: true, merged: null, problem: null, thrownAway: null });
+  const st = world([
+    { id: 'l1', name: 'Checkout fix', state: 'failed', atLimit: true, stateReason: 'It reached its spending limit.', endedMin: 1, sinceMin: 1, model: 'claude-opus-5-5',
+      usage: { inputTokens: 38000, outputTokens: 21000, cacheReadTokens: 2900000, cacheWriteTokens: 160000, costUsd: 2.04, unreportedUsd: 0, contextTokens: 98000, contextWindow: 200000, contextPct: 0.49 },
+      work: work('checkout-fix', 'l1') },
+    { id: 'l2', name: 'Parser tests', harness: 'codex', model: 'gpt-5-codex', state: 'failed', endedMin: 6, sinceMin: 6, error: 'Codex stopped: the tests ran out of memory.', work: work('parser-tests', 'l2') },
+    { id: 'l3', name: 'Docs site', state: 'working', now: 'Editing the getting started page', work: work('docs-site', 'l3') },
+  ], now);
+  st.mode = 'live';
+  st.repo = { name: 'storefront', head: 'abc1234', branch: 'main', dirty: 0, identity: true };
+  st.machines = [{ ...LAPTOP, agents: 1, note: '1 agent' }];
   return st;
 }
 
@@ -1182,11 +1205,21 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         if (mode.answer === 'refuse') return reply({ ok: false, reply: p === '/api/git' ? 'Workbench could not read the history of your repository.' : 'Workbench could not read that agent’s changes.' });
         return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1])));
       }
-      const m = /^\/api\/agents\/([^/]+)\/(answer|say|stop)$/.exec(p);
+      const m = /^\/api\/agents\/([^/]+)\/(answer|say|stop|raise-limit)$/.exec(p);
       if (m) {
         const a = state.agents.find(x => x.id === decodeURIComponent(m[1]));
         if (!a) return reply({ ok: false, reply: 'There is no such agent.' });
         if (mode.answer === 'refuse') return reply({ ok: false, reply: `I could not reach ${a.name}.` });
+        if (m[2] === 'raise-limit') {
+          // as the engine checks it: the state the button was drawn for, then a live Claude Code root at its limit
+          if (json && json.state && json.state !== a.state) return reply({ ok: false, reply: 'That changed. Have another look.' });
+          if (state.mode !== 'live') return reply({ ok: false, reply: 'This is the demo, so nothing is really spent.' });
+          if (a.parentId || a.earlier || a.harness !== 'claude' || a.state !== 'failed' || !a.atLimit) return reply({ ok: false, reply: `${a.name} has not reached its spending limit.` });
+          const limit = (a.budgetUsd || state.defaultBudgetUsd) + state.defaultBudgetUsd;
+          Object.assign(a, { state: 'working', stateReason: null, atLimit: false, endedAt: null, stateSince: Date.now(), now: 'Picking up where it left off', budgetUsd: limit });
+          setTimeout(() => changed([a]), 60);
+          return reply({ ok: true, reply: `${a.name} can spend $${limit.toFixed(2)} in all now, and it is continuing.` });
+        }
         if (m[2] === 'answer') {
           if (!a.ask && json && !json.askId && ['done_checked', 'done_claimed', 'checks_failed'].includes(a.state)) return reply({ ok: true, reply: `Good. ${a.name} stays as it is.` });
           if (!a.ask || !json || json.askId !== a.ask.id) return reply({ ok: false, reply: json && !json.askId && a.ask ? `Have a look at what ${a.name} is asking first.` : `${a.name} is not waiting for that any more.` });

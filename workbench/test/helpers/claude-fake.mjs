@@ -41,6 +41,10 @@
 //   .claude/settings.json, then the `env` of --settings (which wins).
 // - It exits 0 when stdin closes, unless FAKE_CLAUDE_STUBBORN is set: then it ignores SIGTERM and stdin
 //   closing, and only SIGKILL ends it (its grandchildren ignore SIGTERM too).
+// - FAKE_CLAUDE_SPEND=<usd> makes the first reply of a new session (not a resumed one) cost that much, and holds each
+//   process to its --max-budget-usd as Claude Code does: the reply that brings its spend to the limit ends with an
+//   error_max_budget_usd result, and so does every message after it, at once and spending nothing, while the process
+//   stays alive. A resumed process counts its spend from zero.
 // - FAKE_CLAUDE_CHUNKY=1 writes its output in small pieces, cutting lines and characters apart.
 // - FAKE_CLAUDE_PIDFILE=<file> writes its process id there (and the id of each hook it runs to <file>.hook).
 // - FAKE_CLAUDE_ENVDIR=<dir> writes { url, token } from its WORKBENCH_HOOK_* variables to <dir>/<WORKBENCH_AGENT_ID>.json.
@@ -232,22 +236,29 @@ function main() {
 
   let n = 0;
   let cost = 0;
+  // FAKE_CLAUDE_SPEND: the process keeps to its own --max-budget-usd, as Claude Code does.
+  const limited = !!env.FAKE_CLAUDE_SPEND;
+  const limit = Number(value('--max-budget-usd'));
   function reply(text) {
     n++;
-    cost += 0.01;
+    const spentOut = limited && cost >= limit; // its limit is used up: refused at once, spending nothing
+    if (!spentOut) cost += limited && n === 1 && !resume ? Number(env.FAKE_CLAUDE_SPEND) : 0.01;
     out({
       type: 'system', subtype: 'init', session_id: session, model: 'claude-fake-1', cwd: process.cwd(), claude_code_version: VERSION,
       permissionMode: env.FAKE_CLAUDE_PERMISSION_MODE || value('--permission-mode'), tools: ['Task', 'Bash', 'Edit', 'Read', 'Write'],
     });
-    out({
-      type: 'assistant', parent_tool_use_id: null, session_id: session,
-      message: { id: `msg_fake_${n}`, model: 'claude-fake-1', role: 'assistant', content: [{ type: 'text', text }], usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
-    });
-    out({
-      type: 'result', subtype: 'success', is_error: false, result: text, session_id: session,
-      total_cost_usd: Math.round(cost * 100) / 100,
+    if (!spentOut) {
+      out({
+        type: 'assistant', parent_tool_use_id: null, session_id: session,
+        message: { id: `msg_fake_${n}`, model: 'claude-fake-1', role: 'assistant', content: [{ type: 'text', text }], usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+      });
+    }
+    const totals = {
+      session_id: session, total_cost_usd: Math.round(cost * 100) / 100,
       modelUsage: { 'claude-fake-1': { inputTokens: 5 * n, outputTokens: 2 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, contextWindow: 200000 } },
-    });
+    };
+    if (limited && cost >= limit) out({ type: 'result', subtype: 'error_max_budget_usd', is_error: true, ...totals });
+    else out({ type: 'result', subtype: 'success', is_error: false, result: text, ...totals });
   }
 
   function replay(file) {

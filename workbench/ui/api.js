@@ -63,6 +63,8 @@ export const api = {
   answer: (agentId, askId, answer) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/answer`, askId ? { askId, answer } : { answer }),
   say: (agentId, text) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/say`, { text }),
   stop: (agentId) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/stop`, {}),
+  /** One more spending limit for this run, for an agent at its own; `state` is the state the button was drawn in. */
+  raiseLimit: (agentId, { state = null } = {}) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/raise-limit`, { state: state || null }),
   awake: (machineId, awake) => call('POST', `/api/machines/${encodeURIComponent(machineId)}/awake`, { awake }),
   /**
    * Merge or throw away an agent's work. Neither acts by itself: the engine answers with a card ({ reply, confirm }) the

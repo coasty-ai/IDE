@@ -242,6 +242,52 @@ test('failed and stopped agents with a folder: today\'s answers, plus quiet "Rev
   }
 });
 
+test('a Claude Code agent stopped at its spending limit: "Give it $2.00 more" in place of "Try again", beside Dismiss', { skip }, async () => {
+  const { lidView, S } = await load();
+  live(S);
+  const limited = (o = {}) => finished({ state: 'failed', atLimit: true, stateReason: 'It reached its spending limit.', files: null, says: null, ...o });
+  for (const detail of ['calm', 'more']) for (let fit = 0; fit <= 6; fit++) {
+    const v = show(lidView, S, limited(), { detail, fit });
+    const tag = `${detail} fit ${fit}`;
+    assert.match(v.html, /<h1[^>]*>Invoice export stopped with an error\.<\/h1>/, tag);
+    assert.match(v.html, /<p class="meta">It reached its spending limit\.<\/p>/, tag);
+    const more = labelled(v.html, 'Give it $2.00 more');
+    assert.ok(more, tag);
+    assert.deepEqual([more.cls, more.act, more.agent, more.state], ['big pri', 'raise', 'W1', 'failed'], `${tag}: the primary answer, bound to the agent and the state it was drawn for`);
+    const dismiss = labelled(v.html, 'Dismiss');
+    assert.deepEqual([dismiss.cls, dismiss.act, dismiss.agent, dismiss.state], ['big', 'reviewed', 'W1', 'failed'], tag);
+    assert.equal(labelled(v.html, 'Try again'), undefined, `${tag}: "Try again" would find no limit left`);
+    assert.equal(allButtons(v.html).filter(b => b.cls.startsWith('big')).length, 2, `${tag}: at most two answers`);
+    assert.equal(labelled(v.html, 'Review the changes').cls, 'quiet', `${tag}: its work can still be looked at`);
+  }
+  // The amount is the run's own limit (--budget), as the page writes money.
+  S.meta.defaultBudgetUsd = 5;
+  assert.ok(labelled(show(lidView, S, limited()).html, 'Give it $5.00 more'));
+  // Anywhere else, "Try again" as before: a failure for another reason, Codex, a limit the page was not told, the demo.
+  const tryAgain = (a, why) => {
+    const v = show(lidView, S, a);
+    assert.equal(labelled(v.html, 'Try again')?.act, 'fix', why);
+    assert.ok(!allButtons(v.html).some(b => b.act === 'raise'), why);
+  };
+  live(S);
+  tryAgain(limited({ atLimit: false, stateReason: 'Claude Code reported a problem: API Error: 529 Overloaded' }), 'another failure');
+  tryAgain(limited({ harness: 'codex' }), 'Codex');
+  S.meta.defaultBudgetUsd = null;
+  tryAgain(limited(), 'no limit known');
+  demo(S);
+  tryAgain(limited(), 'the demo');
+  live(S);
+  // A helper goes back to its agent; an agent from an earlier run keeps its own Continue, with a new limit for this run.
+  const helper = limited({ id: 'H1', parentId: 'W1', rootId: 'W1', work: null });
+  const hv = show(lidView, S, helper, {}, { agent: helper, picked: true, queued: 0 });
+  assert.deepEqual(allButtons(hv.html).filter(b => b.cls.startsWith('big')).map(b => b.label), ['Back']);
+  const earlier = limited({ earlier: true, canContinue: true });
+  const ev = show(lidView, S, earlier, {}, { agent: earlier, picked: true, queued: 0 });
+  assert.equal(labelled(ev.html, 'Continue').act, 'fix');
+  assert.match(ev.html, /It would get a new spending limit of \$2\.00 for this run\./);
+  assert.ok(!allButtons(ev.html).some(b => b.act === 'raise'));
+});
+
 test('merged, with nothing new: "<Name>’s work is in main.", See it in git and Ask for a change', { skip }, async () => {
   const { lidView, S } = await load();
   live(S);

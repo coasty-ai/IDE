@@ -406,8 +406,13 @@ export function lidView(f, o = {}) {
     case 'failed': {
       sentence = `${nm} stopped with an error.`;
       msg += metaP(esc(clipShown(prose(a.error || a.stateReason || 'The agent exited unexpectedly.'), fs.meta ? 120 : 70)));
+      // A Claude Code agent stopped by its spending limit: "Try again" would find none of it left, so it is given the run's
+      // limit once more (the engine checks again) and continues where it left off.
+      const budget = S.meta.defaultBudgetUsd;
+      const atLimit = a.atLimit === true && a.harness === 'claude' && S.meta.mode === 'live' && budget > 0;
       acts = a.parentId ? big('Back', { act: 'parent', ...id }, true)
-        : big('Try again', { act: 'fix', ...st, text: 'Please try again.' }, true) + big('Dismiss', { act: 'reviewed', ...st });
+        : (atLimit ? big(`Give it ${money(budget)} more`, { act: 'raise', ...st }, true) : big('Try again', { act: 'fix', ...st, text: 'Please try again.' }, true))
+          + big('Dismiss', { act: 'reviewed', ...st });
       if (reviewable) links.push(reviewLink());
       break;
     }

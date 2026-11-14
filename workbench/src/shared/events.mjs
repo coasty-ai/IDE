@@ -5,7 +5,7 @@
 /** Event kinds. Every event is { kind, agentId?, ts, ...fields }. */
 export const EV = Object.freeze({
   CREATED: 'agent.created',       // { agentId, parentId|null, name, fullName?, task, harness, kind, helperType?, model?, machineId, budgetUsd?, workspace? }
-  STATE: 'agent.state',           // { agentId, state, reason? }
+  STATE: 'agent.state',           // { agentId, state, reason?, atLimit? }  atLimit: a Claude Code root failed at its spending limit
   ACTIVITY: 'agent.activity',     // { agentId, sentence, toolKind, toolUseId?, phase: 'start'|'end', ok? }
   THINKING: 'agent.thinking',     // { agentId, on: boolean }
   USAGE: 'agent.usage',           // { agentId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd?, unreportedUsd?, contextTokens?, contextWindow?, mode: 'set'|'add' }
@@ -22,7 +22,8 @@ export const EV = Object.freeze({
   SESSION: 'agent.session',       // { agentId, sessionId, version? }  harness session or thread id, for resume; version: the harness's own
                                   //   version when it says (Claude Code's claude_code_version from system/init)
   APPROVAL: 'agent.approval',     // { agentId, how: 'auto'|'person'|'timeout', decision: 'allow'|'deny', sentence }
-  RESUMED: 'agent.resumed',       // { agentId }  an earlier agent (from history) is being picked up: it is no longer "earlier"
+  RESUMED: 'agent.resumed',       // { agentId, budgetUsd? }  an earlier agent (from history) is being picked up: it is no longer
+                                  //   "earlier"; or a root at its spending limit was given more (budgetUsd: what it may spend in all)
   WORK: 'agent.work',             // { agentId, work }  what became of a root's work in git (AgentView.work); replaces work as a whole
   ENDED: 'agent.ended',           // { agentId, outcome: 'ok'|'error'|'stopped', error? }
   MACHINE: 'machine.update',      // { machine: Machine }
@@ -49,6 +50,8 @@ export const SPARK_BUCKETS = 20;
  * @property {string} machineId
  * @property {string} state             one of STATE in states.mjs
  * @property {string|null} stateReason
+ * @property {boolean} atLimit          a Claude Code root that failed because it reached its spending limit; it stays so
+ *           while it is failed (its process may exit with an error after that), and any other state ends it
  * @property {number} stateSince        ms epoch
  * @property {string} now               what it is doing right now, a few words
  * @property {boolean} thinking
@@ -132,6 +135,7 @@ export function newAgentView(ev, now = Date.now()) {
     machineId: ev.machineId || 'laptop',
     state: 'starting',
     stateReason: null,
+    atLimit: false,
     stateSince: now,
     now: 'Starting',
     thinking: false,

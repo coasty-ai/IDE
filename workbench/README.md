@@ -28,7 +28,7 @@ Options for real agents:
 | `--repo <path>` | the git repository agents work on (this, or `--clone`, is required) |
 | `--clone <address>` | copy this repository first, like `https://github.com/owner/repo` or `git@github.com:owner/repo.git`, then work on the copy |
 | `--into <folder>` | where `--clone` puts the copy (default: the current folder) |
-| `--budget 2` | the most each agent may spend, in US dollars (default 2) |
+| `--budget 2` | each agent's spending limit for a run, in US dollars (default 2). An agent that reaches it can be given as much again (see "The spending limit" below) |
 | `--model <name>` | the Claude model to use, for example `sonnet` or `haiku`. Codex agents keep Codex's own model |
 | `--claude <path>` | the Claude Code program to run. Without it: `WORKBENCH_CLAUDE_BIN`, then `claude` on the PATH, then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor |
 | `--port 4317` | where the page is served (`0` picks a free port) |
@@ -84,7 +84,7 @@ Each state has its own mark and its own words, so nothing depends on colour:
 | cross | failed |
 | ring | stopped |
 
-Screenshots of each look and view are in `docs/screens/`: the board (`board-*.png`, with the git chip) and the git screen (`git-*.png`). `node scripts/ui-shots.mjs <folder>` takes them again, along with the lid's merge views (`merge-*.png`), which are not kept in the repository so that every agent's copy of it stays smaller; the `live-*.png` shots come from an earlier real run.
+Screenshots of each look and view are in `docs/screens/`: the board (`board-*.png`, with the git chip) and the git screen (`git-*.png`). `node scripts/ui-shots.mjs <folder>` takes them again, along with the lid's merge views (`merge-*.png`) and an agent at its spending limit (`limit-*.png`), which are not kept in the repository so that every agent's copy of it stays smaller; the `live-*.png` shots come from an earlier real run.
 
 ## Agents & keys
 
@@ -144,6 +144,7 @@ An agent connected while Workbench runs can take work at once, and agents from a
 - **When an agent finishes.** A closing "Let me know if you need anything else." is not a question: its work is checked and it is done. A real question at the end ("Should I remove the old route?") waits for your answer; "What changed?" already shows its changes, and its checks run only once it is done.
 - **Commands left running.** An agent may leave a command running when it finishes, such as a development server. Its card says "Waiting for a background command". After four quiet minutes you are asked once whether it is done: "It is done" checks its work (the command keeps running until you stop the agent or close the workbench), "Keep waiting" waits on.
 - **Might be stuck.** An agent that tries the same step three times without success, hits the same error three times close together, or goes quiet for four minutes is marked "might be stuck". The mark goes away as soon as a step works again.
+- **The spending limit.** Each agent may spend up to `--budget` in a run ($2 unless you set it; the Mac app always uses $2). Claude Code stops an agent that reaches it, and the middle says "Checkout fix stopped with an error." and "It reached its spending limit.", with **Give it $2.00 more** in place of **Try again**, beside **Dismiss**. Press it and the agent may spend that much more in this run, and it continues where it left off: "Checkout fix can spend $4.00 in all now, and it is continuing." Nothing more is spent unless you press it, and you can press it again each time the agent reaches its new limit. Codex reports no cost, so it has no limit to raise. An agent from an earlier run gets a fresh limit when you continue it (see "Earlier agents").
 - **Codex agents are real** when Codex is installed and signed in, with your ChatGPT account or an API key. They run in Codex's own sandbox, so they never ask for permission. Codex does not report cost, so it shows as "not reported".
   - **Codex can do git too.** Workbench turns on the network in Codex's sandbox and lets it write the repository's git folders, so a Codex agent can commit, fetch, pull and push. That means Codex can reach the network for anything, not only git: it can download, upload and reach any address. It can also change the repository's git settings and hooks, which git runs as you, outside the sandbox, when it works in your folder. Writable folders you set in your own Codex config do not apply to Workbench's Codex agents.
 - **Your laptop's** CPU and memory are real.
@@ -266,7 +267,7 @@ Or open this folder in the Mac app (see "The Mac app"), which needs no Node on y
 
 - The page and its programming interface listen on `127.0.0.1` only. Every request needs the run's key, and requests from other websites are refused. A link with anything after the address except this run's key (an old link, say) opens the plain page instead; a tab without the key then asks you to open the link printed in the terminal.
 - Each agent gets its own key for asking permission, so one agent's key cannot ask in another agent's name, and it never opens the page's interface.
-- Every agent has a spending limit (`--budget`).
+- Every agent has a spending limit (`--budget`). Only you can raise it, one limit at a time, with the button the middle shows when an agent reaches its own.
 - Agents can read the keys you give them, and so can anything they run: give them keys that can do only what their work needs. Workbench keeps keys out of its page, its logs, its history and the agents you did not give them to; it cannot keep an agent from its own keys. The page shows a key only as "•••• " and its last four characters, never keeps one, and never sends text that looks like a key from the board's input.
 - A key's value never goes into a command line, which other programs on the computer can read. The Mac app gives Workbench a GitHub token on its standard input, never as an argument.
 - Merge and Throw it away always ask first, and check everything again when you answer. A merge goes ahead only if the agent's work and your branch are as its card showed them; otherwise it says so and changes nothing.

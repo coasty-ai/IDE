@@ -83,6 +83,27 @@ test('agent.state sets state, reason, since; ENDED sets endedAt; parent helpers 
   assert.deepEqual(s.get('r1').helpers, { total: 2, working: 0, done: 2 });
 });
 
+test('agent.state: a root that failed at its spending limit stays at it while it is failed; any other state ends that', () => {
+  const { s } = recording();
+  s.apply([created('r1'), state('r1', 'working')]);
+  assert.equal(s.get('r1').atLimit, false, 'a new view is not at its limit');
+  s.apply(state('r1', 'failed', T0 + 2000, { reason: 'It reached its spending limit.', atLimit: true }));
+  assert.equal(s.get('r1').atLimit, true);
+  // Its process may exit with an error after the turn that reached the limit: still failed, still at its limit.
+  s.apply(state('r1', 'failed', T0 + 3000, { reason: 'Claude Code stopped with an error (exit code 1).' }));
+  assert.deepEqual([s.get('r1').stateReason, s.get('r1').atLimit], ['Claude Code stopped with an error (exit code 1).', true]);
+  // A turn that starts, or any other state, ends it; a failure for another reason is not at the limit.
+  s.apply({ kind: EV.TURN, ts: T0 + 4000, agentId: 'r1', phase: 'start' });
+  assert.deepEqual([s.get('r1').state, s.get('r1').atLimit], ['working', false]);
+  s.apply(state('r1', 'failed', T0 + 5000, { reason: 'Claude Code reported a problem: API Error: 529 Overloaded' }));
+  assert.equal(s.get('r1').atLimit, false);
+  s.apply([state('r1', 'working', T0 + 6000), state('r1', 'failed', T0 + 7000, { atLimit: true }), state('r1', 'stopped', T0 + 8000)]);
+  assert.equal(s.get('r1').atLimit, false);
+  // agent.resumed carries what a root of this run may spend in all, once it was given more
+  s.apply({ kind: EV.RESUMED, ts: T0 + 9000, agentId: 'r1', budgetUsd: 4 });
+  assert.deepEqual([s.get('r1').budgetUsd, s.get('r1').earlier, s.get('r1').now], [4, false, 'Picking up where it left off']);
+});
+
 test('unknown states and events for unknown agents are ignored', () => {
   const { s, emitted } = recording();
   s.apply(created('r1'));

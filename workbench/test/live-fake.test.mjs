@@ -563,6 +563,31 @@ test('history: an earlier agent whose folder was removed is shown, and refuses t
   await w2.stop();
 });
 
+test('the spending limit, live: an agent at its limit is given one more for this run, and continues where it left off', async (t) => {
+  // The stand-in keeps to its own limit, as Claude Code does: its first reply costs $0.60 of the run's $0.50, and that
+  // process refuses every message after it, at once.
+  const w = await setup(t, { FAKE_CLAUDE_FIXTURE: '', FAKE_CLAUDE_SPEND: '0.6' });
+  const asked = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
+  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  const id = go.body.agentIds[0];
+  const first = await until('the agent to reach its limit', async () => (await w.agents()).find((a) => a.id === id && a.state === 'failed'));
+  assert.deepEqual([first.stateReason, first.atLimit, first.budgetUsd, first.usage.costUsd], ['It reached its spending limit.', true, 0.5, 0.6]);
+  // The dead end this replaces: "Try again" reaches the same process, which refuses it at once.
+  assert.equal((await w.post(`/api/agents/${id}/say`, { text: 'Please try again.' })).body.ok, true);
+  const second = await until('the refusal', async () => (await w.agents()).find((a) => a.id === id && a.state === 'failed' && a.turns > first.turns));
+  assert.deepEqual([second.atLimit, second.budgetUsd], [true, 0.5]);
+  // One more limit: that process is closed, and a new one resumes the session with what is left of $1.00.
+  const more = await w.post(`/api/agents/${id}/raise-limit`, { state: 'failed' });
+  assert.equal(more.status, 200);
+  assert.deepEqual(more.body, { ok: true, reply: `${first.name} can spend $1.00 in all now, and it is continuing.` });
+  const done = await until('the agent to finish', async () => (await w.agents()).find((a) => a.id === id && a.state === 'done_claimed'));
+  assert.equal(done.says, `You said (resumed ${first.sessionId} with budget 0.4): Please continue where you left off.`);
+  assert.deepEqual([done.budgetUsd, done.atLimit], [1, false]);
+  // The button drawn while it was at its limit is stale now.
+  assert.deepEqual((await w.post(`/api/agents/${id}/raise-limit`, { state: 'failed' })).body, { ok: false, reply: 'That changed. Have another look.' });
+  await stopEngine(w);
+});
+
 // ---- Source control, live: merge an agent's work into the person's branch, and throw an agent's work away ----
 
 /** A person's git identity for the engine (it never uses git's guessed one): a global config file of its own. */

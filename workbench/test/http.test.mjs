@@ -41,6 +41,7 @@ class FakeEngine {
   async answer(id, o) { this.calls.push(['answer', id, o]); return { ok: true, reply: 'Answered.' }; }
   async say(id, text) { this.calls.push(['say', id, text]); return { ok: true, reply: 'Sent.' }; }
   async stop(id) { this.calls.push(['stop', id]); return { ok: true, reply: 'Stopped.' }; }
+  async raiseLimit(id, o) { this.calls.push(['raiseLimit', id, o]); return { ok: true, reply: 'Fix login can spend $4.00 in all now, and it is continuing.' }; }
   async setMachineAwake(id, awake) { this.calls.push(['awake', id, awake]); return { ok: true, reply: 'Done.' }; }
   async gitGraph() {
     this.calls.push(['gitGraph']);
@@ -351,6 +352,10 @@ test('API routes call the engine with the right arguments', async () => {
   await post('/api/agents/abc123/discard', { state: 'needs_ok' });
   await post('/api/agents/abc123/discard', { state: ['done_claimed'] });
   await post('/api/agents/abc123/discard', { state: 'toString' });
+  // One more spending limit for this run, with the state the button was drawn for.
+  assert.equal((await post('/api/agents/abc123/raise-limit', { state: 'failed' })).json.reply, 'Fix login can spend $4.00 in all now, and it is continuing.');
+  await post('/api/agents/abc123/raise-limit', { state: 'at-limit' });
+  await post('/api/agents/abc123/raise-limit', {});
   assert.deepEqual(engine.calls, [
     ['command', 'what needs me', { focusId: 'abc123', confirmId: null, askId: null }],
     ['command', 'yes', { focusId: 'abc123', confirmId: '0a1b2c3d4e5f', askId: 'ok-1a2b3c4d' }],
@@ -372,7 +377,29 @@ test('API routes call the engine with the right arguments', async () => {
     ['proposeDiscard', 'abc123', { state: 'needs_ok' }],
     ['proposeDiscard', 'abc123', { state: null }],
     ['proposeDiscard', 'abc123', { state: null }],
+    ['raiseLimit', 'abc123', { state: 'failed' }],
+    ['raiseLimit', 'abc123', { state: null }],
+    ['raiseLimit', 'abc123', { state: null }],
   ]);
+});
+
+test('the route that raises a spending limit: the page’s token, POST only, from this page, for an agent’s id', async () => {
+  engine.calls.length = 0;
+  const p = '/api/agents/abc123/raise-limit';
+  assert.equal((await request({ method: 'POST', path: p, body: { state: 'failed' }, headers: { 'Content-Type': 'application/json' } })).status, 401);
+  assert.equal((await request({ method: 'POST', path: `${p}?t=${TOKEN}`, body: { state: 'failed' }, headers: { 'Content-Type': 'application/json' } })).status, 401, 'the query token is for GET routes only');
+  assert.equal((await post(p, { state: 'failed' }, { 'X-Workbench-Token': hookTokenFor('abc123') })).status, 401, 'an agent’s own hook token opens nothing here');
+  const get = await request({ path: p, headers: auth() });
+  assert.equal(get.status, 405);
+  assert.equal(get.headers.allow, 'POST');
+  assert.equal((await post(p, { state: 'failed' }, { Origin: 'http://evil.example' })).status, 403);
+  assert.equal((await post('/api/agents/a%2Fb/raise-limit', { state: 'failed' })).status, 404);
+  assert.equal((await post('/api/agents/a:b/raise-limit', { state: 'failed' })).status, 404);
+  assert.deepEqual(engine.calls, [], 'none of these reached the engine');
+  const ok = await post(p, { state: 'failed' });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.json, { ok: true, reply: 'Fix login can spend $4.00 in all now, and it is continuing.' });
+  assert.deepEqual(engine.calls, [['raiseLimit', 'abc123', { state: 'failed' }]]);
 });
 
 test('the git screen, changes, merge and throw-away routes: the token, the methods, a hook token refused, and a card answered by its id', async () => {

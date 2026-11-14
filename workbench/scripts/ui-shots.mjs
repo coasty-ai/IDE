@@ -32,6 +32,9 @@ const SHOTS = [
   { name: 'merge-failed-check', scenario: 'merge-more', query: '&focus=n1', theme: 'black-gold' },
   { name: 'merge-long-branch', scenario: 'merge-more', query: '&focus=n2', theme: 'ivory', detail: 'more' },
   { name: 'merge-not-on-a-branch', scenario: 'merge-detached' },
+  // a Claude Code agent stopped at its spending limit: one more limit for this run, in place of "Try again"
+  { name: 'limit-lid', scenario: 'limit' },
+  { name: 'limit-lid-black-gold', scenario: 'limit', theme: 'black-gold', detail: 'more' },
   // D1: the git screen, reached by clicking the DRAM (`click`: selectors clicked in turn after the page loads)
   { name: 'git-screen', scenario: 'git', click: ['#dram'] },
   { name: 'git-detail', scenario: 'git', click: ['#dram', '#gitGraph .gr[data-id="work:g1"]'] },

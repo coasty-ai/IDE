@@ -459,7 +459,7 @@ function renderCard(quiet = false) {
 
 // ---------------------------------------------------------------- answering what the core shows
 const changed = () => { say('That changed. Have another look.', 5000); render(); };
-const GUARDED = new Set(['answer', 'looksgood', 'fix', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick', 'forget', 'merge', 'discard', 'review']);
+const GUARDED = new Set(['answer', 'looksgood', 'fix', 'raise', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick', 'forget', 'merge', 'discard', 'review']);
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 /**
  * The engine says where to look next (the asker after a refused answer, a stopped agent, a new one): follow it. An agent
@@ -572,6 +572,12 @@ async function actOn(b) {
       if (S.focusId === a.id) S.focusId = null;
       // "Continue" or "Try again" with no agent ready to run it
       if (r.openConnect === true) showConnect(null, r.reply);
+    } else if (act === 'raise') {
+      // "Give it $2.00 more": one more spending limit for this run, and it continues; the engine checks it all again
+      busy(b);
+      const r = await api.raiseLimit(a.id, { state: b.dataset.state });
+      say(r.reply || '');
+      if (S.focusId === a.id) S.focusId = null;
     } else if (act === 'forget') {
       // an agent from an earlier run: the engine asks first, with a card like a launch's
       busy(b);

@@ -2,8 +2,9 @@
 // drawn, the half-second guard after the core changes, holding the core while the person is busy with it, focus never
 // landing on an answer, failed answers that can be retried, "Look later", stepping with "next", typed words bound to the
 // ask on screen, launch questions answered by id and withdrawn when dropped, the look and detail words, the stale key,
-// rest (no motion while waiting), reduced motion, space to talk, the keyboard rules, merging, the git screen, and Agents &
-// keys. Prints PASS or FAIL per point, then every request the page sent, with its body (a key's values shown as "••••").
+// rest (no motion while waiting), reduced motion, space to talk, the keyboard rules, merging, the spending limit, the git
+// screen, and Agents & keys. Prints PASS or FAIL per point, then every request the page sent, with its body (a key's
+// values shown as "••••").
 // Not part of npm test (it needs Chrome). No dependencies.
 //   node scripts/ui-behaviour-check.mjs [--only name] [--log]
 import { startMock } from './ui-mock.mjs';
@@ -918,6 +919,54 @@ try {
     await sleep(900);
     const lit = await b.ev(`[...document.querySelectorAll('#gitScreen button')].filter(x => x.offsetParent !== null).map(x => x.textContent).find(t => /needs you/.test(t)) || ''`);
     check('while the git screen shows, something new needing you lights the top band’s button', /Release prep needs you/.test(lit), `"${lit}"`);
+  });
+
+  // ---------------------------------------------------------------- the spending limit (the 'limit' scenario)
+  // Checkout fix (l1), a Claude Code agent, stopped at its spending limit: the lid offers one more limit in place of "Try
+  // again". Every name starts "Spending limit: ", so --only 'Spending limit' runs just these.
+  const raisePosts = async () => (await posts()).filter(x => /\/raise-limit$/.test(x.path));
+  await run('Spending limit: "Give it $2.00 more" posts the agent and the state it was drawn for, and the agent works again', async () => {
+    await open('limit');
+    await sleep(900);
+    const before = await lidNow(), row = await acts(), quiet = await links();
+    await clickIn('[data-act="raise"]');
+    await sleep(900);
+    const p = await raisePosts(), a = await agentOf('l1'), words = await said();
+    check('Spending limit: "Give it $2.00 more" posts the agent and the state it was drawn for, and the agent works again',
+      /Checkout fix stopped with an error\./.test(before) && row === 'Give it $2.00 more*,Dismiss' && quiet === 'Review the changes'
+      && p.length === 1 && p[0].path === '/api/agents/l1/raise-limit' && p[0].body.state === 'failed'
+      && a.state === 'working' && a.budgetUsd === 4 && /Checkout fix can spend \$4\.00 in all now, and it is continuing\./.test(words),
+      `"${before}" [${row}] [${quiet}] → ${JSON.stringify(p.map(x => [x.path, x.body]))} → ${a.state} $${a.budgetUsd} "${words}"`);
+  });
+
+  await run('Spending limit: a button drawn before the agent changed says "That changed" and posts nothing', async () => {
+    await open('limit');
+    await sleep(900);
+    const a = await agentOf('l1');
+    await b.ev(`window.__frames.hold = true, 1`);
+    await push('agents', [{ ...a, state: 'working', atLimit: false, stateReason: null, endedAt: null, now: 'Working on your message' }]);
+    await sleep(500);   // the stream has brought it; the lid has not been drawn again
+    const drawn = await b.ev(`${page()}?.querySelector('[data-act="raise"]')?.dataset.state || ''`);
+    await clickIn('[data-act="raise"]');
+    await sleep(150);
+    const words = await said();
+    await b.ev(`window.__frames.release(), 1`);
+    await sleep(800);
+    const p = await raisePosts();
+    check('Spending limit: a button drawn before the agent changed says "That changed" and posts nothing', drawn === 'failed' && p.length === 0 && /That changed\. Have another look\./.test(words),
+      `drawn for ${drawn}, posts ${p.length}, said "${words}"`);
+  });
+
+  await run('Spending limit: a refused raise changes nothing, and its button can be tried again', async () => {
+    await open('limit', { mode: { answer: 'refuse' } });
+    await sleep(900);
+    await clickIn('[data-act="raise"]');
+    await sleep(900);
+    const shown = await lidNow(), words = await said(), a = await agentOf('l1');
+    const enabled = await b.ev(`!${page()}?.querySelector('[data-act="raise"]')?.disabled`);
+    check('Spending limit: a refused raise changes nothing, and its button can be tried again',
+      /Checkout fix stopped with an error\./.test(shown) && enabled && /I could not reach Checkout fix\./.test(words) && a.state === 'failed' && a.budgetUsd === 2,
+      `"${shown}" enabled ${enabled} "${words}" ${a.state} $${a.budgetUsd}`);
   });
 
   // ---------------------------------------------------------------- the git screen, held to the lid's rules

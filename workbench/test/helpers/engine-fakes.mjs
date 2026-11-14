@@ -17,10 +17,13 @@ export class FakeRunner {
     this.started = false;
     this.stopCalls = 0;
     this.alive = false;
+    this.limit = opts.budgetUsd ?? null; // its spending limit for this run, as Claude Code's runner keeps it
   }
   async start() { this.started = true; this.alive = true; }
   async send(text) { this.sent.push(text); this.alive = true; }
   async stop() { this.stopCalls += 1; this.alive = false; }
+  /** A raised limit, as Claude Code's runner takes it: its next relaunch gets it. */
+  setLimit(usd) { this.limit = usd; }
   info() { return { pid: null, sessionId: null, alive: this.alive }; }
   /** Emit an event as this runner's adapter would. */
   emit(ev) { this.opts.emit({ agentId: this.opts.agentId, ts: Date.now(), ...ev }); }

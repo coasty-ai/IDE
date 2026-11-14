@@ -65,6 +65,8 @@ const FINAL = new Set([STATE.FINISHED, STATE.FAILED, STATE.STOPPED]);
 const HISTORY_KINDS = new Set([EV.CREATED, EV.STATE, EV.SAYS, EV.FILES, EV.CHECKS, EV.RULES, EV.MODEL, EV.SESSION,
   EV.APPROVAL, EV.USAGE, EV.ENDED, EV.RESUMED, EV.WORK]);
 const CONTINUE_TEXT = 'Please continue where you left off.';
+// Why a turn failed when it reached the spending limit (Claude Code's error_max_budget_usd, in the parser's words too).
+const LIMIT_REASON = 'It reached its spending limit.';
 // From this version on, Claude Code restores a resumed session's totals itself (see _withEarlierSpend).
 const RESTORES_SPEND_FROM = Object.freeze([2, 1, 277]);
 // What a merged agent has left to merge: nothing.
@@ -410,7 +412,7 @@ function errorReason(e) {
   const sub = String(e.subtype || '');
   const text = String(e.finalText || '');
   if (e.reason) return clip(plain(e.reason), 160);
-  if (/budget/i.test(sub) || /budget/i.test(text)) return 'It reached its spending limit.';
+  if (/budget/i.test(sub) || /budget/i.test(text)) return LIMIT_REASON;
   if (/max_turns/i.test(sub)) return 'It reached the limit on how many steps it may take.';
   return firstSentence(text, 160) || 'It stopped because of an error.';
 }
@@ -963,7 +965,10 @@ export class Engine extends EventEmitter {
       return;
     }
     if (e.isError) {
-      this._apply([{ kind: EV.STATE, agentId, state: STATE.FAILED, reason: errorReason(e) }]);
+      const reason = errorReason(e);
+      // A Claude Code agent stopped by its spending limit can be given more for this run (raiseLimit).
+      const atLimit = reason === LIMIT_REASON && this.store.get(agentId)?.harness === 'claude';
+      this._apply([{ kind: EV.STATE, agentId, state: STATE.FAILED, reason, ...(atLimit ? { atLimit: true } : {}) }]);
       return;
     }
 
@@ -1970,6 +1975,54 @@ export class Engine extends EventEmitter {
     if (cur && ENDED.has(cur.state)) this._apply([{ kind: EV.STATE, agentId: root.id, state: STATE.WORKING, reason: null }]);
     this._clearProblem(root.id); // a merge that did not go through no longer describes work it changes again
     return { ok: true };
+  }
+
+  // ================================================================ the spending limit
+
+  /**
+   * One more spending limit for this run (POST /api/agents/:id/raise-limit, the lid's "Give it $2.00 more"): a Claude Code
+   * root that failed because it reached its limit may spend the run's default limit more, and continues where it left
+   * off. `state`: the state the page drew its button for (null: not checked).
+   * @returns {Promise<{ ok: boolean, reply: string }>}
+   */
+  async raiseLimit(agentId, { state = null } = {}) {
+    const out = await this._raiseLimit(this.store.get(String(agentId ?? '')), { state });
+    this._notice(out.reply, typeof agentId === 'string' ? agentId : null);
+    return out;
+  }
+
+  async _raiseLimit(v, { state = null } = {}) {
+    if (!v) return { ok: false, reply: 'I can’t find that agent.' };
+    if (this._shuttingDown) return { ok: false, reply: 'Workbench is shutting down.' };
+    if (this.mode === 'demo') return { ok: false, reply: 'This is the demo, so nothing is really spent.' };
+    if (v.parentId) return { ok: false, reply: 'Helpers share their agent’s spending limit. Give the agent more instead.' };
+    if (v.earlier) return { ok: false, reply: `${v.name} is from an earlier run. Continue gives it a new spending limit for this run.` };
+    if (v.harness !== 'claude') return { ok: false, reply: `${harnessName(v.harness)} reports no cost, so ${v.name} has no spending limit to raise.` };
+    if (this._busy.has(v.id)) return { ok: false, reply: this._busyReply(v) };
+    if (this._resuming.has(v.id)) return { ok: false, reply: `${v.name} is already being picked up.` };
+    if (state && state !== v.state) return { ok: false, reply: 'That changed. Have another look.' };
+    if (v.state !== STATE.FAILED || !v.atLimit) return { ok: false, reply: `${v.name} has not reached its spending limit.` };
+    const run = this.runs.get(v.id);
+    if (typeof run?.runner?.setLimit !== 'function') return { ok: false, reply: `Workbench cannot raise ${v.name}’s spending limit.` };
+    const was = Number.isFinite(v.budgetUsd) && v.budgetUsd > 0 ? v.budgetUsd : this.defaultBudgetUsd;
+    const limit = was + this.defaultBudgetUsd;
+    this._resuming.add(v.id); // being picked up: nothing may merge it, and a second press hears that this one is under way
+    try {
+      // A process still running keeps the limit it was started with, so the message must start a new one.
+      await this._closeIdle(v);
+      run.runner.setLimit(limit);
+      const sent = await this._sendTo(v, CONTINUE_TEXT);
+      if (!sent.ok) {
+        // Nothing started, so nothing changes: the runner gets its limit back. A turn that went past the limit by more
+        // than a whole limit more still leaves under a cent, and the runner says so in its own words.
+        try { run.runner.setLimit(was); } catch (err) { this.log.warn(`Could not put back the spending limit of ${v.id}:`, err); }
+        return sent;
+      }
+    } finally {
+      this._resuming.delete(v.id);
+    }
+    this._apply([{ kind: EV.RESUMED, agentId: v.id, budgetUsd: limit }]);
+    return { ok: true, reply: `${v.name} can spend ${money(limit)} in all now, and it is continuing.` };
   }
 
   // ================================================================ stopping

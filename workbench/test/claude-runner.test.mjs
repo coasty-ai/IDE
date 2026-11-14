@@ -793,6 +793,28 @@ test('a relaunch is refused in plain words when the stopped turn used up the lim
   assert.equal(r.info().alive, false, 'nothing was launched');
 });
 
+test('a raised limit is what the next relaunch gets, less what was spent; a running process keeps the limit it started with', async () => {
+  const c = collector();
+  const r = makeRunner(c, { budgetUsd: 0.03, env: { FAKE_CLAUDE_FIXTURE: 'claude-held-bash.jsonl', FAKE_CLAUDE_FIXTURE_LINES: '32' } });
+  await r.start();
+  await c.until(bothMessages, 'the turn’s two messages');
+  const { sessionId } = r.info();
+  await r.stop();
+  await assert.rejects(r.send('Please continue'), /has used its whole spending limit/);
+  for (const bad of [0, -1, NaN, '2', null]) assert.throws(() => r.setLimit(bad), /positive number of dollars/, String(bad));
+  r.setLimit(1.03);
+  await r.send('Please continue');
+  const hit = await c.until(replyIs(/^You said \(resumed /), 'the resumed reply');
+  // 1.03 - 0.0231 estimated for the stopped turn, as in the test above
+  assert.equal(hit.finalText, `You said (resumed ${sessionId} with budget 1.0069): Please continue`);
+  // While a process runs, a message goes to it as it is: it keeps the limit it was started with.
+  r.setLimit(5);
+  await r.send('And the docs');
+  await c.until(replyIs(/And the docs$/), 'the reply from the same process');
+  assert.equal(c.turnEnds().at(-1).finalText, `You said (resumed ${sessionId} with budget 1.0069): And the docs`);
+  await r.stop();
+});
+
 test('each Claude Code process gets the person’s keys, which never decide which Claude Code runs', async (t) => {
   const dir = scratch(t);
   const seen = path.join(dir, 'seen.txt');

@@ -432,6 +432,8 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/answer$/, run: (b, m) => engine.answer(id(m[1]), { askId: optId(b.askId), answer: b.answer }) },
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/say$/, run: (b, m) => engine.say(id(m[1]), str(b.text)) },
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/stop$/, run: (b, m) => engine.stop(id(m[1])) },
+    // One more spending limit for this run, for an agent that reached its own; `state`: what the button was drawn for.
+    { method: 'POST', re: /^\/api\/agents\/([^/]+)\/raise-limit$/, run: (b, m) => engine.raiseLimit(id(m[1]), { state: optState(b.state) }) },
     { method: 'POST', re: /^\/api\/machines\/([^/]+)\/awake$/, run: (b, m) => engine.setMachineAwake(id(m[1]), b.awake === true) },
     { method: 'POST', re: /^\/hook\/pretool$/, hook: true },
     // Agents & keys. Each answers { ok, sentence, status } with a fresh ConnectStatus (src/core/connect.mjs), or { error }

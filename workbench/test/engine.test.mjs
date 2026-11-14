@@ -2133,6 +2133,171 @@ test('spend: under a cent reads "under $0.01", never "<$0.01" or "about <$0.01"'
   await d.engine.shutdown();
 });
 
+// ------------------------------------------------------------------ the spending limit: one more for this run
+
+const LIMIT_REASON = 'It reached its spending limit.';
+const CONTINUE = 'Please continue where you left off.';
+/** A root whose turn ended at its spending limit, as Claude Code's parser says it (a reason, no subtype). */
+async function atLimit(t, opts = { task: 'Fix the cart total' }) {
+  const a = await started(t, opts);
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: '', backgroundTasks: 0, isError: true, reason: LIMIT_REASON });
+  await until(() => t.store.get(a.id).state === 'failed');
+  return a;
+}
+
+test('spending limit: a root at its limit is given one more, the default, for this run, and continues where it left off', async () => {
+  const t = live();
+  const a = await atLimit(t);
+  assert.deepEqual([t.store.get(a.id).stateReason, t.store.get(a.id).atLimit, t.store.get(a.id).budgetUsd], [LIMIT_REASON, true, 2]);
+  // What happened to the runner, in order: its process still waits for a message, and would keep the limit it was started
+  // with, so it is closed first; the message then starts a new one, which gets the raised limit.
+  const order = [];
+  const { stop, send } = a.runner;
+  a.runner.stop = async () => { order.push('stop'); return stop.call(a.runner); };
+  a.runner.send = async (text) => { order.push(['send', text, a.runner.limit]); return send.call(a.runner, text); };
+  const r = await t.engine.raiseLimit(a.id, { state: 'failed' });
+  assert.deepEqual(r, { ok: true, reply: 'Fix cart total can spend $4.00 in all now, and it is continuing.' });
+  assert.deepEqual(order, ['stop', ['send', CONTINUE, 4]]);
+  const v = t.store.get(a.id);
+  assert.deepEqual([v.state, v.budgetUsd, v.atLimit, v.now], ['working', 4, false, 'Picking up where it left off']);
+  assert.ok(t.notices.includes(r.reply), 'the reply is also a notice');
+  // It works on as any root does; at its new limit it can be given more again.
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: '', backgroundTasks: 0, isError: true, reason: LIMIT_REASON });
+  await until(() => t.store.get(a.id).state === 'failed');
+  assert.equal(t.store.get(a.id).atLimit, true);
+  assert.equal((await t.engine.raiseLimit(a.id, { state: 'failed' })).reply, 'Fix cart total can spend $6.00 in all now, and it is continuing.');
+  assert.equal(a.runner.limit, 6);
+  // A launch's own limit is where its raises start; each raise is the run's default limit (--budget).
+  const b = await atLimit(t, { task: 'Fix the tax rounding', budgetUsd: 0.5 });
+  assert.equal((await t.engine.raiseLimit(b.id, { state: 'failed' })).reply, 'Fix tax rounding can spend $2.50 in all now, and it is continuing.');
+  assert.deepEqual([b.runner.limit, t.store.get(b.id).budgetUsd], [2.5, 2.5]);
+  await t.engine.shutdown();
+});
+
+test('spending limit: the turn may also say so with Claude Code’s own subtype, and its process may then exit, cleanly or with an error', async () => {
+  for (const exit of ['ok', 'error']) {
+    const t = live();
+    const a = await started(t, { task: 'Fix the cart total' });
+    a.runner.emit({ kind: EV.TURN, phase: 'start' });
+    a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: '', backgroundTasks: 0, isError: true, subtype: 'error_max_budget_usd' });
+    await until(() => t.store.get(a.id).state === 'failed');
+    a.runner.alive = false;
+    if (exit === 'ok') {
+      a.runner.emit({ kind: EV.ENDED, outcome: 'ok' });
+    } else {
+      // as the runner reports a process that exits with an error: the tail of its stderr, then failed
+      a.runner.emit({ kind: EV.ENDED, outcome: 'error', error: 'Error: the spending limit was reached' });
+      a.runner.emit({ kind: EV.STATE, state: 'failed', reason: 'Claude Code stopped with an error (exit code 1).' });
+    }
+    await new Promise(r => setTimeout(r, 40)); // past exitGraceMs: a clean exit after a failed turn changes nothing
+    const v = t.store.get(a.id);
+    assert.deepEqual([v.state, v.atLimit], ['failed', true], `exit ${exit}: still at its limit`);
+    assert.equal(v.stateReason, exit === 'ok' ? LIMIT_REASON : 'Claude Code stopped with an error (exit code 1).');
+    assert.equal((await t.engine.raiseLimit(a.id, { state: 'failed' })).ok, true, exit);
+    assert.equal(a.runner.stopCalls, 0, `exit ${exit}: no process was left to close`);
+    assert.deepEqual([a.runner.sent, a.runner.limit], [[CONTINUE], 4], exit);
+    await t.engine.shutdown();
+  }
+});
+
+test('spending limit: refused, changing nothing, for an unknown or stale agent, one not at its limit, a helper, Codex and an earlier agent', async () => {
+  const t = live();
+  const a = await atLimit(t);
+  const no = async (id, state, reply) => assert.deepEqual(await t.engine.raiseLimit(id, { state }), { ok: false, reply });
+  await no('f00f00', 'failed', 'I can’t find that agent.');
+  await no(a.id, 'working', 'That changed. Have another look.');
+  // A helper spends from its agent's limit.
+  t.engine.ingest({ kind: EV.CREATED, agentId: `${a.id}-h1`, parentId: a.id, name: 'Find tests', task: 'find', harness: 'claude' });
+  t.engine.ingest({ kind: EV.STATE, agentId: `${a.id}-h1`, state: 'failed', reason: LIMIT_REASON });
+  await no(`${a.id}-h1`, 'failed', 'Helpers share their agent’s spending limit. Give the agent more instead.');
+  // Not at its limit: a failure for another reason, or no failure at all.
+  const b = await started(t, { task: 'Fix the login redirect' });
+  b.runner.emit({ kind: EV.TURN, phase: 'start' });
+  b.runner.emit({ kind: EV.TURN, phase: 'end', finalText: '', backgroundTasks: 0, isError: true, reason: 'Claude Code reported a problem: API Error: 529 Overloaded' });
+  await until(() => t.store.get(b.id).state === 'failed');
+  await no(b.id, 'failed', 'Fix login redirect has not reached its spending limit.');
+  await no(b.id, null, 'Fix login redirect has not reached its spending limit.');
+  const c = await started(t, { task: 'Fix the tax rounding' });
+  await no(c.id, null, 'Fix tax rounding has not reached its spending limit.');
+  // Codex reports no cost, so it has no limit to raise, whatever words its failure used.
+  const x = await started(t, { task: 'Write the parser tests', harness: 'codex' });
+  x.runner.emit({ kind: EV.TURN, phase: 'start' });
+  x.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'The budget for this account is used up.', backgroundTasks: 0, isError: true });
+  await until(() => t.store.get(x.id).state === 'failed');
+  assert.equal(t.store.get(x.id).atLimit, false);
+  await no(x.id, 'failed', `Codex reports no cost, so ${t.store.get(x.id).name} has no spending limit to raise.`);
+  // An agent from an earlier run gets a new spending limit when it is continued.
+  t.store.restore({ id: 'e1e1e1', name: 'Invoice export', task: 'Export invoices', harness: 'claude', state: 'failed', stateReason: LIMIT_REASON, budgetUsd: 2 }, { ok: true });
+  await no('e1e1e1', 'failed', 'Invoice export is from an earlier run. Continue gives it a new spending limit for this run.');
+  // An adapter whose runner cannot take a raised limit.
+  const setLimit = a.runner.setLimit;
+  a.runner.setLimit = undefined;
+  await no(a.id, 'failed', 'Workbench cannot raise Fix cart total’s spending limit.');
+  a.runner.setLimit = setLimit;
+  // Nothing was raised, closed or sent.
+  assert.deepEqual([a.runner.limit, a.runner.stopCalls, a.runner.sent, t.store.get(a.id).budgetUsd, t.store.get(a.id).state], [2, 0, [], 2, 'failed']);
+  assert.ok(t.notices.includes('Fix login redirect has not reached its spending limit.'), 'a refusal is a notice too');
+  await t.engine.shutdown();
+});
+
+test('spending limit: refused in the demo, where nothing is spent', async () => {
+  const t = demo();
+  await t.engine.start();
+  const v = await t.engine.startAgent({ task: 'Fix the cart total' });
+  const runner = t.sim.runners.at(-1);
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'It stopped because it reached its budget of $2.00.', backgroundTasks: 0, isError: true });
+  await until(() => t.store.get(v.id).state === 'failed');
+  assert.equal(t.store.get(v.id).stateReason, LIMIT_REASON);
+  assert.deepEqual(await t.engine.raiseLimit(v.id, { state: 'failed' }), { ok: false, reply: 'This is the demo, so nothing is really spent.' });
+  assert.deepEqual([runner.sent, runner.limit], [[], 2]);
+  await t.engine.shutdown();
+});
+
+test('spending limit: a raise that starts nothing leaves every limit as it was; a second press waits for the first', async () => {
+  const t = live();
+  const a = await atLimit(t);
+  const unchanged = () => {
+    const v = t.store.get(a.id);
+    assert.deepEqual([a.runner.limit, v.budgetUsd, v.state, v.atLimit], [2, 2, 'failed', true]);
+  };
+  a.runner.send = async () => { throw Object.assign(new Error('Claude Code was not found on this computer.'), { plain: true }); };
+  assert.deepEqual(await t.engine.raiseLimit(a.id, { state: 'failed' }), { ok: false, reply: 'Claude Code was not found on this computer.' });
+  unchanged();
+  // One turn that went past its limit by more than a whole limit more (only with a small --budget): the runner still
+  // finds less than a cent left, and says so in its own words. Nothing is raised, so pressing again does the same.
+  a.runner.send = async () => { throw Object.assign(new Error('Fix cart total has used its whole spending limit, so it can’t continue.'), { plain: true }); };
+  assert.deepEqual(await t.engine.raiseLimit(a.id, { state: 'failed' }), { ok: false, reply: 'Fix cart total has used its whole spending limit, so it can’t continue.' });
+  unchanged();
+  // Two presses at once (two tabs): the second hears that the first is under way, and the limit is raised once.
+  const g = gate();
+  a.runner.send = async (text) => { await g.wait; a.runner.sent.push(text); };
+  const first = t.engine.raiseLimit(a.id, { state: 'failed' });
+  await until(() => a.runner.limit === 4);
+  assert.deepEqual(await t.engine.raiseLimit(a.id, { state: 'failed' }), { ok: false, reply: 'Fix cart total is already being picked up.' });
+  g.open();
+  assert.equal((await first).ok, true);
+  assert.deepEqual([a.runner.limit, t.store.get(a.id).budgetUsd, a.runner.sent], [4, 4, [CONTINUE]]);
+  await t.engine.shutdown();
+});
+
+test('spending limit: nothing is raised while its work is being merged', async (ctx) => {
+  const t = liveFolders(ctx);
+  const a = await atLimit(t);
+  const g = gate();
+  t.git.mergeGate = g;
+  const card = await t.engine.proposeMerge(a.id, { state: 'failed' });
+  const yes = t.engine.confirm(card.confirm.id, true);
+  await until(() => t.calls.mergeWork.length === 1);
+  assert.deepEqual(await t.engine.raiseLimit(a.id, { state: 'failed' }), { ok: false, reply: 'Fix cart total is being merged now.' });
+  g.open();
+  await yes;
+  assert.deepEqual([a.runner.limit, a.runner.sent], [2, []]);
+  await t.engine.shutdown();
+});
+
 // ------------------------------------------------------------------ background work that is not a helper
 
 const DEV = { helpers: 0, commands: 1, others: 0, work: ['Running the dev script'], ids: ['bq2k7x1m9'] };

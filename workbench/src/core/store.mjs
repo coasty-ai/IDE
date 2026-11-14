@@ -268,6 +268,8 @@ export class Store extends EventEmitter {
           meta.background = ev.background && typeof ev.background === 'object' ? splitOf(ev.background) : null;
         }
         this._setState(v, ev.state, ev.reason ?? null, ev.ts, batch, index, changed);
+        // The turn that reached the limit says so; a process that then exits with an error leaves it so (see _setState).
+        if (ev.state === STATE.FAILED && ev.atLimit === true) v.atLimit = true;
         break;
       }
 
@@ -524,6 +526,7 @@ export class Store extends EventEmitter {
     const prev = v.state;
     v.state = next;
     v.stateReason = reason == null ? null : String(reason);
+    if (next !== STATE.FAILED) v.atLimit = false; // at its spending limit only while it stays failed
     if (next !== prev) {
       v.stateSince = ts;
       if (ENDED.has(next)) v.endedAt = ts;

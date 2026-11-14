@@ -161,7 +161,7 @@ export function createRunner(opts = {}) {
   const hide = typeof opts.mask === 'function' ? safeMask(opts.mask) : null; // null: nothing to hide
   const mask = hide || ((s) => s);
   const claudePath = typeof opts.claudePath === 'string' ? opts.claudePath : null;
-  const budgetUsd = opts.budgetUsd == null ? DEFAULT_BUDGET_USD : Number(opts.budgetUsd);
+  let budgetUsd = opts.budgetUsd == null ? DEFAULT_BUDGET_USD : Number(opts.budgetUsd); // for this run; setLimit raises it
   const graceMs = opts.killGraceMs ?? STOP_GRACE_MS;
   const log = makeLog(opts.log, agentId);
   const who = name || 'This agent';
@@ -392,6 +392,15 @@ export function createRunner(opts = {}) {
       const child = proc;
       stopping = doStop(child).finally(() => { stopping = null; });
       return stopping;
+    },
+
+    /**
+     * The agent's spending limit for this run is now `usd` (the person gave it more): its next relaunch gets it, less
+     * what it has spent. A process that is running keeps the limit it was started with.
+     */
+    setLimit(usd) {
+      if (typeof usd !== 'number' || !Number.isFinite(usd) || usd <= 0) throw new Error('The spending limit must be a positive number of dollars.');
+      budgetUsd = usd;
     },
 
     info() {
