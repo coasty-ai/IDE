@@ -679,7 +679,16 @@ function matchStop(core, c) {
   if (/[?？]["'”’)]*$/.test(core[core.length - 1].raw) && c.agents.some(a => saysWhole(ws, a))) return null;
   let rest = core.slice(v);
   // "stop, it's deleting the wrong files": after the stop and its comma comes why, not which agent
-  if (core[v - 1].tail && rest.length && STOP_WORDS.has(ws[0]) && !rest.some(t => STOP_ALL_WORDS.has(t.w))) rest = [];
+  // only after a comma or a full stop, and not when the words name the agent ("stop, stop the flaky test",
+  // "stop, onboarding"); "kill: (1234) No such process" is pasted output
+  if (core[v - 1].tail && /[,.!，。！]["'”’)]*$/.test(core[v - 1].raw) && rest.length && STOP_WORDS.has(ws[0]) && !rest.some(t => STOP_ALL_WORDS.has(t.w))) {
+    if (startsWithSeq(rest.map(t => t.w), STOP_VERBS)) {
+      const again = matchStop(rest, c); // "stop, stop the flaky test"; "stop, stop deleting the files" is still a bare stop
+      if (again && (again.intent.kind === 'stop' || again.intent.kind === 'stop_all') && again.intent.agentIds?.length !== 0) return again;
+    }
+    const named = resolveList(stripTrailing(rest, STOP_TAIL), c);
+    if (!(named.ids.length && named.named && !named.pronoun)) rest = [];
+  }
   if (rest.length >= 2 && (rest[0].w === 'working' || rest[0].w === 'work') && rest[1].w === 'on') rest = rest.slice(2);
   // "stop working", "stop what you're doing", "stop stop stop": a bare stop (not "stop everything", which is stop-all)
   if (rest.length && rest.every(t => BARE_STOP.has(t.w)) && !rest.some(t => t.w === 'everything') && ['stop', 'pause', 'halt', 'kill', 'abort', 'terminate'].includes(ws[0])) {
@@ -1790,7 +1799,11 @@ function matchAddressed(core, c) {
   if (!workAfterName(rest, named, c)) return null;
   const task = tidy(spanText(rest));
   if (!task) return null;
-  return { intent: { kind: 'start', tasks: [...new Set(harnesses)].map(harness => ({ task, harness, machine: laptopId(c) })) }, strong: false };
+  // weak only when the words may be said to the agent asking: no comma or colon after the name (as for
+  // "claude, fix the login page", read by matchStart), and a program the asker runs, when its program is known
+  const asker = c.asker;
+  const notTheAsker = !!(asker && (asker.harness === 'claude' || asker.harness === 'codex') && !harnesses.includes(asker.harness));
+  return { intent: { kind: 'start', tasks: [...new Set(harnesses)].map(harness => ({ task, harness, machine: laptopId(c) })) }, strong: !!named.tail || notTheAsker };
 }
 
 /**
@@ -1862,8 +1875,11 @@ const isQuestion = toks => QUESTION_LEAD.has(toks[0]?.w) || /[?？]["'”’)]*$
 /** Whether the words point at something on screen: "it", or "this" or "that" before a verb, or at the end. */
 function pointsAtScreen(toks) {
   return toks.some((t, i) => t.w === 'it' || t.w === 'its'
-    || ((t.w === 'this' || t.w === 'that') && (i === toks.length - 1 || POINTED_VERB.has(toks[i + 1].w))));
+    || ((t.w === 'this' || t.w === 'that') && ((i === toks.length - 1 && !(WH_LEAD.has(toks[0].w) && contentCount(toks) > 0))
+      || POINTED_VERB.has(toks[i + 1]?.w))));
 }
+// "how do I deploy this", "what language is this?": a question that asks something of its own, about the project
+const WH_LEAD = new Set(['how', 'what', 'where', 'which', 'who', 'when', 'why']);
 
 /** The words that say something, as a count: a word in a script written without spaces, four characters or more, counts twice. */
 function contentCount(toks) {
@@ -2120,10 +2136,22 @@ function parse(said, c, { free = true } = {}) {
   if (!found && reacted.length < core.length) {
     const r = matchCommand(reacted, c, base);
     if (r && r.intent.kind !== 'unknown' && (!waiting || r.intent.kind === 'stop_all')) found = r;
+    // a sure stop past a reaction: of another agent, it is no answer to this one ("ugh, stop onboarding");
+    // of the stuck agent itself, it is its own "Stop it" ("yes stop", "wait wait wait stop")
+    else if (r && waiting && r.strong && r.intent.kind === 'stop' && r.intent.agentIds?.length) {
+      if (!r.intent.agentIds.some(id => id === holder.id || id === c.focusId)) found = r;
+      else if (ask.type === 'stuck' && r.intent.agentIds.length === 1 && r.intent.agentIds[0] === holder.id) {
+        const opt = (Array.isArray(ask.options) ? ask.options : []).find(o => typeof o === 'string' && /^stop\b/i.test(o));
+        return { kind: 'answer', agentId: holder.id, askId: ask.id ?? null, text: opt || 'Stop it' };
+      }
+    }
   }
   // "we need to pause onboarding", "I want to kill the flaky test": a want said about an agent is asked first
   if (found && (found.intent.kind === 'stop' || found.intent.kind === 'say') && found.intent.agentIds?.length !== 0 && saysWant(base)) {
-    found = { intent: { ...found.intent, sure: false }, strong: false };
+    // still asked first, but a want about another agent than the one asking is no answer to it
+    const ids = found.intent.agentIds || [found.intent.agentId];
+    const other = !!holder && !ids.some(id => id === holder.id || id === c.focusId);
+    found = { intent: { ...found.intent, sure: false }, strong: found.strong && other };
   }
   // Words about the card on screen that it cannot act on ("show me the changes" on a card that does not say whose work
   // it is): the card stays, with its hint.
@@ -2198,6 +2226,10 @@ function agentAddressed(core, c) {
   const a = whole[0];
   const rest = stripSoft(core.slice(k + 1));
   if (!rest.length) return null;
+  // "the login page is broken, codex", "…, use codex": a program named after the work picks who does it
+  const rw = rest.map(t => t.w).filter(w => !['use', 'using', 'with', 'via', 'please'].includes(w));
+  const prog = harnessAt(rw, 0);
+  if (prog && prog.len === rw.length) return null;
   const r = matchCommand(rest, { ...c, focusId: a.id, focus: a, asker: null }, rest);
   if (r && !['start', 'task', 'unknown'].includes(r.intent.kind)) return r;
   const text = tidy(spanText(rest));

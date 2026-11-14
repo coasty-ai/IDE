@@ -1771,3 +1771,44 @@ test('questions about an agent said loosely find it; questions about code and th
     { kind: 'deny', agentId: 'a1b2c3', askId: 'ask-perm', text: "don't, it deletes the database" });
   assert.deepEqual(parseCommand('claude, allow it', CTX.permission), { kind: 'allow', agentId: 'a1b2c3', askId: 'ask-perm' });
 });
+
+// ------------------------------------------------------------------ what a third check found
+
+test('a stop names its agent after a comma; a stop past a reaction is no answer to another agent; launches named after a comma are launches', () => {
+  const stop = (...agentIds) => ({ kind: 'stop', agentIds });
+  // Programs on the board, as the engine's views carry them
+  const asking = { ...stopAsker, harness: 'claude' };
+  const others = pair.map(a => ({ ...a, harness: 'claude' }));
+  const stuckAsk = { id: 'ask-s', type: 'stuck', sentence: 'Flaky test has hit the same error three times.', options: ['Stop it', 'Let it keep trying'] };
+  const boards = {
+    question: { agents: [asking, ...others], machines, harnesses, focusId: 'd4e5f6' },
+    stuck: { agents: [{ ...others[0], state: 'maybe_stuck', ask: stuckAsk }, others[1]], machines, harnesses, focusId: '0a0b0c' },
+    codexAsks: { agents: [{ ...asking, harness: 'codex' }, ...others], machines, harnesses, focusId: 'd4e5f6' },
+  };
+  const rows = [
+    ['stop, stop the flaky test', 'pairFocus', stop('0a0b0c')], // not the agent in the centre
+    ['stop, onboarding', 'pair', stop('7a8b9c')],
+    ['stop, stop deleting the files', 'pairFocus', stop('7a8b9c')], // a bare stop again
+    ['kill: (1234) - No such process', 'pairFocus', task('kill: (1234) - No such process')], // pasted output
+    ['ugh, stop onboarding', 'question', stop('7a8b9c')], // another agent: no answer to the one asking
+    ['yes stop', 'stuck', answer('Stop it', '0a0b0c', 'ask-s')], // the stuck agent's own "Stop it"
+    ['wait wait wait stop', 'stuck', answer('Stop it', '0a0b0c', 'ask-s')],
+    ['yes, stop it', 'question', answer('yes, stop it')], // still the answer to "Should I stop it?"
+    ['we need to pause onboarding', 'question', { kind: 'stop', agentIds: ['7a8b9c'], sure: false }], // asked first, not the answer
+    ['claude, the login page is broken', 'question', start(['the login page is broken', 'claude'])],
+    ['codex add csv export', 'question', start(['add csv export', 'codex'])], // a program the asker does not run
+    ['codex add csv export', 'codexAsks', answer('codex add csv export')], // the asker's own program: its answer
+    ['how do i deploy this', 'empty', task('how do i deploy this')],
+    ['what language is this?', 'empty', task('what language is this?')],
+    ['that fixed it', 'empty', unknown('that fixed it')], // a remark still points
+  ];
+  const failures = [];
+  for (const [text, name, expected] of rows) {
+    const got = parseCommand(text, boards[name] || SWEPT[name] || ctxOf(name));
+    try { assert.deepEqual(got, expected); } catch { failures.push(`${JSON.stringify(text)} [${name}]\n    expected ${JSON.stringify(expected)}\n    got      ${JSON.stringify(got)}`); }
+  }
+  assert.equal(failures.length, 0, '\n' + failures.join('\n'));
+  // "…, codex" beside an agent named for the same words is a launch for Codex, not a message that says "codex"
+  const named = { agents: [fromTask('the login page is broken', { id: 'lp0001', state: 'working' })], machines, harnesses, focusId: null };
+  assert.deepEqual(parseCommand('the login page is broken. codex', named), start(['the login page is broken', 'codex']));
+});
