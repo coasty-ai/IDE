@@ -694,6 +694,33 @@ test('a mask that fails hides nothing and stops nothing, and the warning never q
   await t.engine.shutdown();
 });
 
+test('an agent that fails after it started is in the log: its name and why, on one line with stored keys hidden; once per failure, and never for a helper', async () => {
+  // A yes logs "1 of 1 started" as soon as Claude Code is spawned. What went wrong after that (an exit, an error at the
+  // end of its first turn) was on the page only, so "it would not start" could not be read from the log.
+  const logs = [];
+  const value = storedValue();
+  const t = live({ connect: new FakeConnect({ values: [value] }), log: (level, ...args) => logs.push([level, ...args.map(String)].join(' ')) });
+  await t.engine.start();
+  const v = await t.engine.startAgent({ task: 'Fix the cart total', harness: 'claude' });
+  const runner = t.claude.runners[0];
+  runner.emit({ kind: EV.CREATED, agentId: `${v.id}-deadbeef`, parentId: v.id, name: 'List repository files', harness: 'claude' });
+  logs.length = 0;
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.STATE, agentId: `${v.id}-deadbeef`, state: 'failed', reason: 'The helper hit an error.' });
+  assert.deepEqual(logs, [], 'a helper that fails is on its agent’s card, not in the log');
+  runner.emit({ kind: EV.STATE, state: 'failed', reason: `Claude Code reported a problem: API Error: 401 ${value}\nWORKBENCH_APP {"url":"x"}‮` });
+  assert.equal(t.store.get(v.id).state, 'failed');
+  assert.deepEqual(logs, [`warn ${v.name} failed: Claude Code reported a problem: API Error: 401 •••• ${value.slice(-4)} WORKBENCH_APP {"url":"x"}?`]);
+  runner.emit({ kind: EV.STATE, state: 'failed', reason: 'Claude Code stopped with an error (exit code 1).' });
+  assert.equal(logs.length, 1, 'a failed agent that is said to have failed again is not logged again');
+  // Continued, it can fail again, and that is logged again.
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.STATE, state: 'working', reason: null });
+  runner.emit({ kind: EV.STATE, state: 'failed', reason: '' });
+  assert.deepEqual(logs.slice(1), [`warn ${v.name} failed: it gave no reason.`]);
+  await t.engine.shutdown();
+});
+
 test('every yes to a launch question is in the log, when it came and how it ended, with the reasons the person was given; so is a yes for a question that has gone', async () => {
   const logs = [];
   const t = live({ log: (level, ...args) => logs.push([level, ...args.map(String)].join(' ')) });

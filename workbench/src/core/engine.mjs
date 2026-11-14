@@ -151,6 +151,16 @@ function harnessName(h) {
 }
 
 /**
+ * Text an agent or Claude Code wrote, fit for one log line: line breaks and tabs become spaces, any other control,
+ * hidden or direction-changing character shows as "?" (so it cannot start a line of its own, such as a WORKBENCH_APP
+ * line the Mac app reads), and at most 300 characters. Stored keys are already hidden in the events it comes from.
+ */
+function logText(s) {
+  const t = typeof s === 'string' ? s.replace(/\r\n|[\r\n\t]/g, ' ').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '?').replace(/ {2,}/g, ' ').trim() : '';
+  return clip(t, 300);
+}
+
+/**
  * `s` when it is one plain line fit to stand in a reply as it is: a sentence of at most 300 characters that starts
  * with a capital or a digit, ends with a full stop, and holds no control, hidden or direction-changing character.
  */
@@ -699,7 +709,14 @@ export class Engine extends EventEmitter {
     if (!masked && this._mask) list = list.map(e => this._maskEvent(e));
     if (!held && this.held.size) list = this._waitForHeld(list);
     if (!list.length) return;
+    const failing = this.mode === 'live' ? this._newlyFailed(list) : [];
     this.store.apply(list);
+    // A yes to a launch is logged when Claude Code or Codex is spawned ("1 of 1 started"). What goes wrong after that
+    // (it exits, or its first turn ends in an error) is logged here, with the reason the page gives.
+    for (const id of failing) {
+      const v = this.store.get(id);
+      if (v) this.log.warn(`${logText(v.name) || 'An agent'} failed: ${logText(v.stateReason) || 'it gave no reason.'}`);
+    }
     if (this.history && list.some(e => HISTORY_KINDS.has(e.kind))) this.history.schedule();
     const progressed = new Set();
     for (const e of list) {
@@ -709,6 +726,21 @@ export class Engine extends EventEmitter {
     }
     for (const id of progressed) this._clearStuck(id);
     if (this.held.size) this._keepHeldVisible();
+  }
+
+  /** The agents (not helpers) that this batch turns to failed from another state, each once. */
+  _newlyFailed(list) {
+    const now = new Map();
+    const out = [];
+    for (const e of list) {
+      if (e.kind !== EV.STATE || !e.agentId) continue;
+      const v = this.store.get(e.agentId);
+      if (!v || v.parentId) continue;
+      const was = now.has(e.agentId) ? now.get(e.agentId) : v.state;
+      if (e.state === STATE.FAILED && was !== STATE.FAILED && !out.includes(e.agentId)) out.push(e.agentId);
+      now.set(e.agentId, e.state);
+    }
+    return out;
   }
 
   /** The held request an agent is showing, if any. */
