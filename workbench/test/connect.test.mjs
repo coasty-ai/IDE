@@ -1617,8 +1617,8 @@ test('a FIFO in place of settings.json is never waited on: Connect reads it as n
 });
 
 test('a re-check where the program did not answer in time keeps the last check; one where it failed does not; the log says when readiness changes', async () => {
-  // On the owner's Mac a freshly updated Claude Code, on a busy machine, could take longer than 5 seconds to print its
-  // version: one such re-check made it "could not be started", and every launch was refused.
+  // A freshly updated Claude Code, on a busy Mac, can take longer than 5 seconds to print its version: one such re-check
+  // would make it "could not be started", and every launch would be refused.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-connect-slow-'));
   try {
     const keys = { load: async () => ({ keys: [], missing: [] }), list: async () => [], add: async () => ({ id: 'k' }), remove: async () => ({ removed: true }), values: () => [], envFor: () => ({}) };

@@ -33,8 +33,8 @@ const PROBE_TIMEOUT_MS = 10_000;
 const AVAILABLE_TIMEOUT_MS = 30_000;
 /**
  * How long an agent's `--version` may take inside available(). A program just updated is scanned by macOS the first
- * times it runs, and a busy Mac is slower still: 5 seconds (the adapters' own default) was not enough, and one slow
- * check made the agent "could not be started", so that every launch was refused.
+ * times it runs, and a busy Mac is slower still: with the adapters' own 5 seconds, one slow check would make the agent
+ * "could not be started" and refuse every launch until the next check.
  */
 const VERSION_TIMEOUT_MS = 20_000;
 const GITHUB_API = 'https://api.github.com';

@@ -679,22 +679,33 @@ test('a mask that fails hides nothing and stops nothing, and the warning never q
   await t.engine.shutdown();
 });
 
-test('a yes that starts nothing goes to the log, with the reason the person was given, and so does a yes for a question that has gone', async () => {
+test('every yes to a launch question is in the log, when it came and how it ended, with the reasons the person was given; so is a yes for a question that has gone', async () => {
   const logs = [];
   const t = live({ log: (level, ...args) => logs.push([level, ...args.map(String)].join(' ')) });
   await t.engine.start();
+  // one that starts
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
+  const first = await t.engine.command('codex fix the docs');
+  const started = await t.engine.confirm(first.confirm.id, true);
+  assert.equal(started.agentIds.length, 1);
+  assert.deepEqual(logs, ['warn A yes to a launch question came: starting one agent.', 'warn After a yes to a launch question, 1 of 1 started.']);
+  // one that does not: the agent went away between the card and the yes
+  logs.length = 0;
   const card = await t.engine.command('codex fix the docs');
   t.engine.setHarnesses({ codex: { ok: false, reason: 'Codex is not installed.' } });
   const yes = await t.engine.confirm(card.confirm.id, true);
   assert.equal(yes.reply, 'I could not start the agent for “fix the docs”: Codex is not available on this computer.');
-  assert.ok(logs.includes(`warn After a yes to a launch question, 0 of 1 started. ${yes.reply}`), logs.join('\n'));
+  assert.deepEqual(logs, ['warn A yes to a launch question came: starting one agent.', `warn After a yes to a launch question, 0 of 1 started. ${yes.reply}`]);
   // the same card again, and one that never was: nothing is done, and the log says so
+  logs.length = 0;
   assert.equal((await t.engine.confirm(card.confirm.id, true)).reply, 'That request is no longer waiting. Ask again if you still want it.');
-  assert.ok(logs.includes('warn A yes came for a question that was no longer waiting, so nothing was done.'));
-  // a no for a question that has gone is not a launch that failed: nothing more is logged
-  const before = logs.length;
+  assert.deepEqual(logs, ['warn A yes came for a question that was no longer waiting, so nothing was done.']);
+  // a no is not logged, for a card that is there or one that has gone
+  logs.length = 0;
+  t.engine.setHarnesses({ codex: { ok: true, version: '0.166.0' } });
+  const third = await t.engine.command('codex fix the docs');
+  await t.engine.confirm(third.confirm.id, false);
   await t.engine.confirm('no-such-card', false);
-  assert.equal(logs.length, before);
+  assert.deepEqual(logs, []);
   await t.engine.shutdown();
 });

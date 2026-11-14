@@ -3707,6 +3707,9 @@ export class Engine extends EventEmitter {
         return { reply: GONE };
     }
     if (!go) return { reply: c.tasks.length === 1 ? 'OK, I won’t start it.' : 'OK, I won’t start them.' };
+    // Every yes to a launch is in the log, when it came and how it ended, so "I pressed Do it and nothing happened" can
+    // be read from it: no line, the page never sent it; this line alone, the launch has not ended.
+    this.log.warn(`A yes to a launch question came: starting ${c.tasks.length === 1 ? 'one agent' : `${c.tasks.length} agents`}.`);
     const used = new Set();
     const started = [];
     const problems = [];
@@ -3731,8 +3734,7 @@ export class Engine extends EventEmitter {
     const parts = [];
     if (started.length) parts.push(`Started ${joinAnd(started.map(v => v.name))}.`);
     parts.push(...problems);
-    // the page shows the reply for a while only: a launch that started nothing, or not all, is in the log too
-    if (problems.length) this.log.warn(`After a yes to a launch question, ${started.length} of ${c.tasks.length} started. ${problems.join(' ')}`);
+    this.log.warn(`After a yes to a launch question, ${started.length} of ${c.tasks.length} started.${problems.length ? ` ${problems.join(' ')}` : ''}`);
     return { reply: parts.join(' '), agentIds: started.map(v => v.id), ...(openConnect ? { openConnect: true } : {}) };
   }
 
