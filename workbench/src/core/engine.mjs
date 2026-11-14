@@ -2005,7 +2005,7 @@ export class Engine extends EventEmitter {
     const run = this.runs.get(v.id);
     if (typeof run?.runner?.setLimit !== 'function') return { ok: false, reply: `Workbench cannot raise ${v.name}’s spending limit.` };
     const was = Number.isFinite(v.budgetUsd) && v.budgetUsd > 0 ? v.budgetUsd : this.defaultBudgetUsd;
-    const limit = was + this.defaultBudgetUsd;
+    const limit = Math.round((was + this.defaultBudgetUsd) * 100) / 100; // whole cents: 0.05 three times is 0.15
     this._resuming.add(v.id); // being picked up: nothing may merge it, and a second press hears that this one is under way
     try {
       // A process still running keeps the limit it was started with, so the message must start a new one.

@@ -19,7 +19,7 @@ const subagentPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pret
 const rootPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-root-bash.json', import.meta.url), 'utf8'));
 
 /** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). */
-function live({ deps: depOpts = {}, options = {}, adapters = null } = {}) {
+function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2 } = {}) {
   const store = new Store();
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
@@ -28,7 +28,7 @@ function live({ deps: depOpts = {}, options = {}, adapters = null } = {}) {
   const notices = [];
   store.on('notice', n => notices.push(n.text));
   const engine = new Engine({
-    store, mode: 'live', repo: REPO, hook: HOOK, defaultBudgetUsd: 2,
+    store, mode: 'live', repo: REPO, hook: HOOK, defaultBudgetUsd,
     adapters: adapters || { claude, codex }, machines, deps,
     options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
@@ -2173,6 +2173,19 @@ test('spending limit: a root at its limit is given one more, the default, for th
   const b = await atLimit(t, { task: 'Fix the tax rounding', budgetUsd: 0.5 });
   assert.equal((await t.engine.raiseLimit(b.id, { state: 'failed' })).reply, 'Fix tax rounding can spend $2.50 in all now, and it is continuing.');
   assert.deepEqual([b.runner.limit, t.store.get(b.id).budgetUsd], [2.5, 2.5]);
+  await t.engine.shutdown();
+});
+
+test('spending limit: raised limits are whole cents, so three raises of $0.05 make $0.15, not 0.15000000000000002', async () => {
+  const t = live({ defaultBudgetUsd: 0.05 });
+  const a = await atLimit(t);
+  for (let i = 0; i < 2; i++) {
+    assert.equal((await t.engine.raiseLimit(a.id, { state: 'failed' })).ok, true);
+    a.runner.emit({ kind: EV.TURN, phase: 'start' });
+    a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: '', backgroundTasks: 0, isError: true, reason: LIMIT_REASON });
+    await until(() => t.store.get(a.id).state === 'failed');
+  }
+  assert.deepEqual([a.runner.limit, t.store.get(a.id).budgetUsd], [0.15, 0.15]);
   await t.engine.shutdown();
 });
 
