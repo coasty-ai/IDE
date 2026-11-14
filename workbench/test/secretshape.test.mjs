@@ -143,6 +143,19 @@ test('a long paste is checked in good time', () => {
   assert.ok(Date.now() - started < 2000, 'checked in under two seconds');
 });
 
+test('words joined by dashes are checked in a time that grows with their length, not its square', () => {
+  // Every dash is a new place where a link's scheme could begin. With no bound on the scheme, each of them made the
+  // password-in-a-link check read on to the end of the text: about two seconds for the paste above on a Mac, so the
+  // repository's own check (npm test) failed whenever the Mac was busy.
+  const text = 'a-'.repeat(60_000);
+  const started = Date.now();
+  assert.equal(looksLikeSecret(text).secret, false);
+  assert.ok(Date.now() - started < 500, 'checked in under half a second');
+  // A password in a link after such a run is still found.
+  const pw = join('hun', 'ter', '2Qx', '9z');
+  assert.equal(looksLikeSecret(join(text, ' https://deploy:', pw, '@git.example.com/acme/shop.git')).secret, true);
+});
+
 test('secretshape.mjs is pure: the page loads it as it is', () => {
   const text = fs.readFileSync(new URL('../src/shared/secretshape.mjs', import.meta.url), 'utf8');
   assert.ok(!/from\s+['"]node:/.test(text) && !/import\(\s*['"]node:/.test(text), 'no node: imports');
