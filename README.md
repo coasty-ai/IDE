@@ -25,7 +25,7 @@ When the agent is done, review its changes, then merge them or throw them away. 
 
 - Each agent works in its own git worktree, on its own branch. Nothing reaches your branch until you merge it, and a merge always asks first.
 - Claude Code agents wait for your OK before anything but reading, editing and git in their own folder, and a few safe commands such as tests. You see the exact command first. Codex agents never ask: they run in Codex's own sandbox.
-- Each Claude Code agent has a spending limit: 2 US dollars, unless you set `--budget`. Codex reports no cost, so Codex agents have no limit.
+- Each Claude Code agent has a spending limit: 2 US dollars, unless you set `--budget`. When one reaches it, the middle offers to give it one more, and only you can. Codex reports no cost, so Codex agents have no limit.
 - Keys you give agents stay in your login keychain on a Mac, and are shown only as "•••• " and their last four characters.
 
 Agents run as you, so the tests and scripts they run can do anything you can. [SECURITY.md](SECURITY.md) says what Workbench does not protect against.

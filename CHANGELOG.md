@@ -8,6 +8,10 @@
 - **Git in an agent's folder.** Agents may run git's own commands in their own folder, Codex agents too. Git that reaches past an agent's work, such as a force push, waits for your OK and says what it would change. Agents & keys saves git's name and email, which merging needs.
 - **Free text starts work.** Anything you type that says what you want, such as "the login page is broken" or "why is the build slow?", becomes a new agent's task once you say yes. Say an agent's name to pick it.
 - **The Mac app** clones repositories, lists your GitHub repositories, signs you in to GitHub, and offers to install git. With no agent ready, it opens the board anyway, and Agents & keys helps.
+- **More spending limit, in place.** A Claude Code agent stopped by its spending limit can be given one more limit for this run (**Give it $2.00 more**), and it continues where it left off. Before, it could go on only after Workbench was started again.
+- **A release you can sign.** The Mac app's build can sign it with a Developer ID, with the hardened runtime, and have Apple notarize it. The app carries the licenses of Node, npm and its typeface, and every disk image comes with a SHA-256 checksum.
+- **Words that match what happens.** A Codex agent's launch card no longer promises a spending limit Codex does not have, and Agents & keys says which name and email merges use when a repository has its own.
+- **Tests on every push.** GitHub runs `npm test` on Linux with Node 22, 24 and 26.
 - **Fixes.** Codex agents start when Workbench runs with `--model`, which now names only the Claude model. A slow check for passwords in pasted links made `npm test` fail on a busy Mac; it now takes milliseconds. An agent that fails after it started is now in the log, with the reason.
 
 ## 0.1.0
