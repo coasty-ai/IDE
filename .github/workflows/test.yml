@@ -1,0 +1,26 @@
+# npm test on Linux for every push to main or source-control and every pull request. The suite needs no network,
+# no secrets and no real Claude Code or Codex (it uses stand-ins), so this workflow gets read access only.
+name: tests
+
+on:
+  push:
+    branches: [main, source-control]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
