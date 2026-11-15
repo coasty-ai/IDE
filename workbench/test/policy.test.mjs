@@ -1434,3 +1434,22 @@ test("git config asks before it reads git's settings from outside the agent's fo
     'git config --worktree --list', 'git config -f .gitmodules --get-regexp path', 'git config --file .gitmodules --list', 'git config --blob HEAD:.gitmodules --list',
     'git config --get-urlmatch http.proxy https://github.com', 'git config --local --get-regexp remote', 'git var GIT_EDITOR'].map(c => bash(c)), 'allow');
 });
+
+test("Claude Code's settings and git's records are known by name the way the Mac's disks compare names", () => {
+  // APFS folds case and compatibility forms when it compares names: .mcp.json with a long s (U+017F) in place of its s is the
+  // same file as .mcp.json. Characters HFS+ ignores in a name are left out too, as git does for .git. The names are built
+  // from character codes, so nothing hides in this file.
+  const longS = String.fromCharCode(0x17f);
+  const joiner = String.fromCharCode(0x200c); // zero-width non-joiner
+  const wide = s => [...s].map(c => String.fromCharCode(c.charCodeAt(0) + 0xfee0)).join(''); // fullwidth letters
+  const refused = [{ tool: 'Write', input: { file_path: `.mcp.j${longS}on` } }, { tool: 'Edit', input: { file_path: `sub/.MCP.J${longS}ON` } },
+    { tool: 'Write', input: { file_path: `.${wide('claude')}/settings.json` } }, { tool: 'Write', input: { file_path: `.clau${joiner}de/settings.json` } },
+    { tool: 'Write', input: { file_path: '.Claude/hooks/x.sh' } }];
+  check(refused, 'deny');
+  for (const row of refused) assert.match(decide({ cwd, ...row }).sentence, /in Claude Code's own settings$/);
+  asksBecause([{ tool: 'Write', input: { file_path: `.${wide('git')}/config` } }, { tool: 'Write', input: { file_path: `.g${joiner}it/hooks/pre-commit` } }],
+    /git's own records/);
+  asksBecause([bash(`git checkout -- .mcp.j${longS}on`), bash(`git restore .Cl${joiner}aude/settings.json`)], /\.claude folder/);
+  // Reading them is fine, and so are names that only look alike.
+  check([bash(`cat .mcp.j${longS}on`), { tool: 'Write', input: { file_path: '.mcp.jsonx' } }, { tool: 'Write', input: { file_path: `mcp.j${longS}on` } }], 'allow');
+});

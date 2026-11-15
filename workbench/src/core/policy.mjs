@@ -452,12 +452,29 @@ function throughLinks(r, baseReal) {
 }
 
 /**
+ * Characters HFS+ leaves out when it compares names (git's own list, for .git): joiners and direction marks (U+200C to
+ * U+200F, U+202A to U+202E, U+206A to U+206F) and the byte-order mark (U+FEFF). Written as numbers, so none hides here.
+ */
+const hfsIgnored = cp => (cp >= 0x200c && cp <= 0x200f) || (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x206a && cp <= 0x206f) || cp === 0xfeff;
+
+/**
+ * A name as the Mac's disks compare it, for the names the policy protects (.git, .claude, .mcp.json). APFS folds case and
+ * Unicode forms, so ".CLAUDE", and ".mcp.json" written with a long s (U+017F) in place of its s, are the same files as
+ * ".claude" and ".mcp.json". Compared after NFKC normalisation and case folding (upper, then lower case, which also folds
+ * the sharp s and the long s), with the characters HFS+ ignores left out. It folds a little more than a disk does (a
+ * dotless i, fullwidth letters): that only ever protects more.
+ */
+function foldName(seg) {
+  const kept = [...seg].filter(ch => !hfsIgnored(ch.codePointAt(0))).join('');
+  return kept.normalize('NFKC').toUpperCase().toLowerCase().normalize('NFKC');
+}
+
+/**
  * The folder names that hold Claude Code's own settings: a .claude folder at any depth (settings, hooks,
- * skills, agents, commands) and .mcp.json. Compared case-insensitively: on a default macOS disk
- * ".CLAUDE/settings.json" is the same file as ".claude/settings.json".
+ * skills, agents, commands) and .mcp.json, compared as the disk compares names (foldName).
  */
 function claudeSetting(rel) {
-  return rel.split('/').some(seg => { const s = seg.toLowerCase(); return s === '.claude' || s === '.mcp.json'; });
+  return rel.split('/').some(seg => { const s = foldName(seg); return s === '.claude' || s === '.mcp.json'; });
 }
 
 /**
@@ -470,9 +487,9 @@ function placeOf(real, baseReal) {
   if (!real.startsWith(prefix)) return 'outside';
   const rel = real.slice(prefix.length);
   if (claudeSetting(rel)) return 'claude'; // before .git: a .claude folder is refused at any depth
-  // Case-insensitive: on a default macOS disk ".GIT/config" is the same file as ".git/config".
+  // As the disk compares names: on a default macOS disk ".GIT/config" is the same file as ".git/config".
   const segs = rel.split('/');
-  if (segs.some(seg => seg.toLowerCase() === '.git')) return 'git';
+  if (segs.some(seg => foldName(seg) === '.git')) return 'git';
   for (let k = 1; k <= segs.length; k++) if (gitRecordsAt(prefix + segs.slice(0, k).join('/'))) return 'git';
   return 'inside';
 }
@@ -558,7 +575,7 @@ function judgeEditTarget(target, base) {
   // checkout's .claude): refused, since they could switch off this very check.
   if (where === 'claude' || (where === 'outside' && claudeSetting(r.real))) {
     const rel = where === 'claude' ? path.relative(base, r.real) : r.real;
-    return deny(rel.split('/').some(s => s.toLowerCase() === '.claude') ? R.fileClaude : R.fileMcp, 'claude');
+    return deny(rel.split('/').some(s => foldName(s) === '.claude') ? R.fileClaude : R.fileMcp, 'claude');
   }
   if (where === 'git') return ask(R.fileGit, 'git');
   if (where === 'cwd') return ask(R.fileFolder);
