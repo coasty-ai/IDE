@@ -274,10 +274,11 @@ test('a long done tray never puts a machine on the DRAM\'s wire: the sections na
     { id: 'cloud-2', name: 'Cloud workstation in Oregon', awake: true, note: '' }, { id: 'cloud-3', name: 'Cloud workstation in Tokyo', awake: true, note: '' }];
   const bad = [];
   let cutTray = 0, cutNames = 0;
-  for (const [W, H] of WINDOWS) for (const detail of ['calm', 'more']) for (const counts of [{ done: 12, earlier: 6, over: 1 }, { done: 99, earlier: 99, over: 99 }, { done: 0, earlier: 40, over: 0 }])
+  for (const [W, H] of WINDOWS) for (const detail of ['calm', 'more']) for (const counts of [{ done: 12, earlier: 6, over: 1 }, { done: 99, earlier: 99, over: 99 }, { done: 0, earlier: 40, over: 0 },
+    { done: 12, notMerged: 3, earlier: 6, over: 1 }, { done: 0, notMerged: 99, earlier: 99, over: 99 }])
     for (const machines of [DEMO, DEMO.slice(0, 1), LONG]) {
       const P = sizeClass(W, H), words = trayWords(counts);
-      const tray = { count: counts.done + counts.earlier, ...counts, marks: [], ...words };
+      const tray = { count: counts.done + (counts.notMerged || 0) + counts.earlier, ...counts, marks: [], ...words };
       const G = layoutBoard({ W, H, P, detail, roots: [], laneOf: () => null, nRows: maxDenseRows(H, P), dense: true, lidNeed: 220, machines, tray });
       const wx = G.dram.wire.x, tag = `${W}x${H} ${detail} ${words.text} ${machines.length} machine(s)${machines === LONG ? ' (long names)' : ''}`;
       for (const [i, m] of G.machines.entries()) {

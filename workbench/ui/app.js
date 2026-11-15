@@ -7,7 +7,7 @@ import { money, clip } from '/shared/format.mjs';
 import { initToken, hasToken, whenRefused, api, connect } from './api.js';
 import { linkState, cannotSend } from './link.js';
 import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName, workKey } from './model.js';
-import { boardModel, boardAndTray, agoText } from './boardmodel.js';
+import { boardModel, boardAndTray, agoText, doneWords } from './boardmodel.js';
 import { Lanes } from './lanes.js';
 import { sizeClass, frame, layoutBoard, maxDenseRows } from './layout.js';
 import { Board } from './board.js';
@@ -15,7 +15,7 @@ import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
 import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand } from './prefs.js';
-import { markOf, statusWords } from './look.js';
+import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { balanceHeading } from './balance.js';
 import { buttonRow } from './words.js';
@@ -965,15 +965,15 @@ function closeTray() {
 }
 let trayIds = { done: [], earlier: [], over: [] };
 function renderTrayList() {
-  // each row: its mark, its name, and a few words: where its work went or how it ended ("merged", "thrown away",
-  // "stopped"), how long ago for an earlier run's agent, or its state for one at work with no room
+  // each row: its mark, its name, and a few words: where its work went or how it ended ("merged", "thrown away", "not
+  // merged", "checks failed", "stopped"), how long ago for an earlier run's agent, or its state for one at work with no room
   const row = (id, words) => {
     const a = S.agents.get(id);
     if (!a) return '';
     const m = markOf(a.state, STATES.LOOK);
     return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(visibleControls(a.name))} <em>· ${esc(words(a, m))}</em></span></button>`;
   };
-  const done = trayIds.done.map(id => row(id, a => statusWords(a, STATES.LOOK))).join('');
+  const done = trayIds.done.map(id => row(id, a => doneWords(a, STATES.LOOK))).join('');
   const early = (trayIds.earlier || []).map(id => row(id, a => agoText(Date.now() - (a.endedAt || a.stateSince)))).join('');
   const over = trayIds.over.map(id => row(id, (a, m) => m.label)).join('');
   patchChildren(el.trayList, `${done || !early ? `<h2>Done</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);

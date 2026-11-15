@@ -46,7 +46,7 @@ test('the board model marks earlier roots; they go to the tray, not to a lane', 
 });
 
 test('the tray says what is in it, plainly', () => {
-  assert.deepEqual(trayWords({ done: 3 }), { lead: '3 done', rest: '', text: '3 done', sum: '3 done', aria: '3 done. Show them.' });
+  assert.deepEqual(trayWords({ done: 3 }), { lead: '3 done', rest: '', text: '3 done', sum: '3 done', aria: '3 done. Show them.', short: { lead: '3 done', rest: '' } });
   assert.equal(trayWords({ earlier: 5 }).text, '5 from earlier');
   assert.equal(trayWords({ done: 2, earlier: 5, over: 1 }).text, '2 done, 5 from earlier, 1 more working');
   assert.equal(trayWords({ done: 2, earlier: 5 }).aria, '2 done, 5 from an earlier run. Show them.');

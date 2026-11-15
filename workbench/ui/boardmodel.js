@@ -1,7 +1,7 @@
 // From the agents the engine sends to what the board draws: one entry per root agent, with its stop on its lane,
 // its lit line, its place in the queue and its helpers in order; then which of them take a lane and which wait in the
 // done tray. Pure: no DOM, and it imports only pure modules; the state sets come in `ctx`.
-import { needsPerson, needsQueue, helpersByNeed, finishedWith } from './queue.js';
+import { needsPerson, needsQueue, helpersByNeed, finishedWith, workSettled, unmergedWork } from './queue.js';
 import { markOfAgent, statusWords } from './look.js';
 import { denseLanes, ROWS } from './lanes.js';
 
@@ -48,6 +48,8 @@ export function boardModel(agents, ctx) {
       ghost: finished && !inner, failed: a.state === 'failed' && !inner, earlier: !!a.earlier,
       // the person is finished with it (queue.js): it leaves the board, with its helpers, for the done tray
       handled: !inner && finishedWith(a, { NEEDS_YOU, reviewed, later }),
+      // its work is done and not merged yet: in the tray, its row says so and the tray counts it (doneWords, trayWords)
+      notMerged: notMergedYet(a),
       working: (a.state === 'working' || a.state === 'starting') && stop === 'mid',
       kids: kids.map(k => {
         const m = markOfAgent(k, LOOK);
@@ -57,6 +59,22 @@ export function boardModel(agents, ctx) {
     };
   });
   return { roots, queue, byId };
+}
+
+/** A root that finished its work (done, or a failed check) with work not merged yet: not settled, and changed files. */
+const notMergedYet = a => !!a && !a.parentId && !a.earlier && (a.state === 'done_checked' || a.state === 'done_claimed' || a.state === 'checks_failed')
+  && !workSettled(a) && unmergedWork(a);
+
+/**
+ * What a row in the done tray's "Done" section says after the agent's name: where its work went ("merged", "thrown
+ * away"), that it is not merged yet ("not merged", or "checks failed" for a failed check), or how it ended ("stopped",
+ * "done and checked"). Unmerged work then reads differently from work that is in, so it is not forgotten.
+ * @param {object} a  an AgentView
+ */
+export function doneWords(a, LOOK) {
+  if (a.state === 'checks_failed' && !workSettled(a)) return 'checks failed';
+  if (notMergedYet(a)) return 'not merged';
+  return statusWords(a, LOOK);
 }
 
 /**
@@ -109,8 +127,9 @@ export function boardAndTray(roots, lanes, { laptop = () => true, maxRows = Infi
   let tray = null;
   if (done.length || earlier.length || over.length) {
     const marks = done.concat(earlier).map(r => ({ shape: r.mark, tone: r.tone }));
-    tray = { count: done.length + earlier.length, done: done.length, earlier: earlier.length, over: over.length,
-      ids: trayIds.done.concat(trayIds.earlier, trayIds.over), marks, ...trayWords({ done: done.length, earlier: earlier.length, over: over.length }) };
+    // this run's agents in the tray, as its words count them: done, and work not merged yet
+    const counts = { done: done.filter(r => !r.notMerged).length, notMerged: done.filter(r => r.notMerged).length, earlier: earlier.length, over: over.length };
+    tray = { count: done.length + earlier.length, ...counts, ids: trayIds.done.concat(trayIds.earlier, trayIds.over), marks, ...trayWords(counts) };
   }
   return { roots: shown, laneOf, nRows, dense, tray, trayIds };
 }
@@ -128,16 +147,20 @@ export function agoText(ms) {
 }
 
 /**
- * What the done tray says, in a few words: "3 done", then ", 5 from earlier" and ", 1 more working" when there are such.
- * `done`: this run's agents in the tray (finished, failed or stopped, and let go, or waiting there on a dense board),
- * `earlier`: agents from earlier runs, `over`: working agents with no room on the board. lead is the bold part; text is
- * all of it, plain (for measuring); sum is all of it for a screen reader (the board's name says it too), and aria the
- * tray's own name.
+ * What the done tray says, in a few words: "3 done", then ", 1 not merged", ", 5 from earlier" and ", 1 more working"
+ * when there are such. `done`: this run's agents in the tray (finished, failed or stopped, and let go, or waiting there
+ * on a dense board) whose work is in, thrown away or not to merge; `notMerged`: those whose work is done and not merged
+ * yet (doneWords: "not merged", "checks failed"); `earlier`: agents from earlier runs; `over`: working agents with no
+ * room on the board. lead is the bold part; text is all of it, plain (for measuring); sum is all of it for a screen
+ * reader (the board's name says it too), and aria the tray's own name; short is lead and rest with "1 more" for "1 more
+ * working", which the layout falls back on where the machines need the room (its list and its name keep all of it).
  */
-export function trayWords({ done = 0, earlier = 0, over = 0 }) {
-  const lead = done ? `${done} done` : `${earlier} from earlier`;
-  const rest = [done && earlier ? `, ${earlier} from earlier` : '', over ? `, ${over} more working` : ''].join('');
-  const sum = [done ? `${done} done` : '', earlier ? `${earlier} from an earlier run` : '', over ? `${over} more working with no room on the board` : '']
-    .filter(Boolean).join(', ');
-  return { lead, rest, text: lead + rest, sum, aria: `${sum}. Show them.` };
+export function trayWords({ done = 0, notMerged = 0, earlier = 0, over = 0 }) {
+  const lead = done ? `${done} done` : notMerged ? `${notMerged} not merged` : `${earlier} from earlier`;
+  const after = more => [done && notMerged ? `, ${notMerged} not merged` : '', (done || notMerged) && earlier ? `, ${earlier} from earlier` : '',
+    over ? `, ${over} ${more}` : ''].join('');
+  const rest = after('more working');
+  const sum = [done ? `${done} done` : '', notMerged ? `${notMerged} not merged` : '', earlier ? `${earlier} from an earlier run` : '',
+    over ? `${over} more working with no room on the board` : ''].filter(Boolean).join(', ');
+  return { lead, rest, text: lead + rest, sum, aria: `${sum}. Show them.`, short: { lead, rest: after('more') } };
 }

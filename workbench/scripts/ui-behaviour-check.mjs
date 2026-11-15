@@ -728,15 +728,17 @@ try {
     await sleep(1100);
     const after = await chipsNow(), tray = await trayNow(), nodes = await b.ev(`document.querySelectorAll('#parts .node').length`);
     const rails = await b.ev(`document.querySelectorAll('#board .rails [data-for]').length`), sent = (await posts()).filter(x => x.path === '/api/agents/w1/answer');
-    check(DT + '"Not now" lets the chip go: it fades off the board, its lane\'s copper with it, and the tray says 1 done',
-      before === 'w1~' && !!fading && fading.inert && fading.moving > 0 && fading.rails === 3 && after === '' && nodes === 0 && rails === 0 && tray === '1 done'
+    check(DT + '"Not now" lets the chip go: it fades off the board, its lane\'s copper with it, and the tray says its work is not merged',
+      before === 'w1~' && !!fading && fading.inert && fading.moving > 0 && fading.rails === 3 && after === '' && nodes === 0 && rails === 0 && tray === '1 not merged'
       && sent.length === 1 && sent[0].body.answer === 'Not now', `${before} → fading ${JSON.stringify(fading)} → chips "${after}", nodes ${nodes}, rails ${rails}, tray "${tray}", ${JSON.stringify(sent.map(x => x.body))}`);
     // a reload in the same tab: the board comes back without it
     await b.goto(`${base}/?t=k`, 1600);
     const reChips = await chipsNow(), reTray = await trayNow(), reLid = await lidNow();
-    check(DT + 'a reload keeps it in the tray, and it is not asked about again', reChips === '' && reTray === '1 done' && /^All clear/.test(reLid), `chips "${reChips}", tray "${reTray}", lid "${reLid}"`);
-    // picked from the tray: in the core, with what can still be done with it
+    check(DT + 'a reload keeps it in the tray, and it is not asked about again', reChips === '' && reTray === '1 not merged' && /^All clear/.test(reLid), `chips "${reChips}", tray "${reTray}", lid "${reLid}"`);
+    // picked from the tray: in the core, with what can still be done with it; its row says its work is not merged
     await click('#tray'); await sleep(300);
+    const row = await b.ev(`document.querySelector('#trayList .row[data-agent="w1"]')?.textContent.trim() || ''`);
+    check(DT + 'its row in the tray says its work is not merged', row === 'Invoice export · not merged', `"${row}"`);
     await b.ev(`document.querySelector('#trayList .row[data-agent="w1"]').click(), 1`); await sleep(900);
     const lid = await lidNow(), acts = await lidActs();
     check(DT + 'picked from the tray, it shows in the core with what can still be done with it',

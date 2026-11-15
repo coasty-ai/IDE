@@ -4,7 +4,7 @@
 // back to the board when it is continued. Pure modules only, so no browser and no /shared/ mapping.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { boardModel, splitBoard, boardAndTray, trayWords } from '../ui/boardmodel.js';
+import { boardModel, splitBoard, boardAndTray, trayWords, doneWords } from '../ui/boardmodel.js';
 import { Lanes, ROWS } from '../ui/lanes.js';
 import { finishKey, readMarks, keepMarks } from '../ui/queue.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
@@ -136,13 +136,52 @@ test('thirteen on the board, then one is let go: the board is not dense any more
 });
 
 test('the tray\'s words: short, "3 done", with earlier agents and working ones with no room counted as before', () => {
-  assert.deepEqual(trayWords({ done: 3 }), { lead: '3 done', rest: '', text: '3 done', sum: '3 done', aria: '3 done. Show them.' });
+  assert.deepEqual(trayWords({ done: 3 }), { lead: '3 done', rest: '', text: '3 done', sum: '3 done', aria: '3 done. Show them.', short: { lead: '3 done', rest: '' } });
   assert.equal(trayWords({ done: 1 }).text, '1 done');
   assert.equal(trayWords({ earlier: 5 }).text, '5 from earlier');
   assert.equal(trayWords({ earlier: 5 }).aria, '5 from an earlier run. Show them.');
   assert.equal(trayWords({ done: 2, earlier: 5 }).text, '2 done, 5 from earlier');
   assert.equal(trayWords({ done: 2, earlier: 5, over: 1 }).text, '2 done, 5 from earlier, 1 more working');
   assert.equal(trayWords({ done: 4, over: 2 }).aria, '4 done, 2 more working with no room on the board. Show them.');
+  // work not merged yet, counted after what is done
+  assert.equal(trayWords({ done: 2, notMerged: 1 }).text, '2 done, 1 not merged');
+  assert.equal(trayWords({ notMerged: 2, earlier: 5, over: 1 }).text, '2 not merged, 5 from earlier, 1 more working');
+  assert.equal(trayWords({ done: 2, notMerged: 1, earlier: 5, over: 1 }).aria, '2 done, 1 not merged, 5 from an earlier run, 1 more working with no room on the board. Show them.');
+  // the shorter words the layout falls back on where the machines need the room
+  assert.deepEqual(trayWords({ done: 12, earlier: 6, over: 1 }).short, { lead: '12 done', rest: ', 6 from earlier, 1 more' });
+  assert.deepEqual(trayWords({ done: 12, notMerged: 2, earlier: 6, over: 1 }).short, { lead: '12 done', rest: ', 2 not merged, 6 from earlier, 1 more' });
+});
+
+test('work not merged yet is easy to see in the tray: its row says "not merged" ("checks failed" for a failed check), and the tray counts it', () => {
+  const list = [
+    agent('N', 'done_checked', { endedAt: T - 2 * MIN, work: W(), files: files(3) }),                    // "Not now" on work that could merge
+    agent('S', 'stopped', { endedAt: T - 5 * MIN, work: W(), files: null }),                             // "Dismiss"
+    agent('D', 'done_checked', { endedAt: T - 7 * MIN }),                                                // "Looks good" in the demo: nothing to merge
+    agent('M', 'done_claimed', { endedAt: T - 9 * MIN, work: W({ merged: MERGED }), files: files(0) }),
+    agent('X', 'stopped', { endedAt: T - 11 * MIN, work: W({ branch: null, folder: false, thrownAway: THROWN }) }),
+  ];
+  const reviewed = new Set(['N', 'S', 'D'].map(id => finishKey(list.find(a => a.id === id))));
+  const b = boardAndTray(model(list, { reviewed }).roots, new Lanes(null), { laptop });
+  assert.deepEqual(b.trayIds.done, ['N', 'S', 'D', 'M', 'X'], 'newest first, as before');
+  assert.deepEqual(list.map(a => doneWords(a, LOOK)), ['not merged', 'stopped', 'done and checked', 'merged', 'thrown away']);
+  assert.equal(b.tray.text, '4 done, 1 not merged');
+  assert.deepEqual([b.tray.lead, b.tray.rest], ['4 done', ', 1 not merged']);
+  assert.equal(b.tray.sum, '4 done, 1 not merged');
+  assert.equal(b.tray.count, 5);
+  // a failed check: its own words, and its work is not merged either
+  const cf = agent('C', 'checks_failed', { work: W(), files: files(2) });
+  assert.equal(doneWords(cf, LOOK), 'checks failed');
+  assert.equal(doneWords(agent('C2', 'checks_failed'), LOOK), 'checks failed', 'in the demo too');
+  assert.equal(doneWords({ ...cf, work: W({ merged: MERGED }), files: files(0) }, LOOK), 'merged', 'merged anyway');
+  // on a dense board, finished work not looked at waits in the tray too, counted the same way
+  const dense = [...Array.from({ length: 13 }, (_, i) => agent('w' + i, 'working')), agent('f', 'done_checked', { work: W(), files: files(1) }),
+    agent('c', 'checks_failed', { work: W(), files: files(1) })];
+  const later = new Set([finishKey(dense[14])]);
+  const d = boardAndTray(model(dense, { later }).roots, new Lanes(null), { laptop, maxRows: 24 });
+  assert.equal(d.dense, true);
+  assert.equal(d.tray.text, '2 not merged');
+  // only work not merged yet: no "0 done"
+  assert.equal(trayWords({ notMerged: 1 }).text, '1 not merged');
 });
 
 test('a reload keeps finished agents off the board: the tab keeps the looks and the lanes, and a draw before the agents arrive frees nothing', () => {
