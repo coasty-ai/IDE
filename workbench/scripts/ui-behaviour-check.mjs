@@ -794,6 +794,32 @@ try {
       `before ${JSON.stringify(p0)}, after ${JSON.stringify(p1)}, lid "${lid}", tray "${tray}", newcomer ${JSON.stringify(p2)}`);
   });
 
+  await run(DT + 'when the tray empties, its open list closes and the keyboard goes to the core\'s sentence', async () => {
+    const where = () => b.ev(`(() => { const a = document.activeElement; return !a || a === document.body ? 'body' : a.closest('#trayList') ? 'list' : a.id === 'tray' ? 'tray' : a.closest('#core') ? 'core:' + a.tagName : a.tagName; })()`);
+    const shownNow = () => b.ev(`[document.getElementById('tray').hidden, document.getElementById('trayList').hidden, document.getElementById('tray').getAttribute('aria-expanded'), document.getElementById('trayList').textContent.trim()]`);
+    const back = async () => { const w1 = await agentOf('w1'); await push('agents', [{ ...w1, state: 'working', endedAt: null, stateSince: Date.now(), now: 'Working on your message', files: null, checks: null }]); };
+    // its list open, the keyboard on its only row; then Invoice export works again (told something elsewhere)
+    await open('done-waits');
+    await sleep(900);
+    await clickIn('[data-act="looksgood"]'); await sleep(1300);
+    await click('#tray'); await sleep(300);
+    const inList = await where();
+    await back(); await sleep(1300);
+    const [trayHidden, listHidden, expanded, words] = await shownNow(), f = await where();
+    check(DT + 'when the tray empties, its open list closes and the keyboard goes to the core\'s sentence',
+      inList === 'list' && trayHidden && listHidden && expanded === 'false' && f === 'core:H1' && (await chipsNow()) === 'w1',
+      `keyboard ${inList} → ${f}; tray hidden ${trayHidden}, list hidden ${listHidden} ("${words}"), expanded ${expanded}`);
+    // the keyboard on the tray itself, its list closed
+    await open('done-waits');
+    await sleep(900);
+    await clickIn('[data-act="looksgood"]'); await sleep(1300);
+    await b.ev(`document.getElementById('tray').focus(), 1`); await sleep(100);
+    const onTray = await where();
+    await back(); await sleep(1300);
+    const f2 = await where();
+    check(DT + 'when the tray empties with the keyboard on it, the keyboard goes to the core\'s sentence', onTray === 'tray' && f2 === 'core:H1', `${onTray} → ${f2}`);
+  });
+
   await run(DT + 'on a dense board, an agent that leaves moves no other chip', async () => {
     // 'many': 25 agents, so the board is dense; r0, at work on a lane of its own, is stopped and its work thrown away
     await open('many');

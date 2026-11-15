@@ -81,6 +81,9 @@ whenRefused(() => { if (!link.refused) { link.refused = true; renderSoon(); } })
 // ---------------------------------------------------------------- the board
 const lanes = new Lanes(safeStorage('sessionStorage'));
 let G = null, lastFirst = true, fontsReady = false;
+// The keyboard goes to the lid's sentence when what held it leaves (a chip leaving the board, the done tray emptying),
+// as other moves do; a swap that follows carries it to the new sentence.
+const lidHome = () => el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
 const board = new Board({
   boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, dram: el.dram, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
   still: () => debug.still, reduced,
@@ -92,7 +95,7 @@ const board = new Board({
     machine: (id, anchor) => toggleMachines(anchor),
     tray: anchor => toggleTray(anchor),
     // a chip that held the keyboard leaves the board: the keyboard goes to the lid's sentence, as other moves do
-    home: () => el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true }),
+    home: () => lidHome(),
   },
 });
 let leaveTimer = null;
@@ -369,6 +372,9 @@ function renderNow(o = {}) {
   const machines = showData ? S.machines.map(m => ({ id: m.id, name: m.name, awake: m.awake !== false, note: machineNote(m), noteText: machineNote(m) })) : [];
   G = layoutBoard({ W, H, P, detail: prefs.detail, roots, laneOf, nRows, dense, lidNeed: needForLayout(v), machines, tray, measure });
   G.queueLength = bm.queue.length;
+  // the tray is drawn only while it holds agents of this run or an earlier one (board.js paintTray): when it empties, its
+  // list closes and the keyboard there goes to the lid's sentence before the tray is hidden
+  if (!G.tray) trayEmptied();
   const hoverRoot = board.card.rootId || null;
   const left = board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
   lastFirst = false;
@@ -963,6 +969,16 @@ function closeTray() {
   el.tray.setAttribute('aria-expanded', 'false');
   if (inside) el.tray.focus({ preventScroll: true });
 }
+/**
+ * The tray is about to be hidden: it holds nothing any more (its last agent is back on the board, or no data is shown).
+ * An open list closes, and the keyboard on the tray or in its list goes to the lid's sentence first, so it is never
+ * dropped (closeTray would hand it to the tray, which is going).
+ */
+function trayEmptied() {
+  const had = el.tray.contains(document.activeElement) || el.trayList.contains(document.activeElement);
+  if (!el.trayList.hidden) { el.trayList.hidden = true; el.tray.setAttribute('aria-expanded', 'false'); }
+  if (had) lidHome();
+}
 let trayIds = { done: [], earlier: [], over: [] };
 function renderTrayList() {
   // each row: its mark, its name, and a few words: where its work went or how it ended ("merged", "thrown away", "not
@@ -976,7 +992,9 @@ function renderTrayList() {
   const done = trayIds.done.map(id => row(id, a => doneWords(a, STATES.LOOK))).join('');
   const early = (trayIds.earlier || []).map(id => row(id, a => agoText(Date.now() - (a.endedAt || a.stateSince)))).join('');
   const over = trayIds.over.map(id => row(id, (a, m) => m.label)).join('');
-  patchChildren(el.trayList, `${done || !early ? `<h2>Done</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  // a row that held the keyboard and went (its agent back on the board) hands it to the list's first row, else the tray
+  const lost = patchChildren(el.trayList, `${done || !early ? `<h2>Done</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  if (lost) (el.trayList.querySelector('button') || el.tray).focus({ preventScroll: true });
   const r = el.tray.getBoundingClientRect();
   // above the tray, inside the board and beside the core (never on it, never on the top band)
   const top = G ? G.board.y + G.P.topBand : 8;
@@ -996,7 +1014,7 @@ el.trayList.addEventListener('click', e => {
   const kb = el.trayList.contains(document.activeElement);
   closeTray();
   // the agent goes to the core; a keyboard user follows it there (its sentence), a mouse user's focus stays put
-  if (kb) el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+  if (kb) lidHome();
   moved();
   render();
 });
