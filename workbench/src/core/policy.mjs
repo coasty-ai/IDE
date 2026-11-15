@@ -101,6 +101,12 @@ const R = Object.freeze({
   gitBranchGone: "This deletes a branch other than the agent's own, with git's record of where it has been.",
   gitRefGone: "This deletes a branch, tag or other name for a commit, with git's record of where it has been.",
   gitWorktreeGone: "This removes another working copy of the repository, or git's records of one, with any work in it that is not committed.",
+  gitWorktreeOther: "This moves, locks or repairs another working copy of the repository, or git's records of one: git finds one by the end of its path, so it could be another agent's.",
+  gitRepack: "This tidies git's records in a way that can delete work that no branch holds any more, so it could never be brought back.",
+  gitReplace: 'This makes git show other commits in place of the ones it has, in every working copy of the repository, yours included.',
+  gitNetwork: "It names an address or a folder that is not one of the repository's own remotes, and git may use your saved sign-in to reach it.",
+  gitPatch: "A patch can change any file in the agent's folder, links and Claude Code's own settings included, which the agent may not change on its own.",
+  gitSettingsOutside: "This reads git's settings from outside the agent's own folder, which can hold your sign-ins.",
   gitUnknown: "This is not one of git's own commands, so it could be an alias or another program.",
   gitPrograms: 'This git command starts other programs.',
   gitRunsProgram: 'This option makes git start another program.',
@@ -177,6 +183,7 @@ export function decide(req) {
   const inp = input && typeof input === 'object' ? input : {};
   const ctx = { cwd, extraAllow, also: [], recipients };
   let verdict;
+  remotesMemo = new Map();
   try {
     ctx.also = readRoots(readAlso);
     verdict = judge(tool, inp, ctx);
@@ -197,6 +204,7 @@ export function decide(req) {
     sentence = null;
   }
   if (typeof sentence !== 'string' || !sentence) sentence = tool === 'Bash' && verdict.decision !== 'allow' ? 'wants to ' + RUN : desc.sentence;
+  remotesMemo = null;
   return { decision: verdict.decision, reason: verdict.reason, sentence, detail: desc.detail };
 }
 
@@ -250,7 +258,7 @@ function judgeMonitor(input, ctx) {
 
 /** Reasons that are only about where a command reaches. Such an ask keeps the command's everyday words. */
 const WHERE_REASONS = new Set([R.readOutside, R.readLinks, R.readList, R.testsOutside, R.testsGit, R.testsClaude,
-  R.nodeOutside, R.nodeGit, R.nodeClaude, R.fileLinked, R.pathUnclear, R.pathBack, R.pathLink]);
+  R.nodeOutside, R.nodeGit, R.nodeClaude, R.fileLinked, R.pathUnclear, R.pathBack, R.pathLink, R.gitSettingsOutside]);
 
 /** Words that read oddly before " outside its own folder": they get ", using something outside its own folder". */
 const OFF_PLACE = /internet|another computer|on this computer|administrator|stop a program/;
@@ -1027,7 +1035,7 @@ function judgeReadOnly(spec, argv, words, base) {
 
 /**
  * git, in the agent's own folder: any of git's own commands runs without asking (committing, branching, merging,
- * rebasing, fetching, pulling, pushing, cloning...). What reaches past the agent's own work still asks:
+ * rebasing, fetching from and pushing to the repository's own remotes...). What reaches past the agent's own work still asks:
  * - options before the command that point git elsewhere or make it run programs (-c, --git-dir, --work-tree,
  *   --exec-path...), and -C with a folder outside the agent's own (-C inside it is fine), or one where git would find
  *   another repository, whose settings act as -c does;
@@ -1038,7 +1046,9 @@ function judgeReadOnly(spec, argv, words, base) {
  * - a place outside the agent's folder in any word (and, for a command that can write, a place in .git or .claude);
  * - init and clone that keep a repository's records in a separate folder, and init that would set up again a repository
  *   whose records are outside the folder (gitRecordsMove);
- * - what destroys what no fetch can bring back (gitForGood).
+ * - what destroys what no fetch can bring back, and what reaches another working copy (gitForGood);
+ * - a patch, a replacement commit, another repository's address instead of one of the repository's own remotes, and git's
+ *   settings read from outside the folder (gitReaches).
  * Wildcards that could turn file names into options ask, as for every command.
  */
 function judgeGit(argv, words, base, also) {
@@ -1078,7 +1088,7 @@ function judgeGit(argv, words, base, also) {
   if (v) return v;
   const read = GIT_READ.has(sub) || sub === 'config'; // config gets here only when it reads
   return gitWords(sub, args, rest, from, base, also, read) || gitRecordsMove(sub, args, at, base) || gitForGood(sub, args, base)
-    || allow(read ? R.gitRead : R.gitAny);
+    || gitReaches(sub, args, base) || allow(read ? R.gitRead : R.gitAny);
 }
 
 /** The asks that depend on a git command's options, not on the places it names; null when there are none. */
@@ -1210,13 +1220,22 @@ function initsElsewhere(dir, base) {
   }
 }
 
+/** What an ask says for the worktree commands that reach another working copy by the end of its path. */
+const WORKTREE_SAYS = Object.freeze({
+  move: 'wants to move another working copy of the repository', lock: 'wants to lock another working copy of the repository',
+  unlock: 'wants to unlock another working copy of the repository', repair: "wants to repair git's records of other working copies",
+});
+
 /**
  * What destroys what no fetch can bring back, null for anything else: git's record of earlier commits (reflog expire,
- * delete and drop), the commits no branch holds (gc --prune with any value, prune), a branch other than the agent's own
- * with its record (branch -d or -D: Workbench names the agent's branch workbench/<its folder's name>), any of git's names
- * for a commit (update-ref -d, or a new value of all zeros, which deletes too), and other working copies of the
- * repository with their uncommitted work (worktree remove and prune: git finds a working copy by the end of its path, so
- * the words cannot show whose it is). An agent's own work needs none of them.
+ * delete and drop), the commits no branch holds (gc --prune with any value, prune), upkeep that can delete them too
+ * (maintenance run with any task, repack -d, prune-packed: after a dropped stash, `maintenance run --task=loose-objects` and
+ * `repack -a -d` leave nothing to bring back), a branch other than the agent's own with its record (branch -d or -D:
+ * Workbench names the agent's branch workbench/<its folder's name>), any of git's names for a commit (update-ref -d, or a
+ * new value of all zeros, which deletes too), and other working copies of the repository (worktree remove and prune, with
+ * their uncommitted work, and move, lock, unlock and repair: git finds a working copy by the end of its path, so the words
+ * cannot show whose it is, and a working copy moved into the agent's folder goes when that folder is thrown away). An
+ * agent's own work needs none of them.
  */
 function gitForGood(sub, args, base) {
   const first = args.find(a => !a.startsWith('-'));
@@ -1224,6 +1243,10 @@ function gitForGood(sub, args, base) {
   if (sub === 'prune' || (sub === 'gc' && args.some(a => longIs(a, ['prune'])))) {
     return { ...ask(R.gitPrune), say: 'wants to delete commits that no branch holds' };
   }
+  if ((sub === 'maintenance' && first === 'run') || sub === 'prune-packed' || (sub === 'repack' && args.some(a => /^-[^-]*d/.test(a)))) {
+    return { ...ask(R.gitRepack), say: "wants to tidy git's records, which can delete work that no branch holds" };
+  }
+  if (sub === 'worktree' && Object.hasOwn(WORKTREE_SAYS, first ?? '')) return { ...ask(R.gitWorktreeOther), say: WORKTREE_SAYS[first] };
   if (sub === 'update-ref' && refDeletes(args)) return { ...ask(R.gitRefGone), say: 'wants to delete a branch, tag or other name for a commit' };
   const gone = sub === 'branch' ? branchDeletes(args) : null;
   if (gone && (gone.remotes || gone.names.some(n => n !== 'workbench/' + path.basename(base)))) {
@@ -1280,6 +1303,278 @@ function refDeletes(args) {
     operands.push(a);
   }
   return /^(0{40}|0{64})$/.test(operands[1] ?? '');
+}
+
+/**
+ * What reaches past the agent's own work by what a git command does, rather than by the places it names; null for
+ * anything else: a patch, which can write any file in the folder (apply, am); a replacement commit, which changes what
+ * every working copy shows (gitReplaces); another repository, reached with the person's saved sign-in (gitNetwork); and
+ * git's settings read from outside the folder: the person's own, the computer's, or a list across all of them
+ * (configReadsOutside, and `git var -l`, which lists them too), as `cat ~/.gitconfig` asks.
+ */
+function gitReaches(sub, args, base) {
+  if (sub === 'apply' && appliesPatch(args)) return { ...ask(R.gitPatch), say: 'wants to apply a patch to its files' };
+  if (sub === 'am' && !(args.length === 1 && /^--show-current-patch(=|$)/.test(args[0]))) return { ...ask(R.gitPatch), say: 'wants to apply patches and commit them' };
+  const replaced = gitReplaces(sub, args);
+  if (replaced) return replaced;
+  const far = gitNetwork(sub, args, base);
+  if (far) return far;
+  if ((sub === 'config' && configReadsOutside(args)) || (sub === 'var' && args.some(a => /^-[^-]*l/.test(a)))) {
+    return { ...ask(R.gitSettingsOutside, 'outside'), say: "wants to read git's settings from outside its own folder" };
+  }
+  return null;
+}
+
+/** Whether `git apply` applies the patch: unless --stat, --numstat, --summary or --check turn that off and --apply does not turn it back on. */
+function appliesPatch(args) {
+  let inspects = false;
+  for (const a of args) {
+    if (a === '--') break;
+    if (/^--(stat|numstat|summary|check)$/.test(a)) inspects = true;
+    else if (longIs(a, ['apply']) || longIs(a, ['build-fake-ancestor'])) return true; // --build-fake-ancestor writes a file of its own
+  }
+  return !inspects;
+}
+
+/**
+ * A replacement commit: git then shows other contents in place of a commit it has, in every working copy, the person's
+ * own included, until the replacement goes. `git replace` in any form but a list, and the same done another way: a name
+ * under refs/replace written directly (update-ref, symbolic-ref) or fetched into (a refspec whose destination can be
+ * there, such as refs/replace/* or refs/*). null for anything else.
+ */
+function gitReplaces(sub, args) {
+  const hit = { ...ask(R.gitReplace), say: 'wants to make git show a different commit in place of another' };
+  if (sub === 'replace') return replaceWrites(args) ? hit : null;
+  if (sub === 'update-ref' || sub === 'symbolic-ref') return args.some(a => /^refs\/replace(\/|$)/i.test(a)) ? hit : null;
+  if (sub === 'fetch' || sub === 'pull') {
+    const { operands } = gitArgs(args, NET_VALUES[sub]);
+    for (const spec of operands.slice(1)) {
+      const at = spec.indexOf(':');
+      if (at >= 0 && intoReplace(spec.slice(at + 1))) return hit;
+    }
+  }
+  return null;
+}
+
+/** Whether a fetch refspec's destination can name something under refs/replace/: it is there, or a pattern whose fixed start is on the way. */
+function intoReplace(dst) {
+  const d = dst.toLowerCase();
+  const star = d.indexOf('*');
+  return d.startsWith('refs/replace/') || (star >= 0 && 'refs/replace/'.startsWith(d.slice(0, star)));
+}
+
+/** Whether `git replace` writes: anything but listing (no words, or -l/--list with patterns, and --format). */
+function replaceWrites(args) {
+  let lists = false;
+  const operands = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+    if (a === '-l' || (longIs(a, ['list']) && !a.includes('='))) { lists = true; continue; }
+    if (a.startsWith('--') && a.length > 4 && 'format'.startsWith(a.slice(2).split('=')[0])) { if (!a.includes('=')) k++; continue; }
+    if (a.startsWith('-')) return true; // -f, -d, --edit, --graft, --raw, --convert-graft-file...: each changes what git shows
+    operands.push(a);
+  }
+  return !lists && operands.length > 0;
+}
+
+/**
+ * The options of the git commands that reach another repository which take the next word as their value (from
+ * `git <command> -h`; an option shown with [=<value>] takes it only after "=", and is not here). They matter: the first
+ * other word is the repository. `flags`: options with no value of their own whose whole name starts one of `long`; git takes
+ * a whole name over an abbreviation, so `fetch --recurse-submodules <repository>` is not `--recurse-submodules-default`.
+ */
+const NET_VALUES = Object.freeze({
+  fetch: { long: ['upload-pack', 'jobs', 'depth', 'shallow-since', 'shallow-exclude', 'deepen', 'refmap', 'server-option', 'negotiation-tip',
+    'filter', 'submodule-prefix', 'recurse-submodules-default'], short: 'jo', flags: ['recurse-submodules'] },
+  pull: { long: ['cleanup', 'strategy', 'strategy-option', 'upload-pack', 'depth', 'shallow-since', 'shallow-exclude', 'deepen', 'refmap',
+    'server-option', 'negotiation-tip'], short: 'sXo', flags: ['recurse-submodules'] },
+  push: { long: ['repo', 'recurse-submodules', 'receive-pack', 'exec', 'push-option'], short: 'o' },
+  'ls-remote': { long: ['upload-pack', 'exec', 'sort', 'server-option'], short: 'o' },
+  archive: { long: ['format', 'prefix', 'add-file', 'add-virtual-file', 'output', 'remote', 'exec', 'mtime'], short: 'o' },
+});
+
+/**
+ * A git command's words that are not options or their values (`operands`), and its options with their values (`opts`,
+ * [name, value]). git takes any start of a long option that fits only one: a start that fits one with a value takes the next
+ * word (when it fits more than one, git refuses the command). `--no-…` takes none.
+ */
+function gitArgs(args, values) {
+  const operands = [];
+  const opts = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const name = (eq < 0 ? a : a.slice(0, eq)).slice(2);
+      const takes = values.long.includes(name) || (!(values.flags ?? []).includes(name) && values.long.some(n => n.startsWith(name)));
+      if (eq >= 0) opts.push([name, a.slice(eq + 1)]);
+      else if (name && !name.startsWith('no-') && takes) { opts.push([name, args[k + 1]]); k++; }
+      else opts.push([name, undefined]);
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        if (!values.short.includes(a[j])) continue;
+        if (j === a.length - 1) { opts.push([a[j], args[k + 1]]); k++; } else opts.push([a[j], a.slice(j + 1)]);
+        break;
+      }
+      continue;
+    }
+    operands.push(a);
+  }
+  return { operands, opts };
+}
+
+/** A word that is an address wherever it stands: a web address, user@host:path, or a file: address. A refspec is never one. */
+const ADDRESS = /^([a-z][a-z0-9+.-]*:\/\/|[^@/:\s]+@[^/:\s]+:|file:)/i;
+
+/**
+ * Another repository, reached from the agent's: a git command that names an address (a web address, ssh, user@host:path,
+ * host:path, file:) or a folder where git takes a repository, instead of one of the repository's own remotes
+ * (configuredRemotes). git would reach it with the person's saved sign-in, or read and write another repository on this
+ * computer. A remote's name decides only when the repository's settings name it: git takes any other word for a path.
+ * - fetch, pull, push, ls-remote: the repository is the first other word (all of them after fetch --multiple), or push's
+ *   --repo; an address among the other words asks too, wherever it stands. Naming none uses the repository's own remotes.
+ * - clone, send-pack and fetch-pack always name an address or a folder; so do `submodule add`, `remote add` and
+ *   `remote set-url`, and `submodule init`, `sync`, `set-url` and `update --init`, which take addresses from .gitmodules, a
+ *   file the agent can change.
+ * - `remote show` and `remote prune` with a name that is not a remote's, `archive --remote`, and request-pull's address.
+ */
+function gitNetwork(sub, args, base) {
+  const far = say => ({ ...ask(R.gitNetwork, undefined, 'reach another repository'), ...(say ? { say } : {}) });
+  const own = r => r !== undefined && configuredRemotes(base).has(r);
+  const first = args.find(a => !a.startsWith('-'));
+  if (sub === 'clone') return far(); // narrate names what it downloads, and from where
+  if (sub === 'send-pack' || sub === 'fetch-pack') return far('wants to reach another repository');
+  if (sub === 'submodule') {
+    if (first === 'add') return far('wants to add a submodule from another repository');
+    if (first === 'init' || first === 'sync' || first === 'set-url') return far('wants to set up submodules from the addresses in .gitmodules');
+    if (first === 'update' && args.some(a => longIs(a, ['init']))) return far('wants to download submodules from the addresses in .gitmodules');
+    return null;
+  }
+  if (sub === 'remote') {
+    if (first === 'add') return far('wants to add a remote');
+    if (first === 'set-url') return far('wants to change where a remote points');
+    if (first === 'show' || first === 'prune') return args.filter(a => !a.startsWith('-')).slice(1).every(own) ? null : far();
+    return null;
+  }
+  if (sub === 'request-pull') return own(args.filter(a => !a.startsWith('-'))[1]) ? null : far('wants to reach another repository');
+  if (!Object.hasOwn(NET_VALUES, sub)) return null;
+  const { operands, opts } = gitArgs(args, NET_VALUES[sub]);
+  if (sub === 'archive') {
+    const remote = opts.filter(([n]) => n.length >= 2 && 'remote'.startsWith(n));
+    return remote.every(([, v]) => own(v)) ? null : far('wants to download an archive from another repository');
+  }
+  const multiple = sub === 'fetch' && args.some(a => /^--mu/.test(a) || /^-[^-]*m/.test(a));
+  const repos = multiple ? operands : operands.slice(0, 1);
+  if (sub === 'push') repos.push(...opts.filter(([n]) => n.length >= 1 && 'repo'.startsWith(n)).map(([, v]) => v));
+  if (!repos.every(own)) return far();
+  if (args.some(a => ADDRESS.test(a) || ADDRESS.test(a.slice(a.indexOf('=') + 1)))) return far();
+  return null;
+}
+
+/** Set by decide() for one decision: the repository's own remotes, by the agent's folder, so its settings are read once. */
+let remotesMemo = null;
+
+/**
+ * The names of the repository's own remotes: the [remote "<name>"] sections of its settings (for a worktree, the main
+ * repository's, and the worktree's own config.worktree), and git's oldest forms, a file in remotes/ or branches/. Read from
+ * the records git uses from the agent's folder (gitDirsOf). A remote set only in the person's own settings (~/.gitconfig)
+ * or in an included file is not counted, so naming it asks.
+ */
+function configuredRemotes(base) {
+  if (remotesMemo?.has(base)) return remotesMemo.get(base);
+  const names = new Set();
+  const dirs = gitDirsOf(base);
+  if (dirs) {
+    for (const file of [dirs.common + '/config', dirs.git + '/config.worktree']) {
+      const text = readText(file);
+      if (text === null) continue;
+      for (const m of text.matchAll(/^[ \t]*\[[ \t]*remote[ \t]+"((?:[^"\\\n]|\\.)*)"[ \t]*\]/gim)) names.add(m[1].replace(/\\(.)/g, '$1'));
+      for (const m of text.matchAll(/^[ \t]*\[[ \t]*remote\.([^\]\s]+)[ \t]*\]/gim)) names.add(m[1].toLowerCase()); // the old [remote.name]
+    }
+    for (const sub of ['remotes', 'branches']) {
+      try { for (const n of fs.readdirSync(dirs.common + '/' + sub)) names.add(n); } catch { /* none */ }
+    }
+  }
+  remotesMemo?.set(base, names);
+  return names;
+}
+
+/** The records git uses from `dir`: the nearest .git on the way up, a folder or a file that names one, and the folder they share (commondir). */
+function gitDirsOf(dir) {
+  for (let d = dir; ; d = path.dirname(d)) {
+    let st = null;
+    try { st = fs.statSync(d + '/.git'); } catch { /* not here */ }
+    if (st) {
+      let git = d + '/.git';
+      if (st.isFile()) {
+        const m = /^gitdir:[ \t]*(.*?)[ \t]*$/m.exec(readText(git) ?? '');
+        if (!m || !m[1]) return null;
+        git = path.resolve(d, m[1]);
+      }
+      const common = (readText(git + '/commondir') ?? '').trim();
+      return { git, common: common ? path.resolve(git, common) : git };
+    }
+    if (path.dirname(d) === d) return null;
+  }
+}
+
+/** A file's text, or null when it cannot be read. */
+function readText(p) {
+  try { return fs.readFileSync(p, 'utf8'); } catch { return null; }
+}
+
+/** git config's long options (git 2.39 to 2.47), to read an abbreviation as git does. */
+const CONFIG_OPTS = ['global', 'system', 'local', 'worktree', 'file', 'blob', 'get', 'get-all', 'get-regexp', 'get-urlmatch', 'replace-all', 'add',
+  'unset', 'unset-all', 'rename-section', 'remove-section', 'list', 'fixed-value', 'edit', 'get-color', 'get-colorbool', 'type', 'bool', 'int',
+  'bool-or-int', 'bool-or-str', 'path', 'expiry-date', 'no-type', 'null', 'name-only', 'includes', 'show-origin', 'show-scope', 'default', 'comment',
+  'value', 'url', 'all', 'regexp', 'append'];
+
+/**
+ * Whether a `git config` that only reads reaches settings outside the agent's folder: the person's own or the computer's
+ * (--global, --system), or a list or search across every scope (--list, -l, --get-regexp, --show-origin, --show-scope,
+ * git 2.46's `list` and `get --regexp`, --get-urlmatch with a section and no key) unless --local, --worktree, --file or --blob
+ * keeps it to one file, and --includes does not reach past it. One setting read by its name stays a plain read: git uses it
+ * here anyway. A file named with --file is judged as a place, as for any command.
+ */
+function configReadsOutside(args) {
+  let wide = false;
+  let scoped = false;
+  let widen = false;
+  let lists = false;
+  let url = false;
+  const names = [];
+  // An option's meanings: its exact name, or every long option it is the start of (git refuses one that fits several).
+  const means = name => (CONFIG_OPTS.includes(name) ? [name] : CONFIG_OPTS.filter(n => n.startsWith(name)));
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { names.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      const m = means(a.slice(2).split('=')[0]);
+      if (m.some(n => n === 'global' || n === 'system')) wide = true;
+      if (m.some(n => ['list', 'get-regexp', 'show-origin', 'show-scope', 'regexp'].includes(n))) lists = true;
+      if (m.some(n => n === 'includes')) widen = true;
+      if (m.some(n => n === 'get-urlmatch' || n === 'url')) url = true;
+      if (m.length === 1 && ['local', 'worktree', 'file', 'blob'].includes(m[0])) scoped = true;
+      if (!a.includes('=') && m.length === 1 && ['file', 'blob', 'type', 'default', 'comment', 'value', 'url'].includes(m[0])) k++;
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        if (a[j] === 'l') lists = true;
+        if (a[j] === 'f') { scoped = true; if (j === a.length - 1) k++; break; } // -f <file>: the rest is its value
+      }
+      continue;
+    }
+    names.push(a);
+  }
+  if (names[0] === 'list') lists = true;
+  const name = names[0] === 'get' || names[0] === 'list' ? names[1] : names[0];
+  if (url && typeof name === 'string' && !name.includes('.')) lists = true; // a section alone: every key in it
+  return wide || (lists && (!scoped || widen));
 }
 
 /** `gh auth token`, `gh auth status --show-token` (-t) and `gh auth git-credential` show the person's GitHub sign-in. */
