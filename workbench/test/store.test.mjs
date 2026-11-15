@@ -272,6 +272,35 @@ test('a root picked up again by a message drops the error of its earlier run', (
   assert.equal(s.get('r1').error, 'Exit code 4', 'a later failure says its own error');
 });
 
+test('a process that ends after its agent finished leaves the finish as it was: endedAt stays the first of that run', () => {
+  const { s } = recording();
+  s.apply([created('r1'), state('r1', 'working', T0 + 1000)]);
+  s.apply(state('r1', 'done_checked', T0 + 5000));
+  assert.equal(s.get('r1').endedAt, T0 + 5000);
+  // Claude Code's process exits a little after its last turn: the finish the page keys its looks on does not move
+  s.apply({ kind: EV.ENDED, ts: T0 + 9000, agentId: 'r1', outcome: 'ok' });
+  assert.equal(s.get('r1').endedAt, T0 + 5000);
+  assert.equal(s.get('r1').state, 'done_checked');
+  assert.equal(s.get('r1').error, null);
+  // picked up again, it finishes again: a new finish, which its own late process end leaves alone too
+  s.apply({ kind: EV.TURN, ts: T0 + 10000, agentId: 'r1', phase: 'start' });
+  assert.equal(s.get('r1').endedAt, null);
+  s.apply(state('r1', 'done_claimed', T0 + 12000));
+  s.apply({ kind: EV.ENDED, ts: T0 + 15000, agentId: 'r1', outcome: 'ok' });
+  assert.equal(s.get('r1').endedAt, T0 + 12000);
+  // a stopped agent, whose process ends after the stop
+  s.apply([created('r2'), state('r2', 'working', T0 + 1000), state('r2', 'stopped', T0 + 2000)]);
+  s.apply({ kind: EV.ENDED, ts: T0 + 6000, agentId: 'r2', outcome: 'stopped' });
+  assert.equal(s.get('r2').endedAt, T0 + 2000);
+  // a process that ends while its agent still works sets endedAt, as before, and the state that follows sets its own
+  s.apply([created('r3'), state('r3', 'working', T0 + 1000)]);
+  s.apply({ kind: EV.ENDED, ts: T0 + 3000, agentId: 'r3', outcome: 'error', error: 'Exit code 1' });
+  assert.equal(s.get('r3').endedAt, T0 + 3000);
+  assert.equal(s.get('r3').error, 'Exit code 1');
+  s.apply(state('r3', 'failed', T0 + 3500));
+  assert.equal(s.get('r3').endedAt, T0 + 3500);
+});
+
 test('plan, says, files, checks, rules, model, session, approvals and ended', () => {
   const { s } = recording();
   s.apply(created('r1'));

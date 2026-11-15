@@ -75,7 +75,7 @@ Reducer rules (in `store.mjs`):
 | `agent.work` | `{ agentId, work }`: `work` replaces the view's `work` as a whole (see "Work" below). Only its known fields are kept, as copies; a field the payload leaves out is `null` (`folder`: `false`). Ignored for helpers: a helper works in its agent's folder. |
 | `agent.resumed` | An earlier agent (restored from history, see "History") is picked up: `earlier = false`, `canContinue = null`, `continueReason = null`, `now = 'Picking up where it left off'`, and `budgetUsd` is replaced when the event carries one (the fresh limit for this run). The engine sends it with `agent.state working` in one batch. It also follows the `agent.state working` of a root of this run given one more spending limit (`raiseLimit`, see "The spending limit"): then `budgetUsd` is what it may spend in all now. |
 | `agent.approval` | `approvals.auto`, `.byYou` or `.denied` += 1 (`denied` for any `decision: 'deny'`). |
-| `agent.ended` | `endedAt = ts`; `error` from the event. |
+| `agent.ended` | `endedAt = ts`, unless the agent has finished already (it is in a state in `ENDED` and has an `endedAt`): then `endedAt` stays the first of that run, so a process that ends after its agent finished (a clean exit after its last turn, or a stopped agent's process ending after the stop) changes nothing the page keys its looks on (`finishKey`, see "Finished with"). `error` from the event. |
 | `machine.update` | Insert or replace the machine by `id`. |
 | `notice` | Pass through to the UI as a notice. |
 
