@@ -109,6 +109,7 @@ const R = Object.freeze({
   gitRepack: "This tidies git's records in a way that can delete work that no branch holds any more, so it could never be brought back.",
   gitReplace: 'This makes git show other commits in place of the ones it has, in every working copy of the repository, yours included.',
   gitNetwork: "It names an address or a folder that is not one of the repository's own remotes, and git may use your saved sign-in to reach it.",
+  gitSubmodules: 'Submodules come from the addresses in the .gitmodules file, which the agent can change, and git may use your saved sign-in to reach them.',
   gitPatch: "A patch can change any file in the agent's folder, links and Claude Code's own settings included, which the agent may not change on its own.",
   gitSettingsOutside: "This reads git's settings from outside the agent's own folder, which can hold your sign-ins.",
   gitUnknown: "This is not one of git's own commands, so it could be an alias or another program.",
@@ -1673,7 +1674,8 @@ function refDeletes(args) {
 /**
  * What reaches past the agent's own work by what a git command does, rather than by the places it names; null for
  * anything else: a patch, which can write any file in the folder (apply, am); a replacement commit, which changes what
- * every working copy shows (gitReplaces); another repository, reached with the person's saved sign-in (gitNetwork); and
+ * every working copy shows (gitReplaces); another repository, reached with the person's saved sign-in, and submodules from
+ * the addresses in .gitmodules (gitNetwork); and
  * git's settings read from outside the folder: the person's own, the computer's, or a list across all of them
  * (configReadsOutside, and `git var -l`, which lists them too), as `cat ~/.gitconfig` asks.
  */
@@ -1704,16 +1706,18 @@ function appliesPatch(args) {
 /**
  * A replacement commit: git then shows other contents in place of a commit it has, in every working copy, the person's
  * own included, until the replacement goes. `git replace` in any form but a list, and the same done another way: a name
- * under refs/replace written directly (update-ref, symbolic-ref) or fetched into (a refspec whose destination can be
- * there, such as refs/replace/* or refs/*). null for anything else.
+ * under refs/replace written directly (update-ref, symbolic-ref) or fetched into (a refspec, or a --refmap, whose
+ * destination can be there, such as refs/replace/* or refs/*). null for anything else.
  */
 function gitReplaces(sub, args) {
   const hit = { ...ask(R.gitReplace), say: 'wants to make git show a different commit in place of another' };
   if (sub === 'replace') return replaceWrites(args) ? hit : null;
   if (sub === 'update-ref' || sub === 'symbolic-ref') return args.some(a => /^refs\/replace(\/|$)/i.test(a)) ? hit : null;
   if (sub === 'fetch' || sub === 'pull') {
-    const { operands } = gitArgs(args, NET_VALUES[sub]);
-    for (const spec of operands.slice(1)) {
+    const { operands, opts } = gitArgs(args, NET_VALUES[sub]);
+    // --refmap maps the refs named on the command line as a refspec in the settings would (`refs/heads/*:refs/replace/*`).
+    const refmaps = opts.filter(([n, v]) => n.length >= 3 && 'refmap'.startsWith(n) && typeof v === 'string').map(([, v]) => v);
+    for (const spec of [...operands.slice(1), ...refmaps]) {
       const at = spec.indexOf(':');
       if (at >= 0 && intoReplace(spec.slice(at + 1))) return hit;
     }
@@ -1803,20 +1807,23 @@ const ADDRESS = /^([a-z][a-z0-9+.-]*:\/\/|[^@/:\s]+@[^/:\s]+:|file:)/i;
  * - fetch, pull, push, ls-remote: the repository is the first other word (all of them after fetch --multiple), or push's
  *   --repo; an address among the other words asks too, wherever it stands. Naming none uses the repository's own remotes.
  * - clone, send-pack and fetch-pack always name an address or a folder; so do `submodule add`, `remote add` and
- *   `remote set-url`, and `submodule init`, `sync`, `set-url` and `update --init`, which take addresses from .gitmodules, a
- *   file the agent can change.
+ *   `remote set-url`. `submodule init`, `sync`, `set-url` and `update` take addresses from .gitmodules, a file the agent can
+ *   change: `update` with --init, and a plain `update` too when the settings make every submodule active (submodule.active,
+ *   as `git clone --recurse-submodules` leaves it), which then clones a submodule only .gitmodules names.
  * - `remote show` and `remote prune` with a name that is not a remote's, `archive --remote`, and request-pull's address.
  */
 function gitNetwork(sub, args, base) {
-  const far = say => ({ ...ask(R.gitNetwork, undefined, 'reach another repository'), ...(say ? { say } : {}) });
+  const far = (say, reason = R.gitNetwork) => ({ ...ask(reason, undefined, 'reach another repository'), ...(say ? { say } : {}) });
   const own = r => r !== undefined && configuredRemotes(base).has(r);
   const first = args.find(a => !a.startsWith('-'));
   if (sub === 'clone') return far(); // narrate names what it downloads, and from where
   if (sub === 'send-pack' || sub === 'fetch-pack') return far('wants to reach another repository');
   if (sub === 'submodule') {
     if (first === 'add') return far('wants to add a submodule from another repository');
-    if (first === 'init' || first === 'sync' || first === 'set-url') return far('wants to set up submodules from the addresses in .gitmodules');
-    if (first === 'update' && args.some(a => longIs(a, ['init']))) return far('wants to download submodules from the addresses in .gitmodules');
+    if (first === 'init' || first === 'sync' || first === 'set-url') return far('wants to set up submodules from the addresses in .gitmodules', R.gitSubmodules);
+    if (first === 'update') {
+      return far(args.some(a => longIs(a, ['init'])) ? 'wants to download submodules from the addresses in .gitmodules' : 'wants to download submodules', R.gitSubmodules);
+    }
     return null;
   }
   if (sub === 'remote') {

