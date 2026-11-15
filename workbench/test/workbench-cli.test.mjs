@@ -301,13 +301,16 @@ test('elsewhere the browser opens a 0600 file in a new 0700 folder that sends it
   const address = pageAddress();
   const key = new URL(address).searchParams.get('t');
   const { calls, spawnFn } = fakeSpawn();
-  const opened = openBrowser(address, { platform: 'linux', spawn: spawnFn, say: () => {}, tmpdir: tmp, keepMs: 60_000 });
+  const { privateTemp } = await import('../src/core/workspace.mjs');
+  const made = (prefix) => privateTemp(prefix, { home: tmp });
+  const opened = openBrowser(address, { platform: 'linux', spawn: spawnFn, say: () => {}, privateTemp: made, keepMs: 60_000 });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, 'xdg-open');
   assert.equal(calls[0].args.length, 1);
   assert.ok(!calls[0].args[0].includes(key), 'the key is in no argument');
   const file = calls[0].args[0];
-  assert.equal(path.dirname(path.dirname(file)), tmp);
+  // In Workbench's private folder for temporary files, never the system's, which a Codex agent's sandbox can write.
+  assert.equal(path.dirname(path.dirname(file)), path.join(tmp, '.workbench', 'tmp'));
   assert.equal(statSync(path.dirname(file)).mode & 0o777, 0o700);
   assert.equal(statSync(file).mode & 0o777, 0o600);
   const page = readFileSync(file, 'utf8');
@@ -317,10 +320,16 @@ test('elsewhere the browser opens a 0600 file in a new 0700 folder that sends it
   opened.cleanup();
   assert.equal(existsSync(path.dirname(file)), false);
   const again = fakeSpawn();
-  openBrowser(address, { platform: 'linux', spawn: again.spawnFn, say: () => {}, tmpdir: tmp, keepMs: 30 });
+  openBrowser(address, { platform: 'linux', spawn: again.spawnFn, say: () => {}, privateTemp: made, keepMs: 30 });
   await sleep(150);
   assert.equal(existsSync(path.dirname(again.calls[0].args[0])), false, 'gone once it had time to be read');
-  assert.deepEqual(readdirSync(tmp), []);
+  assert.deepEqual(readdirSync(path.join(tmp, '.workbench', 'tmp')), []);
+  // With no private folder to be had, nothing is written anywhere else: the person opens the printed address.
+  const said = [];
+  const none = fakeSpawn();
+  openBrowser(address, { platform: 'linux', spawn: none.spawnFn, say: (l) => said.push(l), privateTemp: () => { throw new Error('no folder'); } });
+  assert.equal(none.calls.length, 0);
+  assert.deepEqual(said, ['Could not open the browser. Open the address above yourself.']);
 });
 
 test('only an address shaped as Workbench builds it is opened; on Windows the person opens it', async () => {

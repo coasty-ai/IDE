@@ -808,14 +808,17 @@ const OPENER_KEEP_MS = 2 * 60_000;
 /**
  * Open the page in the person's browser without its key on any command line, which every account on the computer can
  * read (ps). On macOS, `/usr/bin/osascript -` reads `open location "<address>"` on its standard input. Elsewhere, a
- * small page that sends the browser on to the address is written to a new private folder (0700; the file 0600) and
- * opened with `xdg-open <file>`; it is removed after `keepMs`, or by `cleanup()` (when Workbench stops), whichever is
- * first. On Windows, and for any address not shaped as Workbench builds it, the person opens the printed address.
+ * small page that sends the browser on to the address is written to a new private folder from `privateTemp` (the
+ * loaded workspace module's: `~/.workbench/tmp/workbench-open-XXXXXX`, 0700; the file 0600; never the system's
+ * temporary folder, which a Codex agent's sandbox can write) and opened with `xdg-open <file>`; it is removed after
+ * `keepMs`, or by `cleanup()` (when Workbench stops), whichever is first. With no `privateTemp`, or none to be had,
+ * nothing is written and the person opens the printed address, as on Windows and for any address not shaped as
+ * Workbench builds it.
  * @param {string} address  `http://127.0.0.1:<port>/?t=<key>`
- * @param {{ platform?: string, spawn?: Function, say?: Function, tmpdir?: string, keepMs?: number }} [o] (tests)
+ * @param {{ platform?: string, spawn?: Function, say?: Function, privateTemp?: (prefix: string) => string, keepMs?: number }} [o]
  * @returns {{ cleanup(): void }}
  */
-export function openBrowser(address, { platform = process.platform, spawn: run = spawn, say: out = say, tmpdir = os.tmpdir(), keepMs = OPENER_KEEP_MS } = {}) {
+export function openBrowser(address, { platform = process.platform, spawn: run = spawn, say: out = say, privateTemp = null, keepMs = OPENER_KEEP_MS } = {}) {
   const none = { cleanup() {} };
   if (platform === 'win32' || typeof address !== 'string' || !PAGE_ADDRESS.test(address)) {
     out('Open the address above in your browser.');
@@ -852,7 +855,8 @@ export function openBrowser(address, { platform = process.platform, spawn: run =
     dir = null;
   };
   try {
-    dir = fs.mkdtempSync(path.join(tmpdir, 'workbench-open-'));
+    if (typeof privateTemp !== 'function') throw new Error('no private folder for temporary files');
+    dir = privateTemp('workbench-open-');
     const file = path.join(dir, 'open.html');
     fs.writeFileSync(file, [
       '<!doctype html>', '<meta charset="utf-8">', '<meta name="referrer" content="no-referrer">',
@@ -1197,7 +1201,7 @@ async function main() {
     if (appGone) stopAll(0); // the app went away while Workbench started, after a clone
   }
   if (args.open) {
-    const opened = openBrowser(address);
+    const opened = openBrowser(address, { privateTemp: mods?.workspace?.privateTemp });
     process.on('exit', () => opened.cleanup());
   }
   return null; // keep running
