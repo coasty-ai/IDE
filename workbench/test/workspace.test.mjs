@@ -173,6 +173,23 @@ test('git in a process group of its own (detached) ends the same ways as git sta
   assert.equal(none.code, 'ENOENT');
 });
 
+test('the folders that hold agents’ copies are private: ~/.workbench, worktrees/ and each repository’s folder are made 0700', async () => {
+  // HOME is these tests' own temporary folder (see before()), so this is the default place, as a live run uses it.
+  const top = path.join(process.env.HOME, '.workbench');
+  assert.equal(fs.existsSync(top), false);
+  const ws = await createWorkspace({ repoRoot: repo, agentId: 'pv0001', slug: 'private' });
+  try {
+    const mode = (p) => fs.statSync(p).mode & 0o777;
+    assert.equal(path.dirname(path.dirname(ws.path)), fs.realpathSync.native(path.join(top, 'worktrees')));
+    assert.equal(mode(top), 0o700);
+    assert.equal(mode(path.join(top, 'worktrees')), 0o700);
+    assert.equal(mode(path.dirname(ws.path)), 0o700);
+  } finally {
+    await removeWorkspace({ repoRoot: repo, path: ws.path, deleteBranch: true });
+    fs.rmSync(top, { recursive: true, force: true });
+  }
+});
+
 test('createWorkspace makes a worktree from the last commit, diffStats counts the changes, removeWorkspace cleans up', async () => {
   const root = fs.realpathSync.native(repo);
   const ws = await createWorkspace({ repoRoot: repo, agentId: 'a1b2c3', slug: 'Fix the flaky test!', baseDir });

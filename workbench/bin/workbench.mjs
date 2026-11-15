@@ -870,6 +870,20 @@ export function openBrowser(address, { platform = process.platform, spawn: run =
   return { cleanup() { clearTimeout(timer); remove(); } };
 }
 
+/**
+ * ~/.workbench holds agents' copies of the person's repositories, their history and what keys are kept: only this
+ * account may open it. One an earlier Workbench made may still be open to others (0755): it is made 0700 at every
+ * start, through a link too, when it is this account's (privateFolder in src/core/prefs.mjs). A missing one is not
+ * made here, and nothing about it ever stops the start.
+ */
+function tightenHome(prefsMod, log) {
+  try {
+    prefsMod.privateFolder(path.join(os.homedir(), '.workbench'), { create: false });
+  } catch (err) {
+    log.warn('Workbench could not make ~/.workbench private to your account:', err);
+  }
+}
+
 /** Exit with a code once output is flushed; force it if something keeps the process alive. */
 function finish(code) {
   process.exitCode = code;
@@ -939,6 +953,7 @@ async function main() {
     if (args.verbose && err.cause) complain(err.cause.stack || String(err.cause));
     return 1;
   }
+  tightenHome(mods.prefs, log);
 
   // --clone: copy the repository first, then go on as --repo <its folder>. For the Mac app, standard input is the
   // lifeline from now on: if it closes after the clone, Workbench stops as soon as it has started (appGone, below).

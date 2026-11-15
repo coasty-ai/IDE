@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync, accessSync, existsSync, readdirSync, constants } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync, accessSync, existsSync, readdirSync, chmodSync, constants } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -376,6 +376,29 @@ test('--port with another program answering there, on any of this computer’s o
       `Port ${port} is already in use. Try another one with --port, or leave --port out for a free one.`, host);
     assert.doesNotMatch(r.stdout, /Workbench is running at/, host);
   }
+});
+
+test('at every start, a ~/.workbench that others could open is made 0700, also through a link; a missing one is not made', async (t) => {
+  const w = setup(t);
+  const dir = path.join(w.home, '.workbench');
+  const none = await running(t, ['--demo', '--no-open'], w.env);
+  assert.equal(await none.stop(), 0, none.out());
+  assert.equal(existsSync(dir), false);
+  // one an earlier Workbench made: agents' copies of a private repository were open to every account
+  mkdirSync(path.join(dir, 'worktrees'), { recursive: true });
+  chmodSync(dir, 0o755);
+  const tight = await running(t, ['--demo', '--no-open'], w.env);
+  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  assert.equal(await tight.stop(), 0, tight.out());
+  // a ~/.workbench that is a link to a folder of the person's (on another disk, say): that folder is made private
+  const real = path.join(w.dir, 'elsewhere');
+  mkdirSync(real);
+  chmodSync(real, 0o755);
+  rmSync(dir, { recursive: true });
+  symlinkSync(real, dir);
+  const linked = await running(t, ['--demo', '--no-open'], w.env);
+  assert.equal(statSync(real).mode & 0o777, 0o700);
+  assert.equal(await linked.stop(), 0, linked.out());
 });
 
 test('the look, the detail and the first answer are kept across runs in ~/.workbench/prefs.json, and the next page arrives with them', async (t) => {

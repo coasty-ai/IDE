@@ -322,7 +322,9 @@ export async function createWorkspace({ repoRoot, agentId, slug, baseDir } = {})
   const folder = workspacesFolder(root, baseDir);
   const wsPath = path.join(folder, `${s}-${id}`);
   const branch = `workbench/${s}-${id}`;
-  fs.mkdirSync(folder, { recursive: true });
+  // Agents' copies of a private repository: only this account may open the folders that hold them. Each folder made
+  // here (~/.workbench, worktrees/ and the repository's own) is made 0700.
+  fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
   if (fs.existsSync(wsPath)) throw plainError(`A workspace already exists at ${wsPath}.`);
   // Only a branch that is not there yet may be taken away again below: one that is could hold kept work.
   const fresh = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: root, okCodes: [1] })
