@@ -52,7 +52,8 @@
     <form id="bar" autocomplete="off" data-box="bar">
       <span class="to" id="to"><span id="toText"></span><button type="button" id="toCancel" aria-label="Stop replying">×</button></span>
       <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-      <span class="field" data-box="field"><input id="say" aria-label="Type what you want, or hold the space bar to talk"><span class="ph" id="ph" aria-hidden="true"></span></span>
+      <!-- The input is a box that grows with its text (saybox.js): Enter sends, Shift+Enter adds a line. -->
+      <span class="field" data-box="field"><textarea id="say" rows="1" enterkeyhint="send" aria-label="Type what you want, or hold the space bar to talk"></textarea><span class="ph" id="ph" aria-hidden="true"></span></span>
       <span class="heard" id="heard" data-clip-ok="the words heard so far; all of them are sent"></span>
       <button type="button" id="mic" aria-pressed="false" aria-label="Talk"><svg aria-hidden="true"><use href="#g-mic"/></svg></button>
     </form>

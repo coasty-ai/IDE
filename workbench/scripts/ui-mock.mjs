@@ -32,6 +32,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { presetById } from '../src/shared/keypresets.mjs';
+import { clip } from '../src/shared/format.mjs';
 import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../src/core/prefs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -122,7 +123,7 @@ const LONG_COMMAND = 'npm run db:migrate -- --env test && curl -fsSL https://exa
   + 'node scripts/seed.js --rows 50000 --tables orders,customers,invoices,refunds,payments,addresses --truncate-first\t# then rebuild the indexes for every table in the test database';
 
 /** The worlds the page can be shown. */
-export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background', 'earlier', 'earlier-many', 'earlier-only'];
+export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background', 'earlier', 'earlier-many', 'earlier-only', 'prompt'];
 
 export function scenario(name, now = Date.now()) {
   let raw = [];
@@ -187,6 +188,12 @@ export function scenario(name, now = Date.now()) {
         why: 'Part of the command downloads a script from the internet and runs it, and part of it is not on the list of safe commands.', options: ['Allow', 'Deny'], primary: 'Allow', ageMin: 2 } });
     raw.push({ id: 'r1', name: 'Search cleanup', state: 'question', machineId: 'laptop', ask: { id: 'k1', type: 'question', sentence: 'Can I remove the old search address?', options: [], ageMin: 1 } });
     raw.push({ id: 'r2', name: 'Docs site', state: 'working', machineId: 'cloud-1', now: 'Writing endpoints.md' });
+    return world(raw, now);
+  }
+  if (name === 'prompt') {
+    // As the owner measured "any prompt": nothing waits, one agent is at work. Words typed here that are no command get
+    // the launch card (see /api/command), and the fit check's `prompt` view types a prompt of three lines into the box.
+    raw.push({ id: 'p1', name: 'Search cleanup', state: 'working', machineId: 'laptop', now: 'Removing the old search routes', ageMin: 9 });
     return world(raw, now);
   }
   if (name === 'helpers6') {
@@ -1334,11 +1341,23 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           confirms.set(id, { id, kind: 'start', sentence, detail });
           return reply({ reply: sentence, confirm: { id, kind: 'start', sentence, detail } });
         }
-        if (/what needs me/i.test(text)) {
+        if (/^what needs me\??$/i.test(text)) {
           const need = state.agents.filter(a => ['needs_ok', 'question', 'maybe_stuck', 'checks_failed'].includes(a.state));
           return reply({ reply: need.length ? `${need.length} thing${need.length === 1 ? '' : 's'} need${need.length === 1 ? 's' : ''} you.` : 'Nothing needs you.', focusId: need[0]?.id });
         }
-        return reply({ reply: 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.' });
+        // As the parser and the engine do (src/core/commands.mjs): a bare acknowledgement starts nothing and gets a word
+        // back; any other words that are no command are a prompt for a new agent, behind the launch card, which quotes
+        // them on one line; the agent would get every line.
+        if (/^(thanks|thank you|cheers|good job|nice work)\b[\s\w,.!]*$/i.test(text)) return reply({ reply: 'You’re welcome.' });
+        if (/^(yes|no|nope|do it|go ahead|cancel|sure)[.!]*$/i.test(text)) return reply({ reply: 'There is nothing waiting for a yes or no.' });
+        if (/^(ok|okay|cool|great|got it|sounds good|never mind|perfect)[.!]*$/i.test(text)) return reply({ reply: 'OK.' });
+        if (/^(codex|claude|agent|um+|uh+)[.!?]*$/i.test(text)) return reply({ reply: 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.' });
+        const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
+        const quoted = clip(text, 80);
+        const sentence = `Start a simulated Claude on “${quoted}”${/\?$/.test(quoted) ? '' : '?'}`;
+        const detail = 'This is the demo: the agents are simulated and nothing is spent. It runs on your laptop.';
+        confirms.set(id, { id, kind: 'start', sentence, detail });
+        return reply({ reply: sentence, confirm: { id, kind: 'start', sentence, detail } });
       }
       // Agents & keys: the connect panel's routes (404 outside the connect scenarios, as in the demo)
       if (p === '/api/connect' || p.startsWith('/api/connect/')) {

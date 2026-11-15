@@ -164,6 +164,35 @@ try {
     check('a typed launch shows its card at once (pointer on the core), and "yes" then answers the card', /^Start a simulated Claude/.test(shown) && yes && /^c/.test(yes.body.confirmId || '') && yes.body.askId === null,
       `"${shown}" ${JSON.stringify(p.map(x => x.body))}`);
   });
+  await run('the input grows with its text: Enter sends, Shift+Enter adds a line, a paste keeps its lines', async () => {
+    await open('prompt');
+    await sleep(700);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    const line = await b.ev(`parseFloat(getComputedStyle(document.getElementById('say')).lineHeight)`);
+    const lines = () => b.ev(`Math.round(document.getElementById('say').clientHeight / ${line})`);
+    const value = () => b.ev(`document.getElementById('say').value`);
+    await b.type('fix the login'); await b.key('Enter', { shift: true }); await b.type('it fails on Safari'); await sleep(150);
+    const typed = await value(), two = await lines();
+    const early = (await posts()).filter(x => x.path === '/api/command').length;
+    // a real paste, through the clipboard: the page is given focus and the clipboard, as a person's window has them
+    await b.send('Browser.grantPermissions', { origin: base, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
+    await b.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await b.ev(`navigator.clipboard.writeText('\\nTypeError: total is undefined\\n  at render (cart.js:12)')`);
+    await b.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86, modifiers: 4, commands: ['paste'] });
+    await b.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86, modifiers: 4 });
+    await sleep(200);
+    const pasted = await value(), four = await lines();
+    await b.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+    await b.key('Enter'); await sleep(900);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const card = await h1(), after = [await value(), await lines()];
+    const git = await b.ev(`document.getElementById('gitSay').tagName`);
+    const want = 'fix the login\nit fails on Safari\nTypeError: total is undefined\n  at render (cart.js:12)';
+    check('the input grows with its text: Enter sends, Shift+Enter adds a line, a paste keeps its lines',
+      typed === 'fix the login\nit fails on Safari' && two === 2 && early === 0 && pasted === want && four === 4 && p.length === 1 && p[0].body.text === want
+        && /^Start a simulated Claude on “fix the login it fails on Safari TypeError: total is undefined[^\n”]*”\?$/.test(card) && after[0] === '' && after[1] === 1 && git === 'INPUT',
+      JSON.stringify({ typed, two, early, pasted, four, sent: p.map(x => x.body.text), card, after, git }));
+  });
   await run('a failed answer keeps the core held on what the person answered, and its button can be tried again', async () => {
     await open('race', { mode: { answer: '500' } });
     await sleep(800);
