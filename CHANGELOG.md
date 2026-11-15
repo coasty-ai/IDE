@@ -11,6 +11,10 @@
 - **More spending limit, in place.** A Claude Code agent stopped by its spending limit can be given one more limit for this run (**Give it $2.00 more**), and it continues where it left off. Before, it could go on only after Workbench was started again.
 - **A release you can sign.** The Mac app's build can sign it with a Developer ID, with the hardened runtime, and have Apple notarize it. The app carries the licenses of Node, npm and its typeface, and every disk image comes with a SHA-256 checksum.
 - **Words that match what happens.** A Codex agent's launch card no longer promises a spending limit Codex does not have, and Agents & keys says which name and email merges use when a repository has its own.
+- **Security review before release.** A fresh review reproduced each issue against the real code, and each is fixed and pinned by tests:
+  - Permissions: zsh's `=program` words and wildcards that reach through links no longer slip past the checks. Git that reaches other working copies, other repositories' addresses, patches (`git apply`, `git am`), `git replace`, upkeep that deletes for good and settings outside the folder now waits for your OK. Claude Code's protected files are known by name the way the Mac's disks compare names.
+  - The page: each run serves it on a free port picked at random, so nothing another program left at an earlier address applies; the Mac app's web view keeps nothing between runs. Your look and detail are kept in `~/.workbench/prefs.json` instead. The page's key is never on a command line.
+  - Files: Workbench keeps its temporary files in a private folder under `~/.workbench`, runs its own merges with no git hooks, installs the very `gh` it checked, and makes agents' folders private to your account.
 - **Tests on every push.** GitHub runs `npm test` on Linux with Node 22, 24 and 26.
 - **Fixes.** Codex agents start when Workbench runs with `--model`, which now names only the Claude model. A slow check for passwords in pasted links made `npm test` fail on a busy Mac; it now takes milliseconds. An agent that fails after it started is now in the log, with the reason.
 

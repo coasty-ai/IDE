@@ -31,6 +31,8 @@ node scripts/ui-contrast.mjs          # contrast of every colour, in all three l
 - **Tests use stand-ins and temporary folders.** Use `node:test` and `node:assert/strict`, a temporary folder and a temporary HOME, and no network. A test sets git's name and email itself, and never relies on yours.
 - **Never start real agents in tests.** Use the stand-ins in `workbench/test/helpers/` for Claude Code, Codex, GitHub's `gh`, macOS's `security` and Linux's `secret-tool`. No test touches the real keychain, a keyring or GitHub.
 - **Keys stay out** of logs, command lines, addresses and test fixtures. A test that needs a key-shaped value builds it from parts as it runs.
+- **Temporary files go in `~/.workbench/tmp`.** Workbench's own temporary files come from `privateTemp()` in `workbench/src/core/workspace.mjs`, never from the system's temporary folder, which a Codex agent's sandbox can write.
+- **No fixed address, no key on a command line.** Each run picks a free port unless `--port` is given, and the page's key is never passed to another program as an argument.
 - **Child processes get an argument array**, never a shell line built from what a person or an agent typed. Every git call goes through `git()` in `workbench/src/core/workspace.mjs`.
 - Leave the top-level `docs/` folder, the research and mockups, as it is.
 
