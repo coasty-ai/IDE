@@ -16,6 +16,7 @@ import { setupVoice } from './voice.js';
 import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand } from './prefs.js';
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
+import { balanceHeading } from './balance.js';
 import { buttonRow } from './words.js';
 import { visibleControls } from './words.js'; // say(): what is said shows hidden characters as the lid does
 import { spentAmountWords } from './numbers.js';
@@ -284,6 +285,7 @@ function paintLid(v, f) {
   if (cur && cur.dataset.key === v.key) {
     // the same thing, updated: patch the words, keep focus, an opened detail and a button whose answer is on its way
     if (patchChildren(cur, v.html)) cur.querySelector('h1')?.focus({ preventScroll: true });
+    balanceHeading(cur.querySelector('h1')); // even lines where the engine cannot balance them (older WebKit)
     cur.dataset.need = String(v.need);
     if (lastView && lastView.count !== v.count && v.count) setText(el.announce, v.count + '.');
   } else {
@@ -302,6 +304,7 @@ function paintLid(v, f) {
     page.dataset.need = String(v.need);
     patchChildren(page, v.html);
     el.pages.appendChild(page);
+    balanceHeading(page.querySelector('h1'));
     if (!calm && el.pages.querySelector('.page.old')) { page.dataset.hidden = '1'; page.style.opacity = '0'; }
     else if (!calm) riseIn(page);
     // a new thing in the core: its answers wait until it is in and a moment more, so a click or a key meant for what was
