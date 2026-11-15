@@ -21,7 +21,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 /**
  * No port of its own: without --port (or with 0), the server takes a free one picked at random, so the page's address
- * is new each run and nothing another program left in the browser for an earlier address can read the key.
+ * is new each run, and almost never one where another program left something in the browser to read the key.
  */
 const DEFAULT_PORT = 0;
 const DEFAULT_BUDGET_USD = 2;

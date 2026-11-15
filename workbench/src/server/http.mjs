@@ -6,8 +6,8 @@
 // A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
 // The page goes out with the person's look, detail and first answer on its <html> tag (src/core/prefs.mjs).
 // Unless the person chose a port, each run takes a free one picked at random, so the page's address (its origin) is
-// new every time: nothing another program left in the browser for an address it served earlier can read this run's
-// key. A port something else answers on is never taken.
+// new every time, and only by a rare chance one another program served before: what that program left in the browser
+// for its address is almost never there to read this run's key. A port something else answers on is never taken.
 import http from 'node:http';
 import net from 'node:net';
 import fs from 'node:fs';

@@ -472,8 +472,8 @@ final class Engine {
       args += ["--clone", address, "--into", into.path]
     }
     if !isDemo, let claude = claude { args += ["--claude", claude] }
-    // Always a free port, which Workbench picks at random: the page's address is new each run, so nothing another
-    // program left for an earlier address (a service worker, a cached script) can read the key in it.
+    // Always a free port, which Workbench picks at random: the page's address is new each run, and almost never one
+    // where another program left something (a service worker, a cached script) that could read the key in it.
     args += ["--app", "--port", "0"]
     process.arguments = args
     process.environment = Environment.forWorkbench()
