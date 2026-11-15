@@ -1185,9 +1185,12 @@ el.connectBtn.addEventListener('click', () => showConnect(el.connectBtn));
  */
 function paintPermBtn(P, live) {
   const b = el.permBtn;
+  const v = permButtonView(S.meta.permissions);
+  // Its look before it shows, and before anything below measures it: on a page that loads with full permissions on (from
+  // <html> at first), it is lit from its first frame, rather than drawn quiet and faded to lit by its transition.
+  b.classList.toggle('on', v.on);
   b.hidden = !live;
   if (!live || !G) return;
-  const v = permButtonView(S.meta.permissions);
   b.style.fontSize = P.silkSub + 'px';
   const draw = label => {
     const html = `<span class="led${v.on ? ' on' : ''}" aria-hidden="true"></span><span class="lbl">${esc(label)}</span>`;
@@ -1206,7 +1209,6 @@ function paintPermBtn(P, live) {
     }
   }
   if (b.offsetWidth > rightOf() - left) draw(v.short);
-  b.classList.toggle('on', v.on);
   b.dataset.state = v.state;
   if (b.getAttribute('aria-pressed') !== v.pressed) b.setAttribute('aria-pressed', v.pressed);
   if (b.getAttribute('aria-label') !== v.name) b.setAttribute('aria-label', v.name);
@@ -1218,14 +1220,19 @@ function paintPermBtn(P, live) {
 /**
  * Pressed when off, it asks the engine, whose card ("Let agents do anything without asking?") comes in the middle; only
  * that card's yes turns them on. Pressed when on, it turns them off at once. A button drawn for the other mode sends
- * nothing ("That changed. Have another look."). A card already on screen is withdrawn first, as for Merge, so none waits
- * unseen. A keyboard press takes the keyboard to the card.
+ * nothing ("That changed. Have another look."). Another card already on screen is withdrawn first, as for Merge, so none
+ * waits unseen; its own card stays as it is, with nothing said, and the focus goes to it. A keyboard press takes the
+ * keyboard to the card.
  */
 el.permBtn.addEventListener('click', async () => {
   const b = el.permBtn;
   if (b.getAttribute('aria-disabled') === 'true') return;
   touch();
   if (b.dataset.state !== S.meta.permissions) { changed(); return; }
+  if (b.dataset.state !== 'full' && S.confirm?.kind === 'permissions') {
+    el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+    return;
+  }
   if (cannotSend(linkNow())) return;
   const drawn = b.dataset.state;
   const keyboard = document.activeElement === b;

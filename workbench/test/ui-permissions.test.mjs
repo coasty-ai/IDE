@@ -60,3 +60,17 @@ test('the page learns the mode from <html> and from the snapshot, and a press go
   assert.match(app, /api\.permissions\(drawn === 'full' \? 'ask' : 'full'\)/);
   assert.match(app, /setAttribute\('aria-pressed', v\.pressed\)/);
 });
+
+test('the button has its look before it shows, and a press while its own card is up keeps that card', () => {
+  const app = read('app.js');
+  const paint = app.slice(app.indexOf('function paintPermBtn('), app.indexOf('el.permBtn.addEventListener('));
+  // lit or quiet before it is shown and measured, so a page that loads with full permissions on never fades it in
+  const look = paint.indexOf("b.classList.toggle('on', v.on);");
+  assert.ok(look > 0 && look < paint.indexOf('b.hidden = !live;') && look < paint.indexOf('offsetWidth'), 'the look comes first');
+  assert.equal(paint.split("b.classList.toggle('on', v.on);").length, 2, 'set once');
+  // its own card on screen: nothing is withdrawn or sent, nothing said, and the focus goes to the card
+  const press = app.slice(app.indexOf('el.permBtn.addEventListener('), app.indexOf('setupConnect('));
+  const own = press.indexOf("if (b.dataset.state !== 'full' && S.confirm?.kind === 'permissions') {");
+  assert.ok(own > 0 && own < press.indexOf('api.confirm(') && own < press.indexOf('api.permissions('), 'kept before anything is sent');
+  assert.match(press.slice(own, own + 200), /h1'\)\?\.focus\(\{ preventScroll: true \}\);\s*return;/);
+});

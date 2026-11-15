@@ -1589,6 +1589,23 @@ try {
       `html ${tag}; ${JSON.stringify(btn)}; seen ${seen}`);
   });
 
+  await run(FP + 'a page that loads with them on has the button lit from its first frame, never fading in from the quiet look', async () => {
+    // the button's colours on every frame from the first one it shows, with motion on (the stream's first snapshot held
+    // past the page's first 60 ms, when transitions are off anyway)
+    await b.beforeLoad(`(() => { window.__permLook = []; const tick = () => { const e = document.getElementById('permBtn');
+      if (e && !e.hidden) { const cs = getComputedStyle(e); window.__permLook.push([cs.borderTopColor, cs.backgroundColor, cs.color, cs.boxShadow].join(' | ')); }
+      if (window.__permLook.length < 40) requestAnimationFrame(tick); }; requestAnimationFrame(tick); })()`);
+    await open('full', { mode: { holdMs: 700 } });
+    await sleep(700);
+    const motion = await b.ev(`!document.body.classList.contains('still') && !matchMedia('(prefers-reduced-motion: reduce)').matches`);
+    const frames = await b.ev(`window.__permLook || []`);
+    const lit = await b.ev(`(() => { const cs = getComputedStyle(document.getElementById('permBtn')); return [cs.borderTopColor, cs.backgroundColor, cs.color, cs.boxShadow].join(' | '); })()`);
+    const other = frames.filter(f => f !== lit);
+    check(FP + 'a page that loads with them on has the button lit from its first frame, never fading in from the quiet look',
+      motion && frames.length >= 20 && other.length === 0,
+      `motion ${motion}; ${frames.length} frames, ${other.length} not lit (first: ${other[0] || 'none'}); lit: ${lit}`);
+  });
+
   await run(FP + 'a button drawn for the other mode says "That changed" and posts nothing', async () => {
     await open('demo');
     await sleep(900);
@@ -1605,6 +1622,28 @@ try {
     check(FP + 'a button drawn for the other mode says "That changed" and posts nothing',
       drawn === 'ask' && p.length === 0 && /That changed\. Have another look\./.test(words) && now.pressed === 'true',
       `drawn for ${drawn}, posts ${p.length}, said "${words}", now ${now.pressed}`);
+  });
+
+  await run(FP + 'pressed again while its own card is up, the card stays as it is, nothing is said, and the focus goes to it', async () => {
+    await open('demo');
+    await sleep(900);
+    await realClick('#permBtn');
+    await sleep(1100);
+    const yesOf = () => b.ev(`${page()}?.querySelector('[data-act="confirm"][data-go="1"]')?.dataset.confirm || ''`);
+    const first = await yesOf(), lid = await lidNow();
+    await b.ev(`document.getElementById('say').focus(), 1`); // the focus elsewhere first, so where it goes shows
+    await clearLog();
+    const before = await said();
+    for (const press of [() => realClick('#permBtn'), async () => { await b.ev(`document.getElementById('permBtn').focus(), 1`); await b.key('Enter'); }]) {
+      await press();
+      await sleep(900);
+    }
+    const again = await yesOf(), lidAgain = await lidNow(), f = await focusNow(), after = await said();
+    const sent = (await posts()).filter(x => x.path.startsWith('/api/confirm/') || x.path === '/api/permissions');
+    check(FP + 'pressed again while its own card is up, the card stays as it is, nothing is said, and the focus goes to it',
+      lid === 'Before agents stop asking / Let agents do anything without asking?' && lidAgain === lid && !!first && again === first
+      && sent.length === 0 && f === 'core:H1' && after === before,
+      `"${lid}" ${first} → "${lidAgain}" ${again}; focus ${f}; said "${before}" → "${after}"; sent ${JSON.stringify(sent.map(x => x.path))}`);
   });
 
   await run(FP + 'their card goes when they are turned on in another tab, and nothing is sent for it', async () => {
