@@ -197,7 +197,9 @@ test('without --repo or --demo it explains what it needs', async () => {
 test('--help prints the usage and exits cleanly', async () => {
   const r = await run(['--help']);
   assert.equal(r.code, 0);
-  assert.match(r.stdout, /node bin\/workbench\.mjs --demo \[--port 4317\] \[--no-open\]/);
+  assert.match(r.stdout, /node bin\/workbench\.mjs --demo \[--port <n>\] \[--no-open\]/);
+  assert.match(r.stdout, /--port <n> {10}the port for the web page \(default: a free one, new each run\)/);
+  assert.doesNotMatch(r.stdout, /4317/);
   assert.match(r.stdout, /node bin\/workbench\.mjs --repo <path> \[--budget 2\] \[--model <name>\] \[--claude <path>\]/);
   assert.match(r.stdout, /--claude <path> {5}the Claude Code program to run\. Without it: WORKBENCH_CLAUDE_BIN, then claude on the\n {22}PATH, then the newest Claude Code extension in VS Code or Cursor/);
 });
@@ -241,6 +243,46 @@ async function running(t, args, env) {
     stop: async () => { proc.kill('SIGINT'); return Promise.race([exited, sleep(15_000).then(() => 'still running')]); },
   };
 }
+
+test('without --port the page takes a free port picked at random, new each run; --port still chooses one', async (t) => {
+  assert.equal(parseArgs(['--demo']).port, 0);
+  assert.equal(parseArgs(['--demo', '--port', '0']).port, 0);
+  assert.equal(parseArgs(['--demo', '--port=4317']).port, 4317);
+  const w = setup(t);
+  const a = await running(t, ['--demo', '--no-open'], w.env);
+  const b = await running(t, ['--demo', '--no-open'], w.env);
+  for (const r of [a, b]) assert.ok(r.port >= 49152 && r.port <= 65535, `port ${r.port}`);
+  assert.notEqual(a.port, b.port);
+  assert.equal(await a.stop(), 0, a.out());
+  assert.equal(await b.stop(), 0, b.out());
+  // the person's own port
+  const s = http.createServer();
+  await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
+  const mine = s.address().port;
+  await new Promise((resolve) => s.close(resolve));
+  const c = await running(t, ['--demo', '--no-open', '--port', String(mine)], w.env);
+  assert.equal(c.port, mine);
+  assert.equal(await c.stop(), 0, c.out());
+});
+
+test('--port with another program answering there, on any of this computer’s own addresses, is refused as in use', async (t) => {
+  const w = setup(t);
+  for (const host of ['0.0.0.0', '::', '127.0.0.1']) {
+    const other = http.createServer((req, res) => res.end('SQUATTER'));
+    try {
+      await new Promise((resolve, reject) => { other.once('error', reject); other.listen(0, host, resolve); });
+    } catch {
+      continue; // no such address on this computer
+    }
+    t.after(() => other.close());
+    const port = other.address().port;
+    const r = await run(['--demo', '--no-open', '--port', String(port)], w.env);
+    assert.equal(r.code, 1, `${host}: ${r.stdout}${r.stderr}`);
+    assert.equal(r.stderr.trim().split('\n').filter(l => !l.startsWith('[workbench ')).join('\n'),
+      `Port ${port} is already in use. Try another one with --port, or leave --port out for a free one.`, host);
+    assert.doesNotMatch(r.stdout, /Workbench is running at/, host);
+  }
+});
 
 test('the look, the detail and the first answer are kept across runs in ~/.workbench/prefs.json, and the next page arrives with them', async (t) => {
   const w = setup(t);
@@ -626,10 +668,12 @@ test('the options for cloning and for the Mac app’s GitHub helpers: what they 
     parseArgs(['--clone', ' https://github.com/octo/hello.git ', '--into', '/tmp/code', '--app'])),
   { clone: 'https://github.com/octo/hello.git', into: '/tmp/code', connectGithub: false, githubRepos: false, error: null });
   assert.equal(parseArgs(['--clone=git@github.com:octo/hello.git']).clone, 'git@github.com:octo/hello.git');
-  // Exactly as the Mac app runs it: no --repo, and --claude, --app and --port with --clone and --into.
+  // Exactly as the Mac app runs it: no --repo, and --claude, --app and --port 0 (a free port, new each run) with --clone
+  // and --into.
   assert.deepEqual((({ clone, into, claude, app, port, repo, open, error }) => ({ clone, into, claude, app, port, repo, open, error }))(
-    parseArgs(['--clone', 'git@github.com:octo/hello.git', '--into', '/Users/ada/Developer', '--claude', '/opt/claude/claude', '--app', '--port', '4317'])),
-  { clone: 'git@github.com:octo/hello.git', into: '/Users/ada/Developer', claude: '/opt/claude/claude', app: true, port: 4317, repo: null, open: false, error: null });
+    parseArgs(['--clone', 'git@github.com:octo/hello.git', '--into', '/Users/ada/Developer', '--claude', '/opt/claude/claude', '--app', '--port', '0'])),
+  { clone: 'git@github.com:octo/hello.git', into: '/Users/ada/Developer', claude: '/opt/claude/claude', app: true, port: 0, repo: null, open: false, error: null });
+  assert.equal(parseArgs(['--clone', 'https://github.com/octo/hello', '--port', '4317']).port, 4317);
   assert.equal(parseArgs(['--clone', 'https://github.com/octo/hello', '--into', '/tmp/x', '--app', '--port', '0']).port, 0);
   assert.equal(parseArgs(['--connect-github']).error, null);
   assert.equal(parseArgs(['--github-repos', '--app', '--verbose']).error, null);
@@ -782,13 +826,13 @@ test('--clone, run as a program: an address Workbench does not clone from is ref
   assert.deepEqual(readdirSync(into), [], 'nothing was cloned');
 });
 
-test('--clone as the Mac app runs it (--into, --claude, --app, a busy --port, no --repo): progress only as WORKBENCH_CLONE lines, then the new folder, which the board opens', { skip: !CLONE_READY && 'needs cloneRepo in src/core/workspace.mjs (U2)' }, async (t) => {
+test('--clone with the Mac app’s options (--into, --claude, --app, no --repo) and a busy --port of the person’s: progress only as WORKBENCH_CLONE lines, then the new folder, which the board opens', { skip: !CLONE_READY && 'needs cloneRepo in src/core/workspace.mjs (U2)' }, async (t) => {
   const w = setup(t, { fakeGit: true });
   // What the stand-in git copies, whatever the address says: a bare copy of the test repository.
   const bare = path.join(w.dir, 'hello.git');
   execFileSync(realGit(), ['clone', '-q', '--bare', w.repo, bare], { stdio: 'pipe' });
   const into = path.join(w.dir, 'Developer');
-  // Port 4317 is taken (here, another one): the page takes a free one rather than throw the clone away.
+  // The port given with --port is taken: the page takes a free one rather than throw the clone away.
   const busy = http.createServer();
   await new Promise((resolve) => busy.listen(0, '127.0.0.1', resolve));
   t.after(() => busy.close());

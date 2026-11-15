@@ -5,7 +5,11 @@
 // (16 KB on the Agents & keys routes, which carry keys: never echoed, never logged, never in a URL).
 // A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
 // The page goes out with the person's look, detail and first answer on its <html> tag (src/core/prefs.mjs).
+// Unless the person chose a port, each run takes a free one picked at random, so the page's address (its origin) is
+// new every time: nothing another program left in the browser for an address it served earlier can read this run's
+// key. A port something else answers on is never taken.
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -23,6 +27,11 @@ const NO_CONNECT_DEMO = 'The demo’s agents are simulated, so there is nothing 
 const NO_CONNECT = 'Agents & keys is not available in this Workbench. The details are in its log.';
 const DRAIN_LIMIT = 1024 * 1024;   // read and discard at most this much of an oversized body
 const SSE_MAX_BUFFER = 8 * 1024 * 1024;
+/** Where a free port is picked from (the ports no service is registered for), how many picks, and how long a knock waits. */
+const PICK_FROM = 49152;
+const PICK_TO = 65535;
+const PICK_TRIES = 20;
+const KNOCK_MS = 300;
 const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const SECURITY_HEADERS = Object.freeze({
@@ -134,15 +143,16 @@ function isPlainError(err) {
  * @param {string} [opts.repoRoot] the repository's folder, for keys kept for "this repository" (else the engine's)
  * @param {object} [opts.prefs]    the person's choices for the page, `{ get(), set(change) }` (createPrefs in
  *        src/core/prefs.mjs, which keeps them in ~/.workbench/prefs.json); without it, kept for this run only
- * @param {number} [opts.port]     0 picks a free port
+ * @param {number} [opts.port]     the port the person chose; without it (or 0), a free one picked at random, new each run
  * @param {string} [opts.host]     always 127.0.0.1
  * @param {string} [opts.rootDir]  folder that holds ui/ and src/shared/
  * @param {object} [opts.log]
  * @param {object} [opts.options]  { coalesceMs = 250, pingMs = 15000, requestTimeoutMs, checkIntervalMs } (tests shorten these),
- *        and keyPresets: a stand-in for src/shared/keypresets.mjs ({ presetById }), for tests
+ *        keyPresets: a stand-in for src/shared/keypresets.mjs ({ presetById }), and pickPort: a stand-in for the random
+ *        pick of a port, for tests
  * @returns {{ listen(): Promise<{ url: string }>, close(): Promise<void>, readonly url: string|null, readonly port: number|null }}
  */
-export function createServer({ engine, store, token, hookTokenFor = null, connect = null, repoRoot = null, prefs = memoryPrefs(), port = 4317, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
+export function createServer({ engine, store, token, hookTokenFor = null, connect = null, repoRoot = null, prefs = memoryPrefs(), port = 0, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
   if (!engine) throw new Error('The server needs the engine.');
   if (typeof token !== 'string' || !/^[0-9a-f]{64}$/i.test(token)) {
     throw new Error('The server token must be 32 random bytes written as hex.');
@@ -777,16 +787,58 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     else socket.destroy();
   });
 
-  function listen() {
+  /** Listen on 127.0.0.1 at this port (0: the system picks): resolves the port. */
+  function bind(p) {
     return new Promise((resolve, reject) => {
       const onError = (err) => reject(err);
       server.once('error', onError);
-      server.listen(port, '127.0.0.1', () => {
+      server.listen(p, '127.0.0.1', () => {
         server.off('error', onError);
-        boundPort = server.address().port;
-        resolve({ url: `http://127.0.0.1:${boundPort}/` });
+        resolve(server.address().port);
       });
     });
+  }
+
+  /**
+   * Whether anything answers on this port at 127.0.0.1 or [::1]. On a Mac, 127.0.0.1 can be bound beside a listener on
+   * 0.0.0.0 or [::], which served http://127.0.0.1:<port>/ until then; one on [::1] gets http://localhost:<port>/. No
+   * answer either way within KNOCK_MS counts as taken.
+   */
+  function answers(p) {
+    const knock = (h) => new Promise((resolve) => {
+      const s = net.connect({ host: h, port: p, timeout: KNOCK_MS });
+      const done = (v) => { s.destroy(); resolve(v); };
+      s.once('connect', () => done(true));
+      s.once('timeout', () => done(true));
+      s.once('error', () => done(false));
+    });
+    return Promise.all([knock('127.0.0.1'), knock('::1')]).then(([a, b]) => a || b);
+  }
+
+  const pickPort = typeof options.pickPort === 'function' ? options.pickPort : () => crypto.randomInt(PICK_FROM, PICK_TO + 1);
+  const inUse = (p) => Object.assign(new Error(`Port ${p} is already in use.`), { code: 'EADDRINUSE', port: p });
+
+  /**
+   * The port the person chose, when nothing else answers there (else EADDRINUSE, as when it is bound); otherwise a
+   * free one picked at random: up to PICK_TRIES picks nothing answers on, then the system picks.
+   */
+  async function listen() {
+    if (port) {
+      if (await answers(port)) throw inUse(port);
+      boundPort = await bind(port);
+    } else {
+      for (let i = 0; i < PICK_TRIES && boundPort == null; i++) {
+        const p = Number(pickPort());
+        if (!Number.isInteger(p) || p < 1 || p > 65535 || await answers(p)) continue;
+        try {
+          boundPort = await bind(p);
+        } catch (err) {
+          if (err.code !== 'EADDRINUSE' && err.code !== 'EACCES') throw err;
+        }
+      }
+      if (boundPort == null) boundPort = await bind(0);
+    }
+    return { url: `http://127.0.0.1:${boundPort}/` };
   }
 
   async function close() {

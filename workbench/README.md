@@ -17,7 +17,7 @@ npm start -- --repo ~/code/myapp   # real agents on your own git repository
 npm start -- --clone https://github.com/owner/repo --into ~/Developer   # copy a repository first, then run agents on it
 ```
 
-The terminal prints a link like `http://127.0.0.1:4317/?t=…`. Open it in Chrome, which is needed for voice; it opens by itself unless you pass `--no-open`. The `t=` part is a key that only this run knows.
+The terminal prints a link like `http://127.0.0.1:52817/?t=…`. Open it in Chrome, which is needed for voice; it opens by itself unless you pass `--no-open`. The port is a free one, new each run, and the `t=` part is a key that only this run knows.
 
 Workbench starts even when neither Claude Code nor Codex is ready. It says "No coding agent is ready yet. Open the page to connect one.", and **Agents & keys** on the page helps you install one, sign in, or give it an API key (see "Agents & keys" below).
 
@@ -33,7 +33,7 @@ Options for real agents:
 | `--budget 2` | each agent's spending limit for a run, in US dollars (default 2). An agent that reaches it can be given as much again (see "The spending limit" below) |
 | `--model <name>` | the Claude model to use, for example `sonnet` or `haiku`. Codex agents keep Codex's own model |
 | `--claude <path>` | the Claude Code program to run. Without it: `WORKBENCH_CLAUDE_BIN`, then `claude` on the PATH, then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor |
-| `--port 4317` | where the page is served (`0` picks a free port) |
+| `--port <n>` | where the page is served. Without it, a free port, new each run (see "Safety"). A port you choose is refused while another program answers on it |
 
 ## The Mac app
 
@@ -48,6 +48,7 @@ Workbench is also a Mac app, for Apple silicon and macOS 13.5 or later. From the
 - **Closing the window, or quitting, stops the agents.** If any are still working, it asks first. What they did stays in their folders. If the app is closed in any other way (it crashed, say), Workbench notices and stops its agents too.
 - **A copy downloaded on another Mac** opens only after System Settings → Privacy & Security → Open Anyway, unless it was signed with a Developer ID and notarized by Apple. A copy you build yourself opens directly. To build one that opens like any app from the web: `bash workbench/app/mac/build.sh --sign "Developer ID Application: Your Name (TEAMID)" --notarize <profile>`, where `<profile>` was saved once with `xcrun notarytool store-credentials`. Every disk image comes with a `.sha256` file: `shasum -a 256 -c Workbench-<version>-arm64.dmg.sha256` checks a download.
 - **Licenses** of what the app carries (Node, npm, the JetBrains Mono typeface) are listed in `Contents/Resources/THIRD_PARTY_NOTICES.md` inside the app.
+- **Each folder you open gets a new address for its page**, and the window keeps nothing from one session to the next. Your look and detail stay: Workbench keeps them.
 - **Its log** is `~/Library/Logs/Workbench/workbench.log` (View → Show Log). What Workbench prints in a terminal goes there, such as the folders that keep an agent's work when it stops, each yes to start an agent, and why an agent failed ("Fix login failed: …").
 
 ## What you see
@@ -269,6 +270,7 @@ Or open this folder in the Mac app (see "The Mac app"), which needs no Node on y
 ## Safety
 
 - The page and its programming interface listen on `127.0.0.1` only. Every request needs the run's key, and requests from other websites are refused. A link with anything after the address except this run's key (an old link, say) opens the plain page instead; a tab without the key then asks you to open the link printed in the terminal.
+- The page has a new address every run: a free port, picked at random. Something another program left in your browser for an address it served earlier (a script it cached, say) cannot read this run's key. A port you choose with `--port` is the same address every run, so leave it out unless you need it.
 - Each agent gets its own key for asking permission, so one agent's key cannot ask in another agent's name, and it never opens the page's interface.
 - Every Claude Code agent has a spending limit (`--budget`). Only you can raise it, one limit at a time, with the button the middle shows when an agent reaches its own. Codex reports no cost, so Codex agents have no limit, and their launch card says so.
 - Agents can read the keys you give them, and so can anything they run: give them keys that can do only what their work needs. Workbench keeps keys out of its page, its logs, its history and the agents you did not give them to; it cannot keep an agent from its own keys. The page shows a key only as "•••• " and its last four characters, never keeps one, and never sends text that looks like a key from the board's input.

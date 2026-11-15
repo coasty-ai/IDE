@@ -430,7 +430,6 @@ enum CloneStep {
 
 final class Engine {
   let target: Target
-  let port: Int             // 0: a free one
   let process = Process()
   private let input = Pipe()
   private let output = Pipe()
@@ -443,7 +442,7 @@ final class Engine {
   /// Why a clone was refused, from Workbench's `WORKBENCH_CLONE {"error",…}` line: auth, ssh, network, exists, url or
   /// git.
   private(set) var cloneFailure: (kind: String, sentence: String?)?
-  /// Started for the clone sheet: the clone itself, or its new folder opened on a free port.
+  /// Started for the clone sheet: the clone itself.
   var forClone = false
   /// Stopped because the person cancelled the clone: its end needs no words.
   var cancelled = false
@@ -458,9 +457,8 @@ final class Engine {
   var isDemo: Bool { if case .demo = target { return true }; return false }
   var isClone: Bool { if case .clone = target { return true }; return false }
 
-  init(target: Target, port: Int, claude: String?) {
+  init(target: Target, claude: String?) {
     self.target = target
-    self.port = port
     let res = Bundle.main.resourceURL!
     process.executableURL = res.appendingPathComponent("node/bin/node")
     var args = [res.appendingPathComponent("workbench/bin/workbench.mjs").path]
@@ -474,7 +472,9 @@ final class Engine {
       args += ["--clone", address, "--into", into.path]
     }
     if !isDemo, let claude = claude { args += ["--claude", claude] }
-    args += ["--app", "--port", String(port)]
+    // Always a free port, which Workbench picks at random: the page's address is new each run, so nothing another
+    // program left for an earlier address (a service worker, a cached script) can read the key in it.
+    args += ["--app", "--port", "0"]
     process.arguments = args
     process.environment = Environment.forWorkbench()
     process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
@@ -1017,9 +1017,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     return e.folder?.standardizedFileURL.path == folder.standardizedFileURL.path
   }
 
-  func start(_ target: Target, port: Int = 4317, forClone: Bool = false) {
+  func start(_ target: Target, forClone: Bool = false) {
     if case .repo(let folder) = target { Recents.add(folder); rebuildRecent() }
-    let e = Engine(target: target, port: port, claude: ChosenClaude.path)
+    let e = Engine(target: target, claude: ChosenClaude.path)
     e.forClone = forClone || e.isClone
     engine = e
     e.onReady = { [weak self, weak e] url, name in
@@ -1059,11 +1059,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
     if !wasReady, case .clone(let address, let into) = e.target {
       cloneEnded(e, address: address, into: into)
-      return
-    }
-    // Port 4317 taken (another Workbench): try once more on a free port.
-    if !wasReady, e.port != 0, e.tail.contains(where: { $0.contains("is already in use") }) {
-      start(e.target, port: 0, forClone: e.forClone)
       return
     }
     let said = e.tail.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.suffix(8).joined(separator: "\n")
@@ -1158,11 +1153,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     let name = CloneAddress.shortName(address)
     let made = e.root ?? CloneAddress.folder(address, in: into)
     let cloned = e.cloneFailure == nil && made.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent(".git").path) } == true
-    // Port 4317 taken (another Workbench): the clone is done, so its folder is opened on a free port.
-    if cloned, let root = made, e.port != 0, e.tail.contains(where: { $0.contains("is already in use") }) {
-      start(.repo(root), port: 0, forClone: true)
-      return
-    }
     if cloned, let root = made { Recents.add(root); rebuildRecent() }
     let sentence: String
     if let f = e.cloneFailure {
@@ -1197,6 +1187,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     welcome = nil
     if boardWindow == nil {
       let config = WKWebViewConfiguration()
+      // Nothing the web view keeps (storage, service workers, its cache) goes to disk or outlives this window, so
+      // nothing a page left at some address in an earlier session is there when Workbench's page comes to it. The
+      // choices the page remembers are kept by Workbench itself, so this costs nothing.
+      config.websiteDataStore = .nonPersistent()
       config.preferences.setValue(true, forKey: "developerExtrasEnabled")
       let wv = WKWebView(frame: .zero, configuration: config)
       wv.navigationDelegate = self

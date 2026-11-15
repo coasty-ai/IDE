@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Workbench: launch coding agents and see what each one is doing, in plain language.
 //
-//   node bin/workbench.mjs --demo [--port 4317] [--no-open]
-//   node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
+//   node bin/workbench.mjs --demo [--port <n>] [--no-open]
+//   node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port <n>] [--no-open]
 //   node bin/workbench.mjs --clone <address> [--into <folder>] [the --repo options]
 //   node bin/workbench.mjs --connect-github | --github-signin | --github-status | --github-repos      (for the Mac app)
 //   node bin/workbench.mjs --git-status                           (for the Mac app)
@@ -19,7 +19,11 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DEFAULT_PORT = 4317;
+/**
+ * No port of its own: without --port (or with 0), the server takes a free one picked at random, so the page's address
+ * is new each run and nothing another program left in the browser for an earlier address can read the key.
+ */
+const DEFAULT_PORT = 0;
 const DEFAULT_BUDGET_USD = 2;
 /** How long a clone may take before Workbench gives up on it. */
 const CLONE_TIMEOUT_MS = 30 * 60_000;
@@ -53,10 +57,10 @@ const DEVICE_URL = 'https://github.com/login/device';
 export const USAGE = `Workbench launches coding agents and shows what each one is doing, in plain language.
 
 Try it with simulated agents (nothing is spent):
-  node bin/workbench.mjs --demo [--port 4317] [--no-open]
+  node bin/workbench.mjs --demo [--port <n>] [--no-open]
 
 Run real agents on a git repository:
-  node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port 4317] [--no-open]
+  node bin/workbench.mjs --repo <path> [--budget 2] [--model <name>] [--claude <path>] [--port <n>] [--no-open]
 
 Copy a repository from GitHub (or another git host) first, then run agents on it:
   node bin/workbench.mjs --clone <address> [--into <folder>] [the options for --repo]
@@ -72,7 +76,7 @@ Options:
   --model <name>      the model Claude Code agents ask for, like sonnet or haiku (Codex keeps its own)
   --claude <path>     the Claude Code program to run. Without it: WORKBENCH_CLAUDE_BIN, then claude on the
                       PATH, then the newest Claude Code extension in VS Code or Cursor
-  --port <n>          the port for the web page (default 4317; 0 picks a free one)
+  --port <n>          the port for the web page (default: a free one, new each run)
   --no-open           do not open the browser
   --app               for the Mac app: no browser, one line the app reads (WORKBENCH_APP {...}), and Workbench
                       stops, as on Ctrl-C, when its standard input closes (the app quit or crashed). With --clone,
@@ -1075,16 +1079,16 @@ async function main() {
     try {
       ({ url } = await server.listen());
     } catch (err) {
-      // A fresh clone is not thrown away for a busy port: the page takes a free one (the Mac app reads it from WORKBENCH_APP).
-      if (err.code !== 'EADDRINUSE' || !args.clone || args.port === 0) throw err;
+      // A fresh clone is not thrown away for a busy --port: the page takes a free one.
+      if (err.code !== 'EADDRINUSE' || !args.clone || !args.port) throw err;
       await server.close().catch(() => {});
       server = mods.createServer({ engine, store, token, hookTokenFor, connect, repoRoot: repo?.root ?? null, prefs, port: 0, host: '127.0.0.1', rootDir: ROOT, log });
       ({ url } = await server.listen());
       say(`Port ${args.port} is already in use, so the page took a free one.`);
     }
   } catch (err) {
-    if (err.code === 'EADDRINUSE') complain(`Port ${args.port} is already in use. Try another one with --port, or --port 0 to pick a free one.`);
-    else if (err.code === 'EACCES') complain(`Workbench is not allowed to use port ${args.port}. Try another one with --port, or --port 0.`);
+    if (err.code === 'EADDRINUSE') complain(`Port ${args.port} is already in use. Try another one with --port, or leave --port out for a free one.`);
+    else if (err.code === 'EACCES') complain(`Workbench is not allowed to use port ${args.port}. Try another one with --port, or leave --port out for a free one.`);
     else complain(`Workbench could not start its web page: ${err.message}`);
     await engine.shutdown().catch(() => {});
     return 1;

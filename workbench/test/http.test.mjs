@@ -1,6 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -172,6 +173,92 @@ test('the page is served with a query only when the query carries the key; anyth
     const r = await request({ path: p });
     assert.equal(r.status, 200, p);
     assert.ok(r.text.includes('Workbench'), p);
+  }
+});
+
+// ------------------------------------------------------------------ where the page is served
+
+/** Something else listening on `host`:`port` (0: a free one), as another program would. */
+async function holder(t, host, port = 0) {
+  // the server's knock hangs up at once, so the answer may meet a closed connection
+  const s = net.createServer((c) => { c.on('error', () => {}); c.end('SQUATTER\n'); });
+  try {
+    await new Promise((resolve, reject) => { s.once('error', reject); s.listen(port, host, resolve); });
+  } catch {
+    return null; // no such address here (a computer without IPv6, say)
+  }
+  t.after(() => s.close());
+  return s.address().port;
+}
+
+/** A port nothing listens on just now. */
+async function freePort() {
+  const s = net.createServer();
+  await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
+  const p = s.address().port;
+  await new Promise((resolve) => s.close(resolve));
+  return p;
+}
+
+test('with no port, or port 0, each server takes a free port picked at random from 49152 to 65535, never a fixed one', async (t) => {
+  const ports = [];
+  for (const o of [{}, { port: 0 }, { port: null }]) {
+    const s = new Store();
+    const srv = createServer({ engine: new FakeEngine(s), store: s, token: TOKEN, rootDir: ROOT, ...o });
+    const { url } = await srv.listen();
+    t.after(() => srv.close());
+    const p = Number(new URL(url).port);
+    assert.equal(url, `http://127.0.0.1:${p}/`);
+    assert.equal(srv.port, p);
+    assert.ok(p >= 49152 && p <= 65535, `port ${p}`);
+    ports.push(p);
+  }
+  assert.equal(new Set(ports).size, 3, 'three servers, three ports');
+});
+
+test('a port something else answers on, at 127.0.0.1, 0.0.0.0, [::] or [::1], is never taken: the next pick is', async (t) => {
+  // On a Mac, a listener on 0.0.0.0 or [::] leaves 127.0.0.1 free to bind, though it served http://127.0.0.1:<port>/
+  // until then, and a listener on [::1] gets http://localhost:<port>/.
+  const held = [];
+  for (const host of ['127.0.0.1', '0.0.0.0', '::', '::1']) {
+    const p = await holder(t, host);
+    if (p) held.push(p);
+  }
+  assert.ok(held.length >= 2, `held ${held.length}`);
+  const free = await freePort();
+  const tried = [];
+  const picks = [...held, free];
+  const s = new Store();
+  const srv = createServer({ engine: new FakeEngine(s), store: s, token: TOKEN, rootDir: ROOT, options: { pickPort: () => { const p = picks.shift(); tried.push(p); return p; } } });
+  const { url } = await srv.listen();
+  t.after(() => srv.close());
+  assert.equal(Number(new URL(url).port), free);
+  assert.deepEqual(tried, [...held, free]);
+  // the page is there, and nothing else
+  const r = await request({ path: '/', at: free });
+  assert.equal(r.status, 200);
+});
+
+test('when every pick is taken, the system picks; a port the person chose is used as given, unless something else answers there', async (t) => {
+  const busy = await holder(t, '127.0.0.1');
+  const s = new Store();
+  const fallback = createServer({ engine: new FakeEngine(s), store: s, token: TOKEN, rootDir: ROOT, options: { pickPort: () => busy } });
+  const { url } = await fallback.listen();
+  t.after(() => fallback.close());
+  assert.notEqual(Number(new URL(url).port), busy);
+  // the person's port
+  const mine = await freePort();
+  const chosen = createServer({ engine: new FakeEngine(s), store: s, token: TOKEN, rootDir: ROOT, port: mine });
+  assert.equal((await chosen.listen()).url, `http://127.0.0.1:${mine}/`);
+  t.after(() => chosen.close());
+  // ... but never one another program serves, on any of this computer's own addresses
+  for (const host of ['0.0.0.0', '::', '::1', '127.0.0.1']) {
+    const p = await holder(t, host);
+    if (!p) continue;
+    const srv = createServer({ engine: new FakeEngine(s), store: s, token: TOKEN, rootDir: ROOT, port: p });
+    t.after(() => srv.close());
+    await assert.rejects(srv.listen(), (err) => err.code === 'EADDRINUSE', host);
+    assert.equal(srv.port, null, host);
   }
 });
 
