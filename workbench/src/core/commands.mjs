@@ -153,12 +153,12 @@ function stripSoft(toks) {
   return toks.slice(k);
 }
 
-function stripPolite(toks) {
+function stripPolite(toks, seqs = POLITE) {
   let cur = toks;
   for (let changed = true; changed;) {
     changed = false;
     const ws = cur.map(t => t.w);
-    for (const seq of POLITE) {
+    for (const seq of seqs) {
       if (seq.length < cur.length && seqAt(ws, 0, seq)) {
         cur = stripSoft(cur.slice(seq.length));
         changed = true;
@@ -378,12 +378,14 @@ function resolveRef(toks, c) {
   }
   for (const a of c.agents) if (ws.includes(a.id.toLowerCase())) return { ids: [a.id], full: true, sure: true, named: true, coverage: 1, total: 99 };
   let best = null;
+  const said = refKey(ws);
   for (const a of c.agents) {
     const sc = scoreAgent(ws, a);
     if (!sc.units || !sc.matched) continue;
     const coverage = sc.matched / sc.units;
     if (coverage < 0.5) continue;
-    const key = [coverage, sc.total, a.kind === 'helper' ? 0 : 1, ENDED.has(a.state) ? 0 : 1, a.id === c.focusId ? 1 : 0];
+    // as well matched, the agent whose whole name the words are wins ("stop asking" for Stop asking, not Stop asking for password)
+    const key = [coverage, sc.total, agentWords(a).nameKey === said ? 1 : 0, a.kind === 'helper' ? 0 : 1, ENDED.has(a.state) ? 0 : 1, a.id === c.focusId ? 1 : 0];
     if (!best || compareKeys(key, best.key) > 0) best = { a, key, coverage, total: sc.total, matched: sc.matched };
   }
   if (!best) return none;
@@ -478,11 +480,14 @@ function confirmReply(toks, kind, c) {
   const isYes = w => (CONFIRM_YES.has(w) && (launch || !START_YES.has(w))) || own.includes(w);
   const isNo = w => (CONFIRM_NO.has(w) && !own.includes(w)) || ownNo.includes(w);
   // The full permissions card: the words that ask for them say yes to it ("stop asking"), and the words that turn them
-  // off, or "keep asking", say no.
+  // off say no: "ask first", "keep asking", and "turn it off", "switch it off" or "leave it off", which keep them off.
+  // Words that end with a question mark ask about the card rather than answer it: it stays.
   if (kind === 'permissions') {
-    const mode = permissionsMode(stripTrailing(stripPolite(stripSoft(toks))));
+    if (endsAsking(toks)) return 'asks';
+    const mode = modeWords(toks, c);
     if (mode) return mode === 'full';
-    if (/^keep asking(?: me)?$/.test(toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w)).join(' '))) return false;
+    const said = stripTrailing(stripPolite(stripSoft(toks), MODE_POLITE)).map(t => t.w).join(' ');
+    if (/^(?:(?:no|nope|nah) )?(?:keep asking(?: me)?|(?:turn|switch|leave|keep) (?:(?:it|them) )?off)$/.test(said)) return false;
   }
   // Before the fillers go: "so" is one. Throwing work away and full permissions take their own words, so "make it so"
   // keeps those cards.
@@ -690,6 +695,8 @@ function matchStop(core, c) {
   }
   const v = startsWithSeq(ws, STOP_VERBS);
   if (!v) return null;
+  // "Stop asking for password" is the name of the agent "Stop asking for password": said alone, it shows it, as any name does
+  if (bareName(ws, c)) return null;
   // "stop checkout test?" asks about the agent of that name; "can you stop the flaky test?" still stops
   if (/[?？]["'”’)]*$/.test(core[core.length - 1].raw) && c.agents.some(a => saysWhole(ws, a))) return null;
   let rest = core.slice(v);
@@ -1755,13 +1762,48 @@ function permissionsMode(core) {
 }
 
 /**
- * "full permissions", "stop asking", "allow everything", "don't ask me", "full access" (on); "ask first", "ask me first",
- * "ask again", "turn off full permissions", "full permissions off" (off). Only these words whole, so "give the deploy
- * role full permissions on the bucket", "add full access for admins", "stop asking for a password on login" and "make
- * the app ask first before deleting" are work. Weak: while a question waits, they are its answer.
+ * The polite words that may stand before the mode's words: they ask Workbench to do it, and leave who acts as it is. "I
+ * need to", "we should", "you should", "let's", "help me" and the other openers of POLITE are not here: "we should ask
+ * first" is a thought, not the mode.
  */
-function matchPermissions(core) {
-  const mode = permissionsMode(core);
+const MODE_POLITE = [['please'], ['kindly'], ['just'], ['can', 'you'], ['could', 'you'], ['would', 'you'], ['will', 'you']];
+
+/** Whether the words end with a question mark: then they ask, and act on nothing. */
+const endsAsking = toks => toks.length > 0 && /[?？]["'”’)]*$/.test(toks[toks.length - 1].raw);
+
+/**
+ * Whether the words are exactly an agent's name, as the person would say it: the name read as their words are (case and
+ * punctuation aside), word for word, a plural ending aside ("full permission" for an agent called Full permissions).
+ */
+function namesAgent(toks, c) {
+  const ws = toks.map(t => t.w);
+  return c.agents.some(a => {
+    const name = lex(String(a.name ?? '')).filter(t => !DISFLUENCY.has(t.w)).map(t => t.w);
+    return name.length === ws.length && name.every((w, i) => w === ws[i] || stem(w) === stem(ws[i]));
+  });
+}
+
+/**
+ * 'full', 'ask' or null: what the person's words, whole, ask of full permissions. Soft openers ("okay", "um"), the polite
+ * words of MODE_POLITE ("please", "can you") and trailing ones ("please", "thanks", "now") may go with them. An opener that
+ * changes who acts ("I need to ask first", "we should stop asking", "help me stop asking") makes them something else, and
+ * so does a question mark at the end ("ask first?"). Words that are exactly the name of an agent on the board ("Ask first",
+ * "Full permissions") are that agent's.
+ */
+function modeWords(toks, c) {
+  if (!toks.length || endsAsking(toks) || namesAgent(toks, c)) return null;
+  return permissionsMode(stripTrailing(stripPolite(stripSoft(toks), MODE_POLITE)));
+}
+
+/**
+ * "full permissions", "stop asking", "allow everything", "don't ask me", "full access" (on); "ask first", "ask me first",
+ * "ask again", "turn off full permissions", "full permissions off" (off). Only these words whole (modeWords, read from what
+ * the person said, `base`), so "give the deploy role full permissions on the bucket", "add full access for admins", "stop
+ * asking for a password on login" and "make the app ask first before deleting" are work. Weak: while a question waits,
+ * they are its answer.
+ */
+function matchPermissions(base, c) {
+  const mode = modeWords(base, c);
   return mode ? { intent: { kind: 'permissions', mode }, strong: false } : null;
 }
 
@@ -2153,7 +2195,7 @@ function parse(said, c, { free = true } = {}) {
   // they are its answer (step 3). Only the whole utterance counts: after an agent's name ("claude, stop asking",
   // "Onboarding, ask first") the words are work or a message for that agent, as before.
   if (!(ask && (ask.type === 'question' || ask.type === 'stuck'))) {
-    const mode = matchPermissions(stripTrailing(stripPolite(stripSoft(base))));
+    const mode = matchPermissions(base, c);
     if (mode) return mode.intent;
   }
   const reply = (r) => {
@@ -2349,7 +2391,7 @@ function matchCommand(core, c, base = core) {
   // cleanup change" and "show search cleanup's changes" were status questions, and still are when they name no agent.
   return matchHelp(core, base, c)
     || matchConnect(core)
-    || matchPermissions(core)
+    || matchPermissions(base, c)
     || matchMachines(core, c)
     || matchStop(core, c)
     || matchForget(core, c)

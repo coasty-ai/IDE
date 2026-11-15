@@ -1379,10 +1379,10 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         const text = String(json?.text || '').trim();
         const shown = json?.confirmId ? confirms.get(json.confirmId) : null;
         if (shown && shown.kind === 'permissions') {
-          // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking" or
-          // a no. A bare "yes" is not enough: the card stays.
+          // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking",
+          // "turn it off" and its kin, or a no. A bare "yes" is not enough, and a question answers nothing: the card stays.
           if (/^(turn (it|them) on|turn on full permissions|do it|stop asking|full permissions|allow everything)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
-          if (/^(keep asking|no|cancel|never mind|ask first|ask me first)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if (/^(keep asking|no|cancel|never mind|ask first|ask me first|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           return reply({ reply: 'I did not catch that. Say “do it” to turn on full permissions, or “cancel”.', confirm: cardOf(shown) });
         }
         if (shown) {

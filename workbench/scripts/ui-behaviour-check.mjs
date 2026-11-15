@@ -1640,24 +1640,28 @@ try {
       `"${lid}", focus ${f}, ${JSON.stringify(p)}`);
   });
 
-  await run(FP + 'words: "stop asking" brings the card, a bare "yes" keeps it, "turn it on" turns them on, "ask first" turns them off', async () => {
+  await run(FP + 'words: "stop asking" brings the card, a bare "yes" keeps it, "turn it off" keeps asking, "turn it on" turns them on, "ask first" turns them off', async () => {
     await open('demo');
     await sleep(900);
     await typeIn('stop asking'); await sleep(1100);
     const card = await lidNow();
     await typeIn('yes'); await sleep(900);
     const kept = await lidNow(), keptSaid = await said();
+    await typeIn('turn it off'); await sleep(1100);
+    const no = await lidNow(), noSaid = await said(), still = await permBtn();
+    await typeIn('stop asking'); await sleep(1100);
     await typeIn('turn it on'); await sleep(1300);
     const on = await permBtn();
     await typeIn('ask first'); await sleep(1300);
     const off = await permBtn(), offSaid = await said();
     const p = (await posts()).filter(x => x.path === '/api/command').map(x => [x.body.text, !!x.body.confirmId]);
-    check(FP + 'words: "stop asking" brings the card, a bare "yes" keeps it, "turn it on" turns them on, "ask first" turns them off',
+    check(FP + 'words: "stop asking" brings the card, a bare "yes" keeps it, "turn it off" keeps asking, "turn it on" turns them on, "ask first" turns them off',
       card === 'Before agents stop asking / Let agents do anything without asking?' && kept === card
-      && /Say “do it” to turn on full permissions, or “cancel”\./.test(keptSaid) && on.pressed === 'true' && off.pressed === 'false'
+      && /Say “do it” to turn on full permissions, or “cancel”\./.test(keptSaid) && !/^Before agents stop asking/.test(no)
+      && /OK, agents still ask before risky steps\./.test(noSaid) && still.pressed === 'false' && on.pressed === 'true' && off.pressed === 'false'
       && /Agents ask again before risky steps\./.test(offSaid)
-      && JSON.stringify(p) === JSON.stringify([['stop asking', false], ['yes', true], ['turn it on', true], ['ask first', false]]),
-      `"${card}"; yes → "${kept}" "${keptSaid}"; on ${on.pressed}; off ${off.pressed} "${offSaid}"; ${JSON.stringify(p)}`);
+      && JSON.stringify(p) === JSON.stringify([['stop asking', false], ['yes', true], ['turn it off', true], ['stop asking', false], ['turn it on', true], ['ask first', false]]),
+      `"${card}"; yes → "${kept}" "${keptSaid}"; turn it off → "${no}" "${noSaid}" (${still.pressed}); on ${on.pressed}; off ${off.pressed} "${offSaid}"; ${JSON.stringify(p)}`);
   });
 
   await run(FP + 'the button sits in the top band just left of Agents & keys, lit amber in every look', async () => {
