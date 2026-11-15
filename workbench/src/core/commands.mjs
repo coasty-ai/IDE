@@ -151,9 +151,14 @@ function spanText(toks) {
   return out;
 }
 
-/** Trim quotes and closing punctuation from task or message text. */
+/**
+ * Trim quotes and closing punctuation from task or message text. Text of several lines keeps its edges as written, less
+ * the spaces around it: a pasted snippet's first quote or last semicolon is part of it.
+ */
 function tidy(s) {
-  return String(s).replace(/^["'“”‘’]+/, '').replace(/["'“”‘’]+$/, '').replace(/[\s,;:.!]+$/, '').replace(/["'“”‘’]+$/, '').trim();
+  const t = String(s);
+  if (LINE_BREAK.test(t.trim())) return t.trim();
+  return t.replace(/^["'“”‘’]+/, '').replace(/["'“”‘’]+$/, '').replace(/[\s,;:.!]+$/, '').replace(/["'“”‘’]+$/, '').trim();
 }
 
 function seqAt(ws, i, seq) {
@@ -2018,18 +2023,22 @@ function saidNeverMind(ws) {
 /** Workbench's own verbs for an agent's work and for earlier agents. */
 const AGENT_VERBS = [['throw', 'away'], ['throw', 'out'], ['pick', 'up'], ['carry', 'on'], ['discard'], ['scrap'], ['trash'], ['throw'],
   ['land'], ['merge'], ['bring'], ['forget'], ['continue'], ['resume']];
+/** What may follow one of them and still mean an agent: "it", "them", and words that say how ("throw it all away now"). */
+const AGENT_VERB_TAIL = new Set(['it', 'its', 'them', 'this', 'that', 'these', 'those', 'one', 'ones', 'all', 'away', 'out', 'in', 'up',
+  'please', 'now', 'again', 'too', 'then', 'just']);
 
 /**
  * Words that address an agent and say nothing else: an agent named alone ("codex", "agent", "the new agent", "start the
  * agent"), or one of Workbench's own verbs with nothing after it but "it", "them" or the like ("discard", "throw it away",
  * "merge them", "continue"). They are no prompt for another agent: they keep their old meaning (unknown, and on a card
- * that has run out, the engine says it is no longer waiting).
+ * that has run out, the engine says it is no longer waiting). Anything more names something that is no agent, so it is
+ * a prompt as written ("throw away my work", "discard everything", "forget the old stuff").
  */
 function addressesAnAgent(ws) {
   const n = parseNoun(ws, startsWithSeq(ws, START_STRONG));
   if (n.hasNoun && n.end === ws.length) return true;
   const v = startsWithSeq(ws, AGENT_VERBS);
-  return v > 0 && ws.slice(v).every(w => NOTHING_WORDS.has(w) || w === 'away');
+  return v > 0 && ws.slice(v).every(w => AGENT_VERB_TAIL.has(w));
 }
 
 /** The agent in the centre waits on the person through a helper, though not one the words could answer (two wait). */

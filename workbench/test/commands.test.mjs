@@ -753,7 +753,7 @@ test('the new words never take over work, answers or replies to a permission', (
     ['discard unused imports', 'none', task('discard unused imports')],
     ['discard unused imports', 'invoice', task('discard unused imports')],
     ['discard my changes', 'invoice', task('discard my changes')], // the person's own, never an agent's
-    ['throw away my work', 'invoice', unknown('throw away my work')],
+    ['throw away my work', 'invoice', task('throw away my work')],
     ['throw away your changes', 'invoice', task('throw away your changes')],
     ['discard all changes', 'invoice', task('discard all changes')],
     ['discard changes', 'invoice', task('discard changes')],
@@ -1923,7 +1923,9 @@ test('bare acknowledgements with nothing waiting start nothing: thanks, a yes or
 });
 
 test('"full permissions …" and "ask first" are kept for Full permissions mode: never a prompt here', () => {
-  for (const text of ['full permissions', 'Full permissions on', 'full permissions for onboarding', 'full permission please', 'ask first', 'Ask first.', 'please ask first']) {
+  // Also after the verbs a person would put before them: these are kept too, so the other change can take them.
+  for (const text of ['full permissions', 'Full permissions on', 'full permissions for onboarding', 'full permission please', 'ask first', 'Ask first.', 'please ask first',
+    'turn on full permissions', 'use full permissions', 'enable full permissions', 'give it full permissions', 'switch to ask first', 'go back to ask first']) {
     for (const ctx of [CTX.none, CTX.onboarding, oneAtWork]) {
       const got = parseCommand(text, ctx);
       assert.ok(got.kind !== 'task' && got.kind !== 'start' && got.kind !== 'ack', `${JSON.stringify(text)}: ${JSON.stringify(got)}`);
@@ -1948,4 +1950,16 @@ test('a prompt of several lines keeps its lines; a card that quotes it shows one
   assert.deepEqual(parseCommand('thanks\nthe footer is broken too', oneAtWork), task('the footer is broken too'));
   // One line reads as before: runs of spaces are one space.
   assert.deepEqual(parseCommand('fix   the   login', oneAtWork), task('fix the login'));
+  // Pasted code keeps its edges: a first quote and a last semicolon are part of it (one line still loses its last full stop).
+  const code = '"use strict" breaks the build here:\nconst total = require("./total");';
+  assert.deepEqual(parseCommand(code, oneAtWork), task(code));
+  assert.deepEqual(parseCommand('Update the docs for the new API.', oneAtWork), task('Update the docs for the new API'));
+});
+
+test('a verb of Workbench\'s with only "it" or "them" after it addresses an agent; with anything more it is a prompt', () => {
+  sweptRows([
+    ['discard', 'invoice', unknown('discard')], ['throw it away', 'pendingGone', unknown('throw it away')], ['throw them all away', 'invoice', unknown('throw them all away')],
+    ['throw away my work', 'invoice', task('throw away my work')], ['discard everything', 'none', task('discard everything')],
+    ['scrap the old one', 'none', task('scrap the old one')], ['forget the old stuff', 'oneAtWork', task('forget the old stuff')],
+  ]);
 });
