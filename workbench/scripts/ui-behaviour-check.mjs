@@ -924,11 +924,18 @@ try {
     await sleep(900);
     await typeIt('looks good, merge it'); await sleep(1000);
     const p3 = await sent();
+    // so does "looks good" where the lid has no "Looks good": work that can merge offers Merge and "Not now", and words
+    // that sound like approval never press "Not now", which would send work not merged yet to the tray
+    await open('done-waits');
+    await sleep(900);
+    await typeIt('looks good'); await sleep(1000);
+    const p4 = await sent(), chips4 = await chipsNow();
     check(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent',
       p1.length === 1 && p1[0][0] === '/api/agents/w1/answer' && p1[0][1].answer === 'Not now' && !('askId' in p1[0][1]) && chips1 === '' && tray1 === '1 not merged'
       && /Invoice export is done and checked\./.test(lid) && p2.length === 1 && p2[0][0] === '/api/agents/228202/answer' && p2[0][1].answer === 'Looks good' && tray2 === '1 done'
-      && p3.length === 1 && p3[0][0] === '/api/command' && p3[0][1].text === 'looks good, merge it',
-      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}`);
+      && p3.length === 1 && p3[0][0] === '/api/command' && p3[0][1].text === 'looks good, merge it'
+      && p4.length === 1 && p4[0][0] === '/api/command' && p4[0][1].text === 'looks good' && chips4 === 'w1~',
+      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" with no such button: ${JSON.stringify(p4)}, chips "${chips4}"`);
   });
 
   // ---------------------------------------------------------------- D2: merge, review and throw away (the 'merge' scenarios)

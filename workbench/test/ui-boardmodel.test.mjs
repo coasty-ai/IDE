@@ -153,6 +153,27 @@ test('thirteen on the board, then one leaves: the board stays dense, and every o
   assert.ok(b.laneOf('z') && b.laneOf('z').row != null);
 });
 
+test('a dense board whose only root left is finished work waiting in the tray stays dense; once that is let go, whole lanes come back', () => {
+  const lanes = new Lanes(memory()), lap = r => r.machineId === 'laptop';
+  const list = Array.from({ length: 13 }, (_, i) => agent('r' + i, 'working', { machineId: i % 2 ? 'cloud-1' : 'laptop' }));
+  assert.equal(boardAndTray(model(list).roots, lanes, { laptop: lap, maxRows: 24 }).dense, true);
+  // all but r0 are stopped and their work thrown away; r0 finishes and waits to be looked at, in the tray
+  const gone = a => ({ ...a, state: 'stopped', endedAt: T, stateSince: T, work: W({ branch: null, folder: false, thrownAway: { at: T + 1, saved: 'x' } }) });
+  const done0 = { ...list[0], state: 'done_checked', endedAt: T, stateSince: T };
+  const now = [done0, ...list.slice(1).map(gone)];
+  let b = boardAndTray(model(now).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.equal(b.dense, true, 'no chip is drawn, but r0 is still on the board');
+  assert.deepEqual(ids(b.roots), []);
+  assert.ok(b.trayIds.done.includes('r0'));
+  // "Looks good" on it: the board is empty, so whole lanes come back, and a newcomer takes one
+  const reviewed = new Set([finishKey(done0)]);
+  b = boardAndTray(model(now, { reviewed }).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.equal(b.dense, false);
+  b = boardAndTray(model([...now, agent('n', 'starting')], { reviewed }).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.deepEqual([b.dense, b.nRows, ids(b.roots)], [false, ROWS, ['n']]);
+  assert.ok(b.laneOf('n') && b.laneOf('n').row != null);
+});
+
 test('a dense board goes back to whole lanes at a reload, which lays it out afresh; a draw before the agents arrive changes nothing', () => {
   const tab = memory(), lap = r => r.machineId === 'laptop';
   const list = Array.from({ length: 13 }, (_, i) => agent('d' + i, 'working', { machineId: i % 2 ? 'cloud-1' : 'laptop' }));
