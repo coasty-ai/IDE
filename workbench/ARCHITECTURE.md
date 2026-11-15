@@ -22,7 +22,7 @@ The browser UI is served by the engine on `127.0.0.1` and talks to it over HTTP 
 - Tests never reach the person's keychain or accounts. Key tests use `test/helpers/security-fake.mjs` and `test/helpers/secret-tool-fake.mjs`, never `/usr/bin/security` or a real keyring. A test that makes git keep, read or forget a sign-in sets `GIT_CONFIG_NOSYSTEM=1` and a `GIT_CONFIG_GLOBAL` of its own: on a Mac, git's system config hands sign-ins to the login keychain. A test never reaches GitHub: it passes Connect a `fetchJson` of its own, or, running the CLI's GitHub helpers as programs, gives them nothing that would be sent (no token, a refused one, no connection). A test never adds a key through the CLI, whose key store uses `/usr/bin/security` (with no keys, it starts nothing). A key-shaped value in a test is built from parts at run time, so no fixture looks like a real key. The one check against the real keychain is `scripts/keychain-check.mjs`, which the owner runs, never an agent or a test: it saves three made-up values, reads them back from a second process (which gets only their SHA-256), removes them and asks `security find-generic-password` without `-w` that they are gone; `--file-only` runs it against the file store.
 - A key's secret value (an API key, a token) never goes into a log line, an argv, an address, a server answer, the event log or the history. What agents and checks print is masked before anyone sees it (see "Keys" and "Keys, masking and the default agent").
 - Every child process is spawned with an argument array (`execFile`/`spawn`, never a shell string), with two exceptions. The first is declared checks, which are shell commands the repo owner wrote in `workbench.json`. The second is the agent installers in `src/core/connect.mjs`: two fixed lines Workbench itself carries, `curl -fsSL https://claude.ai/install.sh | bash` and `curl -fsSL https://chatgpt.com/codex/install.sh | sh`, which Terminal runs as `/bin/sh -c <line>` when the person presses Install (see "Terminal"). They are never built from anything a person or an agent typed. Every git call the program makes goes through `git()` in `src/core/workspace.mjs`, or through `gitStream()`, its streaming variant for clones in the same file. Both add `-c core.fsmonitor=false`, scrub the git environment and set a time limit (tests and `scripts/` may run git themselves).
-- Workbench's own temporary files and folders (a script for Terminal, the download of `gh`, a scratch git index, the folder git runs in outside every repository) go in a new private folder from `privateTemp()` in `src/core/workspace.mjs`: `~/.workbench/tmp/<prefix>XXXXXX`, mode 0700 (see "Workspaces and receipt"). Never in the system's temporary folder (`os.tmpdir()`, `$TMPDIR`): a Codex agent's sandbox can write there (see "Codex adapter"), and so can any program of the person's, so a file left there could be changed before Workbench uses it. Tests and `scripts/` may use the temporary folder.
+- Workbench's own temporary files and folders (a script for Terminal, the download of `gh`, a scratch git index, the folder git runs in outside every repository) go in a new private folder from `privateTemp()` in `src/core/workspace.mjs`: `~/.workbench/tmp/<prefix>XXXXXX`, mode 0700 (see "Workspaces and receipt"). Never in the system's temporary folder (`os.tmpdir()`, `$TMPDIR`): a Codex agent's sandbox can write there (see "Codex adapter"), and so can any program of the person's, so a file left there could be changed before Workbench uses it. The one exception is a save from the file view: a rename is atomic only within one volume, so `writeFile` in `src/core/files.mjs` writes the new bytes to a sibling `.<name>.workbench-save-<16 random hex>` beside the file, made only where nothing is (flag `wx`), and renames it over the file (see "The file view's files"). Tests and `scripts/` may use the temporary folder.
 - Plain language in anything a person sees: sentences built from facts (paths, branch names, counts), not identifiers, and never git's own error text (git's words go only in an error's `.detail`, for the log: see "Workspaces and receipt"). Use `src/shared/narrate.mjs`.
 
 ## Files and owners
@@ -34,6 +34,7 @@ The browser UI is served by the engine on `127.0.0.1` and talks to it over HTTP 
 | Claude Code adapter | `src/adapters/claude/args.mjs`, `src/adapters/claude/parse.mjs`, `src/adapters/claude/runner.mjs`, `src/adapters/claude/hook-bridge.mjs` |
 | Codex adapter | `src/adapters/codex/parse.mjs`, `src/adapters/codex/runner.mjs` |
 | Language, policy, workspaces and source control, receipt | `src/core/commands.mjs`, `src/core/policy.mjs`, `src/core/workspace.mjs`, `src/core/receipt.mjs` |
+| The file view | `src/core/files.mjs` |
 | Keys and Agents & keys | `src/core/keys.mjs`, `src/core/connect.mjs`, `src/core/terminal.mjs`, `src/core/github.mjs`, `src/core/signin.mjs`, `src/shared/keypresets.mjs`, `src/shared/secretshape.mjs` |
 | Simulator and machines | `src/adapters/sim/simulator.mjs`, `src/core/machines.mjs` |
 | UI | `ui/index.html`, `ui/app.css`, `ui/app.js`, `ui/*.js` (the git screen: `ui/gitgraph.js`, `ui/diffview.js`, `ui/gitscreen.js`; Agents & keys: `ui/connect.js`, `ui/connectview.js`), `ui/fonts/` |
@@ -822,6 +823,83 @@ Messages, authors and dates:
     - `stopped` when `signal` stopped it (above).
     - `git` for anything else ("Git could not clone <address>."), for the time limit ("Git took too long and was stopped.") and for a missing git ("Git is not installed, or it is not on the PATH.").
   - A folder that did not exist before the clone and is still there after a failure is removed (git normally removes it itself). An empty folder that was there before is left.
+
+## The file view's files (`src/core/files.mjs`)
+
+What the file view lists, reads and saves, in the person's repository or an agent's folder (`root`, the folder every `rel` is relative to). Every git call goes through `git()`. Every refusal is a plain error: `.plain`, a sentence built from facts, `why: 'refused'` (or `why: 'changed'` with `hash`, below), and Node's or git's own words only in `.detail`, for the log. A `root` that is not given, not there or not a folder: "No project folder was given.", "The folder <root> does not exist." or "<root> is not a folder.".
+
+**Path rules.** `checkPath(rel)` -> its parts, or a refusal. The engine checks with it again.
+
+- `rel` is a string of at most 4096 bytes of UTF-8 (`MAX_PATH_BYTES`), relative, with `/` between its parts. No part is empty, `.` or `..`, and it holds no NUL. The refusals are "No file was named.", "That file name is longer than 4096 bytes, so Workbench does not look for it." and "“<rel>” is not the name of a file inside the project.". A backslash is part of a name.
+- No part is `.git` in any case, nor `.git` with a character HFS+ leaves out of names (git's `core.protectHFS` list: U+200C to U+200F, U+202A to U+202E, U+206A to U+206F, U+FEFF): "Workbench leaves git’s own folder alone, so it does not open <rel>." (`change` for a save).
+- The folder that holds the file is resolved to its real path (`realpath`, which also gives a name's case as it is on disk). It must be the real root or inside it: "<rel> leads outside the project folder, so Workbench does not open it." (`change` for a save). Its parts from the root are checked for `.git` again: "<rel> leads into git’s own folder, which Workbench leaves alone.". So a folder link inside the project is followed, and only there. The file's own last part is never followed: a link there is shown as a link and never written through.
+
+**`listFiles({ root, max = 50_000 })`** -> `{ files, truncated? }`
+
+- `files`: paths from `root` with `/`, ordered by path. They come from `git ls-files -z --cached --others --exclude-standard`, run as its two halves (`--cached`, then `--others --exclude-standard`) so that tracked files come first when the list is cut. That is every tracked file (one in a conflict once), then every new file no ignore rule hides.
+- `truncated: true` when there were more than `max` (never more than 50,000, `MAX_LIST_FILES`).
+- Left out: a repository inside the folder (git names it `folder/`), a name that is not UTF-8 (the page could not ask for it by name), and a name the path rules refuse. Names are read as bytes.
+- When git fails: "Git could not list the files in <root>.", or git's trouble ("Git is not installed, or it is not on the PATH.", "Git took too long and was stopped.", "Git gave back more than Workbench can read at once.").
+
+**`readFile({ root, rel })`** -> `{ kind, text?, hash, size, lines?, link?, eol, bom }`
+
+- `kind`, decided in this order:
+  - `missing`: nothing is there, or a folder on the way is missing.
+  - `link`: `link` is where it points, as text, and `hash` and `size` are those of that text. What it points at is never read.
+  - `large`: over 1 MB (`MAX_FILE_BYTES`, 1,048,576 bytes), known from `fstat` without reading it.
+  - `binary`: a NUL byte anywhere. Git looks at the first 8000 bytes; Workbench looks at all of them, so text it shows or saves never holds a NUL.
+  - `notutf8`: not whole UTF-8.
+  - `secret`: an env file (below).
+  - `text`.
+- A folder is refused ("<rel> is a folder, not a file."), and so is anything else that is not a regular file or a link, such as a FIFO ("<rel> is not a regular file, so Workbench does not open it.").
+- The file is opened with `O_NOFOLLOW | O_NONBLOCK`, so a link put there meanwhile is not followed and a FIFO never blocks. It is checked with `fstat` and read once: the hash, size, line endings and text come from the same bytes. When it cannot be read: "Workbench is not allowed to read <rel>." or "Workbench could not read <rel>.".
+- `hash`: the SHA-256 (hex) of the bytes on disk; null for `large` and `missing`. `size`: their number.
+- `text` (`text` and `secret` only): the file with its BOM (EF BB BF) taken off and CRLF shown as LF. `lines`: its lines, counted as git counts them: a last line without a newline counts, and an empty file has none.
+- `eol`: `lf`, `crlf`, `none` (no line break) or `mixed`. `mixed` means both, or a carriage return on its own: Workbench never writes that line ending, and a text box would turn it into LF. `bom`: whether the file starts with a UTF-8 BOM. Both describe the text, so they are `none` and false for the other kinds.
+- **Env files** are named `.env`, `.env.<anything>` or `<anything>.env`, in any case. Their `text` has every value masked the way Workbench shows a secret (`shownValue` in `keys.mjs`: "•••• " and its last four characters for a value of 12 characters or more, otherwise "••••"), line for line:
+  - a line that names its value (`NAME=value`, `export NAME=value` or `NAME: value`, or one of these commented out with `#`) keeps the name, `export`, the `=` or `: ` and the quotes, and its value is masked;
+  - a name counts only when it cannot be a key itself. It has a variable's shape (a letter or `_`, then letters, digits, `_`, `.` or `-`) and at most 64 characters. It does not mix upper case, lower case and digits, as base64 does. No part of it between `_`, `.` and `-` that holds a digit is longer than 10 characters, as base32 and hex would be (`K8S_NAMESPACE`, `OAUTH2_CLIENT_ID` and `POSTGRES15_HOST` count). And `looksLikeSecret` (`src/shared/secretshape.mjs`) does not flag it. Otherwise a token padded with `=` would pass for a name with an empty value, and be shown whole;
+  - a quoted value that goes on past its line shows "••••" on each line, up to the line with its closing quote;
+  - blank lines stay;
+  - every other line, a comment too, is "••••" after its `#`, with no last characters: a line that names nothing may be part of a key, such as a line of a private key pasted without quotes.
+
+**`writeFile({ root, rel, text, hash, force })`** -> `{ hash, size }`, the SHA-256 and size of the bytes written
+
+- Checked in this order. Each check is a refusal that writes nothing:
+  - the path rules;
+  - `text` is a string ("There was no text to save.");
+  - `hash` is 64 hex characters ("Workbench does not know which version of <rel> was edited, so nothing was saved.");
+  - `text` holds no carriage return, since it arrives with LF ("The text to save has a carriage return in it, which Workbench does not write, so nothing was saved."), no NUL ("The text to save has a NUL character in it, so nothing was saved."), and no half of a surrogate pair ("The text to save has characters that cannot be written as UTF-8, so nothing was saved.");
+  - the file is there. Only regular files that already exist are written; a new file is never made ("<rel> is not there any more, and Workbench does not make new files.");
+  - it is not a link ("<rel> is a link, and Workbench does not write through links."), a folder or another kind of file;
+  - it is at most 1 MB, and is not binary, not UTF-8 or an env file ("<rel> is a binary file, so Workbench does not edit it.", likewise "is not UTF-8 text", "holds keys", "is larger than 1 MB");
+  - its line endings are not mixed ("<rel> mixes line endings, so Workbench does not edit it.").
+- **The hash.** The SHA-256 of the bytes on disk must be `hash`. Otherwise the answer is `why: 'changed'`, with `hash` the file's hash now: "<rel> changed on disk since it was opened, so nothing was written.". `force` (the person saves theirs anyway) skips nothing. With it, the caller passes the hash that the `changed` refusal gave, and that must still match; when it does not: "<rel> changed again, so nothing was written.".
+- Then the file must be writable for this account (`access`, `W_OK`): "<rel> is read-only, so Workbench did not change it.".
+- **Line endings are kept.** Each LF becomes CRLF in a CRLF file; a file with no line break yet gets LF. The BOM is put back, and the final newline is as the text has it. The bytes written, counted after CRLF and the BOM, must be at most 1 MB: "The edit would make <rel> larger than 1 MB, so Workbench did not save it.".
+- **Atomic, beside the file.** This is the one exception to `privateTemp()`: a rename is atomic only within one volume.
+  1. In the file's real folder, a sibling `.<name>.workbench-save-<16 random hex>` is made, with the name cut short when the whole would pass 255 bytes. It is opened with flag `wx` (it fails if anything, even a link, is there) and mode 0600.
+  2. It gets the original's mode (`fchmod`, so the umask cannot change it), is written, and is fsynced.
+  3. The last look, just before the rename. The folder's real path must be unchanged ("The folder that holds <rel> moved while Workbench saved it, so nothing was written."). `lstat` must say the file is still a regular file. Its bytes must still have `hash`, or the answer is `changed` with the new hash, so an agent that wrote it meanwhile keeps its write.
+  4. The sibling is renamed over the file, and the folder is fsynced.
+- On any failure the sibling is removed; only a sibling this call made is ever removed. The failures are "Workbench is not allowed to save <rel>.", "There is no room left on the disk, so <rel> was not saved.", "<rel> is on a disk Workbench cannot write to." and "Workbench could not save <rel>.".
+
+**`changedLines({ root, since, rel })`** -> line numbers (ascending, from 1) in the file as it is now that the work since `since` added or changed, committed or not
+
+- `since`: the commit the agent's unmerged work starts from, 40 or 64 hex; anything else: "Workbench does not know which commit its work started from.".
+- `git diff-index -p <since> -- <path>` in `root`, with the diff flags of `patchesOf` in `workspace.mjs` and no others: `core.quotePath=false`, `core.bigFileThreshold`, `--literal-pathspecs`, `--no-ext-diff`, `--no-textconv`, `--no-color`, `--no-renames`. `diff-index` takes the place of `diff-tree`, since one side is the working folder.
+- Each hunk is walked by its counts, so a line of the file that looks like a header (`+++ x`) is still a line. Lines only taken away mark nothing, and a binary file has no lines.
+- A file never added (`git ls-files --others --exclude-standard` lists it) is new altogether, as the git screen calls it, so every line counts. A file an ignore rule hides is not work, and marks nothing.
+- The path goes to git through real folders, so a path through a folder link gives the real file's lines. Anything that is not a regular file (a link, a missing file) has none.
+- A `since` the repository no longer has: "The commit its work started from is no longer in this repository."; other failures: "Git could not tell which lines of <rel> changed.".
+
+**Known limits.**
+
+- A submodule's folder is listed, since git lists it as a tracked path, and reading it answers that it is a folder. A tracked file deleted from the folder is still listed, and reads as `missing`.
+- Node has no `openat`, so each check and the step after it are separate calls, and an agent racing a save can still change things between them. The last look narrows that to the rename itself. The rename names both files through the same folder, so a folder swapped for a link makes it fail: the sibling is not there.
+- A save cut short by a crash can leave its sibling behind, and it then shows as a new file in that folder.
+- `changedLines` runs git in `root`, so the clean filters and attributes there apply, as they do for the work set (see "Source control"). An assume-unchanged bit there hides a change.
+- A save puts a new file in place, so other hard links to the old one keep the old bytes, and extended attributes do not carry over.
 
 ## History
 
