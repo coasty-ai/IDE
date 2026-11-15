@@ -880,6 +880,36 @@ try {
       `"${shown}" → chips ${chips}, tray "${tray}"; after Look later: chips ${chips2}, tray "${tray2}"`);
   });
 
+  await run(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent', async () => {
+    const typeIt = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); };
+    const sent = async () => (await posts()).filter(x => x.path === '/api/command' || /\/answer$/.test(x.path)).map(x => [x.path, x.body]);
+    // typed "not now" at done-waits' Invoice export: what its "Not now" posts, and it goes to the tray, not merged
+    await open('done-waits');
+    await sleep(900);
+    await typeIt('not now'); await sleep(1300);
+    const p1 = await sent(), chips1 = await chipsNow(), tray1 = await trayNow();
+    // said aloud, "Looks good." at the demo's Invoice export (the demo merges nothing, so its lid has "Looks good")
+    await open('demo');
+    await b.goto(`${base}/?t=k&focus=228202`, 1600);
+    await clearLog();
+    const lid = await h1();
+    await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+    await b.key(' ', { phase: 'down' }); await sleep(150);
+    await b.ev(`window.__sr.last.hear('Looks good.'), 1`);
+    await b.key(' ', { phase: 'up' }); await sleep(1300);
+    const p2 = await sent(), tray2 = await trayNow();
+    // anything more than those words goes on as before: to the engine, as a command
+    await open('done-waits');
+    await sleep(900);
+    await typeIt('looks good, merge it'); await sleep(1000);
+    const p3 = await sent();
+    check(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent',
+      p1.length === 1 && p1[0][0] === '/api/agents/w1/answer' && p1[0][1].answer === 'Not now' && !('askId' in p1[0][1]) && chips1 === '' && tray1 === '1 not merged'
+      && /Invoice export is done and checked\./.test(lid) && p2.length === 1 && p2[0][0] === '/api/agents/228202/answer' && p2[0][1].answer === 'Looks good' && tray2 === '1 done'
+      && p3.length === 1 && p3[0][0] === '/api/command' && p3[0][1].text === 'looks good, merge it',
+      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}`);
+  });
+
   // ---------------------------------------------------------------- D2: merge, review and throw away (the 'merge' scenarios)
   // In 'merge', the lid shows Invoice export (m1a2b3, done and checked, work not merged yet) first, of three to look at;
   // Search cleanup (m7e8f9) has a merge that conflicts, Price rounding (mab0c1) one your own changes blocked.

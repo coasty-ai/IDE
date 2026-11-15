@@ -14,7 +14,8 @@ import { Board } from './board.js';
 import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
-import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand } from './prefs.js';
+import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand, lidAnswer } from './prefs.js';
+import * as ANSWERS from '/shared/answers.mjs';   // "looks good" and "not now", as the engine reads them
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { balanceHeading } from './balance.js';
@@ -704,6 +705,18 @@ function applyPref(kind, value, { quietly = false } = {}) {
   if (hasToken()) api.prefs({ [kind]: v }).catch(e => { if (e?.refused) say(e.message); });
 }
 
+/**
+ * The lid's own button that typed or spoken words stand for ("Looks good", "Not now": lidAnswer), on the page shown now
+ * (not one fading out, nor one still to rise), drawn for the agent the words were bound to when they began. null when
+ * the words stand for no button, are bound to nothing (begun during a swap), or the lid has no such button for them.
+ */
+function lidButton(label, b) {
+  if (!label || !b || !b.agentId) return null;
+  const page = el.pages.querySelector('.page:not(.old):not([data-hidden])');
+  const keys = label === 'Looks good' ? ['looksgood:Looks good'] : ['looksgood:Not now', 'later:Not now'];
+  return [...(page ? page.querySelectorAll('button[data-act]') : [])].find(x => x.dataset.agent === b.agentId && keys.includes(x.dataset.key)) || null;
+}
+
 async function submit(text) {
   text = String(text || '').trim();
   if (!text) return;
@@ -725,6 +738,11 @@ async function submit(text) {
     return;
   }
   if (cannotSend(linkNow())) return;
+  // "looks good" or "not now" (the engine's own words for them) at a finished agent's lid: the page presses that lid's
+  // "Looks good" or "Not now", drawn for the agent the words were begun for, so they do exactly what the button does,
+  // and no command goes to the engine. Anything else, or words bound to nothing, goes on as before.
+  const press = !S.reply && !S.confirm ? lidButton(lidAnswer(text, ANSWERS), b) : null;
+  if (press) { if (!press.disabled) await actOn(press); return; }
   try {
     if (S.reply) {
       const r = S.reply;
