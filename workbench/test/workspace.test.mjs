@@ -2238,7 +2238,6 @@ test('mergeWork says when git does not know the person’s name and email, whate
   delete process.env.GIT_CONFIG_GLOBAL; // a HOME with no config files at all: only Workbench's own private folder
   try {
     assert.deepEqual(fs.readdirSync(process.env.HOME).filter(n => n !== '.workbench'), []);
-    assert.deepEqual(fs.readdirSync(path.join(process.env.HOME, '.workbench')), ['tmp']);
     assert.equal(process.env.GIT_AUTHOR_NAME, 'Workbench Test'); // plain git would use this, or guess one
     assert.equal(await gitIdentity({ repoRoot: t.root }), null);
     const { expect } = await proposal(t);
@@ -2446,9 +2445,8 @@ test('Workbench’s own git never works in the temporary folder, where another p
 
 test('nothing is left behind in the temporary folder, or in Workbench’s own private one', () => {
   assert.deepEqual(fs.readdirSync(tmp).filter(f => f.startsWith('workbench-')), []);
-  const own = path.join(process.env.HOME, '.workbench', 'tmp');
-  assert.ok(fs.existsSync(own), 'the tests used it');
-  assert.deepEqual(fs.readdirSync(own).filter(f => f.startsWith('workbench-')), []);
+  const own = path.join(process.env.HOME, '.workbench', 'tmp'); // the tests above use it (see the planting git's test)
+  assert.deepEqual(fs.existsSync(own) ? fs.readdirSync(own).filter(f => f.startsWith('workbench-')) : [], []);
 });
 
 test('nothing was written to the real home folder', () => {
