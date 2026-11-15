@@ -428,11 +428,14 @@ try {
         await b.ev(`document.querySelector('.mach')?.click(), true`); await settle(150); await check(tag);
         await b.ev(`[...document.querySelectorAll('.mach')].pop()?.click(), true`); await settle(150); await check(tag);
       } else if (v === 'tray') {
-        await load('many');
-        await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
-        const shown = await b.ev(`!document.getElementById('trayList').hidden`);
-        if (!shown) failures.push(`${tag}: the done tray did not open its list`);
-        await check(tag);
+        // a dense board's tray, and the tray of agents the person is finished with (merged, thrown away)
+        for (const sc of ['many', 'done-tray']) {
+          await load(sc);
+          await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
+          const shown = await b.ev(`!document.getElementById('trayList').hidden`);
+          if (!shown) failures.push(`${tag} (${sc}): the done tray did not open its list`);
+          await check(`${tag} (${sc})`);
+        }
       } else if (v === 'earlier') {
         // agents from an earlier run: in the lid (one that can continue, one that cannot), the tray's list, the forget
         // question, and a card pinned on one
@@ -555,7 +558,7 @@ try {
         await load('merge-detached', '&focus=d1'); await check(tag + ' (not on a branch)');
         await load('merge-noid', '&focus=d2'); await check(tag + ' (no name and email)');
       } else if (v === 'wire') {
-        // A crowded board whose done tray reads "12 done or stopped, 6 from earlier, 7 more working" (the reviewer's board
+        // A crowded board whose done tray reads "12 done, 6 from earlier, 7 more working" (the reviewer's board
         // at 960×900), with the demo's four machines; then a fuller one whose machines have long names. No section of the
         // edge connector may lie on the DRAM's wire, and every word must fit its box (the fit check above).
         const crowd = async ({ working, done, earlier, rename }) => {
@@ -578,8 +581,8 @@ try {
           for (const m of document.querySelectorAll('.mach')) { const b = m.getBoundingClientRect(); if (b.left < x + 6 && b.right > x - 6) on.push(m.getAttribute('aria-label')); }
           return { on, tray: document.getElementById('tray').textContent.trim(), names: [...document.querySelectorAll('.mach')].map(m => [m.querySelector('.lb b span')?.textContent || '', m.title || '']) };
         })()`;
-        for (const [what, o, tray] of [['12 done, 6 from earlier, more working', { working: 31, done: 12, earlier: 6 }, /^12 done or stopped, 6 from earlier, \d+ more working$/],
-          ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }, /^60 done(, | or stopped, )40 from earlier, \d+ more/]]) {
+        for (const [what, o, tray] of [['12 done, 6 from earlier, more working', { working: 31, done: 12, earlier: 6 }, /^12 done, 6 from earlier, \d+ more working$/],
+          ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }, /^60 done, 40 from earlier, \d+ more/]]) {
           await load('many'); await crowd(o);
           const r = await b.ev(WIRE);
           if (!tray.test(r.tray)) failures.push(`${tag} (${what}): the crowded board did not show (its tray reads "${r.tray}")`);

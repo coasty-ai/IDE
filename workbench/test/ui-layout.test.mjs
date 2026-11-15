@@ -3,27 +3,20 @@ import assert from 'node:assert/strict';
 import { layoutBoard, sizeClass, frame, boardProblems, boardBoxes, placeCard, maxDenseRows, wrapWords, clipTo, overlapArea, SIZES,
   dramSegments, saidLineH, saidTextLines, SAID_HINT, saidMinLines, bottomRanks, clipToLines } from '../ui/layout.js';
 import { Lanes, denseLanes } from '../ui/lanes.js';
-import { boardModel } from '../ui/boardmodel.js';
+import { boardModel, boardAndTray } from '../ui/boardmodel.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
 import { scenario, SCENARIOS } from '../scripts/ui-mock.mjs';
 
 const WINDOWS = [[960, 900], [1024, 700], [1280, 680], [1440, 789], [1512, 862], [1728, 1000], [1920, 970], [2560, 1300]];
 const STATES = { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY };
 
-/** Lay out a scenario the way the page does. */
+/** Lay out a scenario the way the page does: what is on the board and what waits in the done tray come from boardAndTray. */
 function board(name, W, H, detail, { lanes = new Lanes(null), lidNeed = 220, currentId = null } = {}) {
   const st = scenario(name, 1_800_000_000_000);
-  const bm = boardModel(st.agents, { ...STATES, later: new Set(), currentId });
-  lanes.assign(bm.roots.map(r => ({ id: r.id, startedAt: r.startedAt, laptop: (st.machines.find(m => m.id === r.machineId)?.kind || 'laptop') === 'laptop' })));
+  const bm = boardModel(st.agents, { ...STATES, later: new Set(), reviewed: new Set(), currentId });
   const P = sizeClass(W, H);
-  const dense = bm.roots.length > 12;
-  let roots = bm.roots, laneOf = id => lanes.get(id), nRows = 6, tray = null;
-  if (dense) {
-    const done = roots.filter(r => r.ghost), active = roots.filter(r => !r.ghost);
-    const d = denseLanes(active, id => lanes.get(id), maxDenseRows(H, P));
-    roots = active.filter(r => !d.overflow.includes(r.id)); laneOf = id => d.at.get(id) || null; nRows = d.rows;
-    tray = { count: done.length, text: `${done.length} done or stopped` };
-  }
+  const laptop = r => (st.machines.find(m => m.id === r.machineId)?.kind || 'laptop') === 'laptop';
+  const { roots, laneOf, nRows, dense, tray } = boardAndTray(bm.roots, lanes, { laptop, maxRows: maxDenseRows(H, P) });
   const machines = st.machines.map(m => ({ id: m.id, name: m.name, awake: m.awake, note: '2 agents · memory almost full' }));
   return { G: layoutBoard({ W, H, P, detail, roots, laneOf, nRows, dense, lidNeed, machines, tray }), bm, lanes };
 }
@@ -59,7 +52,7 @@ test('the lid can always hold its smallest content: the fitter has a floor to ai
   }
 });
 
-test('a chip keeps its lane for life: new agents never move the old ones', () => {
+test('a chip keeps its lane while it is on the board: new agents never move the old ones', () => {
   const lanes = new Lanes(null);
   const first = board('demo', 1440, 900, 'calm', { lanes }).G;
   const later = board('busy', 1440, 900, 'calm', { lanes }).G;
@@ -309,7 +302,7 @@ test('a long done tray never puts a machine on the DRAM\'s wire: the sections na
   // at 960×900 with the demo's machines, the full words and whole names fit, the sections only narrowing
   const P = sizeClass(960, 900), words = trayWords({ done: 12, earlier: 6, over: 1 });
   const G = layoutBoard({ W: 960, H: 900, P, detail: 'calm', roots: [], laneOf: () => null, nRows: maxDenseRows(900, P), dense: true, lidNeed: 220, machines: DEMO, tray: { count: 18, done: 12, earlier: 6, over: 1, marks: [], ...words } });
-  assert.equal(G.tray.lead + G.tray.rest, '12 done or stopped, 6 from earlier, 1 more working');
+  assert.equal(G.tray.lead + G.tray.rest, '12 done, 6 from earlier, 1 more working');
   assert.ok(G.machines.every(m => m.label == null), 'whole names');
 });
 

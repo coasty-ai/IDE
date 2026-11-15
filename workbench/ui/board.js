@@ -5,13 +5,17 @@
 // Motion (none at all with still=1; no travel with reduced motion, which is watched live):
 //   a chip slides along its own lane (900 ms) and its copper follows; a line that lights charges from the chip into
 //   the core (600 ms) and its pad pops in; a line that goes out drains back (500 ms); pads renumber; the brackets move
-//   to what the core shows; a finished chip powers down after its slide (800 ms); one pulse runs along the copper per
-//   real step, at most every 1.1 s per agent. A new ask breathes three times, then the board rests.
+//   to what the core shows; a finished chip powers down after its slide (800 ms); a chip that leaves the board (for the
+//   done tray) fades out as it drifts a little towards the board's edge, with its helpers and its lane's copper
+//   (600 ms); one pulse runs along the copper per real step, at most every 1.1 s per agent. A new ask breathes three
+//   times, then the board rests.
 import { pathD, plen, laneTo, placeCard, sideRoom } from './layout.js';
 import { esc, setAttr, setText } from './util.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 const EASE = 'cubic-bezier(.2,.7,.2,1)';
+// a chip leaving the board and its copper fade together, evenly, so neither goes first
+const LEAVE = { duration: 600, easing: 'cubic-bezier(.45,0,.55,1)', fill: 'forwards' };
 const r1 = n => Math.round(n * 10) / 10;
 const glyph = (shape, tone, cls = 't') => `<svg class="g ${cls}-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
 
@@ -25,11 +29,14 @@ function svgEl(tag, attrs, parent) {
 export class Board {
   /**
    * @param {object} o  { boardSvg, wires, parts, core, dram, machines, tray, said, card, hooks, still, reduced }
-   *   hooks: { enter(id), leave(id), pick(id), more(rootId), machine(id, el), tray(el) }
+   *   hooks: { enter(id), leave(id), pick(id), more(rootId), machine(id, el), tray(el), home() }
+   *   home(): a chip that held the keyboard is leaving the board; put the keyboard somewhere that stays (the lid's sentence)
    */
   constructor(o) {
     Object.assign(this, o);
     this.nodes = new Map();      // root id -> { el, chip, svg, kids, sig, kidSig, slide }
+    this.leaving = new Map();    // root id -> the element of a chip still fading off the board (inert, no longer in nodes)
+    this.outSeq = 0;             // keys for copper that fades with a leaving chip ('out:…', kept by paintWires until it ends)
     this.wiresMap = new Map();   // key -> svg element
     this.prev = null;            // last layout, for motion
     this.boardSig = '';
@@ -83,12 +90,16 @@ export class Board {
     s += `<rect class="b-grain" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="${P.boardR}" fill="url(#grainTile)"/>`;
     s += `<rect class="b-dots" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="${P.boardR}" fill="url(#dots)"/>`;
     s += `<rect class="b-edge" x="${b.x + 0.5}" y="${b.y + 0.5}" width="${b.w - 1}" height="${b.h - 1}" rx="${P.boardR}"/>`;
-    // each lane's rail: copper under the mask, from its pin on the core out to a via by the board's edge
+    // each lane's rail: copper under the mask, from its pin on the core out to a via by the board's edge (in a group of
+    // their own, each marked with its agent, so a lane whose chip leaves can fade there: see render)
+    s += '<g class="rails">';
     for (const n of G.nodes) {
-      s += `<path class="rail" d="${pathD(n.lane.pts)}"/>`;
+      const id = esc(n.id);
+      s += `<path class="rail" data-for="${id}" d="${pathD(n.lane.pts)}"/>`;
       const v = n.lane.pts[n.lane.pts.length - 1];
-      s += `<circle cx="${v[0]}" cy="${v[1]}" r="3.6" fill="url(#goldR)"/><circle class="via-hole" cx="${v[0]}" cy="${v[1]}" r="1.5"/>`;
+      s += `<circle data-for="${id}" cx="${v[0]}" cy="${v[1]}" r="3.6" fill="url(#goldR)"/><circle class="via-hole" data-for="${id}" cx="${v[0]}" cy="${v[1]}" r="1.5"/>`;
     }
+    s += '</g>';
     if (dr) s += this.dramSvg(G);
     // the core: a package with balls (or leads) on all four sides, pin 1, its courtyard and the designator YOU
     s += `<rect class="b-shadow" x="${c.x}" y="${c.y + 3}" width="${c.w}" height="${c.h}" rx="9" fill="#000" filter="url(#blur6)" opacity=".5"/>`;
@@ -151,6 +162,9 @@ export class Board {
   ensureNode(n) {
     let rec = this.nodes.get(n.id);
     if (rec) return rec;
+    // the same agent back on the board while its old chip still fades out (continued from the tray at once): that one goes
+    const old = this.leaving.get(n.id);
+    if (old) { old.remove(); this.leaving.delete(n.id); }
     const el = document.createElement('div');
     el.className = 'node';
     el.dataset.id = n.id;
@@ -395,11 +409,37 @@ export class Board {
   /**
    * @param {object} G     the layout
    * @param {object} o     { machines, tray, hoverRoot, litMachine, first }
+   * @returns {string[]}   the roots whose chips left the board in this render (for the done tray, or gone)
    */
   render(G, o = {}) {
     const prev = this.prev;
     const animate = !!prev && !o.first && !this.calm;
+    // A chip that leaves takes its lane's copper with it. The rail is part of the static board, which repaints now, so
+    // it is taken out first and fades where it was; its copper to the core and a fuse fade as 'out:' wires.
+    const gone = [...this.nodes.keys()].filter(id => !G.byId.has(id));
+    const fading = [];
+    if (animate && gone.length) {
+      const ids = new Set(gone);
+      fading.push(...[...this.boardSvg.querySelectorAll('.rails [data-for]')].filter(e => ids.has(e.dataset.for)));
+      for (const id of gone) for (const k of ['conn', 'fuse', 'fusem']) {
+        const e = this.wiresMap.get(k + ':' + id);
+        if (!e) continue;
+        this.wiresMap.delete(k + ':' + id);
+        const key = `out:${id}:${k}:${++this.outSeq}`;
+        e.dataset.key = key;
+        this.wiresMap.set(key, e);
+        fading.push(e);
+      }
+    }
     this.paintBoard(G);
+    if (fading.length) {
+      const rails = this.boardSvg.querySelector('.rails');
+      for (const e of fading) {
+        if (e.dataset.for && rails) rails.appendChild(e);
+        const end = () => { e.remove(); if (e.dataset.key) this.wiresMap.delete(e.dataset.key); };
+        e.animate([{ opacity: 1 }, { opacity: 0 }], LEAVE).finished.then(end, end);
+      }
+    }
     // a line that goes out drains back into its chip: take it out of the map before the wires repaint drops it
     const draining = [];
     if (prev) for (const pn of prev.nodes) {
@@ -422,7 +462,7 @@ export class Board {
     if (oldBrackets && curNow !== curWas) { this.wiresMap.delete('brackets'); if (!animate) oldBrackets.remove(); }
 
     for (const n of G.nodes) this.paintNode(G, n, animate);
-    for (const [id, rec] of this.nodes) if (!G.byId.has(id)) { rec.el.remove(); this.nodes.delete(id); }
+    for (const id of gone) this.leave(id, animate ? prev.byId.get(id) : null);
     this.paintWires(G, o.hoverRoot);
     this.placeCore(G);
     this.placeDram(G);
@@ -493,10 +533,39 @@ export class Board {
         if (nb) nb.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, delay: 420, fill: 'backwards' });
       }
     }
-    this.prev = { nodes: G.nodes.map(n => ({ id: n.id, chip: { ...n.chip }, conn: n.conn, lit: n.lit, qno: n.qno, current: n.current, freeDir: n.freeDir, askId: n.r.askId })), byId: null };
+    this.prev = { nodes: G.nodes.map(n => ({ id: n.id, side: n.side, chip: { ...n.chip }, conn: n.conn, lit: n.lit, qno: n.qno, current: n.current, freeDir: n.freeDir, askId: n.r.askId })), byId: null };
     this.prev.byId = new Map(this.prev.nodes.map(x => [x.id, { ...x, kidSig: this.nodes.get(x.id)?.kidSig }]));
     this.G = G;
     this.refreshRoving(G);
+    return gone;
+  }
+
+  /**
+   * A chip leaves the board (for the done tray, or gone), with its helpers. If the keyboard is on it or on one of its
+   * helpers, it goes to the lid's sentence first (hooks.home), so it is never dropped. Then the chip fades out (600 ms)
+   * as it drifts a little along its lane towards the board's edge; it is inert meanwhile, and out of the keyboard's
+   * order. With nothing moving (`pn` null: still, reduced motion, a hidden tab, the first draw) it just goes.
+   * @param {string} id
+   * @param {{ side: 'L'|'R', chip: { x: number, y: number } }|null} pn  where it was in the last render
+   */
+  leave(id, pn) {
+    const rec = this.nodes.get(id);
+    if (!rec) return;
+    this.nodes.delete(id);
+    if (rec.el.contains(document.activeElement)) this.hooks.home?.();
+    clearTimeout(rec.ghostTimer);
+    if (!pn) { rec.slide?.cancel(); rec.el.remove(); return; }
+    // from where it is now, also in the middle of a slide
+    const cs = getComputedStyle(rec.el).transform;
+    const from = cs && cs !== 'none' ? cs : `translate(${r1(pn.chip.x)}px, ${r1(pn.chip.y)}px)`;
+    rec.slide?.cancel();
+    rec.el.inert = true;
+    rec.el.classList.add('leaving');
+    this.leaving.get(id)?.remove();
+    this.leaving.set(id, rec.el);
+    const to = `translate(${r1(pn.chip.x + (pn.side === 'L' ? -16 : 16))}px, ${r1(pn.chip.y)}px)`;
+    const end = () => { rec.el.remove(); if (this.leaving.get(id) === rec.el) this.leaving.delete(id); };
+    rec.el.animate([{ opacity: 1, transform: from }, { opacity: 0, transform: to }], LEAVE).finished.then(end, end);
   }
 
   /** A chip seen for the first time after the board was drawn: it fades in where it belongs, and its copper draws out. */

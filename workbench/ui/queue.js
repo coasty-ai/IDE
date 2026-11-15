@@ -120,10 +120,43 @@ export function reviewQueue(agents, { reviewed, later }) {
     .sort((a, b) => (b.endedAt || b.stateSince || 0) - (a.endedAt || a.stateSince || 0));
 }
 
-/** What the person set aside, still unchanged: a failed check, or a finished root whose merge did not go through. */
+/**
+ * What the person set aside, still unchanged: a failed check, or a finished root whose merge did not go through. Not one
+ * whose work has since settled (merged, or thrown away): that one is finished with, and waits in the done tray.
+ */
 export function setAsideList(agents, { later }) {
   if (!later) return [];
-  return [...agents].filter(a => (a.state === 'checks_failed' || (!a.parentId && !a.earlier && AT_REST.has(a.state))) && later.has(finishKey(a)));
+  return [...agents].filter(a => (a.state === 'checks_failed' || (!a.parentId && !a.earlier && AT_REST.has(a.state))) && later.has(finishKey(a)) && !workSettled(a));
+}
+
+/**
+ * The person is finished with this root, so it leaves the board for the done tray. Its run has ended (done, a failed
+ * check, failed or stopped), it does not need them, and they let it go: its work is settled, which the engine's snapshot
+ * says (merged with nothing new since, or thrown away), or they looked at this finish ("Looks good", "Not now" on work
+ * that could be merged, "Dismiss": the page's `reviewed` marks). Set aside ("Look later", "Not now" on a merge that did
+ * not go through) is not finished. Helpers go with their agent, and agents from an earlier run wait in the tray by their
+ * own rule, so neither is this rule's.
+ * @param {object} a  an AgentView
+ * @param {{ NEEDS_YOU: Set<string>, reviewed?: Set<string>, later?: Set<string> }} ctx
+ */
+export function finishedWith(a, { NEEDS_YOU, reviewed, later }) {
+  if (!a || a.parentId || a.earlier || !AT_REST.has(a.state) || needsPerson(a, { NEEDS_YOU, later })) return false;
+  if (workSettled(a)) return true;
+  const k = finishKey(a);
+  return !!(reviewed && reviewed.has(k)) && !(later && later.has(k));
+}
+
+/** The marks the page keeps for its tab ("looked at", "set aside": finishKeys), from `storage` (sessionStorage). A damaged entry reads as none. */
+export function readMarks(storage, key) {
+  try {
+    const v = JSON.parse((storage && storage.getItem(key)) || '[]');
+    return new Set(Array.isArray(v) ? v.filter(x => typeof x === 'string') : []);
+  } catch { return new Set(); }
+}
+
+/** Keep them, the newest 300. Nothing is kept where there is no storage, or no room (a private window). */
+export function keepMarks(storage, key, set) {
+  try { if (storage) storage.setItem(key, JSON.stringify([...set].slice(-300))); } catch { /* full or private */ }
 }
 
 /** The id one step from `currentId` in `list`, wrapping round; the first one when `currentId` is not in it. */

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { finishKey, needsPerson, needsQueue, reviewQueue, setAsideList, stepFrom, helpersByNeed, helpersAtWork } from '../ui/queue.js';
+import { finishKey, needsPerson, needsQueue, reviewQueue, setAsideList, stepFrom, helpersByNeed, helpersAtWork, finishedWith, readMarks, keepMarks } from '../ui/queue.js';
 import { unmergedWork, workSettled, workKey, canReview, mergeApplies, discardApplies, gitReason } from '../ui/queue.js';
 import { NEEDS_YOU, PRIORITY, ENDED, ACTIVE } from '../src/shared/states.mjs';
 
@@ -163,4 +163,62 @@ test('why there is no Merge, when git is the reason: in the engine\'s own words'
   assert.equal(gitReason(done({ files: files(0) }), live({ branch: null })), null, 'nothing to merge: git is not the reason');
   assert.equal(gitReason(done({ state: 'working' }), live({ branch: null })), null, 'still working');
   assert.equal(gitReason(done(), { ACTIVE, meta: { mode: 'demo', repo: { branch: null } } }), null, 'the demo');
+});
+
+// ---------------------------------------------------------------- finished with: a root that leaves the board for the done tray
+const memory = () => { const m = new Map(); return { m, getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)) }; };
+const marks = (o = {}) => ({ NEEDS_YOU, reviewed: new Set(), later: new Set(), ...o });
+
+test('finished with: an ended root the person let go, by a look ("Looks good", "Not now" on work that can merge, "Dismiss")', () => {
+  const d = done(), k = finishKey(d);
+  assert.equal(finishedWith(d, marks()), false, 'finished work not looked at yet stays on the board');
+  assert.equal(finishedWith(d, marks({ reviewed: new Set([k]) })), true);
+  for (const st of ['done_checked', 'done_claimed', 'failed', 'stopped']) {
+    assert.equal(finishedWith(ag('x', st, { endedAt: 5 }), marks({ reviewed: new Set(['x@5']) })), true, st);
+  }
+  assert.equal(finishedWith({ ...d, endedAt: 900 }, marks({ reviewed: new Set([k]) })), false, 'a look counts for one finish: finishing again brings it back');
+  assert.equal(finishedWith(d, marks({ reviewed: new Set([k]), later: new Set([k]) })), false,
+    'set aside ("Look later", "Not now" on a merge that did not go through) is not finished, even after a look');
+  assert.equal(finishedWith(ag('c', 'checks_failed', { endedAt: 7 }), marks({ reviewed: new Set(['c@7']) })), false, 'a failed check still needs the person');
+});
+
+test('finished with: work the engine says is settled (merged with nothing new, or thrown away) needs no look', () => {
+  const merged = done({ work: work({ merged: MERGED }), files: files(0) });
+  const thrown = done({ state: 'stopped', work: work({ branch: null, folder: false, thrownAway: THROWN }), files: null });
+  assert.equal(finishedWith(merged, marks()), true, 'merged');
+  assert.equal(finishedWith(thrown, marks()), true, 'thrown away');
+  assert.equal(finishedWith({ ...merged, files: files(2) }, marks()), false, 'merged, then work that is not merged yet');
+  assert.equal(finishedWith(ag('f', 'checks_failed', { endedAt: 500, work: work({ merged: MERGED }), files: files(0) }), marks()), true, 'a failed check merged anyway');
+  assert.equal(finishedWith(thrown, marks({ later: new Set([finishKey(thrown)]) })), true, 'settled wins over set aside: there is nothing left to come back to');
+  assert.deepEqual(setAsideList([thrown, merged], { later: new Set([finishKey(thrown), finishKey(merged)]) }), [], 'and settled work is not listed as set aside');
+});
+
+test('finished with: never a root at work or waiting on the person, a helper, or an agent from an earlier run', () => {
+  const merged = done({ work: work({ merged: MERGED }), files: files(0) });
+  // a merged agent asked for a change works again: its files are not counted yet, so its work still reads as settled
+  assert.equal(finishedWith({ ...merged, state: 'working', endedAt: null, files: null }, marks()), false, 'at work again');
+  for (const st of ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck']) {
+    assert.equal(finishedWith(ag('w', st, { endedAt: 3 }), marks({ reviewed: new Set(['w@3']) })), false, st);
+  }
+  assert.equal(finishedWith(ag('h', 'finished', { parentId: 'W', endedAt: 1 }), marks({ reviewed: new Set(['h@1']) })), false, 'a helper goes with its agent');
+  assert.equal(finishedWith({ ...merged, earlier: true }, marks()), false, 'an earlier agent waits in the tray by its own rule');
+  assert.equal(finishedWith(null, marks()), false);
+});
+
+test('the marks the page keeps for its tab ("looked at", "set aside") read back as they were kept', () => {
+  const tab = memory();
+  keepMarks(tab, 'wb-reviewed', new Set(['a@1', 'b@2']));
+  assert.deepEqual([...readMarks(tab, 'wb-reviewed')], ['a@1', 'b@2']);
+  assert.deepEqual([...readMarks(tab, 'wb-later')], [], 'nothing kept yet');
+  tab.setItem('wb-reviewed', '{not json');
+  assert.equal(readMarks(tab, 'wb-reviewed').size, 0, 'a damaged entry reads as none');
+  tab.setItem('wb-reviewed', JSON.stringify(['a@1', 3, null, { k: 1 }]));
+  assert.deepEqual([...readMarks(tab, 'wb-reviewed')], ['a@1'], 'only strings');
+  assert.equal(readMarks(null, 'wb-reviewed').size, 0, 'no storage (a private window)');
+  assert.doesNotThrow(() => keepMarks(null, 'wb-reviewed', new Set(['a@1'])));
+  assert.doesNotThrow(() => keepMarks({ getItem: () => null, setItem: () => { throw new Error('full'); } }, 'wb-reviewed', new Set(['a@1'])), 'a full storage');
+  keepMarks(tab, 'wb-reviewed', new Set(Array.from({ length: 350 }, (_, i) => 'k' + i)));
+  const back = readMarks(tab, 'wb-reviewed');
+  assert.equal(back.size, 300, 'the newest 300');
+  assert.ok(back.has('k349') && !back.has('k49'));
 });

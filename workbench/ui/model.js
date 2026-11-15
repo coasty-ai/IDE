@@ -17,23 +17,19 @@ export const S = {
   hoverId: null,         // chip or helper under the pointer or keyboard
   pinId: null,           // card pinned by a click
   reply: null,           // { agentId, mode: 'answer'|'say', askId }
-  reviewed: load('wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Not now", "Dismiss")
-  later: load('wb-later'),         // finishKeys set aside: a failed check, or a merge that did not go through ("Look later")
+  // Both kept in this tab's sessionStorage, as the page's key is, so a reload that brings the board back brings them back.
+  reviewed: Q.readMarks(tab(), 'wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Not now", "Dismiss"): such a root leaves the board
+  later: Q.readMarks(tab(), 'wb-later'),         // finishKeys set aside: a failed check, or a merge that did not go through ("Look later")
 };
 
-function load(key) {
-  try { const v = JSON.parse(sessionStorage.getItem(key) || '[]'); return new Set(Array.isArray(v) ? v.filter(x => typeof x === 'string') : []); } catch { return new Set(); }
-}
-function keep(key, set) {
-  try { sessionStorage.setItem(key, JSON.stringify([...set].slice(-300))); } catch { /* full or private */ }
-}
+function tab() { try { return sessionStorage; } catch { return null; } }
 
 export const finishKey = Q.finishKey;
 
 /** "Looks good" / "Not now" / "Dismiss": this finish has been looked at. */
-export function markReviewed(a) { S.reviewed.add(finishKey(a)); keep('wb-reviewed', S.reviewed); }
+export function markReviewed(a) { S.reviewed.add(finishKey(a)); Q.keepMarks(tab(), 'wb-reviewed', S.reviewed); }
 /** "Look later" on a failed check, or on a merge that did not go through: not now, for this finish. */
-export function setAside(a) { S.later.add(finishKey(a)); keep('wb-later', S.later); }
+export function setAside(a) { S.later.add(finishKey(a)); Q.keepMarks(tab(), 'wb-later', S.later); }
 
 export function upsert(list) {
   for (const a of list) if (a && a.id) S.agents.set(a.id, a);

@@ -1,9 +1,11 @@
-// Lanes for life. Each root agent gets one lane, a side and a row, the first time this tab sees it, and keeps it for
-// as long as it exists, so an agent is always found where it was. Pure: no DOM, no imports (node:test loads it).
+// Lanes. Each root agent on the board gets one lane, a side and a row, when it comes onto the board, and keeps it for as
+// long as it stays there, so an agent is always found where it was. One that leaves the board (to the done tray, or
+// gone) frees its lane for a newcomer; the others never move. Pure: no DOM, no imports (node:test loads it).
 //
 // Twelve lanes, six a side. Laptop agents prefer the left and cloud agents the right, unless that side is full or two
 // lanes fuller than the other. Rows fill top, bottom, then the middle, mirrored on the two sides. Past twelve agents
-// a newcomer gets a side but no row (`row: null`): the dense layout gives it half of a split lane (see denseLanes).
+// a newcomer gets a side but no row (`row: null`): the dense layout gives it half of a split lane (see denseLanes), and
+// it takes a lane of its own once one is free.
 
 export const ROWS = 6;
 const SIDE_ROWS = { L: [0, 5, 2, 3, 1, 4], R: [5, 0, 3, 2, 4, 1] };
@@ -34,30 +36,42 @@ export class Lanes {
   count(side) { let n = 0; for (const l of this.map.values()) if (l.side === side) n++; return n; }
 
   /**
-   * Give every root that has no lane yet a lane, in the order they started. Existing lanes never change.
-   * @param {{ id: string, startedAt?: number, laptop?: boolean }[]} roots
+   * Give every root that has no lane yet a lane, in the order they started. Existing lanes never change, except that a
+   * root with a side but no row (it came while every lane was taken) takes a free row, oldest first: on its own side
+   * when it can, else on the other.
+   * @param {{ id: string, startedAt?: number, laptop?: boolean }[]} roots   the roots on the board
    * @returns {boolean} whether anything was added
    */
   assign(roots) {
     let added = false;
-    const fresh = roots.filter(r => r && r.id && !this.map.has(r.id))
-      .sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0) || String(a.id).localeCompare(String(b.id)));
+    const byStart = (a, b) => (a.startedAt || 0) - (b.startedAt || 0) || String(a.id).localeCompare(String(b.id));
+    const rowsOf = s => new Set([...this.map.values()].filter(l => l.side === s && l.row != null).map(l => l.row));
+    const freeRow = s => { const taken = rowsOf(s); const row = SIDE_ROWS[s].find(x => !taken.has(x)); return row == null ? null : row; };
+    const fresh = roots.filter(r => r && r.id && !this.map.has(r.id)).sort(byStart);
     for (const r of fresh) {
       const pref = r.laptop ? 'L' : 'R', other = pref === 'L' ? 'R' : 'L';
-      const rowsOf = s => new Set([...this.map.values()].filter(l => l.side === s && l.row != null).map(l => l.row));
       let side = pref;
       const full = s => rowsOf(s).size >= ROWS;
       if ((full(pref) && !full(other)) || this.count(pref) - this.count(other) >= 2) side = other;
-      const taken = rowsOf(side);
-      const row = SIDE_ROWS[side].find(x => !taken.has(x));
-      this.map.set(r.id, { side, row: row == null ? null : row });
+      this.map.set(r.id, { side, row: freeRow(side) });
       added = true;
+    }
+    for (const r of roots.filter(x => x && x.id && this.map.get(x.id)?.row === null).sort(byStart)) {
+      const l = this.map.get(r.id), other = l.side === 'L' ? 'R' : 'L';
+      for (const side of [l.side, other]) {
+        const row = freeRow(side);
+        if (row != null) { this.map.set(r.id, { side, row }); added = true; break; }
+      }
     }
     if (added) this.save();
     return added;
   }
 
-  /** Forget lanes of agents that no longer exist. Call it only with a full list (a snapshot), never a partial update. */
+  /**
+   * Forget the lanes of roots that are not on the board any more (in the done tray, or gone): those lanes are free for
+   * newcomers. Call it only with the full list of roots on the board, made from every agent there is (a snapshot and
+   * the updates since), never from a partial update, and never before the first snapshot.
+   */
   prune(liveIds) {
     const live = liveIds instanceof Set ? liveIds : new Set(liveIds);
     let gone = false;

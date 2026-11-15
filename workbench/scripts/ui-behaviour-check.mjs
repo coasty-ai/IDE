@@ -685,6 +685,138 @@ try {
     check('an earlier agent whose folder is gone says so and has no Continue', /Its folder is gone, so it cannot continue\./.test(txt) && !/fix/.test(acts) && /forget/.test(acts), `${acts} / ${txt.slice(0, 160)}`);
   });
 
+  // ---------------------------------------------------------------- the done tray: agents the person is finished with
+  // A root leaves the board for the done tray once its run has ended and the person is finished with it: merged with
+  // nothing new, thrown away, or let go with "Looks good", "Not now" (on work that can merge) or "Dismiss". Set aside
+  // stays. Each of these is named "Done tray: …" (`--only 'Done tray'` runs just these).
+  const DT = 'Done tray: ';
+  const chipsNow = () => b.ev(`[...document.querySelectorAll('#parts .node:not(.leaving) .chip')].map(c => c.dataset.id + (c.classList.contains('ghost') ? '~' : '')).join(',')`);
+  const trayNow = () => b.ev(`(() => { const t = document.getElementById('tray'); return t.hidden ? '' : t.textContent.trim(); })()`);
+  const lidActs = () => b.ev(`[...(${page()}?.querySelectorAll('button[data-act]') || [])].map(x => x.dataset.act).join(',')`);
+  const laneY = t => Number((/translate\([^,]+,\s*(-?[\d.]+)px\)/.exec(t || '') || [])[1]);
+  const placesNow = () => b.ev(`Object.fromEntries([...document.querySelectorAll('#parts .node:not(.leaving)')].map(n => [n.dataset.id, n.style.transform]))`);
+  const mergedNow = a => ({ ...a, work: { ...a.work, merged: { into: 'main', merge: 'f'.repeat(40), at: Date.now(), files: 3, adds: 40, dels: 2 }, problem: null }, files: { changed: 0, adds: 0, dels: 0, list: [] } });
+
+  await run(DT + 'merged and thrown-away work waits in the tray, the one at work keeps the board, and both say how many are done', async () => {
+    await open('done-tray');
+    await sleep(900);
+    const chips = await chipsNow(), tray = await trayNow();
+    const names = await b.ev(`[document.getElementById('tray').getAttribute('aria-label'), document.getElementById('parts').getAttribute('aria-label')]`);
+    await click('#tray'); await sleep(300);
+    const rows = await b.ev(`[...document.querySelectorAll('#trayList h2, #trayList .row')].map(r => (r.dataset.agent ? r.dataset.agent + ':' : '') + r.textContent.trim()).join(' | ')`);
+    check(DT + 'merged and thrown-away work waits in the tray, the one at work keeps the board, and both say how many are done',
+      chips === 't1' && tray === '2 done' && names[0] === '2 done. Show them.' && names[1] === 'Your agents and their helpers. 2 done.'
+      && rows === 'Done | t2:Help pages · merged | t3:Dark mode · thrown away',
+      `chips ${chips}, tray "${tray}", names ${JSON.stringify(names)}, list "${rows}"`);
+  });
+
+  await run(DT + 'finished work not looked at yet stays on the board, at its edge, and asks to be looked at', async () => {
+    await open('done-waits');
+    await sleep(900);
+    const chips = await chipsNow(), tray = await trayNow(), lid = await lidNow();
+    check(DT + 'finished work not looked at yet stays on the board, at its edge, and asks to be looked at',
+      chips === 'w1~' && tray === '' && /^Ready for you to look at \/ Invoice export is done and checked\./.test(lid), `chips ${chips}, tray "${tray}", lid "${lid}"`);
+  });
+
+  await run(DT + '"Not now" lets it go: it fades off the board into the tray, a reload keeps it there, and a message brings it back', async () => {
+    await open('done-waits');
+    await sleep(900);
+    const before = await chipsNow();
+    await clickIn('[data-act="looksgood"]');
+    await sleep(200);
+    const fading = await b.ev(`(() => { const n = document.querySelector('#parts .node.leaving'); return n ? { inert: n.inert, moving: n.getAnimations().length, rails: document.querySelectorAll('#board .rails [data-for]').length } : null; })()`);
+    await sleep(1100);
+    const after = await chipsNow(), tray = await trayNow(), nodes = await b.ev(`document.querySelectorAll('#parts .node').length`);
+    const rails = await b.ev(`document.querySelectorAll('#board .rails [data-for]').length`), sent = (await posts()).filter(x => x.path === '/api/agents/w1/answer');
+    check(DT + '"Not now" lets the chip go: it fades off the board, its lane\'s copper with it, and the tray says 1 done',
+      before === 'w1~' && !!fading && fading.inert && fading.moving > 0 && fading.rails === 3 && after === '' && nodes === 0 && rails === 0 && tray === '1 done'
+      && sent.length === 1 && sent[0].body.answer === 'Not now', `${before} → fading ${JSON.stringify(fading)} → chips "${after}", nodes ${nodes}, rails ${rails}, tray "${tray}", ${JSON.stringify(sent.map(x => x.body))}`);
+    // a reload in the same tab: the board comes back without it
+    await b.goto(`${base}/?t=k`, 1600);
+    const reChips = await chipsNow(), reTray = await trayNow(), reLid = await lidNow();
+    check(DT + 'a reload keeps it in the tray, and it is not asked about again', reChips === '' && reTray === '1 done' && /^All clear/.test(reLid), `chips "${reChips}", tray "${reTray}", lid "${reLid}"`);
+    // picked from the tray: in the core, with what can still be done with it
+    await click('#tray'); await sleep(300);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="w1"]').click(), 1`); await sleep(900);
+    const lid = await lidNow(), acts = await lidActs();
+    check(DT + 'picked from the tray, it shows in the core with what can still be done with it',
+      /Invoice export is done and checked\./.test(lid) && /merge/.test(acts) && /reply/.test(acts) && /review/.test(acts) && (await chipsNow()) === '', `lid "${lid}" [${acts}]`);
+    // asked for a change: it works again, back on the board
+    await clearLog();
+    await clickIn('[data-act="reply"]'); await sleep(300);
+    await b.type('please add a test for one invoice'); await b.key('Enter');
+    await sleep(1300);
+    const say = (await posts()).filter(x => /\/say$/.test(x.path)), back = await chipsNow(), trayBack = await trayNow();
+    check(DT + 'a message brings it back to the board, on a lane, at work', say.length === 1 && say[0].path === '/api/agents/w1/say' && back === 'w1' && trayBack === '',
+      `${JSON.stringify(say.map(x => [x.path, x.body]))}; chips "${back}", tray "${trayBack}"`);
+  });
+
+  await run(DT + 'a merge sends it to the tray; the others keep their lanes, and a newcomer takes the freed one', async () => {
+    await open('done-waits');
+    await sleep(900);
+    const w1 = await agentOf('w1');
+    const other = (id, name, at) => ({ ...w1, id, rootId: id, name, state: 'working', endedAt: null, stateSince: at, startedAt: at, now: 'Reading the code', says: null, checks: null, files: null, work: null });
+    await push('agents', [other('w2', 'Docs site', Date.now())]);
+    await sleep(900);
+    const p0 = await placesNow();
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    await clickIn('[data-act="confirm"][data-go="1"]'); await sleep(1500);
+    const p1 = await placesNow(), lid = await lidNow(), tray = await trayNow();
+    await push('agents', [other('w3', 'Login page', Date.now() + 1000)]);
+    await sleep(1200);
+    const p2 = await placesNow();
+    // a lane is a row: the core grows and shrinks with the lid's words, which may move a chip along its lane, never off it
+    check(DT + 'a merge sends it to the tray; the others keep their lanes, and a newcomer takes the freed one',
+      !!p0.w1 && !!p0.w2 && !p1.w1 && laneY(p1.w2) === laneY(p0.w2) && /^merged \/ Invoice export’s work is in main\./.test(lid) && tray === '1 done'
+      && laneY(p2.w3) === laneY(p0.w1) && laneY(p2.w2) === laneY(p0.w2) && laneY(p0.w1) !== laneY(p0.w2),
+      `before ${JSON.stringify(p0)}, after ${JSON.stringify(p1)}, lid "${lid}", tray "${tray}", newcomer ${JSON.stringify(p2)}`);
+  });
+
+  await run(DT + 'the keyboard on a chip that leaves goes to the core\'s sentence, and a card pinned to it goes too', async () => {
+    await open('done-waits');
+    await sleep(900);
+    await realClick('.chip[data-id="w1"]'); await sleep(600);
+    const pinned = await b.ev(`!document.getElementById('card').hidden`);
+    await b.ev(`document.querySelector('.chip[data-id="w1"]').focus(), 1`); await sleep(200);
+    const onChip = await focusNow();
+    // its work is merged some other way (typed words, the git screen): the stream says so
+    await push('agents', [mergedNow(await agentOf('w1'))]);
+    await sleep(1300);
+    const f = await focusNow(), card = await b.ev(`!document.getElementById('card').hidden`), chips = await chipsNow();
+    await b.mouse(5, 5);
+    check(DT + 'the keyboard on a chip that leaves goes to the core\'s sentence, and a card pinned to it goes too',
+      pinned && onChip === 'board:BUTTON' && f === 'core:H1' && !card && chips === '', `pinned ${pinned}, focus ${onChip} → ${f}, card ${card}, chips "${chips}"`);
+  });
+
+  await run(DT + 'with reduced motion a chip leaves at once, and nothing moves', async () => {
+    await open('done-waits');
+    await sleep(900);
+    await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+    await sleep(300);
+    const w1 = await agentOf('w1');
+    await push('agents', [{ ...w1, work: { ...w1.work, branch: null, folder: false, thrownAway: { at: Date.now(), saved: 'refs/workbench/discarded/w1' } } }]);
+    await sleep(400);
+    const nodes = await b.ev(`document.querySelectorAll('#parts .node').length`);
+    const moving = await b.ev(`document.getAnimations().filter(a => a.playState === 'running' && a.effect?.target?.closest?.('#parts, #wires, #board')).length`);
+    await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+    check(DT + 'with reduced motion a chip leaves at once, and nothing moves', nodes === 0 && moving === 0 && (await trayNow()) === '1 done', `nodes ${nodes}, moving ${moving}`);
+  });
+
+  await run(DT + '"Dismiss" lets a failed agent go; "Look later" keeps a failed check on the board', async () => {
+    await open('merge-more');
+    await b.goto(`${base}/?t=k&focus=n3`, 1600);
+    const shown = await lidNow();
+    await clickIn('[data-act="reviewed"]'); await sleep(1300);
+    const chips = await chipsNow(), tray = await trayNow();
+    // a failed check set aside stays on the board (and the existing "Look later" check holds it to its edge)
+    await b.goto(`${base}/?t=k&focus=n1`, 1600);
+    await clickIn('[data-act="later"]'); await sleep(1300);
+    const chips2 = await chipsNow(), tray2 = await trayNow();
+    check(DT + '"Dismiss" lets a failed agent go; "Look later" keeps a failed check on the board',
+      /Order history stopped with an error\./.test(shown) && !/n3/.test(chips) && tray === '1 done' && /n1~/.test(chips2) && !/n3/.test(chips2) && tray2 === '1 done',
+      `"${shown}" → chips ${chips}, tray "${tray}"; after Look later: chips ${chips2}, tray "${tray2}"`);
+  });
+
   // ---------------------------------------------------------------- D2: merge, review and throw away (the 'merge' scenarios)
   // In 'merge', the lid shows Invoice export (m1a2b3, done and checked, work not merged yet) first, of three to look at;
   // Search cleanup (m7e8f9) has a merge that conflicts, Price rounding (mab0c1) one your own changes blocked.
