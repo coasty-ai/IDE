@@ -707,10 +707,12 @@ export async function codesignVerify(file) {
  *    own, ~/.workbench/tmp/workbench-gh-XXXXXX (privateTemp in workspace.mjs), never the temporary folder, which an
  *    agent's process may write; the archive's SHA-256 must be the checksums file's, before anything else is done with it.
  * 3. Only the program is taken out (`/usr/bin/unzip` on macOS, tar elsewhere: argument arrays), into that folder: it
- *    must be a plain file. On macOS it must be signed by GitHub (codesignVerify).
- * 4. It is copied beside ~/.local/bin/gh under a temporary name and made 0755. There it must run and say the
- *    release's version (never in a temporary folder, which may not let programs run). Then it is renamed onto
- *    ~/.local/bin/gh: an older one there is updated in place, and nothing half-written is ever at that path.
+ *    must be a plain file.
+ * 4. It is copied beside ~/.local/bin/gh under a temporary name and made 0755, and that copy, the very file that is
+ *    then renamed into place, is the one checked: on macOS it must be signed by GitHub (codesignVerify), then it must
+ *    run and say the release's version (there, never in a temporary folder, which may not let programs run). Then it
+ *    is renamed onto ~/.local/bin/gh: an older one there is updated in place, and nothing half-written is ever at that
+ *    path.
  * The private folder and the temporary name go in every case. Refusals are plain errors with `.why`: `platform`,
  * `macos`, `network`, `github` (an answer Workbench did not expect), `checksum`, `signature`, `runs`, `disk` (also when
  * the private folder cannot be made) or `cancelled`.
@@ -777,12 +779,8 @@ export async function ghInstall({
       throw refusal('github', 'The download of GitHub’s command-line tool did not hold the program Workbench expected, so it was not installed.',
         x.code !== 0 ? `extracting ${asset.member}: ${x.error?.code || x.code}: ${x.stderr}` : `${asset.member} is not a plain file`);
     }
-    if (platform === 'darwin') {
-      let signed = false;
-      try { signed = await verify(bin); } catch { signed = false; }
-      if (!signed) throw refusal('signature', 'The copy of GitHub’s command-line tool that was downloaded is not signed by GitHub, so Workbench did not install it.');
-    }
-    // It is tried where it will live, under a temporary name: the temporary folder may not let programs run (noexec).
+    // Copied to where it will live, under a temporary name, and checked there: the file checked is the file renamed
+    // into place, so nothing can be swapped in between. It runs there too: a temporary folder may not let programs run.
     const dir = path.dirname(dest);
     const disk = (e) => refusal('disk', `Workbench could not put GitHub’s command-line tool in ${oneLine(dir, 300)}.`, `${e.code || ''} ${e.message || ''}`);
     try {
@@ -792,6 +790,11 @@ export async function ghInstall({
       fs.chmodSync(tmp, 0o755);
     } catch (e) {
       throw disk(e);
+    }
+    if (platform === 'darwin') {
+      let signed = false;
+      try { signed = await verify(tmp); } catch { signed = false; }
+      if (!signed) throw refusal('signature', 'The copy of GitHub’s command-line tool that was downloaded is not signed by GitHub, so Workbench did not install it.');
     }
     const ran = await ghVersion({ ghPath: tmp, env, timeoutMs: 30_000, cwd: work });
     if (ran !== version) {

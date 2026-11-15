@@ -182,7 +182,7 @@ test('ghInstall on a Mac: the latest release from the redirect, checked against 
     verify: async (file) => {
       // Where the download is meanwhile: a private folder of Workbench's own.
       const work = fs.readdirSync(p.own).filter((n) => n.startsWith('workbench-gh-'));
-      verified.push({ file, there: fs.existsSync(file), installed: fs.existsSync(path.join(p.bin, 'gh')), work, own: mode(p.own) });
+      verified.push({ file, ino: fs.statSync(file).ino, installed: fs.existsSync(path.join(p.bin, 'gh')), work, own: mode(p.own) });
       return true;
     },
     onProgress: (x) => progress.push(x),
@@ -197,16 +197,48 @@ test('ghInstall on a Mac: the latest release from the redirect, checked against 
     ['https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_checksums.txt', 'follow'],
     ['https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_macOS_arm64.zip', 'follow'],
   ]);
-  // The signature is checked on the program taken out of the archive, in Workbench's own private folder, before it
-  // goes in place.
+  // The signature is checked on the very file that goes in place: the copy beside ~/.local/bin/gh, under a temporary
+  // name, before it is renamed onto ~/.local/bin/gh.
   assert.equal(verified.length, 1);
-  assert.ok(verified[0].file.startsWith(`${p.own}${path.sep}`), verified[0].file);
-  assert.deepEqual([verified[0].there, verified[0].installed], [true, false]);
+  assert.equal(path.dirname(verified[0].file), p.bin);
+  assert.match(path.basename(verified[0].file), /^\.gh-[0-9]+-[0-9a-f]{8}\.tmp$/);
+  assert.equal(verified[0].ino, fs.statSync(r.path).ino, 'the file installed is the file checked');
+  assert.equal(verified[0].installed, false);
   assert.equal(verified[0].work.length, 1);
   assert.equal(verified[0].own, 0o700);
   assert.deepEqual(progress.map((x) => x.phase).filter((x, i, all) => x !== all[i - 1]), ['finding', 'downloading', 'checking', 'installing']);
   assert.equal(progress.filter((x) => x.phase === 'downloading').at(-1).percent, 100);
   assert.equal(await ghVersion({ ghPath: r.path }), '2.104.0', 'the installed gh runs');
+});
+
+test('ghInstall installs the very file it checked: a program swapped in the download’s folder while it is checked is not installed', { skip: !HAS_UNZIP && 'needs /usr/bin/unzip' }, async (t) => {
+  const p = installPlace(t);
+  const tmp = scratch(t);
+  const genuine = wrapperScript({ version: '2.104.0' });
+  const theirs = '#!/bin/sh\necho "gh version 2.104.0 (someone else’s build)"\n';
+  const swapped = [];
+  let inTmp = null;
+  // While codesign reads, a process that can write the folder the download is in puts its own program, which also says
+  // the right version, in place of the one taken out of the archive (as a Codex agent's could in the temporary folder).
+  const verify = async () => {
+    inTmp = fs.readdirSync(tmp);
+    for (const f of [...filesUnder(tmp), ...(fs.existsSync(p.own) ? filesUnder(p.own) : [])]) {
+      if (!/\/gh_[^/]+\/bin\/gh$/.test(f)) continue;
+      fs.writeFileSync(`${f}.theirs`, theirs, { mode: 0o755 });
+      fs.renameSync(`${f}.theirs`, f);
+      swapped.push(f);
+    }
+    return true;
+  };
+  const r = await withTmpdir(tmp, () => ghInstall({
+    fetchImpl: releaseFetch(fakeRelease({ platform: 'darwin', arch: 'arm64' })).fetchImpl, platform: 'darwin', arch: 'arm64',
+    home: p.home, osRelease: '27.0.0', env: process.env, verify,
+  }));
+  assert.equal(swapped.length, 1, 'the program taken out of the archive was there to swap');
+  assert.equal(fs.readFileSync(r.path, 'utf8'), genuine, 'the program installed is the one that was checked');
+  assert.deepEqual(inTmp, [], 'nothing of the download is in the temporary folder');
+  assert.deepEqual(fs.readdirSync(p.bin), ['gh']);
+  assert.deepEqual(leftIn(p), []);
 });
 
 test('ghInstall on Linux: the tar.gz for this processor, with no signature check (GitHub signs only the macOS builds)', { skip: !HAS_TAR && 'needs tar' }, async (t) => {
