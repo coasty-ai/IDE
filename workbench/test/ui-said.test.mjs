@@ -39,6 +39,8 @@ function page({ width = 2000, lines = 3 } = {}) {
     G: { P: { silkSub: 12 }, said: { x: 0, y: 0, w: width, maxY: 400, lines } },
     measure: () => 10,
     el: { said },
+    // the person's choices as Workbench put them on <html>: the hint under the core is not answered yet
+    prefs: { theme: 'green', detail: 'calm', answered: false },
     needsQueue: () => [], linkNow: () => 'live',
     setTimeout: () => 0, clearTimeout: () => {},
   };

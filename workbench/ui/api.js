@@ -67,6 +67,11 @@ export const api = {
   raiseLimit: (agentId, { state = null } = {}) => call('POST', `/api/agents/${encodeURIComponent(agentId)}/raise-limit`, { state: state || null }),
   awake: (machineId, awake) => call('POST', `/api/machines/${encodeURIComponent(machineId)}/awake`, { awake }),
   /**
+   * Keep a choice for the next time Workbench starts: { theme }, { detail } or { answered: true }. Workbench keeps
+   * them, not the page; when it could not save one, the answer is a refusal ({ ok: false, reply }) in plain words.
+   */
+  prefs: change => call('POST', '/api/prefs', change),
+  /**
    * Merge or throw away an agent's work. Neither acts by itself: the engine answers with a card ({ reply, confirm }) the
    * person answers by id. `state` is the state the button was drawn in; the engine refuses when it has changed.
    */

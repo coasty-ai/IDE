@@ -50,7 +50,9 @@ try {
   for (const s of SHOTS) {
     await fetch(`${base}/ctl/scenario`, { method: 'POST', body: JSON.stringify({ name: s.scenario, push: false }) });
     await b.goto(`${base}/?t=k`, 400);
-    await b.ev(`(() => { localStorage.setItem('wb-theme', ${JSON.stringify(s.theme || 'green')}); localStorage.setItem('wb-detail', ${JSON.stringify(s.detail || 'calm')}); localStorage.removeItem('wb-answered'); sessionStorage.clear(); return 1; })()`);
+    // the look and detail as Workbench keeps them (the page arrives with them on <html>); the hint not seen yet
+    await fetch(`${base}/ctl/prefs`, { method: 'POST', body: JSON.stringify({ theme: s.theme || 'green', detail: s.detail || 'calm', answered: false }) });
+    await b.ev(`(() => { sessionStorage.clear(); return 1; })()`);
     await b.goto(`${base}/?t=k&still=1${s.query || ''}`, 1800);
     if (s.type) {
       await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(s.type)}; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return 1; })()`);

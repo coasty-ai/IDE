@@ -48,7 +48,9 @@ async function open(scenario, { still = false, theme = 'green', detail = 'calm',
   await clearLog();
   await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null, connect: null, ...mode });
   await ctl('scenario', { name: scenario, push: false });
-  await b.ev(`(() => { try { localStorage.setItem('wb-theme', ${JSON.stringify(theme)}); localStorage.setItem('wb-detail', ${JSON.stringify(detail)}); localStorage.setItem('wb-answered', '1'); sessionStorage.removeItem('wb-later'); sessionStorage.removeItem('wb-reviewed'); } catch (e) {} return 1; })()`).catch(() => {});
+  // the look and detail as Workbench keeps them (the page arrives with them on <html>), and the hint already seen
+  await ctl('prefs', { theme, detail, answered: true });
+  await b.ev(`(() => { try { sessionStorage.removeItem('wb-later'); sessionStorage.removeItem('wb-reviewed'); } catch (e) {} return 1; })()`).catch(() => {});
   await b.goto(`${base}/?t=k${still ? '&still=1' : ''}`, 1600);
 }
 const click = sel => b.ev(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return false; e.click(); return true; })()`);
@@ -395,12 +397,17 @@ try {
     await b.type('ivory'); await b.key('Enter'); await sleep(700);
     await b.ev(`document.getElementById('say').focus(), 1`);
     await b.type('less detail'); await b.key('Enter'); await sleep(700);
-    const kept = await b.ev(`[document.documentElement.dataset.theme, document.documentElement.dataset.detail, localStorage.getItem('wb-theme'), localStorage.getItem('wb-detail')].join(',')`);
+    // what the page shows, and what Workbench keeps for its next start (the page keeps nothing itself)
+    const held = await ctl('prefs', {});
+    const kept = [await b.ev(`document.documentElement.dataset.theme + ',' + document.documentElement.dataset.detail`), held.theme, held.detail,
+      await b.ev(`String(localStorage.getItem('wb-theme'))`)].join(',');
     await b.goto(`${base}/?t=k`, 1400);
     const afterReload = await b.ev(`document.documentElement.dataset.theme + ',' + document.documentElement.dataset.detail`);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    check('the look and detail words change the page and never reach the engine', t1 === 'black-gold' && d1 === 'more' && kept === 'ivory,calm,ivory,calm' && afterReload === 'ivory,calm' && p.length === 0, `${t1} ${d1} ${kept} ${afterReload}, commands ${p.length}`);
-    await b.ev(`(localStorage.setItem('wb-theme', 'green'), 1)`);
+    const saved = (await posts()).filter(x => x.path === '/api/prefs').map(x => JSON.stringify(x.body)).join(' ');
+    check('the look and detail words change the page and never reach the engine', t1 === 'black-gold' && d1 === 'more' && kept === 'ivory,calm,ivory,calm,null' && afterReload === 'ivory,calm' && p.length === 0
+      && saved === '{"theme":"black-gold"} {"detail":"more"} {"theme":"ivory"} {"detail":"calm"}', `${t1} ${d1} ${kept} ${afterReload}, commands ${p.length}, kept by Workbench: ${saved}`);
+    await ctl('prefs', { theme: 'green' });
   });
 
   await run('the menu under the workbench mark changes the look', async () => {
@@ -414,7 +421,7 @@ try {
     await b.key('Escape'); await sleep(200);
     const closed = await b.ev(`document.getElementById('look').hidden`);
     check('the menu under the workbench mark changes the look', openNow === 'true' && state === 'black-gold,more' && closed, `${openNow} ${state} ${closed}`);
-    await b.ev(`(localStorage.setItem('wb-theme', 'green'), localStorage.setItem('wb-detail', 'calm'), 1)`);
+    await ctl('prefs', { theme: 'green', detail: 'calm' });
   });
 
   await run('a refused key shows the stale-key state and stops typing', async () => {

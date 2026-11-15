@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="en" data-theme="green" data-detail="calm" class="boot">
+<html lang="en" data-theme="green" data-detail="calm" data-answered="0" class="boot">
 <head>
+<!-- The server replaces data-theme, data-detail and data-answered on <html> with the person's choices as it sends this
+     page (src/core/prefs.mjs), so the first paint already has their look. -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Workbench</title>
 <link rel="icon" href="data:,">
-<script src="/ui/boot.js"></script>
 <link rel="stylesheet" href="/ui/app.css">
 <link rel="preload" href="/ui/fonts/JetBrainsMono-Regular.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/ui/fonts/JetBrainsMono-Medium.woff2" as="font" type="font/woff2" crossorigin>

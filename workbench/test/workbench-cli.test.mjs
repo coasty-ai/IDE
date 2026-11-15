@@ -222,6 +222,45 @@ test('bad options get plain messages', async () => {
   }
 });
 
+/**
+ * Start the CLI and keep it running: resolves once it printed where it runs, with the page's address and key, and a
+ * stop() that sends Ctrl-C and waits for the exit.
+ */
+async function running(t, args, env) {
+  const proc = spawn(process.execPath, [BIN, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  proc.stderr.on('data', (d) => { out += d; });
+  const exited = new Promise((resolve) => proc.on('exit', (code) => resolve(code)));
+  t.after(() => { if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL'); });
+  let m;
+  await until(() => (m = /Workbench is running at (http:\/\/127\.0\.0\.1:(\d+)\/)\?t=([0-9a-f]{64})/.exec(out)) || proc.exitCode != null);
+  assert.ok(m, out);
+  return {
+    origin: m[1], port: Number(m[2]), token: m[3], out: () => out,
+    stop: async () => { proc.kill('SIGINT'); return Promise.race([exited, sleep(15_000).then(() => 'still running')]); },
+  };
+}
+
+test('the look, the detail and the first answer are kept across runs in ~/.workbench/prefs.json, and the next page arrives with them', async (t) => {
+  const w = setup(t);
+  const first = await running(t, ['--demo', '--no-open', '--port', '0'], w.env);
+  const tag = async (at) => (/<html\b[^>]*>/.exec(await (await fetch(at)).text()) || [''])[0];
+  assert.match(await tag(first.origin), /data-theme="green" data-detail="calm" data-answered="0"/);
+  const keep = (body) => fetch(`${first.origin}api/prefs`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': first.token }, body: JSON.stringify(body) });
+  assert.equal((await keep({ theme: 'ivory' })).status, 200);
+  assert.equal((await keep({ detail: 'more', answered: true })).status, 200);
+  assert.equal((await first.stop()), 0, first.out());
+  const dir = path.join(w.home, '.workbench');
+  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  assert.equal(statSync(path.join(dir, 'prefs.json')).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, 'prefs.json'), 'utf8')), { theme: 'ivory', detail: 'more', answered: true });
+  // the next run, at whatever address it has, sends the page with them already on <html>
+  const second = await running(t, ['--demo', '--no-open', '--port', '0'], w.env);
+  assert.match(await tag(second.origin), /data-theme="ivory" data-detail="more" data-answered="1"/);
+  assert.equal((await second.stop()), 0, second.out());
+});
+
 test('--app: one line the Mac app reads, no browser, and Workbench stops when the app closes its standard input', async (t) => {
   const w = setup(t);
   const proc = spawn(process.execPath, [BIN, '--demo', '--app', '--port', '0'], { env: w.env, stdio: ['pipe', 'pipe', 'pipe'] });

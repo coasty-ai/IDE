@@ -13,7 +13,7 @@ import { Board } from './board.js';
 import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
-import { THEME_NAMES, DETAIL_NAMES, loadPrefs, savePref, pageCommand } from './prefs.js';
+import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand } from './prefs.js';
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { buttonRow } from './words.js';
@@ -46,7 +46,8 @@ if (debug.still) el.body.classList.add('still');
 
 const RM = matchMedia('(prefers-reduced-motion: reduce)');
 const reduced = () => RM.matches;
-const prefs = loadPrefs(safeStorage('localStorage'));
+// The person's choices, as Workbench put them on <html> before the first paint (it keeps them, not the page).
+const prefs = pagePrefs(el.html.dataset);
 el.html.dataset.theme = prefs.theme;
 el.html.dataset.detail = prefs.detail;
 
@@ -94,7 +95,7 @@ let leaveTimer = null;
 
 // ---------------------------------------------------------------- notices and the hint under the core
 let notice = null, noticeTimer = null;
-const hintDone = () => { try { return localStorage.getItem('wb-answered') === '1'; } catch { return false; } };
+const hintDone = () => prefs.answered;
 /** How long a reply stays: one that refused or could not start work stays 30 s (9 s was easy to miss), the others 9 s. */
 const REFUSED_RE = /\b(could not start|cannot start|not available|not ready|not signed in|could not be started|did not answer)\b/i;
 function lasting(r) { return r && typeof r.reply === 'string' && (r.openConnect === true || REFUSED_RE.test(r.reply)) ? 30000 : 9000; }
@@ -107,7 +108,13 @@ function say(text, ms = 9000) {
   if (notice && ms) noticeTimer = setTimeout(() => { notice = null; paintSaid(); }, ms);
   paintSaid();
 }
-function answeredOnce() { try { localStorage.setItem('wb-answered', '1'); } catch { /* fine */ } }
+/** The person answered something: the hint under the core goes, now and in later runs (Workbench keeps that). */
+function answeredOnce() {
+  if (prefs.answered) return;
+  prefs.answered = true;
+  el.html.dataset.answered = '1';
+  if (hasToken()) api.prefs({ answered: true }).catch(() => { /* not kept: the hint comes back at the next start */ });
+}
 function paintSaid() {
   gitSay(notice);   // D1: what Workbench said shows on the git screen too
   if (!G) return;
@@ -677,7 +684,7 @@ el.say.addEventListener('input', () => {
 });
 
 function applyPref(kind, value, { quietly = false } = {}) {
-  const v = savePref(safeStorage('localStorage'), kind, value);
+  const v = kind === 'theme' ? normalTheme(value) : normalDetail(value);
   const change = () => { prefs[kind] = v; el.html.dataset[kind] = v; syncMenu(); renderNow({ snap: true }); };
   if (prefs[kind] === v) { syncMenu(); return; }
   if (document.startViewTransition && !reduced() && !debug.still && !document.hidden) {
@@ -686,6 +693,9 @@ function applyPref(kind, value, { quietly = false } = {}) {
     for (const p of [vt.ready, vt.finished, vt.updateCallbackDone]) p?.catch(() => {});
   } else change();
   if (!quietly) say(kind === 'theme' ? `Look: ${THEME_NAMES[v]}.` : `Detail: ${DETAIL_NAMES[v]}.`, 4000);
+  // Workbench keeps it for its next start. When it cannot, it says so, and the choice still lasts for this run; a page
+  // Workbench no longer answers already says that in its own way.
+  if (hasToken()) api.prefs({ [kind]: v }).catch(e => { if (e?.refused) say(e.message); });
 }
 
 async function submit(text) {

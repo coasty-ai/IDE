@@ -10,6 +10,7 @@ import { createServer } from '../src/server/http.mjs';
 import { Store } from '../src/core/store.mjs';
 import { Connect } from '../src/core/connect.mjs';
 import { KeyStore } from '../src/core/keys.mjs';
+import { createPrefs, memoryPrefs, prefsFile } from '../src/core/prefs.mjs';
 import { EV } from '../src/shared/events.mjs';
 
 const ROOT = path.join(os.tmpdir(), `wb-http-${process.pid}-${crypto.randomBytes(3).toString('hex')}`);
@@ -172,6 +173,130 @@ test('the page is served with a query only when the query carries the key; anyth
     assert.equal(r.status, 200, p);
     assert.ok(r.text.includes('Workbench'), p);
   }
+});
+
+// ------------------------------------------------------------------ the person's choices for the page
+
+/** A folder with a page like the real one (an <html> tag carrying the defaults, and words that are not ASCII). */
+function pageRoot(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-http-page-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'ui'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'src', 'shared'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'ui', 'index.html'),
+    '<!doctype html>\n<html lang="en" data-theme="green" data-detail="calm" data-answered="0" class="boot">\n<head><title>Workbench</title></head>\n<body><p data-theme="green">Agents &amp; keys · what’s next</p></body>\n</html>\n');
+  fs.writeFileSync(path.join(root, 'ui', 'other.html'), '<!doctype html>\n<html lang="en" data-theme="green">\n<title>Other</title>\n');
+  return root;
+}
+
+/** A server on `root` with the choices kept in `prefs` (or none given), and a request() bound to its port. */
+async function pageServer(t, root, prefs) {
+  const s = new Store();
+  const srv = createServer({ engine: new FakeEngine(s), store: s, token: TOKEN, hookTokenFor, port: 0, rootDir: root, ...(prefs ? { prefs } : {}) });
+  const { url } = await srv.listen();
+  t.after(() => srv.close());
+  const at = Number(new URL(url).port);
+  return (o = {}) => request({ ...o, at });
+}
+
+const htmlTag = (text) => (/<html\b[^>]*>/.exec(text) || [''])[0];
+
+test('the page arrives with the person’s look, detail and first answer already on <html>, in every address form, with its own length', async (t) => {
+  const root = pageRoot(t);
+  const prefs = memoryPrefs({ theme: 'ivory', detail: 'more', answered: true });
+  const req = await pageServer(t, root, prefs);
+  const onDisk = fs.readFileSync(path.join(root, 'ui', 'index.html'), 'utf8');
+  for (const p of ['/', '/index.html', '/ui/index.html', '/ui/%69ndex.html', `/?t=${TOKEN}`, `/ui/index.html?t=${TOKEN}`]) {
+    const r = await req({ path: p });
+    assert.equal(r.status, 200, p);
+    assert.equal(htmlTag(r.text), '<html lang="en" data-theme="ivory" data-detail="more" data-answered="1" class="boot">', p);
+    // only the tag changes; the length is the page's own, in bytes
+    assert.equal(r.text.replace(htmlTag(r.text), ''), onDisk.replace(htmlTag(onDisk), ''), p);
+    assert.equal(Number(r.headers['content-length']), Buffer.byteLength(r.text), p);
+    assert.equal(r.headers['content-type'], 'text/html; charset=utf-8', p);
+    assert.equal(r.headers['cache-control'], 'no-cache', p);
+    const head = await req({ method: 'HEAD', path: p });
+    assert.equal(head.status, 200, p);
+    assert.equal(head.headers['content-length'], r.headers['content-length'], p);
+    assert.equal(head.text, '', p);
+  }
+  // the next load has a change at once
+  prefs.set({ theme: 'black-gold', detail: 'calm' });
+  assert.equal(htmlTag((await req({ path: '/' })).text), '<html lang="en" data-theme="black-gold" data-detail="calm" data-answered="1" class="boot">');
+  // another .html file is not the page: it goes out as it is on disk
+  const other = await req({ path: '/ui/other.html' });
+  assert.equal(other.text, fs.readFileSync(path.join(root, 'ui', 'other.html'), 'utf8'));
+  // a wrong key still goes to the plain page, which then has the look too
+  assert.equal((await req({ path: '/?t=nope' })).status, 303);
+});
+
+test('a page without an <html> tag goes out exactly as it is; with no store given, the defaults', async () => {
+  const r = await request({ path: '/' });
+  assert.equal(r.text, '<!doctype html><title>Workbench</title>');
+  const got = await request({ path: '/api/prefs', headers: auth() });
+  assert.deepEqual(got.json, { theme: 'green', detail: 'calm', answered: false });
+});
+
+test('GET and POST /api/prefs: the page’s token, JSON from this page, known values only, kept through the store', async (t) => {
+  const kept = memoryPrefs();
+  const calls = [];
+  const req = await pageServer(t, pageRoot(t), { get: () => kept.get(), set: (c) => { calls.push(c); return kept.set(c); } });
+  const json = { 'Content-Type': 'application/json' };
+  const send = (body, headers = {}) => req({ method: 'POST', path: '/api/prefs', body, headers: auth({ ...json, ...headers }) });
+  // the page's token: nothing else opens it, an agent's hook token included
+  assert.equal((await req({ path: '/api/prefs' })).status, 401);
+  assert.equal((await req({ path: '/api/prefs', headers: { 'X-Workbench-Token': hookTokenFor('abc123') } })).status, 401);
+  assert.equal((await req({ method: 'POST', path: '/api/prefs', body: { theme: 'ivory' }, headers: json })).status, 401);
+  const got = await req({ path: '/api/prefs', headers: auth() });
+  assert.equal(got.status, 200);
+  assert.deepEqual(got.json, { theme: 'green', detail: 'calm', answered: false });
+  assert.equal(got.headers['cache-control'], 'no-store');
+  // from this page only, as JSON
+  assert.equal((await send({ theme: 'ivory' }, { Origin: 'http://evil.example' })).status, 403);
+  assert.equal((await req({ method: 'POST', path: '/api/prefs', body: '{"theme":"ivory"}', headers: auth({ 'Content-Type': 'text/plain' }) })).status, 415);
+  assert.equal(calls.length, 0);
+  // a known value is kept; a name it does not know is left out
+  const ok = await send({ theme: 'ivory', colour: 'red' });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.json, { ok: true, theme: 'ivory', detail: 'calm', answered: false });
+  assert.deepEqual(calls, [{ theme: 'ivory' }]);
+  assert.deepEqual((await send({ detail: 'more', answered: true })).json, { ok: true, theme: 'ivory', detail: 'more', answered: true });
+  // anything else is refused in plain words, and the store never sees it
+  for (const [body, said] of [[{ theme: 'neon' }, 'Workbench has no such look.'], [{ detail: 'all' }, 'Workbench has no such detail level.'],
+    [{ answered: false }, 'Workbench keeps only that you have answered once.'], [{}, 'Say which look or detail level to keep.'], [{ colour: 'red' }, 'Say which look or detail level to keep.']]) {
+    const r = await send(body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.deepEqual(r.json, { error: said }, JSON.stringify(body));
+  }
+  assert.equal(calls.length, 2);
+  const put = await req({ method: 'PUT', path: '/api/prefs', headers: auth() });
+  assert.equal(put.status, 405);
+  assert.equal(put.headers.allow, 'GET, POST');
+});
+
+test('a choice the store could not keep is answered plainly as not kept, and lasts for the run', async (t) => {
+  const h = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-http-prefs-'));
+  t.after(() => fs.rmSync(h, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(h, '.workbench'), 'a file, not a folder');
+  const req = await pageServer(t, pageRoot(t), createPrefs({ file: prefsFile(h) }));
+  const r = await req({ method: 'POST', path: '/api/prefs', body: { theme: 'ivory' }, headers: auth({ 'Content-Type': 'application/json' }) });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.json, { ok: false, reply: 'Workbench could not keep that choice for the next time it starts. The details are in its log.', theme: 'ivory', detail: 'calm', answered: false });
+  assert.match(htmlTag((await req({ path: '/' })).text), /data-theme="ivory"/);
+});
+
+test('with the file store, a choice made on the page is in a 0600 file in a 0700 folder, and on the next page load', async (t) => {
+  const h = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-http-prefs-'));
+  t.after(() => fs.rmSync(h, { recursive: true, force: true }));
+  const root = pageRoot(t);
+  const req = await pageServer(t, root, createPrefs({ file: prefsFile(h) }));
+  assert.equal((await req({ method: 'POST', path: '/api/prefs', body: { detail: 'more' }, headers: auth({ 'Content-Type': 'application/json' }) })).status, 200);
+  assert.equal(fs.statSync(path.join(h, '.workbench')).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(prefsFile(h)).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(fs.readFileSync(prefsFile(h), 'utf8')), { theme: 'green', detail: 'more', answered: false });
+  // the next run reads the file
+  const next = await pageServer(t, root, createPrefs({ file: prefsFile(h) }));
+  assert.equal(htmlTag((await next({ path: '/' })).text), '<html lang="en" data-theme="green" data-detail="more" data-answered="0" class="boot">');
 });
 
 test('no directory listing, no hidden files, only .mjs from shared', async () => {

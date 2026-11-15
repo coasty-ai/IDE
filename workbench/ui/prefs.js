@@ -1,27 +1,27 @@
 // How the person has set the page up: the look (theme) and how much detail it shows, plus the few words the page
 // answers itself instead of sending them to the engine. Pure: no DOM, no imports (node:test loads it).
+//
+// Workbench keeps the choices, not the page (src/core/prefs.mjs, in ~/.workbench/prefs.json): the server puts them on
+// <html> as it sends the page (data-theme, data-detail, data-answered), and the page saves a change through
+// POST /api/prefs. The lists match the server's.
 
 export const THEMES = ['green', 'black-gold', 'ivory'];
 export const THEME_NAMES = { green: 'Green', 'black-gold': 'Black and gold', ivory: 'Ivory' };
 export const DETAILS = ['calm', 'more'];
 export const DETAIL_NAMES = { calm: 'Calm', more: 'More' };
 export const DEFAULT_PREFS = Object.freeze({ theme: 'green', detail: 'calm' });
-export const PREF_KEYS = Object.freeze({ theme: 'wb-theme', detail: 'wb-detail' });
 
 export const normalTheme = v => (THEMES.includes(v) ? v : DEFAULT_PREFS.theme);
 export const normalDetail = v => (DETAILS.includes(v) ? v : DEFAULT_PREFS.detail);
 
-/** Read the saved choices. `storage` is localStorage, or anything with getItem; failures fall back to the defaults. */
-export function loadPrefs(storage) {
-  const get = k => { try { return storage?.getItem(k) ?? null; } catch { return null; } };
-  return { theme: normalTheme(get(PREF_KEYS.theme)), detail: normalDetail(get(PREF_KEYS.detail)) };
-}
-
-/** Save one choice; returns the value actually kept. */
-export function savePref(storage, key, value) {
-  const v = key === 'theme' ? normalTheme(value) : normalDetail(value);
-  try { storage?.setItem(PREF_KEYS[key], v); } catch { /* private mode: the choice lasts until reload */ }
-  return v;
+/**
+ * The choices Workbench put on <html>: `dataset` is document.documentElement.dataset, or anything with the same
+ * fields. Anything unknown is the default; `answered` (the person has answered something once) only when it is "1".
+ * @returns {{ theme: string, detail: string, answered: boolean }}
+ */
+export function pagePrefs(dataset) {
+  const d = dataset && typeof dataset === 'object' ? dataset : {};
+  return { theme: normalTheme(d.theme), detail: normalDetail(d.detail), answered: d.answered === '1' };
 }
 
 // The words, matched against the whole utterance only, so "make the login button green" still reaches the agents.

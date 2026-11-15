@@ -8,7 +8,8 @@
 //   node bin/workbench.mjs --git-status                           (for the Mac app)
 //
 // Wires the real modules together: store, engine, commands, policy, workspaces, receipt, machines, the key store and
-// Agents & keys (connect), the adapters and the local web server. Every agent process is stopped when Workbench exits.
+// Agents & keys (connect), the adapters, the page's choices (prefs) and the local web server. Every agent process is
+// stopped when Workbench exits.
 // Run as a program it starts at once; imported (by its tests), it only exports its parts.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -297,14 +298,15 @@ async function loadOptional(rel, log) {
 }
 
 async function loadModules(demo, log) {
-  const [storeMod, engineMod, httpMod, commands, machinesMod] = await Promise.all([
+  const [storeMod, engineMod, httpMod, commands, machinesMod, prefs] = await Promise.all([
     load('src/core/store.mjs'),
     load('src/core/engine.mjs'),
     load('src/server/http.mjs'),
     load('src/core/commands.mjs'),
     load('src/core/machines.mjs'),
+    load('src/core/prefs.mjs'),
   ]);
-  const base = { Store: storeMod.Store, Engine: engineMod.Engine, createServer: httpMod.createServer, commands, Machines: machinesMod.Machines };
+  const base = { Store: storeMod.Store, Engine: engineMod.Engine, createServer: httpMod.createServer, commands, Machines: machinesMod.Machines, prefs };
   if (demo) {
     const sim = await load('src/adapters/sim/simulator.mjs');
     // Not needed by the simulator, but passed along when present.
@@ -990,7 +992,17 @@ async function main() {
   // Agents & keys checked the agent programs again, or saved git's name and email: the engine takes it in now.
   wireConnect(connect, engine, log);
 
-  let server = mods.createServer({ engine, store, token, hookTokenFor, connect, repoRoot: repo?.root ?? null, port: args.port, host: '127.0.0.1', rootDir: ROOT, log });
+  // The person's choices for the page (its look, its detail, whether they have answered once), kept in
+  // ~/.workbench/prefs.json, so the next run's page arrives with them: in the demo too. Without a home folder to keep
+  // them in, they last for this run.
+  let prefs;
+  try {
+    prefs = mods.prefs.createPrefs({ file: mods.prefs.prefsFile(os.homedir()), log });
+  } catch (err) {
+    log.warn('Workbench cannot keep the page’s choices for its next start:', err);
+    prefs = mods.prefs.memoryPrefs();
+  }
+  let server = mods.createServer({ engine, store, token, hookTokenFor, connect, repoRoot: repo?.root ?? null, prefs, port: args.port, host: '127.0.0.1', rootDir: ROOT, log });
 
   // From here on, every way out stops the agents first: orphaned agents keep spending.
   // The only copy of an agent's work is its own folder: every way out also says where the folders are.
@@ -1066,7 +1078,7 @@ async function main() {
       // A fresh clone is not thrown away for a busy port: the page takes a free one (the Mac app reads it from WORKBENCH_APP).
       if (err.code !== 'EADDRINUSE' || !args.clone || args.port === 0) throw err;
       await server.close().catch(() => {});
-      server = mods.createServer({ engine, store, token, hookTokenFor, connect, repoRoot: repo?.root ?? null, port: 0, host: '127.0.0.1', rootDir: ROOT, log });
+      server = mods.createServer({ engine, store, token, hookTokenFor, connect, repoRoot: repo?.root ?? null, prefs, port: 0, host: '127.0.0.1', rootDir: ROOT, log });
       ({ url } = await server.listen());
       say(`Port ${args.port} is already in use, so the page took a free one.`);
     }

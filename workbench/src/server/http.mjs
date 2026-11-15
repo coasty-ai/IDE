@@ -4,6 +4,7 @@
 // agent's own hook token), and for POSTs the Origin, the JSON content type and a 64 KB body limit
 // (16 KB on the Agents & keys routes, which carry keys: never echoed, never logged, never in a URL).
 // A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
+// The page goes out with the person's look, detail and first answer on its <html> tag (src/core/prefs.mjs).
 import http from 'node:http';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -11,6 +12,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { STATE } from '../shared/states.mjs';
+import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../core/prefs.mjs';
 
 const MAX_BODY = 64 * 1024;
 const MAX_CONNECT_BODY = 16 * 1024; // Agents & keys: a few keys of at most 2000 characters each
@@ -130,6 +132,8 @@ function isPlainError(err) {
  * @param {object} [opts.connect]  the connect service (src/core/connect.mjs) for the Agents & keys routes; without it
  *        (the demo) they answer 404 with a plain sentence
  * @param {string} [opts.repoRoot] the repository's folder, for keys kept for "this repository" (else the engine's)
+ * @param {object} [opts.prefs]    the person's choices for the page, `{ get(), set(change) }` (createPrefs in
+ *        src/core/prefs.mjs, which keeps them in ~/.workbench/prefs.json); without it, kept for this run only
  * @param {number} [opts.port]     0 picks a free port
  * @param {string} [opts.host]     always 127.0.0.1
  * @param {string} [opts.rootDir]  folder that holds ui/ and src/shared/
@@ -138,7 +142,7 @@ function isPlainError(err) {
  *        and keyPresets: a stand-in for src/shared/keypresets.mjs ({ presetById }), for tests
  * @returns {{ listen(): Promise<{ url: string }>, close(): Promise<void>, readonly url: string|null, readonly port: number|null }}
  */
-export function createServer({ engine, store, token, hookTokenFor = null, connect = null, repoRoot = null, port = 4317, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
+export function createServer({ engine, store, token, hookTokenFor = null, connect = null, repoRoot = null, prefs = memoryPrefs(), port = 4317, host = '127.0.0.1', rootDir = DEFAULT_ROOT, log, options = {} } = {}) {
   if (!engine) throw new Error('The server needs the engine.');
   if (typeof token !== 'string' || !/^[0-9a-f]{64}$/i.test(token)) {
     throw new Error('The server token must be 32 random bytes written as hex.');
@@ -264,6 +268,16 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     if (url.search && path.extname(real).toLowerCase() === '.html' && !tokenMatches(url.searchParams.get('t'), token)) {
       res.writeHead(303, { Location: '/', 'Content-Length': 0, 'Cache-Control': 'no-store' });
       return res.end();
+    }
+
+    // The page itself goes out with the person's look, detail and first answer on its <html> tag, so its first paint
+    // is already right. Workbench keeps them (prefs), not the page's own storage.
+    if (base === uiDir && real === path.join(root, 'index.html')) {
+      let text;
+      try { text = await fsp.readFile(real, 'utf8'); } catch { return sendJson(res, 404, { error: 'Not found.' }); }
+      const page = Buffer.from(pageWithPrefs(text, prefsNow()));
+      res.writeHead(200, { 'Content-Type': TYPES['.html'], 'Content-Length': page.length, 'Cache-Control': 'no-cache' });
+      return res.end(req.method === 'HEAD' ? undefined : page);
     }
 
     res.writeHead(200, {
@@ -435,6 +449,9 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     // One more spending limit for this run, for an agent that reached its own; `state`: what the button was drawn for.
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/raise-limit$/, run: (b, m) => engine.raiseLimit(id(m[1]), { state: optState(b.state) }) },
     { method: 'POST', re: /^\/api\/machines\/([^/]+)\/awake$/, run: (b, m) => engine.setMachineAwake(id(m[1]), b.awake === true) },
+    // The person's choices for the page: { theme, detail, answered }. A change carries one or more of them (prefsChange).
+    { method: 'GET', re: /^\/api\/prefs$/, run: () => prefsNow() },
+    { method: 'POST', re: /^\/api\/prefs$/, run: (b) => keepPrefs(b) },
     { method: 'POST', re: /^\/hook\/pretool$/, hook: true },
     // Agents & keys. Each answers { ok, sentence, status } with a fresh ConnectStatus (src/core/connect.mjs), or { error }
     // with a plain sentence and a 4xx code (500 when the place keys are kept failed). Keys come in the body only, and
@@ -508,6 +525,30 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
       },
     },
   ];
+
+  // ------------------------------------------------------------ the person's choices for the page
+
+  /** What is kept now, each a known value or its default; a store that fails to read gives the defaults. */
+  function prefsNow() {
+    try {
+      return cleanPrefs(prefs.get());
+    } catch (err) {
+      L.warn('Workbench could not read the page’s choices:', err?.message || err);
+      return cleanPrefs(null);
+    }
+  }
+
+  /**
+   * POST /api/prefs: the change, checked (a 400 with a plain sentence for anything the page does not offer), kept by
+   * the store. `{ ok: true, theme, detail, answered }`; when the store could not save it, `ok: false` and its sentence
+   * as `reply`: the choice still lasts for this run.
+   */
+  function keepPrefs(b) {
+    const r = prefs.set(prefsChange(b));
+    const now = r?.prefs ? cleanPrefs(r.prefs) : prefsNow();
+    if (r?.ok === false) return { ok: false, reply: typeof r.sentence === 'string' && r.sentence ? r.sentence : 'Workbench could not keep that choice.', ...now };
+    return { ok: true, ...now };
+  }
 
   // ------------------------------------------------------------ Agents & keys
 

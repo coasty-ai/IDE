@@ -18,6 +18,10 @@
 //   GET  /ctl/log                  every request the page sent to /api, with its body
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 //   GET  /ctl/reads                the git screen's reads: every GET of /api/git and /api/agents/:id/changes (D1)
+//   POST /ctl/prefs {...}          the person's choices as Workbench keeps them ({ theme, detail, answered }, any of
+//                                  them): the page arrives with them on <html>; answers what is kept now ({} reads it)
+// The person's choices: GET and POST /api/prefs, as the real server answers them (src/core/prefs.mjs), and the page sent
+// with them on its <html> tag.
 // The git screen's routes (D1): GET /api/git (any scenario) and GET /api/agents/:id/changes; answer "refuse" refuses them.
 // The spending limit: POST /api/agents/:id/raise-limit, answered as the engine does in short (see the 'limit' scenario);
 // answer "refuse" refuses it.
@@ -28,6 +32,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { presetById } from '../src/shared/keypresets.mjs';
+import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../src/core/prefs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -784,6 +789,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const clients = new Set();
   const posted = [];
   const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null };
+  const prefs = memoryPrefs();   // the person's choices, as Workbench keeps them across runs
   let name = 'demo';
   let state = scenario(name);
   let cw = connectFacts(name);   // Agents & keys: what Connect knows, in the connect scenarios (null elsewhere)
@@ -1170,6 +1176,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (p === '/ctl/log') { res.end(JSON.stringify(posted)); return; }
       if (p === '/ctl/reads') { res.end(JSON.stringify(GIT_READS)); return; }   // D1: the git screen's GETs
       if (p === '/ctl/clear') { posted.length = 0; res.end('{"ok":true}'); return; }
+      if (p === '/ctl/prefs') { if (Object.keys(b).length) prefs.set(cleanPrefs({ ...prefs.get(), ...b })); res.end(JSON.stringify(prefs.get())); return; }
       res.statusCode = 404; res.end('{}'); return;
     }
     if (p.startsWith('/api/')) {
@@ -1181,6 +1188,14 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (req.method === 'POST') posted.push({ at: Date.now(), method: req.method, path: p, body: json });
       if (!tok || tok === 'bad' || mode.auth === 'bad') { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{"error":"Missing or wrong token."}'); return; }
       if (p === '/api/state') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(state)); return; }
+      // the person's choices, whatever mode.answer says, as the real server keeps them apart from the engine
+      if (p === '/api/prefs') {
+        res.setHeader('content-type', 'application/json');
+        if (req.method === 'GET') { res.end(JSON.stringify(prefs.get())); return; }
+        let change;
+        try { change = prefsChange(json); } catch (e) { res.statusCode = 400; res.end(JSON.stringify({ error: e.message })); return; }
+        res.end(JSON.stringify({ ok: true, ...prefs.set(change).prefs })); return;
+      }
       if (p === '/api/stream') {
         if (mode.down) { req.socket.destroy(); return; }
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
@@ -1343,6 +1358,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     let file = p === '/' ? path.join(ROOT, 'ui/index.html') : p.startsWith('/ui/') ? path.join(ROOT, 'ui', p.slice(4)) : p.startsWith('/shared/') ? path.join(ROOT, 'src/shared', p.slice(8)) : null;
     if (file && !file.startsWith(path.join(ROOT, p.startsWith('/shared/') ? 'src/shared' : 'ui'))) file = null;
     if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404, SECURITY); res.end(); return; }
+    if (file === path.join(ROOT, 'ui', 'index.html')) {
+      // the page, with the person's choices on <html>, as the real server sends it
+      res.writeHead(200, { 'content-type': TYPES['.html'], 'cache-control': 'no-store', ...SECURITY });
+      res.end(pageWithPrefs(fs.readFileSync(file, 'utf8'), prefs.get())); return;
+    }
     res.writeHead(200, { 'content-type': TYPES[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store', ...SECURITY });
     fs.createReadStream(file).pipe(res);
   });

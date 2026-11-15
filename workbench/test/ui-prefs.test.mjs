@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pageCommand, plainWords, loadPrefs, savePref, THEMES, DETAILS, DEFAULT_PREFS, PREF_KEYS } from '../ui/prefs.js';
+import { readFileSync } from 'node:fs';
+import { pageCommand, plainWords, pagePrefs, THEMES, DETAILS, DEFAULT_PREFS } from '../ui/prefs.js';
 
 test('the look and detail words the owner asked for change the page', () => {
   assert.deepEqual(pageCommand('black and gold'), { kind: 'theme', theme: 'black-gold' });
@@ -35,28 +36,24 @@ test('plainWords drops punctuation, filler and the switch-to wording', () => {
   assert.equal(plainWords('OK show me the next one'), 'the next one');
 });
 
-test('the choice is kept in storage, and anything unknown falls back to the defaults', () => {
-  const store = new Map();
-  const storage = { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) };
-  assert.deepEqual(loadPrefs(storage), DEFAULT_PREFS);
-  assert.equal(savePref(storage, 'theme', 'ivory'), 'ivory');
-  assert.equal(savePref(storage, 'detail', 'more'), 'more');
-  assert.deepEqual(loadPrefs(storage), { theme: 'ivory', detail: 'more' });
-  assert.equal(store.get(PREF_KEYS.theme), 'ivory');
-  store.set(PREF_KEYS.theme, 'neon');
-  assert.equal(loadPrefs(storage).theme, 'green');
-  assert.equal(savePref(storage, 'theme', 'neon'), 'green');
-  const broken = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } };
-  assert.deepEqual(loadPrefs(broken), DEFAULT_PREFS);
-  assert.equal(savePref(broken, 'detail', 'more'), 'more');
+test('the page reads its choices from what Workbench put on <html>, and anything unknown is the default', () => {
+  assert.deepEqual(pagePrefs({ theme: 'ivory', detail: 'more', answered: '1' }), { theme: 'ivory', detail: 'more', answered: true });
+  assert.deepEqual(pagePrefs({ theme: 'black-gold', detail: 'calm', answered: '0' }), { theme: 'black-gold', detail: 'calm', answered: false });
+  assert.deepEqual(pagePrefs({ theme: 'neon', detail: 'everything', answered: 'yes' }), { ...DEFAULT_PREFS, answered: false });
+  assert.deepEqual(pagePrefs({}), { ...DEFAULT_PREFS, answered: false });
+  assert.deepEqual(pagePrefs(null), { ...DEFAULT_PREFS, answered: false });
   assert.deepEqual(THEMES, ['green', 'black-gold', 'ivory']);
   assert.deepEqual(DETAILS, ['calm', 'more']);
 });
 
-test('boot.js accepts exactly the same looks and detail levels', async () => {
-  const { readFileSync } = await import('node:fs');
-  const boot = readFileSync(new URL('../ui/boot.js', import.meta.url), 'utf8');
-  for (const t of THEMES) assert.match(boot, new RegExp(`'${t}'`));
-  for (const d of DETAILS) assert.match(boot, new RegExp(`'${d}'`));
-  assert.match(boot, new RegExp(PREF_KEYS.theme)); assert.match(boot, new RegExp(PREF_KEYS.detail));
+test('the page keeps no choice in its own storage: it reads them from <html> and saves a change through Workbench', () => {
+  // The page's own storage belongs to its address, which changes from run to run and which another program may have
+  // served before. test/prefs.test.mjs checks the server's side.
+  const app = readFileSync(new URL('../ui/app.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(app, /localStorage/);
+  assert.match(app, /pagePrefs\(el\.html\.dataset\)/);
+  assert.match(app, /api\.prefs\(\{ \[kind\]: v \}\)/);
+  assert.match(app, /api\.prefs\(\{ answered: true \}\)/);
+  const api = readFileSync(new URL('../ui/api.js', import.meta.url), 'utf8');
+  assert.match(api, /prefs: change => call\('POST', '\/api\/prefs', change\)/);
 });
