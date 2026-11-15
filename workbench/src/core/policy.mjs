@@ -385,6 +385,7 @@ function commandFloor(command, base) {
   let cd = false;
   let code = false;
   let writes = false;
+  let carried = false; // a place a command writes holds a value the shell fills in ("$X", "$d")
   for (const line of lines) {
     const parts = shellCommands(line);
     const bases = base ? cdFolders(parts, base) : [];
@@ -392,6 +393,7 @@ function commandFloor(command, base) {
       const targets = writeTargets(c);
       if (targets.length) writes = true;
       for (const t of targets) {
+        if (/[$`]/.test(withHome(t.word))) carried = true;
         const v = targetLanding(t, bases, base);
         if (v === 'claude') return R.fullClaude;
         if (v === 'unclear') unclear = true;
@@ -404,9 +406,10 @@ function commandFloor(command, base) {
   if (cd) return R.fullCdClaude;
   if (code) return R.fullCodeClaude;
   if (unclear) return R.fullWriteUnclear;
-  // Another command's output ($(…), `…`) glued into a word cuts that word in two ("$(pwd)/.claude/x"), so in a line that
-  // writes, and names them outside a heredoc's text, what it writes to cannot be read.
-  if (writes && GLUED.test(command) && textNamesClaude(withoutHeredocs(command))) return R.fullWriteUnclear;
+  // Where a line that names them (outside a heredoc's text) writes cannot be read when a place it writes holds a variable
+  // ("X=.claude; rm -rf "$X"", "for d in .claude …; do rm -rf "$d"; done"), or when another command's output ($(…), `…`) is
+  // glued into a word and cuts it in two ("$(pwd)/.claude/x").
+  if ((carried || (writes && GLUED.test(command))) && textNamesClaude(withoutHeredocs(command))) return R.fullWriteUnclear;
   return null;
 }
 
@@ -639,11 +642,13 @@ const GIT_WRITES_NAMED = new Set(['checkout', 'restore', 'rm', 'mv', 'apply', 'c
  *   chown, chgrp and chflags: every file after the mode, owner or flags. rm -r, mv's sources and -R count what is inside.
  * - mv: its sources and its destination; cp, ln, install, ditto, rsync and scp: their destination (or -t), and the name each
  *   source gets inside it when it is a folder; ln with one word links it into this folder; rsync --log-file.
- * - dd's of=; sed -i's and perl -i's files; an archive tar creates (-f), and where tar and unzip unpack (-C, -d, and the
- *   members they name); what curl and wget save (-o, -O…); sort's and tree's -o, uniq's second file, find's -fprint and,
- *   with -delete or -exec, where it searches and the names it looks for that name them.
- * - git checkout, restore, rm, mv, apply, clean and stash: the places they name (a message names none); any git command's
- *   --output, and archive's and format-patch's -o; node's (and a package script's) --test-reporter-destination.
+ * - dd's of=; sed -i's and perl -i's files; the file patch patches; the files gzip, bzip2, xz and zstd replace, and zip's
+ *   archive; an archive tar creates (-f), and where tar and unzip unpack (-C, -d, and the members they name); what curl
+ *   and wget save (-o, -O…); sort's and tree's -o, uniq's second file, find's -fprint and, with -delete or -exec, where it
+ *   searches and the names it looks for that name them.
+ * - git checkout, restore, rm, mv, apply, clean and stash: the places they name (a message names none); where clone,
+ *   worktree add, init, submodule add, checkout-index and merge-file write (gitDestinations); any git command's --output,
+ *   and archive's and format-patch's -o; node's (and a package script's) --test-reporter-destination.
  * sudo and doas stand for the command after them; narrate already skips env, timeout, nohup, xargs and the like.
  */
 function writeTargets(c) {
@@ -689,6 +694,23 @@ function programTargets(prog, args) {
     case 'perl': return perlTargets(args);
     case 'tar': return tarTargets(args);
     case 'unzip': return unzipTargets(args);
+    case 'patch': {
+      // the file it patches (its first word), what -o writes, and the folder -d has it patch in
+      const { operands, opts } = argsOf(args, 'odipFBDrVYzg', ['output', 'directory', 'input', 'strip', 'fuzz', 'prefix', 'ifdef', 'reject-file', 'suffix',
+        'version-control', 'basename-prefix', 'get', 'quoting-style']);
+      return each([operands[0], optValue(opts, 'o', 'output'), optValue(opts, 'd', 'directory')].filter(w => w !== undefined));
+    }
+    case 'gzip': case 'gunzip': case 'bzip2': case 'bunzip2': case 'xz': case 'unxz': case 'lzma': case 'zstd': case 'unzstd': {
+      // each file they are given is replaced by its other form, unless they write to their output (-c); zstd's -o names one
+      if (optionWords(args).some(a => shortHas(a, 'c') || longIs(a, ['stdout', 'to-stdout']))) return [];
+      const { operands, opts } = argsOf(args, 'SoTMD', ['suffix', 'output', 'threads', 'memlimit']);
+      return each([...operands, ...optValues(opts, 'o', 'output')]);
+    }
+    case 'zip': {
+      // the archive it writes: its first word, or -O's
+      const { operands, opts } = argsOf(args, 'bntOP', ['temp-path', 'suffixes', 'output-file', 'password']);
+      return each([operands[0], optValue(opts, 'O', 'output-file')].filter(w => w !== undefined));
+    }
     case 'curl': return optionTargets(args, 'AbcCdDeEFHKmoPQrtTuUwxXyYz', 'oDc',
       ['output', 'output-dir', 'dump-header', 'cookie-jar', 'trace', 'trace-ascii', 'stderr', 'libcurl', 'etag-save', 'hsts', 'alt-svc']);
     case 'wget': return optionTargets(args, 'OoaPieBtTwQlARDIXU', 'OoaP', ['output-document', 'output-file', 'append-output', 'directory-prefix']);
@@ -728,12 +750,14 @@ function copyTargets(prog, args) {
 
 /**
  * sed -i (or -I, --in-place): its files, after its script (the first word, unless -e or -f gives it). BSD sed takes the
- * backup extension as the next word ('' for none, or one that starts with a dot); GNU's, like -i.bak, is attached.
+ * backup extension as the next word ('' for none, or one that starts with a dot); GNU's, like -i.bak, is attached, so to
+ * GNU sed that next word is a file (`sed -e s/a/b/ -i .mcp.json`): it counts as one too.
  */
 function sedTargets(args) {
   let inPlace = false;
   let script = false;
   const operands = [];
+  const either = []; // a word BSD sed takes for the backup extension and GNU sed for a file
   for (let k = 0; k < args.length; k++) {
     const a = args[k];
     if (a === '--') { operands.push(...args.slice(k + 1)); break; }
@@ -749,7 +773,7 @@ function sedTargets(args) {
         const ch = a[j];
         if (ch === 'i' || ch === 'I') {
           inPlace = true;
-          if (j === a.length - 1 && k + 1 < args.length && /^(?:\.[^\s/]*)?$/.test(args[k + 1])) k++;
+          if (j === a.length - 1 && k + 1 < args.length && /^(?:\.[^\s/]*)?$/.test(args[k + 1])) either.push(args[++k]);
           break;
         }
         if (ch === 'e' || ch === 'f') { script = true; if (j === a.length - 1) k++; break; }
@@ -759,7 +783,7 @@ function sedTargets(args) {
     }
     operands.push(a);
   }
-  return inPlace ? (script ? operands : operands.slice(1)).map(word => ({ word })) : [];
+  return inPlace ? [...(script ? operands : operands.slice(1)), ...either].map(word => ({ word })) : [];
 }
 
 /** perl -i (-pi, -i.bak): its files, after its script (the first word, unless -e or -E gives the code). */
@@ -888,10 +912,52 @@ function gitTargets(args) {
   if (sub === 'archive' || sub === 'format-patch') {
     rest.forEach((a, k) => { if (a === '-o' && rest[k + 1] !== undefined) out.push(at(rest[k + 1])); else if (/^-o./.test(a)) out.push(at(a.slice(2))); });
   }
+  out.push(...gitDestinations(sub, rest).map(at));
   if (!GIT_WRITES_NAMED.has(sub)) return out;
   const { text } = gitTextWords(sub, rest);
   rest.forEach((a, k) => { if (!text.has(k)) for (const piece of readPieces({ text: a, glob: false })) out.push(at(piece)); });
   return out;
+}
+
+/** The options that take a value, of the git commands that make a folder or write where they are told (`git <command> -h`). */
+const GIT_DEST_VALUES = Object.freeze({
+  clone: { short: 'obucj', long: ['origin', 'branch', 'upload-pack', 'reference', 'reference-if-able', 'separate-git-dir', 'depth', 'shallow-since',
+    'shallow-exclude', 'config', 'server-option', 'jobs', 'filter', 'template', 'bundle-uri', 'ref-format'] },
+  worktree: { short: 'bB', long: ['reason'] },
+  submodule: { short: 'b', long: ['branch', 'name', 'reference', 'depth'] },
+  'merge-file': { short: 'L', long: ['diff-algorithm', 'marker-size'] },
+});
+
+/**
+ * Where git makes a folder or writes files it is told to: the folder clone makes (its second word, or one named after the
+ * address: `git clone https://…/.claude` makes .claude), worktree add's path, init's folders, submodule add's path (or one
+ * named after the address), checkout-index's --prefix, and the file merge-file writes its result into (unless -p sends it out).
+ */
+function gitDestinations(sub, rest) {
+  const named = address => path.basename(String(address).replace(/[/\\]+$/, '').replace(/^.*:/, '')).replace(/\.git$/, '');
+  if (sub === 'clone') {
+    const { operands } = gitArgs(rest, GIT_DEST_VALUES.clone);
+    return operands.length > 1 ? [operands[1]] : operands.length ? [named(operands[0])] : [];
+  }
+  if (sub === 'worktree') {
+    const { operands } = gitArgs(rest, GIT_DEST_VALUES.worktree);
+    return operands[0] === 'add' && operands[1] !== undefined ? [operands[1]] : [];
+  }
+  if (sub === 'init') return initDirs(rest);
+  if (sub === 'submodule') {
+    const { operands } = gitArgs(rest, GIT_DEST_VALUES.submodule);
+    if (operands[0] !== 'add') return [];
+    return operands.length > 2 ? [operands[2]] : operands[1] !== undefined ? [named(operands[1])] : [];
+  }
+  if (sub === 'checkout-index') {
+    return rest.flatMap((a, k) => (a.startsWith('--prefix=') ? [a.slice(9)] : a === '--prefix' && rest[k + 1] !== undefined ? [rest[k + 1]] : []));
+  }
+  if (sub === 'merge-file') {
+    if (optionWords(rest).some(a => a === '-p' || longIs(a, ['stdout']))) return [];
+    const { operands } = gitArgs(rest, GIT_DEST_VALUES['merge-file']);
+    return operands.length ? [operands[0]] : [];
+  }
+  return [];
 }
 
 /** node's --test-reporter-destination (also after a package script's "--"): the file it writes, unless stdout or stderr. */
@@ -2390,6 +2456,16 @@ function gitRecordsMove(sub, args, at, base) {
   if (sub !== 'init' && sub !== 'clone') return null;
   if (args.some(a => longIs(a, ['separate-git-dir']))) return ask(R.gitSeparate);
   if (sub !== 'init') return null;
+  const dirs = initDirs(args);
+  for (const d of dirs.length ? dirs : ['.']) {
+    const r = resolveReal(d, at);
+    if (r.ok && r.exists && initsElsewhere(r.real, base)) return ask(R.gitInitAgain, 'outside');
+  }
+  return null;
+}
+
+/** The folders git init names: its words that are no option or an option's value (none: the folder it runs in). */
+function initDirs(args) {
   const dirs = [];
   for (let k = 0; k < args.length; k++) {
     const a = args[k];
@@ -2404,11 +2480,7 @@ function gitRecordsMove(sub, args, at, base) {
     }
     dirs.push(a);
   }
-  for (const d of dirs.length ? dirs : ['.']) {
-    const r = resolveReal(d, at);
-    if (r.ok && r.exists && initsElsewhere(r.real, base)) return ask(R.gitInitAgain, 'outside');
-  }
-  return null;
+  return dirs;
 }
 
 /** Whether git init in folder `dir` would set up records outside it: its .git is a file (pointing anywhere) or leads out. */

@@ -1610,6 +1610,15 @@ test('with full permissions on, a step that would write into Claude Code’s own
     bash('rm -rf .'), bash('rm -rf ..'),
     // inside another command, behind sudo or timeout, and in the background
     bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), bash('sudo rm -rf .claude'), bash('timeout 5 rm -rf .claude'), monitor({ command: 'rm -rf .claude' }),
+    // GNU sed's -i takes no word of its own: the file after it is a file, even one that could be BSD's backup extension
+    bash('sed -e s/a/b/ -i .mcp.json'),
+    // git that makes a folder or writes files where it is told: clone, worktree add, init, submodule add, checkout-index, merge-file
+    bash('git clone https://example.com/x .claude/skills/x'), bash('git clone https://example.com/owner/.claude'), bash('git worktree add .claude/wt'),
+    bash('git init .claude/x'), bash('git submodule add https://example.com/x .claude/x'), bash('git checkout-index -a --prefix=.claude/'),
+    bash('git merge-file .claude/settings.json a.txt b.txt'),
+    // patch, the compressors, which replace the file they are given, and zip's archive
+    bash('patch .claude/settings.json fix.diff'), bash('patch -d .claude -p1 -i fix.diff'), bash('gzip .claude/settings.json'), bash('zip -r .claude/backup.zip src'),
+    bash('zstd README.md -o .mcp.json'),
   ];
   refusedWith(rows, FLOOR_REASON);
   for (const row of rows) {
@@ -1634,6 +1643,10 @@ test('with full permissions on, reading Claude Code’s settings, mentioning the
     bash('bash .claude/hooks/check.sh'), bash('source .claude/env.sh'), bash('tar -xzf build.tgz -C build'), bash('find .claude -name "*.json" > list.txt'),
     bash('python3 -c "print(1)" > out.txt'), bash("awk -F, '{print $1}' .claude/x.csv > cols.txt"), bash('npx prettier --check .claude/settings.json'),
     bash('echo $(cat .claude/settings.json) > /tmp/settings.txt'), bash('node --test 2>&1 | grep .claude'), bash('python3 --version && cat .claude/settings.json'),
+    // git, sed, patch and the compressors that write elsewhere, or only to their output
+    bash('git clone https://example.com/owner/repo.git'), bash('git worktree add ../wt-feature'), bash('git merge-file -p .claude/settings.json a.txt b.txt > merged.json'),
+    bash("sed -i .bak 's/.claude/.config/' README.md"), bash('gzip -c .claude/settings.json > /tmp/settings.json.gz'), bash('zip -r /tmp/cfg.zip .claude'),
+    bash('patch -p1 -i fix.diff'), bash('X=build; rm -rf "$X"'), bash('rm -rf "$TMPDIR/build"'),
     // reading them, and names that only look like them
     bash('cat .claude/settings.json | head -5'), bash('grep -r hooks .claude | wc -l'), bash('cat ~/.claude/settings.json'),
     bash('ls -la ~/.claude && echo done'), bash('git log -- .claude/settings.json | head'),
@@ -1658,9 +1671,11 @@ test('with full permissions on, an edit, a command or a tool whose landing place
   // a path that cannot be resolved but names them is refused for what it names
   refusedWith([{ tool: 'Write', input: { file_path: '~nobody/.claude/settings.json' } }, { tool: 'Write', input: { file_path: 'missing/../.claude/settings.json' } }],
     FLOOR_REASON, inEdge);
-  // commands, and a value another command fills in cutting the word a command writes to
+  // commands, a value another command fills in cutting the word a command writes to, and a name a variable carries to a
+  // command that writes, in a line that names them
   refusedWith([bash('echo x > missing/../notes.md'), bash('touch ~nobody/x'), bash('cp a.txt chain/c0'), bash('rm loopA/x'),
-    bash('cp a.txt "$(pwd)/.claude/settings.json"'), bash('echo hi > "$(git rev-parse --show-toplevel)/.mcp.json"')], WRITE_UNCLEAR, inEdge);
+    bash('cp a.txt "$(pwd)/.claude/settings.json"'), bash('echo hi > "$(git rev-parse --show-toplevel)/.mcp.json"'),
+    bash('X=.claude; rm -rf "$X"'), bash('for d in .claude .mcp.json; do rm -rf "$d"; done'), bash('cp .claude/settings.json "$BACKUP"')], WRITE_UNCLEAR, inEdge);
   // tools of other services
   refusedWith([{ tool: 'mcp__fs__write_file', input: { path: 'missing/../x' } }, { tool: 'mcp__fs__write_file', input: { path: 'chain/c0' } }], TOOL_UNCLEAR, inEdge);
   // without full permissions, these ask
