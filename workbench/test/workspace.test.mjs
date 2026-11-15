@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   prepareRepo, createWorkspace, removeWorkspace, diffStats, readRepoConfig, normalizeConfig, slugify, workspacesFolder,
-  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp,
+  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp, fillWorkspace,
 } from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
 
@@ -2458,6 +2458,426 @@ test('Workbench’s own git never works in the temporary folder, where another p
   assert.ok(lines.some(l => l.startsWith(`worktree ${own}${path.sep}workbench-ignore-`)), 'the rules it started from were read in a folder of its own');
   assert.equal(fs.statSync(own).mode & 0o777, 0o700);
   assert.deepEqual(fs.readdirSync(own).filter(f => f.startsWith('workbench-')), []);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Filling a new workspace (fillWorkspace): the ignored files an agent's copy needs, from the person's folder.
+
+/** Write `files` under `dir`; a value { link: target } makes a link. */
+function put(dir, files) {
+  for (const [f, v] of Object.entries(files)) {
+    const file = path.join(dir, f);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (v && typeof v === 'object') fs.symlinkSync(v.link, file);
+    else fs.writeFileSync(file, v);
+  }
+}
+
+/**
+ * A repository whose one commit holds `tracked` (its .gitignore among them; `forced` are added with -f), then
+ * `untracked` written in the person's folder only, and an agent's folder made from the commit. `agent()` makes another.
+ */
+let fillRepos = 0;
+async function fillRepo(tracked, untracked = {}, { forced = [] } = {}) {
+  const n = ++fillRepos;
+  const r = path.join(T, `fill-${n}`);
+  fs.mkdirSync(r);
+  git(r, 'init', '-q', '-b', 'main');
+  put(r, tracked);
+  git(r, 'add', '-A');
+  if (forced.length) git(r, 'add', '-f', '--', ...forced);
+  git(r, 'commit', '-q', '-m', 'first');
+  put(r, untracked);
+  const root = fs.realpathSync.native(r);
+  let agents = 0;
+  const agent = async () => (await createWorkspace({ repoRoot: root, agentId: `fill${n}x${++agents}`, slug: 'fill', baseDir })).path;
+  const ws = await agent();
+  return { root, ws, agent, p: f => path.join(root, f), w: f => path.join(ws, f) };
+}
+
+/**
+ * cp as a stand-in for fillWorkspace: each call is noted ({ file, args, timeout }); `act` may make something and throw,
+ * as a cp that fails part-way; otherwise the copy is made with Node, the way cp makes it: links as links, modes kept.
+ */
+function cpStandIn(act) {
+  const calls = [];
+  const copy = async (file, args, { timeout } = {}) => {
+    calls.push({ file, args: [...args], timeout });
+    const [src, dst] = args.slice(-2);
+    await act?.({ file, args, src, dst });
+    fs.cpSync(src, dst, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, errorOnExist: true, force: false });
+    return { code: 0, stderr: '' };
+  };
+  return { calls, copy };
+}
+
+/** An error the way execFile gives one for a cp that failed: its exit code (or how it was stopped) and its words. */
+const cpError = (stderr, more = {}) => Object.assign(new Error(`Command failed\n${stderr}`), { code: 1, killed: false, signal: null, stderr, ...more });
+const readText = f => fs.readFileSync(f, 'utf8');
+const present = f => { try { fs.lstatSync(f); return true; } catch { return false; } };
+const modeOf = f => fs.statSync(f).mode & 0o777;
+const pathsOf = list => list.map(e => e.path);
+
+// Each has repositories of its own, and none changes process.env, so they run a few at a time.
+describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
+  test('by default it copies the .env files and node_modules folders git ignores, at any depth, and leaves out a tracked .env.example', async () => {
+    const t = await fillRepo({
+      '.gitignore': '.env\n.env.*\n!.env.example\n.envrc\nnode_modules/\n/secrets/\n.vercel\n/build/\n',
+      '.env.example': 'EXAMPLE=committed\n',
+      'package.json': '{}\n',
+      'packages/a/package.json': '{}\n',
+      'packages/b/package.json': '{}\n',
+      'src/index.js': 'x\n',
+      'tools/run.py': 'x\n',
+    }, {
+      '.env': 'ROOT=1\n',
+      '.env.local': 'LOCAL=1\n',
+      '.env.example': 'EXAMPLE=edited\n', // the person's change to a tracked file
+      '.envrc': 'use node\n',
+      'packages/a/.env.development.local': 'A=1\n',
+      'packages/a/node_modules/y/index.js': 'y\n',
+      'node_modules/foo/index.js': 'foo\n',
+      'node_modules/foo/.env': 'PACKAGE=1\n', // a package's own: it comes with node_modules, never on its own
+      'node_modules/foo/node_modules/bar/index.js': 'bar\n', // comes with the outer node_modules
+      'node_modules/.bin/foo': { link: '../foo/index.js' },
+      'secrets/.env': 'SECRET=1\n', // in a folder git ignores as a whole
+      'secrets/key.pem': 'key\n',
+      '.vercel/.env.development.local': 'V=1\n',
+      '.vercel/project.json': '{}\n',
+      'src/sub/.env.test': 'T=1\n', // a folder holding only ignored files: git lists the folder and the file
+      'tools/.env/pyvenv.cfg': 'home = /usr/bin\n', // a virtualenv named .env: a folder, never an env file
+      'tools/.env/lib/site/.env': 'IN_VENV=1\n',
+      'build/nested/.env': 'NESTED=1\n', // inside another repository (made below)
+    });
+    git(t.p('build/nested'), 'init', '-q');
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cpStandIn().copy });
+    const as = (kind, paths) => paths.map(p => ({ path: p, kind, cloned: true }));
+    assert.deepEqual(r.copied, [
+      ...as('env', ['.env', '.env.local', '.envrc', '.vercel/.env.development.local']),
+      ...as('deps', ['node_modules']),
+      ...as('env', ['packages/a/.env.development.local']),
+      ...as('deps', ['packages/a/node_modules']),
+      ...as('env', ['secrets/.env', 'src/sub/.env.test']),
+    ]);
+    assert.deepEqual(r.skipped, []);
+    assert.ok(Number.isInteger(r.ms) && r.ms >= 0);
+    assert.equal(readText(t.w('.env')), 'ROOT=1\n');
+    assert.equal(readText(t.w('secrets/.env')), 'SECRET=1\n');
+    assert.equal(readText(t.w('packages/a/node_modules/y/index.js')), 'y\n');
+    assert.equal(readText(t.w('node_modules/foo/node_modules/bar/index.js')), 'bar\n');
+    assert.equal(readText(t.w('node_modules/foo/.env')), 'PACKAGE=1\n');
+    assert.equal(fs.readlinkSync(t.w('node_modules/.bin/foo')), '../foo/index.js');
+    assert.equal(readText(t.w('.env.example')), 'EXAMPLE=committed\n', 'a tracked file is the agent’s own, as committed');
+    for (const f of ['secrets/key.pem', '.vercel/project.json', 'tools/.env', 'build']) assert.equal(present(t.w(f)), false, f);
+  });
+
+  test('a .worktreeinclude chooses instead: the ignored paths it matches, with negations, nested paths and folders git ignores as a whole', async () => {
+    const t = await fillRepo({
+      '.gitignore': '.env\n.env.*\nnode_modules/\n/data/\n/secrets/\nconfig/*.json\n!config/public.json\n*.log\n',
+      '.worktreeinclude': ['# what the app reads', '.env*', '!.env.test', 'config/*.json', 'data/*', '!data/big/', 'secrets/', '*.log', '!logs/keep.log', ''].join('\n'),
+      'config/public.json': '{}\n',
+      'config/app.yml': 'a: 1\n',
+      'secrets/README.md': 'committed\n', // tracked inside an ignored folder: git then lists that folder file by file
+      'src/index.js': 'x\n',
+    }, {
+      '.env': 'E=1\n',
+      '.env.test': 'T=1\n',
+      'src/sub/.env.local': 'S=1\n',
+      'config/secret.json': '{"k":1}\n',
+      'config/local.yml': 'not ignored\n',
+      'data/a.json': '[]\n',
+      'data/b.csv': 'b\n',
+      'data/big/blob.bin': 'big\n',
+      'secrets/README.md': 'changed by the person\n',
+      'secrets/.env': 'S=1\n',
+      'secrets/deep/key.pem': 'key\n',
+      'logs/a.log': 'a\n',
+      'logs/keep.log': 'k\n',
+      'node_modules/x/index.js': 'x\n',
+      'node_modules/x/.env.example': 'X=1\n', // a package's own, which .env* matches too, as in git
+    }, { forced: ['secrets/README.md'] });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cpStandIn().copy });
+    // data/ is one entry in git's list of what it ignores, and file by file in what .worktreeinclude matches; src/sub/
+    // holds only matching files, so both lists name it whole, and it is copied as one.
+    assert.deepEqual(pathsOf(r.copied), ['.env', 'config/secret.json', 'data/a.json', 'data/b.csv', 'logs/a.log', 'node_modules/x/.env.example',
+      'secrets/.env', 'secrets/deep', 'src/sub']);
+    assert.ok(r.copied.every(e => e.kind === 'listed' && e.cloned === true));
+    assert.deepEqual(r.skipped, []);
+    assert.equal(readText(t.w('secrets/deep/key.pem')), 'key\n');
+    assert.equal(readText(t.w('src/sub/.env.local')), 'S=1\n');
+    assert.equal(readText(t.w('secrets/README.md')), 'committed\n');
+    for (const f of ['.env.test', 'data/big', 'logs/keep.log', 'config/local.yml', 'node_modules/x/index.js']) assert.equal(present(t.w(f)), false, f);
+    // With node_modules/ listed too, it is one entry, whole.
+    fs.appendFileSync(t.p('.worktreeinclude'), 'node_modules/\n');
+    const ws2 = await t.agent();
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: ws2, platform: 'darwin', copy: cpStandIn().copy });
+    assert.deepEqual(pathsOf(r2.copied).filter(p => p.startsWith('node_modules')), ['node_modules']);
+    assert.equal(readText(path.join(ws2, 'node_modules/x/index.js')), 'x\n');
+  });
+
+  test('an empty .worktreeinclude copies nothing; one that is a link is never read, and the default applies', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\nnode_modules/\n', '.worktreeinclude': '' },
+      { '.env': 'E=1\n', 'node_modules/x/index.js': 'x\n', 'include.txt': '.env\n' });
+    const cp = cpStandIn();
+    const fill = () => fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    for (const text of ['', '# nothing yet\n\n']) {
+      fs.writeFileSync(t.p('.worktreeinclude'), text);
+      const r = await fill();
+      assert.deepEqual([r.copied, r.skipped], [[], []]);
+    }
+    assert.equal(cp.calls.length, 0);
+    fs.rmSync(t.p('.worktreeinclude'));
+    fs.symlinkSync('include.txt', t.p('.worktreeinclude'));
+    assert.deepEqual((await fill()).copied.map(e => [e.path, e.kind]), [['.env', 'env'], ['node_modules', 'deps']]);
+  });
+
+  test('virtualenvs are never copied by default; one .worktreeinclude names is copied, and listed in skipped as a venv', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\n.venv/\nvenv/\n/envs/\n', 'tools/run.py': 'x\n' }, {
+      '.env': 'E=1\n',
+      '.venv/pyvenv.cfg': 'home = /usr/bin\n',
+      '.venv/bin/python': { link: '/usr/bin/python3' },
+      'venv/pyvenv.cfg': 'home = /usr/bin\n',
+      'envs/py311/pyvenv.cfg': 'home = /usr/bin\n', // a virtualenv by what it holds
+      'envs/py311/lib/x.py': 'x\n',
+      'tools/.env/pyvenv.cfg': 'home = /usr/bin\n',
+    });
+    const fill = ws => fillWorkspace({ repoRoot: t.root, path: ws, platform: 'darwin', copy: cpStandIn().copy });
+    const r = await fill(t.ws);
+    assert.deepEqual(r.copied, [{ path: '.env', kind: 'env', cloned: true }]);
+    assert.deepEqual(r.skipped, []);
+    for (const f of ['.venv', 'venv', 'envs', 'tools/.env']) assert.equal(present(t.w(f)), false, f);
+
+    fs.writeFileSync(t.p('.worktreeinclude'), '.env\n.venv/\nenvs/py311/\ntools/.env/\n');
+    const ws2 = await t.agent();
+    const r2 = await fill(ws2);
+    // envs/ holds nothing but the virtualenv it names, so envs/ is copied whole; the virtualenv is still named.
+    assert.deepEqual(r2.copied.map(e => [e.path, e.kind]), [['.env', 'listed'], ['.venv', 'listed'], ['envs', 'listed'], ['tools/.env', 'listed']]);
+    assert.deepEqual(r2.skipped, ['.venv', 'envs/py311', 'tools/.env'].map(p => ({ path: p, why: 'venv' })));
+    assert.equal(fs.readlinkSync(path.join(ws2, '.venv/bin/python')), '/usr/bin/python3', 'inside a folder copied whole, as it is');
+    assert.equal(readText(path.join(ws2, 'envs/py311/lib/x.py')), 'x\n');
+  });
+
+  test('a link that points inside the person’s folder is copied as a link; one that points outside is not', async () => {
+    const outside = path.join(T, 'fill-outside.env');
+    fs.writeFileSync(outside, 'OUTSIDE=1\n');
+    const elsewhere = fs.mkdtempSync(path.join(T, 'fill-elsewhere-'));
+    const t = await fillRepo({ '.gitignore': '.env*\n/lnk\n', 'config/dev.env': 'DEV=1\n' }, {
+      '.env': { link: 'config/dev.env' },
+      '.env.dangling': { link: 'missing/dev.env' }, // leads nowhere yet, inside
+      '.env.local': { link: outside },
+      '.env.up': { link: '../fill-outside.env' },
+      'lnk': { link: elsewhere },
+      '.env.through': { link: 'lnk/dev.env' }, // inside as written, outside once lnk is followed
+    });
+    // Absolute, even into the person's folder: its copy would point there, never into the agent's folder.
+    fs.symlinkSync(t.p('config/dev.env'), t.p('.env.abs'));
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws }); // the real cp, on this computer
+    assert.deepEqual(r.copied.map(e => [e.path, e.kind]), [['.env', 'env'], ['.env.dangling', 'env']]);
+    assert.deepEqual(r.skipped, ['.env.abs', '.env.local', '.env.through', '.env.up'].map(p => ({ path: p, why: 'link-outside' })));
+    assert.equal(fs.readlinkSync(t.w('.env')), 'config/dev.env');
+    assert.equal(readText(t.w('.env')), 'DEV=1\n', 'it leads to the agent’s own copy of the tracked file');
+    assert.equal(fs.readlinkSync(t.w('.env.dangling')), 'missing/dev.env');
+    for (const f of ['.env.abs', '.env.local', '.env.through', '.env.up']) assert.equal(present(t.w(f)), false, f);
+    assert.equal(readText(outside), 'OUTSIDE=1\n');
+  });
+
+  test('nothing already in the agent’s folder is replaced, and nothing is written through a link there', async () => {
+    const t = await fillRepo({
+      '.gitignore': '.env*\nnode_modules/\n',
+      'shared/readme.md': 'shared\n',
+      'conf': { link: 'shared' },
+      '.env.shared': 'COMMITTED=1\n',
+    }, {}, { forced: ['.env.shared'] });
+    // In the person's folder: .env.shared is no longer tracked (the commit still holds it), and conf became a folder.
+    git(t.root, 'rm', '-q', '--cached', '.env.shared');
+    fs.writeFileSync(t.p('.env.shared'), 'PERSON=1\n');
+    fs.rmSync(t.p('conf'));
+    put(t.root, { 'conf/.env': 'CONF=1\n', '.env': 'PERSON=1\n', '.env.local': 'LOCAL=1\n', 'node_modules/x/index.js': 'x\n' });
+    // In the agent's folder: a .env and a node_modules of its own (a post-checkout hook may make them).
+    put(t.ws, { '.env': 'AGENT=1\n', 'node_modules/keep.txt': 'kept\n' });
+    const cp = cpStandIn();
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    assert.deepEqual(r.copied, [{ path: '.env.local', kind: 'env', cloned: true }]);
+    assert.deepEqual(r.skipped, ['.env', '.env.shared', 'conf/.env', 'node_modules'].map(p => ({ path: p, why: 'exists' })));
+    assert.deepEqual(cp.calls.map(c => c.args.at(-1)), [t.w('.env.local')]);
+    assert.equal(readText(t.w('.env')), 'AGENT=1\n');
+    assert.equal(readText(t.w('.env.shared')), 'COMMITTED=1\n');
+    assert.equal(fs.readlinkSync(t.w('conf')), 'shared');
+    assert.equal(present(t.w('shared/.env')), false);
+    assert.deepEqual(fs.readdirSync(t.w('node_modules')), ['keep.txt']);
+  });
+
+  test('each file keeps its mode: a 0600 .env stays 0600', async () => {
+    const t = await fillRepo({ '.gitignore': '.env*\n.envrc\n' }, { '.env': 'A=1\n', '.env.local': 'B=1\n', '.envrc': 'C=1\n', 'cfg/.env.test': 'D=1\n' });
+    const modes = { '.env': 0o600, '.env.local': 0o640, '.envrc': 0o755, 'cfg/.env.test': 0o400 };
+    for (const [f, m] of Object.entries(modes)) fs.chmodSync(t.p(f), m);
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws }); // the real cp, on this computer
+    assert.deepEqual(pathsOf(r.copied), Object.keys(modes).sort());
+    for (const [f, m] of Object.entries(modes)) {
+      assert.equal(modeOf(t.w(f)), m, f);
+      assert.equal(readText(t.w(f)), readText(t.p(f)), f);
+    }
+  });
+
+  const SMALL = [{ '.gitignore': '.env*\nnode_modules/\n', 'packages/a/package.json': '{}\n' },
+    { '.env': 'E=1\n', 'node_modules/x/index.js': 'x\n', 'packages/a/node_modules/y/index.js': 'y\n' }];
+
+  test('on a Mac each entry is cloned by /bin/cp -c -R -p, given as an argument array, within five minutes', async () => {
+    const t = await fillRepo(...SMALL);
+    const cp = cpStandIn();
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    assert.deepEqual(r.copied.map(e => [e.path, e.cloned]), [['.env', true], ['node_modules', true], ['packages/a/node_modules', true]]);
+    const calls = [...cp.calls].sort((a, b) => (a.args.at(-1) < b.args.at(-1) ? -1 : 1));
+    assert.deepEqual(calls.map(c => [c.file, c.args]),
+      ['.env', 'node_modules', 'packages/a/node_modules'].map(p => ['/bin/cp', ['-c', '-R', '-p', t.p(p), t.w(p)]]));
+    for (const c of calls) assert.ok(c.timeout > 0 && c.timeout <= 5 * 60_000, String(c.timeout));
+  });
+
+  test('on a Mac, where cp -c cannot clone (another volume), a file is copied plainly and a folder is left out', async () => {
+    const t = await fillRepo(...SMALL);
+    const cp = cpStandIn(({ args, dst }) => {
+      if (args[0] !== '-c') return;
+      if (path.basename(dst) === 'node_modules') {
+        // cp makes the folders, then fails once for every file: more words than execFile keeps, so it is stopped.
+        fs.mkdirSync(path.join(dst, 'x'), { recursive: true });
+        const said = `cp: ${dst}/x/index.js: clonefile failed: Cross-device link\n`.repeat(3000);
+        throw Object.assign(new RangeError('stderr maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', stderr: said });
+      }
+      throw cpError(`cp: ${dst}: clonefile failed: Cross-device link\n`);
+    });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    assert.deepEqual(r.copied, [{ path: '.env', kind: 'env', cloned: false }]);
+    assert.deepEqual(r.skipped, [{ path: 'node_modules', why: 'noclone' }, { path: 'packages/a/node_modules', why: 'noclone' }]);
+    assert.ok(cp.calls.some(c => c.file === '/bin/cp' && c.args.join('\n') === ['-R', '-p', t.p('.env'), t.w('.env')].join('\n')), 'a plain copy');
+    assert.ok(!cp.calls.some(c => c.args[0] !== '-c' && c.args.at(-1).endsWith('node_modules')), 'a folder is never copied in full');
+    assert.equal(readText(t.w('.env')), 'E=1\n');
+    assert.equal(present(t.w('node_modules')), false, 'the half-made copy is gone');
+    assert.equal(present(t.w('packages/a/node_modules')), false);
+  });
+
+  test('on a Mac, the clones are really made: every file, links as links, modes kept', { skip: process.platform !== 'darwin' && 'cp -c is the Mac’s' }, async () => {
+    const files = { '.env': 'TOKEN=1\n', '.env.local': { link: '.env' }, 'node_modules/.bin/tool': { link: '../pkg0/lib/f0.js' } };
+    for (let i = 0; i < 40; i++) files[`node_modules/pkg${i % 8}/lib/f${i}.js`] = `module.exports = ${i};\n`;
+    const t = await fillRepo({ '.gitignore': '.env*\nnode_modules/\n' }, files);
+    fs.chmodSync(t.p('.env'), 0o600);
+    fs.chmodSync(t.p('node_modules/pkg1/lib/f1.js'), 0o755);
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws });
+    assert.deepEqual(r.copied, [['.env', 'env'], ['.env.local', 'env'], ['node_modules', 'deps']].map(([p, kind]) => ({ path: p, kind, cloned: true })));
+    assert.deepEqual(r.skipped, []);
+    assert.deepEqual(folderPrint(t.w('node_modules')), folderPrint(t.p('node_modules')));
+    assert.equal(fs.readlinkSync(t.w('node_modules/.bin/tool')), '../pkg0/lib/f0.js');
+    assert.equal(fs.readlinkSync(t.w('.env.local')), '.env');
+    assert.equal(modeOf(t.w('.env')), 0o600);
+    assert.equal(modeOf(t.w('node_modules/pkg1/lib/f1.js')), 0o755);
+  });
+
+  test('on Linux an env file is copied with --reflink=auto, and node_modules only as a clone: where there are none, it is left out', async () => {
+    const t = await fillRepo(SMALL[0], { ...SMALL[1], '.env.local': 'L=1\n' });
+    const ext4 = cpStandIn(({ args, src, dst }) => {
+      if (!args.includes('--reflink=always')) return;
+      fs.mkdirSync(dst); // cp makes the folder, then cannot clone a file into it
+      throw cpError(`cp: failed to clone '${dst}/x/index.js' from '${src}/x/index.js': Operation not supported\n`);
+    });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'linux', copy: ext4.copy });
+    assert.deepEqual(r.copied, [{ path: '.env', kind: 'env', cloned: false }, { path: '.env.local', kind: 'env', cloned: false }]);
+    assert.deepEqual(r.skipped, [{ path: 'node_modules', why: 'noclone' }, { path: 'packages/a/node_modules', why: 'noclone' }]);
+    for (const c of ext4.calls) {
+      assert.ok(['/bin/cp', 'cp'].includes(c.file), c.file);
+      const p = path.relative(t.ws, c.args.at(-1));
+      assert.deepEqual(c.args, ['-a', p.endsWith('node_modules') ? '--reflink=always' : '--reflink=auto', t.p(p), t.w(p)]);
+    }
+    assert.equal(present(t.w('node_modules')), false, 'the half-made copy is gone');
+    assert.equal(present(t.w('packages/a/node_modules')), false);
+    // Where the disk makes clones (btrfs, XFS), node_modules is one.
+    const ws2 = await t.agent();
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: ws2, platform: 'linux', copy: cpStandIn().copy });
+    assert.deepEqual(r2.copied.map(e => [e.path, e.cloned]), [['.env', false], ['.env.local', false], ['node_modules', true], ['packages/a/node_modules', true]]);
+    assert.equal(readText(path.join(ws2, 'packages/a/node_modules/y/index.js')), 'y\n');
+  });
+
+  test('an entry that fails is left out and its half-made copy removed; the others are still copied', async () => {
+    const t = await fillRepo({ '.gitignore': '.env*\n.envrc\nnode_modules/\n', 'packages/a/package.json': '{}\n' }, {
+      '.env': 'E=1\n', '.env.local': 'L=1\n', '.envrc': 'R=1\n', 'src/.env': 'S=1\n',
+      'node_modules/x/index.js': 'x\n', 'packages/a/node_modules/y/index.js': 'y\n',
+    });
+    const cp = cpStandIn(({ dst }) => {
+      if (dst.endsWith('.env.local')) throw cpError(`cp: ${dst}: Permission denied\n`);
+      if (dst === t.w('packages/a/node_modules')) {
+        fs.mkdirSync(path.join(dst, 'y'), { recursive: true }); // stopped part-way by its time limit
+        throw cpError('', { code: null, killed: true, signal: 'SIGTERM' });
+      }
+    });
+    const copy = (file, args, o) => {
+      if (args.at(-1).endsWith('.envrc')) throw new Error('cp could not be started'); // thrown at once, not a rejection
+      return cp.copy(file, args, o);
+    };
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy });
+    assert.deepEqual(pathsOf(r.copied), ['.env', 'node_modules', 'src/.env']);
+    assert.deepEqual(r.skipped, ['.env.local', '.envrc', 'packages/a/node_modules'].map(p => ({ path: p, why: 'failed' })));
+    for (const f of ['.env.local', '.envrc', 'packages/a/node_modules']) assert.equal(present(t.w(f)), false, f);
+    assert.equal(readText(t.w('src/.env')), 'S=1\n');
+    assert.equal(readText(t.w('node_modules/x/index.js')), 'x\n');
+  });
+
+  test('when git cannot list the folder, or .worktreeinclude cannot be read, nothing is copied, and skipped says so', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\n' }, { '.env': 'E=1\n' });
+    const cp = cpStandIn();
+    const broken = async () => { throw Object.assign(new Error('Command failed'), { code: 128, stderr: 'fatal: not a git repository' }); };
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy, run: broken });
+    assert.deepEqual([r.copied, r.skipped], [[], [{ path: '.', why: 'failed' }]]);
+    fs.writeFileSync(t.p('.worktreeinclude'), `.env\n${'#'.repeat(300 * 1024)}\n`); // far too big for a list of patterns
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    assert.deepEqual([r2.copied, r2.skipped], [[], [{ path: '.worktreeinclude', why: 'failed' }]]);
+    assert.equal(cp.calls.length, 0);
+    assert.equal(present(t.w('.env')), false);
+  });
+
+  test('.git and tracked files are never touched, even when .worktreeinclude names everything', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\n*.log\n', 'a.txt': 'committed\n', '.env.example': 'X=committed\n', '.worktreeinclude': '*\n.git\n.git/\n**/.git/**\n' },
+      { 'a.txt': 'changed by the person\n', '.env': 'E=1\n', 'debug.log': 'log\n', 'new.txt': 'new, not ignored\n' });
+    const dotGit = fs.readFileSync(t.w('.git'));
+    const person = () => ({ head: git(t.root, 'rev-parse', 'HEAD'), refs: git(t.root, 'for-each-ref'), index: sha(fs.readFileSync(t.p('.git/index'))), config: readText(t.p('.git/config')) });
+    const before = person();
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws }); // the real cp, on this computer
+    assert.deepEqual(r.copied.map(e => [e.path, e.kind]), [['.env', 'listed'], ['debug.log', 'listed']]);
+    assert.deepEqual(r.skipped, []);
+    assert.deepEqual(fs.readFileSync(t.w('.git')), dotGit);
+    assert.equal(readText(t.w('a.txt')), 'committed\n');
+    assert.equal(present(t.w('new.txt')), false);
+    assert.equal(statusOf(t.ws), '', 'what was copied is ignored there too');
+    assert.deepEqual(person(), before);
+    // By default as well: only .env, and the tracked .env.example as committed.
+    fs.rmSync(t.p('.worktreeinclude'));
+    const ws2 = await t.agent();
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: ws2 });
+    assert.deepEqual(pathsOf(r2.copied), ['.env']);
+    assert.equal(readText(path.join(ws2, '.env.example')), 'X=committed\n');
+    assert.equal(readText(path.join(ws2, 'a.txt')), 'committed\n');
+  });
+
+  test('the whole fill has a time limit: a copy still going then is stopped, and one not started is left out', async () => {
+    const t = await fillRepo({ '.gitignore': '.env*\n' }, Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`.env.${i}`, `N=${i}\n`])));
+    const limits = [];
+    const copy = (file, args, { timeout }) => new Promise((_, reject) => {
+      limits.push(timeout);
+      setTimeout(() => reject(cpError('', { code: null, killed: true, signal: 'SIGTERM' })), timeout); // as execFile's limit stops cp
+    });
+    const started = Date.now();
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy, timeoutMs: 300 });
+    assert.deepEqual(r.copied, []);
+    assert.deepEqual(r.skipped.map(s => s.why), Array(12).fill('failed'));
+    assert.ok(limits.length <= 8 && limits.every(ms => ms > 0 && ms <= 300), String(limits));
+    assert.ok(Date.now() - started < 5000);
+    assert.deepEqual(fs.readdirSync(t.ws).filter(f => f.startsWith('.env')), []);
+  });
+
+  test('fillWorkspace refuses what is not a workspace folder', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\n' }, { '.env': 'E=1\n' });
+    await assert.rejects(fillWorkspace({ repoRoot: t.root, path: 'relative/folder' }), /No workspace folder was given/);
+    await assert.rejects(fillWorkspace({ repoRoot: t.root, path: path.join(T, 'no-such-folder') }), /No workspace folder was given/);
+    await assert.rejects(fillWorkspace({ repoRoot: t.root, path: t.root }), /main folder of the repository/);
+    await assert.rejects(fillWorkspace({ repoRoot: path.join(T, 'no-such-repo'), path: t.ws }), /does not exist/);
+  });
 });
 
 test('nothing is left behind in the temporary folder, or in Workbench’s own private one', () => {
