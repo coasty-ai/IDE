@@ -3858,7 +3858,9 @@ test('repository: a workspace module that cannot tell who commits leaves identit
 test('words not caught say what to type; while a permission waits in the centre, they say so; a no keeps its “don’t”', async () => {
   const t = live();
   t.engine.deps.commands = commands;
-  assert.equal((await t.engine.command('ok')).reply, 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.');
+  // An agent named with nothing to say is still not caught; a bare "ok" is an acknowledgement now (see "any prompt" below).
+  assert.equal((await t.engine.command('codex')).reply, 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.');
+  assert.equal((await t.engine.command('ok')).reply, 'OK.');
   const { id } = await started(t);
   const pending = t.engine.hookPreToolUse(id, rootPayload);
   await until(() => t.store.get(id).ask);
@@ -3871,5 +3873,44 @@ test('words not caught say what to type; while a permission waits in the centre,
   const out = await pending;
   assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
   assert.equal(out.hookSpecificOutput.permissionDecisionReason, "The person said no, and added: don't use the production database");
+  await t.engine.shutdown();
+});
+
+test('any prompt: words that are no command, and commands that name no agent, get a launch card; bare acknowledgements a word back', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  // Questions to the agent and words that name no agent: the same launch card as any task, asked first.
+  for (const said of ['who are you', 'what model are you', 'discard the old migrations folder', 'forget about the old api and use v2',
+    'status of the repo', 'what needs me to approve this PR?', 'stop the old cron job', 'merge the feature branch', 'readme']) {
+    const out = await t.engine.command(said);
+    assert.equal(out.confirm?.kind, 'start', `${said}: ${out.reply}`);
+    assert.equal(out.reply, `Start Claude on “${said}”${said.endsWith('?') ? '' : '?'}`);
+  }
+  assert.equal(t.claude.runners.length, 0, 'asked first: nothing started');
+  // Bare acknowledgements start nothing and get a word back, also as a notice.
+  const before = t.notices.length;
+  assert.deepEqual(await t.engine.command('thanks'), { reply: 'You’re welcome.' });
+  assert.deepEqual(await t.engine.command('great job on the parser'), { reply: 'You’re welcome.' });
+  assert.deepEqual(await t.engine.command('ok'), { reply: 'OK.' });
+  assert.deepEqual(await t.engine.command('cool'), { reply: 'OK.' });
+  assert.deepEqual(await t.engine.command('never mind'), { reply: 'OK.' });
+  assert.deepEqual(await t.engine.command('yes'), { reply: 'There is nothing waiting for a yes or no.' });
+  assert.deepEqual(await t.engine.command('do it'), { reply: 'There is nothing waiting for a yes or no.' });
+  assert.deepEqual(t.notices.slice(before), ['You’re welcome.', 'You’re welcome.', 'OK.', 'OK.', 'OK.', 'There is nothing waiting for a yes or no.',
+    'There is nothing waiting for a yes or no.']);
+  // Help, the words kept for Full permissions mode, and an agent named alone start nothing either.
+  assert.equal((await t.engine.command('help')).reply, commands.HELP_REPLY);
+  for (const said of ['full permissions', 'ask first', 'codex']) assert.equal((await t.engine.command(said)).confirm, undefined, said);
+  // A card on screen keeps unrecognised words to itself, as before: it stays, and nothing new is proposed.
+  const card = await t.engine.command('who are you');
+  const kept = await t.engine.command('blorp', { confirmId: card.confirm.id });
+  assert.deepEqual(kept.confirm, card.confirm);
+  assert.equal(kept.reply, 'I did not catch that. Say “do it” to start it, or “cancel”.');
+  // A prompt of several lines: the card quotes one line, and the agent gets every line.
+  const prompt = 'The checkout page throws this:\nTypeError: Cannot read properties of undefined\n    at render (cart.js:12:5)';
+  const multi = await t.engine.command(prompt);
+  assert.equal(multi.reply, 'Start Claude on “The checkout page throws this: TypeError: Cannot read properties of undefined…”?');
+  assert.match((await t.engine.confirm(multi.confirm.id, true)).reply, /^Started /);
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), [prompt]);
   await t.engine.shutdown();
 });

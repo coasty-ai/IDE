@@ -91,6 +91,9 @@ const LOOKS_GOOD_RE = /^(looks good|look good|lgtm|great|thanks|thank you|good|f
 // The lid's "Not now" on work that can be merged: the agent stays as it is, and the reply does not sound like approval.
 const NOT_NOW_RE = /^not now[.!]*$/i;
 const HELP = 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.';
+// Bare acknowledgements with nothing waiting start nothing: a word back. A yes or a no hears that nothing waits for one.
+const WELCOME = 'You’re welcome.';
+const NOTHING_TO_ANSWER = 'There is nothing waiting for a yes or no.';
 // The answer to "help", "hi" or "what can you do": short enough for three lines under the DRAM on the narrowest board.
 const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
@@ -3519,6 +3522,9 @@ export class Engine extends EventEmitter {
       case 'connect':
         // "connect", "add a key", "sign in", "agents": the page opens Agents & keys.
         return { reply: CONNECT_REPLY, openConnect: true };
+      case 'ack':
+        // "thanks", "ok", "yes" with nothing waiting (the parser's ack): a word back, and nothing starts
+        return { reply: intent.thanks ? WELCOME : intent.reply ? NOTHING_TO_ANSWER : 'OK.' };
       case 'answer':
       case 'allow':
       case 'deny': {
@@ -3618,7 +3624,7 @@ export class Engine extends EventEmitter {
         return this._sleepIdle();
       case 'confirm': {
         // Only the card on screen: never "the latest one".
-        if (!shown) return { reply: 'There is nothing waiting for a yes or no.' };
+        if (!shown) return { reply: NOTHING_TO_ANSWER };
         const r = await this._confirm(shown.id, !!intent.go);
         // A typed or spoken yes that started agents puts the first one in the centre, so a second "yes" said out of
         // habit finds nothing to answer, rather than whatever asks next.
