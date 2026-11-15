@@ -45,6 +45,8 @@ export const setAsideList = () => Q.setAsideList(S.agents.values(), { later: S.l
 // git screen's detail (ui/gitscreen.js) uses the same rules for its Merge and Throw it away.
 const workCtx = () => ({ ACTIVE, meta: S.meta });
 export const { unmergedWork, workSettled, workKey, canReview } = Q;
+/** Settled work that finished again since, unseen (a merged agent asked for a change that brought nothing new): see queue.js. */
+export const finishedSinceSettled = a => Q.finishedSinceSettled(a, { reviewed: S.reviewed });
 /** Merge into the person's branch is offered: live mode, a root at rest, its folder there, a branch and an identity, unmerged work. */
 export const mergeApplies = a => Q.mergeApplies(a, workCtx());
 /** Throw it away is offered: live mode, a root whose work was not thrown away, with its branch or its folder still there. */

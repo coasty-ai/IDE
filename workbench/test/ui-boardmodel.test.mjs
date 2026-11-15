@@ -18,8 +18,9 @@ const agent = (id, state, o = {}) => ({ id, parentId: null, rootId: id, name: id
 const helper = (id, parent, state, o = {}) => agent(id, state, { parentId: parent, rootId: parent, ...o });
 const asking = (id, state = 'needs_ok') => ({ id: 'k-' + id, type: state === 'question' ? 'question' : 'permission', sentence: `${id} asks`, options: ['Allow', 'Deny'], createdAt: T - MIN });
 const W = (o = {}) => ({ branch: 'workbench/x', from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...o });
-const MERGED = { into: 'main', merge: 'abc1234abc1234abc1234abc1234abc1234abcd', at: T - 2 * MIN, files: 3, adds: 12, dels: 3 };
-const THROWN = { at: T - 2 * MIN, saved: 'refs/workbench/discarded/x' };
+// merged and thrown away after the agents finished (at T - MIN), as the person does: settled since that finish
+const MERGED = { into: 'main', merge: 'abc1234abc1234abc1234abc1234abc1234abcd', at: T - MIN / 2, files: 3, adds: 12, dels: 3 };
+const THROWN = { at: T - MIN / 2, saved: 'refs/workbench/discarded/x' };
 const files = n => ({ changed: n, adds: 4 * n, dels: n, list: [] });
 const model = (agents, { reviewed = new Set(), later = new Set() } = {}) => boardModel(agents, { ...STATES, reviewed, later });
 const ids = list => list.map(r => r.id);
@@ -218,4 +219,11 @@ test('an agent in the tray that is continued, told something or asked for a chan
   assert.deepEqual(ids(boardAndTray(model([busy]).roots, lanes, { laptop }).roots), ['M']);
   const changed = { ...m, state: 'done_claimed', endedAt: T + 9 * MIN, files: files(2) };
   assert.deepEqual(ids(boardAndTray(model([changed]).roots, lanes, { laptop }).roots), ['M']);
+  // asked for a change that brings nothing new: its work is all in still, but what it said has not been seen, so it
+  // stays at the edge until it is looked at
+  const same = { ...m, state: 'done_claimed', endedAt: T + 9 * MIN, files: files(0), says: 'Nothing needed changing.' };
+  b = boardAndTray(model([same]).roots, lanes, { laptop });
+  assert.deepEqual(ids(b.roots), ['M']);
+  assert.equal(b.roots[0].stop, 'edge');
+  assert.deepEqual(boardAndTray(model([same], { reviewed: new Set([finishKey(same)]) }).roots, lanes, { laptop }).trayIds.done, ['M'], '"Looks good" lets it go');
 });

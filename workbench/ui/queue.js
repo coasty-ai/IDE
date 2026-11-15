@@ -31,6 +31,21 @@ export function workSettled(a) {
 }
 
 /**
+ * Its work is settled, yet it finished again after that, and nobody has looked at this finish: a merged agent asked for a
+ * change that brought nothing new. The merge or the throw-away was the person's own act on an earlier finish; this one,
+ * and what the agent said in it, they have not seen, so it waits to be looked at like any finish. A merge at the moment
+ * it finished counts as after it. `reviewed`: the page's looks, when the caller has them.
+ */
+export function finishedSinceSettled(a, { reviewed } = {}) {
+  if (!workSettled(a)) return false;
+  const w = a.work, settled = Number((w.thrownAway || w.merged).at) || 0;
+  return (a.endedAt ?? a.stateSince ?? 0) > settled && !(reviewed && reviewed.has(finishKey(a)));
+}
+
+/** Settled, and nothing since that the person has not seen: such a root needs no one and is not "to look at". */
+const settledSeen = (a, marks) => workSettled(a) && !finishedSinceSettled(a, marks);
+
+/**
  * The work's signature: merged, a problem, thrown away, its folder gone, and whether it holds unmerged work. It is part
  * of the lid's key, so an outcome swaps the page (and arms the click guard), and buttons carry it (data-work), so one
  * drawn before an outcome cannot act after it. How many files changed is not part of it: the engine's card says that.
@@ -91,14 +106,15 @@ export function gitReason(a, { ACTIVE, meta }) {
 
 /**
  * Is this agent or helper waiting on the person right now? A failed check the person set aside ("Look later") is not,
- * until that agent finishes again; nor is one whose work is settled (merged anyway, or thrown away).
+ * until that agent finishes again; nor is one whose work is settled (merged anyway, or thrown away), unless its check
+ * failed again in a finish after that.
  * @param {object} a  an AgentView
  * @param {{ NEEDS_YOU: Set<string>, later?: Set<string> }} ctx
  */
 export function needsPerson(a, { NEEDS_YOU, later }) {
   if (!a || a.earlier || !NEEDS_YOU.has(a.state)) return false; // an agent from an earlier run waits on nobody
   if (a.state !== 'checks_failed') return true;
-  return !(later && later.has(finishKey(a))) && !workSettled(a);
+  return !(later && later.has(finishKey(a))) && !settledSeen(a);
 }
 
 /** Things waiting on the person, most urgent first: by PRIORITY, then the oldest ask first. */
@@ -114,7 +130,8 @@ const TO_LOOK_AT = new Set(['done_checked', 'done_claimed', 'failed']);
 
 /**
  * Finished roots not looked at yet (in this finish), newest first. Not one the person set aside ("Look later", "Not now"
- * on a merge that did not go through), and not one whose work is settled: merged with nothing new, or thrown away. A
+ * on a merge that did not go through), and not one whose work is settled (merged with nothing new, or thrown away) since
+ * it finished: one that finished again after that waits to be looked at like any finish (finishedSinceSettled). A
  * merge that did not go through is news of its own: a look from before it does not count, so a root at rest with one is
  * to be looked at until it clears or the person sets it aside (one with a failed check needs the person already).
  */
@@ -128,7 +145,7 @@ function toLookAt(a, { reviewed, later }) {
   const k = finishKey(a);
   if (later && later.has(k)) return false;
   if (a.work && a.work.problem) return a.state !== 'checks_failed';
-  return TO_LOOK_AT.has(a.state) && !(reviewed && reviewed.has(k)) && !workSettled(a);
+  return TO_LOOK_AT.has(a.state) && !(reviewed && reviewed.has(k)) && !settledSeen(a, { reviewed });
 }
 
 /**
@@ -137,25 +154,26 @@ function toLookAt(a, { reviewed, later }) {
  */
 export function setAsideList(agents, { later }) {
   if (!later) return [];
-  return [...agents].filter(a => (a.state === 'checks_failed' || (!a.parentId && !a.earlier && AT_REST.has(a.state))) && later.has(finishKey(a)) && !workSettled(a));
+  return [...agents].filter(a => (a.state === 'checks_failed' || (!a.parentId && !a.earlier && AT_REST.has(a.state))) && later.has(finishKey(a)) && !settledSeen(a));
 }
 
 /**
  * The person is finished with this root, so it leaves the board for the done tray. Its run has ended (done, a failed
  * check, failed or stopped), it does not need them, and they let it go: its work is settled, which the engine's snapshot
- * says (merged with nothing new since, or thrown away), or they looked at this finish ("Looks good", "Not now" on work
- * that could be merged, "Dismiss": the page's `reviewed` marks). Set aside ("Look later", "Not now" on a merge that did
- * not go through) is not finished, and neither is a root whose merge did not go through (`work.problem`), whatever was
- * said before it: it stays on the board until that clears (a merge that goes through, a message it takes, a new turn, or
- * its work thrown away). Helpers go with their agent, and agents from an earlier run wait in the tray by their own rule,
- * so neither is this rule's.
+ * says (merged with nothing new since, or thrown away), and it has not finished since (finishedSinceSettled: a merged
+ * agent asked for a change that brought nothing new stays until its reply is seen); or they looked at this finish ("Looks
+ * good", "Not now" on work that could be merged, "Dismiss": the page's `reviewed` marks). Set aside ("Look later", "Not
+ * now" on a merge that did not go through) is not finished, and neither is a root whose merge did not go through
+ * (`work.problem`), whatever was said before it: it stays on the board until that clears (a merge that goes through, a
+ * message it takes, a new turn, or its work thrown away). Helpers go with their agent, and agents from an earlier run
+ * wait in the tray by their own rule, so neither is this rule's.
  * @param {object} a  an AgentView
  * @param {{ NEEDS_YOU: Set<string>, reviewed?: Set<string>, later?: Set<string> }} ctx
  */
 export function finishedWith(a, { NEEDS_YOU, reviewed, later }) {
   if (!a || a.parentId || a.earlier || !AT_REST.has(a.state) || needsPerson(a, { NEEDS_YOU, later })) return false;
   if (a.work && a.work.problem) return false;
-  if (workSettled(a)) return true;
+  if (settledSeen(a, { reviewed })) return true;
   const k = finishKey(a);
   return !!(reviewed && reviewed.has(k)) && !(later && later.has(k));
 }

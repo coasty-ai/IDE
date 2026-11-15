@@ -311,6 +311,25 @@ test('merged, with nothing new: "<Name>’s work is in main.", See it in git and
   }
 });
 
+test('merged, then asked for a change that brought nothing new: the lid shows that finish, with what it said and "Looks good"', { skip }, async () => {
+  const { lidView, S, finishKey } = await load();
+  live(S);
+  const merged = { into: 'main', merge: 'e4f1c3a9b8d7e4f1c3a9b8d7e4f1c3a9b8d7e4f1', at: NOW - 20 * MIN, files: 3, adds: 12, dels: 3 };
+  const a = finished({ endedAt: NOW - MIN, says: 'Nothing needed changing: the export already batches.', work: WORK({ merged }), files: FILES(0) });
+  S.reviewed.clear();
+  const v = show(lidView, S, a);
+  assert.match(v.html, /<h1[^>]*>Invoice export is done and checked\.<\/h1>/);
+  assert.match(v.html, /Nothing needed changing: the export already batches\./);
+  assert.equal(v.count, 'Ready for you to look at');
+  assert.deepEqual([labelled(v.html, 'Looks good').act, labelled(v.html, 'Looks good').answer], ['looksgood', 'Looks good']);
+  assert.ok(!allButtons(v.html).some(b => b.act === 'merge'), 'nothing to merge');
+  // once looked at, picked from the tray it says where its work is, as before
+  S.reviewed.add(finishKey(a));
+  const after = show(lidView, S, a, {}, { agent: a, picked: true, queued: 0 });
+  assert.match(after.html, /<h1[^>]*>Invoice export’s work is in main\.<\/h1>/);
+  S.reviewed.clear();
+});
+
 test('a merge that conflicts: the engine\'s sentence, what both changed, and "Ask it to bring in main" with its exact message', { skip }, async () => {
   const { lidView, S } = await load();
   live(S);

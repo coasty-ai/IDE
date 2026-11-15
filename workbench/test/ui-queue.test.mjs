@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { finishKey, needsPerson, needsQueue, reviewQueue, setAsideList, stepFrom, helpersByNeed, helpersAtWork, finishedWith, readMarks, keepMarks } from '../ui/queue.js';
+import { finishKey, needsPerson, needsQueue, reviewQueue, setAsideList, stepFrom, helpersByNeed, helpersAtWork, finishedWith, finishedSinceSettled, readMarks, keepMarks } from '../ui/queue.js';
 import { unmergedWork, workSettled, workKey, canReview, mergeApplies, discardApplies, gitReason } from '../ui/queue.js';
 import { NEEDS_YOU, PRIORITY, ENDED, ACTIVE } from '../src/shared/states.mjs';
 
@@ -65,8 +65,9 @@ const work = (o = {}) => ({ branch: 'workbench/invoice-export-a1b2c3', from: 'ma
 const files = n => ({ changed: n, adds: 4 * n, dels: n, list: [] });
 const done = (o = {}) => ag('W', 'done_checked', { endedAt: 500, work: work(), files: files(3), ...o });
 const live = (repo = {}) => ({ ACTIVE, meta: { mode: 'live', repo: { name: 'invoices-api', head: 'abc1234', branch: 'main', dirty: 0, identity: true, ...repo } } });
-const MERGED = { into: 'main', merge: 'e4f1c3a9b8d7e4f1c3a9b8d7e4f1c3a9b8d7e4f1', at: 400, files: 3, adds: 12, dels: 3 };
-const THROWN = { at: 450, saved: 'refs/workbench/discarded/W' };
+// merged and thrown away after `done()` finished (at 500), as the person does: settled since that finish
+const MERGED = { into: 'main', merge: 'e4f1c3a9b8d7e4f1c3a9b8d7e4f1c3a9b8d7e4f1', at: 600, files: 3, adds: 12, dels: 3 };
+const THROWN = { at: 650, saved: 'refs/workbench/discarded/W' };
 
 test('merge applies: live mode, a root at rest with its folder and branch, your folder on a branch git can commit on, and unmerged work', () => {
   assert.equal(mergeApplies(done(), live()), true);
@@ -222,6 +223,34 @@ test('finished with: never while its work has a problem (a merge that did not go
   const cf = { ...p, state: 'checks_failed' };
   assert.equal(needsPerson(cf, { NEEDS_YOU }), true);
   assert.deepEqual(reviewQueue([cf], { reviewed: new Set() }), []);
+});
+
+test('finished with: settled work that finished again since waits to be looked at, so what it said is seen', () => {
+  const merged = done({ work: work({ merged: MERGED }), files: files(0) });     // finished at 500, merged at 600
+  assert.equal(finishedSinceSettled(merged), false);
+  assert.equal(finishedWith(merged, marks()), true);
+  assert.equal(finishedWith({ ...merged, endedAt: 600 }, marks()), true, 'a merge at the moment it finished counts as after it');
+  // asked for a change, it finishes again at 900 with nothing new: all of its work is in still, but this finish is unseen
+  const again = { ...merged, endedAt: 900, says: 'Nothing needed changing: the export already batches.' };
+  assert.equal(workSettled(again), true);
+  assert.equal(finishedSinceSettled(again), true);
+  assert.equal(finishedWith(again, marks()), false, 'it stays on the board, at the edge');
+  assert.deepEqual(reviewQueue([again], { reviewed: new Set() }).map(x => x.id), ['W'], 'and is to be looked at');
+  const seen = new Set([finishKey(again)]);
+  assert.equal(finishedSinceSettled(again, { reviewed: seen }), false);
+  assert.equal(finishedWith(again, marks({ reviewed: seen })), true, '"Looks good" lets it go');
+  assert.deepEqual(reviewQueue([again], { reviewed: seen }), []);
+  // work thrown away the same way
+  const thrown = done({ state: 'stopped', work: work({ branch: null, folder: false, thrownAway: THROWN }), files: null });
+  assert.equal(finishedWith(thrown, marks()), true);
+  assert.equal(finishedWith({ ...thrown, endedAt: 900 }, marks()), false);
+  // a failed check merged anyway whose check fails again with nothing new needs the person, and can be set aside
+  const cf = ag('f', 'checks_failed', { endedAt: 500, work: work({ merged: MERGED }), files: files(0) });
+  assert.equal(needsPerson(cf, { NEEDS_YOU }), false);
+  const cf2 = { ...cf, endedAt: 900 };
+  assert.equal(needsPerson(cf2, { NEEDS_YOU }), true);
+  assert.equal(needsPerson(cf2, { NEEDS_YOU, later: new Set([finishKey(cf2)]) }), false);
+  assert.deepEqual(setAsideList([cf2], { later: new Set([finishKey(cf2)]) }).map(x => x.id), ['f']);
 });
 
 test('the marks the page keeps for its tab ("looked at", "set aside") read back as they were kept', () => {
