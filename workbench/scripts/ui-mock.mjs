@@ -588,7 +588,8 @@ function limitWorld(now) {
 // with nothing new since, or thrown away (the snapshot says so, as here), or looked at ("Looks good", "Not now",
 // "Dismiss": the page keeps those for its tab, so no snapshot can carry them).
 //   done-tray    live, on main: Docs site at work; Help pages, merged with nothing new, and Dark mode, stopped and its
-//                work thrown away, wait in the done tray ("2 done")
+//                work thrown away, wait in the done tray ("2 done"); Move invoices older than seven years to the cold
+//                archive, stopped with its work kept, waits at the board's edge until the person dismisses it
 //   done-waits   live, on main: Invoice export, done and checked, its work not merged yet and not looked at: it stays on
 //                the board, at the edge, until the person merges it, says "Not now", or throws its work away
 const TRAY_SCENARIOS = ['done-tray', 'done-waits'];
@@ -601,6 +602,9 @@ function trayWorld(name, now) {
       files: { changed: 0, adds: 0, dels: 0, list: [] }, work: work('help-pages', 't2', { merged: { into: 'main', merge: 'b7d1e0c4a9f2b7d1e0c4a9f2b7d1e0c4a9f2b7d1', at: now - 6 * MIN, files: 3, adds: 36, dels: 6 } }) },
     { id: 't3', name: 'Dark mode', state: 'stopped', ageMin: 55, endedMin: 20,
       work: work('dark-mode', 't3', { branch: null, folder: false, thrownAway: { at: now - 15 * MIN, saved: 'refs/workbench/discarded/t3' } }) },
+    // stopped with its work kept, and a long name: at the board's edge until the person dismisses it ("· stopped")
+    { id: 't4', name: 'Move invoices older than seven years to the cold archive', state: 'stopped', ageMin: 35, endedMin: 8,
+      work: work('archive-old-invoices', 't4') },
   ] : [
     { id: 'w1', name: 'Invoice export', state: 'done_checked', ageMin: 30, endedMin: 3, says: 'Invoices now go out in small batches, so large accounts can export without timing out.',
       files: { changed: 3, adds: 40, dels: 2, list: [{ path: 'src/invoices/batch.ts', adds: 22, dels: 0 }, { path: 'src/invoices/export.ts', adds: 8, dels: 2 }, { path: 'test/invoices/large-account.test.ts', adds: 10, dels: 0 }] },

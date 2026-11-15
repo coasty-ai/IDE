@@ -705,7 +705,7 @@ try {
     await click('#tray'); await sleep(300);
     const rows = await b.ev(`[...document.querySelectorAll('#trayList h2, #trayList .row')].map(r => (r.dataset.agent ? r.dataset.agent + ':' : '') + r.textContent.trim()).join(' | ')`);
     check(DT + 'merged and thrown-away work waits in the tray, the one at work keeps the board, and both say how many are done',
-      chips === 't1' && tray === '2 done' && names[0] === '2 done. Show them.' && names[1] === 'Your agents and their helpers. 2 done.'
+      chips === 't1,t4~' && tray === '2 done' && names[0] === '2 done. Show them.' && names[1] === 'Your agents and their helpers. 2 done.'
       && rows === 'Done | t2:Help pages · merged | t3:Dark mode · thrown away',
       `chips ${chips}, tray "${tray}", names ${JSON.stringify(names)}, list "${rows}"`);
   });
@@ -751,6 +751,27 @@ try {
     const say = (await posts()).filter(x => /\/say$/.test(x.path)), back = await chipsNow(), trayBack = await trayNow();
     check(DT + 'a message brings it back to the board, on a lane, at work', say.length === 1 && say[0].path === '/api/agents/w1/say' && back === 'w1' && trayBack === '',
       `${JSON.stringify(say.map(x => [x.path, x.body]))}; chips "${back}", tray "${trayBack}"`);
+  });
+
+  await run(DT + 'a stopped agent let go with "Dismiss", picked in the tray, continues: back on the board, at work', async () => {
+    // done-tray's t4: stopped with its work kept, and a long name
+    await open('done-tray');
+    await b.goto(`${base}/?t=k&focus=t4`, 1600);
+    const shown = await lidNow();
+    await clickIn('[data-act="reviewed"]'); await sleep(1300);
+    const chips = await chipsNow(), tray = await trayNow();
+    await click('#tray'); await sleep(300);
+    const row = await b.ev(`document.querySelector('#trayList .row[data-agent="t4"]')?.textContent.trim() || ''`);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="t4"]')?.click(), 1`); await sleep(1000);
+    const picked = await lidNow(), acts = await lidActs();
+    await clearLog();
+    await clickIn('[data-act="fix"]'); await sleep(1300);
+    const say = (await posts()).filter(x => /\/say$/.test(x.path)), back = await chipsNow(), trayBack = await trayNow();
+    check(DT + 'a stopped agent let go with "Dismiss", picked in the tray, continues: back on the board, at work',
+      /was stopped\.$/.test(shown) && chips === 't1' && tray === '3 done' && row === 'Move invoices older than seven years to the cold archive · stopped'
+      && /was stopped\.$/.test(picked) && /fix/.test(acts) && /reviewed/.test(acts)
+      && say.length === 1 && say[0].path === '/api/agents/t4/say' && say[0].body.text === 'Please continue where you left off.' && back === 't1,t4' && trayBack === '2 done',
+      `"${shown}" → chips ${chips}, tray "${tray}", row "${row}"; picked "${picked}" [${acts}]; ${JSON.stringify(say.map(x => [x.path, x.body]))}; chips "${back}", tray "${trayBack}"`);
   });
 
   await run(DT + 'a lane\'s copper fades with its chip, also while the core changes size for what comes next', async () => {

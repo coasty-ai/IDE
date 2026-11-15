@@ -428,15 +428,22 @@ try {
         await b.ev(`document.querySelector('.mach')?.click(), true`); await settle(150); await check(tag);
         await b.ev(`[...document.querySelectorAll('.mach')].pop()?.click(), true`); await settle(150); await check(tag);
       } else if (v === 'tray') {
-        // a dense board's tray, and the tray of agents the person is finished with (merged, thrown away); then a row for
-        // work the person looked at: "Not now" on done-waits' work, not merged yet ("Invoice export · not merged")
+        // a dense board's tray, and the tray of agents the person is finished with (merged, thrown away); then rows for
+        // work the person looked at: "Dismiss" on done-tray's stopped agent with a long name ("· stopped"), and "Not now"
+        // on done-waits' work, not merged yet ("Invoice export · not merged")
+        const trayReads = () => b.ev(`document.getElementById('tray').hidden ? '' : document.getElementById('tray').textContent.trim()`);
         for (const sc of ['many', 'done-tray', 'done-waits']) {
           // the looks this tab kept from an earlier view must not decide what this one shows
           await b.ev(`(() => { try { sessionStorage.removeItem('wb-reviewed'); sessionStorage.removeItem('wb-later'); } catch (e) {} return 1; })()`).catch(() => {});
-          await load(sc);
+          await load(sc, sc === 'done-tray' ? '&focus=t4' : '');
+          if (sc === 'done-tray') {
+            await clickLid('[data-act="reviewed"]');
+            const words = await trayReads();
+            if (words !== '3 done') failures.push(`${tag} (${sc}): "Dismiss" did not send the stopped agent to the tray (the tray reads "${words}")`);
+          }
           if (sc === 'done-waits') {
             await clickLid('[data-act="looksgood"][data-answer="Not now"]');
-            const words = await b.ev(`document.getElementById('tray').hidden ? '' : document.getElementById('tray').textContent.trim()`);
+            const words = await trayReads();
             if (words !== '1 not merged') failures.push(`${tag} (${sc}): "Not now" did not send its work to the tray as not merged (the tray reads "${words}")`);
           }
           await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
