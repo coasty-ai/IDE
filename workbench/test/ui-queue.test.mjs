@@ -205,6 +205,25 @@ test('finished with: never a root at work or waiting on the person, a helper, or
   assert.equal(finishedWith(null, marks()), false);
 });
 
+test('finished with: never while its work has a problem (a merge that did not go through), whatever the person said before', () => {
+  const p = done({ work: work({ problem: { why: 'conflict', sentence: 'Invoice export’s work does not merge cleanly into main.', paths: ['src/a.js'], at: 600 } }) });
+  const k = finishKey(p);
+  // "Not now" sent it to the tray, then it was picked there and merged, and the merge did not go through
+  assert.equal(finishedWith(p, marks({ reviewed: new Set([k]) })), false, 'the problem brings it back to the board');
+  assert.equal(finishedWith(p, marks({ reviewed: new Set([k]), later: new Set([k]) })), false, '"Look later" on the problem keeps it there');
+  for (const st of ['done_claimed', 'failed', 'stopped']) assert.equal(finishedWith({ ...p, state: st }, marks({ reviewed: new Set([k]) })), false, st);
+  assert.equal(finishedWith({ ...p, work: work() }, marks({ reviewed: new Set([k]) })), true, 'once the problem is gone, the look holds again');
+  // and it is to be looked at: a look from before the problem does not count for it, while setting it aside does
+  assert.deepEqual(reviewQueue([p], { reviewed: new Set([k]) }).map(x => x.id), ['W']);
+  assert.deepEqual(reviewQueue([{ ...p, state: 'stopped', files: null }], { reviewed: new Set([k]) }).map(x => x.id), ['W'], 'a stopped one too');
+  assert.deepEqual(reviewQueue([p], { reviewed: new Set([k]), later: new Set([k]) }), []);
+  assert.deepEqual(setAsideList([p], { later: new Set([k]) }).map(x => x.id), ['W'], 'set aside, it is listed as such');
+  // a failed check whose "Merge anyway" did not go through needs the person already: it is not in the review queue twice
+  const cf = { ...p, state: 'checks_failed' };
+  assert.equal(needsPerson(cf, { NEEDS_YOU }), true);
+  assert.deepEqual(reviewQueue([cf], { reviewed: new Set() }), []);
+});
+
 test('the marks the page keeps for its tab ("looked at", "set aside") read back as they were kept', () => {
   const tab = memory();
   keepMarks(tab, 'wb-reviewed', new Set(['a@1', 'b@2']));

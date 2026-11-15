@@ -173,6 +173,24 @@ test('a reload keeps finished agents off the board: the tab keeps the looks and 
   assert.ok(b.trayIds.done.includes('M') && !ids(b.roots).includes('M'));
 });
 
+test('picked from the tray, a merge that does not go through brings it back to the board, and "Look later" keeps it there', () => {
+  const lanes = new Lanes(null);
+  const a = agent('A', 'done_checked', { work: W(), files: files(3) });
+  const reviewed = new Set([finishKey(a)]);     // "Not now"
+  let b = boardAndTray(model([a, agent('B', 'working')], { reviewed }).roots, lanes, { laptop });
+  assert.deepEqual(b.trayIds.done, ['A']);
+  const p = { ...a, work: W({ problem: { why: 'conflict', sentence: 'It does not merge cleanly into main.', paths: ['src/a.js'], at: T } }) };
+  b = boardAndTray(model([p, agent('B', 'working')], { reviewed }).roots, lanes, { laptop });
+  assert.deepEqual(ids(b.roots), ['A', 'B']);
+  assert.equal(b.roots.find(r => r.id === 'A').stop, 'edge');
+  assert.equal(b.tray, null);
+  b = boardAndTray(model([p, agent('B', 'working')], { reviewed, later: new Set([finishKey(p)]) }).roots, lanes, { laptop });
+  assert.deepEqual(ids(b.roots), ['A', 'B'], 'set aside, it stays');
+  // the problem clears (Try again went through): merged with nothing new, it is finished with again
+  const merged = { ...p, work: W({ merged: { ...MERGED, at: T + MIN } }), files: files(0) };
+  assert.deepEqual(boardAndTray(model([merged, agent('B', 'working')], { reviewed }).roots, lanes, { laptop }).trayIds.done, ['A']);
+});
+
 test('an agent in the tray that is continued, told something or asked for a change comes back to the board, on a lane, at work', () => {
   const lanes = new Lanes(null);
   const a = agent('A', 'stopped', { work: W(), files: null });
