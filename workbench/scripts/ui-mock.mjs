@@ -29,8 +29,9 @@
 // Agents & keys: the connect panel's routes, /api/connect*, in the 'connect-*' scenarios (see connectFacts below); mode
 // gains connect: { terminal, github, githubAgents, fail, gh, browser } and delay.connect.
 // Full permissions: POST /api/permissions { mode }, answered as the engine does (the card for 'full', which only its yes
-// turns on; 'ask' at once), the snapshot's `permissions`, the page sent with data-permissions on <html>, and the words
-// for them in POST /api/command. See the 'full' scenarios.
+// turns on, counting what it allowed; 'ask' at once, withdrawing every such card; a card from before the last change of
+// mode is refused, "That changed. Have another look."), the snapshot's `permissions`, the page sent with data-permissions
+// on <html>, and the words for them in POST /api/command. See the 'full' scenarios.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -828,6 +829,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   let state = worldOf(name);
   let cw = factsOf(name);   // Agents & keys: what Connect knows, in the connect scenarios (null elsewhere)
   let confirmSeq = 0;
+  let modeChanges = 0;   // how often full permissions went on or off in this world (permissionsAnswer)
   const confirms = new Map();
   const send = (event, data) => { const f = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`; for (const c of clients) c.write(f); };
   // a launch the person confirmed, as the engine does it: the reply names the new agent (focusId) before the stream
@@ -933,11 +935,16 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   };
   const PROBLEM = new Set(['conflict', 'blocked', 'moved', 'identity', 'detached', 'busy', 'ancestry', 'git']);
   /** Settle a card: a launch starts, a forget forgets, a merge merges (or fails as mode.merge says), a throw-away throws away. */
-  /** Full permissions on or off, as the engine's _permissions: 'full' is a card, 'ask' is at once. */
+  /**
+   * Full permissions on or off, as the engine's _permissions: 'full' is a card, 'ask' is at once, and withdraws every card
+   * that would turn them on. modeChanges counts the changes: a card made before the last one is refused (settle).
+   */
   const permissionsAnswer = want => {
     if (want === 'ask') {
+      for (const [id, c] of confirms) if (c.kind === 'permissions') confirms.delete(id);
       if (state.permissions !== 'full') return { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' };
       state.permissions = 'ask';
+      modeChanges++;
       setTimeout(() => { send('snapshot', state); send('notice', { text: FULL_OFF }); }, 60);
       return { ok: true, reply: FULL_OFF, permissions: 'ask' };
     }
@@ -945,20 +952,25 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     const n = state.agents.filter(a => a.ask && a.ask.type === 'permission').length;
     const detail = n ? `${FULL_DETAIL} The ${n} question${n === 1 ? '' : 's'} waiting now ${n === 1 ? 'is' : 'are'} allowed too.` : FULL_DETAIL;
     const card = { kind: 'permissions', sentence: 'Let agents do anything without asking?', detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true };
-    return { reply: card.sentence, confirm: newConfirm(card) };
+    return { reply: card.sentence, confirm: newConfirm(card, { modeAt: modeChanges }) };
   };
   const settle = (c, go) => {
     if (c.kind === 'permissions') {
+      if (c.modeAt !== modeChanges) return { reply: 'That changed. Have another look.' };
       if (!go) return { reply: 'OK, agents still ask before risky steps.' };
       state.permissions = 'full';
-      // every permission question waiting is allowed, as an automatic approval
+      modeChanges++;
+      // every permission question waiting is allowed, as an automatic approval, and the reply counts them
+      let n = 0;
       for (const a of state.agents) {
         if (a.ask?.type !== 'permission') continue;
         Object.assign(a, { ask: null, state: 'working', stateSince: Date.now(), now: 'Carrying on', approvals: { ...a.approvals, auto: a.approvals.auto + 1 } });
+        n++;
       }
       countHelpers(state.agents);
-      setTimeout(() => { send('snapshot', state); send('notice', { text: FULL_ON }); }, 60);
-      return { reply: FULL_ON, permissions: 'full' };
+      const reply = n ? `Full permissions are on. ${n} waiting question${n === 1 ? ' was' : 's were'} allowed.` : FULL_ON;
+      setTimeout(() => { send('snapshot', state); send('notice', { text: reply }); }, 60);
+      return { reply, permissions: 'full' };
     }
     if (c.kind === 'forget') {
       if (!go) return { reply: 'OK, I won’t forget it.' };
@@ -1237,7 +1249,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (p === '/ctl/reads') { res.end(JSON.stringify(GIT_READS)); return; }   // D1: the git screen's GETs
       if (p === '/ctl/clear') { posted.length = 0; res.end('{"ok":true}'); return; }
       if (p === '/ctl/prefs') {
-        if (b.permissions === 'full' || b.permissions === 'ask') state.permissions = b.permissions;
+        if ((b.permissions === 'full' || b.permissions === 'ask') && b.permissions !== state.permissions) { state.permissions = b.permissions; modeChanges++; }
         const { permissions, ...choices } = b;
         if (Object.keys(choices).length) prefs.set(cleanPrefs({ ...prefs.get(), ...choices }));
         const { permissions: kept, ...now } = prefs.get();

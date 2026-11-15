@@ -102,7 +102,11 @@ const FULL_DETAIL = 'Every agent and its helpers can then run any command, chang
 const FULL_ON = 'Full permissions are on. Agents no longer ask.';
 const FULL_OFF = 'Agents ask again before risky steps.';
 const FULL_REASON = 'Full permissions are on.';
-const MODE_NOT_KEPT = 'Workbench could not keep that choice for the next time it starts. The details are in its log.';
+// When the choice cannot be saved and what is kept says otherwise, the next start differs from this run, and the reply says so.
+const ON_NOT_KEPT = 'Full permissions are on for now, but Workbench could not save that, so agents will ask again the next time it starts.';
+const OFF_NOT_KEPT = 'Full permissions are off for now, but Workbench could not save that, so they will be on again the next time it starts.';
+// A full permissions card made before the mode last changed: its question is not the one it asked.
+const MODE_CHANGED = 'That changed. Have another look.';
 const MODE_WORDS = 'Say whether agents should ask first or have full permissions.';
 
 /** How a state reads after an agent's name: "Checkout fix needs your OK". */
@@ -490,6 +494,10 @@ export class Engine extends EventEmitter {
     // Full permissions ('full'), or agents ask before risky steps ('ask'). Live mode starts with what the person kept;
     // the demo always starts asking, and what is turned on there lasts for its own run only.
     this.permissionMode = this.mode === 'live' ? this._keptMode() : 'ask';
+    // What the kept choices say (live mode), as far as the engine knows: what the next start will read.
+    this._savedMode = this.permissionMode;
+    // Counts each change of mode: a full permissions card is answered only while the mode is as it was when it was made.
+    this._modeChanges = 0;
     this.options = { ...DEFAULTS, ...options };
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.stuck = new StuckDetector({ silenceMs: this.options.stuckSilenceMs });
@@ -1308,12 +1316,23 @@ export class Engine extends EventEmitter {
         // Who SendMessage may reach without asking: the main agent and this agent's own helpers, as its output named them.
         recipients: this._recipients(root, run),
       };
-      // With full permissions on, nothing asks: the policy allows it, or refuses the floor.
-      d = await this.deps.policy.decide({ ...req, full: this.permissionMode === 'full' });
+      // With full permissions on, nothing asks: the policy allows it, or refuses the floor. The mode is read again once the
+      // policy has answered: turned on or off while it checked, the request is judged as the mode now on judges it. Each
+      // mode is asked about once, so this ends after two answers at most.
+      const verdicts = new Map();
+      let full = this.permissionMode === 'full';
+      for (;;) {
+        if (!verdicts.has(full)) verdicts.set(full, await this.deps.policy.decide({ ...req, full }));
+        const now = this.permissionMode === 'full';
+        if (now === full) break;
+        full = now;
+      }
+      d = verdicts.get(full);
       if (d?.decision === 'ask') {
-        const f = await this.deps.policy.decide({ ...req, full: true });
+        // what full permissions would decide, kept on the held request, should the person turn them on while it waits
+        const f = verdicts.has(true) ? verdicts.get(true) : await this.deps.policy.decide({ ...req, full: true });
         inFull = f?.decision === 'allow' ? 'allow' : 'deny';
-        if (this.permissionMode === 'full') d = f; // turned on while it was checked: judged as full permissions judge it
+        if (this.permissionMode === 'full') d = f; // turned on while that was checked: judged as full permissions judge it
       }
     } catch (err) {
       this.log.error('The permission policy failed:', err);
@@ -1498,34 +1517,49 @@ export class Engine extends EventEmitter {
     if (this.permissionMode === 'full') return { ok: true, reply: 'Full permissions are already on.', permissions: 'full' };
     const n = this._allowableHeld().length + this._simPermissionAsks().length;
     const detail = n ? `${FULL_DETAIL} The ${n} question${n === 1 ? '' : 's'} waiting now ${n === 1 ? 'is' : 'are'} allowed too.` : FULL_DETAIL;
-    return this._newConfirm({ kind: 'permissions', sentence: FULL_SENTENCE, detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true });
+    // modeAt: the mode's changes so far, so a yes or no that comes after the mode changed again acts on nothing (_confirm)
+    return this._newConfirm({ kind: 'permissions', sentence: FULL_SENTENCE, detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true,
+      modeAt: this._modeChanges });
   }
 
   /**
-   * The yes to the card: full permissions are on, kept for the next start, and every question already waiting that they
-   * allow is allowed now, as an automatic approval: held hook requests, helpers' too, and the demo's own asks. A request
-   * that would change Claude Code's own settings keeps waiting for the person.
+   * The yes to the card: full permissions are on, kept for the next start, and every question waiting now that they allow is
+   * allowed, as an automatic approval: held hook requests, helpers' too, and the demo's own asks, also those that came after
+   * the card was made. A request they would refuse keeps waiting for the person. The reply counts what it allowed ("Full
+   * permissions are on. 2 waiting questions were allowed."), and says so when the next start will not have them on.
    */
   _fullOn() {
     this.permissionMode = 'full';
-    const kept = this._keepMode('full');
-    for (const held of this._allowableHeld()) this._resolveHeld(held, { decision: 'allow', how: 'auto', reason: FULL_REASON });
-    for (const { v, ask } of this._simPermissionAsks()) {
+    this._modeChanges += 1;
+    const lasts = this._keepMode('full') || this._savedMode === 'full';
+    const held = this._allowableHeld();
+    const sims = this._simPermissionAsks();
+    for (const h of held) this._resolveHeld(h, { decision: 'allow', how: 'auto', reason: FULL_REASON });
+    for (const { v, ask } of sims) {
       this._answerSim(v, ask, 'Allow', { how: 'auto' }).catch(err => this.log.warn('The demo could not take an answer:', err));
     }
     this.log.warn('Full permissions are on: agents run every step without asking.');
     this.emit('permissions', 'full');
-    return { reply: kept ? FULL_ON : `${FULL_ON} ${MODE_NOT_KEPT}`, permissions: 'full' };
+    const n = held.length + sims.length;
+    const allowed = n ? `${n} waiting question${n === 1 ? ' was' : 's were'} allowed.` : '';
+    const reply = lasts ? (allowed ? `Full permissions are on. ${allowed}` : FULL_ON) : [ON_NOT_KEPT, allowed].filter(Boolean).join(' ');
+    return { reply, permissions: 'full' };
   }
 
-  /** Full permissions off, at once: agents ask again from their next step. */
+  /**
+   * Full permissions off, at once: agents ask again from their next step. Any card that would turn them on is withdrawn
+   * (the person said to keep asking), also when they were off already. When the change cannot be saved and what is kept
+   * says on, the reply says they will be on again the next time Workbench starts.
+   */
   _askAgain() {
+    for (const [id, c] of this.confirms) if (c.kind === 'permissions') this.confirms.delete(id);
     if (this.permissionMode !== 'full') return { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' };
     this.permissionMode = 'ask';
-    const kept = this._keepMode('ask');
+    this._modeChanges += 1;
+    const lasts = this._keepMode('ask') || this._savedMode !== 'full';
     this.log.warn('Full permissions are off: agents ask again before risky steps.');
     this.emit('permissions', 'ask');
-    return { ok: true, reply: kept ? FULL_OFF : `${FULL_OFF} ${MODE_NOT_KEPT}`, permissions: 'ask' };
+    return { ok: true, reply: lasts ? FULL_OFF : OFF_NOT_KEPT, permissions: 'ask' };
   }
 
   /** The mode the person kept: 'full' only when the kept choices say exactly that. Live mode reads it at start. */
@@ -1538,15 +1572,20 @@ export class Engine extends EventEmitter {
     }
   }
 
-  /** Keep the mode for the next start (live mode: the demo's is for its own run). False when it could not be kept. */
+  /**
+   * Keep the mode for the next start (live mode: the demo's is for its own run). False when it could not be kept; what is
+   * kept (_savedMode) then stays as it was.
+   */
   _keepMode(mode) {
     if (this.mode !== 'live' || typeof this.prefs?.set !== 'function') return true;
+    let kept = false;
     try {
-      return this.prefs.set({ permissions: mode })?.ok !== false;
+      kept = this.prefs.set({ permissions: mode })?.ok !== false;
     } catch (err) {
       this.log.warn('Workbench could not keep full permissions for its next start:', err?.message || err);
-      return false;
     }
+    if (kept) this._savedMode = mode;
+    return kept;
   }
 
   /** The held hook requests that full permissions allow (every one but those that would change Claude Code's settings). */
@@ -3938,6 +3977,8 @@ export class Engine extends EventEmitter {
         if (!go) return { reply: 'OK, I won’t throw it away.' };
         return this._discardConfirmed(c);
       case 'permissions':
+        // A card made before the mode last changed asked another question than the one on now: neither answer acts.
+        if (c.modeAt !== this._modeChanges) return { reply: MODE_CHANGED };
         if (!go) return { reply: 'OK, agents still ask before risky steps.' };
         return this._fullOn();
       case 'start':

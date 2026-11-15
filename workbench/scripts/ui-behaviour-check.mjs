@@ -1556,7 +1556,7 @@ try {
     const confirms = (await posts()).filter(x => x.path.startsWith('/api/confirm/')).map(x => x.body.go);
     check(FP + 'Keep asking changes nothing; Turn on full permissions lights the button, allows the question waiting, and says so',
       kept.pressed === 'false' && !kept.on && !!askBefore && on.pressed === 'true' && on.on && on.led && on.state === 'full'
-      && /Full permissions are on\. Agents no longer ask\./.test(words) && a.ask === null && a.state === 'working' && JSON.stringify(confirms) === '[false,true]',
+      && /Full permissions are on\. 1 waiting question was allowed\./.test(words) && a.ask === null && a.state === 'working' && JSON.stringify(confirms) === '[false,true]',
       `kept ${JSON.stringify(kept)}; on ${JSON.stringify(on)}; said "${words}"; ${a.state} ${JSON.stringify(a.ask)}; confirms ${JSON.stringify(confirms)}`);
   });
 
@@ -1605,6 +1605,24 @@ try {
     check(FP + 'a button drawn for the other mode says "That changed" and posts nothing',
       drawn === 'ask' && p.length === 0 && /That changed\. Have another look\./.test(words) && now.pressed === 'true',
       `drawn for ${drawn}, posts ${p.length}, said "${words}", now ${now.pressed}`);
+  });
+
+  await run(FP + 'their card goes when they are turned on in another tab, and nothing is sent for it', async () => {
+    await open('demo');
+    await sleep(900);
+    await realClick('#permBtn');
+    await sleep(1100);
+    const card = await lidNow();
+    await clearLog();
+    // another tab said yes: the stream brings the mode, and this card asks about the mode as it was
+    await ctl('prefs', { permissions: 'full' });
+    await push('snapshot', { ...(await ctl('state')), permissions: 'full' });
+    await sleep(900);
+    const after = await lidNow(), on = await permBtn();
+    const sent = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
+    check(FP + 'their card goes when they are turned on in another tab, and nothing is sent for it',
+      card === 'Before agents stop asking / Let agents do anything without asking?' && !/^Before agents stop asking/.test(after) && on.pressed === 'true' && sent.length === 0,
+      `"${card}" → "${after}" (${on.pressed}); confirms sent ${sent.length}`);
   });
 
   await run(FP + 'a keyboard press takes the keyboard to the card; a card already on screen is withdrawn first', async () => {

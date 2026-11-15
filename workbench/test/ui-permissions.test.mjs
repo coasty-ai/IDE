@@ -48,9 +48,12 @@ test('the page learns the mode from <html> and from the snapshot, and a press go
   const app = read('app.js');
   const api = read('api.js');
   assert.match(api, /permissions: mode => call\('POST', '\/api\/permissions', \{ mode \}\)/);
-  // from <html> before the first snapshot, then from each snapshot's meta
+  // from <html> before the first snapshot, then from each snapshot's meta and from answers that carry it
   assert.match(app, /permissions: prefs\.permissions/);
-  assert.match(app, /permissions: snapMode\(snap, S\.meta\.permissions\)/);
+  assert.match(app, /modeIs\(snapMode\(snap, was\)\)/);
+  assert.match(app, /if \(r\) modeIs\(r\.permissions\)/);
+  // once the mode changes, a card that would turn them on goes: the engine withdrew it, or would refuse it
+  assert.match(app, /if \(mode !== S\.meta\.permissions && S\.confirm\?\.kind === 'permissions'\) S\.confirm = null;/);
   // the button carries the mode it was drawn for, and a press for another mode sends nothing
   assert.match(app, /b\.dataset\.state = v\.state/);
   assert.match(app, /if \(b\.dataset\.state !== S\.meta\.permissions\) \{ changed\(\); return; \}/);

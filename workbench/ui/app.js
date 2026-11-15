@@ -544,7 +544,7 @@ async function actOn(b) {
       const r = await api.confirm(id, go);
       if (S.confirm && S.confirm.id === id) S.confirm = null;
       // the yes to full permissions: the band's button lights at once (the stream's snapshot says so too)
-      if (r && (r.permissions === 'full' || r.permissions === 'ask')) S.meta.permissions = r.permissions;
+      if (r) modeIs(r.permissions);
       say(r.reply || '', lasting(r));
       after(r);
       moved();
@@ -1024,11 +1024,23 @@ function applyDebug() {
 /** The permission mode a snapshot gives ('full' or 'ask'); an engine that says neither keeps what the page had. */
 const snapMode = (snap, was) => (snap.permissions === 'full' || snap.permissions === 'ask' ? snap.permissions : was);
 
+/**
+ * The permission mode as the engine says it now. When it changes, a card that would turn full permissions on goes: the
+ * engine withdrew it (they were turned off) or would refuse it (it asks about the mode as it was), here or in another tab.
+ */
+function modeIs(mode) {
+  if (mode !== 'full' && mode !== 'ask') return;
+  if (mode !== S.meta.permissions && S.confirm?.kind === 'permissions') S.confirm = null;
+  S.meta.permissions = mode;
+}
+
 function onSnapshot(snap) {
   // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board.
   // meta.permissions: whether full permissions are on, for the band's button and the launch card.
+  const was = S.meta.permissions;
   S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap),
-    permissions: snapMode(snap, S.meta.permissions) };
+    permissions: was };
+  modeIs(snapMode(snap, was));
   const fresh = new Map((snap.agents || []).map(a => [a.id, a]));
   for (const id of [...S.agents.keys()]) if (!fresh.has(id)) S.agents.delete(id);
   upsert(snap.agents || []);
@@ -1233,7 +1245,7 @@ el.permBtn.addEventListener('click', async () => {
       renderNow();
       if (keyboard) el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
     } else {
-      if (r.permissions === 'full' || r.permissions === 'ask') S.meta.permissions = r.permissions;
+      modeIs(r.permissions);
       say(r.reply || '');
     }
   } catch (err) { say(err.message); }
