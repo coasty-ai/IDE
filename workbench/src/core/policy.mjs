@@ -85,6 +85,10 @@ const R = Object.freeze({
   comment: 'Part of the command is hidden behind a # comment.',
   globCommand: 'The name of the command uses a wildcard.',
   globOption: 'A wildcard in this command could turn file names into options.',
+  globMany: 'A wildcard in this command matches more files than can be checked.',
+  globUnclear: 'A wildcard in this command is written in a way that could not be checked.',
+  globOutside: "A wildcard in this command searches a folder outside the agent's own.",
+  equals: "To zsh, a word that starts with = is the full path of a program, which is outside the agent's own folder.",
   notSafe: 'This command is not on the list of safe commands.',
   readOnly: 'This command only reads.',
   writesFile: 'This command can write to a file.',
@@ -258,7 +262,8 @@ function judgeMonitor(input, ctx) {
 
 /** Reasons that are only about where a command reaches. Such an ask keeps the command's everyday words. */
 const WHERE_REASONS = new Set([R.readOutside, R.readLinks, R.readList, R.testsOutside, R.testsGit, R.testsClaude,
-  R.nodeOutside, R.nodeGit, R.nodeClaude, R.fileLinked, R.pathUnclear, R.pathBack, R.pathLink, R.gitSettingsOutside]);
+  R.nodeOutside, R.nodeGit, R.nodeClaude, R.fileLinked, R.pathUnclear, R.pathBack, R.pathLink, R.globMany, R.globUnclear, R.globOutside,
+  R.gitSettingsOutside]);
 
 /** Words that read oddly before " outside its own folder": they get ", using something outside its own folder". */
 const OFF_PLACE = /internet|another computer|on this computer|administrator|stop a program/;
@@ -318,11 +323,12 @@ function vouch(c, base, ctx, wheres) {
     // A shell given its command inline stands for that command (judged as its own part), if nothing else is added.
     return (rest.length === 3 && /^-l?c$|^-cl$/.test(rest[1])) || (c.prog === 'eval' && rest.length === 2);
   }
+  // narrate's words have their quotes taken off already, so every wildcard and "=" counts as unquoted here.
   const words = rest.map(text => {
     const glob = /[*?[^#]/.test(text);
-    return { text, glob, globLead: glob && /^[-*?[^#]/.test(text) };
+    return { text, glob, globLead: glob && /^[-*?[^#]/.test(text), pattern: text, equals: /^=.|[=:]=./.test(text) };
   });
-  const v = judgeWords(words, base, ctx);
+  const v = judgeExpanded(words, base, ctx);
   if (v.decision === 'allow') return true;
   if (!WHERE_REASONS.has(v.reason)) return false;
   if (v.where) wheres.push(v.where);
@@ -355,6 +361,7 @@ function scanWhere(command, base, also) {
       if (k === c.at && !c.script) continue; // the program itself
       const text = home(c.words[k]);
       const word = { text, glob: /[*?[]/.test(text) };
+      if (/^=.|[=:]=./.test(text)) note('outside'); // zsh's =program: a program's full path
       if (word.glob && globClimbs(text)) note('outside');
       for (const piece of readPieces(word)) {
         for (const b of bases) {
@@ -716,7 +723,11 @@ const GLOB_CHARS = new Set(['*', '?', '[']);
  * Split a command into words the way a POSIX shell would, once SHELL_META has been ruled out.
  * Quotes join onto the surrounding word ('ec'ho is "echo"). Each word records whether it has an
  * unquoted wildcard, and whether that wildcard could expand to something that starts with '-'.
- * @returns {{ words: { text: string, glob: boolean, globLead: boolean }[] } | { error: string }}
+ * `pattern` is the word as the shell matches it against file names: every quoted character escaped with a backslash
+ * (SHELL_META keeps a backslash of the command's own out). `equals`: zsh would replace it with a program's full path,
+ * since an unquoted "=" starts it (`=node`, also after empty quotes) or, with the MAGIC_EQUAL_SUBST option the person may
+ * have set, follows "=" or ":" (`--output==node`), and something comes after that "=".
+ * @returns {{ words: { text: string, glob: boolean, globLead: boolean, pattern: string, equals: boolean }[] } | { error: string }}
  */
 export function splitWords(cmd) {
   const words = [];
@@ -725,7 +736,7 @@ export function splitWords(cmd) {
   for (const ch of cmd) {
     if (quote) {
       if (ch === quote) quote = null;
-      else cur.text += ch;
+      else { cur.text += ch; cur.pattern += '\\' + ch; }
       continue;
     }
     if (ch === ' ' || ch === '\t') {
@@ -733,13 +744,14 @@ export function splitWords(cmd) {
       cur = null;
       continue;
     }
-    if (!cur) cur = { text: '', glob: false, globLead: false, quoted: false };
+    if (!cur) cur = { text: '', pattern: '', glob: false, globLead: false, quoted: false, eq: -1 };
     if (ch === "'" || ch === '"') {
       quote = ch;
       cur.quoted = true;
       continue;
     }
     if (ch === '#' && cur.text === '' && !cur.quoted) return { error: R.comment };
+    if (ch === '=' && cur.eq < 0 && (cur.text === '' || /[=:]$/.test(cur.text))) cur.eq = cur.text.length;
     // '^' and '#' are wildcards too when zsh's extendedglob option is on.
     if (GLOB_CHARS.has(ch) || ch === '^' || ch === '#') {
       cur.glob = true;
@@ -748,10 +760,13 @@ export function splitWords(cmd) {
       if (cur.text === '' || cur.text.startsWith('-')) cur.globLead = true;
     }
     cur.text += ch;
+    cur.pattern += ch;
   }
   if (quote) return { error: R.quotes };
   if (cur) words.push(cur);
-  return { words: words.map(({ text, glob, globLead }) => ({ text, glob, globLead })) };
+  return {
+    words: words.map(({ text, pattern, glob, globLead, eq }) => ({ text, glob, globLead, pattern, equals: eq >= 0 && eq < text.length - 1 })),
+  };
 }
 
 /** A short-option cluster (like -uo) that contains any of the letters. */
@@ -933,7 +948,7 @@ function judgeBash(input, ctx) {
   if (!base) return ask(R.noCwd);
   const split = splitWords(command);
   if (split.error) return ask(split.error, undefined, RUN);
-  return judgeWords(split.words, base, ctx);
+  return judgeExpanded(split.words, base, ctx);
 }
 
 /** One simple command, already split into words, against the agent's real folder. */
@@ -947,6 +962,8 @@ function judgeWords(words, base, { extraAllow, also = [] }) {
   if (matchesExtra(argv, extraAllow)) {
     return words.some(w => w.globLead) ? ask(R.globOption, undefined, RUN) : allow(R.extra);
   }
+  // zsh replaces =node with the full path of the node program: a place outside the folder, whatever the command.
+  if (words.some(w => w.equals)) return ask(R.equals, 'outside');
 
   // Commands that only read must also read only inside the agent's folder (or its scratch folders).
   const cmd = argv[0];
@@ -963,6 +980,337 @@ function judgeWords(words, base, { extraAllow, also = [] }) {
   if (cmd === 'git') return judgeGit(argv, words, base, also);
   if (cmd === 'gh' && ghShowsSignIn(argv)) return ask(R.ghSignIn, undefined, 'see your GitHub sign-in');
   return judgeRunner(argv, words, base) || ask(R.notSafe);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Wildcards, expanded the way zsh would
+
+/**
+ * How much one command's wildcards may read before the policy stops and asks, for each of the two readings below: the
+ * folder entries read, and the files matched.
+ */
+const GLOB_LIMIT = Object.freeze({ entries: 10000, matches: 500 });
+
+/** Reasons a wildcard could not be expanded safely, as asks. */
+const GLOB_ASK = Object.freeze({
+  many: () => ask(R.globMany, 'mayLeave'), unclear: () => ask(R.globUnclear, 'mayLeave'), outside: () => ask(R.globOutside, 'outside'),
+});
+
+/**
+ * One simple command, its wildcards included. zsh turns a word with an unquoted *, ? or [...] into the names of the files it
+ * matches before the command sees them, so such a word is judged by what it can become, by the same rules as words written
+ * out in full: judgeWords on the words as they are written (which also asks for wildcards that could become options or
+ * climb out of the folder), then on each reading of the command that globReadings finds. The first ask decides.
+ * The repository owner's own prefixes allow any words after them, as before; echo, which and pwd open no file.
+ */
+function judgeExpanded(words, base, ctx) {
+  const written = judgeWords(words, base, ctx);
+  if (written.decision !== 'allow' || written.reason === R.extra || !words.some(w => w.glob) || NO_FILE_ARGS.has(words[0].text)) return written;
+  const readings = globReadings(words, base, ctx.also ?? []);
+  if (!Array.isArray(readings)) return readings;
+  for (const r of readings) {
+    const v = judgeWords(r, base, ctx);
+    if (v.decision !== 'allow') return v;
+  }
+  return written;
+}
+
+/**
+ * The commands a line with wildcards can become, each a list of plain words. Claude Code keeps the person's own zsh options
+ * (it turns off only extendedglob and bare glob qualifiers), and those decide some of what a wildcard becomes, so every
+ * reading they allow is covered:
+ * - each wildcard word replaced by every file it matches the strict way (zsh's defaults: case counts; a hidden name only
+ *   for a pattern that starts with a dot; `**` only as a whole segment before "/", which descends into folders without
+ *   following links, `***` following them), and by every file it matches the loose way (any case, hidden names and folders
+ *   too, and `**` at the start of any segment standing for `**` / `*`: the NO_CASE_GLOB, GLOB_DOTS and GLOB_STAR_SHORT
+ *   options);
+ * - for git, whose words take roles by where they stand (an option's value, `worktree move`), each loose match alone in
+ *   its word's place;
+ * - the words as written (NO_NOMATCH, NOGLOB, and bash, which keep a word that matches nothing), and the line without each
+ *   word that matches nothing the strict way (NULL_GLOB drops it, so the next word takes its place).
+ * Matches are judged with links followed, as paths written out in full are. Only folders inside the agent's own folder or
+ * its scratch folders are searched: a search elsewhere, too many matches, or a form this does not read (a quoted character
+ * inside [...], ~user) is returned as an ask instead.
+ * @returns {object[][] | object} the readings, or an ask
+ */
+function globReadings(words, base, also) {
+  const budgets = [{ entries: 0, matches: 0 }, { entries: 0, matches: 0 }];
+  const plain = text => ({ text, glob: false, globLead: false, pattern: text, equals: false });
+  const found = [];
+  for (const w of words) {
+    const pattern = w.pattern ?? w.text;
+    if (!w.glob || !hasWildcard(pattern)) { found.push(null); continue; } // ^ and # alone: plain text without extendedglob
+    const strict = expandPattern(pattern, base, also, false, budgets[0]);
+    if (strict.error) return GLOB_ASK[strict.error]();
+    const loose = expandPattern(pattern, base, also, true, budgets[1]);
+    if (loose.error) return GLOB_ASK[loose.error]();
+    found.push({ strict: strict.paths, loose: loose.paths });
+  }
+  const at = found.flatMap((f, k) => (f ? [k] : []));
+  const fill = pick => words.flatMap((w, k) => {
+    const list = found[k] ? pick(found[k], k) : null;
+    return list === null ? [plain(w.text)] : list.map(plain);
+  });
+  const readings = [fill(() => null), fill(f => (f.loose.length ? f.loose : null)), fill(f => f.strict)];
+  // NULL_GLOB drops the words that match nothing for the person's options: any of those that match nothing the strict way.
+  const none = at.filter(k => !found[k].strict.length);
+  if (none.length > 3) return GLOB_ASK.unclear();
+  for (let mask = 1; mask < 1 << none.length; mask++) {
+    const gone = new Set(none.filter((k, b) => mask & (1 << b)));
+    readings.push(words.flatMap((w, k) => (gone.has(k) ? [] : [plain(w.text)])));
+  }
+  if (words[0].text === 'git') {
+    for (const k of at) for (const m of found[k].loose) readings.push(words.map((w, j) => plain(j === k ? m : w.text)));
+  }
+  const seen = new Set();
+  return readings.filter(r => { const key = r.map(w => w.text).join('\0'); return !seen.has(key) && seen.add(key); });
+}
+
+/** Whether a pattern (quoted characters escaped with a backslash) has an unquoted *, ? or [. */
+function hasWildcard(pattern) {
+  for (let k = 0; k < pattern.length; k++) {
+    if (pattern[k] === '\\') { k++; continue; }
+    if (GLOB_CHARS.has(pattern[k])) return true;
+  }
+  return false;
+}
+
+/** A pattern's characters, one for each code point, each noting whether it was quoted (escaped with a backslash). */
+function patternChars(pattern) {
+  const cps = [...pattern];
+  const out = [];
+  for (let k = 0; k < cps.length; k++) {
+    if (cps[k] === '\\' && k + 1 < cps.length) out.push({ ch: cps[++k], lit: true });
+    else out.push({ ch: cps[k], lit: false });
+  }
+  return out;
+}
+
+/**
+ * One segment of a pattern (between slashes) as tokens: a character { c }, any run { star }, one character { one }, or a
+ * set [...] { set: { neg, items } }, whose items are ranges { from, to } (code points) and classes { cls } ([:alpha:]).
+ * A [ with no closing ] is a plain character (zsh refuses the pattern; bash keeps it as it is). null for a quoted
+ * character inside [...], which this does not read. `wild`: some token is not a plain character.
+ */
+function segmentTokens(chars) {
+  const tokens = [];
+  let wild = false;
+  for (let k = 0; k < chars.length; k++) {
+    const { ch, lit } = chars[k];
+    if (lit) tokens.push({ c: ch });
+    else if (ch === '*') { if (!tokens.at(-1)?.star) tokens.push({ star: true }); wild = true; }
+    else if (ch === '?') { tokens.push({ one: true }); wild = true; }
+    else if (ch === '[') {
+      const set = parseSet(chars, k);
+      if (set === null) return null;
+      if (!set) tokens.push({ c: ch });
+      else { tokens.push({ set: set.set }); wild = true; k = set.end; }
+    } else tokens.push({ c: ch });
+  }
+  return { tokens, wild };
+}
+
+/** The set that starts with the [ at chars[k]: { set, end } (end: the index of its ]), false when nothing closes it, null when a quoted character is inside. */
+function parseSet(chars, k) {
+  let j = k + 1;
+  let neg = false;
+  if (j < chars.length && !chars[j].lit && (chars[j].ch === '!' || chars[j].ch === '^')) { neg = true; j++; }
+  const items = [];
+  const code = s => s.codePointAt(0);
+  for (let first = true; j < chars.length; j++, first = false) {
+    const { ch, lit } = chars[j];
+    if (lit) return null;
+    if (ch === ']' && !first) return { set: { neg, items }, end: j };
+    if (ch === '[' && chars[j + 1]?.ch === ':') { // [:name:]
+      let e = j + 2;
+      while (e + 1 < chars.length && !(chars[e].ch === ':' && chars[e + 1].ch === ']')) e++;
+      if (e + 1 < chars.length) {
+        if (chars.slice(j, e + 2).some(c => c.lit)) return null;
+        items.push({ cls: chars.slice(j + 2, e).map(c => c.ch).join('') });
+        j = e + 1;
+        continue;
+      }
+    }
+    const to = chars[j + 2];
+    if (chars[j + 1] && !chars[j + 1].lit && chars[j + 1].ch === '-' && to && !(to.ch === ']' && !to.lit)) {
+      if (to.lit) return null;
+      items.push({ from: code(ch), to: code(to.ch) });
+      j += 2;
+      continue;
+    }
+    items.push({ from: code(ch), to: code(ch) });
+  }
+  return false;
+}
+
+/**
+ * Whether one character matches a set. The strict way reads a class ([:alpha:]) as matching nothing; the loose way, also
+ * trying the character's other case, as matching anything: so what the strict way matches, zsh matches whatever its
+ * options, and what zsh matches, the loose way matches too. `bytes`: c is one byte of a name read byte by byte, as zsh does
+ * in the C locale; a byte of a longer character then matches any set the loose way, and none the strict way.
+ */
+function setHas(set, c, loose, bytes = false) {
+  if (bytes && c.charCodeAt(0) >= 0x80) return loose;
+  const tries = loose ? [c, c.toLowerCase(), c.toUpperCase()].filter(x => [...x].length === 1) : [c];
+  const known = x => set.items.some(it => !it.cls && x.codePointAt(0) >= it.from && x.codePointAt(0) <= it.to);
+  const cls = set.items.some(it => it.cls);
+  if (!set.neg) return tries.some(known) || (loose && cls);
+  return loose ? tries.some(x => !known(x)) : !known(c) && !cls;
+}
+
+/**
+ * Whether a name matches a segment's tokens; the loose way ignores case. zsh reads a name character by character, or byte by
+ * byte in the C locale (Workbench may well run without LANG, started from the Dock), where ? matches one of the two bytes
+ * of an accented letter. So when the name or the tokens are not plain ASCII, both are tried: the loose way takes either
+ * match, the strict way only both.
+ */
+function matchTokens(tokens, name, loose) {
+  const ascii = s => /^[\x00-\x7f]*$/.test(s);
+  const plainAscii = ascii(name) && tokens.every(t => (t.c === undefined || ascii(t.c)) && (!t.set || t.set.items.every(it => it.cls || it.to < 0x80)));
+  const byChar = matchUnits(tokens, [...name], loose, false);
+  if (plainAscii) return byChar;
+  const asBytes = s => [...new TextEncoder().encode(s)].map(b => String.fromCharCode(b));
+  const byteTokens = tokens.flatMap(t => (t.c !== undefined && !ascii(t.c) ? asBytes(t.c).map(c => ({ c })) : [t]));
+  const byByte = matchUnits(byteTokens, asBytes(name), loose, true);
+  return loose ? byChar || byByte : byChar && byByte;
+}
+
+/** Whether a list of characters (or bytes) matches the tokens: row[n] says the tokens so far match the first n of them. */
+function matchUnits(tokens, cs, loose, bytes) {
+  const same = (a, b) => a === b || (loose && (a.toLowerCase() === b.toLowerCase() || a.toUpperCase() === b.toUpperCase()));
+  let row = cs.map(() => false);
+  row.unshift(true);
+  for (const t of tokens) {
+    const next = new Array(cs.length + 1).fill(false);
+    for (let n = 0; n <= cs.length; n++) {
+      if (t.star) next[n] = row[n] || (n > 0 && next[n - 1]);
+      else if (n > 0 && row[n - 1]) next[n] = t.one || (t.set ? setHas(t.set, cs[n - 1], loose, bytes) : same(t.c, cs[n - 1]));
+    }
+    row = next;
+  }
+  return row[cs.length];
+}
+
+/** Thrown when a wildcard reads or matches more than GLOB_LIMIT allows. */
+const TOO_MANY = Symbol('too many');
+
+/**
+ * The paths one pattern matches, as zsh would write them, read the strict or the loose way (see globReadings). The folder the
+ * search starts in, the pattern's text before its first wildcard segment, must be inside the agent's folder or one of its
+ * scratch folders.
+ * @returns {{ paths: string[] } | { error: 'many' | 'unclear' | 'outside' }}
+ */
+function expandPattern(pattern, base, also, loose, budget) {
+  let chars = patternChars(pattern);
+  let prefix = '';
+  if (chars[0]?.ch === '~' && !chars[0].lit) { // tilde expansion comes first: only ~ and ~/ are the home folder
+    if (chars.length > 1 && chars[1].ch !== '/') return { error: 'unclear' };
+    prefix = os.homedir().replace(/\/+$/, '') + '/';
+    chars = chars.slice(1);
+  } else if (chars[0]?.ch === '/') prefix = '/';
+  while (chars[0]?.ch === '/') chars = chars.slice(1);
+  const segs = [[]];
+  for (const c of chars) { if (c.ch === '/') segs.push([]); else segs.at(-1).push(c); }
+  const dirsOnly = segs.length > 1 && !segs.at(-1).length; // a pattern that ends in "/" matches folders only
+  const parts = segs.filter(s => s.length);
+  const tok = parts.map(segmentTokens);
+  if (tok.some(t => t === null)) return { error: 'unclear' };
+  const stars = p => { let n = 0; while (n < p.length && p[n].ch === '*' && !p[n].lit) n++; return n; };
+  const firstWild = tok.findIndex(t => t.wild);
+  const where = resolveReal(prefix + parts.slice(0, firstWild < 0 ? parts.length : firstWild).map(p => p.map(c => c.ch).join('')).join('/') || '.', base);
+  if (!where.ok) return { error: 'unclear' };
+  if (placeOf(where.real, base) === 'outside' && !also.some(test => test(where.real))) return { error: 'outside' };
+
+  const fsPath = text => (text.startsWith('/') ? text : text ? base + '/' + text : base);
+  const join = (dir, name) => (!dir ? name : dir.endsWith('/') ? dir + name : dir + '/' + name);
+  const list = (dir, types) => {
+    let names;
+    try { names = fs.readdirSync(fsPath(dir), types ? { withFileTypes: true } : undefined); } catch { return []; }
+    budget.entries += names.length;
+    if (budget.entries > GLOB_LIMIT.entries) throw TOO_MANY;
+    return names;
+  };
+  const isDir = text => { try { return fs.statSync(fsPath(text)).isDirectory(); } catch { return false; } };
+  const hidden = name => name.startsWith('.');
+  // A folder whose names the agent could have chosen: in its own folder or its scratch folders, not the ones above them.
+  const mine = text => {
+    let real;
+    try { real = fs.realpathSync.native(fsPath(text)); } catch { return false; }
+    return placeOf(real, base) !== 'outside' || also.some(test => test(real));
+  };
+  // The folders below `dir`, at any depth: not through links, unless `follow` (***), and hidden ones only the loose way.
+  const below = (dir, follow) => {
+    const out = [];
+    const seen = new Set();
+    const stack = [dir];
+    while (stack.length) {
+      const d = stack.pop();
+      for (const e of list(d, true)) {
+        if (!loose && hidden(e.name)) continue;
+        const text = join(d, e.name);
+        if (!(e.isDirectory() || (follow && e.isSymbolicLink() && isDir(text)))) continue;
+        if (follow) {
+          let real;
+          try { real = fs.realpathSync.native(fsPath(text)); } catch { continue; }
+          if (seen.has(real)) continue;
+          seen.add(real);
+        }
+        out.push(text);
+        stack.push(text);
+      }
+    }
+    return out;
+  };
+  const matchIn = (dirs, tokens, last) => {
+    const out = [];
+    for (const d of dirs) {
+      for (const name of list(d, false)) {
+        if (!loose && hidden(name) && tokens[0]?.c !== '.') continue; // zsh: a leading dot must be written
+        if (!matchTokens(tokens, name, loose)) continue;
+        const text = join(d, name);
+        if (last || isDir(text)) out.push(text); // a folder, or a link to one, to go on into
+      }
+    }
+    return out;
+  };
+
+  try {
+    let cur = [prefix];
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      const last = i === parts.length - 1;
+      const n = stars(p);
+      if (n >= 2 && (loose || (n === p.length && n <= 3 && !last))) { // ** and ***, recursive
+        const dirs = cur.flatMap(c => [c, ...below(c, n >= 3)]);
+        const rest = p.slice(n);
+        if (!rest.length && !last) { cur = dirs; continue; }
+        cur = matchIn(dirs, segmentTokens([{ ch: '*', lit: false }, ...rest]).tokens, last);
+        continue;
+      }
+      if (!tok[i].wild) {
+        const name = p.map(c => c.ch).join('');
+        const next = [];
+        for (const c of cur) {
+          const text = join(c, name);
+          if (!last || present(fsPath(text))) next.push(text);
+          // NO_CASE_GLOB on a disk that minds case: an entry that differs only in case
+          if (loose && name !== '.' && name !== '..' && mine(c)) {
+            for (const e of list(c, false)) if (e !== name && matchTokens(tok[i].tokens, e, true)) next.push(join(c, e));
+          }
+        }
+        cur = next;
+        continue;
+      }
+      cur = matchIn(cur, tok[i].tokens, last);
+    }
+    if (dirsOnly) cur = cur.filter(isDir).map(t => t + '/');
+    budget.matches += cur.length;
+    if (budget.matches > GLOB_LIMIT.matches) return { error: 'many' };
+    return { paths: cur };
+  } catch (e) {
+    if (e === TOO_MANY) return { error: 'many' };
+    throw e;
+  }
 }
 
 /**
@@ -1049,7 +1397,7 @@ function judgeReadOnly(spec, argv, words, base) {
  * - what destroys what no fetch can bring back, and what reaches another working copy (gitForGood);
  * - a patch, a replacement commit, another repository's address instead of one of the repository's own remotes, and git's
  *   settings read from outside the folder (gitReaches).
- * Wildcards that could turn file names into options ask, as for every command.
+ * Wildcards that could turn file names into options ask, as for every command; judgeExpanded judges what the others become.
  */
 function judgeGit(argv, words, base, also) {
   let i = 1;

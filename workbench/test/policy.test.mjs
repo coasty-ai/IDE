@@ -25,6 +25,7 @@ before(() => {
   for (const f of ['/test.mjs', '/src/existing.js', '/README.md', '/nb.ipynb', '/reporter.mjs', '/setup.mjs', '/.claude/settings.json', '/.claude/x.mjs', '/list.txt']) fs.writeFileSync(cwd + f, 'x\n');
   fs.writeFileSync(outside + '/evil.mjs', '');
   fs.writeFileSync(outside + '/shared.txt', '');
+  fs.writeFileSync(outside + '/dir/secret.txt', 'x\n'); // behind the link "link"
   // The repository's own remotes: a plain push or fetch to one of them runs.
   fs.writeFileSync(cwd + '/.git/config', '[core]\n\tbare = false\n[remote "origin"]\n\turl = https://github.com/owner/repo.git\n'
     + '[remote "upstream"]\n\turl = https://github.com/other/repo.git\n');
@@ -1226,6 +1227,95 @@ test('git asks before it destroys what no fetch can bring back; the rest of git 
     'git update-ref refs/heads/x HEAD 1111111111111111111111111111111111111111', 'git tag -d v0.9', 'git stash drop', 'git branch -udevelop',
     'git branch -m new', 'git branch feature', 'git branch -d', 'git worktree add wt', 'git worktree list',
   ].map(c => bash(c)), 'allow');
+});
+
+// ---------------------------------------------------------------------------------------------
+// The shell's own expansions. Claude Code runs a command through the person's login shell, zsh on a Mac, with the
+// person's own zsh options, so a word can stand for more than its letters.
+
+test("a word that starts with = asks: to zsh it is the full path of a program, outside the agent's folder", () => {
+  asksBecause(['cat =fakeprog', 'cat =node', 'git log -1 --format=%B --output =fakeprog', 'head ="ls"', "cat ''=ls", 'grep -f =x README.md', 'ls =ls',
+    // after = or : too, with zsh's MAGIC_EQUAL_SUBST option, which the person may have set
+    'git log --output==fakeprog', 'grep --file==x README.md', 'git log --output=a:=fakeprog', 'node --test --test-reporter-destination==x',
+  ].map(c => bash(c)), /full path of a program/);
+  assert.equal(decide({ cwd, ...bash('cat =fakeprog') }).sentence, 'wants to run a command outside its own folder');
+  // A quoted =, a lone =, or one inside a word is plain text.
+  check(['cat "="fakeprog', "cat '=x'", 'git log --format=%H', 'git commit -m "a = b"', 'echo a=b', 'git log --since=2.weeks', 'cat a=x=y', 'echo ='].map(c => bash(c)), 'allow');
+  assert.equal(splitWords('cat =x "="y a==b').words.map(w => w.equals).join(), 'false,true,false,true');
+});
+
+test('a wildcard is expanded the way zsh would, and each file it matches is judged as if it were written out in full', () => {
+  // "link" leads outside, to a folder holding secret.txt: written out in full, reading through it asks, and so does a wildcard that matches it.
+  asksBecause(['cat l?nk/secret.txt', 'cat lin[k]/secret.txt', 'cat [l]ink/secret.txt', 'cat */secret.txt', 'head -n1 l*/secret.txt', 'grep -r x l?nk',
+    'wc -c ./l?nk/*', 'git diff --no-index l?nk/secret.txt README.md', 'cat tests/l*-out/shared.txt', 'cat ***/secret.txt', 'cat ***/s*.txt'].map(c => bash(c)),
+  /outside the agent's own folder/);
+  assert.equal(decide({ cwd, ...bash('cat l?nk/secret.txt') }).sentence, 'wants to read a file outside its own folder');
+  // In the C locale zsh reads a name byte by byte, so ?? matches an accented letter, two bytes: a link by that name is reached too.
+  const accented = String.fromCharCode(0xe9);
+  fs.symlinkSync(outside + '/dir', cwd + '/' + accented);
+  try {
+    asksBecause([bash('cat ??/secret.txt'), bash('cat ?/secret.txt'), bash('cat [!x][!x]/secret.txt')], /outside the agent's own folder/);
+  } finally {
+    fs.rmSync(cwd + '/' + accented);
+  }
+  // Ordinary wildcards that only reach files inside the folder still run on their own.
+  check(['ls src/*.js', 'cat *.md', 'wc -l src/*.js', 'head -n 3 src/*.js', 'grep -n x src/*.js', 'ls src/[a-z]*', 'ls src/[!z]*', 'cat .claude/*.json',
+    'git add src/*.js', 'git diff -- src/*.js', 'git log -- src/*', 'node --test test/*.test.mjs', 'ls **/*.js', 'cat **/secret.txt', 'ls -d src/*/', 'cat src/*.mjs',
+    () => bash(`cat ${cwd}/src/*.js`), () => ({ ...bash(`cat ${T}/scratch/*.txt`), readAlso: [T + '/scratch'] }),
+  ].map(c => (typeof c === 'string' ? bash(c) : c)), 'allow');
+});
+
+test("a wildcard that writes through a link into another repository's records, or onto the agent's own .git, asks", () => {
+  // As in the person's checkout: a link in the agent's folder that leads to the main repository's .git
+  fs.mkdirSync(T + '/mainrepo/.git/hooks', { recursive: true });
+  fs.writeFileSync(T + '/mainrepo/.git/config', '[core]\n');
+  fs.writeFileSync(T + '/mainrepo/.git/hooks/post-checkout', ''); // a wildcard only ever matches what is there
+  fs.symlinkSync(T + '/mainrepo/.git', cwd + '/gln');
+  try {
+    const rows = [
+      ['git log -1 --format=%B --output g?n/config', 'wants to write to a file outside its own folder'],
+      ['git log -1 --format=%B --output .gi?', "wants to write to a file in git's own records"],
+      ['git log --output .g*/config', "wants to write to a file in git's own records"],
+      ['git archive -o g?n/hooks/post-checkout HEAD', null], ['git checkout -- .cla?de/settings.json', null],
+    ];
+    for (const [command, sentence] of rows) {
+      const d = decide({ cwd, ...bash(command) });
+      assert.equal(d.decision, 'ask', command);
+      if (sentence) assert.equal(d.sentence, sentence, command);
+    }
+    // With zsh's NULL_GLOB a wildcard that matches nothing is dropped, and the next word takes its place: here, git's own records.
+    const shifted = decide({ cwd, ...bash('git log --output nothing-*.txt .git') });
+    assert.deepEqual([shifted.decision, shifted.sentence], ['ask', "wants to write to a file in git's own records"]);
+  } finally {
+    fs.rmSync(cwd + '/gln');
+  }
+});
+
+test('a wildcard is judged by every word it could become, so a file name cannot turn into an option or a git command', () => {
+  for (const f of ['/-R', '/move', '/src/second.js']) fs.writeFileSync(cwd + f, 'x\n');
+  try {
+    // A file named -R makes `grep -*` follow links; one named "move" makes `git worktree m*` move a working copy.
+    asksBecause([bash('grep -* foo .')], /follow links/);
+    asksBecause([bash('git worktree m* other-agent stolen')], /another working copy/);
+    // Two files make `git config src/*` a write: name, then value.
+    asksBecause([bash('git config src/*')], /git's settings/);
+  } finally {
+    for (const f of ['/-R', '/move', '/src/second.js']) fs.rmSync(cwd + f);
+  }
+});
+
+test('a wildcard that cannot be expanded safely asks', () => {
+  fs.mkdirSync(cwd + '/many');
+  for (let k = 0; k < 501; k++) fs.writeFileSync(`${cwd}/many/f${k}.txt`, '');
+  try {
+    asksBecause([bash('ls many/*'), bash('wc -l many/*.txt')], /more files than can be checked/);
+  } finally {
+    fs.rmSync(cwd + '/many', { recursive: true, force: true });
+  }
+  // A quoted character inside [...] is a form the policy does not read.
+  asksBecause([bash("cat src/['*']x")], /could not be checked/);
+  // A search that starts outside the folder asks before anything is read there.
+  check([bash('cat /etc/*'), () => bash(`cat ${outside}/*`), bash('ls ~/*'), bash('cat ../*'), bash('cat link/*')], 'ask');
 });
 
 // ---------------------------------------------------------------------------------------------
