@@ -511,3 +511,48 @@ test('everything an agent controls reaches the lid with its hidden characters sh
   const changed = lidView({ agent: cases[1], index: 0, total: 1 }, { detail: 'more', open: { changed: true } });
   assert.match(changed.html, /<li>src\/payments\/refund⟦U\+202E⟧cod\.exe <span>\+2 −1<\/span><\/li>/);
 });
+
+// ---------------------------------------------------------------- full permissions
+test('the full permissions card: its own count line and words, no answer drawn as the default, and its warning at every fit step but the last', { skip }, async () => {
+  const { lidView } = await load();
+  const detail = 'Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. It stays on until you turn it off. The 2 questions waiting now are allowed too.';
+  const card = { id: 'c9', kind: 'permissions', sentence: 'Let agents do anything without asking?', detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true };
+  const v = lidView({ confirm: card }, {});
+  assert.equal(v.count, 'Before agents stop asking');
+  assert.deepEqual(v.bind, { confirmId: 'c9' });
+  assert.deepEqual(allButtons(v.html).map(b => [b.label, b.cls, b.act, b.confirm, b.go]),
+    [['Turn on full permissions', 'big', 'confirm', 'c9', '1'], ['Keep asking', 'big', 'confirm', 'c9', '0']], 'neither answer is the dark default');
+  assert.match(v.html, /<svg class="g k-stuck"/, 'a risky card reads as one');
+  assert.match(v.say, /^Before agents stop asking: Let agents do anything without asking\? Every agent and its helpers/);
+  for (let fit = 0; fit <= 5; fit++) assert.ok(lidView({ confirm: card }, { fit }).html.includes(`<p class="meta">${detail}</p>`), `fit ${fit}`);
+  const last = lidView({ confirm: card }, { fit: 6 });
+  assert.ok(!last.html.includes(detail));
+  assert.equal(labelled(last.html, 'See all of it').act, 'exact');
+});
+
+test('while full permissions are on, a launch card says it will not ask before any step; off, it is as before', { skip }, async () => {
+  const { lidView, S } = await load();
+  const one = { id: 'c2', kind: 'start', sentence: 'Start Claude Code on “fix the login page”?', detail: 'It can spend up to $2.00.', agents: 1 };
+  const many = { id: 'c3', kind: 'start', sentence: 'Start 2 agents: Claude Code on “a” and Claude Code on “b”?', detail: 'Each one can spend up to $2.00.', agents: 2 };
+  const was = S.meta.permissions;
+  try {
+    S.meta.permissions = 'ask';
+    assert.ok(lidView({ confirm: one }, {}).html.includes('<p class="meta">It can spend up to $2.00.</p>'));
+    assert.doesNotMatch(lidView({ confirm: one }, {}).say, /Full permissions/);
+    S.meta.permissions = 'full';
+    const v = lidView({ confirm: one }, {});
+    assert.ok(v.html.includes('<p class="meta">It can spend up to $2.00. Full permissions are on, so it will not ask before any step.</p>'), v.html);
+    assert.match(v.say, /Full permissions are on, so it will not ask before any step\.$/);
+    assert.ok(lidView({ confirm: many }, {}).html.includes('Each one can spend up to $2.00. Full permissions are on, so they will not ask before any step.'));
+    // a launch card with no detail of its own still says it
+    assert.ok(lidView({ confirm: { ...one, detail: null } }, {}).html.includes('<p class="meta">Full permissions are on, so it will not ask before any step.</p>'));
+    // only launch cards: a merge or a stop says nothing of it
+    for (const kind of ['merge', 'discard', 'stop', 'say', 'forget', 'permissions']) {
+      assert.doesNotMatch(lidView({ confirm: { id: 'c4', kind, sentence: 'Merge it?', detail: 'x.' } }, {}).html, /Full permissions are on/, kind);
+    }
+    // the same card, patched in place when the mode changes: its key stays the card's
+    assert.equal(lidView({ confirm: one }, {}).key, 'confirm:c2');
+  } finally {
+    S.meta.permissions = was;
+  }
+});

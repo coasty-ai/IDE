@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Full permissions.** A button in the top band, beside Agents & keys, for when you want agents to stop asking. Turning it on asks first ("Let agents do anything without asking?"), and the questions already waiting are allowed too. While it is on, it is lit amber and every step that would wait for your OK runs, counted as an automatic approval; changes to Claude Code's own settings, and helpers that would work elsewhere, stay refused. It stays on across restarts, and Workbench says so when it starts; pressing it again, or saying "ask first", turns it off at once. "full permissions", "stop asking" and "allow everything" ask for it in words. In the demo it lasts for that run only.
+
 ## 0.2.0 (2026-11-14)
 
 - **Agents & keys.** A panel on the page that helps install Claude Code and Codex, signs them in through the browser or gives them an API key, and picks the agent for new work. An agent connected while Workbench runs takes work at once, and earlier agents that used it can be continued again.

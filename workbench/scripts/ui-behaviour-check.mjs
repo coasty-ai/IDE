@@ -3,8 +3,8 @@
 // landing on an answer, failed answers that can be retried, "Look later", stepping with "next", typed words bound to the
 // ask on screen, launch questions answered by id and withdrawn when dropped, the look and detail words, the stale key,
 // rest (no motion while waiting), reduced motion, space to talk, the keyboard rules, merging, the spending limit, the git
-// screen, and Agents & keys. Prints PASS or FAIL per point, then every request the page sent, with its body (a key's
-// values shown as "••••").
+// screen, Agents & keys, and Full permissions (the band's button, its card, the launch card's words, the typed words).
+// Prints PASS or FAIL per point, then every request the page sent, with its body (a key's values shown as "••••").
 // Not part of npm test (it needs Chrome). No dependencies.
 //   node scripts/ui-behaviour-check.mjs [--only name] [--log]
 import { startMock } from './ui-mock.mjs';
@@ -1518,6 +1518,147 @@ try {
     check(AK + 'with no coding agent ready it opens by itself, once, the band’s light is lit, and the lid offers Connect',
       opened && lid === 'Connect a coding agent to start.' && lidBtn === 'Connect' && lit && closed && !again && byLid,
       `opened ${opened}, lid "${lid}" [${lidBtn}], lit ${lit}, closed ${closed}, opened again by a snapshot ${again}, by the lid's Connect ${byLid}`);
+  });
+
+  // ---------------------------------------------------------------- full permissions: the band's button, the card, the words
+  const FP = 'full permissions: ';
+  const permBtn = () => b.ev(`(() => { const e = document.getElementById('permBtn'); if (!e) return null; const r = e.getBoundingClientRect();
+    return { hidden: e.hidden, pressed: e.getAttribute('aria-pressed'), on: e.classList.contains('on'), led: !!e.querySelector('.led.on'), state: e.dataset.state || '',
+      name: e.getAttribute('aria-label') || '', text: e.textContent, left: r.left, right: r.right, mid: r.top + r.height / 2 }; })()`);
+  const permPosts = async () => (await posts()).filter(x => x.path === '/api/permissions');
+  const lidDetail = () => b.ev(`${page()}?.querySelector('.meta')?.textContent || ''`);
+
+  await run(FP + 'the band’s button is quiet and not pressed while agents ask; pressed, it asks the engine, and the card comes in the middle with no default answer', async () => {
+    await open('demo');
+    await sleep(900);
+    const off = await permBtn();
+    await realClick('#permBtn');
+    await sleep(1100);
+    const card = await lidNow(), row = await acts(), detail = await lidDetail(), p = await permPosts();
+    const yesBtn = await b.ev(`${page()}?.querySelector('[data-act="confirm"][data-go="1"]')?.dataset.confirm || ''`);
+    check(FP + 'the band’s button is quiet and not pressed while agents ask; pressed, it asks the engine, and the card comes in the middle with no default answer',
+      off && !off.hidden && off.pressed === 'false' && !off.on && !off.led && off.state === 'ask' && off.name === 'Full permissions'
+      && card === 'Before agents stop asking / Let agents do anything without asking?' && row === 'Turn on full permissions,Keep asking'
+      && /It stays on until you turn it off\. The 1 question waiting now is allowed too\.$/.test(detail) && /^c/.test(yesBtn)
+      && p.length === 1 && JSON.stringify(p[0].body) === '{"mode":"full"}',
+      `${JSON.stringify(off)}; "${card}" [${row}] "${detail}"; ${JSON.stringify(p.map(x => x.body))}`);
+  });
+
+  await run(FP + 'Keep asking changes nothing; Turn on full permissions lights the button, allows the question waiting, and says so', async () => {
+    await clickIn('[data-act="confirm"][data-go="0"]');
+    await sleep(900);
+    const kept = await permBtn(), askBefore = (await agentOf('399e17')).ask;
+    await realClick('#permBtn');
+    await sleep(1100);
+    await clickIn('[data-act="confirm"][data-go="1"]');
+    await sleep(1300);
+    const on = await permBtn(), words = await said(), a = await agentOf('399e17');
+    const confirms = (await posts()).filter(x => x.path.startsWith('/api/confirm/')).map(x => x.body.go);
+    check(FP + 'Keep asking changes nothing; Turn on full permissions lights the button, allows the question waiting, and says so',
+      kept.pressed === 'false' && !kept.on && !!askBefore && on.pressed === 'true' && on.on && on.led && on.state === 'full'
+      && /Full permissions are on\. Agents no longer ask\./.test(words) && a.ask === null && a.state === 'working' && JSON.stringify(confirms) === '[false,true]',
+      `kept ${JSON.stringify(kept)}; on ${JSON.stringify(on)}; said "${words}"; ${a.state} ${JSON.stringify(a.ask)}; confirms ${JSON.stringify(confirms)}`);
+  });
+
+  await run(FP + 'while they are on, a launch card says it will not ask; pressed when on, the button turns them off at once, with no card', async () => {
+    await typeIn('start an agent to fix the flaky checkout test');
+    await sleep(1100);
+    const detail = await lidDetail();
+    await clickIn('[data-act="confirm"][data-go="0"]');
+    await sleep(900);
+    await clearLog();
+    await realClick('#permBtn');
+    await sleep(1000);
+    const off = await permBtn(), lid = await lidNow(), words = await said(), p = await permPosts();
+    check(FP + 'while they are on, a launch card says it will not ask; pressed when on, the button turns them off at once, with no card',
+      /It runs on your laptop\. Full permissions are on, so it will not ask before any step\.$/.test(detail)
+      && off.pressed === 'false' && !off.on && !/^Before agents stop asking/.test(lid) && /Agents ask again before risky steps\./.test(words)
+      && p.length === 1 && JSON.stringify(p[0].body) === '{"mode":"ask"}',
+      `launch "${detail}"; ${JSON.stringify(off)}; lid "${lid}"; said "${words}"; ${JSON.stringify(p.map(x => x.body))}`);
+  });
+
+  await run(FP + 'the page arrives with the button already right: from <html> before the first snapshot, never drawn the other way', async () => {
+    await b.beforeLoad(`(() => { window.__perm = []; document.addEventListener('DOMContentLoaded', () => { const e = document.getElementById('permBtn');
+      if (e) new MutationObserver(() => window.__perm.push((e.hidden ? 'hidden' : 'shown') + ':' + e.getAttribute('aria-pressed'))).observe(e, { attributes: true }); }); })()`);
+    await open('full', { mode: { holdMs: 700 } });
+    await sleep(600);
+    const tag = await b.ev(`document.documentElement.dataset.permissions`);
+    const btn = await permBtn(), seen = await b.ev(`(window.__perm || []).join(',')`);
+    check(FP + 'the page arrives with the button already right: from <html> before the first snapshot, never drawn the other way',
+      tag === 'full' && btn.pressed === 'true' && btn.on && !/shown:false/.test(seen) && /shown:true/.test(seen),
+      `html ${tag}; ${JSON.stringify(btn)}; seen ${seen}`);
+  });
+
+  await run(FP + 'a button drawn for the other mode says "That changed" and posts nothing', async () => {
+    await open('demo');
+    await sleep(900);
+    await b.ev(`window.__frames.hold = true, 1`);
+    await push('snapshot', { ...(await ctl('state')), permissions: 'full' });
+    await sleep(500);   // the stream has brought it; the band has not been drawn again
+    const drawn = (await permBtn()).state;
+    await b.ev(`document.getElementById('permBtn').click(), 1`);
+    await sleep(150);
+    const words = await said();
+    await b.ev(`window.__frames.release(), 1`);
+    await sleep(800);
+    const p = await permPosts(), now = await permBtn();
+    check(FP + 'a button drawn for the other mode says "That changed" and posts nothing',
+      drawn === 'ask' && p.length === 0 && /That changed\. Have another look\./.test(words) && now.pressed === 'true',
+      `drawn for ${drawn}, posts ${p.length}, said "${words}", now ${now.pressed}`);
+  });
+
+  await run(FP + 'a keyboard press takes the keyboard to the card; a card already on screen is withdrawn first', async () => {
+    await open('demo');
+    await sleep(900);
+    await typeIn('start an agent to fix the flaky checkout test');
+    await sleep(1100);
+    await b.ev(`document.getElementById('permBtn').focus(), 1`);
+    await b.key('Enter');
+    await sleep(1300);
+    const lid = await lidNow(), f = await focusNow();
+    const p = (await posts()).filter(x => x.path.startsWith('/api/confirm/') || x.path === '/api/permissions').map(x => x.path.startsWith('/api/confirm/') ? `confirm:${x.body.go}` : `permissions:${x.body.mode}`);
+    check(FP + 'a keyboard press takes the keyboard to the card; a card already on screen is withdrawn first',
+      lid === 'Before agents stop asking / Let agents do anything without asking?' && f === 'core:H1' && JSON.stringify(p) === '["confirm:false","permissions:full"]',
+      `"${lid}", focus ${f}, ${JSON.stringify(p)}`);
+  });
+
+  await run(FP + 'words: "stop asking" brings the card, a bare "yes" keeps it, "turn it on" turns them on, "ask first" turns them off', async () => {
+    await open('demo');
+    await sleep(900);
+    await typeIn('stop asking'); await sleep(1100);
+    const card = await lidNow();
+    await typeIn('yes'); await sleep(900);
+    const kept = await lidNow(), keptSaid = await said();
+    await typeIn('turn it on'); await sleep(1300);
+    const on = await permBtn();
+    await typeIn('ask first'); await sleep(1300);
+    const off = await permBtn(), offSaid = await said();
+    const p = (await posts()).filter(x => x.path === '/api/command').map(x => [x.body.text, !!x.body.confirmId]);
+    check(FP + 'words: "stop asking" brings the card, a bare "yes" keeps it, "turn it on" turns them on, "ask first" turns them off',
+      card === 'Before agents stop asking / Let agents do anything without asking?' && kept === card
+      && /Say “do it” to turn on full permissions, or “cancel”\./.test(keptSaid) && on.pressed === 'true' && off.pressed === 'false'
+      && /Agents ask again before risky steps\./.test(offSaid)
+      && JSON.stringify(p) === JSON.stringify([['stop asking', false], ['yes', true], ['turn it on', true], ['ask first', false]]),
+      `"${card}"; yes → "${kept}" "${keptSaid}"; on ${on.pressed}; off ${off.pressed} "${offSaid}"; ${JSON.stringify(p)}`);
+  });
+
+  await run(FP + 'the button sits in the top band just left of Agents & keys, lit amber in every look', async () => {
+    const out = [];
+    let ok = true;
+    for (const theme of ['green', 'black-gold', 'ivory']) {
+      await open('full-live', { theme });
+      await sleep(900);
+      const p = await permBtn();
+      const c = await b.ev(`(() => { const r = document.getElementById('connectBtn').getBoundingClientRect(); return { left: r.left, mid: r.top + r.height / 2, hidden: document.getElementById('connectBtn').hidden }; })()`);
+      const colours = await b.ev(`(() => { const e = document.getElementById('permBtn'), cs = getComputedStyle(e), led = getComputedStyle(e.querySelector('.led'));
+        const lit = getComputedStyle(document.documentElement).getPropertyValue('--lit').trim(); return { border: cs.borderTopColor, led: led.backgroundColor, lit }; })()`);
+      const rgb = hex => { const n = parseInt(hex.replace('#', ''), 16); return `rgb(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255})`; };
+      const here = p.on && p.pressed === 'true' && !c.hidden && p.right <= c.left - 6 && p.right >= c.left - 14 && Math.abs(p.mid - c.mid) <= 1.5
+        && colours.border === rgb(colours.lit) && colours.led === rgb(colours.lit);
+      ok = ok && here;
+      out.push(`${theme}: ${here} (${Math.round(p.right)}→${Math.round(c.left)}, ${JSON.stringify(colours)})`);
+    }
+    check(FP + 'the button sits in the top band just left of Agents & keys, lit amber in every look', ok, out.join('; '));
   });
 
   if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);

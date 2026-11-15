@@ -1812,3 +1812,107 @@ test('a stop names its agent after a comma; a stop past a reaction is no answer 
   const named = { agents: [fromTask('the login page is broken', { id: 'lp0001', state: 'working' })], machines, harnesses, focusId: null };
   assert.deepEqual(parseCommand('the login page is broken. codex', named), start(['the login page is broken', 'codex']));
 });
+
+// ---------------------------------------------------------------------------------------------
+// Full permissions: a few words, said whole, turn them on (asked first, with a card) and off. Never work, never an
+// answer to a question, and never a "yes" to a permission.
+
+CTX.pendingPermissions = { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c20', kind: 'permissions' } };
+CTX.pendingPermissionsOnPermission = { agents, machines, harnesses, focusId: 'a1b2c3', pendingConfirm: { id: 'c20', kind: 'permissions' } };
+
+const PERMS_ON = ['full permissions', 'Full permissions.', 'turn on full permissions', 'Turn on full permissions, please', 'full permissions on',
+  'allow everything', 'Allow everything!', 'stop asking', 'Stop asking!', "don't ask me", 'dont ask me', 'do not ask me', 'full access',
+  'please turn on full permissions', 'okay, stop asking', 'switch on full permissions', 'turn full permissions on', 'full permission',
+  'stop asking me', 'can you stop asking', 'turn on full access', 'um, full permissions', 'just stop asking', 'stop asking now', 'Full Access'];
+const PERMS_OFF = ['ask first', 'Ask first.', 'ask me first', 'turn off full permissions', 'full permissions off', 'ask again', 'ask me again',
+  'switch off full permissions', 'turn full permissions off', 'please ask first', 'full access off', 'Turn off full permissions please', 'okay ask first'];
+
+test('full permissions: the words that turn them on and off, said whole, wherever nothing waits for an answer', () => {
+  for (const ctx of [CTX.none, CTX.onboarding, CTX.invoice, { agents: [], machines, harnesses, focusId: null }]) {
+    for (const s of PERMS_ON) assert.deepEqual(parseCommand(s, ctx), { kind: 'permissions', mode: 'full' }, s);
+    for (const s of PERMS_OFF) assert.deepEqual(parseCommand(s, ctx), { kind: 'permissions', mode: 'ask' }, s);
+  }
+});
+
+test('full permissions: words that only share theirs are work, chat or something else, never the mode', () => {
+  const pinned = ['give the deploy role full permissions on the bucket', 'add full access for admins', 'stop asking for a password on login',
+    'make the app ask first before deleting'];
+  // the four the owner named stay work, as they were
+  for (const s of pinned) {
+    const r = parseCommand(s, CTX.none);
+    assert.equal(r.kind, 'task', `${s} -> ${JSON.stringify(r)}`);
+    assert.equal(r.task, s);
+  }
+  const others = [
+    ...pinned,
+    'full permissions for the admin role', 'allow everything in the firewall config', 'grant full access to the s3 bucket', 'give admins full access',
+    'stop asking users for their email twice', 'the login form should ask first', 'ask first before you delete the old records', 'why do you keep asking',
+    'do not ask me for the token every time in the cli', 'make sure the installer asks again after an error', 'turn on dark mode', 'full screen mode',
+    'full', 'permissions', 'access', 'ask', 'stop', 'allow', 'everything', 'first', 'again', 'full permissions full permissions', 'stop asking stop asking',
+    'what are full permissions', 'are full permissions on', 'should I turn on full permissions', 'how do I stop it asking',
+    'turn on full permissions for the api tokens', 'fix the bug where it keeps asking again', 'ask the agent first', 'ask search cleanup again',
+    'stop onboarding', 'stop everything', 'allow it', 'yes',
+  ];
+  for (const ctx of [CTX.none, CTX.onboarding]) {
+    for (const s of others) assert.notEqual(parseCommand(s, ctx).kind, 'permissions', s);
+  }
+  // after an agent's name the words are for that agent, as before: a message to it, asked first, or work for that program
+  for (const ctx of [CTX.none, CTX.onboarding, CTX.permission]) {
+    assert.deepEqual(parseCommand('Onboarding, ask first', ctx), { kind: 'say', agentId: '7a8b9c', text: 'ask first', sure: false });
+    assert.deepEqual(parseCommand('Flaky test: stop asking', ctx), { kind: 'say', agentId: '0a0b0c', text: 'stop asking', sure: false });
+    assert.deepEqual(parseCommand('Onboarding: full permissions', ctx), { kind: 'say', agentId: '7a8b9c', text: 'full permissions', sure: false });
+    for (const [s, harness, task] of [['claude, stop asking', 'claude', 'stop asking'], ['codex: full access', 'codex', 'full access']]) {
+      const r = parseCommand(s, ctx);
+      assert.equal(r.kind, 'start', `${s} -> ${JSON.stringify(r)}`);
+      assert.deepEqual(r.tasks.map(t => [t.harness, t.task]), [[harness, task]], s);
+    }
+  }
+});
+
+test('full permissions: while an agent asks a question, the words are its answer; while it asks for permission, "yes" still allows', () => {
+  // a question or a stuck agent: whatever is said is the answer, these words too
+  for (const s of [...PERMS_ON, ...PERMS_OFF]) {
+    const q = parseCommand(s, CTX.question);
+    assert.equal(q.kind, 'answer', `${s} -> ${JSON.stringify(q)}`);
+    assert.equal(q.agentId, 'd4e5f6');
+    assert.equal(q.askId, 'ask-q');
+    assert.notEqual(parseCommand(s, CTX.stuck).kind, 'permissions', s);
+  }
+  // a permission: a yes is an allow, a no a deny, as always
+  for (const s of ['yes', 'Yes.', 'allow', 'allow it', 'yes allow it', 'go ahead', 'sure', 'ok']) {
+    assert.deepEqual(parseCommand(s, CTX.permission), { kind: 'allow', agentId: 'a1b2c3', askId: 'ask-perm' }, s);
+  }
+  for (const s of ['no', 'deny', 'nope']) assert.equal(parseCommand(s, CTX.permission).kind, 'deny', s);
+  // the mode's own words, said whole, are the mode: turning it on asks first, and then allows what waits
+  for (const s of PERMS_ON) assert.deepEqual(parseCommand(s, CTX.permission), { kind: 'permissions', mode: 'full' }, s);
+  for (const s of PERMS_OFF) assert.deepEqual(parseCommand(s, CTX.permission), { kind: 'permissions', mode: 'ask' }, s);
+  // longer words that start like them are still a reply to the permission
+  assert.equal(parseCommand('yes, and stop asking about npm', CTX.permission).kind, 'deny');
+  assert.equal(parseCommand("no, don't ask me again about that", CTX.permission).kind, 'deny');
+});
+
+test('full permissions: the card that asks first takes its own words; a bare yes is not enough', () => {
+  for (const ctx of [CTX.pendingPermissions, CTX.pendingPermissionsOnPermission]) {
+    for (const s of ['turn on full permissions', 'Turn it on', 'turn them on', 'switch it on', 'do it', 'yes, do it', 'yes turn it on', 'stop asking',
+      'full permissions', 'allow everything', "don't ask me"]) {
+      assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: true }, s);
+    }
+    for (const s of ['keep asking', 'Keep asking.', 'no', 'cancel', 'nope', 'never mind', 'ask first', 'ask me first', 'keep it off', 'no thanks', "don't turn it on"]) {
+      assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: false }, s);
+    }
+    // a yes said out of habit, or a yes asked rather than said, settles nothing: the card stays
+    for (const s of ['yes', 'sure', 'okay', 'go ahead', 'yep', 'yes please', 'make it so', 'turn it on?', 'do it?']) {
+      assert.equal(parseCommand(s, ctx).kind, 'unknown', s);
+    }
+    // and a question about it never turns them on
+    for (const s of ['is that safe?', 'what does it do', 'why']) assert.notEqual(parseCommand(s, ctx).kind, 'confirm', s);
+  }
+  // a reply to the card may open with a program's name, as replies to cards do
+  assert.deepEqual(parseCommand('claude, turn it on', CTX.pendingPermissions), { kind: 'confirm', go: true });
+  assert.deepEqual(parseCommand('claude, keep asking', CTX.pendingPermissions), { kind: 'confirm', go: false });
+  // on any other card, the mode's words ask for the mode (the engine withdraws that card), and that card's yes stays its own
+  assert.deepEqual(parseCommand('full permissions', CTX.pendingStart), { kind: 'permissions', mode: 'full' });
+  assert.deepEqual(parseCommand('ask first', CTX.pendingMerge), { kind: 'permissions', mode: 'ask' });
+  assert.deepEqual(parseCommand('yes', CTX.pendingStart), { kind: 'confirm', go: true });
+  assert.deepEqual(parseCommand('turn on full permissions', CTX.pendingDiscard), { kind: 'permissions', mode: 'full' });
+});

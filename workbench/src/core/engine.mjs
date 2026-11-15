@@ -7,6 +7,8 @@
 //   connect:  optional, the Connect service (src/core/connect.mjs): the person's keys for agents and checks
 //             (envFor), hiding those keys (mask), and the default agent (defaultAgent). Absent: no keys, nothing
 //             hidden, and new work goes to the first agent that is ready.
+//   prefs:    optional, the person's kept choices ({ get(), set(change) }, createPrefs in src/core/prefs.mjs): live mode
+//             reads full permissions from it at start and keeps them there when they change. The demo never does.
 // This file must not import those modules directly. Each git function it uses (snapshotWork, workDiff, mergeWork,
 // discardWork, gitGraph, gitIdentity, ...) is checked with typeof first, so an older workspace module gives a plain
 // refusal instead of a crash.
@@ -94,6 +96,14 @@ const HELP = 'I did not catch that. Say what to work on, like “the login page 
 // The answer to "help", "hi" or "what can you do": short enough for three lines under the DRAM on the narrowest board.
 const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
+// Full permissions: the card that asks first, and what is said when they go on and off.
+const FULL_SENTENCE = 'Let agents do anything without asking?';
+const FULL_DETAIL = 'Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. It stays on until you turn it off.';
+const FULL_ON = 'Full permissions are on. Agents no longer ask.';
+const FULL_OFF = 'Agents ask again before risky steps.';
+const FULL_REASON = 'Full permissions are on.';
+const MODE_NOT_KEPT = 'Workbench could not keep that choice for the next time it starts. The details are in its log.';
+const MODE_WORDS = 'Say whether agents should ask first or have full permissions.';
 
 /** How a state reads after an agent's name: "Checkout fix needs your OK". */
 const PHRASE = Object.freeze({
@@ -219,6 +229,7 @@ function confirmVerb(c) {
     case 'forget': return 'forget it';
     case 'merge': return 'merge it';
     case 'discard': return 'throw it away';
+    case 'permissions': return 'turn on full permissions';
     case 'stop': return `stop ${c.agentIds?.length > 1 ? 'them' : 'it'}`;
     case 'start': return `start ${c.tasks?.length > 1 ? 'them' : 'it'}`;
     default: return 'go ahead';
@@ -455,8 +466,10 @@ export class Engine extends EventEmitter {
    * @param {object|null} [o.connect]  the Connect service, or null: envFor({ repoRoot, harness }) gives the keys an
    *        agent (and the checks of its work) get, mask(text) hides the stored keys in everything the engine applies,
    *        and defaultAgent() says where new work goes.
+   * @param {object|null} [o.prefs]  the person's kept choices ({ get(), set(change) }): live mode reads full permissions
+   *        from them at start (`permissions: 'full'`), and keeps a change there
    */
-  constructor({ store, mode = 'demo', repo = null, hook = null, defaultBudgetUsd = 2, defaultModel = null, adapters = {}, machines = null, deps = {}, connect = null, log = null, options = {} } = {}) {
+  constructor({ store, mode = 'demo', repo = null, hook = null, defaultBudgetUsd = 2, defaultModel = null, adapters = {}, machines = null, deps = {}, connect = null, prefs = null, log = null, options = {} } = {}) {
     super();
     if (!store) throw new Error('The engine needs a store.');
     this.store = store;
@@ -473,6 +486,10 @@ export class Engine extends EventEmitter {
     // Hides the person's stored keys in text: for the runners, the checks and every event applied. Null without one.
     this._mask = typeof this.connect?.mask === 'function' ? (s) => this._maskText(s) : null;
     this.log = makeLog(log);
+    this.prefs = prefs && typeof prefs === 'object' ? prefs : null;
+    // Full permissions ('full'), or agents ask before risky steps ('ask'). Live mode starts with what the person kept;
+    // the demo always starts asking, and what is turned on there lasts for its own run only.
+    this.permissionMode = this.mode === 'live' ? this._keptMode() : 'ask';
     this.options = { ...DEFAULTS, ...options };
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.stuck = new StuckDetector({ silenceMs: this.options.stuckSilenceMs });
@@ -919,6 +936,10 @@ export class Engine extends EventEmitter {
         }
         break;
       }
+      case EV.ASK:
+        // The demo, with full permissions on: a simulated permission ask is answered Allow by Workbench itself.
+        if (this.mode === 'demo' && this.permissionMode === 'full' && e.ask?.type === 'permission' && !this.asks.has(e.ask.id)) this._allowSimSoon(e.agentId, e.ask.id);
+        break;
       default:
         break;
     }
@@ -1274,9 +1295,10 @@ export class Engine extends EventEmitter {
     let config = DEFAULT_CONFIG;
     try { config = (await run.config) || DEFAULT_CONFIG; } catch { config = DEFAULT_CONFIG; }
     let d;
+    let inFull = 'deny'; // for a request that waits: what full permissions would decide, should the person turn them on
     try {
       if (typeof this.deps.policy?.decide !== 'function') throw new Error('No permission policy is loaded.');
-      d = await this.deps.policy.decide({
+      const req = {
         tool,
         input,
         cwd: run.workspace?.path ?? null, // the engine's workspace, never the payload's cwd
@@ -1285,7 +1307,14 @@ export class Engine extends EventEmitter {
         readAlso: this._readAlso(run),
         // Who SendMessage may reach without asking: the main agent and this agent's own helpers, as its output named them.
         recipients: this._recipients(root, run),
-      });
+      };
+      // With full permissions on, nothing asks: the policy allows it, or refuses the floor.
+      d = await this.deps.policy.decide({ ...req, full: this.permissionMode === 'full' });
+      if (d?.decision === 'ask') {
+        const f = await this.deps.policy.decide({ ...req, full: true });
+        inFull = f?.decision === 'allow' ? 'allow' : 'deny';
+        if (this.permissionMode === 'full') d = f; // turned on while it was checked: judged as full permissions judge it
+      }
     } catch (err) {
       this.log.error('The permission policy failed:', err);
       return hookResponse('deny', 'Workbench could not check this request, so it said no.');
@@ -1296,6 +1325,7 @@ export class Engine extends EventEmitter {
     const shownInput = this._mask ? maskValue(input, this._mask) : input;
     const described = describeRequest(tool, shownInput);
     const sentence = `${asker.name} ${d?.sentence || described.sentence}`;
+    // Allowed, also by full permissions ("Full permissions are on."): an automatic approval.
     if (d?.decision === 'allow') {
       this._apply([{ kind: EV.APPROVAL, agentId: asker.id, how: 'auto', decision: 'allow', sentence }]);
       return hookResponse('allow', d.reason || 'Allowed by the workbench rules.');
@@ -1312,7 +1342,7 @@ export class Engine extends EventEmitter {
     if (asker.parentId && (!askerNow || ENDED.has(askerNow.state))) return hookResponse('deny', 'The helper is no longer running.');
     const why = typeof d.reason === 'string' && d.reason.trim() ? clip(d.reason, 300) : null;
     const detail = shownInput !== input ? described.detail : (d.detail ?? described.detail);
-    return this._hold({ asker, root, sentence, detail, why, signal });
+    return this._hold({ asker, root, sentence, detail, why, signal, inFull });
   }
 
   /** The runner's info(), or null when it has none or it fails. */
@@ -1370,15 +1400,16 @@ export class Engine extends EventEmitter {
     }
   }
 
-  _hold({ asker, root, sentence, detail, why = null, signal }) {
-    // `why` is the permission check's own reason, so the page can say why it asks.
+  _hold({ asker, root, sentence, detail, why = null, signal, inFull = 'deny' }) {
+    // `why` is the permission check's own reason, so the page can say why it asks. `inFull`: whether full permissions
+    // would allow it ('allow'), so turning them on allows it too; anything else keeps waiting for the person.
     const ask = { id: `ok-${hex(4)}`, type: 'permission', sentence, detail: String(detail ?? ''), ...(why ? { why } : {}), options: ['Allow', 'Deny'], primary: 'Allow' };
     return new Promise((resolve) => {
       // Remember the state to go back to: a root asked on behalf of an unknown helper may be waiting on helpers.
       const cur0 = this.store.get(asker.id);
       const showing = cur0?.ask ? this.held.get(cur0.ask.id) : null;
       const prevState = showing ? showing.prevState : cur0?.state;
-      const held = { askId: ask.id, agentId: asker.id, rootId: root.id, ask, resolve, timer: null, done: false, prevState };
+      const held = { askId: ask.id, agentId: asker.id, rootId: root.id, ask, resolve, timer: null, done: false, prevState, inFull };
       this.held.set(ask.id, held);
       this.asks.set(ask.id, { agentId: asker.id, type: 'permission' });
       const ms = this.options.permissionTimeoutMs;
@@ -1445,6 +1476,101 @@ export class Engine extends EventEmitter {
         this._resolveHeld(held, { decision: 'deny', how: 'auto', reason, silent: true });
       }
     }
+  }
+
+  // ================================================================ full permissions
+
+  /**
+   * Full permissions on or off (POST /api/permissions { mode }, and the words for them). 'full' never turns them on by
+   * itself: it answers with a card, and only its yes turns them on (_fullOn). 'ask' turns them off at once. Said as a
+   * notice when there is no card.
+   * @returns {Promise<{ reply: string, confirm: object } | { ok: true, reply: string, permissions: 'ask'|'full' }>}
+   */
+  async permissions(mode) {
+    const out = await this._permissions(mode);
+    if (!out.confirm) this._notice(out.reply);
+    return out;
+  }
+
+  async _permissions(mode) {
+    if (mode !== 'full' && mode !== 'ask') throw plainError(MODE_WORDS);
+    if (mode === 'ask') return this._askAgain();
+    if (this.permissionMode === 'full') return { ok: true, reply: 'Full permissions are already on.', permissions: 'full' };
+    const n = this._allowableHeld().length + this._simPermissionAsks().length;
+    const detail = n ? `${FULL_DETAIL} The ${n} question${n === 1 ? '' : 's'} waiting now ${n === 1 ? 'is' : 'are'} allowed too.` : FULL_DETAIL;
+    return this._newConfirm({ kind: 'permissions', sentence: FULL_SENTENCE, detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true });
+  }
+
+  /**
+   * The yes to the card: full permissions are on, kept for the next start, and every question already waiting that they
+   * allow is allowed now, as an automatic approval: held hook requests, helpers' too, and the demo's own asks. A request
+   * that would change Claude Code's own settings keeps waiting for the person.
+   */
+  _fullOn() {
+    this.permissionMode = 'full';
+    const kept = this._keepMode('full');
+    for (const held of this._allowableHeld()) this._resolveHeld(held, { decision: 'allow', how: 'auto', reason: FULL_REASON });
+    for (const { v, ask } of this._simPermissionAsks()) {
+      this._answerSim(v, ask, 'Allow', { how: 'auto' }).catch(err => this.log.warn('The demo could not take an answer:', err));
+    }
+    this.log.warn('Full permissions are on: agents run every step without asking.');
+    this.emit('permissions', 'full');
+    return { reply: kept ? FULL_ON : `${FULL_ON} ${MODE_NOT_KEPT}`, permissions: 'full' };
+  }
+
+  /** Full permissions off, at once: agents ask again from their next step. */
+  _askAgain() {
+    if (this.permissionMode !== 'full') return { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' };
+    this.permissionMode = 'ask';
+    const kept = this._keepMode('ask');
+    this.log.warn('Full permissions are off: agents ask again before risky steps.');
+    this.emit('permissions', 'ask');
+    return { ok: true, reply: kept ? FULL_OFF : `${FULL_OFF} ${MODE_NOT_KEPT}`, permissions: 'ask' };
+  }
+
+  /** The mode the person kept: 'full' only when the kept choices say exactly that. Live mode reads it at start. */
+  _keptMode() {
+    try {
+      return this.prefs?.get?.()?.permissions === 'full' ? 'full' : 'ask';
+    } catch (err) {
+      this.log.warn('Workbench could not read whether full permissions are on, so agents ask:', err?.message || err);
+      return 'ask';
+    }
+  }
+
+  /** Keep the mode for the next start (live mode: the demo's is for its own run). False when it could not be kept. */
+  _keepMode(mode) {
+    if (this.mode !== 'live' || typeof this.prefs?.set !== 'function') return true;
+    try {
+      return this.prefs.set({ permissions: mode })?.ok !== false;
+    } catch (err) {
+      this.log.warn('Workbench could not keep full permissions for its next start:', err?.message || err);
+      return false;
+    }
+  }
+
+  /** The held hook requests that full permissions allow (every one but those that would change Claude Code's settings). */
+  _allowableHeld() {
+    return [...this.held.values()].filter(h => !h.done && h.inFull === 'allow');
+  }
+
+  /** The demo: the permission asks its simulated agents are waiting on (none in live mode). */
+  _simPermissionAsks() {
+    if (this.mode !== 'demo' || !this.adapters.sim) return [];
+    return this.store.list().filter(v => v.ask?.type === 'permission' && !this.asks.has(v.ask.id)).map(v => ({ v, ask: v.ask }));
+  }
+
+  /**
+   * The demo, with full permissions on: a simulated permission ask is answered Allow, once the simulator has said all of
+   * it (its state comes right after the ask), and only if it still waits and full permissions are still on.
+   */
+  _allowSimSoon(agentId, askId) {
+    setImmediate(() => {
+      if (this._shuttingDown || this.permissionMode !== 'full') return;
+      const v = this.store.get(agentId);
+      if (!v?.ask || v.ask.id !== askId || v.ask.type !== 'permission') return;
+      this._answerSim(v, v.ask, 'Allow', { how: 'auto' }).catch(err => this.log.warn('The demo could not take an answer:', err));
+    });
   }
 
   // ================================================================ answers
@@ -1638,12 +1764,13 @@ export class Engine extends EventEmitter {
     return { ok: true, reply: sent.reply || `Sent your follow-up to ${v.name}.` };
   }
 
-  async _answerSim(v, ask, text) {
+  /** `opts.how`: 'auto' when Workbench answers by itself (full permissions), so the simulator counts no yes of yours. */
+  async _answerSim(v, ask, text, opts = null) {
     const sim = this.adapters.sim;
     if (typeof sim.onAnswer !== 'function') return { ok: false, reply: 'The demo cannot take that answer.' };
     let res;
     try {
-      res = await sim.onAnswer(v.id, ask, text);
+      res = await (opts ? sim.onAnswer(v.id, ask, text, opts) : sim.onAnswer(v.id, ask, text));
     } catch (err) {
       this.log.warn('The simulator could not take an answer:', err);
       return { ok: false, reply: 'The demo could not take that answer.' };
@@ -3479,15 +3606,17 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId? }. `kind` is always there (start,
-   * stop, say, forget, merge or discard); yes and no are the buttons' own words when they are not "Do it" and "Cancel";
-   * agentId (merge and discard cards only) is the agent the card is about.
+   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId?, agents? }. `kind` is always there
+   * (start, stop, say, forget, merge, discard or permissions); yes and no are the buttons' own words when they are not
+   * "Do it" and "Cancel"; agentId (merge and discard cards only) is the agent the card is about; agents (launch cards
+   * only) is how many agents it starts, so the page can say "it" or "they".
    */
   _card(c) {
     const out = { id: c.id, sentence: c.sentence, detail: c.detail ?? null, kind: c.kind };
     if (c.yes) out.yes = c.yes;
     if (c.no) out.no = c.no;
     if (typeof c.danger === 'boolean') out.danger = c.danger;
+    if (c.kind === 'start' && Array.isArray(c.tasks)) out.agents = c.tasks.length;
     // a merge or throw-away card names the agent it is about, so the git screen can show it in that agent's detail
     if ((c.kind === 'merge' || c.kind === 'discard') && typeof c.agentId === 'string' && c.agentId) out.agentId = c.agentId;
     return out;
@@ -3519,6 +3648,11 @@ export class Engine extends EventEmitter {
       case 'connect':
         // "connect", "add a key", "sign in", "agents": the page opens Agents & keys.
         return { reply: CONNECT_REPLY, openConnect: true };
+      case 'permissions': {
+        // "full permissions", "stop asking": a card first. "ask first": off at once.
+        const r = await this._permissions(intent.mode);
+        return r.confirm ? r : { reply: r.reply };
+      }
       case 'answer':
       case 'allow':
       case 'deny': {
@@ -3803,6 +3937,9 @@ export class Engine extends EventEmitter {
       case 'discard':
         if (!go) return { reply: 'OK, I won’t throw it away.' };
         return this._discardConfirmed(c);
+      case 'permissions':
+        if (!go) return { reply: 'OK, agents still ask before risky steps.' };
+        return this._fullOn();
       case 'start':
         if (Array.isArray(c.tasks)) break;
       // falls through: a launch card without its tasks cannot be one
@@ -4063,6 +4200,8 @@ export class Engine extends EventEmitter {
       spendTodayUsd: s.spendTodayUsd,
       spendTodayEstimated: !!s.spendTodayEstimated, // part of it is Workbench's estimate: say "about"
       defaultBudgetUsd: this.defaultBudgetUsd,
+      // 'full' while full permissions are on, else 'ask': the top band's Full permissions button
+      permissions: this.permissionMode,
     };
   }
 }

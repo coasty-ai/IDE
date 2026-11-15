@@ -11,6 +11,7 @@
 //   sleep_idle              forget { agentIds }     continue { agentId }
 //   changes { agentId }     merge { agentId, into? }                     discard { agentId }
 //   confirm { go }          help                    connect              unknown { text }
+//   permissions { mode: 'full'|'ask' }   full permissions on (the engine asks first, with a card) or off
 // Extra fields some intents carry: askId (allow, deny, answer), text (deny: the person's words, such as
 // "no, use the staging database"), conditional (deny: a yes that came with conditions, "yes but only in the
 // tests folder"; text is the whole reply), sure: false (stop, say: the words found the agent but did not name
@@ -453,12 +454,13 @@ const START_YES = new Set(['start', 'launch']);
  * "scrap it" and "trash it" ask for a throw-away card, but they do not answer one: that card takes only its button,
  * "throw it away", "discard it" or "do it", and "scrap that" is one sound from "scratch that", which means never mind.
  */
-const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw'] };
-/** Words that may come with a card's own yes: "bring it in", "throw it away", "merge its changes". */
-const CARD_YES_FILL = { merge: ['in', 'its', 'work', 'changes', 'branch'], discard: ['away', 'out', 'its', 'work', 'changes', 'branch'] };
-/** A card's own no: the throw-away card's "Keep it" button, said. */
-const CARD_NO = { discard: ['keep'] };
-const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'] };
+const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw'], permissions: ['turn', 'switch'] };
+/** Words that may come with a card's own yes: "bring it in", "throw it away", "merge its changes", "turn it on". */
+const CARD_YES_FILL = { merge: ['in', 'its', 'work', 'changes', 'branch'], discard: ['away', 'out', 'its', 'work', 'changes', 'branch'],
+  permissions: ['on', 'full', 'permissions', 'permission'] };
+/** A card's own no: the throw-away card's "Keep it" button, and the full permissions card's "Keep asking", said. */
+const CARD_NO = { discard: ['keep'], permissions: ['keep'] };
+const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'], permissions: ['asking', 'off', 'me'] };
 
 /**
  * A reply to the confirm card on screen: true (yes), false (no), 'asks' (a yes asked rather than said, such as
@@ -475,8 +477,16 @@ function confirmReply(toks, kind, c) {
   const ownNoFill = (typeof kind === 'string' && Object.hasOwn(CARD_NO_FILL, kind)) ? CARD_NO_FILL[kind] : [];
   const isYes = w => (CONFIRM_YES.has(w) && (launch || !START_YES.has(w))) || own.includes(w);
   const isNo = w => (CONFIRM_NO.has(w) && !own.includes(w)) || ownNo.includes(w);
-  // Before the fillers go: "so" is one. Throwing work away takes its own words, so "make it so" keeps that card.
-  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : kind === 'discard' ? 'keep' : true;
+  // The full permissions card: the words that ask for them say yes to it ("stop asking"), and the words that turn them
+  // off, or "keep asking", say no.
+  if (kind === 'permissions') {
+    const mode = permissionsMode(stripTrailing(stripPolite(stripSoft(toks))));
+    if (mode) return mode === 'full';
+    if (/^keep asking(?: me)?$/.test(toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w)).join(' '))) return false;
+  }
+  // Before the fillers go: "so" is one. Throwing work away and full permissions take their own words, so "make it so"
+  // keeps those cards.
+  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : kind === 'discard' || kind === 'permissions' ? 'keep' : true;
   // "don't merge it", "do not throw it away": a no, though the card's own word is in it.
   const first = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w));
   const negated = first[0] === "don't" ? 1 : first[0] === 'do' && first[1] === 'not' ? 2 : first[0] === 'never' ? 1 : 0;
@@ -502,6 +512,11 @@ function confirmReply(toks, kind, c) {
     if (kind === 'discard') {
       const explicit = ws.some((w, i) => (w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || (own.includes(w) && w !== 'throw'))
         || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
+      if (!explicit) return 'keep';
+    }
+    // Turning full permissions on takes its own words too: "turn it on", "turn on full permissions" or "do it".
+    if (kind === 'permissions') {
+      const explicit = ws.some((w, i) => w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || (ws.some(w => own.includes(w)) && ws.includes('on'));
       if (!explicit) return 'keep';
     }
     return true;
@@ -1713,6 +1728,43 @@ function matchConnect(core) {
   return null;
 }
 
+// Full permissions ----------------------------------------------------------------------------
+
+/** The words that turn full permissions on, said whole: the engine asks first, with a card. */
+const PERMISSIONS_ON = [
+  /^(?:(?:turn|switch) on )?full (?:permissions?|access)(?: on)?$/,
+  /^(?:turn|switch) full (?:permissions?|access) on$/,
+  /^allow everything$/,
+  /^stop asking(?: me)?$/,
+  /^(?:don't|do not) ask me$/,
+];
+/** The words that turn them off, said whole: agents ask again, at once. */
+const PERMISSIONS_OFF = [
+  /^ask (?:me )?(?:first|again)$/,
+  /^(?:turn|switch) off full (?:permissions?|access)$/,
+  /^(?:turn|switch) full (?:permissions?|access) off$/,
+  /^full (?:permissions?|access) off$/,
+];
+
+/** 'full', 'ask', or null: what these words, whole, ask of full permissions. */
+function permissionsMode(core) {
+  const s = core.map(t => t.w).join(' ');
+  if (PERMISSIONS_ON.some(re => re.test(s))) return 'full';
+  if (PERMISSIONS_OFF.some(re => re.test(s))) return 'ask';
+  return null;
+}
+
+/**
+ * "full permissions", "stop asking", "allow everything", "don't ask me", "full access" (on); "ask first", "ask me first",
+ * "ask again", "turn off full permissions", "full permissions off" (off). Only these words whole, so "give the deploy
+ * role full permissions on the bucket", "add full access for admins", "stop asking for a password on login" and "make
+ * the app ask first before deleting" are work. Weak: while a question waits, they are its answer.
+ */
+function matchPermissions(core) {
+  const mode = permissionsMode(core);
+  return mode ? { intent: { kind: 'permissions', mode }, strong: false } : null;
+}
+
 // Work requests without a start verb ----------------------------------------------------------
 
 const WORK_VERBS = new Set(['add', 'fix', 'write', 'rewrite', 'create', 'build', 'implement', 'refactor', 'update', 'upgrade',
@@ -2096,6 +2148,14 @@ function parse(said, c, { free = true } = {}) {
   }
   // 2. The focused agent is waiting for permission.
   const permission = ask && ask.type === 'permission';
+  // Full permissions, said whole, come before a permission's own reply: "allow everything" and "don't ask me" would
+  // otherwise be a no that carries those words. "yes" is no such word, so a yes still allows. While a question waits,
+  // they are its answer (step 3). Only the whole utterance counts: after an agent's name ("claude, stop asking",
+  // "Onboarding, ask first") the words are work or a message for that agent, as before.
+  if (!(ask && (ask.type === 'question' || ask.type === 'stuck'))) {
+    const mode = matchPermissions(stripTrailing(stripPolite(stripSoft(base))));
+    if (mode) return mode.intent;
+  }
   const reply = (r) => {
     const intent = { kind: r.kind, agentId: holder.id, askId: ask.id ?? null };
     if (r.text) intent.text = r.text;
@@ -2231,7 +2291,8 @@ function agentAddressed(core, c) {
   const prog = harnessAt(rw, 0);
   if (prog && prog.len === rw.length) return null;
   const r = matchCommand(rest, { ...c, focusId: a.id, focus: a, asker: null }, rest);
-  if (r && !['start', 'task', 'unknown'].includes(r.intent.kind)) return r;
+  // full permissions are Workbench's, never an agent's: "Onboarding, ask first" is a message to it
+  if (r && !['start', 'task', 'unknown', 'permissions'].includes(r.intent.kind)) return r;
   const text = tidy(spanText(rest));
   return text ? { intent: { kind: 'say', agentId: a.id, text, sure: false }, strong: false } : null;
 }
@@ -2269,7 +2330,8 @@ function vocativeRest(core, c) {
   const rest = stripSoft(core.slice(h.len));
   if (!rest.length) return null;
   const r = matchCommand(rest, c, rest);
-  if (!r || ['start', 'task', 'unknown'].includes(r.intent.kind)) return null;
+  // "claude, stop asking" is work for Claude, as before: full permissions take their words only whole
+  if (!r || ['start', 'task', 'unknown', 'permissions'].includes(r.intent.kind)) return null;
   if (!core[h.len - 1].tail && r.intent.kind !== 'stop' && r.intent.kind !== 'stop_all') return null;
   if (r.intent.kind === 'stop' && r.intent.agentIds?.length === 1 && r.intent.agentIds[0] === c.focusId) {
     const f = c.focus;
@@ -2287,6 +2349,7 @@ function matchCommand(core, c, base = core) {
   // cleanup change" and "show search cleanup's changes" were status questions, and still are when they name no agent.
   return matchHelp(core, base, c)
     || matchConnect(core)
+    || matchPermissions(core)
     || matchMachines(core, c)
     || matchStop(core, c)
     || matchForget(core, c)

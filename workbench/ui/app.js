@@ -29,6 +29,8 @@ import { clipToLines } from './layout.js';
 // keys out of the board's input). The shared module is read as a whole: a name it lacks is never a broken page.
 import { setupConnect, openConnect, closeConnect, connectShown, connectNeeds } from './connect.js';
 import { connectMeta, bandView, keyRefusal } from './connectview.js';
+// Full permissions: the top band's button beside Agents & keys (its words and state), sent to the engine when pressed.
+import { permButtonView } from './permissions.js';
 import * as secretShape from '/shared/secretshape.mjs';
 
 // The address is read once, before the key is taken out of it. Switches count only with the key (see address.js).
@@ -42,6 +44,7 @@ const el = {
   parts: $('parts'), machines: $('machines'), tray: $('tray'), card: $('card'), pop: $('pop'), trayList: $('trayList'), look: $('look'),
   brand: $('brand'), mode: $('mode'), repo: $('repo'), conn: $('conn'), spend: $('spend'), wires: $('wires'), board: $('board'),
   dram: $('dram'), boardScreen: $('boardScreen'), gitScreen: $('gitScreen'), gitSay: $('gitSay'), connectBtn: $('connectBtn'),
+  permBtn: $('permBtn'),
 };
 if (debug.still) el.body.classList.add('still');
 
@@ -51,6 +54,9 @@ const reduced = () => RM.matches;
 const prefs = pagePrefs(el.html.dataset);
 el.html.dataset.theme = prefs.theme;
 el.html.dataset.detail = prefs.detail;
+// Whether full permissions are on, as Workbench put it on <html>, so the band's button is right before the first
+// snapshot; each snapshot's meta says it after that.
+Object.assign(S.meta, { permissions: prefs.permissions });
 
 function safeStorage(name) { try { return window[name]; } catch { return null; } }
 
@@ -446,6 +452,7 @@ function paintTop(P, linkS) {
   }
   if (G) board.placeTop(G, el);
   paintConnectBtn(P, live);
+  paintPermBtn(P, live);
 }
 
 // ---------------------------------------------------------------- the card
@@ -536,6 +543,8 @@ async function actOn(b) {
     try {
       const r = await api.confirm(id, go);
       if (S.confirm && S.confirm.id === id) S.confirm = null;
+      // the yes to full permissions: the band's button lights at once (the stream's snapshot says so too)
+      if (r && (r.permissions === 'full' || r.permissions === 'ask')) S.meta.permissions = r.permissions;
       say(r.reply || '', lasting(r));
       after(r);
       moved();
@@ -872,7 +881,7 @@ document.addEventListener('click', e => {
   if (!el.pop.hidden && !el.pop.contains(e.target) && !e.target.closest('.mach')) closePop();
   if (!el.trayList.hidden && !el.trayList.contains(e.target) && !el.tray.contains(e.target)) closeTray();
   if (!el.look.hidden && !el.look.contains(e.target) && !el.brand.contains(e.target)) closeLook(false);
-  if (S.pinId && !e.target.closest('#parts, #card, #core, .pop, .mach, #tray, #brand, #connect, #connectBtn')) { S.pinId = null; render(); }
+  if (S.pinId && !e.target.closest('#parts, #card, #core, .pop, .mach, #tray, #brand, #connect, #connectBtn, #permBtn')) { S.pinId = null; render(); }
 });
 
 // ---------------------------------------------------------------- the look menu (the workbench mark)
@@ -1012,9 +1021,14 @@ function applyDebug() {
   renderSoon();
 }
 
+/** The permission mode a snapshot gives ('full' or 'ask'); an engine that says neither keeps what the page had. */
+const snapMode = (snap, was) => (snap.permissions === 'full' || snap.permissions === 'ask' ? snap.permissions : was);
+
 function onSnapshot(snap) {
-  // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board
-  S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap) };
+  // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board.
+  // meta.permissions: whether full permissions are on, for the band's button and the launch card.
+  S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap),
+    permissions: snapMode(snap, S.meta.permissions) };
   const fresh = new Map((snap.agents || []).map(a => [a.id, a]));
   for (const id of [...S.agents.keys()]) if (!fresh.has(id)) S.agents.delete(id);
   upsert(snap.agents || []);
@@ -1150,6 +1164,82 @@ function paintConnectBtn(P, live) {
   b.style.top = Math.round(G.brand.y - b.offsetHeight / 2) + 'px';
 }
 el.connectBtn.addEventListener('click', () => showConnect(el.connectBtn));
+
+/**
+ * The top band's Full permissions button, just left of Agents & keys (or where it would be, in the demo): quiet while
+ * agents ask before risky steps, lit while full permissions are on, with aria-pressed saying which. It carries the mode it
+ * was drawn for (data-state). Where the band has no room for both buttons' words, Agents & keys takes its short word
+ * first, then this one. On a live link only.
+ */
+function paintPermBtn(P, live) {
+  const b = el.permBtn;
+  b.hidden = !live;
+  if (!live || !G) return;
+  const v = permButtonView(S.meta.permissions);
+  b.style.fontSize = P.silkSub + 'px';
+  const draw = label => {
+    const html = `<span class="led${v.on ? ' on' : ''}" aria-hidden="true"></span><span class="lbl">${esc(label)}</span>`;
+    if (b.dataset.html !== html) { b.innerHTML = html; b.dataset.html = html; }
+  };
+  const c = el.connectBtn, left = G.fiducials[0][0] + 7 + 14;
+  const rightOf = () => (c.hidden ? G.fiducials[1][0] - 7 - 14 : c.offsetLeft - 10);
+  draw(v.label);
+  if (b.offsetWidth > rightOf() - left && !c.hidden) {
+    // Agents & keys takes its short word, staying where it ends
+    const cv = bandView(S.meta.connect), end = c.offsetLeft + c.offsetWidth;
+    if (cv) {
+      const html = `<span class="led ${cv.light}" aria-hidden="true"></span><span class="lbl">${esc(cv.short)}</span>`;
+      if (c.dataset.html !== html) { c.innerHTML = html; c.dataset.html = html; }
+      c.style.left = Math.round(end - c.offsetWidth) + 'px';
+    }
+  }
+  if (b.offsetWidth > rightOf() - left) draw(v.short);
+  b.classList.toggle('on', v.on);
+  b.dataset.state = v.state;
+  if (b.getAttribute('aria-pressed') !== v.pressed) b.setAttribute('aria-pressed', v.pressed);
+  if (b.getAttribute('aria-label') !== v.name) b.setAttribute('aria-label', v.name);
+  if (b.title !== v.title) b.title = v.title;
+  b.style.left = Math.round(Math.max(left, rightOf() - b.offsetWidth)) + 'px';
+  b.style.top = Math.round(G.brand.y - b.offsetHeight / 2) + 'px';
+}
+
+/**
+ * Pressed when off, it asks the engine, whose card ("Let agents do anything without asking?") comes in the middle; only
+ * that card's yes turns them on. Pressed when on, it turns them off at once. A button drawn for the other mode sends
+ * nothing ("That changed. Have another look."). A card already on screen is withdrawn first, as for Merge, so none waits
+ * unseen. A keyboard press takes the keyboard to the card.
+ */
+el.permBtn.addEventListener('click', async () => {
+  const b = el.permBtn;
+  if (b.getAttribute('aria-disabled') === 'true') return;
+  touch();
+  if (b.dataset.state !== S.meta.permissions) { changed(); return; }
+  if (cannotSend(linkNow())) return;
+  const drawn = b.dataset.state;
+  const keyboard = document.activeElement === b;
+  b.setAttribute('aria-disabled', 'true');
+  try {
+    if (drawn !== 'full' && S.confirm) {
+      const old = S.confirm;
+      const w = await api.confirm(old.id, false);
+      if (S.confirm === old) S.confirm = null;
+      say(w.reply || '');
+    }
+    const r = await api.permissions(drawn === 'full' ? 'ask' : 'full');
+    if (r.confirm) {
+      S.confirm = r.confirm;
+      S.focusId = null;
+      moved();
+      renderNow();
+      if (keyboard) el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+    } else {
+      if (r.permissions === 'full' || r.permissions === 'ask') S.meta.permissions = r.permissions;
+      say(r.reply || '');
+    }
+  } catch (err) { say(err.message); }
+  b.removeAttribute('aria-disabled');
+  render();
+});
 
 setupConnect({
   looksLikeSecret: t => secretShape.looksLikeSecret?.(t),

@@ -6,6 +6,10 @@
 // turn an allow into an ask, never the other way round. Refused outright, because an OK could not
 // make them safe: changes to Claude Code's own settings (.claude folders, .mcp.json) and helpers
 // that would work outside the agent's folder.
+//
+// With full permissions on (decide's `full`), the person is not asked at all: every step that would ask runs, except
+// the floor, which is refused. The floor is what is refused anyway (above), and any step that would ask and names
+// Claude Code's own settings as more than something to read (withFull).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -143,6 +147,9 @@ const R = Object.freeze({
   nodeOption: 'This node command uses an option that can run code it was not given as a file.',
   nodeValue: 'An option of this node command has a value that could not be checked.',
   extra: "This command is on the repository's list of allowed commands.",
+  full: 'Full permissions are on.',
+  fullClaude: "This would change Claude Code's own settings, which agents may not change, even with full permissions on.",
+  fullUnchecked: "Whether this would change Claude Code's own settings could not be checked, so it was refused.",
 });
 
 /**
@@ -174,17 +181,18 @@ const RUN = 'run a command';
 /**
  * Decide on one tool call.
  * @param {{ tool: string, input?: object, cwd: string, extraAllow?: string[],
- *           readAlso?: (string | { root: string, session: string })[], recipients?: string[] }} req
+ *           readAlso?: (string | { root: string, session: string })[], recipients?: string[], full?: boolean }} req
  *   cwd is the agent's own folder (its workspace); extraAllow holds command prefixes from workbench.json.
  *   readAlso names the agent's own scratch folders, which it may read without asking: a string is a folder
  *   that belongs to this agent alone; { root, session } covers <root>/<any key>/<session id>/..., where
  *   Claude Code keeps one session's files (the key folder is shared with other sessions, so only the
  *   folder named after this session's id counts).
  *   recipients are the names SendMessage may reach without asking: "main" and this agent's own helpers.
+ *   full (exactly true): full permissions are on, so nothing asks: see withFull.
  * @returns {{ decision: 'allow'|'ask'|'deny', reason: string, sentence: string, detail: string }}
  */
 export function decide(req) {
-  const { tool, input, cwd, extraAllow, readAlso, recipients } = req && typeof req === 'object' ? req : {};
+  const { tool, input, cwd, extraAllow, readAlso, recipients, full } = req && typeof req === 'object' ? req : {};
   const inp = input && typeof input === 'object' ? input : {};
   const ctx = { cwd, extraAllow, also: [], recipients };
   let verdict;
@@ -195,6 +203,7 @@ export function decide(req) {
   } catch {
     verdict = ask(R.broken); // fail closed on anything unexpected
   }
+  if (full === true) verdict = withFull(tool, inp, ctx, verdict);
   let desc;
   try {
     desc = describeRequest(typeof tool === 'string' && tool ? tool : 'a tool', inp);
@@ -256,6 +265,237 @@ function judgeMonitor(input, ctx) {
   if (input.ws !== undefined) return ask(R.monitorWeb);
   if (Object.keys(input).some(k => !MONITOR_FIELDS.has(k))) return ask(R.monitorOther);
   return judgeBash({ command: input.command }, ctx); // its sentence stays "run a command in the background..."
+}
+
+// ---------------------------------------------------------------------------------------------
+// Full permissions
+
+/**
+ * Full permissions: a step the policy would ask about runs without asking, with the reason "Full permissions are on.",
+ * unless it would change Claude Code's own settings (changesClaude): that is refused, as edits there always are. What
+ * the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's settings, helpers
+ * that would work elsewhere) is refused as before. A check that fails refuses: it never allows by mistake.
+ */
+function withFull(tool, input, ctx, verdict) {
+  if (verdict.decision !== 'ask') return verdict;
+  let floor;
+  try {
+    floor = changesClaude(tool, input, ctx);
+  } catch {
+    return deny(R.fullUnchecked, 'claude');
+  }
+  if (floor) return deny(R.fullClaude, 'claude');
+  const out = allow(R.full, verdict.where);
+  return verdict.say ? { ...out, say: verdict.say } : out;
+}
+
+/** Reasons that only say where a command reads: such a part changes nothing there. */
+const READ_WHERE = new Set([R.readOutside, R.readLinks, R.readList, R.globOutside, R.gitSettingsOutside]);
+/** Programs that run what they are given on their input or take their words from it, so any text in the line may count. */
+const RUNS_INPUT = new Set(['xargs', 'parallel', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'eval', 'source', '.',
+  'python', 'python2', 'python3', 'node', 'perl', 'ruby', 'php', 'deno', 'bun', 'osascript', 'awk', 'gawk', 'pwsh', 'lua', 'tclsh', 'Rscript']);
+
+/**
+ * Whether a step that would ask names Claude Code's own settings as more than something to read: an edit whose path
+ * names them, as written or wherever it leads; a command with a part that names them and does more than read
+ * (commandChangesClaude); a tool of another service, or one the policy does not know, with any text that names them.
+ * Reads, web pages, messages and helpers change no file. Best effort: code a step runs can still write anywhere the
+ * person can (ARCHITECTURE.md, "Permission policy").
+ */
+function changesClaude(tool, input, ctx) {
+  const base = realFolder(ctx.cwd);
+  if (EDIT_TOOLS.has(tool)) {
+    return [input.file_path, input.notebook_path].some(p => typeof p === 'string' && (textNamesClaude(p) || (!!base && placeNamesClaude(p.trim(), base, base))));
+  }
+  if (tool === 'Bash' || tool === 'Monitor') return typeof input.command === 'string' && commandChangesClaude(input.command, base, ctx);
+  if (Object.hasOwn(READ_TOOLS, tool) || HELPER_TOOLS.has(tool) || ['WebFetch', 'WebSearch', 'SendMessage'].includes(tool)) return false;
+  return stringsIn(input).some(textNamesClaude);
+}
+
+/**
+ * A command line that names Claude Code's settings as more than something to read: a part that names them (by its words,
+ * links followed, and by what a wildcard matches, read from every folder the line cd's into) and that the policy, judging
+ * it alone, would not allow or would ask about only because it reads outside the folder. A part with a redirection, a
+ * variable set before it, or a value the shell fills in never only reads. When the line names them where no part shows
+ * it (inside a brace, as in .{claude,git}), or when a part runs what it is given (xargs, a shell, an interpreter: the
+ * names can reach it through a pipe or a heredoc), any mention refuses it.
+ */
+function commandChangesClaude(command, base, ctx) {
+  const parts = shellCommands(command);
+  const runsInput = parts.some(c => RUNS_INPUT.has(c.prog) || c.words.slice(0, c.at ?? 0).includes('xargs'));
+  const named = textNamesClaude(runsInput ? command : withoutHeredocs(command));
+  if (!parts.length) return named;
+  if (named && runsInput) return true;
+  const bases = base ? cdBases(parts, base) : [];
+  const naming = parts.filter(c => partNamesClaude(c, bases, base));
+  if (named && !naming.length) return true;
+  return naming.some(c => !readsOnly(c, base, ctx));
+}
+
+/** The folders a line's relative words are read from: the agent's own, and each existing folder it cd's or pushd's into. */
+function cdBases(parts, base) {
+  const bases = [base];
+  for (const c of parts) {
+    if (c.prog !== 'cd' && c.prog !== 'pushd') continue;
+    const to = c.args.filter(a => !a.startsWith('-')).at(-1);
+    const r = to ? resolveReal(withHome(to), base) : null;
+    if (r?.ok && r.exists && !bases.includes(r.real)) bases.push(r.real);
+  }
+  return bases;
+}
+
+/** $HOME or ${HOME} at the start of a word, as the home folder. */
+const withHome = text => String(text).replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.homedir());
+
+/** Whether any word of one part names Claude Code's settings: as written, wherever it leads, or by what it matches. */
+function partNamesClaude(c, bases, base) {
+  for (const raw of c.words) {
+    for (const form of braceForms(withHome(raw))) {
+      if (textNamesClaude(form)) return true;
+      if (!base) continue;
+      for (const piece of new Set([form, ...form.split(/[=:,]/)])) {
+        if (!piece || (piece.startsWith('-') && !piece.includes('/'))) continue;
+        for (const b of bases) {
+          if (placeNamesClaude(piece, b, base)) return true;
+          if (/[*?[]/.test(piece) && globNamesClaude(piece, b, base)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/** Whether a path, read from folder `b`, leads into Claude Code's settings: in the agent's folder or anywhere else. */
+function placeNamesClaude(p, b, base) {
+  if (typeof p !== 'string' || !p || p.includes('\0')) return false;
+  const r = throughLinks(resolveReal(p, b), base);
+  if (!r.ok) return false;
+  const place = placeOf(r.real, base);
+  return place === 'claude' || (place === 'outside' && claudeSetting(r.real));
+}
+
+/**
+ * Whether a wildcard, read from folder `b`, matches anything in Claude Code's settings, the loose way (any case, hidden
+ * names: zsh's NO_CASE_GLOB and GLOB_DOTS, which the person may have set). A wildcard that cannot be expanded here
+ * (outside the folders it may search, too many matches) matches nothing: textNamesClaude still reads its dot patterns.
+ */
+function globNamesClaude(piece, b, base) {
+  const x = expandPattern(piece, b, [], true, { entries: 0, matches: 0 });
+  return !x.error && x.paths.some(p => placeNamesClaude(p, b, base));
+}
+
+/**
+ * Whether text names Claude Code's settings by name: a piece of it between spaces, the shell's punctuation, slashes, =,
+ * : and commas, that the disk takes for .claude or .mcp.json (foldName), after the shell's quotes and backslashes are
+ * taken away and its braces expanded; or a wildcard piece that starts with a dot and could match one of them.
+ */
+function textNamesClaude(text) {
+  const t = String(text ?? '').replace(/[\\'"]/g, '');
+  for (const word of t.split(/[ \t\n\r;&|<>()`$]+/)) {
+    for (const form of braceForms(word)) {
+      for (const seg of form.split(/[/=:,{}]+/)) {
+        if (!seg) continue;
+        const f = foldName(seg);
+        if (f === '.claude' || f === '.mcp.json') return true;
+        if (/[*?[]/.test(seg) && dotPatternMatchesClaude(seg)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** A word's forms with its braces expanded as the shell would ({a,b} and nested ones, at most 32 forms). */
+function braceForms(word, limit = 32) {
+  const m = /\{([^{}]*,[^{}]*)\}/.exec(word);
+  if (!m) return [word];
+  const out = [];
+  for (const alt of m[1].split(',')) {
+    for (const f of braceForms(word.slice(0, m.index) + alt + word.slice(m.index + m[0].length), limit)) {
+      out.push(f);
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether a wildcard segment that starts with a dot (or with a bracket that lists one) could match .claude or .mcp.json:
+ * a hidden name matches only a pattern that starts with a dot, zsh's default. Any case counts.
+ */
+function dotPatternMatchesClaude(seg) {
+  if (seg[0] !== '.' && !/^\[[!^]?[^\]]*\.[^\]]*\]/.test(seg)) return false;
+  let re = '';
+  for (let k = 0; k < seg.length; k++) {
+    const ch = seg[k];
+    if (ch === '*') re += '.*';
+    else if (ch === '?') re += '.';
+    else if (ch === '[' && seg.indexOf(']', k + 2) > 0) {
+      const close = seg.indexOf(']', k + 2);
+      let body = seg.slice(k + 1, close);
+      const not = body[0] === '!' || body[0] === '^';
+      if (not) body = body.slice(1);
+      re += `[${not ? '^' : ''}${body.replace(/[\\\]^]/g, '\\$&')}]`;
+      k = close;
+    } else re += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  try {
+    const r = new RegExp(`^${re}$`, 'i');
+    return r.test('.claude') || r.test('.mcp.json');
+  } catch {
+    return true; // a pattern that cannot be read could match anything
+  }
+}
+
+/** The command without the text of its heredocs (from the line after <<WORD up to the line WORD), which is data. */
+function withoutHeredocs(command) {
+  let out = '';
+  let rest = String(command);
+  for (;;) {
+    const m = /<<(-?)\s*(['"]?)([A-Za-z0-9_.-]+)\2/.exec(rest);
+    if (!m) return out + rest;
+    const nl = rest.indexOf('\n', m.index + m[0].length);
+    if (nl < 0) return out + rest;
+    out += rest.slice(0, nl + 1);
+    const lines = rest.slice(nl + 1).split('\n');
+    const end = lines.findIndex(line => (m[1] ? line.replace(/^\t+/, '') : line) === m[3]);
+    rest = end < 0 ? '' : lines.slice(end).join('\n');
+  }
+}
+
+/**
+ * Whether one part of a command only reads: the policy, judging that part alone, would allow it, or asks only because
+ * what it reads is outside the folder. A part with a value the shell fills in or an escape, a variable set before it,
+ * env or xargs before it, or a redirection other than to the terminal or /dev/null, never only reads; nor does a part
+ * that only sets variables, or a shell given its command inline.
+ */
+function readsOnly(c, base, ctx) {
+  if (!base || c.empty || c.inline) return false;
+  if (c.words.some(w => /[$`\\]/.test(w) || CONTROL.test(w))) return false;
+  if (c.words.slice(0, c.at).some(w => /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(w) || w === 'env' || w === 'xargs')) return false;
+  const rest = [];
+  for (let k = c.at; k < c.words.length; k++) {
+    const w = c.words[k];
+    if (QUIET_REDIRECT.test(w)) continue;
+    if (REDIRECT_ALONE.test(w) && QUIET_TARGET.test(c.words[k + 1] ?? '')) { k++; continue; }
+    if (/[<>]/.test(w)) return false;
+    rest.push(w);
+  }
+  if (!rest.length) return false;
+  const words = rest.map(text => {
+    const glob = /[*?[^#]/.test(text);
+    return { text, glob, globLead: glob && /^[-*?[^#]/.test(text), pattern: text, equals: /^=.|[=:]=./.test(text) };
+  });
+  const v = judgeExpanded(words, base, ctx);
+  return v.decision === 'allow' || READ_WHERE.has(v.reason);
+}
+
+/** Every string in a tool's input, a few levels down (at most 200): what a tool of another service could act on. */
+function stringsIn(value, depth = 0, out = []) {
+  if (out.length >= 200 || depth > 4) return out;
+  if (typeof value === 'string') out.push(value);
+  else if (Array.isArray(value)) for (const v of value) stringsIn(v, depth + 1, out);
+  else if (value && typeof value === 'object') for (const v of Object.values(value)) stringsIn(v, depth + 1, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------

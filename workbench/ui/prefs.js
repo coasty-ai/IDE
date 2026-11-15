@@ -3,25 +3,30 @@
 //
 // Workbench keeps the choices, not the page (src/core/prefs.mjs, in ~/.workbench/prefs.json): the server puts them on
 // <html> as it sends the page (data-theme, data-detail, data-answered), and the page saves a change through
-// POST /api/prefs. The lists match the server's.
+// POST /api/prefs. The lists match the server's. The server also puts the permission mode there (data-permissions), so
+// the top band's Full permissions button is right from the first paint; the page changes it only through the engine
+// (POST /api/permissions), never through its own choices.
 
 export const THEMES = ['green', 'black-gold', 'ivory'];
 export const THEME_NAMES = { green: 'Green', 'black-gold': 'Black and gold', ivory: 'Ivory' };
 export const DETAILS = ['calm', 'more'];
 export const DETAIL_NAMES = { calm: 'Calm', more: 'More' };
 export const DEFAULT_PREFS = Object.freeze({ theme: 'green', detail: 'calm' });
+/** ask: agents ask before risky steps; full: full permissions are on. */
+export const PERMISSIONS = ['ask', 'full'];
 
 export const normalTheme = v => (THEMES.includes(v) ? v : DEFAULT_PREFS.theme);
 export const normalDetail = v => (DETAILS.includes(v) ? v : DEFAULT_PREFS.detail);
 
 /**
  * The choices Workbench put on <html>: `dataset` is document.documentElement.dataset, or anything with the same
- * fields. Anything unknown is the default; `answered` (the person has answered something once) only when it is "1".
- * @returns {{ theme: string, detail: string, answered: boolean }}
+ * fields. Anything unknown is the default; `answered` (the person has answered something once) only when it is "1",
+ * and `permissions` is 'full' only when it says exactly that.
+ * @returns {{ theme: string, detail: string, answered: boolean, permissions: 'ask'|'full' }}
  */
 export function pagePrefs(dataset) {
   const d = dataset && typeof dataset === 'object' ? dataset : {};
-  return { theme: normalTheme(d.theme), detail: normalDetail(d.detail), answered: d.answered === '1' };
+  return { theme: normalTheme(d.theme), detail: normalDetail(d.detail), answered: d.answered === '1', permissions: d.permissions === 'full' ? 'full' : 'ask' };
 }
 
 // The words, matched against the whole utterance only, so "make the login button green" still reaches the agents.

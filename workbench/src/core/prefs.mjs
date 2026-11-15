@@ -2,6 +2,9 @@
 // have answered something once (the hint under the core then stays away). The page gets a new address every run, so
 // its own storage starts empty each time; Workbench keeps these three in ~/.workbench/prefs.json instead, and the server
 // puts them on the page's <html> tag before the first paint (pageWithPrefs), so the board never flashes the wrong look.
+// The same file keeps one choice that is not the page's own: full permissions (`permissions`, ask or full), which the
+// engine reads at start and saves when the person turns them on or off. The page's own route never changes it
+// (prefsChange leaves it out): only the engine does, after its card.
 //
 // Only these keys, and only the values the page offers, are ever read, written or sent: never a secret, never anything
 // else. The folder is made private (0700) and the file is 0600, written to a new temporary file and renamed. A file
@@ -10,10 +13,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-/** The looks and detail levels, as ui/prefs.js lists them (test/prefs.test.mjs keeps the two lists the same). */
+/** The looks, detail levels and permission modes, as ui/prefs.js lists them (test/prefs.test.mjs keeps them the same). */
 export const THEMES = Object.freeze(['green', 'black-gold', 'ivory']);
 export const DETAILS = Object.freeze(['calm', 'more']);
-export const DEFAULT_PREFS = Object.freeze({ theme: 'green', detail: 'calm', answered: false });
+/** ask: agents ask before risky steps (the default); full: they run every step without asking, but the floor. */
+export const PERMISSIONS = Object.freeze(['ask', 'full']);
+export const DEFAULT_PREFS = Object.freeze({ theme: 'green', detail: 'calm', answered: false, permissions: 'ask' });
 
 const MAX_FILE = 4096;
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
@@ -32,6 +37,7 @@ export function cleanPrefs(raw) {
     theme: THEMES.includes(o.theme) ? o.theme : DEFAULT_PREFS.theme,
     detail: DETAILS.includes(o.detail) ? o.detail : DEFAULT_PREFS.detail,
     answered: o.answered === true,
+    permissions: PERMISSIONS.includes(o.permissions) ? o.permissions : DEFAULT_PREFS.permissions,
   };
 }
 
@@ -42,7 +48,8 @@ function refusal(message) {
 
 /**
  * The change a request asks for: `theme`, `detail` and `answered` (only ever true), each checked. Other names are left
- * out, never kept. Nothing known, or a value the page does not offer, is refused with a plain sentence (status 400).
+ * out, never kept: `permissions` too, which only the engine changes, after the person said yes to its card. Nothing
+ * known, or a value the page does not offer, is refused with a plain sentence (status 400).
  * @returns {{ theme?: string, detail?: string, answered?: true }}
  */
 export function prefsChange(body) {
@@ -171,13 +178,14 @@ export function memoryPrefs(start = {}) {
 }
 
 /**
- * The page with the person's choices on its first <html> tag: data-theme, data-detail and data-answered ("1" or "0"),
- * replaced where they are and added where they are not. The values come from the lists only (cleanPrefs), so nothing
- * else ever reaches the page. A page without an <html> tag goes out as it is.
+ * The page with the person's choices on its first <html> tag: data-theme, data-detail, data-answered ("1" or "0") and
+ * data-permissions ("ask" or "full", the mode the server says is on), replaced where they are and added where they are
+ * not. The values come from the lists only (cleanPrefs), so nothing else ever reaches the page. A page without an
+ * <html> tag goes out as it is.
  */
 export function pageWithPrefs(html, prefs) {
   const p = cleanPrefs(prefs);
-  const attrs = [['data-theme', p.theme], ['data-detail', p.detail], ['data-answered', p.answered ? '1' : '0']];
+  const attrs = [['data-theme', p.theme], ['data-detail', p.detail], ['data-answered', p.answered ? '1' : '0'], ['data-permissions', p.permissions]];
   // the tag, with quoted values that may hold ">"; each attribute with any form of value, or none
   return String(html).replace(/<html(?=[\s>])(?:[^>"']|"[^"]*"|'[^']*')*>/i, (tag) => {
     let t = tag;

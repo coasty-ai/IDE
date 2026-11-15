@@ -422,11 +422,42 @@ test('the look, the detail and the first answer are kept across runs in ~/.workb
   const dir = path.join(w.home, '.workbench');
   assert.equal(statSync(dir).mode & 0o777, 0o700);
   assert.equal(statSync(path.join(dir, 'prefs.json')).mode & 0o777, 0o600);
-  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, 'prefs.json'), 'utf8')), { theme: 'ivory', detail: 'more', answered: true });
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, 'prefs.json'), 'utf8')), { theme: 'ivory', detail: 'more', answered: true, permissions: 'ask' });
   // the next run, at whatever address it has, sends the page with them already on <html>
   const second = await running(t, ['--demo', '--no-open', '--port', '0'], w.env);
   assert.match(await tag(second.origin), /data-theme="ivory" data-detail="more" data-answered="1"/);
   assert.equal((await second.stop()), 0, second.out());
+});
+
+test('full permissions kept from an earlier run are read at start and said in the start lines; the demo neither reads nor changes them', async (t) => {
+  const w = setup(t);
+  const dir = path.join(w.home, '.workbench');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, 'prefs.json');
+  writeFileSync(file, JSON.stringify({ theme: 'ivory', detail: 'calm', answered: true, permissions: 'full' }), { mode: 0o600 });
+  const LINE = 'Full permissions are on: agents run every step without asking. Turn them off on the page.';
+  const on = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
+  assert.equal(on.code, 0, on.err);
+  assert.equal(on.lines.filter(l => l === LINE).length, 1, on.out);
+  assert.ok(on.lines.indexOf(LINE) > on.lines.findIndex(l => l.startsWith('Each agent can spend up to')), 'after the spending limit');
+  assert.ok(on.lines.indexOf(LINE) < on.lines.indexOf('Press Ctrl-C to stop.'));
+  // the page arrives with the button already on
+  const live = await running(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
+  assert.match((/<html\b[^>]*>/.exec(await (await fetch(live.origin)).text()) || [''])[0], /data-theme="ivory" data-detail="calm" data-answered="1" data-permissions="full"/);
+  assert.equal(await live.stop(), 0, live.out());
+  // the demo starts asking, says nothing of them, and keeps the file's choice as it was, even when a look is saved
+  const demo = await running(t, ['--demo', '--no-open', '--port', '0'], w.env);
+  assert.match((/<html\b[^>]*>/.exec(await (await fetch(demo.origin)).text()) || [''])[0], /data-permissions="ask"/);
+  const keep = await fetch(`${demo.origin}api/prefs`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': demo.token }, body: JSON.stringify({ theme: 'black-gold' }) });
+  assert.equal(keep.status, 200);
+  assert.equal(await demo.stop(), 0, demo.out());
+  assert.ok(!demo.out().includes(LINE), demo.out());
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { theme: 'black-gold', detail: 'calm', answered: true, permissions: 'full' });
+  // with them off, nothing is said
+  writeFileSync(file, JSON.stringify({ permissions: 'ask' }), { mode: 0o600 });
+  const off = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
+  assert.equal(off.code, 0, off.err);
+  assert.ok(!off.out.includes(LINE), off.out);
 });
 
 test('--app: one line the Mac app reads, no browser, and Workbench stops when the app closes its standard input', async (t) => {

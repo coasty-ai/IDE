@@ -11,6 +11,7 @@ import { visibleControls, clipMiddle, cutMiddle, whoAsks, headlineClass } from '
 import { esc } from './util.js';
 import { agoText } from './boardmodel.js';
 import { lidConnectWords } from './connectview.js';
+import { launchNote } from './permissions.js';
 
 const mark = (shape, tone) => `<svg class="g k-${tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${shape}"/></svg>`;
 // "waiting 4 min": whole minutes only, so the lid does not tick every second while something waits ("asked just now" first)
@@ -65,7 +66,7 @@ const branchLabel = b => visibleControls(cutMiddle(b, 16));
 const branchTitle = (words, b) => (Array.from(String(b)).length > 16 ? ` title="${esc(words + visibleControls(b))}"` : '');
 
 /** The count line of an engine card follows what it is about. */
-const CARD_COUNT = { merge: 'Before it merges', discard: 'Before it is thrown away', forget: 'Before it is forgotten' };
+const CARD_COUNT = { merge: 'Before it merges', discard: 'Before it is thrown away', forget: 'Before it is forgotten', permissions: 'Before agents stop asking' };
 /** Why an agent at its spending limit stopped, in the engine's words (its reason for Claude Code's error_max_budget_usd). */
 const LIMIT_REASON = 'It reached its spending limit.';
 
@@ -168,8 +169,10 @@ export function lidView(f, o = {}) {
     // button asked for (forget, merge, throw away). Its own words for yes and no; a dangerous one has no default answer.
     const c = f.confirm;
     const words = CARD_COUNT[c.kind] || 'You said';
-    // its words name branches, paths and tasks: anything that could hide or turn text is shown
-    const sentence = visibleControls(c.sentence), detail = c.detail ? visibleControls(c.detail) : '';
+    // its words name branches, paths and tasks: anything that could hide or turn text is shown. A launch card adds,
+    // while full permissions are on (the snapshot's meta), that what it starts will not ask before any step.
+    const note = c.kind === 'start' ? launchNote(S.meta.permissions, c.agents) : '';
+    const sentence = visibleControls(c.sentence), detail = [c.detail ? visibleControls(c.detail) : '', note].filter(Boolean).join(' ');
     const t = long(sentence);
     // A card about an agent's work keeps what it says at every fit step but the last, where it goes under "See all of it":
     // a merge's counts and checks, and what a throw-away deletes, are what the person decides on.

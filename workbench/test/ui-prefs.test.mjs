@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { pageCommand, plainWords, pagePrefs, THEMES, DETAILS, DEFAULT_PREFS } from '../ui/prefs.js';
+import { pageCommand, plainWords, pagePrefs, THEMES, DETAILS, PERMISSIONS, DEFAULT_PREFS } from '../ui/prefs.js';
 
 test('the look and detail words the owner asked for change the page', () => {
   assert.deepEqual(pageCommand('black and gold'), { kind: 'theme', theme: 'black-gold' });
@@ -37,13 +37,14 @@ test('plainWords drops punctuation, filler and the switch-to wording', () => {
 });
 
 test('the page reads its choices from what Workbench put on <html>, and anything unknown is the default', () => {
-  assert.deepEqual(pagePrefs({ theme: 'ivory', detail: 'more', answered: '1' }), { theme: 'ivory', detail: 'more', answered: true });
-  assert.deepEqual(pagePrefs({ theme: 'black-gold', detail: 'calm', answered: '0' }), { theme: 'black-gold', detail: 'calm', answered: false });
-  assert.deepEqual(pagePrefs({ theme: 'neon', detail: 'everything', answered: 'yes' }), { ...DEFAULT_PREFS, answered: false });
-  assert.deepEqual(pagePrefs({}), { ...DEFAULT_PREFS, answered: false });
-  assert.deepEqual(pagePrefs(null), { ...DEFAULT_PREFS, answered: false });
+  assert.deepEqual(pagePrefs({ theme: 'ivory', detail: 'more', answered: '1', permissions: 'full' }), { theme: 'ivory', detail: 'more', answered: true, permissions: 'full' });
+  assert.deepEqual(pagePrefs({ theme: 'black-gold', detail: 'calm', answered: '0', permissions: 'ask' }), { theme: 'black-gold', detail: 'calm', answered: false, permissions: 'ask' });
+  assert.deepEqual(pagePrefs({ theme: 'neon', detail: 'everything', answered: 'yes', permissions: 'FULL' }), { ...DEFAULT_PREFS, answered: false, permissions: 'ask' });
+  assert.deepEqual(pagePrefs({}), { ...DEFAULT_PREFS, answered: false, permissions: 'ask' });
+  assert.deepEqual(pagePrefs(null), { ...DEFAULT_PREFS, answered: false, permissions: 'ask' });
   assert.deepEqual(THEMES, ['green', 'black-gold', 'ivory']);
   assert.deepEqual(DETAILS, ['calm', 'more']);
+  assert.deepEqual(PERMISSIONS, ['ask', 'full']);
 });
 
 test('the page keeps no choice in its own storage: it reads them from <html> and saves a change through Workbench', () => {

@@ -25,6 +25,7 @@ When the agent is done, review its changes, then merge them or throw them away. 
 
 - Each agent works in its own git worktree, on its own branch. Nothing reaches your branch until you merge it, and a merge always asks first.
 - Claude Code agents wait for your OK before anything but reading, editing and git in their own folder, and a few safe commands such as tests. You see the exact command first. Codex agents never ask: they run in Codex's own sandbox.
+- **Full permissions**, a button in the page's top band, stop the questions when you want agents to just get on with it. Turning them on asks first. While they are on, agents run every step without asking, except changes to Claude Code's own settings and helpers that would work elsewhere, which stay refused. They stay on, across restarts, until you turn them off.
 - Each Claude Code agent has a spending limit: 2 US dollars, unless you set `--budget`. When one reaches it, the middle offers to give it one more, and only you can. Codex reports no cost, so Codex agents have no limit.
 - Keys you give agents stay in your login keychain on a Mac, and are shown only as "•••• " and their last four characters.
 

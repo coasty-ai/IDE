@@ -1,0 +1,59 @@
+// The top band's Full permissions button (ui/permissions.js), and how the page wires it: the mode from the snapshot and
+// from <html>, the press sent to the engine, and the button carrying the mode it was drawn for.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { permButtonView, permissionMode, launchNote } from '../ui/permissions.js';
+
+const read = (f) => readFileSync(new URL(`../ui/${f}`, import.meta.url), 'utf8');
+
+test('the button is quiet while agents ask, and lit and pressed while full permissions are on', () => {
+  assert.deepEqual(permButtonView('ask'), {
+    state: 'ask', on: false, pressed: 'false', label: 'Full permissions', short: 'Full', name: 'Full permissions',
+    title: 'Agents ask before risky steps. Press to let them run every step without asking.',
+  });
+  assert.deepEqual(permButtonView('full'), {
+    state: 'full', on: true, pressed: 'true', label: 'Full permissions', short: 'Full', name: 'Full permissions',
+    title: 'Full permissions are on: agents run every step without asking. Press to turn them off.',
+  });
+  // anything but full is ask: an unknown or missing mode never lights it
+  for (const v of [undefined, null, '', 'FULL', 'on', true, 1, {}]) {
+    assert.equal(permissionMode(v), 'ask', String(v));
+    assert.equal(permButtonView(v).on, false, String(v));
+  }
+});
+
+test('a launch card says, while full permissions are on, that it will not ask', () => {
+  assert.equal(launchNote('full'), 'Full permissions are on, so it will not ask before any step.');
+  assert.equal(launchNote('full', 1), 'Full permissions are on, so it will not ask before any step.');
+  assert.equal(launchNote('full', 3), 'Full permissions are on, so they will not ask before any step.');
+  assert.equal(launchNote('ask', 3), '');
+  assert.equal(launchNote(undefined), '');
+});
+
+test('the band holds the button beside Agents & keys, with aria-pressed, hidden until the page is live', () => {
+  const html = read('index.html');
+  const btn = (/<button id="permBtn"[^>]*>/.exec(html) || [''])[0];
+  assert.ok(btn, 'there is a Full permissions button');
+  assert.match(btn, /type="button"/);
+  assert.match(btn, / hidden/);
+  assert.match(btn, /aria-pressed="false"/);
+  assert.match(btn, /data-box="permbtn"/);
+  assert.ok(html.indexOf('id="permBtn"') < html.indexOf('id="connectBtn"'), 'before Agents & keys, in the top band');
+  assert.ok(html.indexOf('id="permBtn"') > html.indexOf('<header id="top">'));
+  assert.match(html, /<html [^>]*data-permissions="ask"/);
+});
+
+test('the page learns the mode from <html> and from the snapshot, and a press goes to the engine, checked against what was drawn', () => {
+  const app = read('app.js');
+  const api = read('api.js');
+  assert.match(api, /permissions: mode => call\('POST', '\/api\/permissions', \{ mode \}\)/);
+  // from <html> before the first snapshot, then from each snapshot's meta
+  assert.match(app, /permissions: prefs\.permissions/);
+  assert.match(app, /permissions: snapMode\(snap, S\.meta\.permissions\)/);
+  // the button carries the mode it was drawn for, and a press for another mode sends nothing
+  assert.match(app, /b\.dataset\.state = v\.state/);
+  assert.match(app, /if \(b\.dataset\.state !== S\.meta\.permissions\) \{ changed\(\); return; \}/);
+  assert.match(app, /api\.permissions\(drawn === 'full' \? 'ask' : 'full'\)/);
+  assert.match(app, /setAttribute\('aria-pressed', v\.pressed\)/);
+});
