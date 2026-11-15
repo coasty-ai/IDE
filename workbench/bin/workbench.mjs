@@ -800,19 +800,74 @@ export async function githubStatusMode({ connect, say: out = say, log }) {
   return 0;
 }
 
-function openBrowser(address) {
-  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? null : 'xdg-open';
-  if (!cmd) {
-    say('Open the address above in your browser.');
-    return;
+/** The page's address exactly as Workbench builds it: nothing in it needs quoting in AppleScript or HTML. */
+const PAGE_ADDRESS = /^http:\/\/127\.0\.0\.1:\d{1,5}\/\?t=[0-9a-f]{64}$/;
+/** How long the page that sends the browser on stays on disk: time for a browser that is not running yet to start. */
+const OPENER_KEEP_MS = 2 * 60_000;
+
+/**
+ * Open the page in the person's browser without its key on any command line, which every account on the computer can
+ * read (ps). On macOS, `/usr/bin/osascript -` reads `open location "<address>"` on its standard input. Elsewhere, a
+ * small page that sends the browser on to the address is written to a new private folder (0700; the file 0600) and
+ * opened with `xdg-open <file>`; it is removed after `keepMs`, or by `cleanup()` (when Workbench stops), whichever is
+ * first. On Windows, and for any address not shaped as Workbench builds it, the person opens the printed address.
+ * @param {string} address  `http://127.0.0.1:<port>/?t=<key>`
+ * @param {{ platform?: string, spawn?: Function, say?: Function, tmpdir?: string, keepMs?: number }} [o] (tests)
+ * @returns {{ cleanup(): void }}
+ */
+export function openBrowser(address, { platform = process.platform, spawn: run = spawn, say: out = say, tmpdir = os.tmpdir(), keepMs = OPENER_KEEP_MS } = {}) {
+  const none = { cleanup() {} };
+  if (platform === 'win32' || typeof address !== 'string' || !PAGE_ADDRESS.test(address)) {
+    out('Open the address above in your browser.');
+    return none;
   }
+  let told = false;
+  const yourself = () => {
+    if (told) return;
+    told = true;
+    out('Could not open the browser. Open the address above yourself.');
+  };
+  const start = (cmd, args, stdio) => {
+    const child = run(cmd, args, { stdio, detached: true });
+    child.on('error', yourself);
+    child.on('exit', (code) => { if (code) yourself(); });
+    child.unref?.();
+    return child;
+  };
+  if (platform === 'darwin') {
+    try {
+      const child = start('/usr/bin/osascript', ['-'], ['pipe', 'ignore', 'ignore']);
+      // osascript gone before it read its input: that is said by its exit, never a crash of Workbench's
+      child.stdin.on('error', () => {});
+      child.stdin.end(`open location "${address}"\n`);
+    } catch {
+      yourself();
+    }
+    return none;
+  }
+  let dir = null;
+  const remove = () => {
+    if (!dir) return;
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* already gone */ }
+    dir = null;
+  };
   try {
-    const child = spawn(cmd, [address], { stdio: 'ignore', detached: true });
-    child.on('error', () => say('Could not open the browser. Open the address above yourself.'));
-    child.unref();
+    dir = fs.mkdtempSync(path.join(tmpdir, 'workbench-open-'));
+    const file = path.join(dir, 'open.html');
+    fs.writeFileSync(file, [
+      '<!doctype html>', '<meta charset="utf-8">', '<meta name="referrer" content="no-referrer">',
+      `<meta http-equiv="refresh" content="0; url=${address}">`, '<title>Workbench</title>',
+      `<p><a href="${address}">Open Workbench</a></p>`, '',
+    ].join('\n'), { mode: 0o600, flag: 'wx' });
+    start('xdg-open', [file], 'ignore');
   } catch {
-    say('Could not open the browser. Open the address above yourself.');
+    remove();
+    yourself();
+    return none;
   }
+  const timer = setTimeout(remove, keepMs);
+  timer.unref?.();
+  return { cleanup() { clearTimeout(timer); remove(); } };
 }
 
 /** Exit with a code once output is flushed; force it if something keeps the process alive. */
@@ -1126,7 +1181,10 @@ async function main() {
     process.stdin.resume();
     if (appGone) stopAll(0); // the app went away while Workbench started, after a clone
   }
-  if (args.open) openBrowser(address);
+  if (args.open) {
+    const opened = openBrowser(address);
+    process.on('exit', () => opened.cleanup());
+  }
   return null; // keep running
 }
 

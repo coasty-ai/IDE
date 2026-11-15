@@ -17,7 +17,7 @@ import { checkRules } from '../src/core/receipt.mjs';
 import { Engine } from '../src/core/engine.mjs';
 // Imported, the CLI only exports its parts: it starts only when run as a program.
 import { parseArgs, createLogger, displayUrl, cloneFirst, connectGithubMode, githubReposMode, readLine, pathWithLocalBin, agentLines, wireConnect } from '../bin/workbench.mjs';
-import { githubSigninMode, githubStatusMode } from '../bin/workbench.mjs';
+import { githubSigninMode, githubStatusMode, openBrowser } from '../bin/workbench.mjs';
 import { ghWrapper, FAKE_CODE, FAKE_REPOS } from './helpers/gh-fake.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -243,6 +243,100 @@ async function running(t, args, env) {
     stop: async () => { proc.kill('SIGINT'); return Promise.race([exited, sleep(15_000).then(() => 'still running')]); },
   };
 }
+
+// ------------------------------------------------------------------ opening the browser
+
+/** The page's address as Workbench builds it, with a key made at run time. */
+const pageAddress = () => `http://127.0.0.1:${50000 + Math.floor(Math.random() * 9999)}/?t=${Buffer.from(String(Math.random()).repeat(4)).toString('hex').slice(0, 64).padEnd(64, '0')}`;
+
+/** A stand-in for spawn: records each call and gives back a child whose standard input is kept. */
+function fakeSpawn({ fail = null, exitCode = 0, stdinError = null } = {}) {
+  const calls = [];
+  const spawnFn = (cmd, args, opts) => {
+    if (fail === 'throw') throw new Error('spawn failed');
+    const child = new EventEmitter();
+    const call = { cmd, args: [...args], opts, stdin: '' };
+    calls.push(call);
+    child.unref = () => { call.unref = true; };
+    child.stdin = new PassThrough();
+    child.stdin.on('data', (d) => { call.stdin += d; });
+    // the program went away before it read its input: writing to it fails
+    if (stdinError) child.stdin.end = () => { setImmediate(() => child.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: stdinError }))); return child.stdin; };
+    setImmediate(() => (fail === 'error' ? child.emit('error', new Error('ENOENT')) : child.emit('exit', exitCode)));
+    return child;
+  };
+  return { calls, spawnFn };
+}
+
+test('the browser opens without the key on any command line: on a Mac, osascript reads `open location` on its standard input', async () => {
+  const address = pageAddress();
+  const key = new URL(address).searchParams.get('t');
+  const said = [];
+  const { calls, spawnFn } = fakeSpawn();
+  openBrowser(address, { platform: 'darwin', spawn: spawnFn, say: (l) => said.push(l) });
+  await sleep(20);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, '/usr/bin/osascript');
+  assert.deepEqual(calls[0].args, ['-']);
+  assert.ok(![calls[0].cmd, ...calls[0].args].some((a) => a.includes(key)), 'the key is in no argument');
+  assert.equal(calls[0].opts.stdio[0], 'pipe');
+  assert.equal(calls[0].stdin, `open location "${address}"\n`);
+  assert.equal(calls[0].unref, true);
+  assert.deepEqual(said, []);
+  // osascript could not open it, or could not run: the person is told to open the printed address
+  for (const how of [{ exitCode: 1 }, { fail: 'error' }, { fail: 'throw' }]) {
+    const lines = [];
+    openBrowser(address, { platform: 'darwin', spawn: fakeSpawn(how).spawnFn, say: (l) => lines.push(l) });
+    await sleep(20);
+    assert.deepEqual(lines, ['Could not open the browser. Open the address above yourself.'], JSON.stringify(how));
+  }
+  // osascript gone before it read its input: a closed pipe is not an error of Workbench's, which goes on
+  openBrowser(address, { platform: 'darwin', spawn: fakeSpawn({ stdinError: 'EPIPE' }).spawnFn, say: () => {} });
+  await sleep(20);
+});
+
+test('elsewhere the browser opens a 0600 file in a new 0700 folder that sends it on to the page; the file goes soon after', async (t) => {
+  const tmp = realpathSync(mkdtempSync(path.join(tmpdir(), 'wb-open-')));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const address = pageAddress();
+  const key = new URL(address).searchParams.get('t');
+  const { calls, spawnFn } = fakeSpawn();
+  const opened = openBrowser(address, { platform: 'linux', spawn: spawnFn, say: () => {}, tmpdir: tmp, keepMs: 60_000 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, 'xdg-open');
+  assert.equal(calls[0].args.length, 1);
+  assert.ok(!calls[0].args[0].includes(key), 'the key is in no argument');
+  const file = calls[0].args[0];
+  assert.equal(path.dirname(path.dirname(file)), tmp);
+  assert.equal(statSync(path.dirname(file)).mode & 0o777, 0o700);
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  const page = readFileSync(file, 'utf8');
+  assert.ok(page.includes(`<meta http-equiv="refresh" content="0; url=${address}">`), page);
+  assert.ok(page.includes(`<a href="${address}">`), page);
+  // removed when Workbench stops (or after keepMs)
+  opened.cleanup();
+  assert.equal(existsSync(path.dirname(file)), false);
+  const again = fakeSpawn();
+  openBrowser(address, { platform: 'linux', spawn: again.spawnFn, say: () => {}, tmpdir: tmp, keepMs: 30 });
+  await sleep(150);
+  assert.equal(existsSync(path.dirname(again.calls[0].args[0])), false, 'gone once it had time to be read');
+  assert.deepEqual(readdirSync(tmp), []);
+});
+
+test('only an address shaped as Workbench builds it is opened; on Windows the person opens it', async () => {
+  for (const bad of ['http://127.0.0.1:4317/?t=abc', 'http://127.0.0.1:4317/?t=' + 'a'.repeat(64) + '"; do shell script "x', 'http://example.com/?t=' + 'a'.repeat(64), 'file:///etc/passwd']) {
+    const { calls, spawnFn } = fakeSpawn();
+    const said = [];
+    openBrowser(bad, { platform: 'darwin', spawn: spawnFn, say: (l) => said.push(l) });
+    assert.equal(calls.length, 0, bad);
+    assert.deepEqual(said, ['Open the address above in your browser.'], bad);
+  }
+  const { calls, spawnFn } = fakeSpawn();
+  const said = [];
+  openBrowser(pageAddress(), { platform: 'win32', spawn: spawnFn, say: (l) => said.push(l) });
+  assert.equal(calls.length, 0);
+  assert.deepEqual(said, ['Open the address above in your browser.']);
+});
 
 test('without --port the page takes a free port picked at random, new each run; --port still chooses one', async (t) => {
   assert.equal(parseArgs(['--demo']).port, 0);
