@@ -1467,7 +1467,6 @@ test("Claude Code's settings and git's records are known by name the way the Mac
 // Full permissions (decide's `full`): every step the policy would ask about is allowed, but the floor
 
 const FULL = 'Full permissions are on.';
-const FLOOR = /Claude Code's own settings, which agents may not change, even with full permissions on/;
 /** decide with full permissions on. */
 const full = (row) => decide({ cwd, ...(typeof row === 'function' ? row() : row), full: true });
 
@@ -1522,55 +1521,187 @@ test('with full permissions on, the floor is refused exactly as before: Claude C
   }
 });
 
-test('with full permissions on, a command or tool that names Claude Code’s own settings and does more than read them is refused, never asked', () => {
+// Why full permissions refuse a step, each said only when it is true.
+const FLOOR_REASON = "This would change Claude Code's own settings, which agents may not change, even with full permissions on.";
+const EDIT_UNCLEAR = 'Full permissions are on, but Workbench could not tell where this edit lands, so it did not allow it.';
+const WRITE_UNCLEAR = 'Full permissions are on, but Workbench could not tell where this command writes, so it did not allow it.';
+const TOOL_UNCLEAR = 'Full permissions are on, but Workbench could not tell where this tool works, so it did not allow it.';
+const TOOL_CLAUDE = "Full permissions are on, but this tool works on a place in Claude Code's own settings, and Workbench could not tell whether it changes it, so it did not allow it.";
+const CD_CLAUDE = "Full permissions are on, but this would move the shell into Claude Code's own settings, where its next commands could change them, so it did not allow it.";
+const CODE_CLAUDE = "Full permissions are on, but Workbench could not tell what this does with Claude Code's own settings, which it names, so it did not allow it.";
+
+/** Each row is refused with full permissions on, with exactly this reason. `run` decides one row (full permissions on). */
+function refusedWith(rows, reason, run = full) {
+  const wrong = [];
+  for (const row of rows) {
+    const req = typeof row === 'function' ? row() : row;
+    const d = run(row);
+    if (d.decision !== 'deny' || d.reason !== reason) wrong.push(`${JSON.stringify(req.input)} -> ${d.decision}: ${d.reason}`);
+  }
+  assert.equal(wrong.length, 0, `expected refused, "${reason}":\n  ` + wrong.join('\n  '));
+}
+
+/** Each row runs with full permissions on. */
+function allowedInFull(rows, run = full) {
+  const wrong = [];
+  for (const row of rows) {
+    const req = typeof row === 'function' ? row() : row;
+    const d = run(row);
+    if (d.decision !== 'allow') wrong.push(`${JSON.stringify(req.input)} -> ${d.decision}: ${d.reason}`);
+  }
+  assert.equal(wrong.length, 0, 'expected allowed:\n  ' + wrong.join('\n  '));
+}
+
+/**
+ * A second agent folder, for the places no path can be told for: ten links in a row to something missing (more than the
+ * policy follows), two links that lead to each other, a file taken for a folder, and a folder that holds a .claude.
+ */
+let edgeDir = null;
+function edge() {
+  if (edgeDir) return edgeDir;
+  edgeDir = T + '/edge';
+  for (const d of ['/.claude', '/chain', '/holds/.claude', '/src']) fs.mkdirSync(edgeDir + d, { recursive: true });
+  fs.writeFileSync(edgeDir + '/README.md', 'x\n');
+  for (let i = 0; i < 10; i++) fs.symlinkSync(i < 9 ? `c${i + 1}` : 'nothing-here', `${edgeDir}/chain/c${i}`);
+  fs.symlinkSync('loopB', edgeDir + '/loopA');
+  fs.symlinkSync('loopA', edgeDir + '/loopB');
+  return edgeDir;
+}
+const inEdge = (row) => decide({ cwd: edge(), ...(typeof row === 'function' ? row() : row), full: true });
+
+test('with full permissions on, a step that would write into Claude Code’s own settings is refused, in every form the policy can read', () => {
   const longS = String.fromCharCode(0x17f);
   const joiner = String.fromCharCode(0x200c);
-  const refused = [
-    // the commands the policy asks about today that write there
-    bash('echo {} > .claude/settings.json'), bash('cat > .claude/settings.json <<EOF\n{}\nEOF'), bash('rm -rf .claude'), bash('mv .claude .claude-old'),
-    bash('rm -rf .CLAUDE'), bash(`rm .mcp.j${longS}on`), bash(`rm .clau${joiner}de/settings.json`), bash("sed -i '' s/a/b/ .mcp.json"),
-    () => bash(`cp ${outside}/evil.mjs .claude/settings.json`), // the place outside does not hide the place it writes
-    bash('git checkout -- .claude/settings.json'), bash('git restore .claude/settings.json'), bash('git checkout main -- .claude'),
-    bash('node --test --test-reporter=spec --test-reporter-destination=.claude/settings.json'), bash('node .claude/x.mjs'),
-    bash('cd .claude && rm settings.json'), bash('cd .claude'), bash('mkdir -p sub/.claude && touch sub/.claude/settings.json'),
-    // through a link into .claude, and to something missing there
-    bash('rm cfg/settings.json'), bash('tee to-claude'),
+  const rows = [
+    // redirections, read with the quotes: glued to a word or an fd number, appending, opened to read and write, stdout and stderr together
+    bash('echo {} > .claude/settings.json'), bash('cat > .claude/settings.json <<EOF\n{}\nEOF'), bash('echo x>.claude/a'), bash('npm test 2>>.claude/log'),
+    bash('exec 3<> .mcp.json'), bash('make >&.claude/build.log'),
+    // rm, rmdir, unlink, touch, mkdir, truncate, tee, chmod and chown change every file they name (an option's value is not one)
+    bash('rm -rf .claude'), bash('rm -rf .CLAUDE'), bash(`rm .mcp.j${longS}on`), bash(`rm .clau${joiner}de/settings.json`), bash('rmdir .claude'),
+    bash('unlink .mcp.json'), bash('touch -r README.md .claude/x'), bash('mkdir -p sub/.claude && touch sub/.claude/settings.json'),
+    bash('truncate -s 0 .claude/settings.json'), bash('echo "x" | tee -a ".claude/settings.json"'), bash('chmod 600 .claude/settings.json'),
+    bash('chmod -x .mcp.json'), bash('chown -R me .claude'),
+    // mv moves its sources away and writes its destination; cp, ln, install and rsync write their destination, or the name they give inside it
+    bash('mv .claude .claude-old'), bash('mv notes.json .mcp.json'), bash('mv notes.json .claude/'),
+    () => bash(`cp ${outside}/evil.mjs .claude/settings.json`), () => bash(`cp ${outside}/.mcp.json .`), () => bash(`cp -r ${outside}/dir/ .claude`),
+    bash('ln -sf /tmp/x .claude/settings.json'), bash('install -m 644 hook.sh .claude/hooks/check.sh'), bash('rsync -a backup/ .claude/'),
+    bash('cp -t .claude a.json b.json'),
+    // dd's of=, sed -i and perl -i, an archive written or unpacked there, a download saved there
+    bash('dd if=/dev/zero of=.claude/settings.json'), bash("sed -i '' s/a/b/ .mcp.json"), bash("sed -i 's/a/b/' .claude/settings.json"),
+    bash('sed --in-place -e s/a/b/ .claude/settings.json'), bash("perl -pi -e 's/a/b/' .claude/settings.json"),
+    bash('tar -xzf hooks.tgz -C .claude'), bash('tar xf hooks.tar .claude/settings.json'), bash('tar -cf .claude/backup.tar src'),
+    bash('unzip hooks.zip -d .claude'), bash('unzip -o hooks.zip .mcp.json'),
+    bash('curl -o .claude/settings.json https://example.com/x'), bash('curl -sSLo .mcp.json https://example.com/x'), bash('wget -O .claude/settings.json https://example.com/x'),
+    // git that writes the files it names, from any -C folder; options that name the file written
+    bash('git checkout -- .claude/settings.json'), bash('git restore .claude/settings.json'), bash('git checkout main -- .claude'), bash('git rm -r .claude'),
+    bash('git mv .claude old-settings'), bash('git apply --directory=.claude fix.patch'), bash('git clean -fdx .claude'), bash('git -C .claude checkout .'),
+    bash('git diff --output=.claude/x'), bash('node --test --test-reporter=spec --test-reporter-destination=.claude/settings.json'),
+    bash('sort -o .claude/x list.txt'), bash('uniq list.txt .claude/x'), bash('find . -fprint .claude/x'), bash('find .claude -name "*.json" -delete'),
+    bash("find . -path './.claude/*' -exec rm {} \\;"),
+    // through a link into .claude, and to something missing there; read from the folder a cd leads to
+    bash('rm cfg/settings.json'), bash('tee to-claude'), bash('cd .claude && rm settings.json'),
     // the person's own settings, and the main checkout's
     bash('rm -rf ~/.claude'), bash('echo x >> $HOME/.claude/settings.json'), () => bash(`echo x > ${outside}/.mcp.json`),
-    // written so the shell puts the name together
-    bash("rm -rf '.cla''ude'"), bash('rm -rf .cl\\aude'), bash('rm -rf .{claude,git}'), bash('echo "x" | tee ".claude/settings.json"'),
+    // written so the shell puts the name together, braces too
+    bash("rm -rf '.cla''ude'"), bash('rm -rf .cl\\aude'), bash('rm -rf .{claude,git}'), bash('rm -rf {.claude,build}'), bash('mkdir -p src/{a,.claude}'),
     // wildcards that match it: a dot pattern, and * as zsh matches it with GLOB_DOTS, which the person may have set
     bash('rm -rf .c*'), bash('rm -rf .??aude'), bash('rm -rf *'), bash('chmod -R 777 ./*'),
-    // inside another command, and in the background
-    bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), monitor({ command: 'rm -rf .claude' }),
-    // a tool of another service that names it
-    { tool: 'mcp__fs__write_file', input: { path: '.claude/settings.json', content: '{}' } },
-    { tool: 'mcp__fs__edit', input: { edits: [{ file: 'sub/.mcp.json' }] } },
-    // a path the policy cannot resolve still names it
-    { tool: 'Write', input: { file_path: '~nobody/.claude/settings.json' } }, { tool: 'Write', input: { file_path: 'missing/../.claude/settings.json' } },
+    // a folder that holds them, as a whole
+    bash('rm -rf .'), bash('rm -rf ..'),
+    // inside another command, behind sudo or timeout, and in the background
+    bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), bash('sudo rm -rf .claude'), bash('timeout 5 rm -rf .claude'), monitor({ command: 'rm -rf .claude' }),
   ];
-  for (const row of refused) {
+  refusedWith(rows, FLOOR_REASON);
+  for (const row of rows) {
     const req = typeof row === 'function' ? row() : row;
-    const d = full(row);
-    assert.equal(d.decision, 'deny', JSON.stringify(req.input));
-    assert.match(d.reason, FLOOR, JSON.stringify(req.input));
-    // without full permissions, none of these runs without asking either
-    assert.notEqual(decide({ cwd, ...req }).decision, 'allow', JSON.stringify(req.input));
+    assert.notEqual(decide({ cwd, ...req }).decision, 'allow', JSON.stringify(req.input)); // none runs without asking when they are off
   }
+  // a folder that holds a .claude, removed or moved as a whole
+  refusedWith([bash('rm -rf holds'), bash('mv holds elsewhere')], FLOOR_REASON, inEdge);
 });
 
-test('with full permissions on, reading Claude Code’s settings, and names that only look like them, run', () => {
-  const rows = [
+test('with full permissions on, reading Claude Code’s settings, mentioning them, and running a script that lives there all run', () => {
+  allowedInFull([
+    // the owner's examples: a copy out, an archive of them, words that mention them, a script given them as an argument, a script that lives there
+    bash('cp .claude/settings.json /tmp/backup.json'), bash('tar -czf /tmp/cfg.tgz .claude'), bash('gh pr create --body "Explains the .claude folder"'),
+    bash(`curl -d '{"note":"see .claude"}' https://example.com`), bash("echo '.claude/' >> .gitignore"), bash('echo "Never edit .claude by hand" > docs/NOTE.md'),
+    bash('python3 scripts/check.py --exclude .claude'), bash('node .claude/x.mjs'),
+    { tool: 'mcp__github__create_issue', input: { owner: 'acme', repo: 'shop', title: 'Explain the .claude folder', body: 'See .claude/settings.json and .mcp.json.' } },
+    // a name in quotes is no redirection; sed's script is no file; input read from there; git that only stages; a heredoc's text is data
+    bash("sed -i '' 's/.claude/.config/' README.md"), bash('git commit -m "a > .claude/x"'), bash('echo "see -> .claude/x" > notes.md'),
+    bash('cat < .claude/settings.json'), bash('git add .claude/x'), bash("git commit -m \"$(cat <<'EOF'\nExplain the .claude folder\nEOF\n)\""),
+    bash('grep -rn hooks .claude > /tmp/hooks.txt'), () => bash(`cp -r .claude ${outside}/settings-backup`), bash('ln -s .claude/settings.json settings-link'),
+    bash('bash .claude/hooks/check.sh'), bash('source .claude/env.sh'), bash('tar -xzf build.tgz -C build'), bash('find .claude -name "*.json" > list.txt'),
+    bash('python3 -c "print(1)" > out.txt'), bash("awk -F, '{print $1}' .claude/x.csv > cols.txt"), bash('npx prettier --check .claude/settings.json'),
+    bash('echo $(cat .claude/settings.json) > /tmp/settings.txt'), bash('node --test 2>&1 | grep .claude'), bash('python3 --version && cat .claude/settings.json'),
+    // reading them, and names that only look like them
     bash('cat .claude/settings.json | head -5'), bash('grep -r hooks .claude | wc -l'), bash('cat ~/.claude/settings.json'),
     bash('ls -la ~/.claude && echo done'), bash('git log -- .claude/settings.json | head'),
     () => ({ tool: 'Read', input: { file_path: home + '/.claude/settings.json' } }),
     bash('rm -rf .claude-notes'), bash('rm CLAUDE.md && echo gone'), bash('rm docs/mcp.json.bak; ls'), bash('rm -rf build/*'), bash('rm *.log'),
-    bash('rm -rf node_modules'), { tool: 'Write', input: { file_path: '.claude-notes/a.md' } }, { tool: 'mcp__docs__search', input: { query: 'claude code settings' } },
-  ];
-  for (const row of rows) {
-    const req = typeof row === 'function' ? row() : row;
-    assert.equal(full(row).decision, 'allow', JSON.stringify(req.input));
+    bash('rm -rf node_modules'), bash('rm -rf src'), bash('mv src lib'), { tool: 'Write', input: { file_path: '.claude-notes/a.md' } },
+  ]);
+});
+
+test('with full permissions on, an edit, a command or a tool whose landing place cannot be told is refused, never allowed', () => {
+  const e = edge();
+  // edits: ten links in a row to something missing, a step back out of a folder that is not there, someone else's home folder,
+  // two links that lead to each other, a file taken for a folder, blank space around the path, and no path at all
+  refusedWith([
+    { tool: 'Write', input: { file_path: 'chain/c0' } }, { tool: 'Edit', input: { file_path: 'missing/../notes.md' } },
+    { tool: 'Write', input: { file_path: '~nobody/notes.md' } }, { tool: 'MultiEdit', input: { file_path: 'loopA/x.md' } },
+    { tool: 'Write', input: { file_path: 'README.md/x' } }, { tool: 'NotebookEdit', input: { notebook_path: ' src/a.ipynb' } },
+    { tool: 'Write', input: {} },
+  ], EDIT_UNCLEAR, inEdge);
+  // and an agent's folder that cannot be checked
+  refusedWith([{ tool: 'Write', input: { file_path: 'a.md' } }], EDIT_UNCLEAR, row => decide({ cwd: e + '/no-such-folder', ...row, full: true }));
+  // a path that cannot be resolved but names them is refused for what it names
+  refusedWith([{ tool: 'Write', input: { file_path: '~nobody/.claude/settings.json' } }, { tool: 'Write', input: { file_path: 'missing/../.claude/settings.json' } }],
+    FLOOR_REASON, inEdge);
+  // commands, and a value another command fills in cutting the word a command writes to
+  refusedWith([bash('echo x > missing/../notes.md'), bash('touch ~nobody/x'), bash('cp a.txt chain/c0'), bash('rm loopA/x'),
+    bash('cp a.txt "$(pwd)/.claude/settings.json"'), bash('echo hi > "$(git rev-parse --show-toplevel)/.mcp.json"')], WRITE_UNCLEAR, inEdge);
+  // tools of other services
+  refusedWith([{ tool: 'mcp__fs__write_file', input: { path: 'missing/../x' } }, { tool: 'mcp__fs__write_file', input: { path: 'chain/c0' } }], TOOL_UNCLEAR, inEdge);
+  // without full permissions, these ask
+  for (const row of [{ tool: 'Write', input: { file_path: 'chain/c0' } }, { tool: 'Write', input: { file_path: 'loopA/x.md' } }, bash('echo x > missing/../notes.md')]) {
+    assert.equal(decide({ cwd: e, ...row }).decision, 'ask', JSON.stringify(row.input));
   }
+  // what can be told still runs
+  allowedInFull([bash('echo hi > "$(pwd)/out.txt"'), { tool: 'Write', input: { file_path: 'src/new.md' } }, bash('cp a.txt src/')], inEdge);
+});
+
+test('with full permissions on, code that names Claude Code’s own settings where Workbench cannot follow it, and a cd into them, are refused', () => {
+  refusedWith([
+    bash(`python3 -c "import shutil; shutil.rmtree('.claude')"`), bash(`node -e "require('fs').rmSync('.claude', { recursive: true })"`),
+    bash(`perl -e 'unlink ".mcp.json"'`), bash('echo "rm -rf .claude" | sh'), bash("bash <<'EOF'\nrm -rf .claude\nEOF"),
+    bash('echo .claude | xargs rm -rf'), bash(`awk '{ print > ".claude/x" }' list.txt`), bash(`osascript -e 'do shell script "rm -rf .claude"'`),
+    bash("python3 - <<'EOF'\nimport os; os.remove('.mcp.json')\nEOF"), bash('parallel rm -rf ::: .claude'),
+  ], CODE_CLAUDE);
+  // the shell would stay there: its next command's words are read from the agent's own folder
+  refusedWith([bash('cd .claude'), bash('pushd .claude > /dev/null'), bash('cd cfg'), bash('cd ~/.claude && ls')], CD_CLAUDE);
+  // a script given as a file, code that names nothing of theirs, and names passed to a program that only reads, run
+  allowedInFull([bash('python3 scripts/x.py .claude'), bash('node -e "console.log(1)"'), bash('echo hi | sh'), bash('ls .claude | xargs -n1 echo'),
+    bash('cd src && rm old.js')]);
+});
+
+test('with full permissions on, a tool of another service is judged by the places it is given, not by what its text mentions', () => {
+  refusedWith([
+    { tool: 'mcp__fs__write_file', input: { path: '.claude/settings.json', content: '{}' } },
+    { tool: 'mcp__fs__edit', input: { edits: [{ file: 'sub/.mcp.json', old: 'a', new: 'b' }] } },
+    { tool: 'mcp__fs__move_file', input: { source: 'notes.json', destination: '.claude/settings.json' } },
+    // through a link into .claude: a tool's name does not say whether it only reads
+    { tool: 'mcp__fs__read_file', input: { file_path: 'cfg/settings.json' } },
+    { tool: 'FooTool', input: { target: '~/.claude/settings.json' } }, { tool: 'mcp__x__y', input: { filePath: '.CLAUDE/x' } },
+    { tool: 'mcp__x__y', input: { paths: ['src/a.js', '.mcp.json'] } },
+  ], TOOL_CLAUDE);
+  allowedInFull([
+    { tool: 'mcp__github__create_issue', input: { title: 'Explain .claude', body: 'see .mcp.json' } },
+    { tool: 'mcp__slack__send_message', input: { channel: 'dev', text: 'Never edit .claude by hand' } },
+    { tool: 'mcp__fs__write_file', input: { path: 'docs/claude.md', content: 'See .claude/settings.json' } },
+    { tool: 'mcp__github__get_file_contents', input: { owner: 'acme', repo: 'shop', path: 'README.md' } },
+    { tool: 'mcp__docs__search', input: { query: 'claude code settings in .claude' } },
+  ]);
 });
 
 test('without full permissions, nothing the policy says changes', () => {

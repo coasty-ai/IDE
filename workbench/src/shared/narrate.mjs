@@ -28,17 +28,23 @@ function hostOf(url) { try { return new URL(url).hostname.replace(/^www\./, '');
 /**
  * Split a shell command into the simple commands it runs: the parts joined by ; & | && || or new lines, and
  * the commands inside $( ), ` ` and ( ). Quotes are respected and heredoc text is skipped, so quoted text is
- * not taken for a command. Each part notes whether it sends its output into a file.
- * Only used to put a command into words; the permission policy never relies on it.
- * @returns {{ text: string, writes: boolean }[]}
+ * not taken for a command. Each part notes whether it sends its output into a file (`writes`), and its
+ * redirections (`redir`: where each operator is in its text, and what kind it is), read with the quotes, so
+ * `echo "a > b"` has none and `echo x>b` has one (see partRedirects).
+ * Used to put a command into words, and by the permission policy's floor for full permissions, which reads where
+ * a command writes from it (src/core/policy.mjs); the policy's other rules never rely on it.
+ * @returns {{ text: string, writes: boolean, redir: { start: number, end: number, kind: string }[] }[]}
  */
 function shellParts(cmd) {
   const parts = [];
-  let cur = { text: '', writes: false };
+  const fresh = () => ({ text: '', writes: false, redir: [] });
+  let cur = fresh();
   let q = null; // the open quote, ' or "
   const outer = []; // the quote to go back to when a $( ), ( ) or ` ` ends
   let heredoc = null; // { word, tabs }: the text from the next line up to `word` is data, not commands
-  const end = () => { if (cur.text.trim()) parts.push(cur); cur = { text: '', writes: false }; };
+  const end = () => { if (cur.text.trim()) parts.push(cur); cur = fresh(); };
+  // A redirection's own fd number ("2>", "10<") starts it, when the number is a word of its own so far.
+  const fdStart = () => { const m = /(?:^|[ \t])(\d+)$/.exec(cur.text); return cur.text.length - (m ? m[1].length : 0); };
   for (let k = 0; k < cmd.length; k++) {
     const ch = cmd[k];
     if (q === "'") { if (ch === "'") q = null; cur.text += ch; continue; }
@@ -73,22 +79,80 @@ function shellParts(cmd) {
       heredoc = null;
       continue;
     }
-    if (ch === '&' && cmd[k + 1] === '>') { cur.text += ch; continue; } // &> file: a redirection, not "&"
-    if (';&|{}\n\r'.includes(ch)) { end(); continue; }
     if (ch === '<' && cmd[k + 1] === '<' && cmd[k + 2] !== '<') {
       const m = /^<<(-?)\s*(['"]?)([A-Za-z0-9_.-]+)\2/.exec(cmd.slice(k, k + 200));
-      if (m) { heredoc = { word: m[3], tabs: m[1] === '-' }; cur.text += m[0]; k += m[0].length - 1; continue; }
+      if (m) {
+        heredoc = { word: m[3], tabs: m[1] === '-' };
+        const start = fdStart();
+        cur.text += m[0];
+        k += m[0].length - 1;
+        cur.redir.push({ start, end: cur.text.length, kind: 'heredoc' }); // its word is its end line, not a file
+        continue;
+      }
     }
-    if (ch === '>') {
-      // `> file` and `>> file` write a file; `2>&1` and `> /dev/null` do not.
-      const m = /^>[>|]?\s*(&|\/dev\/(null|stdout|stderr|tty)\b)?/.exec(cmd.slice(k, k + 40));
-      if (!m[1]) cur.writes = true;
-      else if (m[1] === '&') { cur.text += m[0]; k += m[0].length - 1; continue; } // keep "&1" in this part
+    if (ch === '>' || ch === '<' || (ch === '&' && cmd[k + 1] === '>')) {
+      // One redirection, its operator whole: `&>` is no "&", `>|` no pipe and `<&3` no new command. `> file`, `>> file`,
+      // `&> file`, `<> file` and `>&file` write a file; `2>&1`, `<&3`, `> /dev/null` and `<` do not.
+      const op = /^(?:&>>?|<<<|<>|<&|<|>>|>\||>&|>)/.exec(cmd.slice(k, k + 3))[0];
+      const start = ch === '&' ? cur.text.length : fdStart();
+      cur.text += op;
+      k += op.length - 1;
+      const after = cmd.slice(k + 1, k + 41);
+      let kind = op === '<' ? 'read' : op === '<<<' ? 'string' : op === '<&' ? 'dup' : 'write';
+      if (op === '>&' && /^\s*(?:\d+|-)(?:$|[\s;&|<>()])/.test(after)) kind = 'dup';
+      if (kind === 'write' && /^\s*\/dev\/(?:null|stdout|stderr|tty)(?:$|[\s;&|<>()])/.test(after)) kind = 'quiet';
+      if (kind === 'write') cur.writes = true;
+      cur.redir.push({ start, end: cur.text.length, kind });
+      continue;
     }
+    if (';&|{}\n\r'.includes(ch)) { end(); continue; }
     cur.text += ch;
   }
   end();
   return parts;
+}
+
+/**
+ * The word a redirection names, from `from` in a part's text: its quotes and backslashes taken away as shellWords does,
+ * up to a blank or the next redirection. `end` is where it ends in the text.
+ */
+function redirectWord(text, from) {
+  let k = from;
+  while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++;
+  let w = '';
+  let q = null;
+  for (; k < text.length; k++) {
+    const ch = text[k];
+    if (q) {
+      if (ch === q) q = null;
+      else if (ch === '\\' && q === '"' && k + 1 < text.length) w += text[++k];
+      else w += ch;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '<' || ch === '>') break;
+    if (ch === "'" || ch === '"') q = ch;
+    else if (ch === '\\' && k + 1 < text.length) w += text[++k];
+    else w += ch;
+  }
+  return { word: w, end: k };
+}
+
+/**
+ * A part's redirections, `{ op, kind, target }` each (kind: 'write', 'quiet' for /dev/null and the like, 'read', 'dup',
+ * 'string' for <<<, 'heredoc'), and its text without them, so its words are the command's own (`echo x>.claude/a` is
+ * `echo x`, writing `.claude/a`).
+ */
+function partRedirects(part) {
+  const redirects = [];
+  let bare = '';
+  let at = 0;
+  for (const r of part.redir) {
+    const w = r.kind === 'heredoc' ? { word: '', end: r.end } : redirectWord(part.text, r.end);
+    redirects.push({ op: part.text.slice(r.start, r.end), kind: r.kind, target: w.word });
+    bare += part.text.slice(at, r.start) + ' ';
+    at = w.end;
+  }
+  return { redirects, bare: bare + part.text.slice(at) };
 }
 
 /** The words of one part, with quotes and backslashes removed the way the shell would. */
@@ -178,10 +242,14 @@ function simpleCommands(command, depth = 0) {
   for (const part of shellParts(String(command || ''))) {
     const words = shellWords(part.text);
     const c = simpleCommand(words, part.writes);
+    // where the part redirects to, and the command without its redirections (null when that leaves no program)
+    const { redirects, bare } = partRedirects(part);
+    const own = { redirects, bare: simpleCommand(shellWords(bare), part.writes) };
     if (!c) {
-      if (words.length) out.push({ empty: true, prog: '', script: false, args: [], writes: part.writes, sub: '', subArgs: [], gitOpts: false, words, at: words.length });
+      if (words.length) out.push({ empty: true, prog: '', script: false, args: [], writes: part.writes, sub: '', subArgs: [], gitOpts: false, words, at: words.length, ...own });
       continue;
     }
+    Object.assign(c, own);
     out.push(c);
     const dashC = SHELLS.has(c.prog) ? c.args.findIndex(a => /^-[a-z]*c[a-z]*$/.test(a)) : -1;
     const inner = dashC >= 0 && c.args[dashC + 1] !== undefined ? c.args[dashC + 1] : c.prog === 'eval' ? c.args.join(' ') : null;
@@ -542,8 +610,11 @@ export function commandAction(command, vouch) {
 /**
  * The simple commands of a command line, each with all its words (`words`), where the program is among them
  * (`at`), the program's name (`prog`), the words after it (`args`), whether the program is named by a path to a
- * script (`script`), and whether the part sends its output into a file (`writes`). For the permission policy's
- * wording only: the policy never decides anything from this reading.
+ * script (`script`), and whether the part sends its output into a file (`writes`). Also its redirections
+ * (`redirects`: `{ op, kind, target }`, read with the quotes) and the command without them (`bare`, the same
+ * fields, or null when only redirections and variables are left); `find -exec`'s inner command has neither. For the
+ * permission policy's wording, and for its floor under full permissions, which reads where a command writes from
+ * `redirects` and `bare`: the policy's other decisions never come from this reading.
  */
 export function shellCommands(command) {
   try { return simpleCommands(command); } catch { return []; }

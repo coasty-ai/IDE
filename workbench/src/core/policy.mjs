@@ -8,8 +8,8 @@
 // that would work outside the agent's folder.
 //
 // With full permissions on (decide's `full`), the person is not asked at all: every step that would ask runs, except
-// the floor, which is refused. The floor is what is refused anyway (above), and any step that would ask and names
-// Claude Code's own settings as more than something to read (withFull).
+// the floor, which is refused. The floor is what is refused anyway (above), any step that would ask and would write into
+// Claude Code's own settings as far as the policy can tell, and any whose landing place it cannot tell (withFull).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -150,6 +150,12 @@ const R = Object.freeze({
   full: 'Full permissions are on.',
   fullClaude: "This would change Claude Code's own settings, which agents may not change, even with full permissions on.",
   fullUnchecked: "Whether this would change Claude Code's own settings could not be checked, so it was refused.",
+  fullEditUnclear: 'Full permissions are on, but Workbench could not tell where this edit lands, so it did not allow it.',
+  fullWriteUnclear: 'Full permissions are on, but Workbench could not tell where this command writes, so it did not allow it.',
+  fullToolUnclear: 'Full permissions are on, but Workbench could not tell where this tool works, so it did not allow it.',
+  fullToolClaude: "Full permissions are on, but this tool works on a place in Claude Code's own settings, and Workbench could not tell whether it changes it, so it did not allow it.",
+  fullCdClaude: "Full permissions are on, but this would move the shell into Claude Code's own settings, where its next commands could change them, so it did not allow it.",
+  fullCodeClaude: "Full permissions are on, but Workbench could not tell what this does with Claude Code's own settings, which it names, so it did not allow it.",
 });
 
 /**
@@ -272,116 +278,736 @@ function judgeMonitor(input, ctx) {
 
 /**
  * Full permissions: a step the policy would ask about runs without asking, with the reason "Full permissions are on.",
- * unless it would change Claude Code's own settings (changesClaude): that is refused, as edits there always are. What
- * the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's settings, helpers
- * that would work elsewhere) is refused as before. A check that fails refuses: it never allows by mistake.
+ * unless the floor refuses it (fullFloor): a step that would write into Claude Code's own settings, as far as the policy can
+ * tell, or one whose landing place it cannot tell. What the policy allows or refuses anyway stays exactly as it is: edits
+ * to Claude Code's settings and helpers that would work elsewhere are refused as before. A check that fails refuses: it
+ * never allows by mistake.
  */
 function withFull(tool, input, ctx, verdict) {
   if (verdict.decision !== 'ask') return verdict;
-  let floor;
+  let refused;
   try {
-    floor = changesClaude(tool, input, ctx);
+    refused = fullFloor(tool, input, ctx);
   } catch {
     return deny(R.fullUnchecked, 'claude');
   }
-  if (floor) return deny(R.fullClaude, 'claude');
+  if (refused) return deny(refused, 'claude');
   const out = allow(R.full, verdict.where);
   return verdict.say ? { ...out, say: verdict.say } : out;
 }
 
-/** Reasons that only say where a command reads: such a part changes nothing there. */
-const READ_WHERE = new Set([R.readOutside, R.readLinks, R.readList, R.globOutside, R.gitSettingsOutside]);
-/** Programs that run what they are given on their input or take their words from it, so any text in the line may count. */
-const RUNS_INPUT = new Set(['xargs', 'parallel', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'eval', 'source', '.',
-  'python', 'python2', 'python3', 'node', 'perl', 'ruby', 'php', 'deno', 'bun', 'osascript', 'awk', 'gawk', 'pwsh', 'lua', 'tclsh', 'Rscript']);
-
 /**
- * Whether a step that would ask names Claude Code's own settings as more than something to read: an edit whose path
- * names them, as written or wherever it leads; a command with a part that names them and does more than read
- * (commandChangesClaude); a tool of another service, or one the policy does not know, with any text that names them.
- * Reads, web pages, messages and helpers change no file. Best effort: code a step runs can still write anywhere the
- * person can (ARCHITECTURE.md, "Permission policy").
+ * Why full permissions refuse a step that would ask, or null when it runs. An edit (editFloor), a command (commandFloor) and
+ * a tool of another service or one the policy does not know (toolFloor) are judged by where they write, as far as the
+ * policy can tell, and each reason is said only when it is true. Reads, web pages, messages and helpers change no file.
+ * Best effort: code a step runs can still write anywhere the person can (ARCHITECTURE.md, "Permission policy").
  */
-function changesClaude(tool, input, ctx) {
+function fullFloor(tool, input, ctx) {
   const base = realFolder(ctx.cwd);
-  if (EDIT_TOOLS.has(tool)) {
-    return [input.file_path, input.notebook_path].some(p => typeof p === 'string' && (textNamesClaude(p) || (!!base && placeNamesClaude(p.trim(), base, base))));
-  }
-  if (tool === 'Bash' || tool === 'Monitor') return typeof input.command === 'string' && commandChangesClaude(input.command, base, ctx);
-  if (Object.hasOwn(READ_TOOLS, tool) || HELPER_TOOLS.has(tool) || ['WebFetch', 'WebSearch', 'SendMessage'].includes(tool)) return false;
-  return stringsIn(input).some(textNamesClaude);
+  if (EDIT_TOOLS.has(tool)) return editFloor(tool, input, base);
+  if (tool === 'Bash' || tool === 'Monitor') return typeof input.command === 'string' ? commandFloor(input.command, base) : null;
+  if (Object.hasOwn(READ_TOOLS, tool) || HELPER_TOOLS.has(tool) || ['WebFetch', 'WebSearch', 'SendMessage'].includes(tool)) return null;
+  return toolFloor(input, base);
 }
 
 /**
- * A command line that names Claude Code's settings as more than something to read: a part that names them (by its words,
- * links followed, and by what a wildcard matches, read from every folder the line cd's into) and that the policy, judging
- * it alone, would not allow or would ask about only because it reads outside the folder. A part with a redirection, a
- * variable set before it, or a value the shell fills in never only reads. When the line names them where no part shows
- * it (inside a brace, as in .{claude,git}), or when a part runs what it is given (xargs, a shell, an interpreter: the
- * names can reach it through a pipe or a heredoc), any mention refuses it.
+ * An edit writes where its path leads. A path that names Claude Code's settings as written is refused for that (also
+ * ~nobody/.claude/… and missing/../.claude/…, which cannot be resolved); one whose landing place cannot be resolved (more
+ * links in a row than the policy follows, a step back out of a folder that is not there, ~user, links that lead to each
+ * other, a file taken for a folder, blank space around it, no path, an agent's folder that cannot be checked) is refused
+ * too, never allowed.
  */
-function commandChangesClaude(command, base, ctx) {
-  const parts = shellCommands(command);
-  const runsInput = parts.some(c => RUNS_INPUT.has(c.prog) || c.words.slice(0, c.at ?? 0).includes('xargs'));
-  const named = textNamesClaude(runsInput ? command : withoutHeredocs(command));
-  if (!parts.length) return named;
-  if (named && runsInput) return true;
-  const bases = base ? cdBases(parts, base) : [];
-  const naming = parts.filter(c => partNamesClaude(c, bases, base));
-  if (named && !naming.length) return true;
-  return naming.some(c => !readsOnly(c, base, ctx));
+function editFloor(tool, input, base) {
+  if ([input.file_path, input.notebook_path].some(p => typeof p === 'string' && textNamesClaude(p))) return R.fullClaude;
+  const target = tool === 'NotebookEdit' ? (input.notebook_path ?? input.file_path) : (input.file_path ?? input.notebook_path);
+  if (typeof target !== 'string' || !target.trim() || padded(target) || !base) return R.fullEditUnclear;
+  const v = landing(target, base, base);
+  return v === 'claude' ? R.fullClaude : v === 'unclear' ? R.fullEditUnclear : null;
 }
 
-/** The folders a line's relative words are read from: the agent's own, and each existing folder it cd's or pushd's into. */
-function cdBases(parts, base) {
-  const bases = [base];
-  for (const c of parts) {
-    if (c.prog !== 'cd' && c.prog !== 'pushd') continue;
-    const to = c.args.filter(a => !a.startsWith('-')).at(-1);
-    const r = to ? resolveReal(withHome(to), base) : null;
-    if (r?.ok && r.exists && !bases.includes(r.real)) bases.push(r.real);
+/** Whether a real path is in Claude Code's own settings: in the agent's folder (placeOf), or anywhere else (claudeSetting). */
+function settingsPlace(real, base) {
+  const place = placeOf(real, base);
+  return place === 'claude' || (place === 'outside' && claudeSetting(real));
+}
+
+/** Whether a real path is a folder. */
+function isFolder(real) {
+  try { return fs.statSync(real).isDirectory(); } catch { return false; }
+}
+
+/**
+ * Whether a folder holds Claude Code's own settings, so that removing or moving it as a whole changes them: it is the agent's
+ * folder, the home folder, or a folder above them where they are (<agent's folder>/.claude or .mcp.json, ~/.claude), or it
+ * has a .claude folder or a .mcp.json of its own.
+ */
+function holdsClaude(real, base) {
+  if (!isFolder(real)) return false;
+  const within = p => p === real || p.startsWith(real === '/' ? '/' : real + '/');
+  for (const p of [base + '/.claude', base + '/.mcp.json', path.join(os.homedir(), '.claude')]) if (within(p) && present(p)) return true;
+  try {
+    return fs.readdirSync(real).some(n => { const f = foldName(n); return f === '.claude' || f === '.mcp.json'; });
+  } catch {
+    return false;
   }
-  return bases;
+}
+
+/**
+ * Where writing at `p`, read from folder `b`, lands: 'claude' (Claude Code's settings, here or anywhere else), 'clear', or
+ * 'unclear' when the path cannot be resolved (links followed, through a link to something missing too). `deep`: the step
+ * changes what is inside a folder there as well (rm -r, mv, chmod -R). `into`: a name it gives inside it when it is a
+ * folder (`cp evil/.mcp.json .` writes ./.mcp.json).
+ */
+function landing(p, b, base, { deep = false, into = null } = {}) {
+  if (typeof p !== 'string' || !p || p.includes('\0')) return 'unclear';
+  const r = throughLinks(resolveReal(p, b), base);
+  if (!r.ok) return 'unclear';
+  if (settingsPlace(r.real, base)) return 'claude';
+  if (deep && r.exists && holdsClaude(r.real, base)) return 'claude';
+  if (into && r.exists && isFolder(r.real) && settingsPlace(path.join(r.real, into), base)) return 'claude';
+  return 'clear';
+}
+
+/**
+ * A command line, as far as the policy can tell. Refused when a part would write into Claude Code's own settings (its
+ * redirections, and the files its program writes: writeTargets), when a cd or pushd would leave the shell in them (the
+ * next command's words are read from the agent's own folder), when a part runs code it is given whose text names them
+ * (codeNamesClaude, xargs and parallel too), or when the policy cannot tell where a part writes (a place that cannot be
+ * resolved, a word another command's output cuts in two). Reads, mentions in the words of commands that write elsewhere,
+ * and a script run from there all run. Every form of the line with its braces expanded is read (lineBraceForms), and every
+ * part, also inside sh -c '…', eval, $(…) and backticks (narrate's shellCommands); relative words are read from the agent's
+ * folder and from each folder the line cd's into.
+ */
+function commandFloor(command, base) {
+  const lines = lineBraceForms(command);
+  if (!lines) return R.fullWriteUnclear;
+  let unclear = false;
+  let cd = false;
+  let code = false;
+  let writes = false;
+  for (const line of lines) {
+    const parts = shellCommands(line);
+    const bases = base ? cdFolders(parts, base) : [];
+    for (const c of parts) {
+      const targets = writeTargets(c);
+      if (targets.length) writes = true;
+      for (const t of targets) {
+        const v = targetLanding(t, bases, base);
+        if (v === 'claude') return R.fullClaude;
+        if (v === 'unclear') unclear = true;
+      }
+      if (base && entersClaude(c, bases, base)) cd = true;
+      if (codeNamesClaude(c, line)) code = true;
+    }
+    if (!code && feedsNames(parts) && textNamesClaude(line)) code = true;
+  }
+  if (cd) return R.fullCdClaude;
+  if (code) return R.fullCodeClaude;
+  if (unclear) return R.fullWriteUnclear;
+  // Another command's output ($(…), `…`) glued into a word cuts that word in two ("$(pwd)/.claude/x"), so in a line that
+  // writes, and names them outside a heredoc's text, what it writes to cannot be read.
+  if (writes && GLUED.test(command) && textNamesClaude(withoutHeredocs(command))) return R.fullWriteUnclear;
+  return null;
+}
+
+/** A $(…) or `…` with more of its word right before or after it ("$(pwd)/x", x`date`), as opposed to one that is a word of its own. */
+const GLUED = /[^\s;&|(]\$\(|[^\s;&|(]`|\)[^\s;&|)<>]/;
+
+/**
+ * Where one place a command writes lands, read from each folder of the line (or from the folders git's -C words lead to):
+ * 'claude', 'unclear', or null when it is clear. A word another command's output cut in two (empty here) says nothing by
+ * itself: commandFloor reads the line around it. A wildcard is judged by what it matches the loose way (any case, hidden
+ * names, as zsh's NO_CASE_GLOB and GLOB_DOTS); one that cannot be expanded here by its dot patterns (textNamesClaude).
+ */
+function targetLanding(t, bases, base) {
+  const word = withHome(t.word);
+  if (!word || word === '-' || /^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(word)) return null;
+  if (textNamesClaude(word)) return 'claude';
+  if (!base) return 'unclear';
+  const folders = t.chain ? chainFolders(t.chain, bases) : bases;
+  if (!folders) return 'unclear';
+  let unclear = false;
+  for (const b of folders) {
+    if (/[*?[]/.test(word)) {
+      const x = expandPattern(word, b, [], true, { entries: 0, matches: 0 });
+      if (!x.error && x.paths.some(p => landing(p, b, base, t) === 'claude')) return 'claude';
+      continue;
+    }
+    const v = landing(word, b, base, t);
+    if (v === 'claude') return 'claude';
+    if (v === 'unclear') unclear = true;
+  }
+  return unclear ? 'unclear' : null;
+}
+
+/** The folders git's -C words lead to, each read from the one before it, from each folder of the line; null when one cannot be resolved. */
+function chainFolders(chain, bases) {
+  const out = [];
+  for (const b of bases) {
+    let d = b;
+    for (const w of chain) {
+      if (w === '') continue; // git ignores an empty -C
+      const r = resolveReal(withHome(w), d);
+      if (!r.ok) return null;
+      if (!r.exists) { d = null; break; } // git stops there: no folder, no write
+      d = r.real;
+    }
+    if (d) out.push(d);
+  }
+  return out;
+}
+
+/** The folders a line's relative words are read from: the agent's own, and each folder it cd's or pushd's into (a bare cd: home). */
+function cdFolders(parts, base) {
+  const out = [base];
+  for (const c of parts) {
+    const to = cdTo(c);
+    if (to === null) continue;
+    for (const b of [...out]) {
+      const r = resolveReal(withHome(to), b);
+      if (r.ok && r.exists && isFolder(r.real) && !out.includes(r.real)) out.push(r.real);
+    }
+  }
+  return out;
+}
+
+/** Where a cd or pushd goes (its last word that is no option; a bare cd: home), or null for anything else. */
+function cdTo(c) {
+  const p = c.bare === undefined ? c : c.bare;
+  if (!p || (p.prog !== 'cd' && p.prog !== 'pushd')) return null;
+  return p.args.filter(a => !a.startsWith('-')).at(-1) ?? (p.prog === 'cd' && !p.args.includes('-') ? '~' : null);
+}
+
+/** Whether a cd or pushd would leave the shell in Claude Code's own settings, read from each folder of the line. */
+function entersClaude(c, bases, base) {
+  const to = cdTo(c);
+  if (to === null) return false;
+  const word = withHome(to);
+  return textNamesClaude(word) || bases.some(b => landing(word, b, base) === 'claude');
+}
+
+/** Programs that run code they are given: inline, on their input, or as a script file (which runs, wherever it lives). */
+const CODE_RUNNERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'source', '.', 'python', 'python2', 'python3', 'node', 'perl',
+  'ruby', 'php', 'deno', 'bun', 'osascript', 'awk', 'gawk', 'pwsh', 'lua', 'tclsh', 'Rscript']);
+/** Programs that write every file they are given: names that xargs hands them reach them. */
+const FEEDS_WRITE = new Set(['rm', 'rmdir', 'unlink', 'shred', 'srm', 'trash', 'touch', 'mkdir', 'truncate', 'tee', 'chmod', 'chown', 'chgrp', 'chflags',
+  'mv', 'cp', 'ln', 'install', 'rsync', 'ditto', 'sed', 'perl']);
+/** What codeGiven answers for a part that reads its code from its input. */
+const STDIN = Symbol('stdin');
+
+/**
+ * Whether a part runs code it is given, which the policy cannot follow, whose text names Claude Code's own settings: code
+ * given inline (python -c, node -e, perl -e, an awk program…; a shell's inline command is read as parts of its own), or code
+ * read from its input (a shell or an interpreter with no script, fed through a pipe, a heredoc or a redirection: the line,
+ * its heredocs included, is what it may be given). A script run from a file runs.
+ */
+function codeNamesClaude(c, line) {
+  const p = c.bare === undefined ? c : c.bare;
+  if (!p || p.empty || c.inline || !CODE_RUNNERS.has(p.prog)) return false;
+  const code = codeGiven(p);
+  if (code === null) return false;
+  if (code !== STDIN) return textNamesClaude(code);
+  const fed = hasPipe(line) || (c.redirects ?? []).some(r => r.kind === 'read' || r.kind === 'heredoc' || r.kind === 'string');
+  return fed && textNamesClaude(line);
+}
+
+/** Whether a line hands names to a program that writes or runs code: xargs before one, or parallel. */
+function feedsNames(parts) {
+  const feeds = parts.some(c => { const p = c.bare === undefined ? c : c.bare; return c.words?.includes('xargs') || p?.prog === 'parallel'; });
+  return feeds && parts.some(c => { const p = c.bare === undefined ? c : c.bare; return !!p && (FEEDS_WRITE.has(p.prog) || CODE_RUNNERS.has(p.prog) || p.prog === 'parallel'); });
+}
+
+/** Whether a line has a pipe outside quotes (not ||). */
+function hasPipe(line) {
+  let q = null;
+  for (let k = 0; k < line.length; k++) {
+    const ch = line[k];
+    if (q === "'") { if (ch === "'") q = null; continue; }
+    if (ch === '\\') { k++; continue; }
+    if (q === '"') { if (ch === '"') q = null; continue; }
+    if (ch === "'" || ch === '"') q = ch;
+    else if (ch === '|' && line[k + 1] !== '|' && line[k - 1] !== '|' && line[k - 1] !== '>') return true;
+  }
+  return false;
+}
+
+/**
+ * Interpreters' options: the letters (and long names) whose value is code, those that take another value, and those that run
+ * a module rather than code (python -m).
+ */
+const INTERPRETERS = Object.freeze({
+  python: { code: 'c', values: 'WX', module: 'm' }, python2: { code: 'c', values: 'WX', module: 'm' }, python3: { code: 'c', values: 'WX', module: 'm' },
+  node: { code: 'ep', long: ['eval', 'print'], values: 'rC', longValues: ['require', 'import', 'loader', 'experimental-loader', 'conditions', 'input-type'] },
+  perl: { code: 'eE', attached: 'IMmlx0CdDVFi' }, ruby: { code: 'e', values: 'IrCEF' }, php: { code: 'rRBE', values: 'cdfz' },
+  lua: { code: 'e', values: 'l' }, Rscript: { code: 'e' }, osascript: { code: 'e', values: 'lis' }, bun: { code: 'e', long: ['eval', 'print'] },
+});
+
+/** The code a part is given: its inline code, STDIN when it reads it from its input, or null when it runs a script file or a module. */
+function codeGiven(p) {
+  const args = p.args;
+  if (args.some(a => /^(?:-V|--version|-h|--help)$/.test(a))) return null;
+  if (p.prog === 'node' && args.some(a => /^--(?:test|run)(?:=|$)/.test(a))) return null;
+  if (Object.hasOwn(INTERPRETERS, p.prog)) return interpreterCode(args, INTERPRETERS[p.prog]);
+  if (p.prog === 'awk' || p.prog === 'gawk') {
+    // the program is the first word that is no option, unless -f names a file that holds it
+    for (let k = 0; k < args.length; k++) {
+      const a = args[k];
+      if (a === '-f' || a.startsWith('--file')) return null;
+      if (a === '-F' || a === '-v') { k++; continue; }
+      if (a.startsWith('-') && a !== '-') continue;
+      return a;
+    }
+    return null;
+  }
+  if (p.prog === 'pwsh') {
+    const k = args.findIndex(a => /^-(?:c|command)$/i.test(a));
+    if (k >= 0) return args.slice(k + 1).join(' ');
+    return args.some(a => !a.startsWith('-')) ? null : STDIN;
+  }
+  if (p.prog === 'deno') return args[0] === 'eval' ? args.slice(1).join(' ') : args.length ? null : STDIN;
+  if (p.prog === 'source' || p.prog === '.' || p.prog === 'tclsh') return args.length ? null : STDIN;
+  // a shell: a script file, or its commands from its input (-s, or nothing to run); -c is read as parts of its own
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '-s') return STDIN;
+    if (/^[-+]o$|^-O$/.test(a)) { k++; continue; }
+    if (/^[-+]/.test(a) && a !== '-') continue;
+    return a === '-' ? STDIN : null;
+  }
+  return STDIN;
+}
+
+/** An interpreter's inline code (joined when there are several), STDIN with neither code nor a script, or null for a script or a module. */
+function interpreterCode(args, spec) {
+  const code = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') return code.length ? code.join('\n') : args[k + 1] === undefined || args[k + 1] === '-' ? STDIN : null;
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const name = (eq < 0 ? a : a.slice(0, eq)).slice(2);
+      if ((spec.long ?? []).includes(name)) code.push(eq < 0 ? (args[++k] ?? '') : a.slice(eq + 1));
+      else if ((spec.longValues ?? []).includes(name) && eq < 0) k++;
+      continue;
+    }
+    if (a === '-') return code.length ? code.join('\n') : STDIN;
+    if (a.startsWith('-')) {
+      for (let j = 1; j < a.length; j++) {
+        const ch = a[j];
+        const rest = () => (j === a.length - 1 ? (args[++k] ?? '') : a.slice(j + 1));
+        if (spec.code.includes(ch)) { code.push(rest()); break; }
+        if ((spec.module ?? '').includes(ch)) return null;
+        if ((spec.values ?? '').includes(ch)) { rest(); break; }
+        if ((spec.attached ?? '').includes(ch)) break;
+      }
+      continue;
+    }
+    return code.length ? code.join('\n') : null; // the first other word: an argument of the inline code, or the script
+  }
+  return code.length ? code.join('\n') : STDIN;
+}
+
+/** A command's operands and options, read as gitArgs reads git's: `short` and `long` name the options that take a value. */
+const argsOf = (args, short = '', long = []) => gitArgs(args, { short, long });
+/** The words of a command that are options, up to "--". */
+function optionWords(args) {
+  const k = args.indexOf('--');
+  return (k < 0 ? args : args.slice(0, k)).filter(a => a.startsWith('-') && a !== '-');
+}
+/** Every value of an option, given by its short letter or its long name (git's abbreviations too), from argsOf's opts. */
+const optValues = (opts, short, long) => opts.filter(([n, v]) => typeof v === 'string' && (n === short || (!!long && n.length > 1 && long.startsWith(n)))).map(([, v]) => v);
+/** The last value of an option, or undefined. */
+const optValue = (opts, short, long) => optValues(opts, short, long).at(-1);
+
+/** A mode chmod takes as its first word: octal, or symbolic (u+x, go-w, a=r,u+w; -x and -w are modes written as options). */
+const CHMOD_MODE = /^(?:[0-7]{1,4}|[ugoa]*(?:[-+=][rwxXstugo]*)+(?:,[ugoa]*(?:[-+=][rwxXstugo]*)+)*)$/;
+/** The options of the copying programs that take a value, as `short` letters and `long` names. */
+const COPY_VALUES = Object.freeze({
+  cp: { short: 'tS', long: ['target-directory', 'suffix'] }, ln: { short: 'tS', long: ['target-directory', 'suffix'] },
+  install: { short: 'tSmogBf', long: ['target-directory', 'suffix', 'mode', 'owner', 'group'] }, ditto: { short: '', long: ['arch', 'bom'] },
+  rsync: { short: 'eTfBM', long: ['rsh', 'exclude', 'include', 'filter', 'temp-dir', 'log-file', 'backup-dir', 'files-from', 'exclude-from', 'include-from',
+    'partial-dir', 'compare-dest', 'copy-dest', 'link-dest', 'chmod', 'chown', 'rsync-path', 'password-file'] },
+  scp: { short: 'cFiJlLoPS', long: [] },
+});
+/** git commands that write the files they name in the working tree (clean deletes them). */
+const GIT_WRITES_NAMED = new Set(['checkout', 'restore', 'rm', 'mv', 'apply', 'clean', 'stash']);
+
+/**
+ * The places one part of a command writes, as far as the policy can tell: each `{ word, deep?, into?, chain? }` (see landing;
+ * `chain`: git's -C words, which the word is read from). Its redirections into files, and what its program writes:
+ * - rm, rmdir, unlink, shred, touch, mkdir, truncate, tee: every file they name (an option's value is not one); chmod,
+ *   chown, chgrp and chflags: every file after the mode, owner or flags. rm -r, mv's sources and -R count what is inside.
+ * - mv: its sources and its destination; cp, ln, install, ditto, rsync and scp: their destination (or -t), and the name each
+ *   source gets inside it when it is a folder; ln with one word links it into this folder; rsync --log-file.
+ * - dd's of=; sed -i's and perl -i's files; an archive tar creates (-f), and where tar and unzip unpack (-C, -d, and the
+ *   members they name); what curl and wget save (-o, -O…); sort's and tree's -o, uniq's second file, find's -fprint and,
+ *   with -delete or -exec, where it searches and the names it looks for that name them.
+ * - git checkout, restore, rm, mv, apply, clean and stash: the places they name (a message names none); any git command's
+ *   --output, and archive's and format-patch's -o; node's (and a package script's) --test-reporter-destination.
+ * sudo and doas stand for the command after them; narrate already skips env, timeout, nohup, xargs and the like.
+ */
+function writeTargets(c) {
+  const out = (c.redirects ?? []).filter(r => r.kind === 'write').map(r => ({ word: r.target }));
+  const p = c.bare === undefined ? c : c.bare;
+  if (!p || p.empty) return out;
+  let { prog, args } = p;
+  for (let n = 0; (prog === 'sudo' || prog === 'doas') && n < 3; n++) {
+    let k = 0;
+    while (k < args.length && args[k].startsWith('-')) k += /^-[ugCDhprtTU]$/.test(args[k]) ? 2 : 1;
+    prog = String(args[k] ?? '').replace(/^.*\//, '');
+    args = args.slice(k + 1);
+  }
+  return out.concat(programTargets(prog, args));
+}
+
+function programTargets(prog, args) {
+  const each = (words, extra = {}) => words.map(word => ({ word, ...extra }));
+  const recursive = letters => optionWords(args).some(a => shortHas(a, letters) || longIs(a, ['recursive']));
+  switch (prog) {
+    case 'rm': case 'srm': case 'trash': return each(argsOf(args).operands, { deep: prog !== 'rm' || recursive('rR') });
+    case 'rmdir': case 'unlink': case 'tee': return each(argsOf(args).operands);
+    case 'shred': return each(argsOf(args, 'ns', ['iterations', 'size', 'random-source']).operands);
+    case 'touch': return each(argsOf(args, 'rtdA', ['reference', 'date', 'time']).operands);
+    case 'mkdir': return each(argsOf(args, 'm', ['mode', 'context']).operands);
+    case 'truncate': return each(argsOf(args, 'sr', ['size', 'reference']).operands);
+    case 'chmod': case 'chown': case 'chgrp': case 'chflags': {
+      const { operands, opts } = argsOf(args);
+      const byReference = opts.some(([n]) => n.length > 2 && 'reference'.startsWith(n));
+      const first = byReference ? 0 : prog === 'chmod' ? (CHMOD_MODE.test(operands[0] ?? '') ? 1 : 0) : 1;
+      return each(operands.slice(first), { deep: recursive('R') });
+    }
+    case 'mv': {
+      const { operands, opts } = argsOf(args, 'tS', ['target-directory', 'suffix']);
+      const dir = optValue(opts, 't', 'target-directory');
+      const dest = dir ?? (operands.length > 1 ? operands.at(-1) : undefined);
+      const sources = dir !== undefined ? operands : operands.slice(0, -1);
+      return [...each(sources, { deep: true }), ...(dest === undefined ? [] : [{ word: dest }, ...sources.map(s => ({ word: dest, into: path.basename(s) }))])];
+    }
+    case 'cp': case 'ln': case 'install': case 'ditto': case 'rsync': case 'scp': return copyTargets(prog, args);
+    case 'dd': return args.filter(a => a.startsWith('of=')).map(a => ({ word: a.slice(3) }));
+    case 'sed': return sedTargets(args);
+    case 'perl': return perlTargets(args);
+    case 'tar': return tarTargets(args);
+    case 'unzip': return unzipTargets(args);
+    case 'curl': return optionTargets(args, 'AbcCdDeEFHKmoPQrtTuUwxXyYz', 'oDc',
+      ['output', 'output-dir', 'dump-header', 'cookie-jar', 'trace', 'trace-ascii', 'stderr', 'libcurl', 'etag-save', 'hsts', 'alt-svc']);
+    case 'wget': return optionTargets(args, 'OoaPieBtTwQlARDIXU', 'OoaP', ['output-document', 'output-file', 'append-output', 'directory-prefix']);
+    case 'sort': case 'tree': {
+      const spec = READ_ONLY[prog];
+      const k = args.findIndex(a => optionIs(a, spec.writes));
+      const into = k >= 0 && (args[k].startsWith('--') || args[k].includes(spec.target)) ? optionValue(args, k, spec.target) : undefined;
+      return into === undefined ? [] : [{ word: into }];
+    }
+    case 'uniq': { const files = uniqFiles(args); return files.length > 1 ? [{ word: files[1] }] : []; }
+    case 'find': return findTargets(args);
+    case 'git': return gitTargets(args);
+    case 'node': case 'npm': case 'pnpm': case 'yarn': case 'npx': return reporterTargets(args);
+    default: return [];
+  }
+}
+
+/** cp, ln, install, ditto, rsync and scp: the destination, and the name each source gets inside it when it is a folder. */
+function copyTargets(prog, args) {
+  const { short, long } = COPY_VALUES[prog];
+  const { operands, opts } = argsOf(args, short, long);
+  const out = prog === 'rsync' ? optValues(opts, null, 'log-file').map(word => ({ word })) : [];
+  if (prog === 'install' && optionWords(args).some(a => shortHas(a, 'd') || longIs(a, ['directory']))) return [...out, ...operands.map(word => ({ word }))];
+  const remote = w => /^[^/]*:/.test(w); // host:path, user@host:path, rsync://
+  const dir = optValue(opts, 't', 'target-directory');
+  let dest;
+  let sources;
+  if (dir !== undefined) [dest, sources] = [dir, operands];
+  else if (prog === 'ln' && operands.length === 1) [dest, sources] = ['.', operands]; // a link in this folder, named as what it links to
+  else [dest, sources] = [operands.at(-1), operands.slice(0, -1)];
+  if (dest === undefined || remote(dest)) return out;
+  // rsync --delete removes what the source does not have, everywhere inside its destination
+  out.push({ word: dest, deep: prog === 'rsync' && optionWords(args).some(a => /^--del/.test(a)) });
+  for (const s of sources) out.push({ word: dest, into: path.basename(s.replace(/^[^/]*:/, '')) });
+  return out;
+}
+
+/**
+ * sed -i (or -I, --in-place): its files, after its script (the first word, unless -e or -f gives it). BSD sed takes the
+ * backup extension as the next word ('' for none, or one that starts with a dot); GNU's, like -i.bak, is attached.
+ */
+function sedTargets(args) {
+  let inPlace = false;
+  let script = false;
+  const operands = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+    if (a.startsWith('--')) {
+      const name = a.slice(2).split('=')[0];
+      if (name.length > 1 && 'in-place'.startsWith(name)) inPlace = true;
+      else if (name && ['expression', 'file'].some(n => n.startsWith(name))) { script = true; if (!a.includes('=')) k++; }
+      else if (name.length > 1 && 'line-length'.startsWith(name) && !a.includes('=')) k++;
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        const ch = a[j];
+        if (ch === 'i' || ch === 'I') {
+          inPlace = true;
+          if (j === a.length - 1 && k + 1 < args.length && /^(?:\.[^\s/]*)?$/.test(args[k + 1])) k++;
+          break;
+        }
+        if (ch === 'e' || ch === 'f') { script = true; if (j === a.length - 1) k++; break; }
+        if (ch === 'l') { if (j === a.length - 1) k++; break; }
+      }
+      continue;
+    }
+    operands.push(a);
+  }
+  return inPlace ? (script ? operands : operands.slice(1)).map(word => ({ word })) : [];
+}
+
+/** perl -i (-pi, -i.bak): its files, after its script (the first word, unless -e or -E gives the code). */
+function perlTargets(args) {
+  let inPlace = false;
+  let code = false;
+  const operands = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') { operands.push(...args.slice(k + 1)); break; }
+    if (/^-[^-]/.test(a)) {
+      for (let j = 1; j < a.length; j++) {
+        const ch = a[j];
+        if (ch === 'e' || ch === 'E') { code = true; if (j === a.length - 1) k++; break; }
+        if (ch === 'i') { inPlace = true; break; } // the rest of the word is the backup extension
+        if ('IMmlx0CdDVF'.includes(ch)) break; // the rest of the word is this option's value
+      }
+      continue;
+    }
+    operands.push(a);
+  }
+  return inPlace ? (code ? operands : operands.slice(1)).map(word => ({ word })) : [];
+}
+
+/**
+ * tar: the archive it creates, appends to or updates (-f, unless "-"), its --listed-incremental file, and where it unpacks:
+ * each -C folder, and each member it names, inside them (or in this folder). The old form without a dash (tar xzf a.tgz)
+ * counts. What it unpacks without naming members cannot be told, and runs.
+ */
+function tarTargets(args) {
+  const list = args.length && /^[A-Za-z]+$/.test(args[0]) && /[crtuxA]/.test(args[0]) ? ['-' + args[0], ...args.slice(1)] : args;
+  const { operands, opts } = argsOf(list, 'fCTXbKLNVgI', ['file', 'directory', 'files-from', 'exclude-from', 'blocking-factor', 'starting-file',
+    'tape-length', 'newer', 'label', 'listed-incremental', 'use-compress-program', 'exclude']);
+  const words = optionWords(list);
+  const create = words.some(a => shortHas(a, 'cruA') || longIs(a, ['create', 'append', 'update', 'catenate', 'concatenate']));
+  const extract = words.some(a => shortHas(a, 'x') || longIs(a, ['extract', 'get']));
+  const out = optValues(opts, 'g', 'listed-incremental').map(word => ({ word }));
+  const file = optValue(opts, 'f', 'file');
+  if (create && file !== undefined && file !== '-') out.push({ word: file });
+  if (extract) {
+    const dirs = optValues(opts, 'C', 'directory');
+    out.push(...dirs.map(word => ({ word })));
+    for (const m of operands) for (const d of dirs.length ? dirs : ['.']) out.push({ word: d === '.' ? m : `${d.replace(/\/+$/, '')}/${m}` });
+  }
+  return out;
+}
+
+/** unzip: the folder it unpacks into (-d), and each member it names, inside it (or in this folder); -x's names are left out. */
+function unzipTargets(args) {
+  let dir = null;
+  let exclude = false;
+  let archive = null;
+  const members = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '-d') { dir = args[++k] ?? null; exclude = false; continue; }
+    if (/^-d./.test(a)) { dir = a.slice(2); exclude = false; continue; }
+    if (a === '-x') { exclude = true; continue; }
+    if (a === '-P') { k++; continue; }
+    if (a.startsWith('-')) { exclude = false; continue; }
+    if (archive === null) archive = a;
+    else if (!exclude) members.push(a);
+  }
+  const into = dir ?? '.';
+  return [...(dir === null ? [] : [{ word: dir }]), ...members.map(m => ({ word: into === '.' ? m : `${into.replace(/\/+$/, '')}/${m}` }))];
+}
+
+/**
+ * The files a program's options write: short letters in `writeShort` (in a word of short options, the first letter that takes
+ * a value, `valueShort`, ends it) and long names in `writeLong`, given with "=" or as the next word.
+ */
+function optionTargets(args, valueShort, writeShort, writeLong) {
+  const out = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') break;
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const name = (eq < 0 ? a : a.slice(0, eq)).slice(2);
+      if (writeLong.includes(name)) out.push({ word: eq < 0 ? (args[++k] ?? '') : a.slice(eq + 1) });
+      continue;
+    }
+    if (!/^-[^-]/.test(a)) continue;
+    for (let j = 1; j < a.length; j++) {
+      if (!valueShort.includes(a[j])) continue;
+      const value = j === a.length - 1 ? (args[++k] ?? '') : a.slice(j + 1);
+      if (writeShort.includes(a[j])) out.push({ word: value });
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * find: what -fprint and its kin write, and with -delete, -exec, -execdir, -ok or -okdir (which change what it finds): where
+ * it searches (the words before its first test) and the names it looks for, when they name Claude Code's settings.
+ */
+function findTargets(args) {
+  const out = [];
+  args.forEach((a, i) => { if (FIND_WRITES.has(a) && args[i + 1] !== undefined) out.push({ word: args[i + 1] }); });
+  if (!args.some(a => FIND_BAD.has(a) && !FIND_WRITES.has(a))) return out;
+  let i = 0;
+  while (i < args.length && /^-[HLPEXdsx]+$/.test(args[i])) i++;
+  for (; i < args.length && !/^[-(!]/.test(args[i]); i++) out.push({ word: args[i] });
+  args.forEach((a, k) => { if (k > 0 && /^-(?:i?name|i?path|i?wholename|i?regex|i?lname)$/.test(args[k - 1]) && textNamesClaude(a)) out.push({ word: a }); });
+  return out;
+}
+
+/**
+ * git: what checkout, restore, rm, mv, apply, clean and stash name (each piece of a word, as readPieces finds them; a message
+ * names nothing), read from the folders its -C words lead to; and what --output writes, or -o for archive and format-patch.
+ */
+function gitTargets(args) {
+  const chain = [];
+  let i = 0;
+  for (; i < args.length && args[i].startsWith('-'); i++) {
+    if (args[i] === '-C' && i + 1 < args.length) chain.push(args[++i]);
+    else if (/^(?:-c|--git-dir|--work-tree|--namespace|--config-env|--super-prefix|--attr-source)$/.test(args[i])) i++;
+  }
+  const sub = args[i];
+  const rest = args.slice(i + 1);
+  const out = [];
+  const at = word => ({ word, ...(chain.length ? { chain } : {}) });
+  for (const k of outputWords(rest)) if (k < rest.length && !rest[k].startsWith('--')) out.push(at(rest[k]));
+  for (const a of rest) { const m = /^--output=(.*)$/.exec(a); if (m) out.push(at(m[1])); }
+  if (sub === 'archive' || sub === 'format-patch') {
+    rest.forEach((a, k) => { if (a === '-o' && rest[k + 1] !== undefined) out.push(at(rest[k + 1])); else if (/^-o./.test(a)) out.push(at(a.slice(2))); });
+  }
+  if (!GIT_WRITES_NAMED.has(sub)) return out;
+  const { text } = gitTextWords(sub, rest);
+  rest.forEach((a, k) => { if (!text.has(k)) for (const piece of readPieces({ text: a, glob: false })) out.push(at(piece)); });
+  return out;
+}
+
+/** node's --test-reporter-destination (also after a package script's "--"): the file it writes, unless stdout or stderr. */
+function reporterTargets(args) {
+  const out = [];
+  for (let k = 0; k < args.length; k++) {
+    const m = /^--test-reporter-destination(?:=(.*))?$/.exec(args[k]);
+    if (!m) continue;
+    const v = m[1] ?? args[++k];
+    if (v !== undefined && v !== 'stdout' && v !== 'stderr') out.push({ word: v });
+  }
+  return out;
+}
+
+/**
+ * A tool of another service, or one the policy does not know, by the places it is given: the values of its path-like
+ * arguments (PATH_KEYS, a few levels down, lists too). One that leads into Claude Code's settings, or names them, is refused,
+ * since a tool's name does not say whether it only reads; one that cannot be resolved is refused too. What its other words
+ * mention (a title, a message, a query) counts for nothing.
+ */
+function toolFloor(input, base) {
+  let unclear = false;
+  for (const p of pathArgs(input)) {
+    if (textNamesClaude(p)) return R.fullToolClaude;
+    if (!base || padded(p)) { unclear = true; continue; }
+    const v = landing(p, base, base);
+    if (v === 'claude') return R.fullToolClaude;
+    if (v === 'unclear') unclear = true;
+  }
+  return unclear ? R.fullToolUnclear : null;
+}
+
+/** The names of a tool's arguments that hold a place on disk. */
+const PATH_KEYS = new Set(['path', 'paths', 'file', 'files', 'file_path', 'filePath', 'notebook_path', 'target', 'destination', 'dest']);
+
+/** The values of a tool's path-like arguments (PATH_KEYS), a few levels down (at most 200): strings, and strings in lists. */
+function pathArgs(value, depth = 0, out = []) {
+  if (out.length >= 200 || depth > 4 || !value || typeof value !== 'object') return out;
+  for (const [k, v] of Object.entries(value)) {
+    if (PATH_KEYS.has(k)) {
+      if (typeof v === 'string' && v) out.push(v);
+      else if (Array.isArray(v)) for (const x of v) if (typeof x === 'string' && x) out.push(x);
+    }
+    if (v && typeof v === 'object') pathArgs(v, depth + 1, out);
+  }
+  return out;
 }
 
 /** $HOME or ${HOME} at the start of a word, as the home folder. */
 const withHome = text => String(text).replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.homedir());
 
-/** Whether any word of one part names Claude Code's settings: as written, wherever it leads, or by what it matches. */
-function partNamesClaude(c, bases, base) {
-  for (const raw of c.words) {
-    for (const form of braceForms(withHome(raw))) {
-      if (textNamesClaude(form)) return true;
-      if (!base) continue;
-      for (const piece of new Set([form, ...form.split(/[=:,]/)])) {
-        if (!piece || (piece.startsWith('-') && !piece.includes('/'))) continue;
-        for (const b of bases) {
-          if (placeNamesClaude(piece, b, base)) return true;
-          if (/[*?[]/.test(piece) && globNamesClaude(piece, b, base)) return true;
-        }
-      }
+/**
+ * The forms of a command line with its unquoted braces expanded as the shell expands them ({a,b}, nested ones too), so
+ * `rm -rf .{claude,git}` is read as `rm -rf .claude` and `rm -rf .git`. Braces in quotes, ${…}, {} and a { … } group stay
+ * as they are. null past `limit` forms: too many to read.
+ */
+function lineBraceForms(line, limit = 64) {
+  const at = braceAt(line);
+  if (!at) return [line];
+  const out = [];
+  for (const alt of at.alts) {
+    const forms = lineBraceForms(line.slice(0, at.open) + alt + line.slice(at.close + 1), limit);
+    if (!forms) return null;
+    for (const f of forms) {
+      out.push(f);
+      if (out.length > limit) return null;
     }
   }
-  return false;
+  return out;
 }
 
-/** Whether a path, read from folder `b`, leads into Claude Code's settings: in the agent's folder or anywhere else. */
-function placeNamesClaude(p, b, base) {
-  if (typeof p !== 'string' || !p || p.includes('\0')) return false;
-  const r = throughLinks(resolveReal(p, b), base);
-  if (!r.ok) return false;
-  const place = placeOf(r.real, base);
-  return place === 'claude' || (place === 'outside' && claudeSetting(r.real));
+/** The first unquoted brace expansion in a line: where it opens and closes, and its alternatives; null when there is none. */
+function braceAt(line) {
+  let q = null;
+  for (let k = 0; k < line.length; k++) {
+    const ch = line[k];
+    if (q === "'") { if (ch === "'") q = null; continue; }
+    if (ch === '\\') { k++; continue; }
+    if (q === '"') { if (ch === '"') q = null; continue; }
+    if (ch === "'" || ch === '"') { q = ch; continue; }
+    if (ch === '$' && line[k + 1] === '{') { const close = line.indexOf('}', k); if (close < 0) return null; k = close; continue; }
+    if (ch !== '{') continue;
+    const found = braceBody(line, k);
+    if (found) return found;
+  }
+  return null;
 }
 
-/**
- * Whether a wildcard, read from folder `b`, matches anything in Claude Code's settings, the loose way (any case, hidden
- * names: zsh's NO_CASE_GLOB and GLOB_DOTS, which the person may have set). A wildcard that cannot be expanded here
- * (outside the folders it may search, too many matches) matches nothing: textNamesClaude still reads its dot patterns.
- */
-function globNamesClaude(piece, b, base) {
-  const x = expandPattern(piece, b, [], true, { entries: 0, matches: 0 });
-  return !x.error && x.paths.some(p => placeNamesClaude(p, b, base));
+/** The brace expansion that starts at line[open], if it is one: a matching }, an unquoted comma at its own level, all in one word. */
+function braceBody(line, open) {
+  let depth = 0;
+  let q = null;
+  let start = open + 1;
+  const alts = [];
+  for (let k = open; k < line.length; k++) {
+    const ch = line[k];
+    if (q === "'") { if (ch === "'") q = null; continue; }
+    if (ch === '\\') { k++; continue; }
+    if (q === '"') { if (ch === '"') q = null; continue; }
+    if (ch === "'" || ch === '"') { q = ch; continue; }
+    if (' \t\n\r;&|<>()'.includes(ch)) return null; // a brace expansion is one word
+    if (ch === '$' && line[k + 1] === '{') { const close = line.indexOf('}', k); if (close < 0) return null; k = close; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        if (!alts.length) return null;
+        alts.push(line.slice(start, k));
+        return { open, close: k, alts };
+      }
+    } else if (ch === ',' && depth === 1) {
+      alts.push(line.slice(start, k));
+      start = k + 1;
+    }
+  }
+  return null;
 }
 
 /**
@@ -460,42 +1086,6 @@ function withoutHeredocs(command) {
     const end = lines.findIndex(line => (m[1] ? line.replace(/^\t+/, '') : line) === m[3]);
     rest = end < 0 ? '' : lines.slice(end).join('\n');
   }
-}
-
-/**
- * Whether one part of a command only reads: the policy, judging that part alone, would allow it, or asks only because
- * what it reads is outside the folder. A part with a value the shell fills in or an escape, a variable set before it,
- * env or xargs before it, or a redirection other than to the terminal or /dev/null, never only reads; nor does a part
- * that only sets variables, or a shell given its command inline.
- */
-function readsOnly(c, base, ctx) {
-  if (!base || c.empty || c.inline) return false;
-  if (c.words.some(w => /[$`\\]/.test(w) || CONTROL.test(w))) return false;
-  if (c.words.slice(0, c.at).some(w => /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(w) || w === 'env' || w === 'xargs')) return false;
-  const rest = [];
-  for (let k = c.at; k < c.words.length; k++) {
-    const w = c.words[k];
-    if (QUIET_REDIRECT.test(w)) continue;
-    if (REDIRECT_ALONE.test(w) && QUIET_TARGET.test(c.words[k + 1] ?? '')) { k++; continue; }
-    if (/[<>]/.test(w)) return false;
-    rest.push(w);
-  }
-  if (!rest.length) return false;
-  const words = rest.map(text => {
-    const glob = /[*?[^#]/.test(text);
-    return { text, glob, globLead: glob && /^[-*?[^#]/.test(text), pattern: text, equals: /^=.|[=:]=./.test(text) };
-  });
-  const v = judgeExpanded(words, base, ctx);
-  return v.decision === 'allow' || READ_WHERE.has(v.reason);
-}
-
-/** Every string in a tool's input, a few levels down (at most 200): what a tool of another service could act on. */
-function stringsIn(value, depth = 0, out = []) {
-  if (out.length >= 200 || depth > 4) return out;
-  if (typeof value === 'string') out.push(value);
-  else if (Array.isArray(value)) for (const v of value) stringsIn(v, depth + 1, out);
-  else if (value && typeof value === 'object') for (const v of Object.values(value)) stringsIn(v, depth + 1, out);
-  return out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1613,19 +2203,25 @@ function wordsStayInside(cmd, words, base, also) {
   return null;
 }
 
+/** uniq's files, in order: it reads the first and writes the second. After "--" every word is a file, even one that starts with "-". */
+function uniqFiles(args) {
+  const files = [];
+  let operands = false;
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (!operands && a === '--') { operands = true; continue; }
+    if (!operands && /^-[fsw]$/.test(a)) { k++; continue; } // these take a separate number
+    if (operands || !a.startsWith('-') || a === '-') files.push(a);
+  }
+  return files;
+}
+
 function judgeReadOnly(spec, argv, words, base) {
   if (!spec) return allow(R.readOnly);
   if (spec.uniq) {
     // uniq writes its second file argument, and a wildcard can supply one.
     if (words.some(w => w.glob)) return ask(R.globOption, undefined, RUN);
-    const files = [];
-    let operands = false; // after "--" every word is a file, even one that starts with "-"
-    for (let k = 1; k < argv.length; k++) {
-      const a = argv[k];
-      if (!operands && a === '--') { operands = true; continue; }
-      if (!operands && /^-[fsw]$/.test(a)) { k++; continue; } // these take a separate number
-      if (operands || !a.startsWith('-') || a === '-') files.push(a);
-    }
+    const files = uniqFiles(argv.slice(1));
     return files.length > 1 ? ask(R.writesFile, placeWhere(files[1], base), 'write to a file') : allow(R.readOnly);
   }
   if (words.some(w => w.globLead)) return ask(R.globOption, undefined, RUN);

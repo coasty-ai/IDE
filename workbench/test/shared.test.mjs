@@ -142,6 +142,50 @@ test('shellCommands lists every part with all its words and where the program is
   assert.deepEqual(shellCommands(''), []);
 });
 
+test('shellCommands gives each part its redirections, read with the quotes, and its words without them', () => {
+  const one = (cmd) => {
+    const [c, ...rest] = shellCommands(cmd);
+    assert.equal(rest.length, 0, cmd);
+    return { redirects: c.redirects.map(r => [r.op, r.kind, r.target]), bare: c.bare ? c.bare.words : null, words: c.words };
+  };
+  // glued to a word, to an fd number, and to "&": the target is the next word, its quotes taken away
+  assert.deepEqual(one('echo x>.claude/a').redirects, [['>', 'write', '.claude/a']]);
+  assert.deepEqual(one('echo x>.claude/a').bare, ['echo', 'x']);
+  assert.deepEqual(one('npm test 2>>.claude/log').redirects, [['2>>', 'write', '.claude/log']]);
+  assert.deepEqual(one('npm test 2>>.claude/log').bare, ['npm', 'test']);
+  assert.deepEqual(one('make &> "build log.txt"').redirects, [['&>', 'write', 'build log.txt']]);
+  assert.deepEqual(one('echo hi >>"$HOME/.claude/x"').redirects, [['>>', 'write', '$HOME/.claude/x']]);
+  assert.deepEqual(one('exec 3<> .claude/x').redirects, [['3<>', 'write', '.claude/x']]);
+  // quoted or escaped, it is no redirection: the words stay as they were
+  assert.deepEqual(one('git commit -m "a > .claude/x"').redirects, []);
+  assert.deepEqual(one('git commit -m "a > .claude/x"').bare, ['git', 'commit', '-m', 'a > .claude/x']);
+  assert.deepEqual(one("echo 'see -> .claude/x' > notes.md").redirects, [['>', 'write', 'notes.md']]);
+  assert.deepEqual(one('echo a\\>b').redirects, []);
+  // input, copies of a stream and the quiet places write nothing
+  assert.deepEqual(one('cat < .claude/settings.json').redirects, [['<', 'read', '.claude/settings.json']]);
+  assert.deepEqual(one('cat < .claude/settings.json').bare, ['cat']);
+  assert.deepEqual(one('npm test 2>&1').redirects, [['2>&', 'dup', '1']]);
+  assert.deepEqual(one('npm test 2>&1').bare, ['npm', 'test']);
+  assert.deepEqual(one('npm test >/dev/null').redirects, [['>', 'quiet', '/dev/null']]);
+  assert.deepEqual(one('make >&build.log').redirects, [['>&', 'write', 'build.log']]);
+  assert.deepEqual(one('cat <<< hello').redirects, [['<<<', 'string', 'hello']]);
+  // ">|" and "<&" are one redirection each, not a pipe or a new command
+  assert.deepEqual(one('echo x >| out.txt').redirects, [['>|', 'write', 'out.txt']]);
+  assert.deepEqual(one('read line <&3').redirects, [['<&', 'dup', '3']]);
+  // two in a row, and a heredoc, whose text is data
+  assert.deepEqual(one('echo x >a>b').redirects, [['>', 'write', 'a'], ['>', 'write', 'b']]);
+  const h = shellCommands("cat > .claude/settings.json <<'EOF'\n{ \"a\": 1 }\nEOF");
+  assert.equal(h.length, 1);
+  assert.deepEqual(h[0].redirects.map(r => [r.op, r.kind, r.target]), [['>', 'write', '.claude/settings.json'], ["<<'EOF'", 'heredoc', '']]);
+  assert.deepEqual(h[0].bare.words, ['cat']);
+  // a redirection before the program: the bare words find it
+  assert.equal(shellCommands('>out.txt sort data.txt')[0].bare.prog, 'sort');
+  // each part has its own; "writes" says the same as before
+  const [p, q] = shellCommands('sort a > b.txt | tee c.txt');
+  assert.deepEqual([p.writes, p.redirects.length, q.writes, q.redirects.length], [true, 1, false, 0]);
+  assert.deepEqual(shellCommands('npm test > /dev/null 2>&1').map(c => c.writes), [false]);
+});
+
 test('Monitor is narrated by what it really watches, never by its description', () => {
   assert.deepEqual(narrate('Monitor', { command: 'tail -f build.log', description: 'Nothing to see here' }), { sentence: 'Watching tail -f build.log', kind: 'run' });
   assert.deepEqual(narrate('Monitor', { ws: { url: 'wss://x.example/feed?k=1' } }), { sentence: 'Watching a live feed from x.example', kind: 'web' });
