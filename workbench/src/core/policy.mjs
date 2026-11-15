@@ -374,35 +374,33 @@ function landing(p, b, base, { deep = false, into = null } = {}) {
  * next command's words are read from the agent's own folder), when a part runs code it is given whose text names them
  * (codeNamesClaude, xargs and parallel too), or when the policy cannot tell where a part writes (a place that cannot be
  * resolved, a word another command's output cuts in two). Reads, mentions in the words of commands that write elsewhere,
- * and a script run from there all run. Every form of the line with its braces expanded is read (lineBraceForms), and every
- * part, also inside sh -c '…', eval, $(…) and backticks (narrate's shellCommands); relative words are read from the agent's
- * folder and from each folder the line cd's into.
+ * and a script run from there all run. The line is read with its braces expanded into the words they make (expandBraces),
+ * and every part, also inside sh -c '…', eval, $(…) and backticks (narrate's shellCommands); relative words are read from
+ * the agent's folder and from each folder the line cd's into.
  */
 function commandFloor(command, base) {
-  const lines = lineBraceForms(command);
-  if (!lines) return R.fullWriteUnclear;
+  const line = expandBraces(command);
+  if (line === null) return R.fullWriteUnclear;
   let unclear = false;
   let cd = false;
   let code = false;
   let writes = false;
   let carried = false; // a place a command writes holds a value the shell fills in ("$X", "$d")
-  for (const line of lines) {
-    const parts = shellCommands(line);
-    const bases = base ? cdFolders(parts, base) : [];
-    for (const c of parts) {
-      const targets = writeTargets(c);
-      if (targets.length) writes = true;
-      for (const t of targets) {
-        if (/[$`]/.test(withHome(t.word))) carried = true;
-        const v = targetLanding(t, bases, base);
-        if (v === 'claude') return R.fullClaude;
-        if (v === 'unclear') unclear = true;
-      }
-      if (base && entersClaude(c, bases, base)) cd = true;
-      if (codeNamesClaude(c, line)) code = true;
+  const parts = shellCommands(line);
+  const bases = base ? cdFolders(parts, base) : [];
+  for (const c of parts) {
+    const targets = writeTargets(c);
+    if (targets.length) writes = true;
+    for (const t of targets) {
+      if (/[$`]/.test(withHome(t.word))) carried = true;
+      const v = targetLanding(t, bases, base);
+      if (v === 'claude') return R.fullClaude;
+      if (v === 'unclear') unclear = true;
     }
-    if (!code && feedsNames(parts) && textNamesClaude(line)) code = true;
+    if (base && entersClaude(c, bases, base)) cd = true;
+    if (codeNamesClaude(c, line)) code = true;
   }
+  if (!code && feedsNames(parts) && textNamesClaude(line)) code = true;
   if (cd) return R.fullCdClaude;
   if (code) return R.fullCodeClaude;
   if (unclear) return R.fullWriteUnclear;
@@ -535,13 +533,14 @@ function hasPipe(line) {
 }
 
 /**
- * Interpreters' options: the letters (and long names) whose value is code, those that take another value, and those that run
- * a module rather than code (python -m).
+ * Interpreters' options: the letters (and long names) whose value is code, those that take another value (`values`: the rest
+ * of the word or the next one; `attached`: the rest of the word only), those that take only digits and let the word go on
+ * (`digits`: perl's -l and -0, as in -lne), and those that run a module rather than code (python -m).
  */
 const INTERPRETERS = Object.freeze({
   python: { code: 'c', values: 'WX', module: 'm' }, python2: { code: 'c', values: 'WX', module: 'm' }, python3: { code: 'c', values: 'WX', module: 'm' },
   node: { code: 'ep', long: ['eval', 'print'], values: 'rC', longValues: ['require', 'import', 'loader', 'experimental-loader', 'conditions', 'input-type'] },
-  perl: { code: 'eE', attached: 'IMmlx0CdDVFi' }, ruby: { code: 'e', values: 'IrCEF' }, php: { code: 'rRBE', values: 'cdfz' },
+  perl: { code: 'eE', attached: 'IMmxCdDVFi', digits: 'l0' }, ruby: { code: 'e', values: 'IrCEF' }, php: { code: 'rRBE', values: 'cdfz' },
   lua: { code: 'e', values: 'l' }, Rscript: { code: 'e' }, osascript: { code: 'e', values: 'lis' }, bun: { code: 'e', long: ['eval', 'print'] },
 });
 
@@ -598,7 +597,13 @@ function interpreterCode(args, spec) {
       for (let j = 1; j < a.length; j++) {
         const ch = a[j];
         const rest = () => (j === a.length - 1 ? (args[++k] ?? '') : a.slice(j + 1));
-        if (spec.code.includes(ch)) { code.push(rest()); break; }
+        if (spec.code.includes(ch)) {
+          // followed only by other letters for code (node's -pe: -p prints what -e runs), the last of them takes it
+          if (j < a.length - 1 && [...a.slice(j + 1)].every(x => spec.code.includes(x))) continue;
+          code.push(rest());
+          break;
+        }
+        if ((spec.digits ?? '').includes(ch)) { j = perlDigits(a, j); continue; }
         if ((spec.module ?? '').includes(ch)) return null;
         if ((spec.values ?? '').includes(ch)) { rest(); break; }
         if ((spec.attached ?? '').includes(ch)) break;
@@ -799,13 +804,22 @@ function perlTargets(args) {
         const ch = a[j];
         if (ch === 'e' || ch === 'E') { code = true; if (j === a.length - 1) k++; break; }
         if (ch === 'i') { inPlace = true; break; } // the rest of the word is the backup extension
-        if ('IMmlx0CdDVF'.includes(ch)) break; // the rest of the word is this option's value
+        if (ch === 'l' || ch === '0') { j = perlDigits(a, j); continue; } // only digits, and the word goes on: -lpi, -0777pi
+        if ('IMmxCdDVF'.includes(ch)) break; // the rest of the word is this option's value
       }
       continue;
     }
     operands.push(a);
   }
   return inPlace ? (code ? operands : operands.slice(1)).map(word => ({ word })) : [];
+}
+
+/** perl's -l and -0 take only digits (octal; -0x… hexadecimal): the index of the last of them in the word, after a[j]. */
+function perlDigits(a, j) {
+  let k = j;
+  if (a[j] === '0' && /^[xX]/.test(a[k + 1] ?? '')) { k++; while (/^[0-9a-fA-F]/.test(a[k + 1] ?? '')) k++; return k; }
+  while (/^[0-7]/.test(a[k + 1] ?? '')) k++;
+  return k;
 }
 
 /**
@@ -930,20 +944,28 @@ const GIT_DEST_VALUES = Object.freeze({
 
 /**
  * Where git makes a folder or writes files it is told to: the folder clone makes (its second word, or one named after the
- * address: `git clone https://…/.claude` makes .claude), worktree add's path, init's folders, submodule add's path (or one
- * named after the address), checkout-index's --prefix, and the file merge-file writes its result into (unless -p sends it out).
+ * address: `git clone https://…/.claude` makes .claude), worktree add's path, init's folders, the records --separate-git-dir
+ * puts somewhere (init, clone), submodule add's path (or one named after the address), checkout-index's --prefix, the file
+ * merge-file writes its result into (unless -p sends it out), and the file bundle create writes.
  */
 function gitDestinations(sub, rest) {
   const named = address => path.basename(String(address).replace(/[/\\]+$/, '').replace(/^.*:/, '')).replace(/\.git$/, '');
+  const separate = sub === 'init' || sub === 'clone'
+    ? rest.flatMap((a, k) => (!a.startsWith('--') || !longIs(a, ['separate-git-dir']) ? [] : a.includes('=') ? [a.slice(a.indexOf('=') + 1)] : rest[k + 1] !== undefined ? [rest[k + 1]] : []))
+    : [];
   if (sub === 'clone') {
     const { operands } = gitArgs(rest, GIT_DEST_VALUES.clone);
-    return operands.length > 1 ? [operands[1]] : operands.length ? [named(operands[0])] : [];
+    return [...separate, ...(operands.length > 1 ? [operands[1]] : operands.length ? [named(operands[0])] : [])];
+  }
+  if (sub === 'bundle') {
+    const { operands } = gitArgs(rest, { short: '', long: ['version'] });
+    return operands[0] === 'create' && operands[1] !== undefined ? [operands[1]] : [];
   }
   if (sub === 'worktree') {
     const { operands } = gitArgs(rest, GIT_DEST_VALUES.worktree);
     return operands[0] === 'add' && operands[1] !== undefined ? [operands[1]] : [];
   }
-  if (sub === 'init') return initDirs(rest);
+  if (sub === 'init') return [...separate, ...initDirs(rest)];
   if (sub === 'submodule') {
     const { operands } = gitArgs(rest, GIT_DEST_VALUES.submodule);
     if (operands[0] !== 'add') return [];
@@ -1010,40 +1032,60 @@ function pathArgs(value, depth = 0, out = []) {
 const withHome = text => String(text).replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.homedir());
 
 /**
- * The forms of a command line with its unquoted braces expanded as the shell expands them ({a,b}, nested ones too), so
- * `rm -rf .{claude,git}` is read as `rm -rf .claude` and `rm -rf .git`. Braces in quotes, ${…}, {} and a { … } group stay
- * as they are. null past `limit` forms: too many to read.
+ * A command line with its unquoted braces expanded as the shell expands them: a word that holds one ({a,b}, nested ones
+ * too) becomes its forms, side by side in the same command, so `mv .claude{,-old}` is read as `mv .claude .claude-old`
+ * and `rm -rf .{claude,git}` as `rm -rf .claude .git`. Braces in quotes, ${…}, {} and a { … } group stay as they are.
+ * null past `limit` braces: too many to read.
  */
-function lineBraceForms(line, limit = 64) {
-  const at = braceAt(line);
-  if (!at) return [line];
-  const out = [];
-  for (const alt of at.alts) {
-    const forms = lineBraceForms(line.slice(0, at.open) + alt + line.slice(at.close + 1), limit);
-    if (!forms) return null;
-    for (const f of forms) {
-      out.push(f);
-      if (out.length > limit) return null;
-    }
+function expandBraces(line, limit = 64) {
+  let out = line;
+  for (let n = 0; ; n++) {
+    const at = braceAt(out);
+    if (!at) return out;
+    if (n >= limit || out.length > 65536) return null;
+    const before = out.slice(at.start, at.open);
+    const after = out.slice(at.close + 1, at.end);
+    out = out.slice(0, at.start) + at.alts.map(alt => before + alt + after).join(' ') + out.slice(at.end);
   }
-  return out;
 }
 
-/** The first unquoted brace expansion in a line: where it opens and closes, and its alternatives; null when there is none. */
+/** What ends a word to the shell, outside quotes. */
+const WORD_ENDS = ' \t\n\r;&|<>()';
+
+/**
+ * The first unquoted brace expansion in a line: where it opens and closes, its alternatives, and where the word it is part
+ * of starts and ends; null when there is none.
+ */
 function braceAt(line) {
   let q = null;
+  let start = 0;
   for (let k = 0; k < line.length; k++) {
     const ch = line[k];
     if (q === "'") { if (ch === "'") q = null; continue; }
     if (ch === '\\') { k++; continue; }
     if (q === '"') { if (ch === '"') q = null; continue; }
     if (ch === "'" || ch === '"') { q = ch; continue; }
+    if (WORD_ENDS.includes(ch)) { start = k + 1; continue; }
     if (ch === '$' && line[k + 1] === '{') { const close = line.indexOf('}', k); if (close < 0) return null; k = close; continue; }
     if (ch !== '{') continue;
     const found = braceBody(line, k);
-    if (found) return found;
+    if (found) return { ...found, start, end: wordEnd(line, found.close + 1) };
   }
   return null;
+}
+
+/** Where the word that goes on at `from` ends: at the first blank or piece of the shell's punctuation outside quotes. */
+function wordEnd(line, from) {
+  let q = null;
+  for (let k = from; k < line.length; k++) {
+    const ch = line[k];
+    if (q === "'") { if (ch === "'") q = null; continue; }
+    if (ch === '\\') { k++; continue; }
+    if (q === '"') { if (ch === '"') q = null; continue; }
+    if (ch === "'" || ch === '"') { q = ch; continue; }
+    if (WORD_ENDS.includes(ch)) return k;
+  }
+  return line.length;
 }
 
 /** The brace expansion that starts at line[open], if it is one: a matching }, an unquoted comma at its own level, all in one word. */
@@ -1058,7 +1100,7 @@ function braceBody(line, open) {
     if (ch === '\\') { k++; continue; }
     if (q === '"') { if (ch === '"') q = null; continue; }
     if (ch === "'" || ch === '"') { q = ch; continue; }
-    if (' \t\n\r;&|<>()'.includes(ch)) return null; // a brace expansion is one word
+    if (WORD_ENDS.includes(ch)) return null; // a brace expansion is one word
     if (ch === '$' && line[k + 1] === '{') { const close = line.indexOf('}', k); if (close < 0) return null; k = close; continue; }
     if (ch === '{') depth++;
     else if (ch === '}') {

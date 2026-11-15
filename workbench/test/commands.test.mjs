@@ -1945,8 +1945,10 @@ test('full permissions: the mode words count only said whole, by the person, as 
     'full permissions please', 'um, full permissions']) {
     assert.equal(parseCommand(s, CTX.none).kind, 'permissions', s);
   }
-  // at their card, a question answers nothing (the card stays), and nor do the openers above
-  for (const s of ['stop asking?', 'full permissions?', 'ask first?', 'keep asking?']) assert.equal(parseCommand(s, CTX.pendingPermissions).kind, 'unknown', s);
+  // at their card, their words asked answer nothing (the card stays), and nor do the openers above; a question about
+  // something else is that question, as before
+  for (const s of ['stop asking?', 'full permissions?', 'ask first?', 'keep asking?', 'turn it off?']) assert.equal(parseCommand(s, CTX.pendingPermissions).kind, 'unknown', s);
+  assert.deepEqual(parseCommand('what needs me?', CTX.pendingPermissions), { kind: 'status', needsMe: true });
   for (const s of ['I need to ask first', "let's stop asking", 'help me stop asking', 'you should ask first']) {
     assert.notEqual(parseCommand(s, CTX.pendingPermissions).kind, 'confirm', s);
   }

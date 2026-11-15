@@ -481,13 +481,12 @@ function confirmReply(toks, kind, c) {
   const isNo = w => (CONFIRM_NO.has(w) && !own.includes(w)) || ownNo.includes(w);
   // The full permissions card: the words that ask for them say yes to it ("stop asking"), and the words that turn them
   // off say no: "ask first", "keep asking", and "turn it off", "switch it off" or "leave it off", which keep them off.
-  // Words that end with a question mark ask about the card rather than answer it: it stays.
+  // Those words with a question mark ask about the card rather than answer it: it stays. An agent's whole name is no answer.
   if (kind === 'permissions') {
-    if (endsAsking(toks)) return 'asks';
-    const mode = modeWords(toks, c);
-    if (mode) return mode === 'full';
-    const said = stripTrailing(stripPolite(stripSoft(toks), MODE_POLITE)).map(t => t.w).join(' ');
-    if (/^(?:(?:no|nope|nah) )?(?:keep asking(?: me)?|(?:turn|switch|leave|keep) (?:(?:it|them) )?off)$/.test(said)) return false;
+    const bare = stripTrailing(stripPolite(stripSoft(toks), MODE_POLITE));
+    const mode = namesAgent(toks, c) ? null : permissionsMode(bare);
+    const off = /^(?:(?:no|nope|nah) )?(?:keep asking(?: me)?|(?:turn|switch|leave|keep) (?:(?:it|them) )?off)$/.test(bare.map(t => t.w).join(' '));
+    if (mode || off) return endsAsking(toks) ? 'asks' : mode === 'full';
   }
   // Before the fillers go: "so" is one. Throwing work away and full permissions take their own words, so "make it so"
   // keeps those cards.

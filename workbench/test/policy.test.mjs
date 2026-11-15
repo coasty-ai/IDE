@@ -1619,6 +1619,12 @@ test('with full permissions on, a step that would write into Claude Code’s own
     // patch, the compressors, which replace the file they are given, and zip's archive
     bash('patch .claude/settings.json fix.diff'), bash('patch -d .claude -p1 -i fix.diff'), bash('gzip .claude/settings.json'), bash('zip -r .claude/backup.zip src'),
     bash('zstd README.md -o .mcp.json'),
+    // a brace makes several words of one command: here mv's source and destination
+    bash('mv .claude{,-old}'), bash('mv .mcp.json{,.bak}'),
+    // perl's -l and -0 take only digits, and the rest of their word goes on: -lpi edits in place
+    bash("perl -lpi -e 's/a/b/' .claude/settings.json"), bash("perl -0pi -e 's/a/b/' .mcp.json"), bash("perl -l -0777 -pi -e 's/a/b/' .mcp.json"),
+    // a bundle git writes, and the records --separate-git-dir puts somewhere
+    bash('git bundle create .claude/x.bundle HEAD'), bash('git init --separate-git-dir=.claude/records x'), bash('git clone --separate-git-dir .claude/r https://example.com/x y'),
   ];
   refusedWith(rows, FLOOR_REASON);
   for (const row of rows) {
@@ -1647,6 +1653,7 @@ test('with full permissions on, reading Claude Code’s settings, mentioning the
     bash('git clone https://example.com/owner/repo.git'), bash('git worktree add ../wt-feature'), bash('git merge-file -p .claude/settings.json a.txt b.txt > merged.json'),
     bash("sed -i .bak 's/.claude/.config/' README.md"), bash('gzip -c .claude/settings.json > /tmp/settings.json.gz'), bash('zip -r /tmp/cfg.zip .claude'),
     bash('patch -p1 -i fix.diff'), bash('X=build; rm -rf "$X"'), bash('rm -rf "$TMPDIR/build"'),
+    bash('mv notes{,-old}.md'), bash("perl -lne 'print' .claude/x.txt > lines.txt"), bash('git bundle create /tmp/repo.bundle HEAD'),
     // reading them, and names that only look like them
     bash('cat .claude/settings.json | head -5'), bash('grep -r hooks .claude | wc -l'), bash('cat ~/.claude/settings.json'),
     bash('ls -la ~/.claude && echo done'), bash('git log -- .claude/settings.json | head'),
@@ -1692,6 +1699,8 @@ test('with full permissions on, code that names Claude Code’s own settings whe
     bash(`perl -e 'unlink ".mcp.json"'`), bash('echo "rm -rf .claude" | sh'), bash("bash <<'EOF'\nrm -rf .claude\nEOF"),
     bash('echo .claude | xargs rm -rf'), bash(`awk '{ print > ".claude/x" }' list.txt`), bash(`osascript -e 'do shell script "rm -rf .claude"'`),
     bash("python3 - <<'EOF'\nimport os; os.remove('.mcp.json')\nEOF"), bash('parallel rm -rf ::: .claude'),
+    // in a word of options, -l and -0 take only digits (perl), and node's -p before -e prints what -e runs
+    bash(`perl -le 'unlink ".mcp.json"'`), bash(`perl -lne 'unlink ".mcp.json"' list.txt`), bash(`node -pe "require('fs').rmSync('.claude', { recursive: true })"`),
   ], CODE_CLAUDE);
   // the shell would stay there: its next command's words are read from the agent's own folder
   refusedWith([bash('cd .claude'), bash('pushd .claude > /dev/null'), bash('cd cfg'), bash('cd ~/.claude && ls')], CD_CLAUDE);
