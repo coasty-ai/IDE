@@ -415,8 +415,9 @@ export class Connect extends EventEmitter {
    * @param {Function} [o.openTerminalSteps] ({ title, steps }) => Promise<{ opened }>, default from terminal.mjs (GitHub's
    *   sign-in in Terminal: gh's login, then setup-git)
    * @param {object} [o.ghModule]    src/core/github.mjs, or a stand-in for some of its functions
-   * @param {object} [o.ghOptions]   for GitHub through gh, mainly for tests: { fetchImpl, verify, osRelease, arch, tmpDir,
-   *   dirs, codeWaitMs (15 s), loginMs (14.5 min), terminalMs (15 min), pollMs (3 s), setupWaitMs (10 s) }
+   * @param {object} [o.ghOptions]   for GitHub through gh, mainly for tests: { fetchImpl, verify, osRelease, arch, dirs,
+   *   codeWaitMs (15 s), loginMs (14.5 min), terminalMs (15 min), pollMs (3 s), setupWaitMs (10 s) }. A download goes in
+   *   a private folder under `home`'s .workbench, never the temporary folder (see ghInstall)
    * @param {Function} [o.runProgram] runs xcode-select (git's checks and Install): (program, args, { env, cwd, timeoutMs })
    *   => Promise<{ code, stdout, stderr, timedOut, error }>; tests give a stand-in, never the real `xcode-select --install`
    * @param {number} [o.signInTimeoutMs] how long a sign-in in the browser may wait (10 minutes); for tests
@@ -1567,7 +1568,7 @@ export class Connect extends EventEmitter {
       try {
         const got = await this.gh.ghInstall({
           home: this.home, platform: this.platform, env: this.env, signal: flow.abort.signal,
-          ...pickDefined(o, ['fetchImpl', 'verify', 'osRelease', 'arch', 'tmpDir']),
+          ...pickDefined(o, ['fetchImpl', 'verify', 'osRelease', 'arch']),
         });
         ghPath = got.path;
         flow.ghVersion = got.version;

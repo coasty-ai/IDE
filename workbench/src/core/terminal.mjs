@@ -6,12 +6,14 @@
 //
 // The program and its arguments go into a small script, every word quoted for the shell, so nothing in them is read as
 // shell syntax. The one shell line Workbench writes itself is an installer, fixed text in connect.mjs, run as
-// `/bin/sh -c '<installer>'` (see ARCHITECTURE.md, "Rules for all code").
+// `/bin/sh -c '<installer>'` (see ARCHITECTURE.md, "Rules for all code"). The script waits for Terminal in a private
+// folder of Workbench's own under ~/.workbench, never in the temporary folder, where an agent's process could rewrite it.
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { shellQuote } from '../adapters/claude/args.mjs';
+import { privateTemp } from './workspace.mjs';
 
 /** How long a script's folder is kept after Terminal was asked to open it. */
 export const KEEP_MS = 10 * 60_000;
@@ -74,14 +76,17 @@ export function terminalScript({ title, program, args = [] } = {}) {
 /**
  * Open a terminal window running one program, for the person to answer.
  *
- * macOS: the script (terminalScript) goes into a new private folder (0700) under the temporary folder, as a .command
- * file of mode 0700, which `open -a Terminal <file>` opens (an argument array). The folder is removed after `keepMs`
- * (10 minutes), or when Workbench exits, whichever is first, and at once when Terminal could not be asked.
+ * macOS: the script (terminalScript) goes into a new private folder (0700) of Workbench's own,
+ * ~/.workbench/tmp/workbench-terminal-XXXXXX (privateTemp in workspace.mjs), never the temporary folder, as a .command
+ * file of mode 0700, which `open -a Terminal <file>` opens (an argument array). Terminal can take a while to run it,
+ * and a process that can write the temporary folder (a Codex agent's, in its sandbox) could rewrite it there first.
+ * The folder is removed after `keepMs` (10 minutes), or when Workbench exits, whichever is first, and at once when
+ * Terminal could not be asked. When the folder cannot be made, nothing is opened: `{ opened: false }`.
  * Elsewhere: nothing is written or opened, and the answer is `{ opened: false }`; the caller shows the command.
  *
  * @param {{ title: string, program: string, args?: string[] }} what
- * @param {{ platform?: string, tmpDir?: string, open?: (argv: string[]) => Promise<void>, keepMs?: number }} [o]
- *   for tests: the platform, the temporary folder, and the `open` to call
+ * @param {{ platform?: string, home?: string, open?: (argv: string[]) => Promise<void>, keepMs?: number }} [o]
+ *   for tests: the platform, the home folder (os.homedir()), and the `open` to call
  * @returns {Promise<{ opened: boolean }>}
  */
 export async function openTerminal({ title, program, args = [] } = {}, opts = {}) {
@@ -113,7 +118,7 @@ export function terminalStepsScript({ title, steps } = {}) {
  * Open a terminal window running a few programs in a row (terminalStepsScript), as openTerminal runs one: the same
  * private folder, file mode, `open -a Terminal`, clean-up, and `{ opened: false }` elsewhere than macOS.
  * @param {{ title: string, steps: { program: string, args?: string[] }[] }} what
- * @param {{ platform?: string, tmpDir?: string, open?: (argv: string[]) => Promise<void>, keepMs?: number }} [o]
+ * @param {{ platform?: string, home?: string, open?: (argv: string[]) => Promise<void>, keepMs?: number }} [o]
  * @returns {Promise<{ opened: boolean }>}
  */
 export async function openTerminalSteps({ title, steps } = {}, opts = {}) {
@@ -121,10 +126,14 @@ export async function openTerminalSteps({ title, steps } = {}, opts = {}) {
 }
 
 /** Write `script` as a private .command file and ask Terminal to open it (macOS); elsewhere `{ opened: false }`. */
-async function openScript(title, script, { platform = process.platform, tmpDir = os.tmpdir(), open = openWithMacOS, keepMs = KEEP_MS } = {}) {
+async function openScript(title, script, { platform = process.platform, home = os.homedir(), open = openWithMacOS, keepMs = KEEP_MS } = {}) {
   if (platform !== 'darwin') return { opened: false };
-  const dir = fs.mkdtempSync(path.join(tmpDir, 'workbench-terminal-'));
-  fs.chmodSync(dir, 0o700);
+  let dir;
+  try {
+    dir = privateTemp('workbench-terminal-', { home });
+  } catch {
+    return { opened: false }; // no private folder: never the temporary folder instead
+  }
   removeAtExit(dir);
   const name = oneLine(title, 60).replace(/[^A-Za-z0-9 ._-]+/g, '').replace(/^[ .-]+|[ .]+$/g, '') || 'Workbench';
   const file = path.join(dir, `${name}.command`);

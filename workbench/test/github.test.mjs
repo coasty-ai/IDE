@@ -141,14 +141,34 @@ test('the release files for each computer GitHub publishes gh for, and a plain r
   assert.equal(checksumFor('not a checksums file', r.name), null);
 });
 
-/** A temporary folder that ghInstall's own temporary folder goes in, so the tests can see it is gone. */
+/** A home folder for one install: its ~/.local/bin, and Workbench's own private folder, where the download goes. */
 function installPlace(t) {
   const d = scratch(t);
   const home = path.join(d, 'home');
-  const tmp = path.join(d, 'tmp');
   fs.mkdirSync(home);
-  fs.mkdirSync(tmp);
-  return { home, tmp, bin: path.join(home, '.local', 'bin') };
+  return { home, bin: path.join(home, '.local', 'bin'), own: path.join(home, '.workbench', 'tmp') };
+}
+/** What ghInstall left in Workbench's own private folder (nothing, once it is done). */
+const leftIn = (p) => (fs.existsSync(p.own) ? fs.readdirSync(p.own) : []);
+
+/** Every file under `dir`. */
+function filesUnder(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const p = path.join(dir, e.name);
+    return e.isDirectory() ? filesUnder(p) : [p];
+  });
+}
+
+/** Run `fn` with TMPDIR set to `dir`, then put it back. */
+async function withTmpdir(dir, fn) {
+  const saved = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  }
 }
 
 test('ghInstall on a Mac: the latest release from the redirect, checked against its checksum and GitHub’s signature, leaves only ~/.local/bin/gh', { skip: !HAS_UNZIP && 'needs /usr/bin/unzip' }, async (t) => {
@@ -158,24 +178,32 @@ test('ghInstall on a Mac: the latest release from the redirect, checked against 
   const verified = [];
   const progress = [];
   const r = await ghInstall({
-    fetchImpl, platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', tmpDir: p.tmp, env: process.env,
-    verify: async (file) => { verified.push({ file, there: fs.existsSync(file), installed: fs.existsSync(path.join(p.bin, 'gh')) }); return true; },
+    fetchImpl, platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', env: process.env,
+    verify: async (file) => {
+      // Where the download is meanwhile: a private folder of Workbench's own.
+      const work = fs.readdirSync(p.own).filter((n) => n.startsWith('workbench-gh-'));
+      verified.push({ file, there: fs.existsSync(file), installed: fs.existsSync(path.join(p.bin, 'gh')), work, own: mode(p.own) });
+      return true;
+    },
     onProgress: (x) => progress.push(x),
   });
   assert.deepEqual(r, { path: path.join(p.bin, 'gh'), version: '2.104.0' });
   assert.deepEqual(fs.readdirSync(p.bin), ['gh'], 'the program alone: no licence, no manual, no temporary file');
   assert.equal(mode(r.path), 0o755);
   assert.equal(fs.readFileSync(r.path, 'utf8'), wrapperScript({ version: '2.104.0' }));
-  assert.deepEqual(fs.readdirSync(p.tmp), [], 'the temporary folder is gone');
+  assert.deepEqual(leftIn(p), [], 'the download’s folder is gone');
   assert.deepEqual(calls.map((c) => [c.url, c.redirect]), [
     ['https://github.com/cli/cli/releases/latest', 'manual'],
     ['https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_checksums.txt', 'follow'],
     ['https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_macOS_arm64.zip', 'follow'],
   ]);
-  // The signature is checked on the program taken out of the archive, before it goes in place.
+  // The signature is checked on the program taken out of the archive, in Workbench's own private folder, before it
+  // goes in place.
   assert.equal(verified.length, 1);
-  assert.ok(verified[0].file.startsWith(`${p.tmp}${path.sep}`), verified[0].file);
+  assert.ok(verified[0].file.startsWith(`${p.own}${path.sep}`), verified[0].file);
   assert.deepEqual([verified[0].there, verified[0].installed], [true, false]);
+  assert.equal(verified[0].work.length, 1);
+  assert.equal(verified[0].own, 0o700);
   assert.deepEqual(progress.map((x) => x.phase).filter((x, i, all) => x !== all[i - 1]), ['finding', 'downloading', 'checking', 'installing']);
   assert.equal(progress.filter((x) => x.phase === 'downloading').at(-1).percent, 100);
   assert.equal(await ghVersion({ ghPath: r.path }), '2.104.0', 'the installed gh runs');
@@ -186,13 +214,25 @@ test('ghInstall on Linux: the tar.gz for this processor, with no signature check
   const release = fakeRelease({ platform: 'linux', arch: 'x64' });
   const { fetchImpl, calls } = releaseFetch(release);
   const r = await ghInstall({
-    fetchImpl, platform: 'linux', arch: 'x64', home: p.home, tmpDir: p.tmp, env: process.env,
+    fetchImpl, platform: 'linux', arch: 'x64', home: p.home, env: process.env,
     verify: async () => { throw new Error('the signature is checked on macOS only'); },
   });
   assert.deepEqual(r, { path: path.join(p.bin, 'gh'), version: '2.104.0' });
   assert.equal(calls.at(-1).url, 'https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_linux_amd64.tar.gz');
   assert.deepEqual(fs.readdirSync(p.bin), ['gh']);
-  assert.deepEqual(fs.readdirSync(p.tmp), []);
+  assert.deepEqual(leftIn(p), []);
+});
+
+test('ghInstall refuses, before any download, when it cannot make its private folder', { skip: !HAS_UNZIP && 'needs /usr/bin/unzip' }, async (t) => {
+  const p = installPlace(t);
+  fs.mkdirSync(path.join(p.home, '.workbench'));
+  fs.writeFileSync(p.own, ''); // a file where its folder would be
+  const { fetchImpl, calls } = releaseFetch(fakeRelease());
+  await assert.rejects(ghInstall({ fetchImpl, platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', verify: async () => true }), {
+    plain: true, why: 'disk', message: `Workbench could not make a private folder for its temporary files in ${p.own}.`,
+  });
+  assert.deepEqual(calls.map((c) => c.url), ['https://github.com/cli/cli/releases/latest'], 'only the version was asked');
+  assert.equal(fs.existsSync(p.bin), false);
 });
 
 test('ghInstall refuses a download whose checksum does not match, and installs nothing', { skip: !HAS_UNZIP && 'needs /usr/bin/unzip' }, async (t) => {
@@ -201,22 +241,22 @@ test('ghInstall refuses a download whose checksum does not match, and installs n
   const other = fakeRelease({ platform: 'darwin', arch: 'arm64', program: '#!/bin/sh\necho "gh version 2.104.0"\n' });
   let verified = 0;
   const { fetchImpl } = releaseFetch(release, { archive: other.bytes });
-  await assert.rejects(ghInstall({ fetchImpl, platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', tmpDir: p.tmp, verify: async () => { verified++; return true; } }), {
+  await assert.rejects(ghInstall({ fetchImpl, platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', verify: async () => { verified++; return true; } }), {
     plain: true, why: 'checksum', message: 'The download of GitHub’s command-line tool did not match the checksum GitHub published for it, so Workbench did not install it.',
   });
   assert.equal(verified, 0, 'nothing was taken out of it');
   assert.equal(fs.existsSync(p.bin), false);
-  assert.deepEqual(fs.readdirSync(p.tmp), []);
+  assert.deepEqual(leftIn(p), []);
   // A checksums file with no line for this computer's file: refused too.
   const { fetchImpl: noLine } = releaseFetch({ ...release, checksums: release.checksums.split('\n').filter((l) => !l.endsWith(`  ${release.name}`)).join('\n') });
-  await assert.rejects(ghInstall({ fetchImpl: noLine, platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', tmpDir: p.tmp, verify: async () => true }), { why: 'github' });
+  await assert.rejects(ghInstall({ fetchImpl: noLine, platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', verify: async () => true }), { why: 'github' });
   assert.equal(fs.existsSync(p.bin), false);
-  assert.deepEqual(fs.readdirSync(p.tmp), []);
+  assert.deepEqual(leftIn(p), []);
 });
 
 test('ghInstall refuses a gh GitHub did not sign, a link in place of the program, and a program that does not run', { skip: !HAS_UNZIP && 'needs /usr/bin/unzip' }, async (t) => {
   const p = installPlace(t);
-  const opts = { platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', tmpDir: p.tmp, env: process.env };
+  const opts = { platform: 'darwin', arch: 'arm64', home: p.home, osRelease: '27.0.0', env: process.env };
   await assert.rejects(ghInstall({ ...opts, fetchImpl: releaseFetch(fakeRelease()).fetchImpl, verify: async () => false }), {
     plain: true, why: 'signature', message: 'The copy of GitHub’s command-line tool that was downloaded is not signed by GitHub, so Workbench did not install it.',
   });
@@ -231,7 +271,7 @@ test('ghInstall refuses a gh GitHub did not sign, a link in place of the program
   }
   // The program is tried beside ~/.local/bin/gh under a temporary name: neither it nor a gh is left there.
   assert.deepEqual(fs.existsSync(p.bin) ? fs.readdirSync(p.bin) : [], []);
-  assert.deepEqual(fs.readdirSync(p.tmp), []);
+  assert.deepEqual(leftIn(p), []);
 });
 
 test('ghInstall tries the downloaded gh where it will live, under a temporary name, never in the temporary folder (which may be noexec)', async (t) => {
@@ -251,7 +291,7 @@ test('ghInstall tries the downloaded gh where it will live, under a temporary na
       ].join('\n');
       const r = await ghInstall({
         fetchImpl: releaseFetch(fakeRelease({ platform, arch: 'arm64', program })).fetchImpl, platform, arch: 'arm64', home: p.home,
-        osRelease: '27.0.0', tmpDir: p.tmp, env: process.env, verify: async () => true,
+        osRelease: '27.0.0', env: process.env, verify: async () => true,
       });
       assert.deepEqual(r, { path: path.join(p.bin, 'gh'), version: '2.104.0' });
       const where = fs.readFileSync(ran, 'utf8').trim().split('\n');
@@ -259,7 +299,7 @@ test('ghInstall tries the downloaded gh where it will live, under a temporary na
       assert.match(where[0], /\/\.local\/bin\/\.gh-[0-9]+-[0-9a-f]{8}\.tmp$/, 'under its temporary name beside ~/.local/bin/gh');
       assert.equal(path.dirname(where[0]), p.bin);
       assert.deepEqual(fs.readdirSync(p.bin), ['gh']);
-      assert.deepEqual(fs.readdirSync(p.tmp), []);
+      assert.deepEqual(leftIn(p), []);
       assert.equal(await ghVersion({ ghPath: r.path }), '2.104.0');
     });
   }
@@ -268,24 +308,24 @@ test('ghInstall tries the downloaded gh where it will live, under a temporary na
 test('ghInstall refuses before any download: a computer GitHub publishes no gh for, a Mac older than macOS 13; and with no network', async (t) => {
   const p = installPlace(t);
   const { fetchImpl, calls } = releaseFetch(fakeRelease());
-  await assert.rejects(ghInstall({ fetchImpl, platform: 'win32', arch: 'x64', home: p.home, tmpDir: p.tmp }), { plain: true, why: 'platform' });
-  await assert.rejects(ghInstall({ fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '21.6.0', home: p.home, tmpDir: p.tmp }), {
+  await assert.rejects(ghInstall({ fetchImpl, platform: 'win32', arch: 'x64', home: p.home }), { plain: true, why: 'platform' });
+  await assert.rejects(ghInstall({ fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '21.6.0', home: p.home }), {
     plain: true, why: 'macos', message: 'GitHub’s command-line tool needs macOS 13 or later, so Workbench cannot use it on this Mac. Use a token instead.',
   });
   assert.equal(calls.length, 0);
   const offline = releaseFetch(fakeRelease(), { fail: Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }) });
-  await assert.rejects(ghInstall({ fetchImpl: offline.fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home, tmpDir: p.tmp }), {
+  await assert.rejects(ghInstall({ fetchImpl: offline.fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home }), {
     plain: true, why: 'network', message: 'Workbench could not reach GitHub to get its command-line tool. Check the internet connection, then try again.',
   });
   // GitHub answering something else than a release's redirect.
   for (const o of [{ latest: 'https://evil.example/cli/cli/releases/tag/v2.104.0' }, { latest: 'https://github.com/cli/cli/releases/tag/v2.104.0-rc.1' },
     { latest: 'https://github.com/cli/cli/releases/tag/v2.104.0/../../x' }, { status: 500 }]) {
-    await assert.rejects(ghInstall({ fetchImpl: releaseFetch(fakeRelease(), o).fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home, tmpDir: p.tmp }), {
+    await assert.rejects(ghInstall({ fetchImpl: releaseFetch(fakeRelease(), o).fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home }), {
       plain: true, why: 'github', message: 'GitHub did not give Workbench the number of its latest command-line tool. Try again in a few minutes.',
     }, JSON.stringify(o));
   }
   assert.equal(fs.existsSync(p.bin), false);
-  assert.deepEqual(fs.readdirSync(p.tmp), []);
+  assert.deepEqual(leftIn(p), []);
 });
 
 test('ghInstall updates ~/.local/bin/gh in place, and stops when asked, leaving the gh that was there', { skip: !HAS_UNZIP && 'needs /usr/bin/unzip' }, async (t) => {
@@ -296,18 +336,18 @@ test('ghInstall updates ~/.local/bin/gh in place, and stops when asked, leaving 
   const stop = new AbortController();
   const hanging = releaseFetch(fakeRelease(), { hang: true });
   const stopped = ghInstall({
-    fetchImpl: hanging.fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home, tmpDir: p.tmp, signal: stop.signal, verify: async () => true,
+    fetchImpl: hanging.fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home, signal: stop.signal, verify: async () => true,
     onProgress: (x) => { if (x.phase === 'downloading') stop.abort(); },
   });
   await assert.rejects(stopped, { plain: true, why: 'cancelled', message: 'Stopped getting GitHub’s command-line tool.' });
   assert.equal(await ghVersion({ ghPath: old }), '2.40.1', 'the gh that was there stays');
-  assert.deepEqual(fs.readdirSync(p.tmp), []);
+  assert.deepEqual(leftIn(p), []);
   // Updated in place: the same path, the new program, nothing else beside it.
-  const r = await ghInstall({ fetchImpl: releaseFetch(fakeRelease()).fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home, tmpDir: p.tmp, verify: async () => true });
+  const r = await ghInstall({ fetchImpl: releaseFetch(fakeRelease()).fetchImpl, platform: 'darwin', arch: 'arm64', osRelease: '27.0.0', home: p.home, verify: async () => true });
   assert.equal(r.path, old);
   assert.equal(await ghVersion({ ghPath: old }), '2.104.0');
   assert.deepEqual(fs.readdirSync(p.bin), ['gh']);
-  assert.deepEqual(fs.readdirSync(p.tmp), []);
+  assert.deepEqual(leftIn(p), []);
 });
 
 test('the signature check on a Mac refuses a program GitHub did not sign (the real codesign, on files of this test)', { skip: process.platform !== 'darwin' && 'macOS only' }, async (t) => {
@@ -501,6 +541,24 @@ test('forgetGhGitHelper also takes out what two setup-gits run at once leave (gh
   assert.deepEqual(await forgetGhGitHelper(), { removed: [], kept: [...GH_HELPER_KEYS] });
   assert.deepEqual(gitValues(GH_HELPER_KEYS[0]), ['', gh, 'osxkeychain']);
   assert.deepEqual(gitValues(GH_HELPER_KEYS[1]), [gh, gh]);
+});
+
+test('git’s settings for gh are read and changed from a folder of Workbench’s own, never from the temporary folder', async (t) => {
+  // A temporary folder no one may write: a folder Workbench made there, which another process could fill with a
+  // repository of its own, would show as a failure.
+  fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '');
+  t.after(() => fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, ''));
+  const tmp = scratch(t);
+  fs.chmodSync(tmp, 0o500); // nothing can be made in it, so it stays empty, and goes like any other
+  const gh = '!/Users/ada/.local/bin/gh auth git-credential';
+  for (const key of GH_HELPER_KEYS) for (const v of ['', gh]) gitGlobal('--add', key, v);
+  await withTmpdir(tmp, async () => {
+    assert.equal(await gitUsesGh(), true);
+    assert.deepEqual(await forgetGhGitHelper(), { removed: [...GH_HELPER_KEYS], kept: [] });
+  });
+  assert.deepEqual(fs.readdirSync(tmp), []);
+  const own = path.join(process.env.HOME, '.workbench', 'tmp');
+  assert.deepEqual(fs.readdirSync(own).filter((n) => n.startsWith('workbench-')), [], 'its folders there are gone');
 });
 
 test('isGhHelper: gh’s own helper line, its path quoted or not; nothing else', () => {

@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   prepareRepo, createWorkspace, removeWorkspace, diffStats, readRepoConfig, normalizeConfig, slugify, workspacesFolder,
-  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit,
+  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp,
 } from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
 
@@ -2235,9 +2235,10 @@ test('mergeWork says when git does not know the person’s name and email, whate
   const t = await agentRepo(STARTING_FILES, { identity: false });
   write(t.w('a.txt'), 'one\nAGENT\nthree\n');
   const saved = process.env.GIT_CONFIG_GLOBAL;
-  delete process.env.GIT_CONFIG_GLOBAL; // an empty HOME and no config files at all
+  delete process.env.GIT_CONFIG_GLOBAL; // a HOME with no config files at all: only Workbench's own private folder
   try {
-    assert.equal(fs.readdirSync(process.env.HOME).length, 0);
+    assert.deepEqual(fs.readdirSync(process.env.HOME).filter(n => n !== '.workbench'), []);
+    assert.deepEqual(fs.readdirSync(path.join(process.env.HOME, '.workbench')), ['tmp']);
     assert.equal(process.env.GIT_AUTHOR_NAME, 'Workbench Test'); // plain git would use this, or guess one
     assert.equal(await gitIdentity({ repoRoot: t.root }), null);
     const { expect } = await proposal(t);
@@ -2318,8 +2319,136 @@ test('when the person’s branch moves just before git reads it, git stops befor
   assert.equal(statusOf(t.root), '');
 });
 
-test('nothing is left behind in the temporary folder', () => {
+/** Whether `p` is the folder `dir` or inside it, as given or as its real path. */
+const isIn = (p, dir) => [dir, fs.realpathSync(dir)].some(d => p === d || p.startsWith(d + path.sep));
+
+test('privateTemp makes a new private folder under ~/.workbench/tmp each time, never in the temporary folder', () => {
+  const home = path.join(T, 'private-home');
+  fs.mkdirSync(home);
+  const own = path.join(fs.realpathSync(home), '.workbench', 'tmp');
+  const a = privateTemp('workbench-index-', { home });
+  assert.equal(path.dirname(a), own);
+  assert.match(path.basename(a), /^workbench-index-.{6}$/);
+  assert.equal(fs.statSync(a).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(own).mode & 0o777, 0o700);
+  assert.deepEqual(fs.readdirSync(a), []);
+  const b = privateTemp('workbench-index-', { home });
+  assert.notEqual(b, a);
+  // The folder that holds them is made private again when it was not.
+  fs.chmodSync(own, 0o755);
+  privateTemp('workbench-git-', { home });
+  assert.equal(fs.statSync(own).mode & 0o777, 0o700);
+  // The home folder is read at each call: here, the tests' own.
+  const c = privateTemp('workbench-git-');
+  assert.equal(path.dirname(c), path.join(fs.realpathSync(process.env.HOME), '.workbench', 'tmp'));
+  fs.rmdirSync(c);
   assert.deepEqual(fs.readdirSync(tmp).filter(f => f.startsWith('workbench-')), []);
+  for (const p of fs.readdirSync(own)) fs.rmSync(path.join(own, p), { recursive: true });
+});
+
+test('privateTemp refuses a link or a file in place of ~/.workbench/tmp, in plain words, and makes nothing', () => {
+  const elsewhere = path.join(T, 'private-elsewhere');
+  fs.mkdirSync(elsewhere);
+  for (const [kind, put] of [['link', p => fs.symlinkSync(elsewhere, p)], ['file', p => fs.writeFileSync(p, '')]]) {
+    const home = path.join(T, `private-${kind}`);
+    fs.mkdirSync(path.join(home, '.workbench'), { recursive: true });
+    const own = path.join(home, '.workbench', 'tmp');
+    put(own);
+    assert.throws(() => privateTemp('workbench-index-', { home }), {
+      plain: true, message: `Workbench could not make a private folder for its temporary files in ${own}.`,
+    }, kind);
+  }
+  assert.deepEqual(fs.readdirSync(elsewhere), [], 'nothing was made where the link points');
+});
+
+test('privateTemp removes leftovers more than a day old the first time in a run, and keeps newer ones', () => {
+  const home = path.join(T, 'private-leftovers');
+  const own = path.join(home, '.workbench', 'tmp');
+  fs.mkdirSync(own, { recursive: true, mode: 0o700 });
+  const old = path.join(own, 'workbench-gh-old123');
+  const fresh = path.join(own, 'workbench-terminal-new456');
+  const notOurs = path.join(own, 'someone-else');
+  for (const d of [old, fresh, notOurs]) write(path.join(d, 'x'), 'x\n');
+  const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60_000) / 1000;
+  for (const d of [old, notOurs]) fs.utimesSync(d, twoDaysAgo, twoDaysAgo);
+  const made = privateTemp('workbench-index-', { home });
+  assert.equal(fs.existsSync(old), false, 'Workbench stopped before it could remove it: it goes now');
+  assert.equal(fs.existsSync(fresh), true, 'maybe still in use by another Workbench');
+  assert.equal(fs.existsSync(notOurs), true, 'only Workbench’s own');
+  // Once in a run: a leftover that grows old meanwhile waits for the next run.
+  fs.utimesSync(fresh, twoDaysAgo, twoDaysAgo);
+  privateTemp('workbench-index-', { home });
+  assert.equal(fs.existsSync(fresh), true);
+  assert.equal(fs.existsSync(made), true, 'the folder just made is the caller’s to remove');
+});
+
+test('Workbench’s own git never works in the temporary folder, where another process could plant hooks for it to run', async () => {
+  // A git first on the PATH does, every time, what a process that can write the temporary folder (a Codex agent's, in
+  // its sandbox) could do at the right moment: it fills the folder core.hooksPath names with hooks that note
+  // themselves. It also notes where each git works (its folder, a GIT_INDEX_FILE, a --work-tree), then runs the real git.
+  const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  const shimDir = path.join(T, 'planting-git');
+  const notes = path.join(T, 'planting-git.log');
+  const ran = path.join(T, 'planted-hooks.log');
+  write(path.join(shimDir, 'git'), [
+    '#!/bin/sh',
+    `printf 'cwd %s\\n' "$(pwd -P)" >> '${notes}'`,
+    `if [ -n "$GIT_INDEX_FILE" ]; then printf 'index %s\\n' "$GIT_INDEX_FILE" >> '${notes}'; fi`,
+    'for a in "$@"; do',
+    '  case "$a" in',
+    `    core.hooksPath=*) d="\${a#core.hooksPath=}"; printf 'hooks %s\\n' "$d" >> '${notes}'`,
+    `      for h in ${HOOKS.join(' ')}; do { printf '#!/bin/sh\\necho %s >> "%s"\\n' "$h" '${ran}' > "$d/$h" && chmod +x "$d/$h"; } 2>/dev/null; done ;;`,
+    `    --work-tree=*) printf 'worktree %s\\n' "\${a#--work-tree=}" >> '${notes}' ;;`,
+    '  esac',
+    'done',
+    `exec '${realGit}' "$@"`,
+    '',
+  ].join('\n'));
+  fs.chmodSync(path.join(shimDir, 'git'), 0o755);
+
+  const t = await agentRepo();
+  write(t.w('a.txt'), 'one\nAGENT\nthree\n');
+  write(t.w('new.txt'), 'new\n');
+  write(t.w('.gitignore'), '.env\nnode_modules/\nhidden.txt\n'); // the rules it started from are read in a folder of Workbench's own
+  write(t.w('hidden.txt'), 'hidden by the agent\n');
+  const other = await createWorkspace({ repoRoot: t.root, agentId: `${t.id}o`, slug: 'Throw me', baseDir });
+  write(path.join(other.path, 'x.txt'), 'x\n');
+  const marked = await createWorkspace({ repoRoot: t.root, agentId: `${t.id}m`, slug: 'Marked', baseDir });
+  git(marked.path, 'update-index', '--assume-unchanged', 'b.txt'); // the tidy judges its files again in an index of its own
+
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${shimDir}${path.delimiter}${savedPath}`;
+  try {
+    const { expect } = await proposal(t);
+    await workDiff({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    assert.ok((await diffStats({ path: t.ws.path, base: t.ws.base })).list.some(f => f.path === 'hidden.txt' && f.ignored));
+    assert.equal((await mergeWork(mergeOpts(t, expect))).ok, true);
+    const s2 = await snapshotWork({ repoRoot: t.root, path: other.path, since: other.base });
+    assert.equal((await discardWork({ repoRoot: t.root, path: other.path, branch: other.branch, since: other.base, expect: { workId: s2.workId }, agentId: `${t.id}o` })).ok, true);
+    assert.equal((await gitGraph({ repoRoot: t.root })).ok, true);
+    assert.deepEqual(await removeWorkspace({ repoRoot: t.root, path: marked.path, base: marked.base, onlyIfUnchanged: true, deleteBranch: true }),
+      { removed: true, branch: marked.branch });
+  } finally {
+    process.env.PATH = savedPath;
+  }
+  const lines = fs.readFileSync(notes, 'utf8').split('\n').filter(Boolean);
+  assert.deepEqual(lines.filter(l => isIn(l.slice(l.indexOf(' ') + 1), tmp)), [], 'nothing of Workbench’s own git is in the temporary folder');
+  assert.deepEqual([...new Set(lines.filter(l => l.startsWith('hooks ')).map(l => l.slice('hooks '.length)))], ['/dev/null'],
+    'core.hooksPath names a place where no hook can be put');
+  assert.equal(fs.existsSync(ran), false, 'no planted hook ran');
+  // Its own index and the rules the agent started from were in private folders of its own, which are gone again.
+  const own = path.join(fs.realpathSync(process.env.HOME), '.workbench', 'tmp');
+  assert.ok(lines.some(l => l.startsWith(`index ${own}${path.sep}workbench-index-`)), 'a scratch index of its own was used');
+  assert.ok(lines.some(l => l.startsWith(`worktree ${own}${path.sep}workbench-ignore-`)), 'the rules it started from were read in a folder of its own');
+  assert.equal(fs.statSync(own).mode & 0o777, 0o700);
+  assert.deepEqual(fs.readdirSync(own).filter(f => f.startsWith('workbench-')), []);
+});
+
+test('nothing is left behind in the temporary folder, or in Workbench’s own private one', () => {
+  assert.deepEqual(fs.readdirSync(tmp).filter(f => f.startsWith('workbench-')), []);
+  const own = path.join(process.env.HOME, '.workbench', 'tmp');
+  assert.ok(fs.existsSync(own), 'the tests used it');
+  assert.deepEqual(fs.readdirSync(own).filter(f => f.startsWith('workbench-')), []);
 });
 
 test('nothing was written to the real home folder', () => {

@@ -75,6 +75,11 @@ before(() => {
     '  printf \'%s\\n\' "ARGS $*" >> "$FAKE_GIT_LOG"',
     '  printf \'%s\\n\' "ENV askpass=[${GIT_ASKPASS-unset}] ssh_askpass=[${SSH_ASKPASS-unset}] allow=[${GIT_ALLOW_PROTOCOL-unset}] prompt=[${GIT_TERMINAL_PROMPT-unset}] ceiling=[${GIT_CEILING_DIRECTORIES-unset}] cwd=[$(pwd)]" >> "$FAKE_GIT_LOG"',
     'fi',
+    // FAKE_GIT_PLANT: what a process that can write the temporary folder could do just before git starts there, every
+    // time: a `.git` file in the folder git runs in, pointing at a repository of its own.
+    'if [ -n "$FAKE_GIT_PLANT" ]; then',
+    '  case "$(pwd -P)" in "$TMPDIR"/*) [ -e .git ] || printf \'gitdir: %s\\n\' "$FAKE_GIT_PLANT" > .git ;; esac',
+    'fi',
     'case " $* " in',
     '  *" clone "*)',
     '    for last; do :; done',
@@ -182,17 +187,47 @@ test('approve, fill and reject give git the token on stdin, never in its argumen
   assert.ok(log.some((l) => /ARGS .*credential approve/.test(l)));
   assert.ok(log.some((l) => /ARGS .*credential reject/.test(l)));
   assert.ok(!log.some((l) => l.includes(TOKEN)), 'the token never appears in any git command line');
-  // Every one ran outside any repository, with no way to ask the person.
+  // Every one ran outside any repository, from a new empty folder of Workbench's own (never in the temporary folder),
+  // with git told not to look above it, and with no way to ask the person.
+  const own = path.join(process.env.HOME, '.workbench', 'tmp');
   for (const l of log.filter((x) => x.startsWith('ENV '))) {
     assert.match(l, /prompt=\[0\]/);
-    assert.match(l, /cwd=\[[^\]]*workbench-git-[^\]]*\]/);
-    assert.doesNotMatch(l, /ceiling=\[unset\]/);
+    const cwd = /cwd=\[([^\]]*)\]/.exec(l)[1];
+    assert.equal(path.dirname(cwd), own, l);
+    assert.match(path.basename(cwd), /^workbench-git-/);
+    assert.match(l, new RegExp(`ceiling=\\[${own.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]`));
   }
   const quiet = log.filter((x) => x.startsWith('ENV ') && x.includes('askpass=[]'));
   assert.ok(quiet.length >= 3, 'credential commands run with an empty GIT_ASKPASS');
   for (const l of quiet) assert.match(l, /ssh_askpass=\[unset\]/);
   // The empty folders they ran from are gone.
-  assert.deepEqual(fs.readdirSync(process.env.TMPDIR).filter((n) => n.startsWith('workbench-git-')), []);
+  assert.deepEqual(fs.readdirSync(own).filter((n) => n.startsWith('workbench-git-')), []);
+  assert.deepEqual(fs.readdirSync(process.env.TMPDIR).filter((n) => n.startsWith('workbench-')), []);
+});
+
+test('a process that can write the temporary folder cannot hand Workbench’s git a repository whose helper gets the token', async () => {
+  // The repository such a process (a Codex agent's, in its sandbox) would make: its config names a credential helper,
+  // a program git runs and hands the sign-in to, which keeps everything it is given. The recording git plants a `.git`
+  // pointing at it whenever git is about to run in a folder inside the temporary folder (FAKE_GIT_PLANT).
+  const planted = path.join(T, 'planted.git');
+  const stolen = path.join(T, 'planted-credentials');
+  gitIn(T, 'init', '-q', '--bare', planted);
+  gitIn(planted, 'config', 'credential.helper', `!f() { cat >> ${sh(stolen)}; }; f`);
+  gitIn(planted, 'config', 'user.name', 'Planted Name');
+  process.env.FAKE_GIT_PLANT = planted;
+  try {
+    fs.rmSync(credsFile, { force: true });
+    assert.deepEqual(await approveGitCredential({ host: 'github.com', username: 'octo', password: TOKEN }), { helper: true });
+    assert.match(read(credsFile), /octo/);
+    assert.deepEqual(await fillGitCredential({ host: 'github.com', username: 'octo' }), { username: 'octo', password: TOKEN });
+    await setGitIdentity({ name: 'Global Name', email: 'global@example.org' });
+    assert.equal((await gitConfigIdentity()).name, 'Global Name');
+    assert.deepEqual(await rejectGitCredential({ host: 'github.com', username: 'octo' }), { ok: true });
+    assert.equal(read(stolen), '', 'its helper never ran, and was never given the token');
+  } finally {
+    delete process.env.FAKE_GIT_PLANT;
+    await rejectGitCredential({ host: 'github.com', username: 'octo' });
+  }
 });
 
 test('the credential functions refuse fields that would break git’s input, before running git', async () => {

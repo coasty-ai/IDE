@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { shellQuote } from '../adapters/claude/args.mjs';
-import { git } from './workspace.mjs';
+import { git, privateTemp } from './workspace.mjs';
 
 /** Where gh's releases are: the latest is read from a redirect, never from the API (60 requests an hour per address). */
 export const GH_RELEASES = 'https://github.com/cli/cli/releases';
@@ -461,9 +461,13 @@ export function ghSignOutCommand(ghPath) {
 
 // ------------------------------------------------------------------ git's helper for github.com
 
-/** Run `fn(cwd, env)` in a new empty folder that is in no repository, as workspace.mjs reads git's global settings. */
+/**
+ * Run `fn(cwd, env)` in a new empty folder that is in no repository, as workspace.mjs reads git's global settings: a
+ * private folder of Workbench's own (privateTemp), never in the temporary folder, where another process could put a
+ * repository of its own in it first.
+ */
 async function outsideRepos(fn) {
-  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-git-')));
+  const dir = privateTemp('workbench-git-');
   try {
     return await fn(dir, { GIT_CEILING_DIRECTORIES: path.dirname(dir) });
   } finally {
@@ -699,25 +703,28 @@ export async function codesignVerify(file) {
  * in to GitHub, when gh is missing or older than Workbench needs).
  *
  * 1. The latest version, from the redirect of /releases/latest (never the API).
- * 2. The release's checksums file, then the archive for this computer, into a new private folder (0700) under the
- *    temporary folder; the archive's SHA-256 must be the checksums file's, before anything else is done with it.
- * 3. Only the program is taken out (`/usr/bin/unzip` on macOS, tar elsewhere: argument arrays): it must be a plain
- *    file. On macOS it must be signed by GitHub (codesignVerify).
+ * 2. The release's checksums file, then the archive for this computer, into a new private folder (0700) of Workbench's
+ *    own, ~/.workbench/tmp/workbench-gh-XXXXXX (privateTemp in workspace.mjs), never the temporary folder, which an
+ *    agent's process may write; the archive's SHA-256 must be the checksums file's, before anything else is done with it.
+ * 3. Only the program is taken out (`/usr/bin/unzip` on macOS, tar elsewhere: argument arrays), into that folder: it
+ *    must be a plain file. On macOS it must be signed by GitHub (codesignVerify).
  * 4. It is copied beside ~/.local/bin/gh under a temporary name and made 0755. There it must run and say the
- *    release's version (never in the temporary folder, which may not let programs run). Then it is renamed onto
+ *    release's version (never in a temporary folder, which may not let programs run). Then it is renamed onto
  *    ~/.local/bin/gh: an older one there is updated in place, and nothing half-written is ever at that path.
- * The temporary folder goes in every case. Refusals are plain errors with `.why`: `platform`, `macos`, `network`,
- * `github` (an answer Workbench did not expect), `checksum`, `signature`, `runs`, `disk` or `cancelled`.
+ * The private folder and the temporary name go in every case. Refusals are plain errors with `.why`: `platform`,
+ * `macos`, `network`, `github` (an answer Workbench did not expect), `checksum`, `signature`, `runs`, `disk` (also when
+ * the private folder cannot be made) or `cancelled`.
  *
  * @param {{ onProgress?: (p: { phase: 'finding'|'downloading'|'checking'|'installing', percent?: number }) => void,
  *   fetchImpl?: typeof fetch, platform?: string, arch?: string, home?: string, osRelease?: string,
- *   verify?: (file: string) => Promise<boolean>, tmpDir?: string, env?: object, signal?: AbortSignal }} [o]
- *   verify: the signature check on macOS (codesignVerify); tests give their own
+ *   verify?: (file: string) => Promise<boolean>, env?: object, signal?: AbortSignal }} [o]
+ *   verify: the signature check on macOS (codesignVerify); tests give their own. home: where ~/.local/bin and
+ *   ~/.workbench are (os.homedir())
  * @returns {Promise<{ path: string, version: string }>}
  */
 export async function ghInstall({
   onProgress, fetchImpl = fetch, platform = process.platform, arch = process.arch, home = os.homedir(), osRelease = os.release(),
-  verify = codesignVerify, tmpDir = os.tmpdir(), env = process.env, signal,
+  verify = codesignVerify, env = process.env, signal,
 } = {}) {
   const progress = (p) => { try { onProgress?.(p); } catch { /* the caller's trouble */ } };
   ghAsset({ version: '0.0.0', platform, arch }); // refuses a computer GitHub publishes no gh for, before any download
@@ -727,11 +734,15 @@ export async function ghInstall({
   progress({ phase: 'finding' });
   const version = await ghLatestVersion({ fetchImpl, signal });
   const asset = ghAsset({ version, platform, arch });
-  const work = fs.realpathSync.native(fs.mkdtempSync(path.join(tmpDir, 'workbench-gh-')));
+  let work;
+  try {
+    work = privateTemp('workbench-gh-', { home });
+  } catch (e) {
+    throw refusal('disk', e.plain ? e.message : 'Workbench could not make a private folder for the download.', e.detail || e.message);
+  }
   const dest = ghOwnPath(home);
   let tmp = null;
   try {
-    fs.chmodSync(work, 0o700);
     const base = `${GH_RELEASES}/download/v${version}`;
     const want = checksumFor(await readChecksums(`${base}/${asset.checksums}`, { fetchImpl, signal }), asset.name);
     if (!want) throw notAsExpected('a checksum for its command-line tool', `no line for ${asset.name} in ${asset.checksums}`);

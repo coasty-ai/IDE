@@ -1038,8 +1038,8 @@ function noGhComputer(t, { release: o = {}, fetch: f = {} } = {}) {
   const dir = scratch(t);
   const home = path.join(dir, 'home');
   const bin = path.join(dir, 'bin');
-  const tmp = path.join(dir, 'tmp');
-  for (const d of [home, bin, tmp]) fs.mkdirSync(d);
+  const privateTmp = path.join(home, '.workbench', 'tmp'); // where the download goes: Workbench's own, never the temporary folder
+  for (const d of [home, bin]) fs.mkdirSync(d);
   const git = spawnSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim() || '/usr/bin/git';
   fs.symlinkSync(git, path.join(bin, 'git'));
   const platform = HAS_UNZIP ? 'darwin' : 'linux';
@@ -1050,8 +1050,9 @@ function noGhComputer(t, { release: o = {}, fetch: f = {} } = {}) {
   delete env.WORKBENCH_GH_BIN;
   fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL, '');
   t.after(() => fs.writeFileSync(path.join(T, 'gitconfig'), ''));
-  const ghOptions = { ...FAST, fetchImpl: served.fetchImpl, verify: async () => true, osRelease: '27.0.0', arch: 'arm64', tmpDir: tmp, dirs: [] };
-  return { dir, home, bin, tmp, env, platform, release, calls: served.calls, ghOptions, own: path.join(home, '.local', 'bin', 'gh'), state };
+  const ghOptions = { ...FAST, fetchImpl: served.fetchImpl, verify: async () => true, osRelease: '27.0.0', arch: 'arm64', dirs: [] };
+  const left = () => fs.readdirSync(privateTmp);
+  return { dir, home, bin, privateTmp, left, env, platform, release, calls: served.calls, ghOptions, own: path.join(home, '.local', 'bin', 'gh'), state };
 }
 
 const SIGNED_IN = 'Signed in to GitHub as octo-cat. Git in Terminal, Workbench and your agents use this sign-in.';
@@ -1153,7 +1154,7 @@ test('Sign in to GitHub with no gh: GitHub’s own build is downloaded and check
   assert.deepEqual(end, { ok: true, phase: 'done', login: 'octo-cat', sentence: SIGNED_IN });
   assert.deepEqual(heard.map((p) => [p.phase, p.code ?? null]), [['installing', null], ['code', null], ['code', FAKE_CODE], ['done', null]]);
   assert.deepEqual(fs.readdirSync(path.dirname(w.own)), ['gh']);
-  assert.deepEqual(fs.readdirSync(w.tmp), [], 'the download’s folder is gone');
+  assert.deepEqual(w.left(), [], 'the download’s folder is gone');
   assert.deepEqual(w.calls.map((x) => x.url), [
     'https://github.com/cli/cli/releases/latest',
     `https://github.com/cli/cli/releases/download/v2.104.0/${w.release.checksumsName}`,
@@ -1309,7 +1310,7 @@ test('a download that is refused ends the sign-in in plain words, opens nothing,
   const g = (await c.status()).github;
   assert.deepEqual([g.connected, g.ghInstalled, g.signingIn, g.sentence], [false, false, null, sentence]);
   assert.equal(fs.existsSync(bad.own), false);
-  assert.deepEqual(fs.readdirSync(bad.tmp), []);
+  assert.deepEqual(bad.left(), []);
   assert.deepEqual([steps, terminals], [[], []]);
   // A slow download, stopped: no words left behind, nothing installed.
   const slow = noGhComputer(t, { fetch: { hang: true } });
@@ -1320,7 +1321,7 @@ test('a download that is refused ends the sign-in in plain words, opens nothing,
   assert.deepEqual(await s2.c.cancelGithubSignIn(), { ok: true, sentence: 'Stopped signing in to GitHub.' });
   assert.equal((await s2.c.status()).github.sentence, 'Not connected.');
   assert.equal(fs.existsSync(slow.own), false);
-  assert.deepEqual(fs.readdirSync(slow.tmp), []);
+  assert.deepEqual(slow.left(), []);
 });
 
 test('a WORKBENCH_GH_BIN that is not there: Sign in says so at once, and nothing is downloaded', async (t) => {

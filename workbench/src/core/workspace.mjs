@@ -5,7 +5,8 @@
 // commit, throwing it away, and the commit graph.
 //
 // Every git call goes through git(): execFile (or spawn, for git in a process group of its own) with an argument array
-// and a timeout.
+// and a timeout. Every temporary folder Workbench makes comes from privateTemp(): under ~/.workbench/tmp, never the
+// system's temporary folder, which agents can write.
 import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -142,6 +143,60 @@ function gitTrouble(e) {
   if (e && e.killed) return plainError('Git took too long and was stopped.', e);
   if (e && e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return plainError('Git gave back more than Workbench can read at once.', e);
   return null;
+}
+
+/** Where Workbench keeps its own temporary files, in the home folder (see privateTemp). */
+const PRIVATE_TEMP = ['.workbench', 'tmp'];
+/** Leftovers older than this are removed (see privateTemp): nothing of Workbench's lasts a day. */
+const LEFTOVER_MS = 24 * 60 * 60_000;
+/** The private folders whose leftovers were looked at in this run. */
+const sweptFolders = new Set();
+
+/**
+ * A new, empty private folder (0700) for Workbench's own temporary files, `<home>/.workbench/tmp/<prefix>XXXXXX`, as a
+ * real path: a script for Terminal, gh's download, a scratch git index, the folder git runs in outside every
+ * repository. Never in the system's temporary folder: a Codex agent's sandbox may write there (as may any program of
+ * the person's), so whatever Workbench left there could be changed before Workbench used it. ~/.workbench/tmp is made
+ * 0700 (or made private again) and must be a real folder of this account's, not a link; otherwise this throws a plain
+ * error and makes nothing. The first time in a run, folders of Workbench's own there more than a day old (left by a
+ * Workbench that was stopped before it could remove them) are removed. The caller removes the folder it was given.
+ * @param {string} prefix the start of the folder's name, such as 'workbench-index-'
+ * @param {{ home?: string }} [o] the home folder: os.homedir(), read at each call, unless given
+ * @returns {string}
+ */
+export function privateTemp(prefix, { home = os.homedir() } = {}) {
+  const root = path.join(path.resolve(String(home)), ...PRIVATE_TEMP);
+  const refuse = cause => plainError(`Workbench could not make a private folder for its temporary files in ${root}.`, cause);
+  let real;
+  try {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const st = fs.lstatSync(root);
+    const uid = process.getuid?.();
+    if (st.isSymbolicLink() || !st.isDirectory() || (uid != null && st.uid !== uid)) throw refuse();
+    if ((st.mode & 0o777) !== 0o700) fs.chmodSync(root, 0o700);
+    real = fs.realpathSync.native(root);
+  } catch (e) {
+    throw e && e.plain ? e : refuse(e);
+  }
+  if (!sweptFolders.has(real)) {
+    sweptFolders.add(real);
+    const before = Date.now() - LEFTOVER_MS;
+    let names = [];
+    try { names = fs.readdirSync(real); } catch { /* nothing to look at */ }
+    for (const name of names.filter(n => n.startsWith('workbench-'))) {
+      const p = path.join(real, name);
+      try {
+        if (fs.lstatSync(p).mtimeMs < before) fs.rmSync(p, { recursive: true, force: true });
+      } catch { /* gone meanwhile */ }
+    }
+  }
+  try {
+    const dir = fs.mkdtempSync(path.join(real, prefix));
+    fs.chmodSync(dir, 0o700);
+    return dir;
+  } catch (e) {
+    throw refuse(e);
+  }
 }
 
 function expandHome(p) {
@@ -392,7 +447,7 @@ async function filesAsCommitted(cwd, head) {
     if (!marked) return true;
     return await withoutHooks(async run => {
       await run.shield(cwd);
-      const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
+      const scratch = privateTemp('workbench-index-');
       try {
         const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
         await run(['-c', 'core.splitIndex=false', 'read-tree', head], { cwd, env });
@@ -481,7 +536,7 @@ async function ignoredAt(wsPath, ref, paths, run = git) {
     }
   }
   const texts = await blobs(run, wsPath, [...found.values()]);
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-ignore-'));
+  const scratch = privateTemp('workbench-ignore-');
   try {
     [...found.keys()].forEach((file, k) => {
       const dest = path.join(scratch, ...safeParts(file));
@@ -639,9 +694,10 @@ function countLines(file, budget) {
 //
 // The person's folder only ever sees `git merge --ff-only` to a merge commit built in the object database (merge-tree
 // and commit-tree), with --no-squash, --no-autostash and --no-overwrite-ignore: never a real merge, never conflict markers, never
-// update-ref on a checked-out branch. Every git command here runs with core.hooksPath set to an empty folder and every
-// hook set in git config (hook.<name>.command, git 2.54 and newer) switched off, so no hook runs (commit-tree runs none
-// anyway). Clean and smudge filters and merge drivers from git config still run, as they would for git itself.
+// update-ref on a checked-out branch. Every git command here runs with core.hooksPath set to /dev/null (never a folder,
+// which someone could fill first) and every hook set in git config (hook.<name>.command, git 2.54 and newer) switched
+// off, so no hook runs (commit-tree runs none anyway). Clean and smudge filters and merge drivers from git config still
+// run, as they would for git itself.
 
 const MIN_GIT = [2, 38, 0]; // merge-tree --write-tree
 const MERGE_TIMEOUT_MS = 10 * 60_000; // stopping git half-way through updating the person's folder would be worse than waiting
@@ -759,28 +815,30 @@ function configEnv(pairs) {
 }
 
 /**
- * `fn(run)`, where `run` is git() that runs no hook: core.hooksPath points at a new empty folder (removed afterwards),
- * and the hooks set in git config are switched off for every folder handed to `run.shield(folder)` (the person's
- * folder and the agent's, as soon as they are known; before that, only commands that run no hook are used).
+ * Where withoutHooks points core.hooksPath. Git looks for each hook at <hooksPath>/<name>; nothing is under /dev/null,
+ * and nothing can be put there. Never a folder: a new empty one in the temporary folder could be filled with hooks by
+ * another process (a Codex agent's sandbox can write there) before git looked.
+ */
+const NO_HOOKS = '/dev/null';
+
+/**
+ * `fn(run)`, where `run` is git() that runs no hook: core.hooksPath points at /dev/null (NO_HOOKS), and the hooks set
+ * in git config are switched off for every folder handed to `run.shield(folder)` (the person's folder and the agent's,
+ * as soon as they are known; before that, only commands that run no hook are used).
  * `detached`: every git command of the job, the config read for the shield too, runs in a process group of its own
  * (see git()). Merges and throw-aways use it: a Ctrl-C must not stop git part-way through the person's folder or the
  * agent's, while Workbench waits for the job to finish.
  */
 async function withoutHooks(fn, { detached = false } = {}) {
-  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-nohooks-'));
   const names = new Set();
   let off = {};
   const any = (args, o = {}) => git(args, { ...o, detached });
-  const run = (args, o = {}) => any(['-c', `core.hooksPath=${empty}`, ...args], { ...o, env: { ...off, ...o.env } });
+  const run = (args, o = {}) => any(['-c', `core.hooksPath=${NO_HOOKS}`, ...args], { ...o, env: { ...off, ...o.env } });
   run.shield = async cwd => {
     for (const name of await configHooks(cwd, any)) names.add(name);
     off = configEnv([...names].map(name => [`hook.${name}.enabled`, 'false']));
   };
-  try {
-    return await fn(run);
-  } finally {
-    fs.rmSync(empty, { recursive: true, force: true });
-  }
+  return fn(run);
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -998,7 +1056,7 @@ async function snap(run, root, folder, since, { review = true } = {}) {
 
   // The work as a tree, in a temporary index; meanwhile, what its own ignore rules hide, and the trees it is compared with.
   const work = async () => {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-index-'));
+    const scratch = privateTemp('workbench-index-');
     try {
       const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
       if (!copyIndex(own, env.GIT_INDEX_FILE)) await run(['read-tree', head], { cwd, env });
@@ -1956,9 +2014,14 @@ function gitFailed(e, sentence, secret = null) {
   return err;
 }
 
-/** `fn(cwd, env)` run from a new empty folder outside every repository (removed afterwards). */
+/**
+ * `fn(cwd, env)` run from a new empty folder outside every repository (removed afterwards), with git told not to look
+ * above it. The folder is Workbench's own (privateTemp), never in the temporary folder: there, another process could put
+ * a `.git` in it before git started, and that repository's config could name a credential helper, which git would run
+ * and hand the sign-in to.
+ */
 async function outsideRepos(fn) {
-  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'workbench-git-')));
+  const dir = privateTemp('workbench-git-');
   try {
     return await fn(dir, { GIT_CEILING_DIRECTORIES: path.dirname(dir) });
   } finally {
@@ -2102,7 +2165,7 @@ export async function fillGitCredential({ host, username } = {}) {
     }
     if (fields.host !== host || !fields.password || (fields.username && fields.username !== username)) return null;
     return { username, password: fields.password };
-  });
+  }).catch(() => null); // no folder to run git from
 }
 
 // ---- cloning
