@@ -2597,10 +2597,13 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       'node_modules/x/.env.example': 'X=1\n', // a package's own, which .env* matches too, as in git
     }, { forced: ['secrets/README.md'] });
     const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cpStandIn().copy });
-    // data/ is one entry in git's list of what it ignores, and file by file in what .worktreeinclude matches; src/sub/
-    // holds only matching files, so both lists name it whole, and it is copied as one.
-    assert.deepEqual(pathsOf(r.copied), ['.env', 'config/secret.json', 'data/a.json', 'data/b.csv', 'logs/a.log', 'node_modules/x/.env.example',
-      'secrets/.env', 'secrets/deep', 'src/sub']);
+    // data/ is one entry in git's list of what it ignores, and file by file in what .worktreeinclude matches. src/sub/
+    // holds only matching files: git 2.39 names it whole in both lists (and the file in it too), so it is copied as one;
+    // a git that names only the file gives the file.
+    const sub = pathsOf(r.copied).filter(p => p.startsWith('src/sub'));
+    assert.ok(sub.length === 1 && ['src/sub', 'src/sub/.env.local'].includes(sub[0]), String(sub));
+    assert.deepEqual(pathsOf(r.copied).filter(p => !p.startsWith('src/sub')), ['.env', 'config/secret.json', 'data/a.json', 'data/b.csv', 'logs/a.log',
+      'node_modules/x/.env.example', 'secrets/.env', 'secrets/deep']);
     assert.ok(r.copied.every(e => e.kind === 'listed' && e.cloned === true));
     assert.deepEqual(r.skipped, []);
     assert.equal(readText(t.w('secrets/deep/key.pem')), 'key\n');
@@ -2639,6 +2642,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       'venv/pyvenv.cfg': 'home = /usr/bin\n',
       'envs/py311/pyvenv.cfg': 'home = /usr/bin\n', // a virtualenv by what it holds
       'envs/py311/lib/x.py': 'x\n',
+      'envs/README.txt': 'not listed below\n', // so that only envs/py311/ matches, never envs/ as a whole
       'tools/.env/pyvenv.cfg': 'home = /usr/bin\n',
     });
     const fill = ws => fillWorkspace({ repoRoot: t.root, path: ws, platform: 'darwin', copy: cpStandIn().copy });
@@ -2650,11 +2654,11 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     fs.writeFileSync(t.p('.worktreeinclude'), '.env\n.venv/\nenvs/py311/\ntools/.env/\n');
     const ws2 = await t.agent();
     const r2 = await fill(ws2);
-    // envs/ holds nothing but the virtualenv it names, so envs/ is copied whole; the virtualenv is still named.
-    assert.deepEqual(r2.copied.map(e => [e.path, e.kind]), [['.env', 'listed'], ['.venv', 'listed'], ['envs', 'listed'], ['tools/.env', 'listed']]);
+    assert.deepEqual(r2.copied.map(e => [e.path, e.kind]), [['.env', 'listed'], ['.venv', 'listed'], ['envs/py311', 'listed'], ['tools/.env', 'listed']]);
     assert.deepEqual(r2.skipped, ['.venv', 'envs/py311', 'tools/.env'].map(p => ({ path: p, why: 'venv' })));
     assert.equal(fs.readlinkSync(path.join(ws2, '.venv/bin/python')), '/usr/bin/python3', 'inside a folder copied whole, as it is');
     assert.equal(readText(path.join(ws2, 'envs/py311/lib/x.py')), 'x\n');
+    assert.equal(present(path.join(ws2, 'envs/README.txt')), false);
   });
 
   test('a link that points inside the person’s folder is copied as a link; one that points outside is not', async () => {
@@ -2795,6 +2799,28 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(readText(path.join(ws2, 'packages/a/node_modules/y/index.js')), 'y\n');
   });
 
+  test('only a folder of installed packages or a virtualenv needs a clone; where none can be made, any other listed folder is copied plainly', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\nnode_modules/\n.venv/\n/secrets/\n', '.worktreeinclude': '.env\nnode_modules/\n.venv/\nsecrets/\n' }, {
+      '.env': 'E=1\n', 'node_modules/x/index.js': 'x\n', '.venv/pyvenv.cfg': 'home = /usr/bin\n', 'secrets/key.pem': 'key\n', 'secrets/more/b.pem': 'b\n',
+    });
+    // A Mac whose cp -c cannot clone (the folder is on another volume), and a Linux disk with no clones (ext4).
+    const mac = cpStandIn(({ args, dst }) => {
+      if (args[0] === '-c') throw cpError(`cp: ${dst}: clonefile failed: Cross-device link\n`);
+    });
+    const ext4 = cpStandIn(({ args, src, dst }) => {
+      if (args.includes('--reflink=always')) throw cpError(`cp: failed to clone '${dst}' from '${src}': Operation not supported\n`);
+    });
+    for (const [platform, cp, plain] of [['darwin', mac, ['-R', '-p']], ['linux', ext4, ['-a', '--reflink=auto']]]) {
+      const ws = await t.agent();
+      const r = await fillWorkspace({ repoRoot: t.root, path: ws, platform, copy: cp.copy });
+      assert.deepEqual(r.copied, ['.env', 'secrets'].map(p => ({ path: p, kind: 'listed', cloned: false })), platform);
+      assert.deepEqual(r.skipped, [{ path: '.venv', why: 'noclone' }, { path: 'node_modules', why: 'noclone' }], platform);
+      assert.ok(cp.calls.some(c => c.args.join('\n') === [...plain, t.p('secrets'), path.join(ws, 'secrets')].join('\n')), platform);
+      assert.equal(readText(path.join(ws, 'secrets/more/b.pem')), 'b\n');
+      for (const f of ['node_modules', '.venv']) assert.equal(present(path.join(ws, f)), false, `${platform} ${f}`);
+    }
+  });
+
   test('an entry that fails is left out and its half-made copy removed; the others are still copied', async () => {
     const t = await fillRepo({ '.gitignore': '.env*\n.envrc\nnode_modules/\n', 'packages/a/package.json': '{}\n' }, {
       '.env': 'E=1\n', '.env.local': 'L=1\n', '.envrc': 'R=1\n', 'src/.env': 'S=1\n',
@@ -2863,10 +2889,10 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       setTimeout(() => reject(cpError('', { code: null, killed: true, signal: 'SIGTERM' })), timeout); // as execFile's limit stops cp
     });
     const started = Date.now();
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy, timeoutMs: 300 });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy, timeoutMs: 1000 }); // git's listing counts too
     assert.deepEqual(r.copied, []);
     assert.deepEqual(r.skipped.map(s => s.why), Array(12).fill('failed'));
-    assert.ok(limits.length <= 8 && limits.every(ms => ms > 0 && ms <= 300), String(limits));
+    assert.ok(limits.length <= 8 && limits.every(ms => ms > 0 && ms <= 1000), String(limits));
     assert.ok(Date.now() - started < 5000);
     assert.deepEqual(fs.readdirSync(t.ws).filter(f => f.startsWith('.env')), []);
   });

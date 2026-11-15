@@ -387,11 +387,12 @@ const VCS_FOLDERS = new Set(['.git', '.hg', '.svn', '.bzr', '.jj', '.sl', '_darc
  * version control. Python virtualenvs never by default (they hold absolute paths, and a copy runs the original's code);
  * one that .worktreeinclude names is copied anyway, and also listed in `skipped` with why 'venv'.
  *
- * How: one cp per entry, at most CP_AT_ONCE at once, each within CP_TIMEOUT_MS and the time left of `timeoutMs`. On a
- * Mac `/bin/cp -c -R -p` clones (APFS); where it cannot (another volume), a file is copied plainly and a folder left out.
- * Elsewhere GNU cp: `-a --reflink=auto` for a file, `-a --reflink=always` for a folder, which is left out where the disk
- * makes no clones (ext4). Never with Node: on a Mac, fs.copyFile makes a full copy even when asked to clone, and fs.cp
- * makes relative links absolute unless told not to.
+ * How: one cp per entry, at most CP_AT_ONCE at once, each within CP_TIMEOUT_MS and the time left of `timeoutMs`. A
+ * folder of installed packages (node_modules) or of version control, or a virtualenv, is copied only as a clone, and
+ * left out where none can be made; anything else is copied plainly then. On a Mac `/bin/cp -c -R -p` clones (APFS), and cannot to another volume.
+ * Elsewhere GNU cp: `-a --reflink=always` for those folders (ext4 makes no clones), `-a --reflink=auto` for the rest.
+ * Never with Node: on a Mac, fs.copyFile makes a full copy even when asked to clone, and fs.cp makes relative links
+ * absolute unless told not to.
  *
  * An entry that fails is left out (its half-made copy removed) and the others go on. Nothing throws but bad arguments:
  * when git cannot list the folder, nothing is copied and `skipped` is [{ path: '.', why: 'failed' }]; when
@@ -418,7 +419,7 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
 
   let chosen;
   try {
-    chosen = await chooseFill(run, root);
+    chosen = await chooseFill(run, root, deadline);
   } catch (e) {
     skipped.push({ path: e && e.include ? '.worktreeinclude' : '.', why: 'failed' });
     return done();
@@ -427,6 +428,7 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
   const mac = platform === 'darwin';
   const program = mac || fs.existsSync('/bin/cp') ? '/bin/cp' : 'cp';
   const cpWith = typeof copy === 'function' ? copy : runCp;
+  const dep = dependencyFolders(root);
   let noClones = false; // a clone failed for want of clones: the two disks are the same for every entry
   const made = []; // folders made on the way in the workspace
 
@@ -462,21 +464,23 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
     if (inTheWay) return inTheWay;
     if (!nothingAt(dst)) return 'exists';
     const folder = st.isDirectory();
+    // A folder of installed packages or of version control, or a virtualenv, only as a clone: a full copy of a
+    // node_modules is too slow and too big to make unasked. Anything else is copied plainly where clones cannot be made.
+    const cloneOnly = folder && (kind === 'deps' || dep.is(rel));
     let cloned;
     if (mac) {
-      // A clone takes almost no disk, and seconds for a node_modules. Where cp cannot make one, a file is copied plainly
-      // and a folder left out: a full copy of node_modules is too slow and too big to make unasked.
+      // A clone takes almost no disk, and seconds for a node_modules.
       const r = noClones ? { ok: false, noClone: true } : await cp(['-c', '-R', '-p', src, dst], dst);
       if (r.ok) {
         cloned = true;
       } else {
         if (!r.noClone) return 'failed';
         noClones = true;
-        if (folder) return 'noclone';
+        if (cloneOnly) return 'noclone';
         if (!(await cp(['-R', '-p', src, dst], dst)).ok) return 'failed';
         cloned = false;
       }
-    } else if (!folder) {
+    } else if (!cloneOnly) {
       if (!(await cp(['-a', '--reflink=auto', src, dst], dst)).ok) return 'failed'; // a clone or a copy: cp knows
       cloned = false;
     } else {
@@ -533,12 +537,13 @@ function runCp(file, args, { timeout = CP_TIMEOUT_MS } = {}) {
 }
 
 /**
- * What fillWorkspace copies: [{ path, kind }], paths relative to `root` (a folder's without its "/"). Throws when git
- * cannot list them, or (marked .include) when .worktreeinclude cannot be read.
+ * What fillWorkspace copies: [{ path, kind, venvs? }], paths relative to `root` (a folder's without its "/"). Throws
+ * when git cannot list them before `deadline`, or (marked .include) when .worktreeinclude cannot be read.
  */
-async function chooseFill(run, root) {
+async function chooseFill(run, root, deadline) {
   const include = readInclude(root);
-  const ls = async args => nulList((await run(['ls-files', '-z', '--others', '--ignored', ...args], { cwd: root, timeout: WORKTREE_TIMEOUT_MS })).stdout);
+  const ls = async args => nulList((await run(['ls-files', '-z', '--others', '--ignored', ...args],
+    { cwd: root, timeout: Math.max(1, Math.min(WORKTREE_TIMEOUT_MS, deadline - Date.now())) })).stdout);
   // What git ignores, a folder it ignores as a whole as one entry ("node_modules/"), never a tracked file.
   const ignored = await ls(['--exclude-standard', '--directory']);
   if (include === null) return defaultFill(root, ignored, ls);
