@@ -91,7 +91,7 @@ export class Board {
     s += `<rect class="b-dots" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="${P.boardR}" fill="url(#dots)"/>`;
     s += `<rect class="b-edge" x="${b.x + 0.5}" y="${b.y + 0.5}" width="${b.w - 1}" height="${b.h - 1}" rx="${P.boardR}"/>`;
     // each lane's rail: copper under the mask, from its pin on the core out to a via by the board's edge (in a group of
-    // their own, each marked with its agent, so a lane whose chip leaves can fade there: see render)
+    // their own, each marked with its agent, so the copper of a lane whose chip leaves can be found and faded: see render)
     s += '<g class="rails">';
     for (const n of G.nodes) {
       const id = esc(n.id);
@@ -414,31 +414,26 @@ export class Board {
   render(G, o = {}) {
     const prev = this.prev;
     const animate = !!prev && !o.first && !this.calm;
-    // A chip that leaves takes its lane's copper with it. The rail is part of the static board, which repaints now, so
-    // it is taken out first and fades where it was; its copper to the core and a fuse fade as 'out:' wires.
+    // A chip that leaves takes its lane's copper with it: its rail and via, its copper to the core and a fuse fade as
+    // 'out:' wires, which the wires' repaint keeps until they end. The rail and via are moved out of the static board
+    // first: it repaints whole whenever the board changes (now, and again if the core resizes during the fade).
     const gone = [...this.nodes.keys()].filter(id => !G.byId.has(id));
     const fading = [];
+    const fade = (e, id, k) => { const key = `out:${id}:${k}:${++this.outSeq}`; e.dataset.key = key; this.wiresMap.set(key, e); fading.push(e); };
     if (animate && gone.length) {
       const ids = new Set(gone);
-      fading.push(...[...this.boardSvg.querySelectorAll('.rails [data-for]')].filter(e => ids.has(e.dataset.for)));
+      for (const e of this.boardSvg.querySelectorAll('.rails [data-for]')) if (ids.has(e.dataset.for)) { this.wires.appendChild(e); fade(e, e.dataset.for, 'rail'); }
       for (const id of gone) for (const k of ['conn', 'fuse', 'fusem']) {
         const e = this.wiresMap.get(k + ':' + id);
         if (!e) continue;
         this.wiresMap.delete(k + ':' + id);
-        const key = `out:${id}:${k}:${++this.outSeq}`;
-        e.dataset.key = key;
-        this.wiresMap.set(key, e);
-        fading.push(e);
+        fade(e, id, k);
       }
     }
     this.paintBoard(G);
-    if (fading.length) {
-      const rails = this.boardSvg.querySelector('.rails');
-      for (const e of fading) {
-        if (e.dataset.for && rails) rails.appendChild(e);
-        const end = () => { e.remove(); if (e.dataset.key) this.wiresMap.delete(e.dataset.key); };
-        e.animate([{ opacity: 1 }, { opacity: 0 }], LEAVE).finished.then(end, end);
-      }
+    for (const e of fading) {
+      const end = () => { e.remove(); this.wiresMap.delete(e.dataset.key); };
+      e.animate([{ opacity: 1 }, { opacity: 0 }], LEAVE).finished.then(end, end);
     }
     // a line that goes out drains back into its chip: take it out of the map before the wires repaint drops it
     const draining = [];

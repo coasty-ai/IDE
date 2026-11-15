@@ -724,7 +724,7 @@ try {
     const before = await chipsNow();
     await clickIn('[data-act="looksgood"]');
     await sleep(200);
-    const fading = await b.ev(`(() => { const n = document.querySelector('#parts .node.leaving'); return n ? { inert: n.inert, moving: n.getAnimations().length, rails: document.querySelectorAll('#board .rails [data-for]').length } : null; })()`);
+    const fading = await b.ev(`(() => { const n = document.querySelector('#parts .node.leaving'); return n ? { inert: n.inert, moving: n.getAnimations().length, rails: document.querySelectorAll('#wires [data-key^="out:w1:rail"]').length } : null; })()`);
     await sleep(1100);
     const after = await chipsNow(), tray = await trayNow(), nodes = await b.ev(`document.querySelectorAll('#parts .node').length`);
     const rails = await b.ev(`document.querySelectorAll('#board .rails [data-for]').length`), sent = (await posts()).filter(x => x.path === '/api/agents/w1/answer');
@@ -749,6 +749,26 @@ try {
     const say = (await posts()).filter(x => /\/say$/.test(x.path)), back = await chipsNow(), trayBack = await trayNow();
     check(DT + 'a message brings it back to the board, on a lane, at work', say.length === 1 && say[0].path === '/api/agents/w1/say' && back === 'w1' && trayBack === '',
       `${JSON.stringify(say.map(x => [x.path, x.body]))}; chips "${back}", tray "${trayBack}"`);
+  });
+
+  await run(DT + 'a lane\'s copper fades with its chip, also while the core changes size for what comes next', async () => {
+    // the demo, with Invoice export (done and checked) in the lid: "Looks good" brings Checkout fix's question in, and the
+    // core takes its size once the old page has faded, about 200 ms in, while the chip and its copper are still fading
+    await open('demo');
+    await b.goto(`${base}/?t=k&focus=228202`, 1600);
+    const sizeOf = () => b.ev(`document.getElementById('core').style.height`);
+    const before = await sizeOf(), lid = await h1();
+    await clickIn('[data-act="looksgood"]');
+    await sleep(400);
+    const mid = await b.ev(`(() => { const op = e => +getComputedStyle(e).opacity; const cu = [...document.querySelectorAll('#wires [data-key^="out:228202:rail"]')];
+      const n = document.querySelector('#parts .node.leaving[data-id="228202"]');
+      return { copper: cu.length, opacity: cu.map(e => Math.round(op(e) * 100) / 100), chip: n ? Math.round(op(n) * 100) / 100 : null, size: document.getElementById('core').style.height }; })()`);
+    await sleep(900);
+    const after = await sizeOf(), left = await b.ev(`document.querySelectorAll('#wires [data-key^="out:228202:"], #parts .node[data-id="228202"], #board [data-for="228202"]').length`);
+    check(DT + 'a lane\'s copper fades with its chip, also while the core changes size for what comes next',
+      /Invoice export is done and checked\./.test(lid) && before !== after && mid.size === after && mid.copper === 3 && mid.opacity.every(x => x > 0.03 && x < 0.97)
+      && mid.chip != null && mid.chip > 0.03 && mid.chip < 0.97 && left === 0 && (await trayNow()) === '1 done',
+      `core ${before} → ${mid.size} → ${after}; at 400 ms ${JSON.stringify(mid)}; left after ${left}`);
   });
 
   await run(DT + 'a merge sends it to the tray; the others keep their lanes, and a newcomer takes the freed one', async () => {
