@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (release candidate)
+## 0.2.0 (2026-11-14)
 
 - **Agents & keys.** A panel on the page that helps install Claude Code and Codex, signs them in through the browser or gives them an API key, and picks the agent for new work. An agent connected while Workbench runs takes work at once, and earlier agents that used it can be continued again.
 - **The key store.** Keys you give agents are kept in the login keychain on a Mac (on Linux, a keyring or private files). They reach only the agents you choose and their checks, show only as their last four characters, are hidden in everything agents print, and are never sent from the board's input.
