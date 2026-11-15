@@ -794,6 +794,21 @@ try {
       `before ${JSON.stringify(p0)}, after ${JSON.stringify(p1)}, lid "${lid}", tray "${tray}", newcomer ${JSON.stringify(p2)}`);
   });
 
+  await run(DT + 'on a dense board, an agent that leaves moves no other chip', async () => {
+    // 'many': 25 agents, so the board is dense; r0, at work on a lane of its own, is stopped and its work thrown away
+    await open('many');
+    await sleep(900);
+    const before = await placesNow(), r0 = await agentOf('r0'), at = Date.now();
+    await push('agents', [{ ...r0, state: 'stopped', endedAt: at, stateSince: at, now: 'Stopped',
+      work: { branch: null, from: 'main', folder: false, merged: null, problem: null, thrownAway: { at: at + 1, saved: 'refs/workbench/discarded/r0' } } }]);
+    await sleep(1300);
+    const after = await placesNow();
+    const moved = Object.keys(before).filter(id => id !== 'r0' && after[id] !== before[id]);
+    check(DT + 'on a dense board, an agent that leaves moves no other chip',
+      !!before.r0 && !after.r0 && Object.keys(before).length > 13 && Object.keys(after).length === Object.keys(before).length - 1 && moved.length === 0,
+      `${Object.keys(before).length} chips, then ${Object.keys(after).length}; moved ${JSON.stringify(moved.map(id => [id, before[id], after[id]]))}`);
+  });
+
   await run(DT + 'the keyboard on a chip that leaves goes to the core\'s sentence, and a card pinned to it goes too', async () => {
     await open('done-waits');
     await sleep(900);

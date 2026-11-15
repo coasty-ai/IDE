@@ -93,15 +93,17 @@ export function splitBoard(roots) {
 /**
  * The board and its done tray, as the page draws them. Roots on the board hold lanes (`lanes`, lanes.js); the lanes of
  * roots that are not on it any more are freed, so a newcomer may take them, while the others keep theirs. Past twelve
- * roots on the board it goes dense: finished work there waits in the tray too (it keeps its lane, for when the board
- * thins out), each lane splits, and working agents with no room are counted in the tray. The tray lists this run's
- * finished agents newest first, then the earlier ones.
+ * roots on the board, or while one of them has no lane of its own, it goes dense: finished work there waits in the tray
+ * too (it keeps its lane), each lane splits, and working agents with no room are counted in the tray. Once dense, it
+ * stays dense while any root is on it, and everyone drawn keeps their place (denseLanes, given what it returned last
+ * time): going back to whole lanes would move every chip, so it waits until that moves no one, when the board empties
+ * or at a reload. The tray lists this run's finished agents newest first, then the earlier ones.
  * @param {object[]} roots  boardModel(...).roots
  * @param {import('./lanes.js').Lanes} lanes
  * @param {{ laptop?: (r: object) => boolean, maxRows?: number, prune?: boolean }} [o]
  *   laptop: whether a root runs on the laptop (it prefers the left); maxRows: the most rows a side holds when dense
- *   (layout.js maxDenseRows); prune: free the lanes of roots not on the board. Only with every agent there is: never
- *   before the first snapshot, or while no data is shown.
+ *   (layout.js maxDenseRows); prune: free the lanes of roots not on the board, and keep the dense board's places. Only
+ *   with every agent there is: never before the first snapshot, or while no data is shown.
  * @returns {{ roots: object[], laneOf: (id: string) => object|null, nRows: number, dense: boolean, tray: object|null,
  *             trayIds: { done: string[], earlier: string[], over: string[] } }}
  */
@@ -109,18 +111,19 @@ export function boardAndTray(roots, lanes, { laptop = () => true, maxRows = Infi
   const { on, done: finished, earlier } = splitBoard(roots);
   if (prune) lanes.prune(on.map(r => r.id));
   if (on.length) lanes.assign(on.map(r => ({ id: r.id, startedAt: r.startedAt, laptop: !!laptop(r) })));
-  const dense = on.length > 12;
+  const dense = on.length > 12 || on.some(r => lanes.get(r.id)?.row == null) || (!!lanes.dense && on.length > 0);
   let shown = on, laneOf = id => lanes.get(id), nRows = ROWS, over = [], done = finished;
   if (dense) {
     done = finished.concat(on.filter(r => r.ghost));
     // newcomers take the free rows in this order: whatever needs the person first, so an asker always has a chip
     const active = on.filter(r => !r.ghost).sort((a, b) => (b.stop === 'inner') - (a.stop === 'inner'));
-    const d = denseLanes(active, id => lanes.get(id), maxRows);
+    const d = denseLanes(active, id => lanes.get(id), maxRows, lanes.dense);
+    if (prune) lanes.dense = { k: d.k, want: d.want, at: d.at };
     over = d.overflow;
     shown = active.filter(r => !over.includes(r.id));
     laneOf = id => d.at.get(id) || null;
     nRows = d.rows;
-  }
+  } else if (prune) lanes.dense = null;
   const ended = r => r.endedAt || r.stateSince || 0;
   done = [...done].sort((a, b) => ended(b) - ended(a) || String(a.id).localeCompare(String(b.id)));
   const trayIds = { done: done.map(r => r.id), earlier: earlier.map(r => r.id), over: over.slice() };

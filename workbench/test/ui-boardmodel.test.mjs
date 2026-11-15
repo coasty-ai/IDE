@@ -115,24 +115,77 @@ test('dense: past twelve on the board, finished work there moves to the tray too
   assert.equal(b.tray.text, '2 done');
 });
 
-test('thirteen on the board, then one is let go: the board is not dense any more, and every agent left has a lane of its own', () => {
+test('thirteen on the board, then one leaves: the board stays dense, and every other chip keeps its place on its own side', () => {
   const lanes = new Lanes(memory());
-  const first = agent('first', 'done_checked', { work: W(), files: files(1) });
-  const rest = Array.from({ length: 12 }, (_, i) => agent('r' + i, 'working'));
-  let b = boardAndTray(model([first, ...rest]).roots, lanes, { laptop: r => r.id.endsWith('0') || r.id === 'first', maxRows: 24 });
+  const lap = r => r.machineId === 'laptop';
+  const list = Array.from({ length: 13 }, (_, i) => agent('r' + i, 'working', { machineId: i % 2 ? 'cloud-1' : 'laptop' }));
+  let b = boardAndTray(model(list).roots, lanes, { laptop: lap, maxRows: 24 });
   assert.equal(b.dense, true);
-  assert.equal(lanes.get('r11').row, null, 'the last to come had a side but no row');
-  b = boardAndTray(model([first, ...rest], { reviewed: new Set([finishKey(first)]) }).roots, lanes, { laptop: r => r.id.endsWith('0') || r.id === 'first', maxRows: 24 });
+  assert.equal(b.nRows, 12);
+  assert.ok(list.every(a => b.laneOf(a.id)), 'all thirteen drawn');
+  const was = new Map(list.map(a => [a.id, { ...b.laneOf(a.id) }]));
+  const same = (b, but, why) => { for (const a of list) if (!but.includes(a.id)) assert.deepEqual(b.laneOf(a.id), was.get(a.id), `${a.id} ${why}`); };
+  // r4 finishes: finished work on a dense board waits in the tray, and nobody moves
+  const done4 = { ...list[4], state: 'done_checked', endedAt: T, stateSince: T };
+  const now = list.map(a => (a.id === 'r4' ? done4 : a));
+  b = boardAndTray(model(now).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.deepEqual([b.dense, b.trayIds.done], [true, ['r4']]);
+  same(b, ['r4'], 'did not move when r4 finished');
+  // "Looks good" on it: twelve on the board, which whole lanes would hold, and still nobody moves
+  const reviewed = new Set([finishKey(done4)]);
+  b = boardAndTray(model(now, { reviewed }).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.deepEqual([b.dense, b.nRows], [true, 12]);
+  same(b, ['r4'], 'did not move when r4 left');
+  // a newcomer takes a free row on its own side, and nobody moves for it
+  const n = agent('n', 'starting', { machineId: 'cloud-1' });
+  b = boardAndTray(model([...now, n], { reviewed }).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.equal(b.laneOf('n').side, 'R');
+  same(b, ['r4'], 'did not move for the newcomer');
+  // half of them leave: the board stays as it is still
+  const half = now.filter((a, i) => i % 2 === 0 && a.id !== 'r4');
+  b = boardAndTray(model([...half, n], { reviewed }).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.equal(b.dense, true);
+  for (const a of half) assert.deepEqual(b.laneOf(a.id), was.get(a.id), a.id + ' kept its place');
+  // the board empties: whole lanes again, for whoever comes next
+  boardAndTray([], lanes, { laptop: lap, maxRows: 24 });
+  b = boardAndTray(model([agent('z', 'working')]).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.deepEqual([b.dense, b.nRows], [false, ROWS]);
+  assert.ok(b.laneOf('z') && b.laneOf('z').row != null);
+});
+
+test('a dense board goes back to whole lanes at a reload, which lays it out afresh; a draw before the agents arrive changes nothing', () => {
+  const tab = memory(), lap = r => r.machineId === 'laptop';
+  const list = Array.from({ length: 13 }, (_, i) => agent('d' + i, 'working', { machineId: i % 2 ? 'cloud-1' : 'laptop' }));
+  let lanes = new Lanes(tab);
+  boardAndTray(model(list).roots, lanes, { laptop: lap, maxRows: 24 });
+  const twelve = list.slice(1);
+  let b = boardAndTray(model(twelve).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.equal(b.dense, true, 'one left: still dense');
+  // a draw with no data (the first after a reload, before the snapshot) keeps the dense board as it was
+  boardAndTray([], lanes, { laptop: lap, maxRows: 24, prune: false });
+  assert.equal(boardAndTray(model(twelve).roots, lanes, { laptop: lap, maxRows: 24 }).dense, true);
+  // a reload: the lanes come back from the tab, the dense board does not
+  lanes = new Lanes(tab);
+  b = boardAndTray(model(twelve).roots, lanes, { laptop: lap, maxRows: 24 });
   assert.equal(b.dense, false);
-  assert.deepEqual(ids(b.roots), ids(rest));
-  const used = new Set();
-  for (const r of rest) {
-    const l = b.laneOf(r.id);
-    assert.ok(l && l.row != null, r.id + ' has a row, so it is drawn');
-    used.add(l.side + l.row);
-  }
+  const used = new Set(twelve.map(a => b.laneOf(a.id)).map(l => l.side + l.row));
   assert.equal(used.size, 12, 'one agent a lane');
-  assert.deepEqual(b.trayIds.done, ['first']);
+  for (const a of twelve) assert.equal(b.laneOf(a.id).side, lap(a) ? 'L' : 'R', a.id + ' on its own side');
+});
+
+test('one with no lane of its own keeps the board dense, though twelve or fewer are on it: whole lanes could not draw it', () => {
+  const lap = r => r.machineId === 'laptop';
+  const cloud = Array.from({ length: 7 }, (_, i) => agent('c' + i, 'working', { machineId: 'cloud-1' }));
+  const laptops = Array.from({ length: 4 }, (_, i) => agent('l' + i, 'working'));
+  // as a tab keeps them after a reload: the right side full, and a seventh cloud agent that came while it was, with no lane
+  const tab = memory();
+  tab.setItem('wb-lanes', JSON.stringify([...cloud.slice(0, 6).map((a, i) => [a.id, 'R', i]), ['c6', 'R', null], ...laptops.map((a, i) => [a.id, 'L', i])]));
+  const lanes = new Lanes(tab);
+  const b = boardAndTray(model([...cloud, ...laptops]).roots, lanes, { laptop: lap, maxRows: 24 });
+  assert.equal(lanes.get('c6').row, null, 'no lane is free on its own side, and it never takes one on the other');
+  assert.equal(b.dense, true);
+  assert.equal(b.laneOf('c6').side, 'R', 'drawn on the dense board, on its own side');
+  assert.equal(ids(b.roots).length, 11, 'all eleven drawn');
 });
 
 test('the tray\'s words: short, "3 done", with earlier agents and working ones with no room counted as before', () => {

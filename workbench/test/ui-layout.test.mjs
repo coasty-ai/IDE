@@ -64,6 +64,31 @@ test('a chip keeps its lane while it is on the board: new agents never move the 
   }
 });
 
+test('on a dense board, an agent that leaves moves no other chip, at any window size: same side, same row, same box', () => {
+  const T = 1_800_000_000_000;
+  const list = Array.from({ length: 13 }, (_, i) => ({ id: 'r' + i, parentId: null, rootId: 'r' + i, name: `Agent ${i}`, machineId: i % 2 ? 'cloud-1' : 'laptop',
+    state: 'working', now: 'Reading a.ts', stateSince: T - 60000, startedAt: T - 3_600_000 + i * 1000, endedAt: null, ask: null, earlier: false, work: null, files: null }));
+  // r6 is stopped and its work thrown away: the person is finished with it, so it leaves; twelve stay, which whole
+  // lanes could hold, yet nobody moves
+  const gone = list.map(a => (a.id === 'r6' ? { ...a, state: 'stopped', endedAt: T, work: { branch: null, from: 'main', folder: false, merged: null, problem: null, thrownAway: { at: T + 1, saved: 'x' } } } : a));
+  for (const [W, H] of WINDOWS) for (const detail of ['calm', 'more']) {
+    const lanes = new Lanes(null), P = sizeClass(W, H);
+    const lay = agents => {
+      const bm = boardModel(agents, { ...STATES, later: new Set(), reviewed: new Set() });
+      const p = boardAndTray(bm.roots, lanes, { laptop: r => r.machineId === 'laptop', maxRows: maxDenseRows(H, P) });
+      return { p, G: layoutBoard({ W, H, P, detail, roots: p.roots, laneOf: p.laneOf, nRows: p.nRows, dense: p.dense, lidNeed: 220, machines: [], tray: p.tray }) };
+    };
+    const a = lay(list), b = lay(gone);
+    assert.equal(a.G.nodes.length, 13, `${W}x${H}: all thirteen drawn`);
+    assert.deepEqual([b.p.dense, b.p.nRows, b.G.nodes.length], [true, a.p.nRows, 12], `${W}x${H} ${detail}`);
+    for (const n of a.G.nodes) {
+      if (n.id === 'r6') continue;
+      const m = b.G.byId.get(n.id);
+      assert.deepEqual([m.side, m.rowIdx, m.chip], [n.side, n.rowIdx, n.chip], `${W}x${H} ${detail}: ${n.id} moved`);
+    }
+  }
+});
+
 test('stops: beside you when it needs you, mid-board while it works, at the edge when done', () => {
   const { G } = board('demo', 1440, 900, 'calm');
   const by = name => G.nodes.find(n => n.r.name === name);
