@@ -87,6 +87,15 @@ test('merge applies: live mode, a root at rest with its folder and branch, your 
   assert.equal(mergeApplies(done({ files: files(0) }), live()), false, 'nothing unmerged');
 });
 
+test('while an agent that said it is done is checked again (a save into its copy), merge does not apply: the engine refuses it then', () => {
+  const again = done({ state: 'done_claimed', checks: { state: 'running', results: [] } });
+  assert.equal(mergeApplies(again, live()), false);
+  assert.equal(gitReason(again, live({ branch: null })), null, 'and git is not the reason');
+  assert.equal(mergeApplies(done({ state: 'done_claimed', checks: { state: 'none', results: [] } }), live()), true, 'no checks to run: it can be merged at once');
+  assert.equal(mergeApplies(done({ state: 'done_checked', checks: { state: 'passed', results: [] } }), live()), true);
+  assert.equal(discardApplies(again, live()), true, 'its work can still be thrown away');
+});
+
 test('unmerged work: files changed since its last merge, or, when nothing counted them, a stopped, failed or earlier agent', () => {
   assert.equal(unmergedWork(done()), true);
   assert.equal(unmergedWork(done({ files: files(0) })), false);

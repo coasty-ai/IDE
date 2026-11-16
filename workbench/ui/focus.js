@@ -389,10 +389,13 @@ export function lidView(f, o = {}) {
       break;
     }
     case 'done_checked': case 'done_claimed': {
-      sentence = a.state === 'done_checked' ? `${nm} is done and checked.` : `${nm} says it is done.`;
+      // a save into its copy: its work is recorded and its checks run again, and it cannot be merged until they end
+      const again = a.state === 'done_claimed' && a.checks?.state === 'running';
+      sentence = again ? `${nm} is being checked again.` : a.state === 'done_checked' ? `${nm} is done and checked.` : `${nm} says it is done.`;
       const broken = a.rules?.broken || [];
       if (broken.length) msg += `<p class="know">One thing to know: it broke a rule you set (${esc(clipShown(prose(broken[0].say), 60))}).</p>`;
-      if (a.says && fs.meta) msg += metaP(esc(clipShown(prose(a.says), more && fs.meta === 2 ? 200 : 110)));
+      if (again && fs.meta) msg += metaP('Its work changed, so its checks run again.');
+      else if (a.says && fs.meta) msg += metaP(esc(clipShown(prose(a.says), more && fs.meta === 2 ? 200 : 110)));
       else if (more && fs.meta === 2) msg += meta(a.state === 'done_checked' ? 'its checks passed' : 'nothing checked it');
       if (mergeApplies(a)) {
         // its work can go into the person's branch: Merge (always through the engine's card) or a change; "Not now" does

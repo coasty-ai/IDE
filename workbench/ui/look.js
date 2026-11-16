@@ -31,7 +31,7 @@ export function statusWords(a, LOOK) {
     }
     case 'waiting_helpers': return 'waiting';
     case 'maybe_stuck': return markOfAgent(a, LOOK).label;
-    case 'done_claimed': return 'says it’s done';
+    case 'done_claimed': return a.checks && a.checks.state === 'running' ? 'checked again' : 'says it’s done';
     case 'checks_failed': return 'a check failed';
     case 'finished': return 'finished its part';
     default: return markOf(a.state, LOOK).label;
