@@ -451,6 +451,65 @@ test('every button about an agent\'s work is bound to the agent, its state and i
   }
 });
 
+test('"looks good" and "not now" at a finished agent\'s lid: the button each stands for carries it; where none is for "looks good", the lid says what to choose', { skip }, async () => {
+  const { lidView, S } = await load();
+  // what each phrase presses on a lid: [act:label] of every button carrying it in data-words
+  const words = v => Object.fromEntries(['looks-good', 'not-now'].map(w => [w, allButtons(v.html).filter(b => (b.words || '').split(' ').includes(w)).map(b => `${b.act}:${b.label}`)]));
+  const lid = (a, f, wantWords, hint) => {
+    const v = show(lidView, S, a, {}, f || undefined), tag = `${a.state} ${hint || ''}`;
+    assert.deepEqual(words(v), wantWords, tag);
+    assert.equal(v.bind.finished, true, tag);
+    assert.equal(v.bind.agentId, a.id, tag);
+    if (hint) assert.equal(v.bind.hint, hint, tag);
+    return v;
+  };
+  const picked = a => ({ agent: a, picked: true, queued: 0 });
+  live(S);
+  // work that can merge: "not now" is its own Not now; nothing stands for "looks good", which must never merge it or send
+  // it away unmerged, so the lid names its two answers instead
+  for (const st of ['done_checked', 'done_claimed']) lid(finished({ state: st }), null, { 'looks-good': [], 'not-now': ['looksgood:Not now'] }, 'Choose “Merge into main” or “Not now”.');
+  live(S, { branch: 'release/2026-11-payments-and-refunds' });
+  lid(finished(), null, { 'looks-good': [], 'not-now': ['looksgood:Not now'] }, 'Choose “Merge into release/2026-11-payments-and-refunds” or “Not now”.');
+  live(S);
+  // a failed check: "not now" is Look later
+  lid(finished({ state: 'checks_failed', checks: { state: 'failed', results: [{ name: 'unit tests', ok: false }] } }), null,
+    { 'looks-good': [], 'not-now': ['later:Look later'] }, 'Choose “Ask it to fix that” or “Look later”.');
+  // a merge that did not go through: "not now" sets it aside, by its act, whatever its button says; Dismiss is no answer to either
+  lid(finished({ work: problem('conflict', 'x', ['a.js']) }), null, { 'looks-good': [], 'not-now': ['later:Look later'] }, 'Choose “Ask it to bring in main” or “Look later”.');
+  lid(finished({ work: problem('blocked', 'x', ['a.js']) }), null, { 'looks-good': [], 'not-now': ['later:Not now'] }, 'Choose “Try again” or “Not now”.');
+  lid(finished({ work: problem('moved', 'main changed since you looked. Have another look.') }), null, { 'looks-good': [], 'not-now': ['later:Not now'] }, 'Choose “Try again” or “Not now”.');
+  // where merge does not apply, "Looks good" is the answer to both
+  demo(S);
+  lid(finished(), null, { 'looks-good': ['looksgood:Looks good'], 'not-now': ['looksgood:Looks good'] });
+  live(S);
+  lid(finished({ files: FILES(0) }), null, { 'looks-good': ['looksgood:Looks good'], 'not-now': ['looksgood:Looks good'] });
+  // stopped or failed: "not now" is Dismiss; "looks good" could as well mean Continue or Try again (or more money), so it
+  // presses nothing, and the lid names its answers
+  const stopped = finished({ state: 'stopped', files: null }), failedOne = finished({ state: 'failed', files: null });
+  lid(stopped, picked(stopped), { 'looks-good': [], 'not-now': ['reviewed:Dismiss'] }, 'Choose “Continue” or “Dismiss”.');
+  lid(failedOne, picked(failedOne), { 'looks-good': [], 'not-now': ['reviewed:Dismiss'] }, 'Choose “Try again” or “Dismiss”.');
+  const limited = finished({ state: 'failed', files: null, atLimit: true, harness: 'claude' });
+  lid(limited, picked(limited), { 'looks-good': [], 'not-now': ['reviewed:Dismiss'] }, 'Choose “Give it $2.00 more” or “Dismiss”.');
+  // work thrown away, and work that is in (picked from the tray): nothing is left to decide, so both words let it go
+  const thrown = finished({ state: 'stopped', work: WORK({ branch: null, folder: false, thrownAway: { at: NOW - MIN, saved: 'x' } }) });
+  lid(thrown, picked(thrown), { 'looks-good': ['reviewed:Dismiss'], 'not-now': ['reviewed:Dismiss'] });
+  const merged = finished({ work: WORK({ merged: { into: 'main', merge: 'e4f1', at: NOW - MIN, files: 3, adds: 12, dels: 3 } }), files: FILES(0) });
+  lid(merged, picked(merged), { 'looks-good': ['unpick:Close'], 'not-now': ['unpick:Close'] });
+  // an agent from an earlier run, picked from the tray: "not now" closes it; "looks good" could mean Continue
+  const early = finished({ earlier: true, canContinue: true });
+  lid(early, picked(early), { 'looks-good': [], 'not-now': ['unpick:Close'] }, 'Choose “Continue” or “Forget”.');
+  const gone = finished({ earlier: true, canContinue: false, continueReason: 'Its folder is gone, so it cannot continue.' });
+  lid(gone, picked(gone), { 'looks-good': [], 'not-now': ['unpick:Close'] }, 'Choose “Forget”.');
+  // anything else is not a finished agent's lid: the words go on to the engine as before
+  for (const a of [agent('W1', 'working'), agent('W1', 'question', { ask: { id: 'q', type: 'question', sentence: 'Which one?', options: [], createdAt: NOW } }),
+    agent('H1', 'finished', { parentId: 'W1', rootId: 'W1' })]) {
+    S.agents.clear(); S.agents.set('W1', agent('W1', 'working')); S.agents.set(a.id, a);
+    const v = lidView({ agent: a, picked: true, queued: 0 }, {});
+    assert.deepEqual(words(v), { 'looks-good': [], 'not-now': [] }, a.state);
+    assert.ok(!v.bind.finished, a.state);
+  }
+});
+
 test('engine cards: their own yes and no, a count line that says what they are about', { skip }, async () => {
   const { lidView } = await load();
   const card = o => ({ id: 'c1', sentence: 'Merge Invoice export into main?', detail: '3 files, +12 −3. Its work becomes a commit on its branch, joined into main by a merge commit. Nothing checked its work.', kind: 'merge', yes: 'Merge', no: 'Cancel', danger: false, ...o });

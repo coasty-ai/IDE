@@ -988,18 +988,48 @@ try {
     await sleep(900);
     await typeIt('looks good, merge it'); await sleep(1000);
     const p3 = await sent();
-    // so does "looks good" where the lid has no "Looks good": work that can merge offers Merge and "Not now", and words
-    // that sound like approval never press "Not now", which would send work not merged yet to the tray
+    // "looks good" where no button stands for it: work that can merge offers Merge and "Not now", and words that sound
+    // like approval neither merge it nor press "Not now" (which would send work not merged yet to the tray). Nothing is
+    // sent, and the page says which answers the lid has
+    const saidNow = () => b.ev(`document.getElementById('said').textContent`);
     await open('done-waits');
     await sleep(900);
     await typeIt('looks good'); await sleep(1000);
-    const p4 = await sent(), chips4 = await chipsNow();
+    const p4 = await sent(), chips4 = await chipsNow(), said4 = await saidNow();
+    // "not now" sets aside what its lid sets aside, whatever that button says: "Look later" at a merge that conflicts,
+    // and at a failed check
+    const notNowAt = async (sc, id) => {
+      await open(sc); await b.goto(`${base}/?t=k&focus=${id}`, 1600); await clearLog();
+      await typeIt('not now'); await sleep(1000);
+      return { p: await sent(), said: await saidNow(), later: await b.ev(`sessionStorage.getItem('wb-later') || ''`) };
+    };
+    const conflict = await notNowAt('merge', 'm7e8f9'), failedCheck = await notNowAt('merge-more', 'n1');
+    // "ok" at a stopped agent's lid could as well mean Continue: nothing is pressed or sent, and the lid's answers are
+    // named; "not now" there is its Dismiss, and it goes to the tray. "ok" beside "Give it $2.00 more" sends nothing either
+    await open('done-tray'); await b.goto(`${base}/?t=k&focus=t4`, 1600); await clearLog();
+    await typeIt('ok'); await sleep(1000);
+    const p6 = (await posts()).map(x => [x.path, x.body]), chips6 = await chipsNow(), said6 = await saidNow();
+    await typeIt('not now'); await sleep(1300);
+    const p7 = (await posts()).map(x => [x.path, x.body]), chips7 = await chipsNow(), tray7 = await trayNow();
+    await open('limit'); await sleep(900); await clearLog();
+    const limitLid = await h1();
+    await typeIt('ok'); await sleep(1000);
+    const pLimit = (await posts()).map(x => [x.path, x.body]), saidLimit = await saidNow();
+    // "not now" where "Looks good" answers both (the demo merges nothing): that button, with "Not now" for its answer
+    await open('demo'); await b.goto(`${base}/?t=k&focus=228202`, 1600); await clearLog();
+    await typeIt('not now'); await sleep(1300);
+    const p8 = await sent();
     check(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent',
       p1.length === 1 && p1[0][0] === '/api/agents/w1/answer' && p1[0][1].answer === 'Not now' && !('askId' in p1[0][1]) && chips1 === '' && tray1 === '1 not merged'
       && /Invoice export is done and checked\./.test(lid) && p2.length === 1 && p2[0][0] === '/api/agents/228202/answer' && p2[0][1].answer === 'Looks good' && tray2 === '1 done'
       && p3.length === 1 && p3[0][0] === '/api/command' && p3[0][1].text === 'looks good, merge it'
-      && p4.length === 1 && p4[0][0] === '/api/command' && p4[0][1].text === 'looks good' && chips4 === 'w1~',
-      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" with no such button: ${JSON.stringify(p4)}, chips "${chips4}"`);
+      && p4.length === 0 && chips4 === 'w1~' && said4 === 'Choose “Merge into main” or “Not now”.'
+      && conflict.p.length === 0 && conflict.said === 'OK, Search cleanup can wait.' && /"m7e8f9@/.test(conflict.later)
+      && failedCheck.p.length === 0 && /^OK, .+ can wait\.$/.test(failedCheck.said) && /"n1@/.test(failedCheck.later)
+      && p6.length === 0 && chips6 === 't1,t4~' && said6 === 'Choose “Continue” or “Dismiss”.' && p7.length === 0 && chips7 === 't1' && tray7 === '3 done'
+      && /stopped with an error\.$/.test(limitLid) && pLimit.length === 0 && saidLimit === 'Choose “Give it $2.00 more” or “Dismiss”.'
+      && p8.length === 1 && p8[0][0] === '/api/agents/228202/answer' && p8[0][1].answer === 'Not now',
+      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" with no such button: ${JSON.stringify(p4)}, chips "${chips4}", said "${said4}"; "not now" at a conflict: ${JSON.stringify(conflict)}; at a failed check: ${JSON.stringify(failedCheck)}; "ok" at a stopped agent: ${JSON.stringify(p6)}, chips "${chips6}", said "${said6}"; then "not now": ${JSON.stringify(p7)}, chips "${chips7}", tray "${tray7}"; "ok" at "${limitLid}": ${JSON.stringify(pLimit)}, said "${saidLimit}"; "not now" in the demo: ${JSON.stringify(p8)}`);
   });
 
   // ---------------------------------------------------------------- D2: merge, review and throw away (the 'merge' scenarios)
