@@ -12,8 +12,9 @@ export const S = {
   meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null, permissions: 'ask' },
   loaded: false,         // a snapshot has arrived
   focusId: null,         // set when the person picks an agent or steps the queue; null = follow the queue
-  // an engine card on screen: { id, sentence, detail, kind: 'start'|'stop'|'say'|'forget'|'merge'|'discard'|'permissions'|'setup',
-  // yes?, no?, danger?, agents?, command? }, plus agentId (the page's own note) when a lid button for that agent asked for it
+  // an engine card on screen: { id, sentence, detail, kind: 'stop'|'say'|'forget'|'merge'|'discard'|'permissions'|'start', yes?,
+  // no?, danger?, agentId? } (one agent starts at once; only more than one from one sentence is asked about, with a 'start'
+  // card), plus agentId (the page's own note) when a lid button for that agent asked for it. The setup card is `setup`.
   confirm: null,
   // the setup card the engine waits on (the snapshot's `setup`: { id, kind: 'setup', sentence, command, detail, yes, no }):
   // launches wait for its answer, so it stays in the core, after a card on screen, until it is answered
@@ -78,7 +79,7 @@ export function helpersOf(root) {
 export const helpersAtWork = a => Q.helpersAtWork(childrenOf(a.id), ACTIVE);
 
 /**
- * What the core shows, in this order: a launch question on screen; the setup card launches wait on; the agent the person
+ * What the core shows, in this order: an engine card on screen; the setup card launches wait on; the agent the person
  * picked or stepped to (with its place in a queue, when it is in one); the most urgent thing that needs the person;
  * finished work not yet looked at; otherwise nothing.
  */

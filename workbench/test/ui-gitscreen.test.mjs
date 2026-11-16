@@ -6,6 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import * as nodeModule from 'node:module';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { graphLayout, GRAPH_SIZES } from '../ui/gitgraph.js';
@@ -128,4 +129,53 @@ test('the detail’s buttons take the card’s focus colour, not the board’s',
   const r = rules(CSS).filter(x => x.selectors.includes('#gitDetail button:focus-visible'));
   assert.ok(r.length, 'a focus rule for the buttons in the detail');
   assert.match(r.at(-1).body, /outline(-color)?\s*:[^;]*var\(--card-focus\)/);
+});
+
+// ------------------------------------------------------------------ the git screen's input: words that could not be sent
+
+/**
+ * app.js's gitCommand on its own (node:vm: app.js runs only in the page), with stand-ins for what it calls. `link`: the
+ * page's connection; `command`: the request to POST /api/command. Gives what was sent, what it said under the band, and
+ * what it put back in the git screen's input.
+ */
+function gitCommandIn({ link = 'live', command }) {
+  const APP = readFileSync(new URL('../ui/app.js', import.meta.url), 'utf8');
+  const start = APP.indexOf('async function gitCommand(');
+  const end = APP.indexOf('\n}\n', start);
+  assert.ok(start >= 0 && end > start, 'app.js has gitCommand');
+  const said = [], back = [], sent = [];
+  const sandbox = {
+    // the page's key guard, for a stand-in of a key (no key-shaped text is needed here)
+    refuseKey: t => t === 'A-KEY-STAND-IN', touch() {}, gitScreenWords: () => null, closeGit() {}, pageCommand: () => null, applyPref() {},
+    say: t => said.push(t), cannotSend: s => s === 'stale', linkNow: () => link, S: { confirm: null },
+    api: { command: async (t, b) => { sent.push(t); return command(t, b); }, confirm: async () => ({}) },
+    lookAt() {}, lookedAt() {}, openGit() {}, moved() {}, showConnect() {}, render() {}, ID_RE: /^[0-9a-f]{6,}$/,
+    gitPutBack: t => back.push(t),
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${APP.slice(start, end + 2)}\nthis.gitCommand = gitCommand;`, sandbox);
+  return { run: (t, b = {}) => sandbox.gitCommand(t, b), said, back, sent };
+}
+
+test('words typed on the git screen that could not be sent go back in its input, lines and all, and the line under the band says why', async () => {
+  const paste = 'this fails:\n```js\nfunction total(cart) {\n  return cart.sum();\n}\n```';
+  for (const why of ['That is too long to send in one go. The limit is 64 KB.', 'Something went wrong.', 'Workbench isn’t answering. Is it still running?']) {
+    const g = gitCommandIn({ command: async () => { throw new Error(why); } });
+    await g.run(paste);
+    assert.deepEqual(g.sent, [paste], 'sent as typed, its lines kept');
+    assert.deepEqual(g.back, [paste], why);
+    assert.deepEqual(g.said, [why]);
+  }
+  // a page that cannot send at all: nothing is sent, and the words are put back
+  const stale = gitCommandIn({ link: 'stale', command: async () => assert.fail('nothing is sent') });
+  await stale.run('fix the docs');
+  assert.deepEqual([stale.sent, stale.back, stale.said], [[], ['fix the docs'], ['Workbench is not answering, so that was not sent.']]);
+  // sent: nothing comes back, and the reply is said
+  const ok = gitCommandIn({ command: async () => ({ reply: 'Started Claude on “fix the docs”.', agentIds: ['abc123'] }) });
+  await ok.run('fix the docs');
+  assert.deepEqual([ok.back, ok.said], [[], ['Started Claude on “fix the docs”.']]);
+  // a key is never sent, and never put back
+  const key = gitCommandIn({ command: async () => assert.fail('a key is never sent') });
+  await key.run('A-KEY-STAND-IN');
+  assert.deepEqual([key.sent, key.back], [[], []]);
 });

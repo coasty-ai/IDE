@@ -1,6 +1,6 @@
-// The top band's Full permissions button, and what the lid adds while full permissions are on. Pure: no DOM, no imports
-// (node:test loads it). app.js draws the button beside Agents & keys and sends its presses to the engine
-// (POST /api/permissions); focus.js adds the launch card's sentence. The engine checks everything again when it acts.
+// The top band's Full permissions button. Pure: no DOM, no imports (node:test loads it). app.js draws the button beside
+// Agents & keys and sends its presses to the engine (POST /api/permissions). The button shows the mode: work starts at
+// once, with no card to say it. The engine checks everything again when it acts.
 
 /** 'full' or 'ask': anything else is ask. */
 export const permissionMode = v => (v === 'full' ? 'full' : 'ask');
@@ -23,10 +23,4 @@ export function permButtonView(mode) {
       ? "Full permissions are on: agents ask only before steps that name Claude Code's own settings. Press to turn them off."
       : "Agents ask before risky steps. Press so that they ask only before steps that name Claude Code's own settings.",
   };
-}
-
-/** What a launch card adds while full permissions are on, for the one agent it starts or for several. */
-export function launchNote(mode, agents = 1) {
-  if (permissionMode(mode) !== 'full') return '';
-  return `Full permissions are on, so ${Number(agents) > 1 ? 'they ask' : 'it asks'} only before steps that name Claude Code's own settings.`;
 }

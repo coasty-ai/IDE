@@ -18,17 +18,22 @@ import { launch, sleep } from './ui-cdp.mjs';
 const SIZES = ['960x900', '1024x700', '1280x680', '1440x789', '1512x862', '1728x1000', '1920x970', '2560x1300'];
 const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
-const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
+const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'prompt', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
   // D2: an agent's work in the lid, and the engine's cards for it (the 'merge' scenarios of scripts/ui-mock.mjs)
   'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids',
   // what an agent controls, with characters that hide text or turn it: shown by their codes on the board and in the lid
   'taint',
   // a crowded board with a long done tray: the edge connector's sections keep clear of the DRAM's wire
   'wire',
-  // full permissions: the card the band's button brings, and a launch card's added sentence while they are on
-  'perm-card', 'perm-launch',
+  // full permissions: the card the band's button brings
+  'perm-card',
   // agents' copies: the setup card launches wait on (a long command), and a starting agent's long start detail on its card
   'setup-card'];
+
+// A prompt of three lines, as typed or pasted, each short enough for one line of the box at the narrowest board
+const PROMPT3 = 'The checkout total is off:\nexpected 42.10\nbut got 42.09';
+// A message found by its agent's task, so it is asked first: the longest card that typed words bring
+const LONG_TELL = 'tell the sign-up one to use the new copy on every step of the welcome screens, and in the emails that follow them, before the release on Thursday';
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
 const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
@@ -478,7 +483,7 @@ try {
   }
   if (scenarios.length) console.log('');
 
-  // views: hover cards, menus, opened details, the reply chip, notices, launch questions, and the link states
+  // views: hover cards, menus, opened details, the reply chip, notices, cards from typed words, and the link states
   for (const v of views) {
     for (const s of sizes) for (const d of details) {
       // these two do not depend much on the window: two sizes, unless one is asked for
@@ -596,11 +601,13 @@ try {
         await ctl('push', { event: 'notice', data: { text: 'Search cleanup has your answer and is carrying on. It will tell you when the old search address is gone and the redirect to the new search page works for saved links.' } });
         await settle(200); await check(tag);
       } else if (v === 'confirm') {
+        // a card from typed words, the longest the lid gets from them: a message whose words found its agent by its task,
+        // so it asks first, quoting a long message and the agent's task (work itself starts with no card)
         await load('demo');
-        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = 'start eight agents on the backlog'; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return true; })()`);
+        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(LONG_TELL)}; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return true; })()`);
         await sleep(900); await settle(100);
         const h1 = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
-        if (!/^Start 8 agents/.test(h1)) failures.push(`${tag}: the launch question did not show (${h1.slice(0, 40)})`);
+        if (!/^Tell Onboarding “/.test(h1)) failures.push(`${tag}: the message card did not show (${h1.slice(0, 40)})`);
         await check(tag);
         await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="readall"]')?.click(), true`); await sleep(600); await settle(100); await check(tag + ' (all of it)');
       } else if (v === 'perm-card') {
@@ -611,17 +618,30 @@ try {
         const h1 = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
         if (h1 !== 'Let agents do anything without asking?') failures.push(`${tag}: the full permissions card did not show (${h1.slice(0, 40)})`);
         await check(tag);
-      } else if (v === 'perm-launch') {
-        // a launch of eight while full permissions are on: the card says they ask only before steps that name Claude Code's
-        // own settings, at every fit step
-        await load('full');
-        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = 'start eight agents on the backlog'; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return true; })()`);
+      } else if (v === 'prompt') {
+        // a prompt of three lines in the board's input, in a calm board ('prompt') and over a question with its answers
+        // ('demo', the permission first): the box grows to show its lines where the lid has room and scrolls inside where it
+        // has not, never over the lid's words; then Enter starts its agent at once, with no card, and the line under the
+        // board quotes the prompt on one line
+        for (const sc of ['prompt', 'longq']) {
+          await load(sc);
+          await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(PROMPT3)}; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+          await settle(120);
+          const box = await b.ev(`(() => { const i = document.getElementById('say'), line = parseFloat(getComputedStyle(i).lineHeight); return { shown: Math.round(i.clientHeight / line), all: Math.round(i.scrollHeight / line) }; })()`);
+          if (box.all !== 3) failures.push(`${tag}: the box should hold three lines of text (${sc}: ${box.all})`);
+          if (sc === 'prompt' && box.shown !== 3) failures.push(`${tag}: the box did not grow to show its three lines on a calm board (${box.shown})`);
+          await check(`${tag} (${sc}, three lines in the box)`);
+        }
+        await load('prompt');
+        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(PROMPT3)}; i.dispatchEvent(new Event('input', { bubbles: true }));
+          i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); return true; })()`);
         await sleep(900); await settle(100);
-        const all = await b.ev(`document.querySelector('#pages .page:not(.old)')?.textContent || ''`);
-        const fit = await b.ev(`document.getElementById('core').dataset.fit || '0'`);
-        if (!/Start 8 agents/.test(all)) failures.push(`${tag}: the launch question did not show`);
-        else if (Number(fit) < 3 && !/so they ask only before steps that name Claude Code's own settings/.test(all)) failures.push(`${tag}: the launch card did not say that they ask only before steps that name Claude Code's own settings`);
-        await check(tag);
+        // the whole notice: where the line under the board is narrow it shows cut to its lines, whole for screen readers
+        const said = await b.ev(`(() => { const e = document.getElementById('said'); return e.querySelector('.sr')?.textContent || e.textContent; })()`);
+        const card = await b.ev(`!!document.querySelector('#pages .page:not(.old) [data-act="confirm"]')`);
+        if (card) failures.push(`${tag}: a prompt brought a card`);
+        if (said !== 'Started a simulated Claude on “The checkout total is off: expected 42.10 but got 42.09”.') failures.push(`${tag}: the notice did not quote the prompt on one line (${said.slice(0, 70)})`);
+        await check(tag + ' (its notice)');
       } else if (v === 'setup-card') {
         // the setup card launches wait on, from the snapshot: its question, its whole command (or its tail with "See all
         // of it"), Run it and Not now; then, pinned, the card of an agent whose start detail is long

@@ -92,8 +92,8 @@ const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
 const ALLOW_LABEL_RE = /^allow$/i;
 const DENY_LABEL_RE = /^deny$/i;
-const HELP = 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.';
-// The answer to "help", "hi" or "what can you do": short enough for three lines under the DRAM on the narrowest board.
+// What a `help` intent gets, from a parser that still sends one (the real parser does not: "help" is a prompt there):
+// short enough for three lines under the DRAM on the narrowest board.
 const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
 // Full permissions: the card that asks first, and what is said when they go on and off.
@@ -178,6 +178,22 @@ function lowerFirst(s) {
   return s ? s.charAt(0).toLowerCase() + s.slice(1) : s;
 }
 
+function upperFirst(s) {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+/**
+ * Work in these words for agent `h`, when the words name no agent: the person was just asked what `h` should work on.
+ * Anything else (a command, work that names its agent) is as it was.
+ */
+function forHarness(intent, h) {
+  if (intent.kind === 'task' && !intent.harness) return { ...intent, harness: h };
+  if (intent.kind === 'start' && Array.isArray(intent.tasks) && intent.tasks.length) {
+    return { ...intent, tasks: intent.tasks.map(t => (t && !t.harness ? { ...t, harness: h } : t)) };
+  }
+  return intent;
+}
+
 function joinAnd(items) {
   const a = items.filter(Boolean);
   if (a.length <= 1) return a.join('');
@@ -193,6 +209,46 @@ function joinOr(items) {
 
 function harnessName(h) {
   return HARNESS_NAMES[h] || 'That kind of agent';
+}
+
+// The programs as the notice of a start names them, short, as people say them: "Started Claude on “fix the login”."
+const PROGRAM_SAID = { claude: 'Claude', codex: 'Codex' };
+const COUNT_WORD = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+
+/**
+ * The notice of a start: "Started Claude on “fix the login”.", "Started two Claude agents on “…”.", "Started Claude on
+ * “a” and Codex on “b”."; in the demo, "a simulated Claude". Each task is quoted on one line (clip makes line breaks
+ * spaces). `started`: [{ harness, task }], in the order they started.
+ */
+function startedSentence(started, demo) {
+  return `Started ${startPhrase(started, demo)}.`;
+}
+
+/**
+ * The question of the card that asks before more than one agent starts from one sentence, in the notice's words: "Start
+ * three Claude agents on “the login page”?", "Start Codex on “write tests” and Claude on “fix the parser”?" ("simulated"
+ * in the demo). A quoted task that is a question already ends the sentence.
+ */
+function startQuestion(tasks, demo) {
+  const s = `Start ${startPhrase(tasks, demo)}`;
+  return /\?”$/.test(s) ? s : `${s}?`;
+}
+
+/** Who starts on what: "Claude on “fix the login”", "two Claude agents on “…”", "Codex on “…” and Claude on “…”". */
+function startPhrase(starts, demo) {
+  const byTask = new Map();
+  for (const s of starts) byTask.set(s.task, [...(byTask.get(s.task) || []), s.harness]);
+  const sim = demo ? 'simulated ' : '';
+  const who = (hs) => {
+    const counts = new Map();
+    for (const h of hs) counts.set(h, (counts.get(h) || 0) + 1);
+    return joinAnd([...counts].map(([h, n]) => {
+      const name = PROGRAM_SAID[h] || harnessName(h);
+      return n === 1 ? `${demo ? 'a simulated ' : ''}${name}` : `${COUNT_WORD[n] || n} ${sim}${name} agents`;
+    }));
+  };
+  const width = byTask.size > 1 ? 50 : 80;
+  return joinAnd([...byTask].map(([task, hs]) => `${who(hs)} on “${clip(task, width)}”`));
 }
 
 /**
@@ -255,7 +311,7 @@ function maskValue(value, mask, skip = null, depth = 0) {
   return out;
 }
 
-/** What "do it" does to a confirm card: "start it", "stop them", "send it", "merge it", "throw it away". */
+/** What "do it" does to a confirm card: "stop them", "send it", "merge it", "throw it away". */
 function confirmVerb(c) {
   switch (c.kind) {
     case 'say': return 'send it';
@@ -265,9 +321,20 @@ function confirmVerb(c) {
     case 'permissions': return 'turn on full permissions';
     case 'setup': return 'run it';
     case 'stop': return `stop ${c.agentIds?.length > 1 ? 'them' : 'it'}`;
-    case 'start': return `start ${c.tasks?.length > 1 ? 'them' : 'it'}`;
+    case 'start': return 'start them';
     default: return 'go ahead';
   }
+}
+
+/**
+ * The work of a start, as the engine takes it: each task's words trimmed (none empty), its agent only when it is one the
+ * engine knows (else null: the default agent's), its machine, and at most eight.
+ */
+function startList(tasks) {
+  return (Array.isArray(tasks) ? tasks : [])
+    .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
+    .filter(t => t.task)
+    .slice(0, 8);
 }
 
 /** "2.1.322" -> [2, 1, 322]; null when it does not start like a version. */
@@ -590,7 +657,8 @@ export class Engine extends EventEmitter {
     this.later = new Map();     // agentId -> { ask?, state? }: decisions that wait until its held requests are answered
     this._checkingHeld = false;
     this.asks = new Map();      // askId -> { agentId, type } for asks the engine created
-    this.confirms = new Map();  // confirmId -> a launch, stop or message waiting for "yes"
+    this.confirms = new Map();  // confirmId -> a stop, message, forget, merge, throw-away or full permissions card waiting for "yes"
+    this._askedFor = null;      // { harness, at }: the agent the person was just asked work for ("What should Codex work on?")
     this.stopped = new Set();   // agents the person stopped; late events from them are filtered
     this.stopAsked = new Set(); // live helpers whose root was asked to stop them: no more tools, but their events count
     this.harnessInfo = Object.fromEntries([...AGENT_HARNESSES, 'sim'].map(h => [h, null]));
@@ -844,7 +912,7 @@ export class Engine extends EventEmitter {
     if (!list.length) return;
     const failing = this.mode === 'live' ? this._newlyFailed(list) : [];
     this.store.apply(list);
-    // A yes to a launch is logged when Claude Code or Codex is spawned ("1 of 1 started"). What goes wrong after that
+    // A start is logged when Claude Code or Codex is spawned ("1 of 1 started"). What goes wrong after that
     // (it exits, or its first turn ends in an error) is logged here, with the reason the page gives.
     for (const id of failing) {
       const v = this.store.get(id);
@@ -1961,9 +2029,34 @@ export class Engine extends EventEmitter {
     return { ok: true, reply: `Passed your message to ${v.name}.` };
   }
 
+  /**
+   * "looks good" (and the engine's other words for it, LOOKS_GOOD_RE) or "not now", said at a finished agent's lid
+   * (command(): the parser's `answer` with no ask): what the lid's own button does. Where its work could be merged, the lid
+   * offers Merge and "Not now", and "looks good" is that "Not now": the work stays on its branch, in words that are no
+   * approval. The reply carries `looked`, so the page marks this finish looked at, as the button does; nothing is sent
+   * to the agent, and nothing starts.
+   */
+  async _lookedAt(v, text) {
+    const r = await this._answerDone(v, LOOKS_GOOD_RE.test(text) && this._mergeOffered(v) ? 'Not now' : text);
+    return { reply: r.reply, looked: v.id };
+  }
+
+  /**
+   * Whether the lid offers Merge for this root, by the page's rule (ui/queue.js mergeApplies): live mode, at rest, its
+   * folder and branch there and not thrown away, work not merged yet, and the person on a branch, with a name and email
+   * git is not known to lack.
+   */
+  _mergeOffered(v) {
+    const w = v && !v.parentId ? v.work : null;
+    const repo = this._repoView();
+    return this.mode === 'live' && !!w && !!w.branch && !!w.folder && !w.thrownAway && !ACTIVE.has(v.state)
+      && !!repo?.branch && repo.identity !== false && unmergedWork(v);
+  }
+
   async _answerDone(v, text) {
     if (!text || LOOKS_GOOD_RE.test(text)) return { ok: true, reply: `Good. ${v.name} stays as it is.` };
-    if (NOT_NOW_RE.test(text)) return { ok: true, reply: v.work?.branch ? `OK. ${v.name}’s work stays on its branch for now.` : `OK. ${v.name} stays as it is.` };
+    // what happened, and no bare "OK." before it: words the person said are never answered with a word back
+    if (NOT_NOW_RE.test(text)) return { ok: true, reply: v.work?.branch ? `${v.name}’s work stays on its branch for now.` : `${v.name} stays as it is.` };
     const sent = await this._sendTo(v, text);
     if (!sent.ok) return sent;
     return { ok: true, reply: sent.reply || `Sent your follow-up to ${v.name}.` };
@@ -2495,7 +2588,8 @@ export class Engine extends EventEmitter {
 
   /**
    * Launch a root agent, and resolve once its runner has started (or could not): in live mode, after its copy got its
-   * files and its setup command ran. Does not ask first: command() and the UI confirm before calling this.
+   * files and its setup command ran. Does not ask first: one agent's work never is, and command() asks first before
+   * more than one from one sentence (_proposeStart).
    */
   async startAgent(opts = {}) {
     const v = await this._startAgent(opts);
@@ -2515,7 +2609,7 @@ export class Engine extends EventEmitter {
    * has started (`done`) or it does something slow first: its copy is filled, it waits for the setup card, or its setup
    * command runs. `started` resolves to its view once the runner has started or could not. Both parts are tracked
    * while they are under way, so that shutdown can wait for them (see shutdown). `burst`: what the launches of one
-   * launch card share (the answer to a setup card, see _setupAnswer).
+   * start share (the words that started them, or a start card's yes: the answer to a setup card, see _setupAnswer).
    */
   _begin(opts, burst = null) {
     const track = (p) => {
@@ -2809,7 +2903,7 @@ export class Engine extends EventEmitter {
   /**
    * Whether the setup command `command` of the repository at `root` runs in this agent's copy: 'run' or 'skip'. It runs
    * at once when the person said Run it to this very text before (kept in prefs by root, as its SHA-256, or said in this
-   * run), or when the setup card of the launch card this launch came from (`burst`) was answered already. Otherwise
+   * run), or when the setup card of the start this launch came from (`burst`: _startNow's) was answered already. Otherwise
    * the setup card asks: one per repository and command, open until answered, and every launch that comes meanwhile
    * waits on the same card. Run it is kept; Not now keeps nothing, so the next launch asks again; a card nobody answers
    * counts as Not now after confirmTtlMs, and so does shutdown. An agent stopped meanwhile stops waiting ('skip'), and a
@@ -4370,8 +4464,9 @@ export class Engine extends EventEmitter {
   // ================================================================ commands and confirms
 
   /**
-   * Plain-language command from the bar at the bottom (typed or spoken). Launches need a confirm, and so do stops and
-   * messages whose words found the agent without naming it.
+   * Plain-language command from the bar at the bottom (typed or spoken). One agent's work starts at once, never asked
+   * first; more than one agent from one sentence needs a confirm, and so do stops and messages whose words found the
+   * agent without naming it, forgetting, merging and throwing away.
    * The page sends what it showed when the person began: `focusId`, the agent in the centre; `confirmId`, the confirm
    * card on screen; `askId`, the ask on screen. A yes or no settles only that confirm, and an answer (allow, deny,
    * free text) reaches only that ask. Commands (stop, tell, status, start, ...) act on what the words and the focus
@@ -4379,6 +4474,10 @@ export class Engine extends EventEmitter {
    */
   async command(text, { focusId = null, confirmId = null, askId = null } = {}) {
     const t = String(text ?? '').trim();
+    // "codex" alone asked what Codex should work on (_startNow): these words are its prompt, once, if they come soon. Any
+    // words use the question up, whatever they are.
+    const askedFor = t && this._askedFor && this.now() - this._askedFor.at <= this.options.confirmTtlMs ? this._askedFor.harness : null;
+    if (t) this._askedFor = null;
     let out;
     if (!t) {
       out = { reply: 'Type or say what you would like to do.' };
@@ -4397,31 +4496,48 @@ export class Engine extends EventEmitter {
         this.log.warn('Could not understand a command:', err);
       }
       if (!intent || typeof intent !== 'object') intent = { kind: 'unknown', text: t };
+      if (askedFor) intent = forHarness(intent, askedFor);
       if (shown && intent.kind === 'unknown') {
-        // A near miss ("yes start the agent") keeps the card in the centre, so saying "yes" again still answers it,
-        // and not whatever would have taken its place.
+        // A yes that is not enough for the card, or one asked rather than said ("yes start it" to a stop, a bare "yes" to
+        // a throw-away, "is that right?"), keeps the card in the centre, so saying "do it" still answers it, and not
+        // whatever would have taken its place. The reply says how to answer it.
         out = shown.gone
           ? { reply: GONE }
           : shown.kind === 'setup'
-            ? { reply: 'I did not catch that. Say “run it” or “not now”.', confirm: this._card(shown) }
-            : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
+            ? { reply: 'Say “run it” or “not now”.', confirm: this._card(shown) }
+            : { reply: `Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
       } else {
-        // Any other command withdraws the card on screen, without a notice: the page lets go of it. A look at an
-        // agent's changes does not: it is read-only, so the card keeps waiting, and the reply carries it, as for words
-        // not caught, so the page keeps it too ("show me the changes" before saying yes to a merge). Nor does a setup
-        // card: launches wait on it, and only its own answer (or its time running out) lets them go on. It is not in
-        // `confirms`, so nothing here deletes it, and the page keeps it from the snapshot.
-        const keep = intent.kind === 'changes' && shown && !shown.gone;
+        // Any other command withdraws the card on screen, without a notice: the page lets go of it. Four do not, and the
+        // reply carries the card, as for words not caught, so the page keeps it too. A look at an agent's changes is
+        // read-only, so the card keeps waiting ("show me the changes" before saying yes to a merge). A prompt starts its
+        // agent at once, and the card stays where it is: it was not answered. A stop stops what it names, and the card
+        // stays too ("stop everything, the build is broken" while a merge card waits). A program named alone ("codex", "the
+        // agent", "ask claude") asks what it should work on, and the card stays for its own answer. Nor does anything
+        // withdraw a setup card: launches wait on it, and only its own answer (or its time running out) lets them go on.
+        // It is not in `confirms`, so nothing here deletes it or carries it, and the page keeps it from the snapshot.
+        const prompt = intent.kind === 'task' || (intent.kind === 'start' && Array.isArray(intent.tasks) && intent.tasks.length > 0);
+        const stopping = intent.kind === 'stop' || intent.kind === 'stop_all';
+        const asking = intent.kind === 'start' && !prompt && !intent.task;
+        const keep = (intent.kind === 'changes' || prompt || stopping || asking) && shown && !shown.gone;
         if (shown && !shown.gone && intent.kind !== 'confirm' && !keep) this.confirms.delete(shown.id);
         try {
           // With a card on screen, no ask was: the centre shows one thing at a time.
-          out = await this._runIntent(intent, { focusId, askId: shown ? null : askId, shown });
+          out = await this._runIntent(intent, { focusId, askId: shown ? null : askId, shown, said: t });
         } catch (err) {
           this.log.error('A command failed:', err);
           out = { reply: err?.plain ? err.message : 'Something went wrong while doing that. The details are in the log.' };
         }
         const kept = keep ? this.confirms.get(shown.id) : null;
-        if (kept) out = { ...out, confirm: this._card(kept) };
+        if (kept && out.confirm && out.confirm.id !== kept.id) {
+          // the words asked first with a card of their own ("stop the stuck one"): that card takes the centre
+          this.confirms.delete(kept.id);
+        } else if (kept) {
+          // what a prompt started, a stop stopped, or the question of what a program named alone should work on, is said
+          // under the board all the same: the card in the centre does not say it, and the centre stays on the card
+          if ((prompt || stopping || asking) && out.reply) this._notice(out.reply, null);
+          if (stopping) delete out.focusId;
+          out = { ...out, confirm: this._card(kept) };
+        }
       }
     }
     if (out.reply && !out.confirm) this._notice(out.reply, out.focusId || null);
@@ -4452,7 +4568,11 @@ export class Engine extends EventEmitter {
     const d = this._setupAsks.get(id);
     if (d) return { id: d.id, kind: 'setup', sentence: SETUP_SENTENCE, detail: SETUP_DETAIL, command: d.command, yes: 'Run it', no: 'Not now' };
     const c = this.confirms.get(id);
-    if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) return { id, gone: true };
+    // One that ran out says which agent's work it was about (a merge or throw-away card), so "throw it away" said to it
+    // asks about that agent again rather than about whatever else
+    if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) {
+      return { id, gone: true, ...(c && (c.kind === 'merge' || c.kind === 'discard') && typeof c.agentId === 'string' && c.agentId ? { agentId: c.agentId } : {}) };
+    }
     const agentIds = c.agentIds ?? c.intent?.agentIds ?? (c.agentId ? [c.agentId] : undefined);
     return {
       id: c.id, kind: c.kind, sentence: c.sentence, detail: c.detail, tasks: c.tasks, agentIds,
@@ -4462,11 +4582,10 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId?, agents?, command? }. `kind` is
-   * always there (start, stop, say, forget, merge, discard, permissions or setup); yes and no are the buttons' own words
-   * when they are not "Do it" and "Cancel"; agentId (merge and discard cards only) is the agent the card is about;
-   * agents (launch cards only) is how many agents it starts, so the page can say "it" or "they"; command (setup cards
-   * only) is the setup command it asks about.
+   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId?, command? }. `kind` is always
+   * there (stop, say, forget, merge, discard, permissions, start or setup); yes and no are the buttons' own words when they
+   * are not "Do it" and "Cancel"; agentId (merge and discard cards only) is the agent the card is about; command (setup
+   * cards only) is the setup command it asks about.
    */
   _card(c) {
     const out = { id: c.id, sentence: c.sentence, detail: c.detail ?? null, kind: c.kind };
@@ -4474,7 +4593,6 @@ export class Engine extends EventEmitter {
     if (c.no) out.no = c.no;
     if (typeof c.danger === 'boolean') out.danger = c.danger;
     if (c.kind === 'setup' && typeof c.command === 'string') out.command = c.command;
-    if (c.kind === 'start' && Array.isArray(c.tasks)) out.agents = c.tasks.length;
     // a merge or throw-away card names the agent it is about, so the git screen can show it in that agent's detail
     if ((c.kind === 'merge' || c.kind === 'discard') && typeof c.agentId === 'string' && c.agentId) out.agentId = c.agentId;
     return out;
@@ -4488,18 +4606,23 @@ export class Engine extends EventEmitter {
     return { reply: c.sentence, confirm: this._card(c) };
   }
 
-  async _runIntent(intent, { focusId = null, askId = null, shown = null } = {}) {
+  async _runIntent(intent, { focusId = null, askId = null, shown = null, said = '' } = {}) {
     const get = (id) => (id ? this.store.get(id) : null);
     switch (intent.kind) {
-      case 'start':
-        // "start an agent" with no task comes as { kind: 'start', tasks: [], task: null, harness }: the reply asks what
-        // to work on, naming the agent the words named ("start codex"), or says why that one cannot start.
-        return this._proposeStart(Array.isArray(intent.tasks) ? intent.tasks
-          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : [], intent.harness);
+      case 'start': {
+        // One agent starts at once, never asked. More than one from one sentence ("start three agents on …", "claude and
+        // codex on …") multiplies what is spent, so a card asks first (_proposeStart). "start an agent" with no task comes
+        // as { kind: 'start', tasks: [], task: null, harness }: the reply asks what to work on, naming the agent the words
+        // named ("start codex"), or says why that one cannot start.
+        const tasks = Array.isArray(intent.tasks) ? intent.tasks
+          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : [];
+        if (startList(tasks).length > 1) return this._proposeStart(startList(tasks));
+        return this._startNow(tasks, intent.harness);
+      }
       case 'task':
-        return this._proposeStart([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
+        return this._startNow([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
       case 'help': {
-        // The parser's own words for it when it has them (commands.mjs HELP_REPLY), else the same words kept here.
+        // A parser that still sends `help` (the real one does not): its own words for it when it has them, else these.
         const words = this.deps.commands?.HELP_REPLY;
         return { reply: typeof words === 'string' && words.trim() ? words.trim() : HELP_REPLY };
       }
@@ -4514,6 +4637,13 @@ export class Engine extends EventEmitter {
       case 'answer':
       case 'allow':
       case 'deny': {
+        // A yes or a no to an agent that asks nothing while more than one of its helpers waits: which one is not clear.
+        const root = get(intent.agentId || focusId);
+        const waitingHelpers = root && !root.parentId && !root.ask && intent.kind !== 'answer' ? this._helpersWaiting(root.id) : [];
+        if (waitingHelpers.length > 1) {
+          const n = waitingHelpers.length;
+          return { reply: `${upperFirst(COUNT_WORD[n] || String(n))} helpers are waiting: ${joinAnd(waitingHelpers.map(h => h.name))}. Say which one.`, focusId: root.id };
+        }
         const target = intent.kind === 'answer' ? { v: get(intent.agentId || focusId) } : this._permissionTarget(intent.agentId || focusId);
         const v = target.v;
         if (!v) return { reply: target.reply || 'Which agent is that for?' };
@@ -4522,6 +4652,11 @@ export class Engine extends EventEmitter {
         const named = this._askFor(v, askId);
         if (named.reply) return { reply: named.reply, focusId: v.id };
         const ask = named.ask;
+        // A finished agent's lid: "looks good" (and its kin) or "not now", said, does what its button does, and starts nothing
+        const words = String(intent.text ?? '').trim();
+        if (!ask && intent.kind === 'answer' && !v.parentId && DONE.has(v.state) && (LOOKS_GOOD_RE.test(words) || NOT_NOW_RE.test(words))) {
+          return this._lookedAt(v, words);
+        }
         if (!ask) return { reply: `${v.name} is not waiting for an answer.`, focusId: v.id };
         if (intent.askId && intent.askId !== ask.id) return { reply: `${v.name} is asking something else now. Have a look, then answer again.`, focusId: v.id };
         let r;
@@ -4564,15 +4699,17 @@ export class Engine extends EventEmitter {
         if (!v) return { reply: WHICH_ONE };
         return this._reviewReply(v);
       }
+      // A bare one (`bare`: "merge them", "throw it away" with no agent in the centre): the one finished agent whose work
+      // it could act on, or a question that names them.
       case 'merge': {
-        const v = this._rootOf(intent.agentId);
-        if (!v) return { reply: WHICH_ONE };
+        const v = this._rootOf(intent.agentId) || (intent.bare ? this._bareWork('merge') : null);
+        if (!v || v.reply) return { reply: v?.reply || WHICH_ONE };
         const r = await this._proposeMerge(v, { into: typeof intent.into === 'string' && intent.into.trim() ? intent.into.trim() : null });
         return r.confirm ? r : { reply: r.reply, focusId: v.id };
       }
       case 'discard': {
-        const v = this._rootOf(intent.agentId);
-        if (!v) return { reply: WHICH_ONE };
+        const v = this._rootOf(intent.agentId) || (intent.bare ? this._bareWork('discard') : null);
+        if (!v || v.reply) return { reply: v?.reply || WHICH_ONE };
         const r = await this._proposeDiscard(v);
         return r.confirm ? r : { reply: r.reply, focusId: v.id };
       }
@@ -4609,19 +4746,46 @@ export class Engine extends EventEmitter {
       case 'sleep_idle':
         return this._sleepIdle();
       case 'confirm': {
-        // Only the card on screen: never "the latest one".
-        if (!shown) return { reply: 'There is nothing waiting for a yes or no.' };
+        // Only the card on screen: never "the latest one". With none, a yes or a no is a prompt like any other words (the
+        // real parser sends no confirm then; one that does is not answered "there is nothing waiting").
+        if (!shown) return this._startNow([{ task: said }]);
         const r = await this._confirm(shown.id, !!intent.go);
         // A typed or spoken yes that started agents puts the first one in the centre, so a second "yes" said out of
         // habit finds nothing to answer, rather than whatever asks next.
         return r.agentIds?.length && !r.focusId ? { ...r, focusId: r.agentIds[0] } : r;
       }
       default: {
-        // With a request for permission in the centre, words that are no answer say so, not the general hint.
+        // With a request for permission in the centre, words that are no answer say so.
         const asking = this._permissionInFocus(focusId);
-        return { reply: asking ? `${asking.name} is waiting for your OK. Say “yes” or “no” to it first.` : HELP };
+        if (asking) return { reply: `${asking.name} is waiting for your OK. Say “yes” or “no” to it first.` };
+        // Anything else is a prompt: there is no dead end. Words a parser did not read go to an agent as they were said.
+        const words = (typeof intent.text === 'string' && intent.text.trim()) || said;
+        return this._startNow([{ task: words }]);
       }
     }
+  }
+
+  /** The helpers of a root that wait on the person (a question, a permission, a stuck ask). */
+  _helpersWaiting(rootId) {
+    return this.store.list().filter(a => a.parentId && (a.rootId === rootId || a.parentId === rootId) && a.ask && typeof a.ask === 'object');
+  }
+
+  /**
+   * The agent a bare merge or throw-away means ("merge them", "throw it away" with no agent in the centre): the one
+   * finished root whose work it could act on now (_mergeRefusal or _discardRefusal says nothing against it, and its work
+   * is not settled), or { reply } naming them ("Merge which? Invoice export or Price rounding."), or saying there is none.
+   */
+  _bareWork(verb) {
+    const merge = verb === 'merge';
+    const can = this.store.list().filter(v => !v.parentId && (ENDED.has(v.state) || v.earlier) && !workSettled(v)
+      && !(merge ? this._mergeRefusal(v) : this._discardRefusal(v)))
+      .sort((a, b) => (Number(a.startedAt) || 0) - (Number(b.startedAt) || 0)); // in the order they started
+    if (can.length === 1) return this.store.get(can[0].id);
+    const what = merge ? 'merge' : 'throw away';
+    if (!can.length) return { reply: `No finished agent has work to ${what} right now.` };
+    const names = can.slice(0, 4).map(v => v.name);
+    const rest = can.length - names.length;
+    return { reply: `${upperFirst(what)} which? ${rest ? `${names.join(', ')} or ${rest} more` : joinOr(names)}.` };
   }
 
   /** The agent in the centre, or its one helper, when it waits for permission; else null. */
@@ -4670,23 +4834,29 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * A launch card for these tasks. A task whose words name no agent goes to the default agent (_defaultHarness). With no
-   * agent ready, or one named that cannot run here, the reply says so and carries `openConnect`, so the page opens
-   * Agents & keys. With no task, the reply asks what to work on: `named`, the agent the words named ("start codex"),
-   * is asked about by name when it can start, and is refused as a task naming it would be when it cannot.
+   * Start these tasks' agents at once, whether full permissions are on or off: one agent is never asked about, and more
+   * than one from one sentence comes here after its card's yes (_proposeStart). A task whose
+   * words name no agent goes to the default agent (_defaultHarness). With no agent ready, or one named that cannot run
+   * here, nothing starts, and the reply says so and carries `openConnect`, so the page opens Agents & keys. With no task,
+   * the reply asks what to work on: `named`, the agent the words named ("start codex"), is asked about by name when it
+   * can start, and is refused as a task naming it would be when it cannot. The reply is the notice of what started
+   * (startedSentence), said once, then anything that could not start; `agentIds`: the agents that started, first to
+   * last. It comes once each agent is on the board, before its copy is made ready (see _begin). It names no agent to put
+   * in the centre: what is there stays.
    */
-  _proposeStart(tasks, named = null) {
-    const list = (Array.isArray(tasks) ? tasks : [])
-      .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
-      .filter(t => t.task)
-      .slice(0, 8);
+  async _startNow(tasks, named = null) {
+    const list = startList(tasks);
     let def; // looked up once, and only when a task names no agent
     const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
     if (!list.length) {
+      // Nothing to work on yet: with no agent ready, that comes first, since nothing could start it. Otherwise ask, naming
+      // the agent (the one the words named, else the default), and the next words are its prompt (command(): _askedFor).
       const h = AGENT_HARNESSES.includes(named) ? named : null;
-      if (h) return this._canRun(h) ? { reply: `What should ${harnessName(h)} work on?` } : this._cannotRunReply(h);
-      // Nothing to work on yet: with no agent ready, that comes first, since nothing could start it.
-      return fallback() === null ? { reply: NO_AGENT, openConnect: true } : { reply: 'What should the agent work on?' };
+      if (h && !this._canRun(h)) return this._cannotRunReply(h);
+      const who = h || fallback();
+      if (!who) return { reply: NO_AGENT, openConnect: true };
+      this._askedFor = { harness: who, at: this.now() };
+      return { reply: `What should ${harnessName(who)} work on?` };
     }
     for (const t of list) {
       if (!t.harness) t.harness = fallback();
@@ -4695,53 +4865,75 @@ export class Engine extends EventEmitter {
     for (const t of list) {
       if (!this._canRun(t.harness)) return this._cannotRunReply(t.harness);
     }
-    const detail = this._startDetail(list);
-    // Live mode has no cloud machines: launches go to the laptop, and the question should not say otherwise.
+    // Live mode has no cloud machines: its agents run on the laptop.
     if (this.mode !== 'demo') for (const t of list) t.machine = null;
-    let sentence = null;
-    if (typeof this.deps.commands?.describeIntent === 'function') {
+    // Every start is in the log, when it came and how it ended, so "I pressed Enter and nothing happened" can be read
+    // from it: no line, the page never sent it; this line alone, the start has not ended.
+    this.log.warn(`Words came that start work: starting ${list.length === 1 ? 'one agent' : `${list.length} agents`}.`);
+    const used = new Set();
+    const started = [];
+    const problems = [];
+    let openConnect = false; // an agent went away since it was found ready: Agents & keys is where to bring it back
+    // In live mode each agent's copy is made ready before it starts (_prepare: its files, then the setup command once the
+    // person said Run it to it). These launches share the answer to a setup card (`burst`, see _setupAnswer), so a start
+    // card's yes asks it once, and each is waited for only until it is on the board and has started or begun something
+    // slow (its copy, the setup card, its setup command): the reply never waits on those, and one that then cannot start
+    // says so in a notice of its own.
+    const burst = { setup: new Map() };
+    for (const t of list) {
       try {
-        const s = this.deps.commands.describeIntent({ kind: 'start', tasks: list }, this._commandContext(null));
-        if (typeof s === 'string' && s.trim()) sentence = s.trim();
+        const machineId = await this._pickMachine(t.machine, used);
+        used.add(machineId);
+        const l = await this._begin({ task: t.task, harness: t.harness, machineId }, burst);
+        const v = l.view;
+        if (v.state === STATE.FAILED) {
+          problems.push(`${v.name} could not start. ${v.stateReason || ''}`.trim());
+          continue;
+        }
+        started.push({ v, harness: t.harness, task: t.task });
+        if (!l.done) {
+          l.started.then(after => {
+            if (after?.state === STATE.FAILED) this._notice(`${after.name} could not start. ${after.stateReason || ''}`.trim(), after.id);
+          }, () => {});
+        }
       } catch (err) {
-        this.log.debug('describeIntent failed:', err);
+        if (err?.openConnect && this.mode === 'live') openConnect = true;
+        // A task refused for holding a key is not quoted: a reply is never masked.
+        if (err?.message === SECRET_REFUSED) {
+          if (!problems.includes(SECRET_REFUSED)) problems.push(SECRET_REFUSED);
+        } else {
+          problems.push(`I could not start the agent for “${clip(t.task, 50)}”: ${plainReason(err)}`);
+        }
       }
     }
-    if (!sentence) {
-      const label = (t) => (this.mode === 'demo' ? `a simulated ${harnessName(t.harness)}` : harnessName(t.harness));
-      sentence = list.length === 1
-        ? `Start ${label(list[0])} on “${clip(list[0].task, 90)}”${/\?$/.test(clip(list[0].task, 90)) ? '' : '?'}`
-        : `Start ${list.length} agents: ${joinAnd(list.map(t => `${label(t)} on “${clip(t.task, 50)}”`))}?`;
-    }
-    return this._newConfirm({ kind: 'start', tasks: list, sentence, detail });
-  }
-
-  _startDetail(list) {
-    const many = list.length > 1;
-    const cloud = list.some(t => t.machine && t.machine !== 'laptop');
-    if (this.mode === 'demo') {
-      const where = cloud ? (many ? 'Each one gets its own cloud machine.' : 'It runs on a cloud machine.') : (many ? 'They run on your laptop.' : 'It runs on your laptop.');
-      return `This is the demo: the agents are simulated and nothing is spent. ${where}`;
-    }
-    // Codex reports no cost, so a Codex agent has no spending limit; Claude Code's is the run's default.
-    const codex = list.filter(t => t.harness === 'codex').length;
-    const limit = money(this.defaultBudgetUsd);
-    const parts = [codex === 0 ? `${many ? 'Each one' : 'It'} can spend up to ${limit}.`
-      : codex === list.length ? `Codex reports no cost, so ${many ? 'they have' : 'it has'} no spending limit.`
-        : `Each Claude Code agent can spend up to ${limit}. Codex reports no cost, so it has no spending limit.`];
-    const repo = this.repoInfo;
-    if (repo) {
-      parts.push(`${many ? 'Each works' : 'It works'} in its own copy of ${repo.name || 'the repository'}, made from the last commit.`);
-      const dirty = Number(repo.dirty) || 0;
-      if (dirty > 0) parts.push(`Your ${dirty} uncommitted change${dirty === 1 ? ' is' : 's are'} not included.`);
-    }
-    if (cloud) parts.push('Cloud machines exist only in the demo, so it runs on your laptop.');
-    return parts.join(' ');
+    const parts = [];
+    if (started.length) parts.push(startedSentence(started, this.mode === 'demo'));
+    parts.push(...problems);
+    this.log.warn(`Of the work asked for, ${started.length} of ${list.length} started.${problems.length ? ` ${problems.join(' ')}` : ''}`);
+    return { reply: parts.join(' '), agentIds: started.map(s => s.v.id), ...(openConnect ? { openConnect: true } : {}) };
   }
 
   /**
-   * A stop or a message whose words found the agent without naming it ("stop the stuck one"): ask first, with the
-   * same kind of confirm card as a launch.
+   * More than one agent from one sentence ("start three agents on the login page", "start claude and codex on the
+   * parser"): asked first, with a card, since each one spends on its own. What would refuse the start refuses it now,
+   * with no card: no agent ready, or one named that cannot run here. The card names the agents that would start (the
+   * default one for work that names none), in the words of the notice of a start ("Start three Claude agents on “the login
+   * page”?"); its yes starts them (_startNow checks everything again), its no starts nothing. `list`: startList's tasks.
+   */
+  _proposeStart(list) {
+    let def;
+    const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
+    const tasks = list.map(t => ({ ...t, harness: t.harness || fallback() }));
+    if (tasks.some(t => !t.harness)) return { reply: NO_AGENT, openConnect: true };
+    for (const t of tasks) if (!this._canRun(t.harness)) return this._cannotRunReply(t.harness);
+    const limit = tasks.some(t => t.harness === 'claude') ? ` A Claude agent can spend up to ${money(this.defaultBudgetUsd)}.` : '';
+    const detail = this.mode === 'demo' ? 'This is the demo, so nothing is spent.' : `Each one works in its own folder and spends on its own.${limit}`;
+    return this._newConfirm({ kind: 'start', tasks, sentence: startQuestion(tasks, this.mode === 'demo'), detail, yes: 'Start them', no: 'Cancel' });
+  }
+
+  /**
+   * A stop or a message whose words found the agent without naming it ("stop the stuck one"): ask first, with a
+   * confirm card.
    */
   _proposeIntent(intent) {
     let sentence = null;
@@ -4761,7 +4953,7 @@ export class Engine extends EventEmitter {
     return this._newConfirm({ kind: intent.kind, intent, sentence, detail });
   }
 
-  /** Execute (go = true) or cancel a launch, stop or message proposed by command(). */
+  /** Carry out (go = true) or cancel a card command() or a button proposed: a stop, a message, forget, merge, throw away or full permissions. */
   async confirm(confirmId, go) {
     const out = await this._confirm(confirmId, go);
     this._notice(out.reply, out.focusId || null);
@@ -4803,56 +4995,22 @@ export class Engine extends EventEmitter {
         if (c.modeAt !== this._modeChanges) return { reply: MODE_CHANGED };
         if (!go) return { reply: 'OK, agents still ask before risky steps.' };
         return this._fullOn();
-      case 'start':
-        if (Array.isArray(c.tasks)) break;
-      // falls through: a launch card without its tasks cannot be one
+      case 'start': {
+        // More than one agent from one sentence, asked first (_proposeStart). Only a card that holds them starts them:
+        // a start card without its tasks is none.
+        const tasks = startList(c.tasks);
+        if (tasks.length < 2) {
+          this.log.warn('A start card without the work it asked about was answered; nothing was done.');
+          return { reply: GONE };
+        }
+        if (!go) return { reply: 'OK, I won’t start them.' };
+        return this._startNow(tasks);
+      }
       default:
+        // One agent starts at once (_startNow), and only a start card starts more: a kind nobody knows does nothing.
         this.log.warn(`A confirm card of an unknown kind (${String(c.kind)}) was answered; nothing was done.`);
         return { reply: GONE };
     }
-    if (!go) return { reply: c.tasks.length === 1 ? 'OK, I won’t start it.' : 'OK, I won’t start them.' };
-    // Every yes to a launch is in the log, when it came and how it ended, so "I pressed Do it and nothing happened" can
-    // be read from it: no line, the page never sent it; this line alone, the launch has not ended.
-    this.log.warn(`A yes to a launch question came: starting ${c.tasks.length === 1 ? 'one agent' : `${c.tasks.length} agents`}.`);
-    const used = new Set();
-    const started = [];
-    const problems = [];
-    let openConnect = false; // an agent was gone by the time of the yes: Agents & keys is where to bring it back
-    // The launches of this card share the answer to a setup card (see _setupAnswer). Each is waited for until it is on
-    // the board and has started or begun something slow (its copy, its setup card, its setup command): the reply never
-    // waits on those, and one that then cannot start says so in a notice.
-    const burst = { setup: new Map() };
-    for (const t of c.tasks) {
-      try {
-        const machineId = await this._pickMachine(t.machine, used);
-        used.add(machineId);
-        const l = await this._begin({ task: t.task, harness: t.harness, machineId }, burst);
-        const v = l.view;
-        if (v.state === STATE.FAILED) {
-          problems.push(`${v.name} could not start. ${v.stateReason || ''}`.trim());
-          continue;
-        }
-        started.push(v);
-        if (!l.done) {
-          l.started.then(after => {
-            if (after?.state === STATE.FAILED) this._notice(`${after.name} could not start. ${after.stateReason || ''}`.trim(), after.id);
-          }, () => {});
-        }
-      } catch (err) {
-        if (err?.openConnect && this.mode === 'live') openConnect = true;
-        // A task refused for holding a key (stored after the card was made) is not quoted: a reply is never masked.
-        if (err?.message === SECRET_REFUSED) {
-          if (!problems.includes(SECRET_REFUSED)) problems.push(SECRET_REFUSED);
-        } else {
-          problems.push(`I could not start the agent for “${clip(t.task, 50)}”: ${plainReason(err)}`);
-        }
-      }
-    }
-    const parts = [];
-    if (started.length) parts.push(`Started ${joinAnd(started.map(v => v.name))}.`);
-    parts.push(...problems);
-    this.log.warn(`After a yes to a launch question, ${started.length} of ${c.tasks.length} started.${problems.length ? ` ${problems.join(' ')}` : ''}`);
-    return { reply: parts.join(' '), agentIds: started.map(v => v.id), ...(openConnect ? { openConnect: true } : {}) };
   }
 
   /** Demo only: 'cloud' picks a free cloud machine (waking one if needed); live is always the laptop. */

@@ -26,6 +26,17 @@ export function linkState({ hasKey, loaded, stream, refused = false, downMs = 0 
 /** True in the states where nothing can be sent, so the page hides the input and ignores typing and space. */
 export const cannotSend = state => state === 'no-key' || state === 'stale';
 
+/** The most a request's body may hold, in bytes, as Workbench takes it (src/server/http.mjs MAX_BODY). */
+export const MAX_SEND_BYTES = 64 * 1024;
+/** What the page says when words are too long to send. */
+export const TOO_LONG = 'That is too long to send in one go. The limit is 64 KB.';
+
+/** Whether a request's body, as it would be sent (JSON, in UTF-8 bytes), is over the limit: then it is not sent. */
+export function tooLongToSend(body) {
+  if (body === undefined) return false;
+  return new TextEncoder().encode(JSON.stringify(body)).length > MAX_SEND_BYTES;
+}
+
 /**
  * A request's failure in plain words. Never says "token" or "fetch".
  * @param {number|null} status  the HTTP status, or null when no answer came at all
@@ -33,6 +44,7 @@ export const cannotSend = state => state === 'no-key' || state === 'stale';
  */
 export function plainError(status, said) {
   if (status === 401) return 'This page’s key no longer works. Open the link Workbench printed in the terminal.';
+  if (status === 413) return TOO_LONG;
   if (status == null || status === 0) return 'Workbench isn’t answering. Is it still running?';
   const s = typeof said === 'string' ? said.trim() : '';
   if (s && !/token|fetch/i.test(s)) return s;

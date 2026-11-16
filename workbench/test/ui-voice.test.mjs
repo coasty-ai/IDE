@@ -21,7 +21,8 @@ const el = () => { const attrs = {}; return { textContent: '', title: '', setAtt
 
 function talk() {
   const log = [], board = el(), git = el();
-  const v = setupVoice({ mic: el(), heard: [board, git], onListening: (on, words) => log.push(['listening', on, words]), onFinal: t => log.push(['final', t]), onNotice: t => log.push(['notice', t]) });
+  const v = setupVoice({ mic: el(), heard: [board, git], onListening: (on, words) => log.push(['listening', on, words]), onFinal: t => log.push(['final', t]),
+    onNotice: (t, ms) => log.push(ms ? ['notice', t, ms] : ['notice', t]), onlyFiller: t => /^(?:\s|um|uh|hmm|[.,!?])*$/i.test(t) });
   return { v, log, board, git };
 }
 
@@ -56,4 +57,26 @@ test('a session that heard nothing, or whose words were thrown away, ends with n
   t.v.cancel();
   assert.deepEqual(t.log.filter(x => x[0] !== 'notice'), [['listening', true, ''], ['listening', false, '']]);
   assert.equal(t.v.listening, false);
+});
+
+test('words heard that are only filler send nothing, and the page says, for a moment, that nothing was heard', () => {
+  for (const said of ['um', 'uh, um', 'hmm...']) {
+    const t = talk();
+    t.v.start({ hold: true });
+    FakeSR.last.hear(said);
+    t.v.stop();
+    assert.deepEqual(t.log.filter(x => x[0] !== 'notice' || x[1] === 'Nothing heard.'), [['listening', true, ''], ['listening', false, ''], ['notice', 'Nothing heard.', 2500]], said);
+  }
+  // the browser hearing no speech at all says the same
+  const t = talk();
+  t.v.start({ hold: true });
+  FakeSR.last.onerror({ error: 'no-speech' });
+  t.v.stop();
+  assert.deepEqual(t.log.filter(x => x[0] === 'notice' && x[1] !== 'Voice uses your browser’s speech service, which may send the audio to its provider.'), [['notice', 'Nothing heard.', 2500]]);
+  // anything more is said as it was heard, filler and all
+  const more = talk();
+  more.v.start({ hold: true });
+  FakeSR.last.hear('um stop everything');
+  more.v.stop();
+  assert.deepEqual(more.log.filter(x => x[0] === 'final'), [['final', 'um stop everything']]);
 });

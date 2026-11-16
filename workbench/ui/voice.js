@@ -3,9 +3,14 @@
 // cancel() throws away what was heard: used for Esc, and when the window loses focus while listening.
 // `heard` is where the words heard so far show: one element, or several (the board's input and the git screen's band).
 // onListening(on, words) is told when listening starts, and when it ends with the words it will send ('' when nothing
-// was heard or it was thrown away); onFinal(words) then gets them.
+// was heard or it was thrown away); onFinal(words) then gets them. Words that are only filler ("um", "uh": `onlyFiller`,
+// from /shared/filler.mjs, passed in so this module imports nothing) send nothing, as when the browser heard no speech:
+// onNotice('Nothing heard.', 2500) says so for a moment.
 
-export function setupVoice({ mic, heard, onListening, onFinal, onNotice }) {
+/** How long "Nothing heard." stays under the board, in ms: a moment. */
+const NOTHING_HEARD_MS = 2500;
+
+export function setupVoice({ mic, heard, onListening, onFinal, onNotice, onlyFiller = () => false }) {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
     mic.setAttribute('aria-disabled', 'true');
@@ -50,18 +55,21 @@ export function setupVoice({ mic, heard, onListening, onFinal, onNotice }) {
       show(heardText);
     };
     rec.onerror = e => {
+      if (e.error === 'no-speech') { onNotice('Nothing heard.', NOTHING_HEARD_MS); return; }
       const why = e.error === 'not-allowed' || e.error === 'service-not-allowed' ? 'The microphone is blocked. Allow it in the browser to talk.'
-        : e.error === 'no-speech' ? 'I did not hear anything.'
         : e.error === 'aborted' ? '' : 'Voice stopped: ' + e.error + '.';
       if (why) onNotice(why);
     };
     rec.onend = () => {
-      const text = discard ? '' : (finalText || heardText || '').trim();
+      const said = discard ? '' : (finalText || heardText || '').trim();
+      const filler = !!said && onlyFiller(said); // "um", "uh": nothing to send
+      const text = filler ? '' : said;
       rec = null;
       heardText = '';
       show('');
       setListening(false, text);
       if (text) onFinal(text);
+      else if (filler) onNotice('Nothing heard.', NOTHING_HEARD_MS);
     };
     try { rec.start(); } catch { rec = null; setListening(false); onNotice('Voice could not start.'); }
   }

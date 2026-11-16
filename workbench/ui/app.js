@@ -14,8 +14,10 @@ import { Board } from './board.js';
 import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
+import { setupSayBox } from './saybox.js';
 import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand, lidAnswer } from './prefs.js';
 import * as ANSWERS from '/shared/answers.mjs';   // "looks good" and "not now", as the engine reads them
+import { onlyFiller } from '/shared/filler.mjs'; // spoken "um" or "uh" alone sends nothing
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { balanceHeading } from './balance.js';
@@ -23,7 +25,7 @@ import { buttonRow } from './words.js';
 import { visibleControls } from './words.js'; // say(): what is said shows hidden characters as the lid does
 import { spentAmountWords } from './numbers.js';
 // D1: the git screen below the board, reached by the DRAM (gitscreen.js draws it; this file switches screens)
-import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitTick, gitHold, gitTake, gitRelease, gitListening, gitHome } from './gitscreen.js';
+import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitTick, gitHold, gitTake, gitRelease, gitListening, gitHome, gitPutBack } from './gitscreen.js';
 import { gitScreenWords } from './gitgraph.js';
 import { visibleText } from './diffview.js';
 import { clipToLines } from './layout.js';
@@ -194,7 +196,7 @@ function shownFocus() {
   letGo = false;
   if (!lidFocus || own || !engaged() || keyOf(want) === lidKey) return { f: want, also: false };
   const held = lidFocus;
-  // something else waits behind what is held: an agent that needs the person, or a launch question
+  // something else waits behind what is held: an agent that needs the person, or an engine card
   const also = x => !!(want.confirm || (want.agent && want.agent.id !== x && STATES.NEEDS_YOU.has(want.agent.state)));
   if (held.confirm) return S.confirm && S.confirm.id === held.confirm.id ? { f: { confirm: S.confirm }, also: also(null) } : { f: want, also: false };
   if (held.empty) return { f: want, also: false };
@@ -389,6 +391,8 @@ function renderNow(o = {}) {
   // with no room on the board; when it empties, its list closes and the keyboard there goes to the lid's sentence before
   // the tray is hidden
   if (!G.tray) trayEmptied();
+  // the input grows into the lid's spare height only, so it never covers the lid's words (saybox.js)
+  sayBox.room(G.lidPageH - needForLayout(v));
   const hoverRoot = board.card.rootId || null;
   const left = board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
   lastFirst = false;
@@ -621,7 +625,7 @@ async function actOn(b, o = {}) {
       // Merge (also "Merge anyway" and "Try again") and Throw it away never act by themselves: the engine answers with a
       // card in its own words, bound by id, and the person answers that. Its outcome then shows on this agent.
       busy(b);
-      // A card already on screen (a launch question in the lid while the git screen's detail is used, another agent's
+      // A card already on screen (a card in the lid while the git screen's detail is used, another agent's
       // card) is withdrawn first, as picking a chip does, so none waits unseen. If that does not go through, it stays,
       // nothing is asked, and this button can be tried again.
       const old = S.confirm;
@@ -686,6 +690,16 @@ el.core.addEventListener('pointerleave', () => { pointer.inCore = false; render(
 el.core.addEventListener('focusout', e => { if (!el.core.contains(e.relatedTarget)) render(); });
 
 // ---------------------------------------------------------------- typing and talking
+// The input is a box that grows with its text, never over the lid's words (renderNow gives it the lid's spare height),
+// then scrolls inside. Enter sends; Shift+Enter adds a line; pasted text keeps its lines.
+const sayBox = setupSayBox({ field: el.say, bar: el.bar, send: text => submit(text), lineHeight: () => Math.ceil(parseFloat(getComputedStyle(el.say).lineHeight) || 19) });
+/** Put text in the input (or empty it), as typing would leave it. */
+function setSay(text) {
+  el.say.value = text;
+  el.bar.classList.toggle('typed', !!text);
+  sayBox.fit();
+}
+
 function startReply(a, mode, askId, state) {
   // the reply keeps the agent, the ask, and the state it was opened in: a message is sent only while that still holds
   S.reply = { agentId: a.id, mode, askId: mode === 'answer' ? askId : null, state: state || a.state };
@@ -697,12 +711,14 @@ function startReply(a, mode, askId, state) {
   el.to.title = `${mode === 'answer' ? 'Your answer goes to' : 'This goes to'} ${visibleControls(a.name)}`;
   el.bar.classList.add('replying');
   el.say.setAttribute('aria-label', mode === 'answer' ? `Your answer to ${visibleControls(a.name)}` : `What to tell ${visibleControls(a.name)}`);
+  sayBox.fit(); // the chip takes room from the field: its lines wrap again
   el.say.focus();
 }
 function endReply() {
   S.reply = null;
   el.bar.classList.remove('replying');
   el.say.setAttribute('aria-label', 'Type what you want, or hold the space bar to talk');
+  sayBox.fit();
 }
 el.toCancel.addEventListener('click', () => { endReply(); el.say.focus(); render(); });
 
@@ -743,6 +759,21 @@ function lidButton(label, b) {
   return [...(page ? page.querySelectorAll('button[data-words]') : [])].find(x => x.dataset.agent === b.agentId && x.dataset.words.split(' ').includes(words)) || null;
 }
 
+/**
+ * "looks good" or "not now" that the engine took as a finished agent's own answer, with no button on its lid standing for
+ * them (`looked` in the reply to /api/command, on the board or the git screen): this finish is looked at, as its button
+ * would have marked it, and the centre lets go of it.
+ */
+function lookedAt(res) {
+  const a = typeof res?.looked === 'string' && ID_RE.test(res.looked) ? S.agents.get(res.looked) : null;
+  if (!a) return;
+  markReviewed(a);
+  answeredOnce();
+  if (S.focusId === a.id) S.focusId = null;
+  if (S.pinId === a.id) S.pinId = null;
+  moved();
+}
+
 async function submit(text) {
   text = String(text || '').trim();
   if (!text) return;
@@ -750,8 +781,7 @@ async function submit(text) {
   if (refuseKey(text, true)) return;
   const b = bound || bindingNow();
   bound = null;
-  el.say.value = '';
-  el.bar.classList.remove('typed');
+  setSay('');
   // D1: "git", "show git", "open git", "source control", "show the graph" open the git screen (never sent to the engine)
   if (!S.reply && gitScreenWords(text) === 'open') { openGit({ opener: el.dram }); return; }
   // the page's own words: the look, the detail, and stepping through the queue. They never reach the engine.
@@ -777,6 +807,7 @@ async function submit(text) {
     else if (!press.disabled) await actOn(press, { answer: said });
     return;
   }
+  const replying = S.reply; // a reply box that was open, so a failed send can open it again with the words
   try {
     if (S.reply) {
       const r = S.reply;
@@ -784,11 +815,11 @@ async function submit(text) {
       const a = S.agents.get(r.agentId);
       let res;
       if (r.mode === 'answer' && r.askId) {
-        if (!a || !a.ask || a.ask.id !== r.askId) { el.say.value = text; say(`${a ? a.name : 'That agent'} asked something new. Have a look first.`); render(); return; }
+        if (!a || !a.ask || a.ask.id !== r.askId) { setSay(text); say(`${a ? a.name : 'That agent'} asked something new. Have a look first.`); render(); return; }
         res = await api.answer(r.agentId, r.askId, text);
       } else {
         // a message carries no ask id, so it goes only while the agent is as it was when the reply opened
-        if (!a || a.state !== r.state) { el.say.value = text; el.bar.classList.add('typed'); say('That changed. Have another look.', 5000); render(); return; }
+        if (!a || a.state !== r.state) { setSay(text); say('That changed. Have another look.', 5000); render(); return; }
         res = await api.say(r.agentId, text);
       }
       answeredOnce();
@@ -802,11 +833,13 @@ async function submit(text) {
       // the agent it was drawn for. The setup card stays where it is (S.setup, from the stream) until it is answered.
       if (res.confirm && res.confirm.kind !== 'setup') S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
       else if (!res.confirm && shown && S.confirm === shown) S.confirm = null;
+      lookedAt(res);
       lookAt(res.focusId);
-      // the reply to the person's own words: a new launch question, or the agent it names, shows at once
+      // the reply to the person's own words: a new card, or the agent it names, shows at once (work that started names
+      // none: the centre stays as it is, and the notice says what started)
       if (res.confirm || res.focusId || shown) moved();
       if (b.askId && !res.confirm) answeredOnce();
-      // a new launch question in the core already says it; anything else is said under the core
+      // a new card in the core already says it; anything else is said under the core
       say(res.confirm && (!shown || res.confirm.id !== shown.id) ? '' : (res.reply || ''), lasting(res));
       // "what did search cleanup change": the git screen opens on that agent's branch and its diff
       // also with a merge or throw-away card still shown: the person looks at the work first, then answers the card
@@ -814,9 +847,19 @@ async function submit(text) {
       // "connect", "add a key", "sign in", or work asked for with no agent ready: Agents & keys opens
       if (res.openConnect === true) showConnect(null, res.reply);
     }
-  } catch (err) { say(err.message); }
+  } catch (err) {
+    // nothing was sent (too long: the page checked first), or it failed: the words go back in the box, unless the person
+    // has typed something new there meanwhile, and a reply box that was open opens again with them
+    if (!el.say.value) {
+      const a = replying && S.agents.get(replying.agentId);
+      if (a && !S.reply) startReply(a, replying.mode, replying.askId, replying.state);
+      setSay(text);
+    }
+    say(err.message);
+  }
   render();
 }
+// A textarea sends no form by itself: Enter sends through the box (saybox.js). This catches any other way a form is sent.
 el.bar.addEventListener('submit', e => { e.preventDefault(); submit(el.say.value); });
 
 // Voice is bound to what the screen the microphone turned on over showed (the lid, or the git screen's detail), and what
@@ -826,7 +869,8 @@ let voiceOver = null;   // 'board' | 'git' while listening, and until what was h
 const voice = setupVoice({
   mic: el.mic, heard: [el.heard, $('gitHeard')],
   onFinal: t => { const over = voiceOver; voiceOver = null; if (over === 'git') gitCommand(t, gitTake()); else submit(t); },
-  onNotice: t => say(t),
+  onNotice: (t, ms) => say(t, ms),
+  onlyFiller,
   onListening: (on, words) => {
     el.bar.classList.toggle('listening', on);
     gitListening(on);
@@ -851,7 +895,7 @@ function cardShown(id) {
 
 /**
  * The setup card a snapshot carries (launches wait on it), with only the fields the core draws; null when there is none.
- * It is not dropped like a launch question (Esc, picking a chip): it stays until it is answered.
+ * It is not dropped like another card (Esc, picking a chip): it stays until it is answered.
  */
 function setupCardOf(c) {
   if (!c || typeof c !== 'object' || c.kind !== 'setup' || typeof c.id !== 'string' || !ID_RE.test(c.id) || typeof c.sentence !== 'string' || typeof c.command !== 'string') return null;
@@ -859,12 +903,12 @@ function setupCardOf(c) {
     yes: typeof c.yes === 'string' && c.yes ? c.yes : 'Run it', no: typeof c.no === 'string' && c.no ? c.no : 'Not now' };
 }
 
-// A launch question the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot start it.
+// A card the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot answer it.
 function dropConfirm() {
   const c = S.confirm;
   if (!c) return;
   S.confirm = null;
-  // if the withdrawal does not go through, the card stays: no launch question waits unseen
+  // if the withdrawal does not go through, the card stays: no card waits unseen
   api.confirm(c.id, false).then(r => say(r.reply || ''), err => { if (!S.confirm) S.confirm = c; say(err.message); render(); });
 }
 
@@ -1125,7 +1169,7 @@ function modeIs(mode) {
 
 function onSnapshot(snap) {
   // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board.
-  // meta.permissions: whether full permissions are on, for the band's button and the launch card.
+  // meta.permissions: whether full permissions are on, for the band's button (no card speaks of them).
   const was = S.meta.permissions;
   S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap),
     permissions: was };
@@ -1208,7 +1252,7 @@ setInterval(() => {
 function refuseKey(text, board) {
   const said = keyRefusal(text, secretShape.looksLikeSecret);
   if (!said) return false;
-  if (board) { el.say.value = ''; el.bar.classList.remove('typed'); bound = null; }
+  if (board) { el.say.value = ''; el.bar.classList.remove('typed'); sayBox.fit(); bound = null; }
   say(said);
   showConnect(null, said);
   return true;
@@ -1388,12 +1432,13 @@ const gitAct = b => actOn(b);
  * gitscreen.js): the card in the detail by its id, or the agent whose detail is open, or nothing. A card the reply brings
  * shows in that agent's detail only when the card itself names that agent (its agentId); any other card is shown where it
  * can be answered: in the lid, back on the board. A card that was on screen and that the words were not sent to is
- * still waiting in the engine: it is withdrawn, so none waits unseen.
+ * still waiting in the engine: it is withdrawn, so none waits unseen. Words that could not be sent (too long: the page
+ * checks first; Workbench not answering; a failed request) go back in the git screen's input, as the board's box does.
  */
 async function gitCommand(text, b = {}) {
   text = String(text || '').trim();
   if (!text) return;
-  // as on the board: a key is never sent (the git screen's input is already empty)
+  // as on the board: a key is never sent, and never put back (the git screen's input is already empty)
   if (refuseKey(text, false)) return;
   touch();
   const words = gitScreenWords(text);
@@ -1402,7 +1447,7 @@ async function gitCommand(text, b = {}) {
   const pc = pageCommand(text);
   if (pc && (pc.kind === 'theme' || pc.kind === 'detail')) { applyPref(pc.kind, pc[pc.kind]); return; }
   if (pc && pc.kind === 'next') { say('“Next” steps through what needs you, on the board. Say “back” to go there.', 6000); return; }
-  if (cannotSend(linkNow())) { say('Workbench is not answering, so that was not sent.'); return; }
+  if (cannotSend(linkNow())) { gitPutBack(text); say('Workbench is not answering, so that was not sent.'); return; }
   // as submit() does: a card is answered only by the id it had when the person began
   const shown = S.confirm && b.confirmId && b.confirmId === S.confirm.id ? S.confirm : null;
   const focusId = shown ? null : (b.agentId || null);
@@ -1417,6 +1462,7 @@ async function gitCommand(text, b = {}) {
       S.confirm = same ? { ...res.confirm, agentId: shown.agentId } : mine ? { ...res.confirm, agentId: focusId } : res.confirm;
       if (!mine) closeGit({ toLid: true });
     } else if (shown && S.confirm === shown) S.confirm = null;
+    lookedAt(res);
     lookAt(res.focusId);
     // as the core's input does: a new card says itself; anything else is said
     say(res.confirm && !same ? '' : (res.reply || ''));
@@ -1424,7 +1470,11 @@ async function gitCommand(text, b = {}) {
     moved();
     // Agents & keys opens over the git screen too
     if (res.openConnect === true) showConnect(null, res.reply);
-  } catch (err) { say(err.message); }
+  } catch (err) {
+    // nothing was sent, or it failed: the words go back in the input, unless the person has typed something new there
+    gitPutBack(text);
+    say(err.message);
+  }
   render();
 }
 
@@ -1480,7 +1530,7 @@ setupFiles({
 });
 
 RM.addEventListener('change', () => { if (RM.matches) board.settle(); renderNow({ snap: true }); });
-addEventListener('resize', () => { closePop(); closeTray(); renderNow({ snap: true }); });
+addEventListener('resize', () => { closePop(); closeTray(); renderNow({ snap: true }); sayBox.fit(); });
 document.fonts?.addEventListener?.('loadingdone', () => { widths.clear(); if (fontsReady) renderNow({ snap: true }); });
 
 // Boot: wait for the four weights of JetBrains Mono (the board is measured in it), then draw.

@@ -339,7 +339,7 @@ test('values in copied env files are hidden in what the agent prints, on the pag
   const w = await t.engine.startAgent({ task: 'fix the production build' });
   assert.notEqual(w.state, 'failed');
   t.deps.commands.intent = { kind: 'task', task: 'fix the production build' };
-  assert.ok((await t.engine.command('fix the production build')).confirm, 'a launch card, not "that looks like a key"');
+  assert.equal((await t.engine.command('fix the production build')).reply, 'Started Claude on “fix the production build”.', 'typed, they start at once, never "that looks like a key"');
   await t.engine.shutdown();
 });
 
@@ -351,13 +351,12 @@ test('a copied value never hides the person’s own words: the task, the name, t
   t.git.env = { values: ['production', url], files: 1 };
   // Launched before the value was known (its own copy brings it): its merge comes after.
   const a = await doneAgent(t, { task: 'fix the production build' }, `I fixed the build, which reads ${url} now.`);
-  // Launched once the value is known, through the launch card.
+  // Started once the value is known, by typing it: at once, with no card.
   t.deps.commands.intent = { kind: 'task', task: 'deploy to production' };
   const out = await t.engine.command('deploy to production');
-  assert.equal(out.confirm.sentence, 'Start Claude Code on “deploy to production”?');
-  const yes = await t.engine.confirm(out.confirm.id, true);
-  assert.equal(yes.reply, 'Started Deploy to production.');
-  const b = t.store.get(yes.agentIds[0]);
+  assert.equal(out.confirm, undefined);
+  assert.equal(out.reply, 'Started Claude on “deploy to production”.', 'the reply quotes the prompt as it was typed');
+  const b = t.store.get(out.agentIds[0]);
   assert.deepEqual([b.name, b.task], ['Deploy to production', 'deploy to production'], 'as the board and the history keep it');
   await until(() => t.claude.runners.length === 2 && t.claude.runners[1].started);
   assert.deepEqual(t.claude.runners[1].opts.task, 'deploy to production', 'the agent gets its task as it was typed');
@@ -431,21 +430,25 @@ test('the setup card is asked once for a burst of launches, and its answer goes 
   const t = copies({ setup: 'uv sync' });
   let told = 0;
   t.engine.on('setup', () => { told += 1; });
-  // three launches from one launch card: the reply comes while they wait, and one card shows
+  // three agents from one start card (more than one from one sentence asks first): the reply to its yes comes while they
+  // wait, and one card shows
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the cart' }, { task: 'fix the tax' }, { task: 'fix the docs' }] };
   const out = await t.engine.command('start three agents');
+  assert.equal(out.confirm.kind, 'start');
   const yes = await t.engine.confirm(out.confirm.id, true);
-  assert.equal(yes.reply, 'Started Fix cart, Fix tax and Fix docs.', 'the launch card’s answer does not wait for the setup card');
+  assert.equal(yes.reply, 'Started Claude on “fix the cart”, Claude on “fix the tax” and Claude on “fix the docs”.', 'the start card’s answer does not wait for the setup card');
   const card = await setupCard(t);
-  // one more launched meanwhile joins the same card
-  const late = t.engine.startAgent({ task: 'Fix the login' });
+  // one more, typed while the card waits, starts at once and joins the same card, which stays
+  t.deps.commands.intent = { kind: 'task', task: 'fix the login' };
+  const typed = await t.engine.command('fix the login', { confirmId: card.id });
+  assert.equal(typed.reply, 'Started Claude on “fix the login”.');
+  assert.equal(typed.confirm, undefined, 'the setup card is not in the reply: the page keeps it from the snapshot');
   await until(() => t.store.list().length === 4 && t.calls.fillWorkspace.length === 4);
   await new Promise(r => setTimeout(r, 20));
   assert.equal(t.engine.snapshot().setup.id, card.id);
   assert.equal(told, 1, 'one card, never one per agent');
   assert.equal(t.claude.runners.length, 0);
   assert.deepEqual(await t.engine.confirm(card.id, false), { reply: 'OK. The agents start without it, and Workbench asks again next time.' });
-  await late;
   await until(() => t.claude.runners.length === 4 && t.claude.runners.every(r => r.started));
   assert.equal(t.calls.runSetup.length, 0);
   assert.equal(told, 2);
@@ -481,7 +484,7 @@ test('the setup card: "run it" and "not now" answer it; other words leave it wai
   const card2 = await setupCard(t);
   t.deps.commands.intent = { kind: 'unknown', text: 'hmm' };
   const miss = await t.engine.command('hmm', { confirmId: card2.id });
-  assert.equal(miss.reply, 'I did not catch that. Say “run it” or “not now”.');
+  assert.equal(miss.reply, 'Say “run it” or “not now”.');
   assert.equal(miss.confirm.id, card2.id);
   assert.equal(miss.confirm.command, 'make setup');
   // ten minutes (here one) without an answer: the agent starts without it
@@ -579,7 +582,7 @@ test('an agent stopped while its copy is made ready never starts; shutdown answe
   assert.ok(Array.isArray(kept.kept));
 });
 
-test('a launch card is answered as soon as its agents are on the board; one that then cannot start says so', async () => {
+test('a prompt is answered as soon as its agent is on the board, while its copy is made; one that then cannot start says so', async () => {
   const t = copies();
   const g = gate();
   t.git.fillGate = g;
@@ -587,12 +590,13 @@ test('a launch card is answered as soon as its agents are on the board; one that
   t.engine.adapters.claude = t.claude;
   t.deps.commands.intent = { kind: 'task', task: 'fix the login redirect' };
   const out = await t.engine.command('fix the login redirect');
-  const yes = await t.engine.confirm(out.confirm.id, true);
-  assert.equal(yes.reply, 'Started Fix login redirect.');
+  assert.equal(out.confirm, undefined, 'no card: work starts at once');
+  assert.equal(out.reply, 'Started Claude on “fix the login redirect”.');
+  assert.equal(t.notices.filter(n => /^Started /.test(n)).length, 1, 'said once');
   assert.equal(t.calls.fillWorkspace.length, 1);
   assert.equal(t.claude.runners.length, 0, 'still copying');
   g.open();
-  await until(() => t.store.get(yes.agentIds[0]).state === 'failed');
+  await until(() => t.store.get(out.agentIds[0]).state === 'failed');
   await until(() => t.notices.some(n => n.startsWith('Fix login redirect could not start. It could not start:')));
   await t.engine.shutdown();
 });
@@ -1923,16 +1927,16 @@ test('say: to a helper goes through its root', async () => {
 
 // ------------------------------------------------------------------ commands and confirms
 
-test('command: a start intent asks to confirm first; confirm(go) launches, confirm(no) cancels', async () => {
+test('command: a start of one agent starts it at once: no launch card, and a quiet notice of what started; several from one sentence ask first', async () => {
   const t = live();
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the flaky checkout test', harness: 'claude', machine: null }] };
   const out = await t.engine.command('start an agent to fix the flaky checkout test', { focusId: null });
-  assert.equal(out.reply, 'Start Claude Code on “fix the flaky checkout test”?');
-  assert.ok(out.confirm && /^[0-9a-f]{12}$/.test(out.confirm.id));
-  assert.equal(out.confirm.sentence, out.reply);
-  assert.match(out.confirm.detail, /\$2\.00/);
-  assert.match(out.confirm.detail, /2 uncommitted changes are not included/);
-  assert.equal(t.store.list().length, 0, 'nothing starts before the confirm');
+  assert.deepEqual(Object.keys(out).sort(), ['agentIds', 'reply'], 'no card, and no agent put in the centre');
+  assert.equal(out.reply, 'Started Claude on “fix the flaky checkout test”.');
+  assert.equal(out.agentIds.length, 1);
+  assert.equal(t.store.get(out.agentIds[0]).task, 'fix the flaky checkout test');
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['fix the flaky checkout test']);
+  assert.ok(t.notices.includes(out.reply), 'said under the board');
   const ctx = t.calls.parse[0].ctx;
   // Pinned on purpose: `repo` was added with source control, so "merge it into main" is read against the branch.
   assert.deepEqual(Object.keys(ctx).sort(), ['agents', 'focusId', 'harnesses', 'machines', 'pendingConfirm', 'repo']);
@@ -1940,92 +1944,158 @@ test('command: a start intent asks to confirm first; confirm(go) launches, confi
   // identity: null, as start() has not read it yet (Workbench cannot tell); true or false once it has.
   assert.deepEqual(ctx.repo, { name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2, identity: null });
 
-  const go = await t.engine.confirm(out.confirm.id, true);
-  assert.equal(go.reply, 'Started Fix flaky checkout test.');
-  assert.equal(go.agentIds.length, 1);
-  assert.equal(t.store.get(go.agentIds[0]).task, 'fix the flaky checkout test');
-  const twice = await t.engine.confirm(out.confirm.id, true);
-  assert.match(twice.reply, /no longer waiting/);
-
+  // a task that names no agent goes to the default one
   t.deps.commands.intent = { kind: 'task', task: 'fix the login redirect' };
-  const out2 = await t.engine.command('fix the login redirect');
-  assert.ok(out2.confirm);
-  const no = await t.engine.confirm(out2.confirm.id, false);
-  assert.equal(no.reply, 'OK, I won’t start it.');
-  assert.equal(t.store.list().length, 1);
+  assert.equal((await t.engine.command('fix the login redirect')).reply, 'Started Claude on “fix the login redirect”.');
+  assert.deepEqual([...t.engine.confirms.values()], [], 'no card was made');
+  // more than one agent from one sentence multiplies what is spent: a card asks first, and its yes starts them all, each
+  // named in the notice
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'write tests for the parser', harness: 'codex' }, { task: 'fix the parser', harness: 'claude' }] };
+  const two = await t.engine.command('have codex write tests for the parser and claude fix it');
+  assert.equal(two.confirm.kind, 'start');
+  assert.equal(two.confirm.sentence, 'Start Codex on “write tests for the parser” and Claude on “fix the parser”?');
+  assert.equal(two.reply, two.confirm.sentence);
+  assert.equal(t.codex.runners.length, 0, 'nothing started yet');
+  const yes = await t.engine.confirm(two.confirm.id, true);
+  assert.equal(yes.reply, 'Started Codex on “write tests for the parser” and Claude on “fix the parser”.');
+  assert.equal(yes.agentIds.length, 2);
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), ['write tests for the parser']);
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'tidy the readme', harness: 'claude' }, { task: 'tidy the readme', harness: 'claude' }] };
+  const same = await t.engine.command('start two agents to tidy the readme');
+  assert.equal(same.confirm.sentence, 'Start two Claude agents on “tidy the readme”?');
+  assert.equal((await t.engine.confirm(same.confirm.id, true)).reply, 'Started two Claude agents on “tidy the readme”.');
+  assert.equal(t.store.list().filter(v => !v.parentId).length, 6);
   await t.engine.shutdown();
 });
 
-test('command: "yes" confirms the pending launch through the commands module', async () => {
+test('starting more than one agent from one sentence asks first, with a card; its yes starts them, its no starts nothing', async () => {
   const t = live();
-  t.deps.commands.intent = (text, ctx) => (text !== 'yes'
-    ? { kind: 'start', tasks: [{ task: 'write tests for the parser', harness: 'codex' }, { task: 'fix the parser', harness: 'claude' }] }
-    : ctx.pendingConfirm ? { kind: 'confirm', go: true } : { kind: 'unknown', text });
-  const out = await t.engine.command('have codex write tests for the parser and claude fix it');
-  assert.match(out.reply, /^Start 2 agents: Codex on “write tests for the parser” and Claude Code on “fix the parser”\?$/);
-  // Without the card's id, nothing is shown, so nothing waits for a yes: the newest confirm is never picked.
-  assert.equal((await t.engine.command('yes')).reply, 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.');
-  assert.equal(t.calls.parse[1].ctx.pendingConfirm, null);
-  const yes = await t.engine.command('yes', { confirmId: out.confirm.id }); // the page sends the card it shows
-  assert.equal(t.calls.parse[2].ctx.pendingConfirm.id, out.confirm.id);
-  assert.match(yes.reply, /^Started Write tests for parser and Fix parser\.$/);
-  assert.equal(t.codex.runners.length, 1);
-  assert.equal(t.claude.runners.length, 1);
-  assert.equal(yes.focusId, yes.agentIds[0], 'the first agent it started goes in the centre, not whatever asks next');
+  t.engine.deps.commands = commands;
+  const card = await t.engine.command('start three agents on the login page');
+  assert.deepEqual({ ...card.confirm, id: null }, { id: null, kind: 'start', sentence: 'Start three Claude agents on “the login page”?',
+    detail: 'Each one works in its own folder and spends on its own. A Claude agent can spend up to $2.00.', yes: 'Start them', no: 'Cancel' });
+  assert.equal(t.claude.runners.length, 0, 'nothing started');
+  assert.ok(!t.notices.includes(card.reply), 'a card is not announced under the board');
+  // its no starts nothing
+  assert.equal((await t.engine.command('no, just one', { confirmId: card.confirm.id })).reply, 'OK, I won’t start them.');
+  assert.equal(t.claude.runners.length, 0);
+  // a card that waits keeps a prompt's card rule: one agent's work starts at once, and the card stays
+  const again = await t.engine.command('have two agents fix the flaky test');
+  assert.equal(again.confirm.sentence, 'Start two Claude agents on “fix the flaky test”?');
+  const one = await t.engine.command('fix the docs', { confirmId: again.confirm.id });
+  assert.deepEqual(one.confirm, again.confirm);
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['fix the docs']);
+  // its own words start them: "start them", "do it", "yes, all of them"
+  const yes = await t.engine.command('start them', { confirmId: again.confirm.id });
+  assert.equal(yes.reply, 'Started two Claude agents on “fix the flaky test”.');
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['fix the docs', 'fix the flaky test', 'fix the flaky test']);
+  // and a hint names its verb
+  const third = await t.engine.command('start claude and codex on the parser');
+  assert.equal(third.confirm.sentence, 'Start Claude and Codex on “the parser”?');
+  assert.deepEqual(await t.engine.command('yes start it is that right', { confirmId: third.confirm.id }), { reply: 'Say “do it” to start them, or “cancel”.', confirm: third.confirm });
+  // a start card without its tasks starts nothing
+  t.engine.confirms.set('0123456789ab', { id: '0123456789ab', kind: 'start', sentence: 'Start?', detail: null, createdAt: Date.now() });
+  assert.deepEqual(await t.engine.confirm('0123456789ab', true), { reply: 'That request is no longer waiting. Ask again if you still want it.' });
+  assert.equal(t.claude.runners.length, 3);
   await t.engine.shutdown();
 });
 
-test('command: with no confirm on screen, "yes" answers the held request on screen, not a hidden launch question', async () => {
+test('starting several agents with none ready, or naming one that cannot run, says so with no card, as a start of one does', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  t.engine.harnessInfo.codex = { ok: false, reason: 'Codex was not found on this computer.' };
+  const out = await t.engine.command('start claude and codex on the parser');
+  assert.equal(out.confirm, undefined);
+  assert.match(out.reply, /^Codex is not available on this computer\./);
+  assert.equal(t.claude.runners.length + t.codex.runners.length, 0);
+  await t.engine.shutdown();
+});
+
+test('command: a prompt starts at once whether full permissions are on or off, and the notice adds nothing about them', async () => {
+  for (const permissions of ['ask', 'full']) {
+    const t = live({ prefs: prefsStore({ permissions }) });
+    t.engine.deps.commands = commands;
+    const out = await t.engine.command('fix the login redirect');
+    assert.equal(out.confirm, undefined, permissions);
+    assert.equal(out.reply, 'Started Claude on “fix the login redirect”.', permissions);
+    assert.equal(t.claude.runners.length, 1, permissions);
+    await t.engine.shutdown();
+  }
+});
+
+test('command: a prompt while a card is on screen starts its agent, and the card stays where it is, still answered by its own words', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const card = await t.engine.command('stop the redirect one');
+  assert.equal(card.confirm.kind, 'stop');
+  const before = t.notices.length;
+  const out = await t.engine.command('fix the docs', { confirmId: card.confirm.id });
+  assert.equal(out.reply, 'Started Claude on “fix the docs”.');
+  assert.deepEqual(out.confirm, card.confirm, 'the card stays in the centre');
+  assert.deepEqual(t.notices.slice(before), [out.reply], 'what started is said under the board, though the card is in the centre');
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['Fix the login redirect', 'fix the docs']);
+  const yes = await t.engine.command('yes', { confirmId: card.confirm.id });
+  assert.equal(yes.reply, 'Stopped Fix login redirect.');
+  assert.equal(t.store.get(id).state, 'stopped');
+  await t.engine.shutdown();
+});
+
+test('command: with no confirm on screen, "yes" answers the held request on screen, not a card the page let go of', async () => {
   const t = live();
   t.engine.deps.commands = commands; // the real parser: a confirm in the context takes "yes" before a permission does
   const { id } = await started(t);
   const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } });
   await until(() => t.store.get(id).ask);
-  const proposed = await t.engine.command('start an agent to fix the login redirect');
-  assert.ok(proposed.confirm);
+  const proposed = await t.engine.command('stop the redirect one');
+  assert.equal(proposed.confirm.kind, 'stop');
   // The page dropped the card (another command, a pick, a reload, another tab): it sends no confirmId.
   const yes = await t.engine.command('yes', { focusId: id, askId: t.store.get(id).ask.id });
   assert.equal(yes.reply, 'OK, Fix login redirect can go ahead.');
   assert.equal((await pending).hookSpecificOutput.permissionDecision, 'allow');
-  assert.equal(t.claude.runners.length, 1, 'the hidden launch question started nothing');
+  assert.equal(t.store.get(id).state, 'working', 'the hidden stop question stopped nothing');
   await t.engine.shutdown();
 });
 
-test('command: with no confirm on screen, "stop" stops the focused agent, not a hidden launch question', async () => {
+test('command: with no confirm on screen, "stop" stops the focused agent, not a card the page let go of', async () => {
   const t = live();
   t.engine.deps.commands = commands;
   const { id } = await started(t);
-  await t.engine.command('start an agent to update the docs');
+  const other = await started(t, { task: 'Update the docs' });
+  await t.engine.command('stop the docs one');
   const out = await t.engine.command('stop', { focusId: id });
   assert.equal(out.reply, 'Stopped Fix login redirect.');
   assert.equal(t.store.get(id).state, 'stopped');
+  assert.notEqual(t.store.get(other.id).state, 'stopped');
   await t.engine.shutdown();
 });
 
 test('command: "do it" and "cancel" answer the confirm the page shows; any other command withdraws it', async () => {
   const t = live();
   t.engine.deps.commands = commands;
-  const a = await t.engine.command('start an agent to fix the login redirect');
-  const b = await t.engine.command('start an agent to update the docs', { confirmId: a.confirm.id });
-  assert.equal((await t.engine.confirm(a.confirm.id, true)).reply, 'That request is no longer waiting. Ask again if you still want it.', 'a new proposal replaces the one on screen');
+  const { id } = await started(t);
+  const docs = await started(t, { task: 'Update the docs' });
+  const a = await t.engine.command('stop the redirect one');
+  const b = await t.engine.command('stop the docs one', { confirmId: a.confirm.id });
+  assert.equal((await t.engine.confirm(a.confirm.id, true)).reply, 'That request is no longer waiting. Ask again if you still want it.', 'a new card replaces the one on screen');
   const go = await t.engine.command('do it', { confirmId: b.confirm.id });
-  assert.match(go.reply, /^Started /);
-  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['update the docs']);
+  assert.equal(go.reply, 'Stopped Update docs.');
+  assert.equal(t.store.get(docs.id).state, 'stopped');
+  assert.notEqual(t.store.get(id).state, 'stopped');
 
-  const c = await t.engine.command('start an agent to tidy the readme');
-  assert.equal((await t.engine.command('cancel', { confirmId: c.confirm.id })).reply, 'OK, I won’t start it.');
+  const c = await t.engine.command('stop the redirect one');
+  assert.equal((await t.engine.command('cancel', { confirmId: c.confirm.id })).reply, 'OK, I won’t stop it.');
 
-  const d = await t.engine.command('start an agent to tidy the readme');
+  const d = await t.engine.command('stop the redirect one');
   const before = t.notices.length;
   const status = await t.engine.command('what needs me', { confirmId: d.confirm.id });
   assert.equal(status.confirm, undefined);
   assert.deepEqual(t.notices.slice(before), [status.reply], 'withdrawing says nothing over the answer');
   assert.match((await t.engine.confirm(d.confirm.id, true)).reply, /no longer waiting/, 'the page dropped the card, so the engine did too');
-  assert.equal(t.claude.runners.length, 1);
-  // An id that names nothing (or not an id at all) answers plainly, and starts nothing.
+  assert.notEqual(t.store.get(id).state, 'stopped');
+  // An id that names nothing (or not an id at all) answers plainly, and does nothing.
   assert.equal((await t.engine.command('yes', { confirmId: 'feedfacecafe' })).reply, 'That request is no longer waiting. Ask again if you still want it.');
-  assert.equal((await t.engine.command('blorp', { confirmId: 'feedfacecafe' })).reply, 'That request is no longer waiting. Ask again if you still want it.');
-  assert.equal(t.claude.runners.length, 1);
+  assert.notEqual(t.store.get(id).state, 'stopped');
   await t.engine.shutdown();
 });
 
@@ -2033,47 +2103,55 @@ test('command: with a card on screen no ask was, so words that are no yes or no 
   const t = live();
   t.engine.deps.commands = commands;
   const { id } = await started(t);
+  await started(t, { task: 'Update the docs' });
   const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } });
   await until(() => t.store.get(id).ask);
   const askId = t.store.get(id).ask.id;
-  const card = await t.engine.command('start an agent to update the docs');
-  // A page that sends both: the card wins, the ask id is not used, and the request keeps waiting.
+  const card = await t.engine.command('stop the docs one');
+  // A page that sends both: the card wins, the ask id is not used, and the request keeps waiting. A permission's own
+  // words are no answer to the card, and no work either: the card stays, and says how to answer it.
   const r = await t.engine.command('allow it', { focusId: id, confirmId: card.confirm.id, askId });
-  assert.deepEqual(r, { reply: 'Have a look at what Fix login redirect is asking first.', focusId: id });
+  assert.deepEqual(r, { reply: 'Say “do it” to stop it, or “cancel”.', confirm: card.confirm });
   assert.equal(await settled(pending), false);
+  assert.equal(t.claude.runners.length, 2, 'nothing started');
+  // Another command withdraws it.
+  await t.engine.command('what needs me', { focusId: id, confirmId: card.confirm.id, askId });
   assert.match((await t.engine.confirm(card.confirm.id, true)).reply, /no longer waiting/, 'the card was withdrawn by the other command');
   await t.engine.shutdown();
 });
 
-test('command: words not understood keep the confirm on screen, so "yes" again still answers it', async () => {
+test('command: words that are not enough for the card keep it on screen, so "yes" again still answers it', async () => {
   const t = live();
   t.engine.deps.commands = commands;
   const { id } = await started(t);
+  const docs = await started(t, { task: 'Update the docs' });
   const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } });
   await until(() => t.store.get(id).ask);
-  const p = await t.engine.command('start an agent to update the docs');
+  const p = await t.engine.command('stop the docs one');
   const before = t.notices.length;
-  const miss = await t.engine.command('yes start the agent', { confirmId: p.confirm.id });
-  assert.equal(miss.reply, 'I did not catch that. Say “do it” to start it, or “cancel”.');
+  const miss = await t.engine.command('yes start it', { confirmId: p.confirm.id });
+  assert.equal(miss.reply, 'Say “do it” to stop it, or “cancel”.');
   assert.deepEqual(miss.confirm, p.confirm, 'the same card stays in the centre');
   assert.equal(t.notices.length, before, 'a kept card is not announced');
   const yes = await t.engine.command('yes', { confirmId: miss.confirm.id });
-  assert.match(yes.reply, /^Started /);
-  assert.equal(await settled(pending), false, 'the held request was not answered by a "yes" meant for the launch');
+  assert.equal(yes.reply, 'Stopped Update docs.');
+  assert.equal(t.store.get(docs.id).state, 'stopped');
+  assert.equal(await settled(pending), false, 'the held request was not answered by a "yes" meant for the card');
   assert.equal(t.store.get(id).state, 'needs_ok');
   await t.engine.shutdown();
 });
 
-test('command: "yes" to a confirm that has run out says so and starts nothing', async () => {
+test('command: "yes" to a confirm that has run out says so and does nothing', async () => {
   let now = 1_700_000_000_000;
   const t = live({ options: { now: () => now } });
   t.engine.deps.commands = commands;
-  const p = await t.engine.command('start an agent to fix the login redirect');
+  const { id } = await started(t);
+  const p = await t.engine.command('stop the redirect one');
   now += 10 * 60_000 + 1;
   const yes = await t.engine.command('yes', { confirmId: p.confirm.id });
   assert.equal(yes.reply, 'That request is no longer waiting. Ask again if you still want it.');
   assert.equal(yes.confirm, undefined);
-  assert.equal(t.claude.runners.length, 0);
+  assert.notEqual(t.store.get(id).state, 'stopped');
   await t.engine.shutdown();
 });
 
@@ -2112,9 +2190,10 @@ test('command: allow, stop, status, spend and unknown give plain replies', async
   assert.equal((await t.engine.command('stop everything')).reply, 'Stopped Fix login redirect.');
   assert.equal((await t.engine.command('stop everything')).reply, 'Nothing is running.');
 
+  // Words no parser read are a prompt: an agent starts on them, and the notice says so.
   t.deps.commands.intent = null;
   const unknown = await t.engine.command('blorp');
-  assert.match(unknown.reply, /I did not catch that/);
+  assert.equal(unknown.reply, 'Started Claude on “blorp”.');
   assert.ok(t.notices.includes(unknown.reply));
   await t.engine.shutdown();
 });
@@ -2165,9 +2244,12 @@ test('demo: cloud launches each get their own machine, waking one if needed', as
     { task: 'fix the checkout bug', harness: 'codex', machine: 'cloud' },
     { task: 'write the release notes', harness: 'claude', machine: 'cloud' },
   ] };
-  const out = await t.engine.command('start Claude and Codex on the checkout bug, each on its own cloud machine');
-  assert.match(out.confirm.detail, /Each one gets its own cloud machine/);
-  const go = await t.engine.confirm(out.confirm.id, true);
+  const card = await t.engine.command('start Claude and Codex on the checkout bug, each on its own cloud machine');
+  // more than one agent from one sentence asks first, in the demo too, where nothing is spent
+  assert.equal(card.confirm.sentence, 'Start a simulated Claude and a simulated Codex on “fix the checkout bug” and a simulated Claude on “write the release notes”?');
+  assert.equal(card.confirm.detail, 'This is the demo, so nothing is spent.');
+  const go = await t.engine.confirm(card.confirm.id, true);
+  assert.equal(go.reply, 'Started a simulated Claude and a simulated Codex on “fix the checkout bug” and a simulated Claude on “write the release notes”.');
   const machines = go.agentIds.map(id => t.store.get(id).machineId);
   assert.deepEqual(machines, ['cloud-1', 'cloud-3', 'cloud-2'], 'awake idle machines first, then a sleeping one');
   assert.equal(t.store.machines().find(m => m.id === 'cloud-2').awake, true, 'the sleeping machine was woken');
@@ -2216,7 +2298,7 @@ test('machines: a machines module that words its own replies is passed through, 
   await t.engine.shutdown();
 });
 
-test('command: deny with words passes them on; the commands module can word the confirm', async () => {
+test('command: deny with words passes them on; live mode starts work on the laptop, whatever machine the words named', async () => {
   const t = live();
   const { id } = await started(t);
   const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'psql prod' } });
@@ -2228,11 +2310,10 @@ test('command: deny with words passes them on; the commands module can word the 
   assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
   assert.equal(out.hookSpecificOutput.permissionDecisionReason, 'The person said no, and added: use the staging database');
 
-  t.deps.commands.describeIntent = (intent) => `Start Claude Code on “${intent.tasks[0].task}”${intent.tasks[0].machine ? ' on a cloud machine' : ''}?`;
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'tidy the README', harness: 'claude', machine: 'cloud' }] };
   const c = await t.engine.command('start an agent on a cloud machine to tidy the README');
-  assert.equal(c.confirm.sentence, 'Start Claude Code on “tidy the README”?', 'live mode has no cloud machines to promise');
-  assert.match(c.confirm.detail, /Cloud machines exist only in the demo/);
+  assert.equal(c.reply, 'Started Claude on “tidy the README”.', 'live mode has no cloud machines to promise');
+  assert.equal(t.store.get(c.agentIds[0]).machineId, 'laptop');
   await t.engine.shutdown();
 });
 
@@ -2370,7 +2451,7 @@ test('command (real parser): "is that right?" at a card settles nothing: the car
   assert.equal(stopCard.reply, 'Stop Fix flaky checkout test?');
   for (const q of ['is that the right one?', 'is that right', 'right?', 'yeah is that the right one', 'that the right one']) {
     const r = await t.engine.command(q, { confirmId: stopCard.confirm.id });
-    assert.equal(r.reply, 'I did not catch that. Say “do it” to stop it, or “cancel”.', q);
+    assert.equal(r.reply, 'Say “do it” to stop it, or “cancel”.', q);
     assert.deepEqual(r.confirm, stopCard.confirm, q);
   }
   assert.equal(runner.stopCalls, 0);
@@ -2379,35 +2460,27 @@ test('command (real parser): "is that right?" at a card settles nothing: the car
   assert.deepEqual((await t.engine.command('start it', { confirmId: stopCard.confirm.id })).confirm, stopCard.confirm);
   assert.equal(runner.stopCalls, 0);
   assert.equal((await t.engine.confirm(stopCard.confirm.id, false)).reply, 'OK, I won’t stop it.');
-  // A launch card, likewise: no agent starts.
-  const launch = await t.engine.command('start two agents to tidy the docs');
-  assert.ok(launch.confirm);
-  const runners = t.claude.runners.length;
-  for (const q of ['is that right?', 'is that okay', 'yes?']) {
-    assert.deepEqual((await t.engine.command(q, { confirmId: launch.confirm.id })).confirm, launch.confirm, q);
-  }
-  assert.equal(t.claude.runners.length, runners);
-  assert.match((await t.engine.command('yes', { confirmId: launch.confirm.id })).reply, /^Started /);
-  assert.equal(t.claude.runners.length, runners + 2);
+  assert.equal(t.claude.runners.length, 1, 'and nothing started');
   await t.engine.shutdown();
 });
 
 // A stop or a message acts at once only when the words name the agent (the real parser).
 
-test('command (real parser): a work request that starts with a stop verb is offered as work and stops nothing', async () => {
+test('command (real parser): a work request that starts with a stop verb is work for a new agent and stops nothing', async () => {
   const t = live();
   t.engine.deps.commands = commands;
   const { id, runner } = await started(t, { task: 'Fix the flaky checkout test' });
-  for (const words of ['stop the flaky test from timing out', 'end the flaky test run with a summary', 'kill the flaky test popup on mobile']) {
-    const out = await t.engine.command(words);
-    assert.equal(out.reply, `Start Claude on “${words}”?`);
-    assert.ok(out.confirm);
-    assert.equal((await t.engine.confirm(out.confirm.id, false)).reply, 'OK, I won’t start it.');
+  const words = ['stop the flaky test from timing out', 'end the flaky test run with a summary', 'kill the flaky test popup on mobile'];
+  for (const w of words) {
+    const out = await t.engine.command(w);
+    assert.equal(out.reply, `Started Claude on “${w}”.`);
+    assert.equal(out.confirm, undefined);
   }
+  assert.deepEqual(t.claude.runners.slice(1).map(r => r.opts.task), words);
   assert.equal(runner.stopCalls, 0);
   assert.notEqual(t.store.get(id).state, 'stopped');
   // Its name still stops it in one step, and so does "it" with the agent in the centre.
-  const stop = await t.engine.command('stop the flaky test immediately');
+  const stop = await t.engine.command('stop fix flaky checkout test immediately');
   assert.equal(stop.reply, 'Stopped Fix flaky checkout test.');
   assert.equal(stop.confirm, undefined);
   assert.equal(runner.stopCalls, 1);
@@ -2424,10 +2497,13 @@ test('command (real parser): a stop found by task words asks first; Cancel leave
   assert.equal(runner.stopCalls, 0);
   assert.equal((await t.engine.confirm(ask.confirm.id, false)).reply, 'OK, I won’t stop it.');
   assert.equal(runner.stopCalls, 0);
-  // Words not understood keep the card, with a hint for this kind of card.
+  // Words that are no answer are a prompt, and the card stays; a yes that is not enough says how to answer it.
   const again = await t.engine.command('stop the one timing out');
-  const miss = await t.engine.command('blorp', { confirmId: again.confirm.id });
-  assert.equal(miss.reply, 'I did not catch that. Say “do it” to stop it, or “cancel”.');
+  const other = await t.engine.command('blorp', { confirmId: again.confirm.id });
+  assert.equal(other.reply, 'Started Claude on “blorp”.');
+  assert.deepEqual(other.confirm, again.confirm);
+  const miss = await t.engine.command('yes start it', { confirmId: again.confirm.id });
+  assert.equal(miss.reply, 'Say “do it” to stop it, or “cancel”.');
   assert.deepEqual(miss.confirm, again.confirm);
   const yes = await t.engine.command('stop it', { confirmId: again.confirm.id }); // while "Stop …?" shows, "stop it" means yes
   assert.equal(yes.reply, 'Stopped Fix flaky checkout test.');
@@ -2458,7 +2534,7 @@ test('command (real parser): a message with no break after the name asks first',
   // Which one, in the person's own words, as on a stop card: two agents can have the same name.
   assert.equal(ask.confirm.detail, 'Its task: “Fix the flaky checkout test”');
   assert.deepEqual(runner.sent, []);
-  assert.equal((await t.engine.command('hmm what', { confirmId: ask.confirm.id })).reply, 'I did not catch that. Say “do it” to send it, or “cancel”.');
+  assert.equal((await t.engine.command('is that right?', { confirmId: ask.confirm.id })).reply, 'Say “do it” to send it, or “cancel”.');
   assert.equal((await t.engine.confirm(ask.confirm.id, true)).reply, 'Sent to Fix flaky checkout test.');
   assert.deepEqual(runner.sent, ['keep going']);
   const direct = await t.engine.command('tell the flaky test to use a longer timeout');
@@ -3060,17 +3136,49 @@ test('merge: the card asks first, counts first, and binds itself to the work it 
   await t.engine.shutdown();
 });
 
-test('finished work: "Not now" leaves the agent as it is, sends it nothing, and the reply is no approval', async (ctx) => {
+test('finished work: "Not now" leaves the agent as it is, sends it nothing, and the reply is no approval and no bare "OK."', async (ctx) => {
   const t = liveFolders(ctx);
   const a = await doneAgent(t);
   const before = a.runner.sent.length;
-  const out = await t.engine.answer(a.id, { answer: 'Not now' });
-  assert.equal(out.ok, true);
-  assert.equal(out.reply, `OK. ${a.v.name}’s work stays on its branch for now.`);
+  for (const said of ['Not now', 'not now']) {
+    const out = await t.engine.answer(a.id, { answer: said });
+    assert.equal(out.ok, true);
+    assert.equal(out.reply, `${a.v.name}’s work stays on its branch for now.`, said);
+    assert.ok(!/\bOK\./.test(out.reply), out.reply);
+  }
   assert.equal(a.runner.sent.length, before, '"Not now" is not a message for the agent');
   assert.equal(t.store.get(a.id).state, 'done_claimed');
   const good = await t.engine.answer(a.id, { answer: 'Looks good' });
   assert.equal(good.reply, `Good. ${a.v.name} stays as it is.`);
+  await t.engine.shutdown();
+});
+
+test('"looks good" said at a finished agent\'s lid starts nothing: it answers its finish, and where Merge is offered it is "Not now"', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.engine.deps.commands = commands;
+  const a = await doneAgent(t);
+  const before = a.runner.sent.length;
+  assert.ok(t.store.get(a.id).files?.changed > 0, 'its work is not merged yet, so its lid offers Merge and Not now');
+  // there, "looks good" does what "Not now" does: it stays as it is, on its branch, and the reply is no approval
+  for (const said of ['looks good', 'not now', 'Thanks!', 'lgtm']) {
+    assert.deepEqual(await t.engine.command(said, { focusId: a.id }), { reply: `${a.v.name}’s work stays on its branch for now.`, looked: a.id }, said);
+  }
+  assert.equal(t.claude.runners.length, 1, 'nothing started');
+  assert.equal(a.runner.sent.length, before, 'nothing is sent to it');
+  assert.equal(t.store.get(a.id).state, 'done_claimed');
+  // with nothing to merge, it is the lid's "Looks good"
+  t.store.get(a.id).work = null;
+  assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: `Good. ${a.v.name} stays as it is.`, looked: a.id });
+  assert.equal(t.claude.runners.length, 1);
+  await t.engine.shutdown();
+});
+
+test('finished work with no branch: "Not now" says it stays as it is, with no bare "OK."', async () => {
+  const t = live();
+  const a = await doneAgent(t);
+  t.store.get(a.id).work = null; // as an agent whose folder Workbench never made a branch for
+  const out = await t.engine.answer(a.id, { answer: 'Not now' });
+  assert.equal(out.reply, `${a.v.name} stays as it is.`);
   await t.engine.shutdown();
 });
 
@@ -3678,7 +3786,7 @@ test('merge and throw away by words: the card is for the agent the words named, 
     { kind: 'merge', agentId: a.id, agentIds: [a.id], yes: 'Merge', no: 'Cancel', danger: false });
   // Words it did not catch keep the card, and name what "do it" does to it.
   const miss = await t.engine.command('mumble', { confirmId: card.confirm.id });
-  assert.equal(miss.reply, 'I did not catch that. Say “do it” to merge it, or “cancel”.');
+  assert.equal(miss.reply, 'Say “do it” to merge it, or “cancel”.');
   assert.deepEqual(miss.confirm, card.confirm);
   const yes = await t.engine.command('yes', { confirmId: card.confirm.id });
   assert.deepEqual(yes, { reply: 'Merged Fix cart total into main.', focusId: a.id });
@@ -3699,7 +3807,7 @@ test('merge and throw away by words: the card is for the agent the words named, 
   // A throw-away card: its own near miss, and its own cancel.
   const away = await t.engine.command('throw it away');
   assert.equal(away.confirm.kind, 'discard');
-  assert.equal((await t.engine.command('mumble', { confirmId: away.confirm.id })).reply, 'I did not catch that. Say “do it” to throw it away, or “cancel”.');
+  assert.equal((await t.engine.command('mumble', { confirmId: away.confirm.id })).reply, 'Say “do it” to throw it away, or “cancel”.');
   assert.deepEqual(await t.engine.confirm(away.confirm.id, false), { reply: 'OK, I won’t throw it away.' });
   assert.equal(t.calls.discardWork.length, 0);
   await t.engine.shutdown();
@@ -3758,7 +3866,7 @@ test('confirm: a card of a kind the engine does not know is never taken for a la
   t.engine.confirms.set('0123456789ab', { id: '0123456789ab', kind: 'rebase', agentId: 'abc123', sentence: 'Rebase it?', detail: null, createdAt: at });
   t.engine.confirms.set('ba9876543210', { id: 'ba9876543210', kind: 'start', sentence: 'Start?', detail: null, createdAt: at });
   const miss = await t.engine.command('mumble', { confirmId: '0123456789ab' });
-  assert.equal(miss.reply, 'I did not catch that. Say “do it” to go ahead, or “cancel”.');
+  assert.equal(miss.reply, 'Say “do it” to go ahead, or “cancel”.');
   assert.deepEqual(await t.engine.confirm('0123456789ab', true), { reply: GONE_REPLY });
   assert.deepEqual(await t.engine.confirm('ba9876543210', true), { reply: GONE_REPLY }, 'a launch card without its tasks is none');
   assert.equal(t.store.list().length, 0, 'nothing started');
@@ -3776,16 +3884,15 @@ test('cards: every card the page gets says its kind, and merge and throw-away ca
     assert.ok(out.confirm, out.reply);
     return out.confirm;
   };
-  const start = await card({ kind: 'task', task: 'fix the login redirect' });
-  assert.deepEqual(Object.keys(start).sort(), ['agents', 'detail', 'id', 'kind', 'sentence']);
-  assert.equal(start.kind, 'start');
-  assert.equal(start.agents, 1, 'a launch card says how many agents it starts');
-  const two = await card({ kind: 'start', tasks: [{ task: 'fix the login redirect', harness: 'claude' }, { task: 'fix the docs', harness: 'claude' }] });
-  assert.equal(two.agents, 2);
+  // work starts with no card
+  t.deps.commands.intent = { kind: 'task', task: 'fix the login redirect' };
+  assert.equal((await t.engine.command('words')).confirm, undefined);
   // the full permissions card brings its own words, and no default answer
   const perms = (await t.engine.permissions('full')).confirm;
   assert.deepEqual({ ...perms, id: null }, { id: null, kind: 'permissions', sentence: 'Let agents do anything without asking?', detail: perms.detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true });
-  assert.equal((await card({ kind: 'stop', agentIds: [a.id], sure: false })).kind, 'stop');
+  const stop = await card({ kind: 'stop', agentIds: [a.id], sure: false });
+  assert.deepEqual(Object.keys(stop).sort(), ['detail', 'id', 'kind', 'sentence']);
+  assert.equal(stop.kind, 'stop');
   assert.equal((await card({ kind: 'say', agentId: a.id, text: 'also the docs', sure: false })).kind, 'say');
   assert.equal((await card({ kind: 'forget', agentIds: [a.id] })).kind, 'forget');
   const merge = await t.engine.proposeMerge(a.id);
@@ -4324,10 +4431,12 @@ test('repository: a workspace module that cannot tell who commits leaves identit
 
 // ------------------------------------------------------------------ end of the source-control tests
 
-test('words not caught say what to type; while a permission waits in the centre, they say so; a no keeps its “don’t”', async () => {
+test('words that answer nothing while a permission waits in the centre say so; a no keeps its “don’t”', async () => {
   const t = live();
   t.engine.deps.commands = commands;
-  assert.equal((await t.engine.command('ok')).reply, 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.');
+  // An agent named alone asks what it should work on; a bare "ok" is a prompt like any other (see "every prompt" below).
+  assert.equal((await t.engine.command('codex')).reply, 'What should Codex work on?');
+  assert.equal((await t.engine.command('ok')).reply, 'Started Codex on “ok”.');
   const { id } = await started(t);
   const pending = t.engine.hookPreToolUse(id, rootPayload);
   await until(() => t.store.get(id).ask);
@@ -4640,7 +4749,7 @@ test('full permissions in words: the real parser asks first for "stop asking", a
   assert.equal(r.reply, 'Let agents do anything without asking?');
   assert.equal(r.confirm.kind, 'permissions');
   const habit = await t.engine.command('yes', { confirmId: r.confirm.id });
-  assert.equal(habit.reply, 'I did not catch that. Say “do it” to turn on full permissions, or “cancel”.');
+  assert.equal(habit.reply, 'Say “do it” to turn on full permissions, or “cancel”.');
   assert.equal(habit.confirm.id, r.confirm.id, 'the card stays');
   assert.equal(t.engine.permissionMode, 'ask');
   const yes = await t.engine.command('turn it on', { confirmId: r.confirm.id });
@@ -4663,12 +4772,20 @@ test('full permissions in words: a thanks before them still acts, a question nev
   assert.equal(card.confirm.kind, 'permissions');
   assert.equal((await t.engine.command('thanks, stop asking', { confirmId: card.confirm.id })).reply, FULL_ON);
   assert.equal(t.engine.permissionMode, 'full');
-  // asked, the mark typed apart or not, they change nothing
+  assert.equal((await t.engine.command('thanks, ask first')).reply, FULL_OFF);
+  assert.equal(t.engine.permissionMode, 'ask');
+  const on = await t.engine.command('stop asking');
+  assert.equal((await t.engine.command('turn it on', { confirmId: on.confirm.id })).reply, FULL_ON);
+  // asked, the mark typed apart or not, they change nothing: like any question, each is a prompt, which starts an agent
   for (const q of ['ask first ?', 'ask first?']) {
-    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal((await t.engine.command(q)).reply, `Started Claude on “${q}”.`, q);
     assert.equal(t.engine.permissionMode, 'full', q);
   }
-  assert.equal((await t.engine.command('thanks, ask first')).reply, FULL_OFF);
+  // those agents are called "Ask first": the words alone now reach them, as an agent's name does, and change nothing
+  assert.equal(t.store.list().filter(a => a.name === 'Ask first').length, 2);
+  assert.equal((await t.engine.command('thanks, ask first')).confirm, undefined);
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.equal((await t.engine.command('turn off full permissions')).reply, FULL_OFF);
   assert.equal(t.engine.permissionMode, 'ask');
   // an agent called Stop asking: the words alone reach it, and at the card they are still the card's yes
   const { id } = await started(t, { task: 'Stop asking' });
@@ -4691,26 +4808,28 @@ test('full permissions in words: an agent named like them is reached by its name
     assert.equal(r.confirm, undefined, `${said}: no launch card`);
     assert.equal(t.engine.permissionMode, 'full', said);
   }
+  // asked, with "?!", "? please" or "?.", they change nothing: like any question, each is a prompt, which starts an agent
   for (const q of ['ask first?!', 'ask first? please', 'ask first?.']) {
-    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal((await t.engine.command(q)).reply, `Started Claude on “${q}”.`, q);
     assert.equal(t.engine.permissionMode, 'full', q);
   }
-  assert.equal((await t.engine.command('ask first')).reply, FULL_OFF);
+  // they are called "Ask first" now, so those words alone reach them; "ask me first" still turns them off
+  assert.equal((await t.engine.command('ask first')).confirm, undefined);
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.equal((await t.engine.command('ask me first')).reply, FULL_OFF);
   const card = await t.engine.command('stop asking');
   assert.equal((await t.engine.command('turn it off then', { confirmId: card.confirm.id })).reply, 'OK, agents still ask before risky steps.');
   assert.equal(t.engine.permissionMode, 'ask');
   await t.engine.shutdown();
 });
 
-test('full permissions: the launch, the spending limit and Codex are as before', async () => {
+test('full permissions: work starts as it does with them off, with its spending limit, and Codex is as before', async () => {
   const t = live({ prefs: prefsStore({ permissions: 'full' }) });
   t.engine.deps.commands = commands;
   const launch = await t.engine.command('start an agent to fix the login page');
-  assert.equal(launch.confirm.kind, 'start');
-  // the card is the engine's as before; the page adds, while full permissions are on, that it asks only before steps that
-  // name Claude Code's own settings
-  assert.equal(launch.confirm.detail, 'It can spend up to $2.00. It works in its own copy of shop, made from the last commit. Your 2 uncommitted changes are not included.');
-  assert.equal(launch.confirm.agents, 1, 'how many agents it starts, so the page can say it or they');
+  assert.equal(launch.confirm, undefined);
+  assert.equal(launch.reply, 'Started Claude on “fix the login page”.');
+  assert.equal(t.store.get(launch.agentIds[0]).budgetUsd, 2);
   const { id } = await started(t, { task: 'Fix the cart', harness: 'codex' });
   assert.equal((await t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm a' } })).hookSpecificOutput.permissionDecision, 'deny', 'Codex never asks through the hook');
   await t.engine.shutdown();
@@ -5359,4 +5478,460 @@ test('the file view: without the module that reads files, every request is refus
   assert.deepEqual(await d.engine.files('you'), no);
   await t.engine.shutdown();
   await d.engine.shutdown();
+});
+
+// ------------------------------------------------------------------ every prompt goes to an agent (the real parser)
+
+/** What Workbench must never answer to words that were said. */
+const NEVER_SAID = ['I did not catch that', 'You’re welcome.', 'OK.', 'There is nothing waiting for a yes or no.'];
+
+test('every prompt goes to an agent: whatever is no command starts one at once, exactly as typed, and no reply is a word back in its place', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const prompts = ['what do you think of this workbench', 'who are you', 'how are you', 'what are you thinking', 'thanks', 'ok', 'hi', 'hello', 'help', 'what can you do', '👍', 'hmm',
+    'is this right?', 'go on', 'yes', 'no', 'do it', 'cancel', 'cool', 'never mind', 'never mind, the login page is broken', 'good job', 'blorp',
+    'status of the repo', 'what needs me to approve this PR?', 'discard the old migrations folder', 'readme', 'claude is stuck',
+    'Hello! Can you help me build a website?', 'Update the docs for the new API.', 'function total(cart) {\n  return cart.sum();\n}'];
+  const replies = [];
+  for (const said of prompts) {
+    const out = await t.engine.command(said);
+    replies.push(out.reply);
+    assert.equal(out.confirm, undefined, said);
+    assert.equal(out.agentIds?.length, 1, `${said}: ${out.reply}`);
+    assert.equal(out.reply, `Started Claude on “${commandsClip(said)}”.`, said);
+  }
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), prompts, 'each exactly as typed');
+  for (const r of [...replies, ...t.notices]) for (const s of NEVER_SAID) assert.ok(!r.includes(s), `${JSON.stringify(r)} says ${JSON.stringify(s)}`);
+  assert.deepEqual([...t.engine.confirms.values()].filter(c => c.kind === 'start'), [], 'no launch card was made');
+  // The words for full permissions are still the mode's own, and "connect" opens Agents & keys.
+  assert.equal((await t.engine.command('full permissions')).confirm?.kind, 'permissions');
+  assert.equal((await t.engine.command('ask first')).reply, 'Agents already ask before risky steps.');
+  assert.deepEqual(await t.engine.command('connect'), { reply: 'Opening Agents & keys.', openConnect: true });
+  assert.equal(t.claude.runners.length, prompts.length);
+  await t.engine.shutdown();
+});
+
+/** The one line a notice quotes a prompt on (shared/format.mjs clip, 80 characters). */
+function commandsClip(s) {
+  const one = String(s).replace(/\s+/g, ' ').trim();
+  if (one.length <= 80) return one;
+  const cut = one.slice(0, 79);
+  const sp = cut.lastIndexOf(' ');
+  return (sp > 40 ? cut.slice(0, sp) : cut).replace(/[,.;:\s]+$/, '') + '…';
+}
+
+test('a prompt while a card is on screen starts its agent and leaves the card, which still takes its own words; a yes that is not enough says how to answer it', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const card = await t.engine.command('stop the redirect one');
+  for (const said of ['thanks', 'who are you', 'help', '👍']) {
+    const out = await t.engine.command(said, { confirmId: card.confirm.id });
+    assert.deepEqual(out.confirm, card.confirm, said);
+    assert.equal(out.reply, `Started Claude on “${said}”.`, said);
+  }
+  assert.equal(t.claude.runners.length, 5);
+  const asked = await t.engine.command('is that right?', { confirmId: card.confirm.id });
+  assert.deepEqual(asked, { reply: 'Say “do it” to stop it, or “cancel”.', confirm: card.confirm });
+  assert.equal(t.claude.runners.length, 5, 'a question about the card starts nothing');
+  assert.equal((await t.engine.command('cancel', { confirmId: card.confirm.id })).reply, 'OK, I won’t stop it.');
+  assert.notEqual(t.store.get(id).state, 'stopped');
+  await t.engine.shutdown();
+});
+
+test('after a card ran out, a yes or a no hears that it is no longer waiting and other words are a prompt; nothing is a word back in place of work', async () => {
+  let now = 1_700_000_000_000;
+  const t = live({ options: { now: () => now } });
+  t.engine.deps.commands = commands;
+  await started(t);
+  const card = await t.engine.command('stop the redirect one');
+  assert.ok(card.confirm, card.reply);
+  now += 10 * 60_000 + 1;
+  const replies = [];
+  for (const said of ['yes', 'no', 'ok', 'do it', 'cancel']) {
+    const out = await t.engine.command(said, { confirmId: card.confirm.id });
+    replies.push(out.reply);
+    assert.equal(out.reply, 'That request is no longer waiting. Ask again if you still want it.', said);
+  }
+  const asked = await t.engine.command('who are you', { confirmId: card.confirm.id });
+  replies.push(asked.reply);
+  assert.equal(asked.reply, 'Started Claude on “who are you”.');
+  // with nothing on screen, each of them is a prompt
+  for (const said of ['yes', 'no', 'ok', 'do it', 'cancel', 'help']) {
+    const out = await t.engine.command(said);
+    replies.push(out.reply);
+    assert.equal(out.reply, `Started Claude on “${said}”.`, said);
+  }
+  assert.deepEqual(t.claude.runners.slice(1).map(r => r.opts.task), ['who are you', 'yes', 'no', 'ok', 'do it', 'cancel', 'help']);
+  for (const r of [...replies, ...t.notices]) for (const s of NEVER_SAID) assert.ok(!r.includes(s), `${JSON.stringify(r)} says ${JSON.stringify(s)}`);
+  await t.engine.shutdown();
+});
+
+test('a yes from a parser of its own, with no card on screen, is a prompt too, never "there is nothing waiting"', async () => {
+  const t = live();
+  t.deps.commands.intent = () => ({ kind: 'confirm', go: true });
+  const out = await t.engine.command('yes');
+  assert.equal(out.reply, 'Started Claude on “yes”.');
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['yes']);
+  for (const s of NEVER_SAID) assert.ok(!out.reply.includes(s));
+  await t.engine.shutdown();
+});
+
+test('a prompt said to a program by name loses only the name: the rest reaches that agent as typed, "please" and "thanks" too', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const rows = [
+    ['codex, please fix the login page, thanks', 'please fix the login page, thanks'],
+    ['ask codex to fix the login page please', 'fix the login page please'],
+    ['codex, thanks', 'thanks'],
+    ['codex: the total is off:\n  expected 42.10\n}', 'the total is off:\n  expected 42.10\n}'],
+  ];
+  for (const [said, task] of rows) {
+    const out = await t.engine.command(said);
+    assert.equal(out.reply, `Started Codex on “${commandsClip(task)}”.`, said);
+  }
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), rows.map(([, task]) => task));
+  assert.equal(t.claude.runners.length, 0);
+  await t.engine.shutdown();
+});
+
+test('the same words said twice start two agents while the first is still at work, and words that share a few with an agent at work start one too', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const twice = ['what do you think of this workbench', 'thanks', 'hi', 'help', 'is this right?'];
+  for (const said of twice) {
+    for (const time of ['first', 'second']) {
+      const out = await t.engine.command(said);
+      assert.equal(out.reply, `Started Claude on “${said}”.`, `${said}, the ${time} time`);
+    }
+  }
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), twice.flatMap(s => [s, s]));
+  assert.ok(t.store.list().every(v => !['done_claimed', 'done_checked', 'stopped', 'failed'].includes(v.state)), 'the first ones are still at work');
+  // an agent at work on a task that shares words with the owner's prompt, then ended: the prompt starts another each time
+  const { id } = await started(t, { task: 'Think about how to improve workbench' });
+  assert.equal((await t.engine.command('what do you think of this workbench')).reply, 'Started Claude on “what do you think of this workbench”.');
+  await t.engine.stop(id);
+  assert.equal((await t.engine.command('what do you think')).reply, 'Started Claude on “what do you think”.');
+  for (const r of t.notices) for (const s of NEVER_SAID) assert.ok(!r.includes(s), `${JSON.stringify(r)} says ${JSON.stringify(s)}`);
+  await t.engine.shutdown();
+});
+
+test('what is said to a program by name reaches it with every word after the address, and an emoji or a thanks is its prompt too', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const rows = [
+    ['ask claude which tests are flaky', 'claude', 'which tests are flaky'],
+    ['ask codex who wrote the cart module', 'codex', 'who wrote the cart module'],
+    ['tell codex who the owner is', 'codex', 'who the owner is'],
+    ['ask claude that question again', 'claude', 'that question again'],
+    ['use codex: which tests are flaky?', 'codex', 'which tests are flaky?'],
+    ['codex who are you?', 'codex', 'who are you?'],
+    ['codex are you there?', 'codex', 'are you there?'],
+    ['claude can you hear me', 'claude', 'can you hear me'],
+    ['claude what do you think of this workbench', 'claude', 'what do you think of this workbench'],
+    ['@claude what do you think of this workbench', 'claude', 'what do you think of this workbench'],
+    ['codex, 👍', 'codex', '👍'],
+    ['codex 👍', 'codex', '👍'],
+    ['ask codex 🤔', 'codex', '🤔'],
+    ['claude, 🙏', 'claude', '🙏'],
+    ['tell claude thanks', 'claude', 'thanks'],
+  ];
+  for (const [said, h, task] of rows) {
+    const out = await t.engine.command(said);
+    assert.equal(out.reply, `Started ${h === 'codex' ? 'Codex' : 'Claude'} on “${task}”.`, said);
+  }
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), rows.filter(([, h]) => h === 'claude').map(([, , task]) => task));
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), rows.filter(([, h]) => h === 'codex').map(([, , task]) => task));
+  await t.engine.shutdown();
+});
+
+test('"status" at an agent\'s question or a stuck agent is Workbench\'s status: nothing is sent, and the question keeps waiting', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id, runner } = await started(t);
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I found two login routes.\n\nShould I remove the old one?', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(id).state === 'question');
+  const askId = t.store.get(id).ask.id;
+  for (const said of ['status', 'status?', 'update', 'progress']) {
+    const out = await t.engine.command(said, { focusId: id, askId });
+    assert.equal(out.reply, 'One thing needs you: Fix login redirect has a question.', said);
+  }
+  assert.deepEqual(runner.sent, [], 'nothing reached the agent');
+  assert.equal(t.store.get(id).ask?.id, askId, 'the question keeps waiting');
+  // its answer still reaches it
+  assert.equal((await t.engine.command('yes, remove it', { focusId: id, askId })).reply, 'Sent your answer to Fix login redirect.');
+  assert.deepEqual(runner.sent, ['yes, remove it']);
+  await t.engine.shutdown();
+});
+
+test('"never mind, stop" stops the agent in the centre; pasted code that begins with stop() is a prompt, and the agent keeps working', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const one = await started(t);
+  for (const said of ['stop()\n}', 'stop();', 'stop()']) {
+    const out = await t.engine.command(said, { focusId: one.id });
+    assert.equal(out.reply, `Started Claude on “${commandsClip(said)}”.`, JSON.stringify(said));
+  }
+  assert.notEqual(t.store.get(one.id).state, 'stopped');
+  assert.deepEqual(t.claude.runners.slice(1).map(r => r.opts.task), ['stop()\n}', 'stop();', 'stop()'], 'each exactly as pasted');
+  const out = await t.engine.command('never mind, stop', { focusId: one.id });
+  assert.equal(out.reply, 'Stopped Fix login redirect.');
+  assert.equal(t.store.get(one.id).state, 'stopped');
+  assert.equal(t.claude.runners.length, 4, '"never mind, stop" started nothing');
+  await t.engine.shutdown();
+});
+
+test('an agent named alone asks what it should work on, and the next words are that agent\'s prompt, once', async () => {
+  let now = 1_700_000_000_000;
+  const t = live({ options: { now: () => now } });
+  t.engine.deps.commands = commands;
+  assert.deepEqual(await t.engine.command('codex'), { reply: 'What should Codex work on?' });
+  const out = await t.engine.command('fix the docs');
+  assert.equal(out.reply, 'Started Codex on “fix the docs”.');
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), ['fix the docs']);
+  // only the next words: what follows goes to the default agent again
+  assert.equal((await t.engine.command('tidy the readme')).reply, 'Started Claude on “tidy the readme”.');
+  // "the agent" and "start the agent" name the default one, and so do the next words
+  assert.deepEqual(await t.engine.command('the agent'), { reply: 'What should Claude Code work on?' });
+  assert.equal((await t.engine.command('thanks')).reply, 'Started Claude on “thanks”.');
+  // a command in between is a command, and the next prompt is no longer that agent's
+  assert.deepEqual(await t.engine.command('codex'), { reply: 'What should Codex work on?' });
+  assert.match((await t.engine.command('what needs me')).reply, /^Nothing needs you right now\./);
+  assert.equal((await t.engine.command('fix the cart')).reply, 'Started Claude on “fix the cart”.');
+  // and it does not wait for ever
+  await t.engine.command('codex');
+  now += 10 * 60_000 + 1;
+  assert.equal((await t.engine.command('fix the footer')).reply, 'Started Claude on “fix the footer”.');
+  assert.equal(t.codex.runners.length, 1);
+  await t.engine.shutdown();
+});
+
+test('while two helpers of the agent in the centre wait, a yes or a no says which ones wait, and answers neither', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id, runner } = await started(t);
+  const helpers = [[`${id}-11111111`, 'Find unused imports'], [`${id}-22222222`, 'Scan imports']];
+  for (const [hid, name] of helpers) {
+    runner.emit({ kind: EV.CREATED, agentId: hid, parentId: id, name, harness: 'claude' });
+    runner.emit({ kind: EV.STATE, agentId: hid, state: 'working' });
+    runner.emit({ kind: EV.ASK, agentId: hid, ask: { id: `ask-${hid}`, type: 'question', sentence: `${name} asks which folder to look in.`, options: [] } });
+  }
+  await until(() => helpers.every(([hid]) => t.store.get(hid)?.ask));
+  for (const said of ['ok', 'yes', 'no']) {
+    assert.deepEqual(await t.engine.command(said, { focusId: id }), { reply: 'Two helpers are waiting: Find unused imports and Scan imports. Say which one.', focusId: id }, said);
+  }
+  for (const [hid] of helpers) assert.ok(t.store.get(hid).ask, 'still waiting');
+  assert.equal(t.claude.runners.length, 1, 'nothing started');
+  await t.engine.shutdown();
+});
+
+test('a bare merge or throw-away takes the agent in the centre, else the one finished agent, else names the ones it could act on', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.engine.deps.commands = commands;
+  // none finished: says so, and starts nothing
+  assert.deepEqual(await t.engine.command('merge it'), { reply: 'No finished agent has work to merge right now.' });
+  assert.deepEqual(await t.engine.command('throw it away'), { reply: 'No finished agent has work to throw away right now.' });
+  const a = await doneAgent(t);
+  // one finished: its card
+  const one = await t.engine.command('merge them');
+  assert.equal(one.confirm?.kind, 'merge');
+  assert.equal(one.confirm.agentId, a.id);
+  const away = await t.engine.command('discard');
+  assert.equal(away.confirm?.kind, 'discard');
+  assert.equal(away.confirm.agentId, a.id);
+  // two finished: which one, by name
+  const b = await doneAgent(t, { task: 'Fix the docs site' }, 'I fixed the docs site.');
+  assert.deepEqual(await t.engine.command('merge'), { reply: `Merge which? ${t.store.get(a.id).name} or ${t.store.get(b.id).name}.` });
+  assert.deepEqual(await t.engine.command('throw it away'), { reply: `Throw away which? ${t.store.get(a.id).name} or ${t.store.get(b.id).name}.` });
+  // with an agent in the centre, its card
+  const centre = await t.engine.command('throw it away', { focusId: b.id });
+  assert.equal(centre.confirm?.agentId, b.id);
+  assert.equal(t.claude.runners.length, 2, 'none of these started an agent');
+  await t.engine.shutdown();
+});
+
+test('throw-away words after a card that ran out ask about that card\'s agent again, never start work', async (ctx) => {
+  let now = 1_700_000_000_000;
+  const t = liveFolders(ctx, { options: { now: () => now } });
+  t.engine.deps.commands = commands;
+  const a = await doneAgent(t);
+  await doneAgent(t, { task: 'Fix the docs site' }, 'I fixed the docs site.');
+  const card = await t.engine.proposeMerge(a.id);
+  now += 10 * 60_000 + 1;
+  const again = await t.engine.command('discard all of it', { confirmId: card.confirm.id });
+  assert.equal(again.confirm?.kind, 'discard');
+  assert.equal(again.confirm.agentId, a.id);
+  assert.equal(t.claude.runners.length, 2);
+  await t.engine.shutdown();
+});
+
+test('words no parser could read are a prompt too; with a permission in the centre they say it waits', async () => {
+  const t = live();
+  t.deps.commands.intent = null; // the stand-in parser reads nothing: { kind: 'unknown', text }
+  const out = await t.engine.command('blorp');
+  assert.equal(out.reply, 'Started Claude on “blorp”.');
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['blorp']);
+  const id = out.agentIds[0];
+  const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } });
+  await until(() => t.store.get(id).ask);
+  assert.deepEqual(await t.engine.command('blorp', { focusId: id }), { reply: `${t.store.get(id).name} is waiting for your OK. Say “yes” or “no” to it first.` });
+  assert.equal(t.claude.runners.length, 1);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  await pending;
+  await t.engine.shutdown();
+});
+
+// ------------------------------------------------------------------ rules over the words: a misread starts a paid agent now
+
+test('a stop with its reason after it stops that agent and starts nothing; with a card on screen it still stops, and the card stays', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const docs = await started(t, { task: 'Update the docs' });
+  const readme = await started(t, { task: 'Tidy the readme' });
+  // beside the agent in the centre
+  const out = await t.engine.command('stop it, it is deleting the wrong files', { focusId: id });
+  assert.equal(out.reply, 'Stopped Fix login redirect.');
+  assert.equal(t.store.get(id).state, 'stopped');
+  // with no agent in the centre, which one is not clear: nothing stops, and nothing starts
+  for (const text of ['kill it\nwrong branch', 'pause it - I need to check', 'stop the agent because it is looping']) {
+    assert.equal((await t.engine.command(text)).reply, 'I couldn’t tell which agent to stop.', text);
+  }
+  assert.equal(t.claude.runners.length, 3, 'nothing started');
+  // a card on screen (the page sends no agent in the centre with it): a stop of a named agent stops it, and the card stays
+  const card = await t.engine.command('stop the readme one');
+  assert.equal(card.confirm.kind, 'stop');
+  const before = t.notices.length;
+  const stop = await t.engine.command('stop update docs, it is looping', { confirmId: card.confirm.id });
+  assert.deepEqual(stop, { reply: 'Stopped Update docs.', confirm: card.confirm }, 'the card stays in the centre, and the centre stays on it');
+  assert.deepEqual(t.notices.slice(before), [stop.reply], 'what stopped is said under the board, though the card is in the centre');
+  assert.equal(t.store.get(docs.id).state, 'stopped');
+  assert.notEqual(t.store.get(readme.id).state, 'stopped');
+  // the card still takes its own words
+  assert.equal((await t.engine.command('cancel', { confirmId: card.confirm.id })).reply, 'OK, I won’t stop it.');
+  // a stop of everything keeps a card too
+  const again = await t.engine.command('stop the readme one');
+  const all = await t.engine.command('stop all agents, the build is broken', { confirmId: again.confirm.id });
+  assert.deepEqual(all, { reply: 'Stopped Tidy readme.', confirm: again.confirm });
+  assert.equal(t.claude.runners.length, 3, 'nothing started');
+  await t.engine.shutdown();
+});
+
+test('a program named alone keeps a card on screen: it asks what that program should work on, and the next words are its prompt', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const readme = await started(t, { task: 'Tidy the readme' });
+  const card = await t.engine.command('stop the readme one');
+  for (const [text, who] of [['codex', 'Codex'], ['claude', 'Claude Code'], ['the agent', 'Claude Code'], ['new agent', 'Claude Code'], ['ask claude', 'Claude Code'], ['start codex', 'Codex']]) {
+    const before = t.notices.length;
+    const out = await t.engine.command(text, { confirmId: card.confirm.id });
+    assert.deepEqual(out, { reply: `What should ${who} work on?`, confirm: card.confirm }, text);
+    assert.deepEqual(t.notices.slice(before), [out.reply], `${text}: the question is said under the board, as the card stays`);
+  }
+  // the next words are that program's prompt, and the card still stays
+  await t.engine.command('codex', { confirmId: card.confirm.id });
+  const go = await t.engine.command('fix the login page', { confirmId: card.confirm.id });
+  assert.equal(go.reply, 'Started Codex on “fix the login page”.');
+  assert.deepEqual(go.confirm, card.confirm);
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), ['fix the login page']);
+  // and it still takes its own words
+  assert.equal((await t.engine.command('yes', { confirmId: card.confirm.id })).reply, 'Stopped Tidy readme.');
+  assert.equal(t.store.get(readme.id).state, 'stopped');
+  await t.engine.shutdown();
+});
+
+test('at a permission, "try again" keeps the permission\'s hint and starts nothing, as other words that say no work do', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } });
+  await until(() => t.store.get(id).ask);
+  const askId = t.store.get(id).ask.id;
+  for (const text of ['try again', 'please try it again', 'run it again', 'retry']) {
+    assert.deepEqual(await t.engine.command(text, { focusId: id, askId }), { reply: 'Fix login redirect is waiting for your OK. Say “yes” or “no” to it first.' }, text);
+  }
+  assert.equal(t.claude.runners.length, 1, 'nothing started');
+  assert.equal(await settled(pending), false, 'the request still waits');
+  await t.engine.answer(id, { askId, answer: 'Deny' });
+  await pending;
+  await t.engine.shutdown();
+});
+
+test('words that begin with a card\'s yes or no answer it, whatever follows, and what follows starts nothing', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const readme = await started(t, { task: 'Tidy the readme' });
+  const card = await t.engine.command('stop the readme one');
+  assert.equal((await t.engine.command('no, because the tests are red', { confirmId: card.confirm.id })).reply, 'OK, I won’t stop it.');
+  assert.notEqual(t.store.get(readme.id).state, 'stopped');
+  const again = await t.engine.command('stop the readme one');
+  assert.equal((await t.engine.command('yes, and then tell me what it did', { confirmId: again.confirm.id })).reply, 'Stopped Tidy readme.');
+  assert.equal(t.store.get(readme.id).state, 'stopped');
+  // a yes with a condition no card can carry keeps the card, and starts nothing; its plain yes still answers it
+  const third = await t.engine.command('stop the redirect one');
+  const cond = await t.engine.command('yes, but only after the tests pass', { confirmId: third.confirm.id });
+  assert.deepEqual(cond, { reply: 'Say “do it” to stop it, or “cancel”.', confirm: third.confirm });
+  assert.equal((await t.engine.command('do it, thanks', { confirmId: third.confirm.id })).reply, 'Stopped Fix login redirect.');
+  assert.equal(t.store.get(id).state, 'stopped');
+  assert.equal(t.claude.runners.length, 2, 'nothing started');
+  await t.engine.shutdown();
+});
+
+test('with a finished agent\'s merge card on screen, a stop of "it" with its reason after it stops the one agent at work, and the card stays', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.engine.deps.commands = commands;
+  const cart = await doneAgent(t);
+  const card = await t.engine.proposeMerge(cart.id);
+  assert.equal(card.confirm.kind, 'merge');
+  // as the page sends words while a card is shown: the card's id, and no agent in the centre
+  for (const text of ['stop it, it is deleting the wrong files', 'kill it\nwrong branch', 'pause it - I need to check',
+    'stop the agent because it is looping', 'stop\nit is deleting the wrong files']) {
+    const a = await started(t); // Fix login redirect, the one agent at work
+    const before = t.notices.length;
+    const out = await t.engine.command(text, { focusId: null, confirmId: card.confirm.id, askId: null });
+    assert.deepEqual(out, { reply: 'Stopped Fix login redirect.', confirm: card.confirm }, text);
+    assert.deepEqual(t.notices.slice(before), [out.reply], `${text}: what stopped is said under the board, as the card stays`);
+    assert.equal(t.store.get(a.id).state, 'stopped', text);
+    assert.equal(a.runner.stopCalls, 1, text);
+  }
+  // two at work: which one is not clear, nothing stops, and the card still stays
+  const one = await started(t);
+  const two = await started(t, { task: 'Update the docs' });
+  assert.deepEqual(await t.engine.command('stop it, it is deleting the wrong files', { confirmId: card.confirm.id }),
+    { reply: 'I couldn’t tell which agent to stop.', confirm: card.confirm });
+  assert.deepEqual([one.runner.stopCalls, two.runner.stopCalls], [0, 0]);
+  assert.ok([one, two].every(x => t.store.get(x.id).state !== 'stopped'), 'both still work');
+  // the card still takes its own words, and nothing started
+  assert.equal((await t.engine.command('cancel', { confirmId: card.confirm.id })).reply, 'OK, I won’t merge it.');
+  assert.equal(t.claude.runners.length, 8, 'the finished agent, the five stopped and the two at work: nothing started');
+  assert.equal(t.calls.mergeWork.length, 0, 'nothing merged');
+  await t.engine.shutdown();
+});
+
+test('on a throw-away or full permissions card, a yes that goes on answers it; a yes said alone, or with only thanks, keeps it', async (ctx) => {
+  const t = liveFolders(ctx, { prefs: prefsStore() });
+  t.engine.deps.commands = commands;
+  const cart = await doneAgent(t);
+  const away = await t.engine.proposeDiscard(cart.id);
+  assert.equal(away.confirm.kind, 'discard');
+  for (const text of ['yes', 'sure, thanks a lot']) {
+    assert.deepEqual(await t.engine.command(text, { confirmId: away.confirm.id }), { reply: 'Say “do it” to throw it away, or “cancel”.', confirm: away.confirm }, text);
+  }
+  // a yes put off at once is the card's no
+  assert.deepEqual(await t.engine.command('ok hold on', { confirmId: away.confirm.id }), { reply: 'OK, I won’t throw it away.' });
+  assert.equal(t.calls.discardWork.length, 0, 'nothing thrown away yet');
+  const again = await t.engine.proposeDiscard(cart.id);
+  assert.match((await t.engine.command('yes, and then tell me', { confirmId: again.confirm.id })).reply, /^Threw away Fix cart total’s work\./);
+  assert.equal(t.calls.discardWork.length, 1);
+  const perms = (await t.engine.permissions('full')).confirm;
+  for (const text of ['yes', 'sure, thanks a lot']) {
+    assert.deepEqual(await t.engine.command(text, { confirmId: perms.id }), { reply: 'Say “do it” to turn on full permissions, or “cancel”.', confirm: perms }, text);
+  }
+  assert.equal(t.engine.permissionMode, 'ask');
+  assert.equal((await t.engine.command('yes, and then tell me', { confirmId: perms.id })).reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.equal(t.claude.runners.length, 1, 'nothing started');
+  await t.engine.shutdown();
 });

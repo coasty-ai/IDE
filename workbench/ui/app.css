@@ -327,12 +327,23 @@ svg.g { width: 10px; height: 10px; flex: none; }
 #core .more-text ul { margin: 0; padding-left: 16px; }
 #core .know { margin: 8px 0 0; font-size: var(--l-small); color: var(--lid-ink-2); max-width: 100%; }
 #core button:focus-visible { outline: 2px solid var(--lid-focus); outline-offset: 3px; }
-#bar { flex: none; display: flex; align-items: center; gap: 8px; height: var(--l-inh); margin-top: var(--l-gap3); padding: 0 5px 0 13px; border-radius: 4px;
+/* The input grows with its text (saybox.js sets --say-extra: how much taller than one line it is). The bar grows by as
+   much: the extra height sits above its one-line band, so the reply chip and the microphone stay on the last line, and
+   the field reaches up over it. One line looks as the one-line input did. */
+#bar { flex: none; display: flex; align-items: center; gap: 8px; height: calc(var(--l-inh) + var(--say-extra, 0px)); margin-top: var(--l-gap3);
+  padding: var(--say-extra, 0px) 5px 0 13px; border-radius: 4px;
   background: var(--field); box-shadow: inset 0 1px 2px rgba(40, 35, 20, .28), inset 0 0 0 1px rgba(110, 106, 92, .38); transition: box-shadow .2s ease; }
 :root[data-theme="ivory"] #bar { box-shadow: inset 0 0 0 1px #e4dbcc; border-radius: 8px; }
 #bar:focus-within { box-shadow: inset 0 1px 2px rgba(40, 35, 20, .28), inset 0 0 0 2px var(--lid-focus); }
-#bar .field { position: relative; flex: 1; min-width: 0; height: 100%; display: flex; align-items: center; }
-#say { width: 100%; border: 0; outline: 0; background: transparent; font: inherit; font-size: var(--l-input); color: var(--field-ink); padding: 0; }
+/* the ivory look's border above is the stronger selector: its focus ring needs one as strong, or it never shows */
+:root[data-theme="ivory"] #bar:focus-within { box-shadow: inset 0 0 0 2px var(--lid-focus); }
+#bar .field { position: relative; flex: 1; min-width: 0; height: calc(100% + var(--say-extra, 0px)); margin-top: calc(-1 * var(--say-extra, 0px));
+  display: flex; align-items: center; }
+#say { display: block; width: 100%; border: 0; outline: 0; background: transparent; font: inherit; font-size: var(--l-input); line-height: 1.45;
+  color: var(--field-ink); padding: 0; margin: 0; resize: none; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere;
+  scrollbar-width: thin; scrollbar-color: var(--field-ph) transparent; }
+/* while it listens the words heard take the field's place, on one line */
+#bar.listening { height: var(--l-inh); padding-top: 0; }
 #bar .ph { position: absolute; left: 0; top: 50%; transform: translateY(-50%); font-size: var(--l-input); color: var(--field-ph); pointer-events: none; white-space: nowrap; max-width: 100%; }
 #bar .ph kbd { font: inherit; font-size: .88em; border: 1px solid var(--kbd-line); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; }
 #bar.typed .ph, #bar.listening .ph, #bar.replying .ph { display: none; }
@@ -359,6 +370,7 @@ svg.g { width: 10px; height: 10px; flex: none; }
 #core.idle #mic { color: var(--idle-ink-2); }
 #core.idle button:focus-visible, #core.idle #bar:focus-within { outline-color: var(--focus); }
 #core.idle #bar:focus-within { box-shadow: inset 0 0 0 2px var(--focus); }
+:root[data-theme="ivory"] #core.idle #bar:focus-within { box-shadow: inset 0 0 0 2px var(--focus); } /* stronger than ivory's idle border above */
 #core.cannot #bar { visibility: hidden; }
 #core.dim, #parts.dim, #wires.dim, #machines.dim { opacity: .38; transition: opacity 1.2s ease; }
 
@@ -565,7 +577,10 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitBar { position: relative; display: flex; align-items: center; width: clamp(150px, 20vw, 260px); height: 30px; padding: 0 10px; border-radius: 4px;
   background: var(--card-1); box-shadow: inset 0 0 0 1px var(--card-line); }
 :root[data-theme="ivory"] #gitBar { border-radius: 8px; }
-#gitSay { width: 100%; border: 0; outline: 0; padding: 0; background: transparent; color: var(--card-ink); font: inherit; }
+/* one line high, as the input it was, but a textarea: a paste keeps its lines (the line with the caret shows, and the text
+   scrolls sideways to it), and Enter sends (gitscreen.js) */
+#gitSay { display: block; width: 100%; height: 1.4em; border: 0; outline: 0; padding: 0; background: transparent; color: var(--card-ink); font: inherit;
+  line-height: 1.4; resize: none; overflow: hidden; white-space: pre; overflow-wrap: normal; }
 #gitBar .ph { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--card-sub); pointer-events: none; white-space: nowrap; }
 #gitBar.typed .ph, #gitBar:focus-within .ph { display: none; }
 #gitBar:focus-within { box-shadow: inset 0 0 0 2px var(--card-focus); }

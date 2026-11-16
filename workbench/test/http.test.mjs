@@ -42,7 +42,15 @@ class FakeEngine extends EventEmitter {
     if (mode === 'full') return { reply: 'Let agents do anything without asking?', confirm: { id: '0a1b2c3d4e61', sentence: 'Let agents do anything without asking?', detail: 'It stays on until you turn it off.', kind: 'permissions', yes: 'Turn on full permissions', no: 'Keep asking', danger: true } };
     return { ok: true, reply: 'Agents ask again before risky steps.', permissions: 'ask' };
   }
-  async command(text, opts) { this.calls.push(['command', text, opts]); return { reply: `You said ${text}` }; }
+  async command(text, opts) {
+    this.calls.push(['command', text, opts]);
+    // a finished agent's lid answered by words, and a start card for more than one agent: replies with more than a reply
+    if (text === 'looks good') return { reply: 'Fix login’s work stays on its branch for now.', looked: 'abc123' };
+    if (text === 'start two agents on the docs') {
+      return { reply: 'Start two Claude agents on “the docs”?', confirm: { id: '0a1b2c3d4e62', sentence: 'Start two Claude agents on “the docs”?', detail: 'Each one works in its own folder and spends on its own.', kind: 'start', yes: 'Start them', no: 'Cancel' } };
+    }
+    return { reply: `You said ${text}` };
+  }
   async confirm(id, go) { this.calls.push(['confirm', id, go]); return { reply: go ? 'Started it.' : 'Cancelled.' }; }
   async startAgent(o) {
     this.calls.push(['startAgent', o]);
@@ -622,6 +630,15 @@ test('API routes call the engine with the right arguments', async () => {
     ['raiseLimit', 'abc123', { state: null }],
     ['raiseLimit', 'abc123', { state: null }],
   ]);
+});
+
+test('a command’s reply reaches the page whole: `looked` for a finish the words answered, and a start card for more than one agent', async () => {
+  const looked = await post('/api/command', { text: 'looks good', focusId: 'abc123' });
+  assert.equal(looked.status, 200);
+  assert.deepEqual(looked.json, { reply: 'Fix login’s work stays on its branch for now.', looked: 'abc123' });
+  const card = await post('/api/command', { text: 'start two agents on the docs' });
+  assert.equal(card.json.confirm.kind, 'start');
+  assert.deepEqual([card.json.confirm.yes, card.json.confirm.no], ['Start them', 'Cancel']);
 });
 
 test('the route that raises a spending limit: the page’s token, POST only, from this page, for an agent’s id', async () => {

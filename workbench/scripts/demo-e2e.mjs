@@ -34,12 +34,9 @@ const ag = events.filter(e => e.ev === 'agents');
 if (ag.length > 1) out('agents gap ms (coalesce)', ag.slice(1, 6).map((e, i) => e.t - ag[i].t));
 out('sample agents ev', ag[0] && ag[0].data.length + ' views');
 
-// command -> confirm
+// command -> the agent starts at once (work is never asked first: no card)
 let r = await post('/api/command', { text: 'start an agent to fix the login redirect' });
-out('command start', [r.s, r.j && r.j.reply, r.j && r.j.confirm]);
-const cid = r.j.confirm.id;
-r = await post('/api/confirm/' + cid, { go: true });
-out('confirm', [r.s, r.j]);
+out('command start', [r.s, r.j && r.j.reply, r.j && r.j.confirm, r.j && r.j.agentIds]);
 const newIds = r.j.agentIds || [];
 
 // answer each demo ask
@@ -75,7 +72,8 @@ out('machine events', events.filter(e => e.ev === 'machines').slice(-2).map(e =>
 out('cmd sleep idle', (await post('/api/command', { text: 'sleep idle machines' })).j);
 out('cmd status', (await post('/api/command', { text: 'what needs me' })).j);
 out('cmd spend', (await post('/api/command', { text: 'how much have I spent today' })).j);
-out('cmd unknown', (await post('/api/command', { text: 'blorp' })).j);
+out('cmd prompt (any words)', (await post('/api/command', { text: 'blorp' })).j);
+out('cmd thanks', (await post('/api/command', { text: 'thanks' })).j);
 
 // safety
 const raw = (path, o = {}) => fetch(B + path, o).then(r => r.status);

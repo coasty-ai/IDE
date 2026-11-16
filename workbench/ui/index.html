@@ -53,7 +53,8 @@
     <form id="bar" autocomplete="off" data-box="bar">
       <span class="to" id="to"><span id="toText"></span><button type="button" id="toCancel" aria-label="Stop replying">×</button></span>
       <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-      <span class="field" data-box="field"><input id="say" aria-label="Type what you want, or hold the space bar to talk"><span class="ph" id="ph" aria-hidden="true"></span></span>
+      <!-- The input is a box that grows with its text (saybox.js): Enter sends, Shift+Enter adds a line. -->
+      <span class="field" data-box="field"><textarea id="say" rows="1" enterkeyhint="send" aria-label="Type what you want, or hold the space bar to talk"></textarea><span class="ph" id="ph" aria-hidden="true"></span></span>
       <span class="heard" id="heard" data-clip-ok="the words heard so far; all of them are sent"></span>
       <button type="button" id="mic" aria-pressed="false" aria-label="Talk"><svg aria-hidden="true"><use href="#g-mic"/></svg></button>
     </form>
@@ -124,7 +125,7 @@
     <div class="gright" data-box="gitright">
       <div class="grow">
         <button id="gitNeeds" type="button" hidden></button>
-        <form id="gitBar" autocomplete="off"><span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span><input id="gitSay" aria-label="Type what you want. It goes to Workbench, about the agent shown here."><span class="ph" id="gitPh" aria-hidden="true">type here</span><span class="heard" id="gitHeard" data-clip-ok="the words heard so far; all of them are sent"></span></form>
+        <form id="gitBar" autocomplete="off"><span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span><textarea id="gitSay" rows="1" wrap="off" enterkeyhint="send" aria-label="Type what you want. It goes to Workbench, about the agent shown here."></textarea><span class="ph" id="gitPh" aria-hidden="true">type here</span><span class="heard" id="gitHeard" data-clip-ok="the words heard so far; all of them are sent"></span></form>
       </div>
       <p id="gitSaid" role="status" aria-live="polite"></p>
     </div>

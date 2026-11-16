@@ -89,12 +89,12 @@ test('without Connect, new work goes to the first agent that is ready, Claude Co
   const t = live({ adapters: { codex } });
   await t.engine.start();
   t.deps.commands.intent = { kind: 'task', task: 'fix the login bug' };
-  const card = await t.engine.command('fix the login bug');
-  assert.equal(card.reply, 'Start Codex on “fix the login bug”?');
-  assert.equal(card.openConnect, undefined);
+  const out = await t.engine.command('fix the login bug');
+  assert.equal(out.reply, 'Started Codex on “fix the login bug”.');
+  assert.equal(out.openConnect, undefined);
   const v = await t.engine.startAgent({ task: 'Fix the cart total' });
   assert.equal(v.harness, 'codex');
-  assert.equal(codex.runners.length, 1);
+  assert.equal(codex.runners.length, 2);
   assert.equal(meta(t.engine), undefined, 'no Agents & keys without Connect: the page shows the board as before');
   await t.engine.shutdown();
 
@@ -102,21 +102,6 @@ test('without Connect, new work goes to the first agent that is ready, Claude Co
   await both.engine.start();
   assert.equal((await both.engine.startAgent({ task: 'Fix the cart total' })).harness, 'claude');
   await both.engine.shutdown();
-});
-
-test('a launch card says what each agent may spend: Claude Code its limit, Codex none, since Codex reports no cost', async () => {
-  const t = live();
-  await t.engine.start();
-  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
-  assert.match((await t.engine.command('codex fix the docs')).confirm.detail, /^Codex reports no cost, so it has no spending limit\. /);
-  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }] };
-  assert.match((await t.engine.command('claude fix the docs')).confirm.detail, /^It can spend up to \$2\.00\. /);
-  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }, { task: 'fix the tests', harness: 'claude' }] };
-  assert.match((await t.engine.command('claude fix the docs and the tests')).confirm.detail, /^Each one can spend up to \$2\.00\. /);
-  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }, { task: 'fix the tests', harness: 'codex' }] };
-  assert.match((await t.engine.command('claude fix the docs and codex the tests')).confirm.detail,
-    /^Each Claude Code agent can spend up to \$2\.00\. Codex reports no cost, so it has no spending limit\. /);
-  await t.engine.shutdown();
 });
 
 test('--model is the Claude model: a Codex agent starts with its own model, and a model named for one launch reaches that agent', async () => {
@@ -148,19 +133,18 @@ test('with no agent ready, a start says so and opens Agents & keys', async () =>
   assert.equal(t.store.list().length, 0, 'nothing was made');
   // Naming an agent still wins: Codex runs, though it says it is not signed in (it may have another way in).
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
-  assert.equal((await t.engine.command('codex fix the docs')).reply, 'Start Codex on “fix the docs”?');
+  assert.equal((await t.engine.command('codex fix the docs')).reply, 'Started Codex on “fix the docs”.');
+  assert.equal(t.codex.runners.length, 1);
   // One that cannot run here says so, and opens Agents & keys too.
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }] };
   assert.deepEqual(await t.engine.command('claude fix the docs'), {
     reply: 'Claude Code is not available on this computer. Connect it in Agents & keys.', openConnect: true,
   });
-  // An agent that went away between the card and the yes: the yes says so, and opens Agents & keys.
+  // An agent that went away since: the start says so, and opens Agents & keys, and nothing starts.
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
-  const card = await t.engine.command('codex fix the docs');
   t.engine.setHarnesses({ codex: { ok: false, reason: 'Codex is not installed.' } });
-  const yes = await t.engine.confirm(card.confirm.id, true);
-  assert.equal(yes.reply, 'I could not start the agent for “fix the docs”: Codex is not available on this computer.');
-  assert.equal(yes.openConnect, true);
+  assert.deepEqual(await t.engine.command('codex fix the docs'), { reply: 'Codex is not available on this computer. Connect it in Agents & keys.', openConnect: true });
+  assert.equal(t.codex.runners.length, 1);
   await t.engine.shutdown();
 });
 
@@ -169,9 +153,9 @@ test('with Connect, new work goes to its default agent; naming one still wins; w
   const t = live({ connect });
   await t.engine.start();
   t.deps.commands.intent = { kind: 'task', task: 'fix the login bug' };
-  assert.equal((await t.engine.command('fix the login bug')).reply, 'Start Codex on “fix the login bug”?');
+  assert.equal((await t.engine.command('fix the login bug')).reply, 'Started Codex on “fix the login bug”.');
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the login bug', harness: 'claude' }] };
-  assert.equal((await t.engine.command('claude fix the login bug')).reply, 'Start Claude Code on “fix the login bug”?');
+  assert.equal((await t.engine.command('claude fix the login bug')).reply, 'Started Claude on “fix the login bug”.');
   assert.equal((await t.engine.startAgent({ task: 'Fix the cart total' })).harness, 'codex');
   assert.deepEqual(meta(t.engine).agents.map(a => [a.id, a.ready]), [['claude', true], ['codex', true]]);
 
@@ -263,7 +247,7 @@ test('what Connect said before or while the engine starts stands: the adapters�
   assert.equal(asked, 0, 'not asked again');
   assert.equal(t.engine.snapshot().harnessInfo.claude.ok, false);
   t.deps.commands.intent = { kind: 'task', task: 'fix the login bug' };
-  assert.equal((await t.engine.command('fix the login bug')).reply, 'Start Codex on “fix the login bug”?');
+  assert.equal((await t.engine.command('fix the login bug')).reply, 'Started Codex on “fix the login bug”.');
   await t.engine.shutdown();
 
   // An agent Connect said nothing of is still asked: no adapter is taken as ready untested.
@@ -329,11 +313,11 @@ test('“help” is answered with what to say, “connect” opens Agents & keys
   t.deps.commands.intent = { kind: 'connect' };
   assert.deepEqual(await t.engine.command('add a key'), { reply: 'Opening Agents & keys.', openConnect: true });
   t.deps.commands.intent = { kind: 'start', task: null };
-  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should the agent work on?' });
+  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should Claude Code work on?' }); // it names the default agent
   t.deps.commands.intent = { kind: 'start', task: 'fix the cart total' };
-  assert.equal((await t.engine.command('start an agent on the cart total')).reply, 'Start Claude Code on “fix the cart total”?');
+  assert.equal((await t.engine.command('start an agent on the cart total')).reply, 'Started Claude on “fix the cart total”.');
   t.deps.commands.intent = null;
-  assert.match((await t.engine.command('blorp')).reply, /^I did not catch that\./, 'words not caught are still said so');
+  assert.equal((await t.engine.command('blorp')).reply, 'Started Claude on “blorp”.', 'words no parser read are a prompt');
   await t.engine.shutdown();
 });
 
@@ -352,7 +336,7 @@ test('“start codex” with no task keeps the agent it names: it asks what Code
   t.deps.commands.intent = noTask('claude');
   assert.deepEqual(await t.engine.command('start claude'), { reply: 'What should Claude Code work on?' });
   t.deps.commands.intent = noTask(null);
-  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should the agent work on?' });
+  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should Claude Code work on?' });
   // Signed out, as Connect says it: the same words as work that names it.
   t.engine.setHarnesses({ codex: CODEX_SIGNED_OUT });
   t.deps.commands.intent = noTask('codex');
@@ -374,14 +358,6 @@ test('naming an agent that is installed but signed out says so, and where to sig
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
   assert.deepEqual(await t.engine.command('fix the docs with codex'), { reply: SIGNED_OUT, openConnect: true });
   await assert.rejects(t.engine.startAgent({ task: 'Fix the docs', harness: 'codex' }), { message: SIGNED_OUT, openConnect: true });
-  // Signed out between the card and the yes.
-  t.engine.setHarnesses({ codex: { ok: true, ready: true, found: true, signedIn: 'yes', version: '0.166.0' } });
-  const card = await t.engine.command('fix the docs with codex');
-  assert.ok(card.confirm, card.reply);
-  t.engine.setHarnesses({ codex: CODEX_SIGNED_OUT });
-  const yes = await t.engine.confirm(card.confirm.id, true);
-  assert.equal(yes.reply, `I could not start the agent for “fix the docs”: ${SIGNED_OUT}`);
-  assert.equal(yes.openConnect, true);
   // Without a plain sentence of Connect's own about it, Workbench words it itself.
   t.engine.setHarnesses({ codex: { ...CODEX_SIGNED_OUT, reason: 'not signed in\nrun codex login' } });
   assert.equal((await t.engine.command('fix the docs with codex')).reply, 'Codex is installed but not signed in. Sign in in Agents & keys.');
@@ -408,19 +384,18 @@ test('a key typed into the board is never sent, parsed, kept or logged, and Agen
   assert.equal(k.calls.parse.length, 0, 'not even read as words');
   assert.ok(k.notices.includes(SECRET));
 
-  // A card on screen stays, and still takes its yes.
-  k.deps.commands.intent = { kind: 'task', task: 'fix the cart total' };
-  const card = await k.engine.command('fix the cart total');
+  // A card on screen stays, and still takes its answer.
+  const v = await k.engine.startAgent({ task: 'Fix the cart total' });
+  const runner = k.claude.runners[0];
+  k.deps.commands.intent = { kind: 'stop', agentIds: [v.id], sure: false };
+  const card = await k.engine.command('stop the cart one');
   const again = await k.engine.command(key, { confirmId: card.confirm.id });
   assert.equal(again.reply, SECRET);
   assert.equal(again.openConnect, true);
   assert.equal(again.confirm.id, card.confirm.id);
-  const yes = await k.engine.confirm(card.confirm.id, true);
-  assert.match(yes.reply, /^Started /);
+  assert.equal((await k.engine.confirm(card.confirm.id, false)).reply, 'OK, I won’t stop it.');
 
   // In the reply box: as a message, or as an answer.
-  const [v] = k.store.list();
-  const runner = k.claude.runners[0];
   assert.deepEqual(await k.engine.say(v.id, `here it is: ${key}`), { ok: false, reply: SECRET, openConnect: true });
   assert.deepEqual(await k.engine.answer(v.id, { answer: key }), { ok: false, reply: SECRET, openConnect: true });
   assert.deepEqual(runner.sent, [], 'nothing reached the agent');
@@ -436,7 +411,7 @@ test('a key typed into the board is never sent, parsed, kept or logged, and Agen
   assert.ok(!everything.includes(key.slice(-12)), 'not even in part');
 });
 
-test('text that holds a stored key’s value is refused like a key, though it has no key’s shape: no card, runner, branch or folder', async (t) => {
+test('text that holds a stored key’s value is refused like a key, though it has no key’s shape: no runner, branch or folder', async (t) => {
   const dir = scratch(t);
   const logPath = path.join(dir, 'events.jsonl');
   const logs = [];
@@ -449,10 +424,7 @@ test('text that holds a stored key’s value is refused like a key, though it ha
   const v = await k.engine.startAgent({ task: 'Fix the staging login' });
   const runner = k.claude.runners[0];
 
-  // Before it is stored, the same words are work, or a message, and their cards quote them.
-  k.deps.commands.intent = { kind: 'task', task: words };
-  const before = await k.engine.command(words);
-  assert.ok(before.confirm, before.reply);
+  // Before it is stored, the same words in a message are a message, and its card quotes them.
   k.deps.commands.intent = { kind: 'say', agentId: v.id, text: `the password is ${value}`, sure: false };
   const tell = await k.engine.command(`tell it the password is ${value}`);
   assert.equal(tell.confirm?.kind, 'say', tell.reply);
@@ -462,11 +434,11 @@ test('text that holds a stored key’s value is refused like a key, though it ha
   assert.deepEqual(await k.engine.command(words), { reply: SECRET, openConnect: true });
   assert.equal(k.calls.parse.length, parsed, 'not even read as words');
 
-  // The cards from before: their yes starts nothing and sends nothing, and the reply does not quote the words.
-  const yes = await k.engine.confirm(before.confirm.id, true);
-  assert.equal(yes.reply, SECRET);
-  assert.equal(yes.openConnect, true);
+  // The card from before: its yes sends nothing, and the reply does not quote the words. Words given as work now start
+  // nothing either (above): no runner, branch or folder is named after them.
   assert.deepEqual(await k.engine.confirm(tell.confirm.id, true), { reply: SECRET, openConnect: true });
+  k.deps.commands.intent = { kind: 'task', task: words };
+  assert.deepEqual(await k.engine.command(`please ${words}`), { reply: SECRET, openConnect: true });
   // Given straight to the launch, as the task or as the agent's name.
   await assert.rejects(k.engine.startAgent({ task: words }), { message: SECRET, openConnect: true });
   await assert.rejects(k.engine.startAgent({ task: 'Fix the staging login', name: value }), { message: SECRET, openConnect: true });
@@ -736,31 +708,34 @@ test('an agent that fails after it started is in the log: its name and why, on o
   await t.engine.shutdown();
 });
 
-test('every yes to a launch question is in the log, when it came and how it ended, with the reasons the person was given; so is a yes for a question that has gone', async () => {
+test('every start is in the log, when it came and how it ended, with the reasons the person was given; so is a yes for a card that has gone', async () => {
   const logs = [];
-  const t = live({ log: (level, ...args) => logs.push([level, ...args.map(String)].join(' ')) });
+  const codex = fakeAdapter('codex');
+  const t = live({ adapters: { claude: fakeAdapter('claude', { failStart: new Error('spawn claude ENOENT') }), codex }, log: (level, ...args) => logs.push([level, ...args.map(String)].join(' ')) });
   await t.engine.start();
   // one that starts
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'codex' }] };
   const first = await t.engine.command('codex fix the docs');
-  const started = await t.engine.confirm(first.confirm.id, true);
-  assert.equal(started.agentIds.length, 1);
-  assert.deepEqual(logs, ['warn A yes to a launch question came: starting one agent.', 'warn After a yes to a launch question, 1 of 1 started.']);
-  // one that does not: the agent went away between the card and the yes
+  assert.equal(first.agentIds.length, 1);
+  assert.deepEqual(logs, ['warn Words came that start work: starting one agent.', 'warn Of the work asked for, 1 of 1 started.']);
+  // one that does not: its program would not start
   logs.length = 0;
-  const card = await t.engine.command('codex fix the docs');
-  t.engine.setHarnesses({ codex: { ok: false, reason: 'Codex is not installed.' } });
-  const yes = await t.engine.confirm(card.confirm.id, true);
-  assert.equal(yes.reply, 'I could not start the agent for “fix the docs”: Codex is not available on this computer.');
-  assert.deepEqual(logs, ['warn A yes to a launch question came: starting one agent.', `warn After a yes to a launch question, 0 of 1 started. ${yes.reply}`]);
-  // the same card again, and one that never was: nothing is done, and the log says so
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the docs', harness: 'claude' }] };
+  const failed = await t.engine.command('claude fix the docs');
+  assert.deepEqual(failed.agentIds, []);
+  assert.match(failed.reply, /^Fix docs could not start\. /);
+  assert.equal(logs[0], 'warn Words came that start work: starting one agent.');
+  assert.ok(logs.includes(`warn Of the work asked for, 0 of 1 started. ${failed.reply}`), logs.join('\n'));
+  // a card answered twice, and one that never was: nothing is done, and the log says so
   logs.length = 0;
+  t.deps.commands.intent = { kind: 'stop', agentIds: [first.agentIds[0]], sure: false };
+  const card = await t.engine.command('stop the docs one');
+  await t.engine.confirm(card.confirm.id, false);
   assert.equal((await t.engine.confirm(card.confirm.id, true)).reply, 'That request is no longer waiting. Ask again if you still want it.');
   assert.deepEqual(logs, ['warn A yes came for a question that was no longer waiting, so nothing was done.']);
   // a no is not logged, for a card that is there or one that has gone
   logs.length = 0;
-  t.engine.setHarnesses({ codex: { ok: true, version: '0.166.0' } });
-  const third = await t.engine.command('codex fix the docs');
+  const third = await t.engine.command('stop the docs one');
   await t.engine.confirm(third.confirm.id, false);
   await t.engine.confirm('no-such-card', false);
   assert.deepEqual(logs, []);
