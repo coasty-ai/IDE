@@ -155,6 +155,7 @@ const R = Object.freeze({
   fullToolUnclear: 'Full permissions are on, but Workbench could not tell where this tool works, so it did not allow it.',
   fullToolClaude: "Full permissions are on, but this tool works on a place in Claude Code's own settings, and Workbench could not tell whether it changes it, so it did not allow it.",
   fullCdClaude: "Full permissions are on, but this would move the shell into Claude Code's own settings, where its next commands could change them, so it did not allow it.",
+  fullCdUnclear: "Full permissions are on, but Workbench could not tell where this would leave the shell, and the command names Claude Code's own settings, so it did not allow it.",
   fullCodeClaude: "Full permissions are on, but Workbench could not tell what this does with Claude Code's own settings, which it names, so it did not allow it.",
 });
 
@@ -371,11 +372,11 @@ function landing(p, b, base, { deep = false, into = null } = {}) {
 /**
  * A command line, as far as the policy can tell. Refused when a part would write into Claude Code's own settings (its
  * redirections, and the files its program writes: writeTargets), when the shell would be left in them when the line ends
- * (staysInClaude: the next command's words are read from the agent's own folder), when a part runs code it is given whose
+ * (shellLeftIn: the next command's words are read from the agent's own folder), when a part runs code it is given whose
  * text names them (codeNamesClaude, xargs and parallel too) or a program whose name is put together when it runs and is
- * given their name (`$(echo rm) -rf .claude`), or when the policy cannot tell where a part writes (a place that cannot be
- * resolved; in a line that names them outside a heredoc's text, a place that holds a variable or another command's
- * output). Reads, mentions in the words of commands that write elsewhere, and a script run from there all run.
+ * given their name (`$(echo rm) -rf .claude`), or when the policy cannot tell where a part writes or leaves the shell (a
+ * place that cannot be resolved; in a line that names them outside a heredoc's text, a place that holds a variable or
+ * another command's output). Reads, mentions in the words of commands that write elsewhere, and a script run from there all run.
  *
  * The line is read with its braces expanded into the words they make (expandBraces) and each part whole (narrate's
  * shellCommands, `whole`): another command's output ($(…), `…`, <(…)) leaves a hole (FILLED) in its word and the command
@@ -402,12 +403,15 @@ function commandFloor(command, base) {
     if (codeNamesClaude(c, line) || builtProgram(c)) code = true;
   }
   if (!code && feedsNames(parts) && textNamesClaude(line)) code = true;
-  if (base && staysInClaude(parts, base)) return R.fullCdClaude;
+  const left = base ? shellLeftIn(parts, base) : null;
+  if (left === 'claude') return R.fullCdClaude;
   if (code) return R.fullCodeClaude;
   if (unclear) return R.fullWriteUnclear;
-  // Where a line that names them writes cannot be read when a place it writes holds a variable or another command's output:
-  // "X=.claude; rm -rf "$X"", "for d in .claude …; do rm -rf "$d"; done", "rm -rf "$(echo .claude)"", "$(pwd)/.claude/x".
+  // Where a line that names them writes, or leaves the shell, cannot be read when the place holds a variable or another
+  // command's output: "X=.claude; rm -rf "$X"", "for d in .claude …; do rm -rf "$d"; done", "rm -rf "$(echo .claude)"",
+  // "$(pwd)/.claude/x", "X=.claude; cd "$X"".
   if (carried && named) return R.fullWriteUnclear;
+  if (left === 'carried' && named) return R.fullCdUnclear;
   return null;
 }
 
@@ -494,17 +498,20 @@ function cdTo(c) {
 
 /** A folder in Claude Code's own settings that a cd leads to, though its path cannot be resolved (~nobody/.claude). */
 const IN_CLAUDE = Symbol('in Claude Code’s settings');
+/** A folder a cd leads to that a variable or another command's output holds (`cd "$X"`), or one that a relative cd from there reaches. */
+const CARRIED = Symbol('held in a value the shell fills in');
 
 /**
- * Whether the shell would be left in Claude Code's own settings when the line ends, so that its next commands, whose words
- * are read from the agent's own folder, would run there. Only the shell's own commands count: a cd in a subshell, in
- * another command's output, in a shell of its own (sh -c), in the background, or before the last command of a pipe stays
- * there (zsh runs a pipe's last command in the shell itself; eval runs its commands there too). The line is read as it runs
- * when each of its commands succeeds, a command after || may run or not, and cd, cd -, pushd and popd are followed, each
- * folder resolved before it is judged (`cd .claude/..` is the agent's folder). A folder held in a variable is not known.
+ * Where the shell would be left when the line ends, as far as it matters to its next commands, whose words are read from the
+ * agent's own folder: 'claude' when it may be in Claude Code's own settings, 'carried' when it may be in a folder that a
+ * variable or another command's output holds (commandFloor reads the line around it), else null. Only the shell's own
+ * commands count: a cd in a subshell, in another command's output, in a shell of its own (sh -c), in the background, or
+ * before the last command of a pipe stays there (zsh runs a pipe's last command in the shell itself; eval runs its commands
+ * there too). The line is read as it runs when each of its commands succeeds, a command after || may run or not, and cd,
+ * cd -, pushd and popd are followed, each folder resolved before it is judged (`cd .claude/..` is the agent's folder).
  */
-function staysInClaude(parts, base) {
-  const key = s => [s.dir, s.prev, ...s.stack].map(d => (typeof d === 'symbol' ? '\u0001' : String(d))).join('\n');
+function shellLeftIn(parts, base) {
+  const key = s => [s.dir, s.prev, ...s.stack].map(d => (typeof d === 'symbol' ? d.description : String(d))).join('\n');
   const uniq = list => [...new Map(list.map(s => [key(s), s])).values()];
   const walk = (list, start) => {
     let states = start;
@@ -523,12 +530,13 @@ function staysInClaude(parts, base) {
     return states;
   };
   const end = walk(parts.filter(c => !c.nested && !c.inEval), [{ dir: base, prev: null, stack: [] }]);
-  if (end === null) return true; // more ways than can be followed
-  return end.some(s => {
+  if (end === null) return 'claude'; // more ways than can be followed
+  const inClaude = end.some(s => {
     if (typeof s.dir !== 'string') return s.dir === IN_CLAUDE;
     const r = throughLinks(resolveReal(s.dir, base), base); // links followed: `cd cfg`, where cfg leads into .claude
     return r.ok ? settingsPlace(r.real, base) : textNamesClaude(s.dir);
   });
+  return inClaude ? 'claude' : end.some(s => s.dir === CARRIED) ? 'carried' : null;
 }
 
 /**
@@ -567,17 +575,19 @@ function moveDir(s, c, base) {
 
 /**
  * The folder a cd to `word` leads to from folder `from`, as the shell's cd reads it: the path, with each ".." taking away the
- * folder before it (links are followed when it is judged), a folder the line makes first included. IN_CLAUDE for ~user/.claude
- * and the like, which cannot be resolved but name Claude Code's settings; null when it cannot be known (a variable, another
- * command's output, ~user, a relative path from a folder not known).
+ * folder before it (links are followed when it is judged), a folder the line makes first included. IN_CLAUDE for a path that
+ * cannot be resolved but names Claude Code's settings (~user/.claude, "$X/.claude"); CARRIED for a variable or another
+ * command's output, and for a relative path from such a folder; null when it cannot be known otherwise (~user, a relative
+ * path from a folder not known).
  */
 function dirOf(word, from) {
-  if (filled(word)) return null;
   let w = withHome(word);
+  if (filled(w)) return textNamesClaude(w) ? IN_CLAUDE : CARRIED;
   if (w === '~' || w.startsWith('~/')) w = os.homedir() + w.slice(1);
   else if (w.startsWith('~')) return textNamesClaude(w) ? IN_CLAUDE : null;
   if (!w.startsWith('/')) {
     // from a folder not known, a relative path is not known either; from inside the settings, one that never steps back stays there
+    if (from === CARRIED) return CARRIED;
     if (typeof from !== 'string') return from === IN_CLAUDE && !w.split('/').includes('..') ? IN_CLAUDE : null;
     w = from + '/' + w;
   }

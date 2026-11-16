@@ -135,29 +135,44 @@ export const FILLED = '\u0000';
 
 /** Keywords after which a command still starts: a `{` or a `(` there opens a group or a subshell. */
 const COMMAND_START = /^\s*(?:(?:then|do|else|elif|if|while|until|!|time)\s+)*$/;
+/** Keywords whose parentheses hold a list or a pattern, not a subshell or a word's group: `case x in (a) …`, zsh's `for f (a b) …`. */
+const LIST_KEYWORD = /^\s*(?:case|for|foreach|select)\s/;
 
 /**
  * The parts of a command line as the floor for full permissions reads them (src/core/policy.mjs): each a whole command,
  * whatever its words hold. Another command's output (`$(…)`, `` `…` ``, `<(…)`, `>(…)`, `=(…)`) leaves a hole (FILLED) in its word,
  * and the outer command goes on past it: `mv $(echo a.txt) .mcp.json` is one mv with two words, the commands inside are
- * parts of their own. `(` opens a subshell only where a command starts; after a command's first word it opens a pattern
- * group or an array, part of the word up to its `)` (zsh's `rm -rf (.claude|x)`), and after a function's name it is the
- * `()` of its definition. `{` and `}` split only as words of their own where a command starts (a group, or a function's
- * body); elsewhere, `{}` included, they are words (`find … -exec cp {} … \;`). Quotes, backslashes, `${…}`, heredocs and
- * redirections are read as shellParts reads them. Each part also says whether the shell runs it itself (`nested` false) or a
- * subshell does (inside `( )`, `$( )`, `` ` ` ``, `<( )` or `>( )`), and what ended it (`sep`: ';', '&&', '||', '|', '&',
- * a new line, ')' at a subshell's end, or '').
+ * parts of their own; `${…}` is part of its word up to its own `}`, and output inside it is read the same way. `(` opens a
+ * subshell only where a command starts; after a command's first word it opens a pattern group or an array, part of the word
+ * up to its `)` (zsh's `rm -rf (.claude|x)`), after a function's name it is the `()` of its definition, and after case,
+ * for, foreach and select it holds a pattern or a list, after which a command starts (`case x in (a) …`, `for f (a b) …`).
+ * `{` splits only as a word of its own where a command starts (a group, or a function's body); elsewhere, `{}` included,
+ * it is a word (`find … -exec cp {} … \;`). A `}` of its own ends a command, as zsh reads it anywhere (`{ cp a b }`); bash
+ * reads it as one more word, so when words follow it, all the words, read so, are a part of their own too (`nested`). A `#`
+ * that starts a word starts a comment, to the end of its line. Quotes, backslashes, heredocs and redirections are read as
+ * shellParts reads them. Each part also says whether the shell runs it itself (`nested` false) or a subshell does (inside
+ * `( )`, `$( )`, `` ` ` ``, `<( )` or `>( )`), and what ended it (`sep`: ';', '&&', '||', '|', '&', a new line, ')' at a
+ * subshell's end, '{' or '}', or '').
  * @returns {{ text: string, writes: boolean, redir: object[], nested: boolean, sep: string }[]}
  */
 function lineParts(cmd) {
   const parts = [];
-  const frames = []; // what is open: a subshell ('paren'), another command's output ('sub', 'tick') or a pattern group ('group')
+  // what is open: a subshell ('paren'), another command's output ('sub', 'tick'), a ${…} ('param') or a pattern group ('group')
+  const frames = [];
   let nested = 0; // how many subshells and outputs the current part is in
   const fresh = () => ({ text: '', writes: false, redir: [], nested: nested > 0, sep: '' });
   let cur = fresh();
   let q = null; // the open quote, ' or "
   let heredoc = null;
-  const end = (sep) => { if (cur.text.trim()) { cur.sep = sep; parts.push(cur); } cur = fresh(); };
+  const end = (sep) => {
+    if (cur.text.trim()) {
+      cur.sep = sep;
+      parts.push(cur);
+      // after a "}" of its own in the middle of a command: bash's reading, all its words one command, as a part the shell does not run itself
+      if (cur.shadow) parts.push({ text: `${cur.shadow} ${cur.text}`, writes: cur.writes, redir: [], nested: true, sep });
+    }
+    cur = fresh();
+  };
   const starts = () => COMMAND_START.test(cur.text);
   // another command's output: a hole in this word, which goes on after it; the commands inside are parts of their own
   const open = (kind) => { cur.text += FILLED; frames.push({ kind, q, saved: cur }); q = null; nested++; cur = fresh(); };
@@ -170,9 +185,11 @@ function lineParts(cmd) {
     if (ch === '\\') { cur.text += ch + (cmd[k + 1] || ''); k++; continue; }
     if (ch === '`') { if (frames.at(-1)?.kind === 'tick') close(); else open('tick'); continue; }
     if (ch === '$' && cmd[k + 1] === '(') { open('sub'); k++; continue; }
-    if (ch === '$' && cmd[k + 1] === '{') { k = paramEnd(cmd, k, cur); continue; }
+    // ${…} is part of its word, up to its own "}", and another command's output in it ("${X:-$(…)}") is read as above
+    if (ch === '$' && cmd[k + 1] === '{') { cur.text += '${'; frames.push({ kind: 'param', q }); q = null; k++; continue; }
     if (q === '"') { if (ch === '"') q = null; cur.text += ch; continue; }
     if (ch === "'" || ch === '"') { q = ch; cur.text += ch; continue; }
+    if (frames.at(-1)?.kind === 'param') { cur.text += ch; if (ch === '}') q = frames.pop().q; continue; }
     // <(…) and >(…), and zsh's =(…) at the start of a word: another command's output, as a file
     if ((ch === '<' || ch === '>' || (ch === '=' && /^\s?$/.test(cmd[k - 1] ?? ''))) && cmd[k + 1] === '(') { open('sub'); k++; continue; }
     if (frames.at(-1)?.kind === 'group') { // a pattern group's words and bars are its word's, up to its ")"
@@ -181,6 +198,8 @@ function lineParts(cmd) {
       cur.text += ch;
       continue;
     }
+    // a case pattern's "(" and zsh's "for x (a b) …" list end the words before them, and the command after them starts afresh
+    if ((ch === '(' || ch === ')') && LIST_KEYWORD.test(cur.text)) { end(''); continue; }
     if (ch === '(') {
       if (starts()) { end(''); frames.push({ kind: 'paren' }); nested++; cur = fresh(); continue; }
       const fn = /^\(\s*\)/.exec(cmd.slice(k));
@@ -203,6 +222,18 @@ function lineParts(cmd) {
     if ((ch === '{' || ch === '}') && alone(k) && (starts() || (ch === '{' && /^\s*function\s+[^\s;&|()<>]+\s*$/.test(cur.text)))) {
       cur.text = ''; // a group, or a function's body: its commands are the shell's own
       end(ch);
+      continue;
+    }
+    if (ch === '}' && alone(k)) {
+      // zsh ends a group at a "}" of its own anywhere ("{ cp a.txt b }"); bash takes it for one more word of the command
+      const before = cur.text;
+      end('}');
+      cur.shadow = `${before}}`;
+      continue;
+    }
+    if (ch === '#' && /^[\s;&|()]?$/.test(cmd[k - 1] ?? '')) { // a comment, to the end of its line
+      const nl = cmd.indexOf('\n', k);
+      k = (nl < 0 ? cmd.length : nl) - 1;
       continue;
     }
     if (ch === ';') { end(';'); continue; }
@@ -308,6 +339,8 @@ const GIT_VALUE_OPTS = /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|-
  * only in their own word.)
  */
 const WRAPPER_VALUES = Object.freeze({
+  sudo: { short: 'ugCDhprtTU', long: ['user', 'group', 'close-from', 'chdir', 'host', 'prompt', 'role', 'type', 'command-timeout', 'other-user'] },
+  doas: { short: 'uC', long: [] },
   env: { short: 'uCSP', long: ['unset', 'chdir', 'split-string'] },
   timeout: { short: 'sk', long: ['signal', 'kill-after'] },
   nice: { short: 'n', long: ['adjustment'] },
@@ -333,17 +366,33 @@ function pastOptions(words, k, spec) {
   return k;
 }
 
+/** Read whole, these run the command after them too: sudo and doas, and zsh's noglob, nocorrect and repeat N. */
+const WHOLE_WRAPPERS = new Set([...WRAPPERS, 'sudo', 'doas', 'noglob', 'nocorrect', 'repeat']);
+
+/** env's -S (--split-string): its value is split into the words of the command it runs, in its place. Where they go on. */
+function splitEnv(words, k) {
+  for (let j = k; j < words.length && words[j].startsWith('-') && words[j] !== '--'; j++) {
+    const m = /^(?:-S|--split-string(?:=|$))(.*)$/s.exec(words[j]);
+    if (!m) continue;
+    const [value, used] = m[1] !== '' ? [m[1], 1] : [words[j + 1] ?? '', 2];
+    return [...words.slice(0, j), ...shellWords(value), ...words.slice(j + used)];
+  }
+  return words;
+}
+
 /**
  * One simple command: its program (without a folder), the words after it, and what git or a package tool is asked
  * to do. `words` keeps every word of the part, and `at` is where the program is among them (after NAME=value and
- * wrappers such as `timeout 10`). Read `whole` (for the floor), a wrapper's options that take a value take it first.
+ * wrappers such as `timeout 10`). Read `whole` (for the floor), a wrapper's options that take a value take it first, sudo,
+ * doas and zsh's precommand words are wrappers too, and env -S's words are the command's.
  */
 function simpleCommand(words, writes, whole = false) {
   let k = 0;
   for (;;) {
     while (k < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k])) k++; // NAME=value before the command
-    if (k < words.length && WRAPPERS.has(words[k])) {
+    if (k < words.length && (whole ? WHOLE_WRAPPERS : WRAPPERS).has(words[k])) {
       const wrapper = words[k++];
+      if (whole && wrapper === 'env') words = splitEnv(words, k);
       if (whole && Object.hasOwn(WRAPPER_VALUES, wrapper)) k = pastOptions(words, k, WRAPPER_VALUES[wrapper]);
       else while (k < words.length && /^(-|\d)/.test(words[k])) k++;
       continue;

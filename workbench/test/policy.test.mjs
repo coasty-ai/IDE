@@ -1529,6 +1529,7 @@ const TOOL_UNCLEAR = 'Full permissions are on, but Workbench could not tell wher
 const TOOL_CLAUDE = "Full permissions are on, but this tool works on a place in Claude Code's own settings, and Workbench could not tell whether it changes it, so it did not allow it.";
 const CD_CLAUDE = "Full permissions are on, but this would move the shell into Claude Code's own settings, where its next commands could change them, so it did not allow it.";
 const CODE_CLAUDE = "Full permissions are on, but Workbench could not tell what this does with Claude Code's own settings, which it names, so it did not allow it.";
+const CD_UNCLEAR_REASON = "Full permissions are on, but Workbench could not tell where this would leave the shell, and the command names Claude Code's own settings, so it did not allow it.";
 
 /** Each row is refused with full permissions on, with exactly this reason. `run` decides one row (full permissions on). */
 function refusedWith(rows, reason, run = full) {
@@ -1656,6 +1657,13 @@ test('with full permissions on, a place written out is refused whatever another 
     bash('{ echo x; } > .claude/x'),
     // "{}" stands for what find finds, in the command it runs and in a shell's command it runs; a copy named after a name it looks for
     bash('find .claude -exec rm {} \\;'), bash("find .claude -exec sh -c 'rm {}' \\;"), bash('find . -name .mcp.json -exec cp {} src/ \\;'),
+    // a case pattern's "(" and zsh's short loops; sudo, doas, env -S and zsh's precommand words before the command; another
+    // command's output inside ${…}; zsh's group that ends at a "}" of its own, and bash's reading of that "}" as a word; a comment
+    bash('case x in (a) rm -rf .claude;; esac'), bash('for f (a b) rm -rf .claude'), bash('foreach f (a b) rm -rf .claude; end'),
+    bash("sudo sh -c 'rm -rf .claude'"), bash("doas sh -c 'rm -rf .claude'"), bash("sudo -u root bash -c 'cd .claude && rm settings.json'"),
+    bash("env -S 'rm -rf .claude'"), bash('noglob rm -rf .claude'), bash('nocorrect rm -rf .claude'), bash('repeat 2 rm -rf .claude'),
+    bash('echo ${X:-$(rm -rf .claude)}'), bash('echo "${X:-$(rm -rf .claude)}"'), bash('{ cp a.txt .mcp.json }'), bash('rm -rf } .claude'),
+    bash('cp a.txt .mcp.json # copy it in'),
   ];
   refusedWith(rows, FLOOR_REASON);
   for (const row of rows) assert.notEqual(decide({ cwd, ...row }).decision, 'allow', JSON.stringify(row.input)); // none runs without asking when they are off
@@ -1739,21 +1747,28 @@ test('with full permissions on, code that names Claude Code’s own settings whe
     bash("python3 - <<'EOF'\nimport os; os.remove('.mcp.json')\nEOF"), bash('parallel rm -rf ::: .claude'),
     // in a word of options, -l and -0 take only digits (perl), and node's -p before -e prints what -e runs
     bash(`perl -le 'unlink ".mcp.json"'`), bash(`perl -lne 'unlink ".mcp.json"' list.txt`), bash(`node -pe "require('fs').rmSync('.claude', { recursive: true })"`),
-    // a program whose name is put together when the line runs, given their name
+    // a program whose name is put together when the line runs, given their name; code behind sudo
     bash('$(echo rm) -rf .claude'), bash('$RM -rf .claude'), bash('"$(which rm)" .mcp.json'), bash('`echo rm` -rf .claude'),
+    bash(`sudo python3 -c "import shutil; shutil.rmtree('.claude')"`),
   ], CODE_CLAUDE);
+  // a folder a variable or another command's output holds, in a line that names them: where the shell is left cannot be told
+  refusedWith([bash('X=.claude; cd "$X"'), bash('cd "$(echo .claude)"'), bash('for d in src .claude; do cd "$d"; done'),
+    bash('cd "$(dirname .claude/settings.json)" && ls')], CD_UNCLEAR_REASON);
   // the shell would stay there when the line ends: its next command's words are read from the agent's own folder. The line is
   // read as it runs when each of its commands succeeds; a command after || may run or not; zsh runs a pipe's last command itself
   refusedWith([bash('cd .claude'), bash('pushd .claude > /dev/null'), bash('cd cfg'), bash('cd ~/.claude && ls'), bash('cd .claude && ls'),
     bash('false || cd .claude'), bash('cd .claude || exit 1'), bash("eval 'cd .claude'"), bash('echo | cd .claude'), bash('cd .claude && ls || cd ..'),
-    bash('cd src; cd ../.claude'), bash('pushd .claude && pushd src && popd'), bash('cd ~nobody/.claude')], CD_CLAUDE);
+    bash('cd src; cd ../.claude'), bash('pushd .claude && pushd src && popd'), bash('cd ~nobody/.claude'), bash('{ cd .claude }'),
+    bash('cd .claude # and stay'), bash('cd "$X/.claude"')], CD_CLAUDE);
   // a script given as a file, code that names nothing of theirs, and names passed to a program that only reads, run
   allowedInFull([bash('python3 scripts/x.py .claude'), bash('node -e "console.log(1)"'), bash('echo hi | sh'), bash('ls .claude | xargs -n1 echo'),
     bash('cd src && rm old.js'), bash('$EDITOR notes.md; cat .claude/settings.json'),
     // the shell does not stay there: a subshell, a step back out, popd, cd -, a shell of its own, the background, a pipe's first command
     bash('(cd .claude && ls)'), bash('pushd .claude && ls && popd'), bash('cd .claude/.. && ls'), bash('cd .claude; ls; cd -'), bash('pushd .claude; ls; popd'),
     bash('cd .claude/hooks && ls && cd ../..'), bash("sh -c 'cd .claude && ls'"), bash('cd .claude && ls &'), bash('x=$(cd .claude && pwd); echo "$x"'),
-    bash('cd .claude | cat'), bash('cd .claude && ls && cd -'), bash('if (cd .claude); then ls; fi')]);
+    bash('cd .claude | cat'), bash('cd .claude && ls && cd -'), bash('if (cd .claude); then ls; fi'),
+    // a folder held in a variable, in a line that does not name them, is not known: it runs
+    bash('cd "$REPO" && git status'), bash('cd "$(git rev-parse --show-toplevel)" && npm test')]);
 });
 
 test('with full permissions on, a tool of another service is judged by the places it is given, not by what its text mentions', () => {

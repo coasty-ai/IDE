@@ -225,9 +225,23 @@ test('shellCommands read whole, for the floor: another command’s output leaves
   assert.deepEqual(ev.map(c => [c.prog, !!c.nested, !!c.inEval]), [['eval', false, false], ['cd', false, true]]);
   assert.equal(ev[0].kids[0], ev[1]);
   assert.deepEqual(whole("sh -c 'cd .claude && ls'").map(c => [c.prog, !!c.nested]), [['sh', false], ['cd', true], ['ls', true]]);
-  // "{" and "}" are words but where a command starts; "{}" always; "(" after a command's first word is zsh's pattern group
-  assert.deepEqual(shape('echo { a }')[0].slice(0, 2), ['echo', ['{', 'a', '}']]);
+  // "{" is a word but where a command starts, "{}" always; a "}" of its own ends a command as zsh reads it, and bash's reading,
+  // where it is one more word, is kept as a nested part when words follow it; "(" after a command's first word is zsh's pattern group
+  assert.deepEqual(shape('echo { a }'), [['echo', ['{', 'a'], false, '}']]);
+  assert.deepEqual(shape('{ cp a.txt .mcp.json }'), [['cp', ['a.txt', '.mcp.json'], false, '}']]);
+  assert.deepEqual(shape('rm -rf } .claude'), [['rm', ['-rf'], false, '}'], ['.claude', [], false, ''], ['rm', ['-rf', '}', '.claude'], true, '']]);
   assert.deepEqual(shape('rm -rf (.claude|x)'), [['rm', ['-rf', '(.claude|x)'], false, '']]);
+  // a case pattern's "(" and zsh's "for x (a b)" list start the command after them afresh
+  assert.deepEqual(shape('case x in (a) rm -rf .claude;; esac').map(c => c[0]), ['case', 'a', 'rm', 'esac']);
+  assert.deepEqual(shape('for f (a b) rm -rf .claude').map(c => c.slice(0, 2)), [['for', ['f']], ['a', ['b']], ['rm', ['-rf', '.claude']]]);
+  // another command's output inside ${…}, a comment, sudo, doas, zsh's precommand words and env -S
+  assert.deepEqual(shape('echo ${X:-$(rm -rf .claude)}').map(c => c.slice(0, 3)), [['rm', ['-rf', '.claude'], true], ['echo', [`\${X:-${H}}`], false]]);
+  assert.deepEqual(shape('echo "${X:-a}" > b').map(c => c[0]), ['echo']);
+  assert.deepEqual(shape('cp a.txt .mcp.json # copy it in').map(c => c.slice(0, 2)), [['cp', ['a.txt', '.mcp.json']]]);
+  assert.deepEqual(shape('echo a#b').map(c => c[1]), [['a#b']]);
+  for (const cmd of ["sudo -u root sh -c 'x'", "doas sh -c 'x'", "noglob sh -c 'x'", "repeat 2 sh -c 'x'", "env -S 'sh -c x'", 'env -S"sh -c x"']) {
+    assert.equal(whole(cmd)[0].prog, 'sh', cmd);
+  }
   // read the old way, nothing changes
   assert.deepEqual(shellCommands('mv $(echo a.txt) .mcp.json').map(c => c.prog), ['mv', 'echo', '.mcp.json']);
   assert.equal(shellCommands('xargs -a list.txt cp -t .claude')[0].prog, 'list.txt');
