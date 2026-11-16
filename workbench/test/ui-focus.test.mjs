@@ -400,6 +400,24 @@ test('a merge that did not go through can be let go: a quiet "Dismiss" under the
   assert.equal(labelled(v.html, 'Look later').act, 'later');
 });
 
+test('only the problem lid\'s own "Dismiss" lets a merge that did not go through go; a look drawn before it marks the finish alone', { skip }, async () => {
+  const { markReviewed, S, finishKey } = await load();
+  const { problemKey } = await import('../ui/queue.js');
+  const a = finished({ work: problem('conflict', 'x', ['a.js']) });
+  S.reviewed.clear();
+  // "Not now" or "Looks good" (no data-work), drawn before the merge went wrong
+  markReviewed(a);
+  assert.deepEqual([...S.reviewed], [finishKey(a)]);
+  // the problem lid's Dismiss, drawn for this very problem
+  markReviewed(a, { problem: true });
+  assert.deepEqual([...S.reviewed].sort(), [finishKey(a), problemKey(a)].sort());
+  // with no problem there is nothing more to mark
+  S.reviewed.clear();
+  markReviewed(finished(), { problem: true });
+  assert.deepEqual([...S.reviewed], [finishKey(finished())]);
+  S.reviewed.clear();
+});
+
 test('thrown away: "<Name>’s work was thrown away." and Dismiss', { skip }, async () => {
   const { lidView, S } = await load();
   live(S);

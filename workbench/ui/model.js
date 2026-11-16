@@ -27,12 +27,14 @@ function tab() { try { return sessionStorage; } catch { return null; } }
 export const finishKey = Q.finishKey;
 
 /**
- * "Looks good" / "Not now" / "Dismiss": this finish has been looked at. "Dismiss" on a merge that did not go through
- * lets that problem go too (Q.problemKey), so it leaves the board, and stays off it if the problem clears.
+ * "Looks good" / "Not now" / "Dismiss": this finish has been looked at. `problem`: it was the "Dismiss" of a merge that
+ * did not go through, drawn for that very problem (its data-work, checked against the agent before this), so that
+ * problem goes too (Q.problemKey): it leaves the board, and stays off it if the problem clears. A look drawn before the
+ * problem came never lets the problem go.
  */
-export function markReviewed(a) {
+export function markReviewed(a, { problem = false } = {}) {
   S.reviewed.add(finishKey(a));
-  const pk = Q.problemKey(a);
+  const pk = problem ? Q.problemKey(a) : null;
   if (pk) S.reviewed.add(pk);
   Q.keepMarks(tab(), 'wb-reviewed', S.reviewed);
 }

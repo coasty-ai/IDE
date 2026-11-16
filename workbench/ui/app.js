@@ -626,7 +626,9 @@ async function actOn(b, o = {}) {
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
     } else if (act === 'reviewed') {
-      markReviewed(a);
+      // a Dismiss drawn for the work as it is now (its data-work, checked above) also lets a merge that did not go
+      // through go; one drawn before that problem came (a stopped or failed agent's) marks only the finish
+      markReviewed(a, { problem: b.dataset.work != null });
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
     } else if (act === 'later') {

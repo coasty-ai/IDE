@@ -965,6 +965,25 @@ try {
       `tray "${tray0}"; merged from the tray: chips ${chips1}, lid "${lid1}" [${quiet}]; Look later: chips ${chips2}, lid "${lid2}"; picked "${lid3}"; Dismiss: chips "${chips4}", tray "${tray4}", lid "${lid4}", row "${row}"; reload: chips "${reChips}", tray "${reTray}", lid "${reLid}"`);
   });
 
+  await run(DT + 'a "Not now" drawn before a merge went wrong does not dismiss what went wrong: its agent stays on the board', async () => {
+    // done-waits' Invoice export, its lid drawn with "Not now"; a merge of it conflicts (from elsewhere) before the lid is
+    // drawn again, and the old "Not now" is clicked
+    await open('done-waits');
+    await sleep(900);
+    const w1 = await agentOf('w1');
+    await b.ev(`window.__frames.hold = true, 1`);
+    await push('agents', [{ ...w1, work: { ...w1.work, problem: { why: 'conflict', sentence: 'Invoice export’s work does not merge cleanly into main.', paths: ['src/invoices/batch.ts'], into: 'main', at: Date.now() } } }]);
+    await sleep(500);   // the stream has brought it; the lid has not been drawn again
+    const drawn = await b.ev(`${page()}?.querySelector('[data-act="looksgood"]')?.textContent || ''`);
+    await clickIn('[data-act="looksgood"]');
+    await sleep(300);
+    await b.ev(`window.__frames.release(), 1`);
+    await sleep(1300);
+    const chips = await chipsNow(), tray = await trayNow(), lid = await lidNow();
+    check(DT + 'a "Not now" drawn before a merge went wrong does not dismiss what went wrong: its agent stays on the board',
+      drawn === 'Not now' && chips === 'w1~' && tray === '' && /does not merge cleanly into main\./.test(lid), `clicked "${drawn}" → chips "${chips}", tray "${tray}", lid "${lid}"`);
+  });
+
   await run(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent', async () => {
     const typeIt = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); };
     const sent = async () => (await posts()).filter(x => x.path === '/api/command' || /\/answer$/.test(x.path)).map(x => [x.path, x.body]);
