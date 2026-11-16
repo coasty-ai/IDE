@@ -1539,7 +1539,7 @@ export class Engine extends EventEmitter {
     for (const { v, ask } of sims) {
       this._answerSim(v, ask, 'Allow', { how: 'auto' }).catch(err => this.log.warn('The demo could not take an answer:', err));
     }
-    this.log.warn('Full permissions are on: agents run every step without asking.');
+    this.log.warn("Full permissions are on: agents ask only before steps that name Claude Code's own settings.");
     this.emit('permissions', 'full');
     const n = held.length + sims.length;
     const allowed = n ? `${n} waiting question${n === 1 ? ' was' : 's were'} allowed.` : '';

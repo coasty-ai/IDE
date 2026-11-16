@@ -42,7 +42,7 @@ const NO_GIT_IDENTITY = 'Git does not know your name and email yet. Agents can w
 /** Said at the start when neither Claude Code nor Codex can run here: Workbench starts anyway, and the page connects one. */
 const NO_AGENT = 'No coding agent is ready yet. Open the page to connect one.';
 /** The start line while full permissions are on. */
-const FULL_PERMISSIONS_ON = 'Full permissions are on: agents run every step without asking. Turn them off on the page.';
+const FULL_PERMISSIONS_ON = "Full permissions are on: agents ask only before steps that name Claude Code's own settings. Turn them off on the page.";
 /** How the start says where Claude Code was found. */
 const CLAUDE_FROM = { flag: ' (from --claude)', env: ' (from WORKBENCH_CLAUDE_BIN)', path: '', vscode: ' (from the VS Code extension)' };
 /** What each part of a clone is called, in the plain progress lines. */

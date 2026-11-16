@@ -488,14 +488,15 @@ try {
         if (h1 !== 'Let agents do anything without asking?') failures.push(`${tag}: the full permissions card did not show (${h1.slice(0, 40)})`);
         await check(tag);
       } else if (v === 'perm-launch') {
-        // a launch of eight while full permissions are on: the card says they will not ask, at every fit step
+        // a launch of eight while full permissions are on: the card says they ask only before steps that name Claude Code's
+        // own settings, at every fit step
         await load('full');
         await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = 'start eight agents on the backlog'; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return true; })()`);
         await sleep(900); await settle(100);
         const all = await b.ev(`document.querySelector('#pages .page:not(.old)')?.textContent || ''`);
         const fit = await b.ev(`document.getElementById('core').dataset.fit || '0'`);
         if (!/Start 8 agents/.test(all)) failures.push(`${tag}: the launch question did not show`);
-        else if (Number(fit) < 3 && !/so they will not ask before any step/.test(all)) failures.push(`${tag}: the launch card did not say that they will not ask`);
+        else if (Number(fit) < 3 && !/so they ask only before steps that name Claude Code's own settings/.test(all)) failures.push(`${tag}: the launch card did not say that they ask only before steps that name Claude Code's own settings`);
         await check(tag);
       } else if (v === 'stale') {
         await ctl('scenario', { name: 'demo' }); await size(s); await b.goto(`${base}/?t=bad&still=1`, 1300); await setLook(t, d); await settle(100);

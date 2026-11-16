@@ -435,7 +435,7 @@ test('full permissions kept from an earlier run are read at start and said in th
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, 'prefs.json');
   writeFileSync(file, JSON.stringify({ theme: 'ivory', detail: 'calm', answered: true, permissions: 'full' }), { mode: 0o600 });
-  const LINE = 'Full permissions are on: agents run every step without asking. Turn them off on the page.';
+  const LINE = "Full permissions are on: agents ask only before steps that name Claude Code's own settings. Turn them off on the page.";
   const on = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
   assert.equal(on.code, 0, on.err);
   assert.equal(on.lines.filter(l => l === LINE).length, 1, on.out);

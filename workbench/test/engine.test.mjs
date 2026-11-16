@@ -21,8 +21,8 @@ const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${
 const subagentPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-subagent.json', import.meta.url), 'utf8'));
 const rootPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-root-bash.json', import.meta.url), 'utf8'));
 
-/** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). */
-function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2, prefs = null } = {}) {
+/** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). `log` gets what it logs. */
+function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2, prefs = null, log = null } = {}) {
   const store = new Store();
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
@@ -32,7 +32,7 @@ function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudget
   store.on('notice', n => notices.push(n.text));
   const engine = new Engine({
     store, mode: 'live', repo: REPO, hook: HOOK, defaultBudgetUsd,
-    adapters: adapters || { claude, codex }, machines, deps, prefs,
+    adapters: adapters || { claude, codex }, machines, deps, prefs, log,
     options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
   return { store, engine, claude, codex, deps, calls, git, machines, notices };
@@ -3930,7 +3930,8 @@ test('full permissions: turning them on always asks first, with a card of its ow
 
 test('full permissions: the yes turns them on, keeps them, says so, and allows every question already waiting, helpers’ too', async () => {
   const prefs = prefsStore();
-  const t = live({ prefs });
+  const logged = [];
+  const t = live({ prefs, log: (level, ...args) => logged.push(`${level}: ${args.join(' ')}`) });
   const { id, runner } = await started(t);
   const helperId = `${id}-${subagentPayload.agent_id.slice(0, 8)}`;
   runner.emit({ kind: EV.CREATED, agentId: helperId, parentId: id, name: 'List repository files', harness: 'claude' });
@@ -3953,6 +3954,8 @@ test('full permissions: the yes turns them on, keeps them, says so, and allows e
   assert.equal(t.engine.snapshot().permissions, 'full');
   assert.deepEqual(prefs.saved, [{ permissions: 'full' }]);
   assert.equal(t.notices.filter(n => n === yes.reply).length, 1, 'said once');
+  // the log says so too, and that agents still ask before steps that name Claude Code's own settings
+  assert.deepEqual(logged.filter(l => /Full permissions/.test(l)), ["warn: Full permissions are on: agents ask only before steps that name Claude Code's own settings."]);
   assert.equal(t.store.get(id).ask, null);
   assert.equal(t.store.get(id).state, 'working');
   assert.equal(t.store.get(helperId).ask, null);
@@ -4244,7 +4247,8 @@ test('full permissions: the launch, the spending limit and Codex are as before',
   t.engine.deps.commands = commands;
   const launch = await t.engine.command('start an agent to fix the login page');
   assert.equal(launch.confirm.kind, 'start');
-  // the card is the engine's as before; the page adds, while full permissions are on, that it will not ask
+  // the card is the engine's as before; the page adds, while full permissions are on, that it asks only before steps that
+  // name Claude Code's own settings
   assert.equal(launch.confirm.detail, 'It can spend up to $2.00. It works in its own copy of shop, made from the last commit. Your 2 uncommitted changes are not included.');
   assert.equal(launch.confirm.agents, 1, 'how many agents it starts, so the page can say it or they');
   const { id } = await started(t, { task: 'Fix the cart', harness: 'codex' });
