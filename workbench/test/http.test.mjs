@@ -22,15 +22,22 @@ const hookTokenFor = (id) => crypto.createHmac('sha256', HOOK_KEY).update(`workb
 const CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'";
 
 /** An engine stand-in that records calls and lets a test release a held hook. */
-class FakeEngine {
+class FakeEngine extends EventEmitter {
   constructor(store) {
+    super();
     this.store = store;
     this.calls = [];
     this.releaseHook = null;
     this.hookSignal = null;
+    this.permissionMode = 'ask';
   }
   snapshot() {
-    return { mode: 'demo', repo: null, harnesses: { claude: true, codex: true, sim: true }, agents: this.store.list(), machines: this.store.machines(), spendTodayUsd: 0, defaultBudgetUsd: 2 };
+    return { mode: 'demo', repo: null, harnesses: { claude: true, codex: true, sim: true }, agents: this.store.list(), machines: this.store.machines(), spendTodayUsd: 0, defaultBudgetUsd: 2, permissions: this.permissionMode };
+  }
+  async permissions(mode) {
+    this.calls.push(['permissions', mode]);
+    if (mode === 'full') return { reply: 'Let agents do anything without asking?', confirm: { id: '0a1b2c3d4e61', sentence: 'Let agents do anything without asking?', detail: 'It stays on until you turn it off.', kind: 'permissions', yes: 'Turn on full permissions', no: 'Keep asking', danger: true } };
+    return { ok: true, reply: 'Agents ask again before risky steps.', permissions: 'ask' };
   }
   async command(text, opts) { this.calls.push(['command', text, opts]); return { reply: `You said ${text}` }; }
   async confirm(id, go) { this.calls.push(['confirm', id, go]); return { reply: go ? 'Started it.' : 'Cancelled.' }; }
@@ -296,7 +303,7 @@ test('the page arrives with the person’s look, detail and first answer already
   for (const p of ['/', '/index.html', '/ui/index.html', '/ui/%69ndex.html', `/?t=${TOKEN}`, `/ui/index.html?t=${TOKEN}`]) {
     const r = await req({ path: p });
     assert.equal(r.status, 200, p);
-    assert.equal(htmlTag(r.text), '<html lang="en" data-theme="ivory" data-detail="more" data-answered="1" class="boot">', p);
+    assert.equal(htmlTag(r.text), '<html lang="en" data-theme="ivory" data-detail="more" data-answered="1" class="boot" data-permissions="ask">', p);
     // only the tag changes; the length is the page's own, in bytes
     assert.equal(r.text.replace(htmlTag(r.text), ''), onDisk.replace(htmlTag(onDisk), ''), p);
     assert.equal(Number(r.headers['content-length']), Buffer.byteLength(r.text), p);
@@ -309,7 +316,7 @@ test('the page arrives with the person’s look, detail and first answer already
   }
   // the next load has a change at once
   prefs.set({ theme: 'black-gold', detail: 'calm' });
-  assert.equal(htmlTag((await req({ path: '/' })).text), '<html lang="en" data-theme="black-gold" data-detail="calm" data-answered="1" class="boot">');
+  assert.equal(htmlTag((await req({ path: '/' })).text), '<html lang="en" data-theme="black-gold" data-detail="calm" data-answered="1" class="boot" data-permissions="ask">');
   // another .html file is not the page: it goes out as it is on disk
   const other = await req({ path: '/ui/other.html' });
   assert.equal(other.text, fs.readFileSync(path.join(root, 'ui', 'other.html'), 'utf8'));
@@ -380,10 +387,10 @@ test('with the file store, a choice made on the page is in a 0600 file in a 0700
   assert.equal((await req({ method: 'POST', path: '/api/prefs', body: { detail: 'more' }, headers: auth({ 'Content-Type': 'application/json' }) })).status, 200);
   assert.equal(fs.statSync(path.join(h, '.workbench')).mode & 0o777, 0o700);
   assert.equal(fs.statSync(prefsFile(h)).mode & 0o777, 0o600);
-  assert.deepEqual(JSON.parse(fs.readFileSync(prefsFile(h), 'utf8')), { theme: 'green', detail: 'more', answered: false });
+  assert.deepEqual(JSON.parse(fs.readFileSync(prefsFile(h), 'utf8')), { theme: 'green', detail: 'more', answered: false, permissions: 'ask' });
   // the next run reads the file
   const next = await pageServer(t, root, createPrefs({ file: prefsFile(h) }));
-  assert.equal(htmlTag((await next({ path: '/' })).text), '<html lang="en" data-theme="green" data-detail="more" data-answered="0" class="boot">');
+  assert.equal(htmlTag((await next({ path: '/' })).text), '<html lang="en" data-theme="green" data-detail="more" data-answered="0" class="boot" data-permissions="ask">');
 });
 
 test('no directory listing, no hidden files, only .mjs from shared', async () => {
@@ -1329,6 +1336,89 @@ test('Agents & keys: when what is ready changes, every page gets one fresh snaps
   await w.srv.close();
   assert.equal(w.connect.listenerCount('agents'), 0);
   assert.equal(w.connect.listenerCount('changed'), 0);
+});
+
+// ------------------------------------------------------------------ full permissions
+
+test('POST /api/permissions: the page’s key, from this page, as JSON; full answers the engine’s card, ask turns them off', async () => {
+  engine.calls.length = 0;
+  const p = '/api/permissions';
+  const json = { 'Content-Type': 'application/json' };
+  assert.equal((await request({ method: 'POST', path: p, body: { mode: 'full' }, headers: json })).status, 401);
+  assert.equal((await request({ method: 'POST', path: `${p}?t=${TOKEN}`, body: { mode: 'full' }, headers: json })).status, 401, 'the query token is for GET routes only');
+  assert.equal((await post(p, { mode: 'full' }, { 'X-Workbench-Token': hookTokenFor('abc123') })).status, 401, 'an agent’s own hook token never opens it');
+  const get = await request({ path: p, headers: auth() });
+  assert.equal(get.status, 405);
+  assert.equal(get.headers.allow, 'POST');
+  assert.equal((await post(p, { mode: 'full' }, { Origin: 'http://evil.example' })).status, 403);
+  assert.equal((await post(p, { mode: 'full' }, { Origin: 'null' })).status, 403);
+  assert.equal((await request({ method: 'POST', path: p, body: '{"mode":"full"}', headers: auth({ 'Content-Type': 'text/plain' }) })).status, 415);
+  assert.equal((await request({ method: 'POST', path: p, body: 'mode=full', headers: auth({ 'Content-Type': 'application/x-www-form-urlencoded' }) })).status, 415);
+  for (const body of [{}, { mode: 'FULL' }, { mode: 'on' }, { mode: true }, { mode: ['full'] }, { full: true }]) {
+    const r = await post(p, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.deepEqual(r.json, { error: 'Say whether agents should ask first or have full permissions.' }, JSON.stringify(body));
+  }
+  assert.deepEqual(engine.calls, [], 'none of these reached the engine');
+  const on = await post(p, { mode: 'full' });
+  assert.equal(on.status, 200);
+  assert.equal(on.headers['cache-control'], 'no-store');
+  assert.equal(on.json.confirm.kind, 'permissions');
+  assert.equal(on.json.confirm.yes, 'Turn on full permissions');
+  const off = await post(p, { mode: 'ask' });
+  assert.deepEqual(off.json, { ok: true, reply: 'Agents ask again before risky steps.', permissions: 'ask' });
+  assert.deepEqual(engine.calls, [['permissions', 'full'], ['permissions', 'ask']]);
+  // only the card's yes turns them on, and that goes through POST /api/confirm/:id like every other card
+  assert.equal((await post(`/api/confirm/${on.json.confirm.id}`, { go: true })).status, 200);
+  assert.deepEqual(engine.calls.at(-1), ['confirm', on.json.confirm.id, true]);
+});
+
+test('the page arrives with the permission mode the engine has on, never one only the file says, and the page’s own route never changes it', async (t) => {
+  const root = pageRoot(t);
+  const kept = memoryPrefs({ theme: 'ivory', permissions: 'full' });
+  const calls = [];
+  const s = new Store();
+  const eng = new FakeEngine(s);
+  const srv = createServer({ engine: eng, store: s, token: TOKEN, hookTokenFor, port: 0, rootDir: root, prefs: { get: () => kept.get(), set: (c) => { calls.push(c); return kept.set(c); } } });
+  const { url } = await srv.listen();
+  t.after(() => srv.close());
+  const req = (o = {}) => request({ ...o, at: Number(new URL(url).port) });
+  // another run kept full permissions, but this engine asks: the page shows what is on here
+  assert.equal(htmlTag((await req({ path: '/' })).text), '<html lang="en" data-theme="ivory" data-detail="calm" data-answered="0" class="boot" data-permissions="ask">');
+  eng.permissionMode = 'full';
+  assert.match(htmlTag((await req({ path: `/?t=${TOKEN}` })).text), / data-permissions="full">$/);
+  eng.permissionMode = '"><script>';
+  assert.match(htmlTag((await req({ path: '/' })).text), / data-permissions="ask">$/, 'anything but full is ask');
+  // the page's choices route neither shows nor keeps the mode
+  const send = (body) => req({ method: 'POST', path: '/api/prefs', body, headers: auth({ 'Content-Type': 'application/json' }) });
+  assert.deepEqual((await send({ permissions: 'ask' })).json, { error: 'Say which look or detail level to keep.' });
+  assert.deepEqual((await send({ detail: 'more', permissions: 'ask' })).json, { ok: true, theme: 'ivory', detail: 'more', answered: false });
+  assert.deepEqual(calls, [{ detail: 'more' }]);
+  assert.equal(kept.get().permissions, 'full', 'what the file keeps is the engine’s to change');
+  assert.deepEqual((await req({ path: '/api/prefs', headers: auth() })).json, { theme: 'ivory', detail: 'more', answered: false });
+});
+
+test('when full permissions go on or off, every page gets a fresh snapshot with the mode', async (t) => {
+  const s = new Store();
+  const eng = new FakeEngine(s);
+  const srv = createServer({ engine: eng, store: s, token: TOKEN, hookTokenFor, port: 0, rootDir: ROOT, options: { coalesceMs: 20 } });
+  const { url } = await srv.listen();
+  const at = Number(new URL(url).port);
+  t.after(() => srv.close());
+  const sse = await openSse(`/api/stream?t=${TOKEN}`, at);
+  try {
+    assert.equal((await sse.next('snapshot')).data.permissions, 'ask');
+    eng.permissionMode = 'full';
+    eng.emit('permissions', 'full');
+    assert.equal((await sse.next('snapshot')).data.permissions, 'full');
+    eng.permissionMode = 'ask';
+    eng.emit('permissions', 'ask');
+    assert.equal((await sse.next('snapshot')).data.permissions, 'ask');
+  } finally {
+    sse.close();
+    await srv.close();
+  }
+  assert.equal(eng.listenerCount('permissions'), 0, 'close() lets go of the engine');
 });
 
 // ------------------------------------------------------------------ helpers

@@ -41,6 +41,8 @@ const INSIDE_AGENT = 'Workbench is running inside an agent. It will not start re
 const NO_GIT_IDENTITY = 'Git does not know your name and email yet. Agents can work, but Workbench cannot merge their work until you set them: git config --global user.name "Your Name" and git config --global user.email you@example.com';
 /** Said at the start when neither Claude Code nor Codex can run here: Workbench starts anyway, and the page connects one. */
 const NO_AGENT = 'No coding agent is ready yet. Open the page to connect one.';
+/** The start line while full permissions are on. */
+const FULL_PERMISSIONS_ON = "Full permissions are on: agents ask only before steps that name Claude Code's own settings. Turn them off on the page.";
 /** How the start says where Claude Code was found. */
 const CLAUDE_FROM = { flag: ' (from --claude)', env: ' (from WORKBENCH_CLAUDE_BIN)', path: '', vscode: ' (from the VS Code extension)' };
 /** What each part of a clone is called, in the plain progress lines. */
@@ -1053,6 +1055,17 @@ async function main() {
       seed: 1,
     });
   }
+  // The person's choices for the page (its look, its detail, whether they have answered once), kept in
+  // ~/.workbench/prefs.json, so the next run's page arrives with them: in the demo too. Without a home folder to keep
+  // them in, they last for this run. The same file keeps full permissions, which the engine reads at start and keeps
+  // when they change (in live mode only: the demo's are for its own run).
+  let prefs;
+  try {
+    prefs = mods.prefs.createPrefs({ file: mods.prefs.prefsFile(os.homedir()), log });
+  } catch (err) {
+    log.warn('Workbench cannot keep the page’s choices for its next start:', err);
+    prefs = mods.prefs.memoryPrefs();
+  }
   engine = new mods.Engine({
     store,
     mode: args.demo ? 'demo' : 'live',
@@ -1063,6 +1076,7 @@ async function main() {
     adapters,
     machines,
     connect,
+    prefs,
     deps: { policy: mods.policy, commands: mods.commands, workspace: mods.workspace, receipt: mods.receipt, history: mods.history },
     log,
   });
@@ -1070,16 +1084,6 @@ async function main() {
   // Agents & keys checked the agent programs again, or saved git's name and email: the engine takes it in now.
   wireConnect(connect, engine, log);
 
-  // The person's choices for the page (its look, its detail, whether they have answered once), kept in
-  // ~/.workbench/prefs.json, so the next run's page arrives with them: in the demo too. Without a home folder to keep
-  // them in, they last for this run.
-  let prefs;
-  try {
-    prefs = mods.prefs.createPrefs({ file: mods.prefs.prefsFile(os.homedir()), log });
-  } catch (err) {
-    log.warn('Workbench cannot keep the page’s choices for its next start:', err);
-    prefs = mods.prefs.memoryPrefs();
-  }
   let server = mods.createServer({ engine, store, token, hookTokenFor, connect, repoRoot: repo?.root ?? null, prefs, port: args.port, host: '127.0.0.1', rootDir: ROOT, log });
 
   // From here on, every way out stops the agents first: orphaned agents keep spending.
@@ -1187,6 +1191,8 @@ async function main() {
     const dirty = Number(repo.dirty) || 0;
     if (dirty) say(`Your ${dirty} uncommitted change${dirty === 1 ? ' is' : 's are'} not included.`);
     say(`Each agent can spend up to $${(args.budget ?? DEFAULT_BUDGET_USD).toFixed(2)}.`);
+    // Kept from an earlier run: said at every start while it is on (the Mac app's log has it too).
+    if (engine.permissionMode === 'full') say(FULL_PERMISSIONS_ON);
     if (identity === null) say(NO_GIT_IDENTITY);
   }
   say('Press Ctrl-C to stop.');

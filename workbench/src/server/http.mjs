@@ -4,7 +4,8 @@
 // agent's own hook token), and for POSTs the Origin, the JSON content type and a 64 KB body limit
 // (16 KB on the Agents & keys routes, which carry keys: never echoed, never logged, never in a URL).
 // A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
-// The page goes out with the person's look, detail and first answer on its <html> tag (src/core/prefs.mjs).
+// The page goes out with the person's look, detail and first answer on its <html> tag (src/core/prefs.mjs), and the
+// permission mode the engine has on (data-permissions), so the Full permissions button is right from the first paint.
 // Unless the person chose a port, each run takes a free one picked at random, so the page's address (its origin) is
 // new every time, and only by a rare chance one another program served before: what that program left in the browser
 // for its address is almost never there to read this run's key. A port something else answers on is never taken.
@@ -281,11 +282,12 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     }
 
     // The page itself goes out with the person's look, detail and first answer on its <html> tag, so its first paint
-    // is already right. Workbench keeps them (prefs), not the page's own storage.
+    // is already right. Workbench keeps them (prefs), not the page's own storage. The permission mode is the engine's,
+    // the one on in this run, never one only the file says (another run may have kept it).
     if (base === uiDir && real === path.join(root, 'index.html')) {
       let text;
       try { text = await fsp.readFile(real, 'utf8'); } catch { return sendJson(res, 404, { error: 'Not found.' }); }
-      const page = Buffer.from(pageWithPrefs(text, prefsNow()));
+      const page = Buffer.from(pageWithPrefs(text, { ...prefsNow(), permissions: modeNow() }));
       res.writeHead(200, { 'Content-Type': TYPES['.html'], 'Content-Length': page.length, 'Cache-Control': 'no-cache' });
       return res.end(req.method === 'HEAD' ? undefined : page);
     }
@@ -364,6 +366,9 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     store.on('removed', onRemoved);
     store.on('repo', onRepo);
   }
+  // Full permissions went on or off: every page gets a fresh snapshot, whose `permissions` lights the band's button.
+  const onPermissions = () => onRemoved();
+  if (typeof engine.on === 'function') engine.on('permissions', onPermissions);
   // Agents & keys found an agent, or lost one, or the default changed: the snapshot's harnesses and connect summary say
   // so (the top band's light, the lid). Every page gets a fresh snapshot, once per burst, and only when they changed.
   let connectTimer = null;
@@ -460,8 +465,11 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/raise-limit$/, run: (b, m) => engine.raiseLimit(id(m[1]), { state: optState(b.state) }) },
     { method: 'POST', re: /^\/api\/machines\/([^/]+)\/awake$/, run: (b, m) => engine.setMachineAwake(id(m[1]), b.awake === true) },
     // The person's choices for the page: { theme, detail, answered }. A change carries one or more of them (prefsChange).
-    { method: 'GET', re: /^\/api\/prefs$/, run: () => prefsNow() },
+    { method: 'GET', re: /^\/api\/prefs$/, run: () => pageChoices(prefsNow()) },
     { method: 'POST', re: /^\/api\/prefs$/, run: (b) => keepPrefs(b) },
+    // Full permissions: { mode: 'full' } answers the engine's card (only its yes turns them on, through
+    // POST /api/confirm/:id); { mode: 'ask' } turns them off at once. Agents never have the page's key.
+    { method: 'POST', re: /^\/api\/permissions$/, run: (b) => engine.permissions(modeOf(b.mode)) },
     { method: 'POST', re: /^\/hook\/pretool$/, hook: true },
     // Agents & keys. Each answers { ok, sentence, status } with a fresh ConnectStatus (src/core/connect.mjs), or { error }
     // with a plain sentence and a 4xx code (500 when the place keys are kept failed). Keys come in the body only, and
@@ -538,6 +546,16 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
 
   // ------------------------------------------------------------ the person's choices for the page
 
+  /** The page's own choices from what is kept: the look, the detail and the first answer, never the permission mode. */
+  const pageChoices = (p) => ({ theme: p.theme, detail: p.detail, answered: p.answered });
+  /** The permission mode on in this run, as the engine has it: 'full' or 'ask'. */
+  const modeNow = () => (engine.permissionMode === 'full' ? 'full' : 'ask');
+  /** A mode a request asks for: 'full' or 'ask', else a 400 with a plain sentence. */
+  const modeOf = (v) => {
+    if (v !== 'full' && v !== 'ask') throw new HttpError(400, 'Say whether agents should ask first or have full permissions.');
+    return v;
+  };
+
   /** What is kept now, each a known value or its default; a store that fails to read gives the defaults. */
   function prefsNow() {
     try {
@@ -555,7 +573,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
    */
   function keepPrefs(b) {
     const r = prefs.set(prefsChange(b));
-    const now = r?.prefs ? cleanPrefs(r.prefs) : prefsNow();
+    const now = pageChoices(r?.prefs ? cleanPrefs(r.prefs) : prefsNow());
     if (r?.ok === false) return { ok: false, reply: typeof r.sentence === 'string' && r.sentence ? r.sentence : 'Workbench could not keep that choice.', ...now };
     return { ok: true, ...now };
   }
@@ -851,6 +869,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     store?.off?.('notice', onNotice);
     connect?.off?.('agents', onConnect);
     connect?.off?.('changed', onConnect);
+    if (typeof engine.off === 'function') engine.off('permissions', onPermissions);
     clearTimeout(connectTimer);
     clearTimeout(flushTimer);
     clearInterval(pingTimer);

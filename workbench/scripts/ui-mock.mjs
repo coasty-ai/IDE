@@ -19,7 +19,8 @@
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 //   GET  /ctl/reads                the git screen's reads: every GET of /api/git and /api/agents/:id/changes (D1)
 //   POST /ctl/prefs {...}          the person's choices as Workbench keeps them ({ theme, detail, answered }, any of
-//                                  them): the page arrives with them on <html>; answers what is kept now ({} reads it)
+//                                  them): the page arrives with them on <html>; answers what is kept now ({} reads it).
+//                                  { permissions: 'full' | 'ask' } sets whether full permissions are on in this world
 // The person's choices: GET and POST /api/prefs, as the real server answers them (src/core/prefs.mjs), and the page sent
 // with them on its <html> tag.
 // The git screen's routes (D1): GET /api/git (any scenario) and GET /api/agents/:id/changes; answer "refuse" refuses them.
@@ -27,6 +28,10 @@
 // answer "refuse" refuses it.
 // Agents & keys: the connect panel's routes, /api/connect*, in the 'connect-*' scenarios (see connectFacts below); mode
 // gains connect: { terminal, github, githubAgents, fail, gh, browser } and delay.connect.
+// Full permissions: POST /api/permissions { mode }, answered as the engine does (the card for 'full', which only its yes
+// turns on, counting what it allowed; 'ask' at once, withdrawing every such card; a card from before the last change of
+// mode is refused, "That changed. Have another look."), the snapshot's `permissions`, the page sent with data-permissions
+// on <html>, and the words for them in POST /api/command. See the 'full' scenarios.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -126,6 +131,7 @@ export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy'
 
 export function scenario(name, now = Date.now()) {
   let raw = [];
+  if (FULL_SCENARIOS.includes(name)) return fullWorld(name, now);
   if (MERGE_SCENARIOS.includes(name)) return mergeWorld(name, now);
   if (name === 'limit') return limitWorld(now);
   if (TRAY_SCENARIOS.includes(name)) return trayWorld(name, now);
@@ -820,6 +826,35 @@ function connectWorld(name, now) {
   return st;
 }
 
+// ---------------------------------------------------------------- full permissions (POST /api/permissions)
+//   full        the demo with full permissions on: the band's Full permissions button is lit, and nothing waits for an OK
+//               (Checkout fix's migration was allowed by itself, as an automatic approval)
+//   full-live   a live repository with Agents & keys beside it (connect-github's), full permissions on: both of the top
+//               band's buttons, the widest the band gets
+// Every other world starts with them off. The card's words, and what is said when they go on and off, are the engine's.
+const FULL_SCENARIOS = ['full', 'full-live'];
+SCENARIOS.push(...FULL_SCENARIOS);
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
+const FULL_OFF = 'Agents ask again before risky steps.';
+function fullWorld(name, now) {
+  const st = name === 'full-live' ? connectWorld('connect-github', now) : scenario('demo', now);
+  for (const a of st.agents) {
+    if (a.ask?.type !== 'permission') continue;
+    Object.assign(a, { ask: null, state: 'working', now: 'Updating the test database', stateSince: now - 20000, approvals: { ...a.approvals, auto: a.approvals.auto + 1 } });
+  }
+  st.permissions = 'full';
+  return st;
+}
+/** A world as a scenario gives it, with full permissions off unless the scenario turns them on. */
+function worldOf(name) {
+  const st = scenario(name);
+  if (st.permissions !== 'full') st.permissions = 'ask';
+  return st;
+}
+/** Agents & keys' facts for a world: full-live has connect-github's. */
+const factsOf = name => connectFacts(name === 'full-live' ? 'connect-github' : name);
+
 /** Start the mock. Resolves to { port, close() }. */
 export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) {
   const clients = new Set();
@@ -827,9 +862,10 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null };
   const prefs = memoryPrefs();   // the person's choices, as Workbench keeps them across runs
   let name = 'demo';
-  let state = scenario(name);
-  let cw = connectFacts(name);   // Agents & keys: what Connect knows, in the connect scenarios (null elsewhere)
+  let state = worldOf(name);
+  let cw = factsOf(name);   // Agents & keys: what Connect knows, in the connect scenarios (null elsewhere)
   let confirmSeq = 0;
+  let modeChanges = 0;   // how often full permissions went on or off in this world (permissionsAnswer)
   const confirms = new Map();
   const send = (event, data) => { const f = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`; for (const c of clients) c.write(f); };
   // a launch the person confirmed, as the engine does it: the reply names the new agent (focusId) before the stream
@@ -860,7 +896,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     // as the engine's _card: a merge or throw-away card names the agent it is about
     return { id, ...card, ...((card.kind === 'merge' || card.kind === 'discard') && extra.agentId ? { agentId: extra.agentId } : {}) };
   };
-  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}), ...((c.kind === 'merge' || c.kind === 'discard') && c.agentId ? { agentId: c.agentId } : {}) });
+  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}), ...((c.kind === 'merge' || c.kind === 'discard') && c.agentId ? { agentId: c.agentId } : {}), ...(c.kind === 'start' && c.agents ? { agents: c.agents } : {}) });
   const rootOf = a => (a && a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a);
   const joinAnd = xs => (xs.length <= 1 ? xs.join('') : xs.length === 2 ? `${xs[0]} and ${xs[1]}` : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
   const unend = s => String(s || '').replace(/[.\s]+$/, '');
@@ -935,7 +971,43 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   };
   const PROBLEM = new Set(['conflict', 'blocked', 'moved', 'identity', 'detached', 'busy', 'ancestry', 'git']);
   /** Settle a card: a launch starts, a forget forgets, a merge merges (or fails as mode.merge says), a throw-away throws away. */
+  /**
+   * Full permissions on or off, as the engine's _permissions: 'full' is a card, 'ask' is at once, and withdraws every card
+   * that would turn them on. modeChanges counts the changes: a card made before the last one is refused (settle).
+   */
+  const permissionsAnswer = want => {
+    if (want === 'ask') {
+      for (const [id, c] of confirms) if (c.kind === 'permissions') confirms.delete(id);
+      if (state.permissions !== 'full') return { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' };
+      state.permissions = 'ask';
+      modeChanges++;
+      setTimeout(() => { send('snapshot', state); send('notice', { text: FULL_OFF }); }, 60);
+      return { ok: true, reply: FULL_OFF, permissions: 'ask' };
+    }
+    if (state.permissions === 'full') return { ok: true, reply: 'Full permissions are already on.', permissions: 'full' };
+    const n = state.agents.filter(a => a.ask && a.ask.type === 'permission').length;
+    const detail = n ? `${FULL_DETAIL} The ${n} question${n === 1 ? '' : 's'} waiting now ${n === 1 ? 'is' : 'are'} allowed too.` : FULL_DETAIL;
+    const card = { kind: 'permissions', sentence: 'Let agents do anything without asking?', detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true };
+    return { reply: card.sentence, confirm: newConfirm(card, { modeAt: modeChanges }) };
+  };
   const settle = (c, go) => {
+    if (c.kind === 'permissions') {
+      if (c.modeAt !== modeChanges) return { reply: 'That changed. Have another look.' };
+      if (!go) return { reply: 'OK, agents still ask before risky steps.' };
+      state.permissions = 'full';
+      modeChanges++;
+      // every permission question waiting is allowed, as an automatic approval, and the reply counts them
+      let n = 0;
+      for (const a of state.agents) {
+        if (a.ask?.type !== 'permission') continue;
+        Object.assign(a, { ask: null, state: 'working', stateSince: Date.now(), now: 'Carrying on', approvals: { ...a.approvals, auto: a.approvals.auto + 1 } });
+        n++;
+      }
+      countHelpers(state.agents);
+      const reply = n ? `Full permissions are on. ${n} waiting question${n === 1 ? ' was' : 's were'} allowed.` : FULL_ON;
+      setTimeout(() => { send('snapshot', state); send('notice', { text: reply }); }, 60);
+      return { reply, permissions: 'full' };
+    }
     if (c.kind === 'forget') {
       if (!go) return { reply: 'OK, I won’t forget it.' };
       state.agents = state.agents.filter(x => x.id !== c.forget);
@@ -1197,7 +1269,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       const b = body ? JSON.parse(body) : {};
       res.setHeader('content-type', 'application/json');
       if (p === '/ctl/scenario') {
-        name = b.name; state = scenario(name); cw = connectFacts(name); confirms.clear();
+        name = b.name; state = worldOf(name); cw = factsOf(name); confirms.clear();
         if (b.push !== false) send('snapshot', state);
         res.end(JSON.stringify({ ok: true, agents: state.agents.length })); return;
       }
@@ -1212,7 +1284,13 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (p === '/ctl/log') { res.end(JSON.stringify(posted)); return; }
       if (p === '/ctl/reads') { res.end(JSON.stringify(GIT_READS)); return; }   // D1: the git screen's GETs
       if (p === '/ctl/clear') { posted.length = 0; res.end('{"ok":true}'); return; }
-      if (p === '/ctl/prefs') { if (Object.keys(b).length) prefs.set(cleanPrefs({ ...prefs.get(), ...b })); res.end(JSON.stringify(prefs.get())); return; }
+      if (p === '/ctl/prefs') {
+        if ((b.permissions === 'full' || b.permissions === 'ask') && b.permissions !== state.permissions) { state.permissions = b.permissions; modeChanges++; }
+        const { permissions, ...choices } = b;
+        if (Object.keys(choices).length) prefs.set(cleanPrefs({ ...prefs.get(), ...choices }));
+        const { permissions: kept, ...now } = prefs.get();
+        res.end(JSON.stringify({ ...now, permissions: state.permissions })); return;
+      }
       res.statusCode = 404; res.end('{}'); return;
     }
     if (p.startsWith('/api/')) {
@@ -1227,10 +1305,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       // the person's choices, whatever mode.answer says, as the real server keeps them apart from the engine
       if (p === '/api/prefs') {
         res.setHeader('content-type', 'application/json');
-        if (req.method === 'GET') { res.end(JSON.stringify(prefs.get())); return; }
+        const page = ({ theme, detail, answered }) => ({ theme, detail, answered });   // never the permission mode
+        if (req.method === 'GET') { res.end(JSON.stringify(page(prefs.get()))); return; }
         let change;
         try { change = prefsChange(json); } catch (e) { res.statusCode = 400; res.end(JSON.stringify({ error: e.message })); return; }
-        res.end(JSON.stringify({ ok: true, ...prefs.set(change).prefs })); return;
+        res.end(JSON.stringify({ ok: true, ...page(prefs.set(change).prefs) })); return;
       }
       if (p === '/api/stream') {
         if (mode.down) { req.socket.destroy(); return; }
@@ -1317,6 +1396,14 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         const card = merge ? mergeCard(a) : discardCard(a);
         return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }) });
       }
+      if (p === '/api/permissions' && req.method === 'POST') {
+        const want = json?.mode;
+        if (want !== 'full' && want !== 'ask') { res.statusCode = 400; return reply({ error: 'Say whether agents should ask first or have full permissions.' }); }
+        if (mode.answer === 'refuse') return reply({ ok: false, reply: 'Workbench could not do that just now.' });
+        const out = permissionsAnswer(want);
+        if (!out.confirm) send('notice', { text: out.reply });
+        return reply(out);
+      }
       const cm = /^\/api\/confirm\/([^/]+)$/.exec(p);
       if (cm) {
         const c = confirms.get(decodeURIComponent(cm[1]));
@@ -1327,6 +1414,13 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (p === '/api/command') {
         const text = String(json?.text || '').trim();
         const shown = json?.confirmId ? confirms.get(json.confirmId) : null;
+        if (shown && shown.kind === 'permissions') {
+          // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking",
+          // "turn it off" and its kin, or a no. A bare "yes" is not enough, and a question answers nothing: the card stays.
+          if (/^(turn (it|them) on|turn on full permissions|do it|stop asking|full permissions|allow everything)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
+          if (/^(keep asking|no|cancel|never mind|ask first|ask me first|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          return reply({ reply: 'I did not catch that. Say “do it” to turn on full permissions, or “cancel”.', confirm: cardOf(shown) });
+        }
         if (shown) {
           // a card's own words (src/core/commands.mjs): "merge it" is a yes to a merge; a throw-away needs its own words or
           // "do it", and a bare "yes" is not enough; "forget it" cancels everywhere. Words not understood keep the card.
@@ -1367,8 +1461,20 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
             ? 'Start 8 agents: a simulated Claude on “fix the flaky checkout test”, a simulated Codex on “write tests for the parser”, a simulated Claude on “tidy up the invoice export”, a simulated Claude on “make the login page remember the last email”, a simulated Codex on “add a dark mode to the settings page”, a simulated Claude on “speed up the monthly report”, a simulated Claude on “translate the help pages into French” and a simulated Codex on “find and remove dead code in the search service”?'
             : `Start a simulated Claude on “${text.replace(/^start (an agent|a helper|claude|codex)? ?(to |on )?/i, '').slice(0, 90)}”?`;
           const detail = eight ? 'This is the demo: the agents are simulated and nothing is spent. Each one gets its own cloud machine, and each one can spend up to $2.' : 'This is the demo: the agents are simulated and nothing is spent. It runs on your laptop.';
-          confirms.set(id, { id, kind: 'start', sentence, detail });
-          return reply({ reply: sentence, confirm: { id, kind: 'start', sentence, detail } });
+          // as the engine's _card: a launch card says how many agents it starts
+          const agents = eight ? 8 : 1;
+          confirms.set(id, { id, kind: 'start', sentence, detail, agents });
+          return reply({ reply: sentence, confirm: { id, kind: 'start', sentence, detail, agents } });
+        }
+        // full permissions, said whole: on asks first with the card, off is at once
+        if (/^(full permissions|turn on full permissions|full permissions on|allow everything|stop asking|don'?t ask me|full access)$/i.test(text)) {
+          const out = permissionsAnswer('full');
+          return reply(out.confirm ? out : { reply: out.reply });
+        }
+        if (/^(ask (me )?first|ask (me )?again|turn off full permissions|full permissions off)$/i.test(text)) {
+          const out = permissionsAnswer('ask');
+          send('notice', { text: out.reply });
+          return reply({ reply: out.reply });
         }
         if (/what needs me/i.test(text)) {
           const need = state.agents.filter(a => ['needs_ok', 'question', 'maybe_stuck', 'checks_failed'].includes(a.state));
@@ -1397,7 +1503,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     if (file === path.join(ROOT, 'ui', 'index.html')) {
       // the page, with the person's choices on <html>, as the real server sends it
       res.writeHead(200, { 'content-type': TYPES['.html'], 'cache-control': 'no-store', ...SECURITY });
-      res.end(pageWithPrefs(fs.readFileSync(file, 'utf8'), prefs.get())); return;
+      res.end(pageWithPrefs(fs.readFileSync(file, 'utf8'), { ...prefs.get(), permissions: state.permissions })); return;
     }
     res.writeHead(200, { 'content-type': TYPES[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store', ...SECURITY });
     fs.createReadStream(file).pipe(res);

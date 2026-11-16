@@ -6,6 +6,12 @@
 // turn an allow into an ask, never the other way round. Refused outright, because an OK could not
 // make them safe: changes to Claude Code's own settings (.claude folders, .mcp.json) and helpers
 // that would work outside the agent's folder.
+//
+// With full permissions on (decide's `full`), every step that would ask runs without asking, but two kinds (withFull).
+// The floor is refused: what is refused anyway (above), an edit whose path names Claude Code's own settings, and an edit
+// whose landing place cannot be told or whose file is also linked from another place. A command, or another tool's step,
+// that names those settings is judged as without full permissions: it asks, with the reason it would ask for and why
+// full permissions do not cover it, in words that say only what kind of step it is.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -52,6 +58,7 @@ const R = Object.freeze({
   mcp: 'Tools that reach other services need your OK.',
   unknownTool: 'This tool is not on the list of safe tools.',
   broken: 'Something about this request could not be checked, so it needs your OK.',
+  tooMuch: 'This step has more in it than Workbench can check, so it needs your OK.',
   noCwd: "The agent's own folder could not be checked.",
   noFile: 'It did not say which file it wants to change.',
   noRead: 'It did not say which file it wants to read.',
@@ -143,6 +150,13 @@ const R = Object.freeze({
   nodeOption: 'This node command uses an option that can run code it was not given as a file.',
   nodeValue: 'An option of this node command has a value that could not be checked.',
   extra: "This command is on the repository's list of allowed commands.",
+  full: 'Full permissions are on.',
+  fullClaude: "This would change Claude Code's own settings, which agents may not change, even with full permissions on.",
+  fullUnchecked: "Whether this would change Claude Code's own settings could not be checked, so it was refused.",
+  fullEditUnclear: 'Full permissions are on, but Workbench could not tell where this edit lands, so it did not allow it.',
+  fullNamed: "Full permissions do not cover steps that name Claude Code's own settings.",
+  fullUnsure: "Full permissions do not cover steps that name Claude Code's own settings, and Workbench could not check whether this one does.",
+  fullLinked: 'This file is also linked from another place on disk, so Workbench did not allow it.',
 });
 
 /**
@@ -163,7 +177,8 @@ const WHERE = Object.freeze({
 const USES = Object.freeze({ outside: 'usesOutside', git: 'usesGit', claude: 'usesClaude', linked: 'usesLinked' });
 
 // A verdict: the decision and its reason, plus optionally where (a WHERE key), what an ask does in plain words
-// when the policy knows better than the command's everyday reading (does), or a whole sentence (say).
+// when the policy knows better than the command's everyday reading (does), a whole sentence (say), or that its words
+// say only what kind of step it is (kindOnly: a step full permissions do not cover, notCovered).
 const allow = (reason, where) => ({ decision: 'allow', reason, where });
 const ask = (reason, where, does) => ({ decision: 'ask', reason, where, does });
 const deny = (reason, where) => ({ decision: 'deny', reason, where });
@@ -171,45 +186,104 @@ const deny = (reason, where) => ({ decision: 'deny', reason, where });
 /** What an ask says when the command, or the option that made it ask, has no plainer words. */
 const RUN = 'run a command';
 
+// ---------------------------------------------------------------------------------------------
+// What one decide may do
+
+/**
+ * decide runs on Workbench's main thread for every request, so each of its three phases may do a fixed amount of work:
+ * the check and the floor of full permissions COST_LIMIT each, the words WORDS_LIMIT. A look at the disk (a path
+ * resolved, a link read, a file looked at) costs 1, a folder read 1 and 1 more for every 32 names in it, matching names
+ * against a wildcard 1 for every 2500 steps it takes, expanding one word's braces 1 for every 2048 characters it holds, at each
+ * level, and a path whose answer is already known 0.1: what the disk said, and where each path sits, is kept for the rest
+ * of the decide (`known`). A word of short options longer than OPTION_WORD is too much to check at once. Past a cap, the
+ * phase stops (PAST_CAP), and nothing it found is used: the check asks (R.tooMuch); full permissions refuse an edit as
+ * unchecked (R.fullUnchecked), and ask about another step as without them, saying they could not check it (R.fullUnsure);
+ * and the words fall back to plainer ones.
+ */
+const COST_LIMIT = 1500;
+const WORDS_LIMIT = 500;
+/** Thrown when a phase of decide has done all the work it may. */
+const PAST_CAP = Symbol('past the cap');
+/** The longest word of short options whose every tail is read as a place (readPieces): past it, too much to check. */
+const OPTION_WORD = 1024;
+/** The current phase's count and limit, set by phase(); null outside decide. */
+let work = null;
+/**
+ * Set by decide() for one decision: what the disk said (`real`: resolveReal, `place`: placeOf, `present`, `globs`:
+ * globNamesClaude), and the parts of the command line (`parts`: partsOf), read once.
+ */
+let known = null;
+
+/** The simple commands of a command line (narrate's shellCommands), read once in a decide however many phases ask. */
+function partsOf(command) {
+  if (!known) return shellCommands(command);
+  if (!known.parts.has(command)) known.parts.set(command, shellCommands(command));
+  return known.parts.get(command);
+}
+
+/** Count `cost` against the current phase, and stop it past its limit. */
+function charge(cost) {
+  if (!work) return;
+  work.cost += cost;
+  if (work.cost > work.limit) throw PAST_CAP;
+}
+
+/** Run one phase of decide with a count of its own. */
+function phase(f, limit = COST_LIMIT) {
+  const outer = work;
+  work = { cost: 0, limit };
+  try {
+    return f();
+  } finally {
+    work = outer;
+  }
+}
+
 /**
  * Decide on one tool call.
  * @param {{ tool: string, input?: object, cwd: string, extraAllow?: string[],
- *           readAlso?: (string | { root: string, session: string })[], recipients?: string[] }} req
+ *           readAlso?: (string | { root: string, session: string })[], recipients?: string[], full?: boolean }} req
  *   cwd is the agent's own folder (its workspace); extraAllow holds command prefixes from workbench.json.
  *   readAlso names the agent's own scratch folders, which it may read without asking: a string is a folder
  *   that belongs to this agent alone; { root, session } covers <root>/<any key>/<session id>/..., where
  *   Claude Code keeps one session's files (the key folder is shared with other sessions, so only the
  *   folder named after this session's id counts).
  *   recipients are the names SendMessage may reach without asking: "main" and this agent's own helpers.
+ *   full (exactly true): full permissions are on, so nothing asks: see withFull.
  * @returns {{ decision: 'allow'|'ask'|'deny', reason: string, sentence: string, detail: string }}
  */
 export function decide(req) {
-  const { tool, input, cwd, extraAllow, readAlso, recipients } = req && typeof req === 'object' ? req : {};
+  const { tool, input, cwd, extraAllow, readAlso, recipients, full } = req && typeof req === 'object' ? req : {};
   const inp = input && typeof input === 'object' ? input : {};
   const ctx = { cwd, extraAllow, also: [], recipients };
   let verdict;
   remotesMemo = new Map();
+  known = { real: new Map(), place: new Map(), present: new Map(), globs: new Map(), parts: new Map() };
   try {
-    ctx.also = readRoots(readAlso);
-    verdict = judge(tool, inp, ctx);
-  } catch {
-    verdict = ask(R.broken); // fail closed on anything unexpected
+    verdict = phase(() => {
+      ctx.also = readRoots(readAlso);
+      return judge(tool, inp, ctx);
+    });
+  } catch (e) {
+    verdict = ask(e === PAST_CAP ? R.tooMuch : R.broken); // fail closed on anything unexpected
   }
+  if (full === true) verdict = withFull(tool, inp, ctx, verdict);
   let desc;
   try {
     desc = describeRequest(typeof tool === 'string' && tool ? tool : 'a tool', inp);
   } catch {
     desc = { sentence: 'wants to use a tool', detail: '' };
   }
-  // The words never change the decision: anything that goes wrong here falls back to plainer words.
+  // The words never change the decision: anything that goes wrong here, a cap too, falls back to plainer words.
   let sentence;
   try {
-    sentence = sentenceFor(tool, inp, verdict, desc.sentence, ctx);
+    sentence = phase(() => sentenceFor(tool, inp, verdict, desc.sentence, ctx), WORDS_LIMIT);
   } catch {
     sentence = null;
   }
   if (typeof sentence !== 'string' || !sentence) sentence = tool === 'Bash' && verdict.decision !== 'allow' ? 'wants to ' + RUN : desc.sentence;
   remotesMemo = null;
+  known = null;
   return { decision: verdict.decision, reason: verdict.reason, sentence, detail: desc.detail };
 }
 
@@ -259,6 +333,216 @@ function judgeMonitor(input, ctx) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Full permissions
+
+/**
+ * Full permissions: a step the policy would ask about runs without asking, with the reason "Full permissions are on.",
+ * but two kinds. An edit whose path names Claude Code's own settings is refused, as edits there always are
+ * (editNamesClaude), and so is one whose landing place cannot be told or whose file is also linked from another place on
+ * disk (editFloor); a check of an edit that fails, or does not finish within its cap (PAST_CAP), refuses too. A command,
+ * or a tool of another service or one the policy does not know, that names those settings (stepNamesClaude) is judged as
+ * it is without full permissions: it asks, with its own reason and one more sentence, and so does one the check could not
+ * finish for (notCovered). Such an ask never says what the step does, nor where it reaches: its words say only what kind
+ * of step it is. What the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's
+ * settings, helpers that would work elsewhere) is refused as before. Reads, web pages, messages and helpers change no
+ * file, and run.
+ */
+function withFull(tool, input, ctx, verdict) {
+  if (verdict.decision !== 'ask') return verdict;
+  if (EDIT_TOOLS.has(tool)) {
+    let refused;
+    try {
+      refused = phase(() => (editNamesClaude(input, ctx) ? deny(R.fullClaude, 'claude') : editFloor(tool, input, ctx)));
+    } catch {
+      return deny(R.fullUnchecked);
+    }
+    if (refused) return refused;
+  } else if (!Object.hasOwn(READ_TOOLS, tool) && !HELPER_TOOLS.has(tool) && !['WebFetch', 'WebSearch', 'SendMessage'].includes(tool)) {
+    let named;
+    try {
+      named = phase(() => stepNamesClaude(tool, input, ctx));
+    } catch {
+      return notCovered(verdict, R.fullUnsure);
+    }
+    if (named) return notCovered(verdict, R.fullNamed);
+  }
+  const out = allow(R.full, verdict.where);
+  return verdict.say ? { ...out, say: verdict.say } : out;
+}
+
+/**
+ * A step full permissions do not cover: asked about with the reason it has without them, and why they do not cover it.
+ * Its words say only what kind of step it is (`kindOnly`, see sentenceFor): a command's everyday words, and the place
+ * they add ("in Claude Code's own settings"), are a reading of what it does, and naming those settings says nothing of
+ * what it would do with them (echo '.claude/' >> .gitignore writes .gitignore).
+ */
+const notCovered = (verdict, why) => ({ ...ask(`${verdict.reason} ${why}`), kindOnly: true });
+
+/**
+ * An edit that full permissions would let through, refused when Workbench cannot tell where it lands (no path, blank space
+ * around it, an agent's folder that cannot be checked, a path the system cannot resolve: ~user, a step back out of a
+ * folder that is not there, links that lead to each other or more than 8 in a row, a file taken for a folder), or when it
+ * would change a file that is also linked from another place on disk (a hard link, which could be one of Claude Code's own
+ * settings under another name, wherever the file is). null when it may run.
+ */
+function editFloor(tool, input, ctx) {
+  const target = tool === 'NotebookEdit' ? (input.notebook_path ?? input.file_path) : (input.file_path ?? input.notebook_path);
+  const base = realFolder(ctx.cwd);
+  if (!base || typeof target !== 'string' || !target.trim() || padded(target)) return deny(R.fullEditUnclear);
+  const r = throughLinks(resolveReal(target, base), base);
+  if (!r.ok) return deny(R.fullEditUnclear);
+  if (r.exists && linkedFile(r.real)) return deny(R.fullLinked, 'linked');
+  return null;
+}
+
+
+/** Whether an edit's path names Claude Code's own settings, as written or wherever it leads (links followed). */
+function editNamesClaude(input, ctx) {
+  const base = realFolder(ctx.cwd);
+  return [input.file_path, input.notebook_path].some(p => typeof p === 'string' && (textNamesClaude(p) || (!!base && placeNamesClaude(p.trim(), base, base))));
+}
+
+/**
+ * Whether a step that is not an edit names Claude Code's own settings: a command (Bash, a Monitor's command) whose line
+ * names them (commandNamesClaude), or a tool of another service, or one the policy does not know, with any text in its
+ * input that names them. It says nothing of what the step would do with them. Best effort: code a step runs, and a name
+ * built when the line runs, can still reach them without naming them (ARCHITECTURE.md, "Permission policy").
+ */
+function stepNamesClaude(tool, input, ctx) {
+  if (tool === 'Bash' || tool === 'Monitor') return typeof input.command === 'string' && commandNamesClaude(input.command, realFolder(ctx.cwd));
+  return stringsIn(input).some(textNamesClaude);
+}
+
+/**
+ * Whether a command line names Claude Code's own settings: its whole text does (textNamesClaude), a heredoc's text
+ * included; or one of its parts does, by a word as written, by where a word or one of its values leads, links
+ * followed, or by what a wildcard matches the loose way, read from the agent's folder and from every folder the line
+ * cd's or pushd's into.
+ */
+function commandNamesClaude(command, base) {
+  const parts = partsOf(command);
+  // The whole text, a heredoc's included: a << that is no heredoc (a here-string, a shift, a comment) would otherwise
+  // hide the lines after it. A heredoc that only mentions them asks only where the step asks without full permissions.
+  if (textNamesClaude(command)) return true;
+  const bases = base ? cdBases(parts, base) : [];
+  return parts.some(c => partNamesClaude(c, bases, base));
+}
+
+/** The folders a line's relative words are read from: the agent's own, and each existing folder it cd's or pushd's into. */
+function cdBases(parts, base) {
+  const bases = [base];
+  for (const c of parts) {
+    if (c.prog !== 'cd' && c.prog !== 'pushd') continue;
+    const to = c.args.filter(a => !a.startsWith('-')).at(-1);
+    const r = to ? resolveReal(withHome(to), base) : null;
+    if (r?.ok && r.exists && !bases.includes(r.real)) bases.push(r.real);
+  }
+  return bases;
+}
+
+/** $HOME or ${HOME} at the start of a word, as the home folder. */
+const withHome = text => String(text).replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.homedir());
+
+/** Whether any word of one part names Claude Code's settings: as written, wherever it leads, or by what it matches. */
+function partNamesClaude(c, bases, base) {
+  for (const raw of c.words) {
+    for (const form of braceForms(withHome(raw))) {
+      if (textNamesClaude(form)) return true;
+      if (!base) continue;
+      for (const piece of new Set([form, ...form.split(/[=:,]/)])) {
+        if (!piece || (piece.startsWith('-') && !piece.includes('/'))) continue;
+        for (const b of bases) {
+          if (placeNamesClaude(piece, b, base)) return true;
+          if (/[*?[]/.test(piece) && globNamesClaude(piece, b, base)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/** Whether a path, read from folder `b`, leads into Claude Code's settings: in the agent's folder or anywhere else. */
+function placeNamesClaude(p, b, base) {
+  if (typeof p !== 'string' || !p || p.includes('\0')) return false;
+  const r = throughLinks(resolveReal(p, b), base);
+  if (!r.ok) return false;
+  const place = placeOf(r.real, base);
+  return place === 'claude' || (place === 'outside' && claudeSetting(r.real));
+}
+
+/**
+ * Whether a wildcard, read from folder `b`, matches anything in Claude Code's settings, the loose way (any case, hidden
+ * names: zsh's NO_CASE_GLOB and GLOB_DOTS, which the person may have set). A wildcard that cannot be expanded here
+ * (outside the folders it may search, too many matches) matches nothing: textNamesClaude still reads its dot patterns.
+ */
+function globNamesClaude(piece, b, base) {
+  const key = `${b}\0${piece}`;
+  if (known?.globs.has(key)) return known.globs.get(key);
+  const x = expandPattern(piece, b, [], true, { entries: 0, matches: 0 });
+  const names = !x.error && x.paths.some(p => placeNamesClaude(p, b, base));
+  known?.globs.set(key, names);
+  return names;
+}
+
+/**
+ * Whether text names Claude Code's settings by name: a piece of it between spaces, the shell's punctuation, slashes, =,
+ * : and commas, that the disk takes for .claude or .mcp.json (foldName), after the shell's quotes and backslashes are
+ * taken away and its braces expanded; or a wildcard piece that starts with a dot and could match one of them.
+ */
+function textNamesClaude(text) {
+  const t = String(text ?? '').replace(/[\\'"]/g, '');
+  for (const word of t.split(/[ \t\n\r;&|<>()`$]+/)) {
+    for (const form of braceForms(word)) {
+      for (const seg of form.split(/[/=:,{}]+/)) {
+        if (!seg) continue;
+        const f = foldName(seg);
+        if (f === '.claude' || f === '.mcp.json') return true;
+        if (/[*?[]/.test(seg) && dotPatternMatchesClaude(seg)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** A word's forms with its braces expanded as the shell would ({a,b} and nested ones, at most 32 forms). */
+function braceForms(word, limit = 32) {
+  charge(word.length / 2048); // each level reads the whole word again
+  const m = /\{([^{}]*,[^{}]*)\}/.exec(word);
+  if (!m) return [word];
+  const out = [];
+  for (const alt of m[1].split(',')) {
+    for (const f of braceForms(word.slice(0, m.index) + alt + word.slice(m.index + m[0].length), limit)) {
+      out.push(f);
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether a wildcard segment that starts with a dot (or with a bracket that lists one) could match .claude or .mcp.json:
+ * a hidden name matches only a pattern that starts with a dot, zsh's default. Any case counts. Matched as the wildcards
+ * of a command are (matchTokens, the loose way), in a time that grows with the pattern's length, however many stars it
+ * has.
+ */
+function dotPatternMatchesClaude(seg) {
+  if (seg[0] !== '.' && !/^\[[!^]?[^\]]*\.[^\]]*\]/.test(seg)) return false;
+  const t = segmentTokens(patternChars(seg));
+  if (!t) return true; // a pattern that cannot be read could match anything
+  return matchTokens(t.tokens, '.claude', true) || matchTokens(t.tokens, '.mcp.json', true);
+}
+
+
+/** Every string in a tool's input, a few levels down (at most 200): what a tool of another service could act on. */
+function stringsIn(value, depth = 0, out = []) {
+  if (out.length >= 200 || depth > 4) return out;
+  if (typeof value === 'string') out.push(value);
+  else if (Array.isArray(value)) for (const v of value) stringsIn(v, depth + 1, out);
+  else if (value && typeof value === 'object') for (const v of Object.values(value)) stringsIn(v, depth + 1, out);
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // What an ask says
 
 /** Reasons that are only about where a command reaches. Such an ask keeps the command's everyday words. */
@@ -276,10 +560,13 @@ const suffix = where => (typeof where === 'string' && Object.hasOwn(WHERE, where
  * word ("read a file", "run the tests") is used only when the policy itself, judging each part of the command
  * alone, would allow it or asks only because of where it reaches. Otherwise the sentence names the riskier
  * part, the option that made it ask ("write to a file", "delete files", "run another program"), or says
- * "run a command"; the exact command is always the detail. Never the agent's own description.
+ * "run a command"; the exact command is always the detail. Never the agent's own description. A step full
+ * permissions do not cover (notCovered) says only what kind of step it is: "run a command" for a command, and the
+ * tool's own words for another ("run a command in the background and watch what it prints", "use fs (write_file)").
  */
 function sentenceFor(tool, input, verdict, plain, ctx) {
   if (verdict.say) return verdict.say;
+  if (verdict.kindOnly) return tool === 'Bash' ? 'wants to ' + RUN : plain;
   const command = tool === 'Bash' || (tool === 'Monitor' && input.ws === undefined) ? input.command : undefined;
   if (verdict.decision === 'allow' || typeof command !== 'string' || !command.trim()) return plain + suffix(verdict.where);
   const base = realFolder(ctx.cwd);
@@ -343,7 +630,7 @@ function vouch(c, base, ctx, wheres) {
  * `cd` goes to the home folder) counts as outside by itself.
  */
 function scanWhere(command, base, also) {
-  const cmds = shellCommands(command);
+  const cmds = partsOf(command);
   const home = text => text.replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.homedir());
   const rank = { outside: 3, claude: 2, git: 1 };
   let found;
@@ -386,6 +673,7 @@ function scanWhere(command, base, also) {
 /** The real path of the agent's folder, or null when it is missing or not a folder. */
 function realFolder(cwd) {
   if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || cwd.includes('\0')) return null;
+  charge(1);
   try {
     const real = fs.realpathSync.native(cwd);
     return fs.statSync(real).isDirectory() ? real : null;
@@ -399,10 +687,19 @@ function realFolder(cwd) {
  * The longest existing prefix goes through realpath(3) (fs.realpathSync.native: unlike the JS
  * version it resolves `link/..` after following the link). The missing remainder is appended as
  * text, which is only safe when it has no '..' and does not start with a dangling link.
+ * Within decide, each answer is kept for the rest of it (`known`), and each look at the disk is counted (charge).
  * @returns {{ ok: true, real: string, exists: boolean }
  *   | { ok: false, reason: string, link?: string, rest?: string[] }}  link: the dangling link, and the rest after it
  */
 export function resolveReal(p, baseReal) {
+  if (!known) return resolveOnce(p, baseReal);
+  charge(0.1); // the answer kept, looked up, and what is done with it
+  const key = `${baseReal}\0${p}`;
+  if (!known.real.has(key)) known.real.set(key, resolveOnce(p, baseReal));
+  return known.real.get(key);
+}
+
+function resolveOnce(p, baseReal) {
   if (typeof p !== 'string' || p === '' || p.includes('\0')) return { ok: false, reason: R.pathUnclear };
   let s = p;
   if (s === '~' || s.startsWith('~/')) s = os.homedir() + s.slice(1);
@@ -412,6 +709,7 @@ export function resolveReal(p, baseReal) {
   for (let i = parts.length; i >= 1; i--) {
     const prefix = parts.slice(0, i).join('/') || '/';
     let real;
+    charge(1);
     try {
       real = fs.realpathSync.native(prefix);
     } catch (e) {
@@ -422,6 +720,7 @@ export function resolveReal(p, baseReal) {
     if (rest.includes('..')) return { ok: false, reason: R.pathBack };
     if (rest.length) {
       // realpath said "missing" but the entry is there: a link pointing at something missing.
+      charge(1);
       try {
         fs.lstatSync(path.join(real, rest[0]));
         return { ok: false, reason: R.pathLink, link: path.join(real, rest[0]), rest: rest.slice(1) };
@@ -441,6 +740,7 @@ export function resolveReal(p, baseReal) {
 function throughLinks(r, baseReal) {
   for (let hops = 0; !r.ok && r.link && hops < 8; hops++) {
     let to;
+    charge(1);
     try {
       to = fs.readlinkSync(r.link);
     } catch {
@@ -480,9 +780,17 @@ function claudeSetting(rel) {
 
 /**
  * Where a real path sits relative to the agent's real folder: 'cwd', 'inside', 'git', 'claude' or 'outside'. git's records
- * are a .git folder at any depth, and any folder laid out like one (gitRecordsAt), with everything in them.
+ * are a .git folder at any depth, and any folder laid out like one (gitRecordsAt), with everything in them. Within decide,
+ * each answer is kept for the rest of it.
  */
 function placeOf(real, baseReal) {
+  if (!known) return placeOnce(real, baseReal);
+  const key = `${baseReal}\0${real}`;
+  if (!known.place.has(key)) known.place.set(key, placeOnce(real, baseReal));
+  return known.place.get(key);
+}
+
+function placeOnce(real, baseReal) {
   if (real === baseReal) return 'cwd';
   const prefix = baseReal.endsWith('/') ? baseReal : baseReal + '/';
   if (!real.startsWith(prefix)) return 'outside';
@@ -495,14 +803,22 @@ function placeOf(real, baseReal) {
   return 'inside';
 }
 
-/** Whether something is at `p` (a link to something missing counts). Anything but "not there" counts, to stay careful. */
+/**
+ * Whether something is at `p` (a link to something missing counts). Anything but "not there" counts, to stay careful.
+ * Within decide, each answer is kept for the rest of it, and each look at the disk is counted.
+ */
 function present(p) {
+  if (known?.present.has(p)) return known.present.get(p);
+  charge(1);
+  let there;
   try {
     fs.lstatSync(p);
-    return true;
+    there = true;
   } catch (e) {
-    return !(e && (e.code === 'ENOENT' || e.code === 'ENOTDIR'));
+    there = !(e && (e.code === 'ENOENT' || e.code === 'ENOTDIR'));
   }
+  known?.present.set(p, there);
+  return there;
 }
 
 /**
@@ -538,6 +854,7 @@ function placeWhere(p, base) {
 
 /** A file that shares its contents with another path (a hard link), possibly outside the folder. */
 function linkedFile(real) {
+  charge(1);
   try {
     const st = fs.statSync(real);
     return st.isFile() && st.nlink > 1; // folders always have more than one link
@@ -595,6 +912,7 @@ function readRoots(list) {
   const out = [];
   const real = p => {
     if (typeof p !== 'string' || !path.isAbsolute(p) || p.includes('\0')) return null;
+    charge(1);
     try { return fs.realpathSync.native(p); } catch { return null; } // missing: nothing to read there
   };
   for (const e of Array.isArray(list) ? list : []) {
@@ -754,7 +1072,12 @@ export function splitWords(cmd) {
   for (const ch of cmd) {
     if (quote) {
       if (ch === quote) quote = null;
-      else { cur.text += ch; cur.pattern += '\\' + ch; }
+      else {
+        if (cur.text === '') cur.first = ch;
+        cur.text += ch;
+        cur.pattern += '\\' + ch;
+        cur.last = ch;
+      }
       continue;
     }
     if (ch === ' ' || ch === '\t') {
@@ -762,23 +1085,27 @@ export function splitWords(cmd) {
       cur = null;
       continue;
     }
-    if (!cur) cur = { text: '', pattern: '', glob: false, globLead: false, quoted: false, eq: -1 };
+    // first and last: the word's first character and the one before this, so a long word is read in a time that grows
+    // with its length alone
+    if (!cur) cur = { text: '', pattern: '', glob: false, globLead: false, quoted: false, eq: -1, first: '', last: '' };
     if (ch === "'" || ch === '"') {
       quote = ch;
       cur.quoted = true;
       continue;
     }
     if (ch === '#' && cur.text === '' && !cur.quoted) return { error: R.comment };
-    if (ch === '=' && cur.eq < 0 && (cur.text === '' || /[=:]$/.test(cur.text))) cur.eq = cur.text.length;
+    if (ch === '=' && cur.eq < 0 && (cur.text === '' || cur.last === '=' || cur.last === ':')) cur.eq = cur.text.length;
     // '^' and '#' are wildcards too when zsh's extendedglob option is on.
     if (GLOB_CHARS.has(ch) || ch === '^' || ch === '#') {
       cur.glob = true;
       // The expansion starts with the literal text before the wildcard. Empty or '-' means it
       // could become an option, such as a file someone named "-delete".
-      if (cur.text === '' || cur.text.startsWith('-')) cur.globLead = true;
+      if (cur.text === '' || cur.first === '-') cur.globLead = true;
     }
+    if (cur.text === '') cur.first = ch;
     cur.text += ch;
     cur.pattern += ch;
+    cur.last = ch;
   }
   if (quote) return { error: R.quotes };
   if (cur) words.push(cur);
@@ -1184,26 +1511,36 @@ function setHas(set, c, loose, bytes = false) {
  */
 function matchTokens(tokens, name, loose) {
   const ascii = s => /^[\x00-\x7f]*$/.test(s);
-  const plainAscii = ascii(name) && tokens.every(t => (t.c === undefined || ascii(t.c)) && (!t.set || t.set.items.every(it => it.cls || it.to < 0x80)));
+  // what depends on the tokens alone is read once, however many names they are matched against
+  tokens.ascii ??= tokens.every(t => (t.c === undefined || ascii(t.c)) && (!t.set || t.set.items.every(it => it.cls || it.to < 0x80)));
+  const plainAscii = ascii(name) && tokens.ascii;
   const byChar = matchUnits(tokens, [...name], loose, false);
   if (plainAscii) return byChar;
   const asBytes = s => [...new TextEncoder().encode(s)].map(b => String.fromCharCode(b));
-  const byteTokens = tokens.flatMap(t => (t.c !== undefined && !ascii(t.c) ? asBytes(t.c).map(c => ({ c })) : [t]));
-  const byByte = matchUnits(byteTokens, asBytes(name), loose, true);
+  tokens.bytes ??= tokens.flatMap(t => (t.c !== undefined && !ascii(t.c) ? asBytes(t.c).map(c => ({ c })) : [t]));
+  const byByte = matchUnits(tokens.bytes, asBytes(name), loose, true);
   return loose ? byChar || byByte : byChar && byByte;
 }
 
-/** Whether a list of characters (or bytes) matches the tokens: row[n] says the tokens so far match the first n of them. */
+/**
+ * Whether a list of characters (or bytes) matches the tokens: row[n] says the tokens so far match the first n of them.
+ * Once no n is left, no token after can bring one back, and the answer is no: every token but a star takes a character,
+ * and stars never come two in a row, so a long pattern is read only as far as the name lets it.
+ */
 function matchUnits(tokens, cs, loose, bytes) {
   const same = (a, b) => a === b || (loose && (a.toLowerCase() === b.toLowerCase() || a.toUpperCase() === b.toUpperCase()));
   let row = cs.map(() => false);
   row.unshift(true);
   for (const t of tokens) {
+    charge((cs.length + 1) / 2500);
     const next = new Array(cs.length + 1).fill(false);
+    let left = false;
     for (let n = 0; n <= cs.length; n++) {
       if (t.star) next[n] = row[n] || (n > 0 && next[n - 1]);
       else if (n > 0 && row[n - 1]) next[n] = t.one || (t.set ? setHas(t.set, cs[n - 1], loose, bytes) : same(t.c, cs[n - 1]));
+      if (next[n]) left = true;
     }
+    if (!left) return false;
     row = next;
   }
   return row[cs.length];
@@ -1243,16 +1580,19 @@ function expandPattern(pattern, base, also, loose, budget) {
   const join = (dir, name) => (!dir ? name : dir.endsWith('/') ? dir + name : dir + '/' + name);
   const list = (dir, types) => {
     let names;
+    charge(1);
     try { names = fs.readdirSync(fsPath(dir), types ? { withFileTypes: true } : undefined); } catch { return []; }
+    charge(names.length / 32);
     budget.entries += names.length;
     if (budget.entries > GLOB_LIMIT.entries) throw TOO_MANY;
     return names;
   };
-  const isDir = text => { try { return fs.statSync(fsPath(text)).isDirectory(); } catch { return false; } };
+  const isDir = text => { charge(1); try { return fs.statSync(fsPath(text)).isDirectory(); } catch { return false; } };
   const hidden = name => name.startsWith('.');
   // A folder whose names the agent could have chosen: in its own folder or its scratch folders, not the ones above them.
   const mine = text => {
     let real;
+    charge(1);
     try { real = fs.realpathSync.native(fsPath(text)); } catch { return false; }
     return placeOf(real, base) !== 'outside' || also.some(test => test(real));
   };
@@ -1269,6 +1609,7 @@ function expandPattern(pattern, base, also, loose, budget) {
         if (!(e.isDirectory() || (follow && e.isSymbolicLink() && isDir(text)))) continue;
         if (follow) {
           let real;
+          charge(1);
           try { real = fs.realpathSync.native(fsPath(text)); } catch { continue; }
           if (seen.has(real)) continue;
           seen.add(real);
@@ -1346,8 +1687,12 @@ function readPieces(w) {
     if (w.glob && /[*?[^#]/.test(s)) s = globFolder(s);
     if (s) out.add(s);
   };
-  // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail.
-  if (/^-[^-]/.test(t)) for (let k = 2; k < t.length; k++) add(t.slice(k));
+  // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail; past OPTION_WORD characters,
+  // there are too many tails to check.
+  if (/^-[^-]/.test(t)) {
+    if (t.length > OPTION_WORD) throw PAST_CAP;
+    for (let k = 2; k < t.length; k++) add(t.slice(k));
+  }
   const parts = t.split(/([=:,])/);
   for (let i = 0; i < parts.length; i += 2) {
     if (parts[i - 1] === ':' && /^\/+$/.test(parts[i])) continue;
@@ -1581,7 +1926,8 @@ function initsElsewhere(dir, base) {
   try {
     const real = fs.realpathSync.native(dir + '/.git');
     return !fs.statSync(real).isDirectory() || placeOf(real, base) === 'outside';
-  } catch {
+  } catch (e) {
+    if (e === PAST_CAP) throw e; // the check is over: that is no answer about this .git
     return true; // a link to something missing, or a .git that cannot be read
   }
 }

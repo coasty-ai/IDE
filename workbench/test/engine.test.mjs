@@ -10,16 +10,19 @@ import { EV } from '../src/shared/events.mjs';
 import * as commands from '../src/core/commands.mjs';
 import * as receiptMod from '../src/core/receipt.mjs';
 import * as workspaceMod from '../src/core/workspace.mjs';
+import * as policyMod from '../src/core/policy.mjs';
+import { createPrefs, prefsFile } from '../src/core/prefs.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
 import { FakeSim, FakeGitSim, FakeMachines, fakeAdapter, fakeDeps, gate, gitError, until, FAKE_BASE, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
+import { slowFolder, slowLines } from './helpers/slow-lines.mjs';
 
 const REPO = { root: '/repos/shop', name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2 };
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${id}` };
 const subagentPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-subagent.json', import.meta.url), 'utf8'));
 const rootPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-root-bash.json', import.meta.url), 'utf8'));
 
-/** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). */
-function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2 } = {}) {
+/** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). `log` gets what it logs. */
+function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2, prefs = null, log = null } = {}) {
   const store = new Store();
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
@@ -29,7 +32,7 @@ function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudget
   store.on('notice', n => notices.push(n.text));
   const engine = new Engine({
     store, mode: 'live', repo: REPO, hook: HOOK, defaultBudgetUsd,
-    adapters: adapters || { claude, codex }, machines, deps,
+    adapters: adapters || { claude, codex }, machines, deps, prefs, log,
     options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
   return { store, engine, claude, codex, deps, calls, git, machines, notices };
@@ -97,14 +100,14 @@ async function doneAgent(t, opts = { task: 'Fix the cart total' }, finalText = '
   return a;
 }
 
-function demo({ options = {}, intent = null } = {}) {
+function demo({ options = {}, intent = null, prefs = null } = {}) {
   const store = new Store();
   const sim = new FakeSim();
   const { deps, calls } = fakeDeps({ intent });
   const machines = new FakeMachines({ demo: true });
   const notices = [];
   store.on('notice', n => notices.push(n.text));
-  const engine = new Engine({ store, mode: 'demo', hook: HOOK, adapters: { sim }, machines, deps, options: { tickMs: 10_000_000, simTickMs: 10_000_000, ...options } });
+  const engine = new Engine({ store, mode: 'demo', hook: HOOK, adapters: { sim }, machines, deps, prefs, options: { tickMs: 10_000_000, simTickMs: 10_000_000, ...options } });
   return { store, engine, sim, deps, calls, machines, notices };
 }
 
@@ -3314,8 +3317,14 @@ test('cards: every card the page gets says its kind, and merge and throw-away ca
     return out.confirm;
   };
   const start = await card({ kind: 'task', task: 'fix the login redirect' });
-  assert.deepEqual(Object.keys(start).sort(), ['detail', 'id', 'kind', 'sentence']);
+  assert.deepEqual(Object.keys(start).sort(), ['agents', 'detail', 'id', 'kind', 'sentence']);
   assert.equal(start.kind, 'start');
+  assert.equal(start.agents, 1, 'a launch card says how many agents it starts');
+  const two = await card({ kind: 'start', tasks: [{ task: 'fix the login redirect', harness: 'claude' }, { task: 'fix the docs', harness: 'claude' }] });
+  assert.equal(two.agents, 2);
+  // the full permissions card brings its own words, and no default answer
+  const perms = (await t.engine.permissions('full')).confirm;
+  assert.deepEqual({ ...perms, id: null }, { id: null, kind: 'permissions', sentence: 'Let agents do anything without asking?', detail: perms.detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true });
   assert.equal((await card({ kind: 'stop', agentIds: [a.id], sure: false })).kind, 'stop');
   assert.equal((await card({ kind: 'say', agentId: a.id, text: 'also the docs', sure: false })).kind, 'say');
   assert.equal((await card({ kind: 'forget', agentIds: [a.id] })).kind, 'forget');
@@ -3873,3 +3882,553 @@ test('words not caught say what to type; while a permission waits in the centre,
   assert.equal(out.hookSpecificOutput.permissionDecisionReason, "The person said no, and added: don't use the production database");
   await t.engine.shutdown();
 });
+
+// ------------------------------------------------------------------ full permissions
+
+/** The person's choices as createPrefs keeps them (src/core/prefs.mjs), in memory, recording what the engine saves. */
+function prefsStore(start = {}) {
+  let now = { theme: 'green', detail: 'calm', answered: false, permissions: 'ask', ...start };
+  const saved = [];
+  return {
+    saved,
+    get: () => ({ ...now }),
+    set(change) { saved.push(change); now = { ...now, ...change }; return { ok: true, prefs: { ...now } }; },
+  };
+}
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
+const FULL_OFF = 'Agents ask again before risky steps.';
+const FULL_REASON = 'Full permissions are on.';
+const pause = (ms = 10) => new Promise(r => setTimeout(r, ms));
+
+test('full permissions: turning them on always asks first, with a card of its own; Keep asking changes nothing', async () => {
+  const prefs = prefsStore();
+  const t = live({ prefs });
+  assert.equal(t.engine.permissionMode, 'ask');
+  assert.equal(t.engine.snapshot().permissions, 'ask');
+  const r = await t.engine.permissions('full');
+  assert.deepEqual(r, {
+    reply: 'Let agents do anything without asking?',
+    confirm: { id: r.confirm.id, sentence: 'Let agents do anything without asking?', detail: FULL_DETAIL, kind: 'permissions', yes: 'Turn on full permissions', no: 'Keep asking', danger: true },
+  });
+  assert.equal(t.engine.permissionMode, 'ask', 'nothing changes before the yes');
+  assert.deepEqual(prefs.saved, []);
+  assert.deepEqual(t.notices, [], 'the card says itself');
+  const no = await t.engine.confirm(r.confirm.id, false);
+  assert.equal(no.reply, 'OK, agents still ask before risky steps.');
+  assert.equal(t.engine.permissionMode, 'ask');
+  assert.deepEqual(prefs.saved, []);
+  // a yes to the card once it is gone does nothing
+  assert.deepEqual(await t.engine.confirm(r.confirm.id, true), { reply: 'That request is no longer waiting. Ask again if you still want it.' });
+  assert.equal(t.engine.permissionMode, 'ask');
+  // only the two modes
+  for (const mode of ['FULL', 'on', '', null, undefined, 1]) {
+    await assert.rejects(t.engine.permissions(mode), { message: 'Say whether agents should ask first or have full permissions.' }, String(mode));
+  }
+  await t.engine.shutdown();
+});
+
+test('full permissions: the yes turns them on, keeps them, says so, and allows every question already waiting, helpers’ too', async () => {
+  const prefs = prefsStore();
+  const logged = [];
+  const t = live({ prefs, log: (level, ...args) => logged.push(`${level}: ${args.join(' ')}`) });
+  const { id, runner } = await started(t);
+  const helperId = `${id}-${subagentPayload.agent_id.slice(0, 8)}`;
+  runner.emit({ kind: EV.CREATED, agentId: helperId, parentId: id, name: 'List repository files', harness: 'claude' });
+  runner.emit({ kind: EV.STATE, agentId: helperId, state: 'working' });
+  const a = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm a' } });
+  await until(() => t.store.get(id).ask);
+  const b = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm b' } }); // waits behind a, unseen
+  const h = t.engine.hookPreToolUse(id, subagentPayload);
+  await until(() => t.store.get(helperId).ask);
+  await pause();
+  const card = (await t.engine.permissions('full')).confirm;
+  assert.equal(card.detail, `${FULL_DETAIL} The 3 questions waiting now are allowed too.`);
+  assert.equal(await settled(a), false, 'nothing is allowed before the yes');
+  const yes = await t.engine.confirm(card.id, true);
+  assert.equal(yes.reply, 'Full permissions are on. 3 waiting questions were allowed.', 'it counts what it allowed');
+  for (const p of [a, b, h]) {
+    assert.deepEqual((await p).hookSpecificOutput, { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: FULL_REASON });
+  }
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.equal(t.engine.snapshot().permissions, 'full');
+  assert.deepEqual(prefs.saved, [{ permissions: 'full' }]);
+  assert.equal(t.notices.filter(n => n === yes.reply).length, 1, 'said once');
+  // the log says so too, and that agents still ask before steps that name Claude Code's own settings
+  assert.deepEqual(logged.filter(l => /Full permissions/.test(l)), ["warn: Full permissions are on: agents ask only before steps that name Claude Code's own settings."]);
+  assert.equal(t.store.get(id).ask, null);
+  assert.equal(t.store.get(id).state, 'working');
+  assert.equal(t.store.get(helperId).ask, null);
+  assert.deepEqual(t.store.get(id).approvals, { auto: 2, byYou: 0, denied: 0 }, 'they count as automatic approvals');
+  assert.deepEqual(t.store.get(helperId).approvals, { auto: 1, byYou: 0, denied: 0 });
+  // an agent already running gets the new mode at its next step: allowed at once, as an automatic approval
+  const next = await t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm c' } });
+  assert.deepEqual(next.hookSpecificOutput, { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: FULL_REASON });
+  assert.equal(t.calls.decide.at(-1).full, true, 'the policy hears that full permissions are on');
+  assert.equal(t.store.get(id).approvals.auto, 3);
+  // what the policy refuses is still refused
+  assert.equal((await t.engine.hookPreToolUse(id, { tool_name: 'Forbidden', tool_input: {} })).hookSpecificOutput.permissionDecision, 'deny');
+  await t.engine.shutdown();
+});
+
+test('full permissions: one question waiting is said so; one that would change Claude Code’s own settings is not counted, and still waits for the person', async () => {
+  const t = live({ prefs: prefsStore() });
+  const { id } = await started(t);
+  const a = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm a' } });
+  await until(() => t.store.get(id).ask);
+  const s = t.engine.hookPreToolUse(id, { tool_name: 'Settings', tool_input: {} });
+  await pause();
+  const card = (await t.engine.permissions('full')).confirm;
+  assert.equal(card.detail, `${FULL_DETAIL} The 1 question waiting now is allowed too.`);
+  await t.engine.confirm(card.id, true);
+  assert.equal((await a).hookSpecificOutput.permissionDecision, 'allow');
+  assert.equal(await settled(s), false, 'the floor is never allowed by the yes: the person still answers it');
+  await until(() => t.store.get(id).ask);
+  assert.equal(t.store.get(id).ask.sentence, 'Fix login redirect wants to use Settings');
+  // a new step like it is refused at once
+  const again = await t.engine.hookPreToolUse(id, { tool_name: 'Settings', tool_input: {} });
+  assert.equal(again.hookSpecificOutput.permissionDecision, 'deny');
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await s).hookSpecificOutput.permissionDecision, 'deny');
+  // with nothing waiting, the card says nothing more
+  await t.engine.permissions('ask');
+  assert.equal((await t.engine.permissions('full')).confirm.detail, FULL_DETAIL);
+  await t.engine.shutdown();
+});
+
+test('full permissions: turning them off is at once, with no card, and agents ask again at their next step', async () => {
+  const prefs = prefsStore({ permissions: 'full' });
+  const t = live({ prefs });
+  assert.equal(t.engine.permissionMode, 'full', 'read at start');
+  const { id } = await started(t);
+  assert.equal((await t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm a' } })).hookSpecificOutput.permissionDecision, 'allow');
+  const off = await t.engine.permissions('ask');
+  assert.deepEqual(off, { ok: true, reply: FULL_OFF, permissions: 'ask' });
+  assert.equal(t.engine.permissionMode, 'ask');
+  assert.equal(t.engine.snapshot().permissions, 'ask');
+  assert.deepEqual(prefs.saved, [{ permissions: 'ask' }]);
+  assert.ok(t.notices.includes(FULL_OFF));
+  const held = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm b' } });
+  assert.equal(await settled(held), false, 'it asks again');
+  assert.equal(t.calls.decide.find(r => r.input.command === 'rm b').full, false, 'the policy decides it with full permissions off');
+  // off when it is off, or on when it is on, says so and changes nothing
+  assert.deepEqual(await t.engine.permissions('ask'), { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' });
+  assert.deepEqual(prefs.saved, [{ permissions: 'ask' }]);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  await held;
+  await t.engine.shutdown();
+});
+
+test('full permissions: read at start in live mode; anything but full is ask; the demo starts asking and keeps its choice to itself', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.equal(t.engine.snapshot().permissions, 'full');
+  assert.deepEqual(await t.engine.permissions('full'), { ok: true, reply: 'Full permissions are already on.', permissions: 'full' });
+  await t.engine.shutdown();
+  for (const prefs of [prefsStore({ permissions: 'FULL' }), prefsStore({ permissions: true }), { get() { throw new Error('unreadable'); }, set() { return { ok: true }; } }, null]) {
+    const x = live({ prefs });
+    assert.equal(x.engine.permissionMode, 'ask');
+    await x.engine.shutdown();
+  }
+  // the demo neither reads nor keeps it: what is turned on there is for that run only, never for your own agents
+  const dprefs = prefsStore({ permissions: 'full' });
+  const d = demo({ prefs: dprefs });
+  assert.equal(d.engine.permissionMode, 'ask');
+  const card = (await d.engine.permissions('full')).confirm;
+  assert.equal((await d.engine.confirm(card.id, true)).reply, FULL_ON);
+  assert.equal(d.engine.permissionMode, 'full');
+  assert.equal((await d.engine.permissions('ask')).reply, FULL_OFF);
+  assert.deepEqual(dprefs.saved, []);
+  await d.engine.shutdown();
+});
+
+test('full permissions: when they cannot be kept for the next start, they still last for this run, and the reply says so', async () => {
+  const saved = [];
+  const ON_NOT_KEPT = 'Full permissions are on for now, but Workbench could not save that, so agents will ask again the next time it starts.';
+  const prefs = { get: () => ({ permissions: 'ask' }), set: (c) => { saved.push(c); return { ok: false, sentence: 'Workbench could not keep that choice.', prefs: {} }; } };
+  const t = live({ prefs });
+  const card = (await t.engine.permissions('full')).confirm;
+  assert.equal((await t.engine.confirm(card.id, true)).reply, ON_NOT_KEPT);
+  assert.equal(t.engine.permissionMode, 'full');
+  // turning them off again cannot be saved either, but what is kept says off, so the next start asks anyway: nothing more to say
+  assert.equal((await t.engine.permissions('ask')).reply, FULL_OFF);
+  const throwing = live({ prefs: { get: () => ({}), set: () => { throw new Error('disk full'); } } });
+  const c2 = (await throwing.engine.permissions('full')).confirm;
+  assert.equal((await throwing.engine.confirm(c2.id, true)).reply, ON_NOT_KEPT);
+  assert.equal(throwing.engine.permissionMode, 'full');
+  await t.engine.shutdown();
+  await throwing.engine.shutdown();
+});
+
+test('full permissions with the real policy: what would ask runs as an automatic approval, the floor is still refused, and a step that names Claude Code’s settings asks', async (ctx) => {
+  const t = liveFolders(ctx, { prefs: prefsStore({ permissions: 'full' }) });
+  const seen = [];
+  t.engine.deps.policy = { decide: (req) => { seen.push(req); return policyMod.decide(req); } };
+  const { id } = await started(t);
+  const hook = async (tool_name, tool_input) => (await t.engine.hookPreToolUse(id, { tool_name, tool_input })).hookSpecificOutput;
+  assert.deepEqual(await hook('Bash', { command: 'rm -rf build && npm install' }), { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: FULL_REASON });
+  assert.deepEqual(await hook('WebFetch', { url: 'https://example.com' }), { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: FULL_REASON });
+  assert.equal((await hook('Read', { file_path: 'README.md' })).permissionDecisionReason, "Looking at files inside the agent's own folder is always allowed.");
+  assert.deepEqual(await hook('Write', { file_path: '.claude/settings.json', content: '{}' }), { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Files in a .claude folder change how Claude Code itself runs, so agents may not change them.' });
+  assert.deepEqual(await hook('Agent', { description: 'x', prompt: 'y', isolation: 'worktree' }), { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: "Helpers must work in this agent's own folder, not in a separate copy or on another computer. Start the helper again without isolation." });
+  assert.ok(seen.every(r => r.full === true));
+  assert.deepEqual(t.store.get(id).approvals, { auto: 3, byYou: 0, denied: 2 });
+  assert.equal(t.store.get(id).ask, null, 'nothing asked');
+  // a command that names Claude Code's own settings waits for the person, with the reason it asks for without full
+  // permissions and why they do not cover it; its question says only that the agent wants to run a command, never what
+  // the command does with them
+  const name = t.store.get(id).name;
+  const named = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf .claude' } });
+  await until(() => t.store.get(id).ask);
+  assert.equal(t.store.get(id).state, 'needs_ok');
+  assert.equal(t.store.get(id).ask.sentence, `${name} wants to run a command`);
+  assert.equal(t.store.get(id).ask.why, "This command is not on the list of safe commands. Full permissions do not cover steps that name Claude Code's own settings.");
+  assert.equal(t.store.get(id).ask.detail, 'rm -rf .claude');
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await named).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(seen.length, 6, 'judged once, as full permissions judge it');
+  // one that writes .gitignore, not a file in those settings, is asked about in the same words
+  const ignore = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: "echo '.claude/' >> .gitignore" } });
+  await until(() => t.store.get(id).ask);
+  assert.deepEqual([t.store.get(id).ask.sentence, t.store.get(id).ask.why, t.store.get(id).ask.detail], [`${name} wants to run a command`,
+    "The command chains, redirects or substitutes other commands. Full permissions do not cover steps that name Claude Code's own settings.", "echo '.claude/' >> .gitignore"]);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await ignore).hookSpecificOutput.permissionDecision, 'deny');
+  await t.engine.shutdown();
+});
+
+test('full permissions: a step they do not cover asks while they are on, and stays waiting at the yes to their card', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  const { id } = await started(t);
+  // the stand-in policy's SettingsCommand names Claude Code's settings: it asks with full permissions on too
+  const p = t.engine.hookPreToolUse(id, { tool_name: 'SettingsCommand', tool_input: { command: 'rm -rf .claude' } });
+  await until(() => t.store.get(id).ask);
+  assert.equal(t.store.get(id).ask.why, "Needs a person. Full permissions do not cover steps that name Claude Code's own settings.");
+  assert.equal(await settled(p), false, 'it waits for the person');
+  // turned off and on again, their yes leaves it waiting, and counts nothing
+  await t.engine.permissions('ask');
+  const card = (await t.engine.permissions('full')).confirm;
+  assert.equal(card.detail, FULL_DETAIL, 'not counted among the questions they allow');
+  assert.equal((await t.engine.confirm(card.id, true)).reply, FULL_ON);
+  assert.equal(await settled(p), false);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Allow' });
+  assert.equal((await p).hookSpecificOutput.permissionDecision, 'allow');
+  await t.engine.shutdown();
+});
+
+test('full permissions off: a long line with many cd steps shows its question at once, checked by one decide for each mode', async (ctx) => {
+  const t = liveFolders(ctx, { prefs: prefsStore() });
+  const seen = [];
+  t.engine.deps.policy = { decide: (req) => { seen.push(req.full); return policyMod.decide(req); } };
+  const { id } = await started(t);
+  const folder = path.join(t.dir, fs.readdirSync(t.dir)[0]);
+  for (let i = 0; i < 200; i++) fs.mkdirSync(path.join(folder, `pkg${i}`));
+  const command = Array.from({ length: 200 }, (_, i) => `cd pkg${i} && npm test > out.txt && cd ..`).join(' && ');
+  const t0 = performance.now();
+  const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command } });
+  await until(() => t.store.get(id).ask);
+  // the first request of a fresh engine, before its code is compiled: the 250 ms limit is held by the test of the slow lines below
+  assert.ok(performance.now() - t0 < 1000, `the question came after ${Math.round(performance.now() - t0)} ms`);
+  // asked once as the mode is, and once as full permissions would judge it, for the yes to their card
+  assert.deepEqual(seen, [false, true]);
+  // too involved for full permissions to check in time: their card does not count it, and it waits for the person
+  assert.equal((await t.engine.permissions('full')).confirm.detail, FULL_DETAIL);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await pending).hookSpecificOutput.permissionDecision, 'deny');
+  await t.engine.shutdown();
+});
+
+test('full permissions on and off: each slow line the checkers found is answered or asked within 250 ms, and the engine keeps ticking', async (ctx) => {
+  for (const mode of ['ask', 'full']) {
+    const t = liveFolders(ctx, { prefs: prefsStore({ permissions: mode }) });
+    t.engine.deps.policy = policyMod;
+    const { id } = await started(t);
+    slowFolder(path.join(t.dir, fs.readdirSync(t.dir)[0]));
+    const wrong = [];
+    // one request: how long until it is answered or asked about, and the longest a 100 ms timer had to wait meanwhile
+    const once = async (command) => {
+      let last = performance.now();
+      let gap = 0;
+      const tick = setInterval(() => { const now = performance.now(); gap = Math.max(gap, now - last); last = now; }, 100);
+      const t0 = performance.now();
+      let out = null;
+      const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command } }).then(o => { out = o; });
+      await until(() => out || t.store.get(id).ask);
+      const ms = performance.now() - t0;
+      await pause(10); // a tick held up by the check comes as soon as it ends
+      clearInterval(tick);
+      if (!out) await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+      await pending;
+      return { ms, stood: gap - 100 };
+    };
+    for (const { label, command } of slowLines()) {
+      // the fastest of up to three tries counts, as in policy.test.mjs: other tests running beside this one can slow one down
+      let best = await once(command);
+      for (let i = 1; i < 3 && best.ms >= 250; i++) { const r = await once(command); if (r.ms < best.ms) best = r; }
+      if (best.ms >= 250) wrong.push(`${label}, full permissions ${mode === 'full' ? 'on' : 'off'}: ${Math.round(best.ms)} ms`);
+      if (best.stood >= 250) wrong.push(`${label}, full permissions ${mode === 'full' ? 'on' : 'off'}: the engine stood still for ${Math.round(best.stood)} ms`);
+    }
+    assert.equal(wrong.length, 0, wrong.join('\n'));
+    await t.engine.shutdown();
+  }
+});
+
+test('full permissions in words: the real parser asks first for "stop asking", a bare yes is not enough, and "ask first" turns them off', async () => {
+  const t = live({ prefs: prefsStore() });
+  t.engine.deps.commands = commands;
+  const r = await t.engine.command('stop asking');
+  assert.equal(r.reply, 'Let agents do anything without asking?');
+  assert.equal(r.confirm.kind, 'permissions');
+  const habit = await t.engine.command('yes', { confirmId: r.confirm.id });
+  assert.equal(habit.reply, 'I did not catch that. Say “do it” to turn on full permissions, or “cancel”.');
+  assert.equal(habit.confirm.id, r.confirm.id, 'the card stays');
+  assert.equal(t.engine.permissionMode, 'ask');
+  const yes = await t.engine.command('turn it on', { confirmId: r.confirm.id });
+  assert.equal(yes.reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.deepEqual(await t.engine.command('full permissions'), { reply: 'Full permissions are already on.' });
+  assert.equal((await t.engine.command('ask first')).reply, FULL_OFF);
+  assert.equal(t.engine.permissionMode, 'ask');
+  // "Keep asking", typed, is the card's no
+  const again = await t.engine.command('turn on full permissions');
+  assert.equal((await t.engine.command('keep asking', { confirmId: again.confirm.id })).reply, 'OK, agents still ask before risky steps.');
+  assert.equal(t.engine.permissionMode, 'ask');
+  await t.engine.shutdown();
+});
+
+test('full permissions in words: a thanks before them still acts, a question never does, and their card takes its own words beside an agent of that name', async () => {
+  const t = live({ prefs: prefsStore() });
+  t.engine.deps.commands = commands;
+  const card = await t.engine.command('thank you, stop asking');
+  assert.equal(card.confirm.kind, 'permissions');
+  assert.equal((await t.engine.command('thanks, stop asking', { confirmId: card.confirm.id })).reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  // asked, the mark typed apart or not, they change nothing
+  for (const q of ['ask first ?', 'ask first?']) {
+    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal(t.engine.permissionMode, 'full', q);
+  }
+  assert.equal((await t.engine.command('thanks, ask first')).reply, FULL_OFF);
+  assert.equal(t.engine.permissionMode, 'ask');
+  // an agent called Stop asking: the words alone reach it, and at the card they are still the card's yes
+  const { id } = await started(t, { task: 'Stop asking' });
+  assert.equal(t.store.get(id).name, 'Stop asking');
+  assert.equal((await t.engine.command('stop asking')).confirm, undefined);
+  assert.equal(t.engine.permissionMode, 'ask');
+  const again = await t.engine.command('turn on full permissions');
+  assert.equal((await t.engine.command('stop asking', { confirmId: again.confirm.id })).reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  await t.engine.shutdown();
+});
+
+test('full permissions in words: an agent named like them is reached by its name, a question with "?!" changes nothing, and "turn it off then" answers their card', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  t.engine.deps.commands = commands;
+  const { id } = await started(t, { task: 'Turn off full permissions when the repo is public' });
+  assert.equal(t.store.get(id).name, 'Turn off full permissions');
+  for (const said of ['turn off full permissions', 'Turn off full permissions.']) {
+    const r = await t.engine.command(said);
+    assert.equal(r.confirm, undefined, `${said}: no launch card`);
+    assert.equal(t.engine.permissionMode, 'full', said);
+  }
+  for (const q of ['ask first?!', 'ask first? please', 'ask first?.']) {
+    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal(t.engine.permissionMode, 'full', q);
+  }
+  assert.equal((await t.engine.command('ask first')).reply, FULL_OFF);
+  const card = await t.engine.command('stop asking');
+  assert.equal((await t.engine.command('turn it off then', { confirmId: card.confirm.id })).reply, 'OK, agents still ask before risky steps.');
+  assert.equal(t.engine.permissionMode, 'ask');
+  await t.engine.shutdown();
+});
+
+test('full permissions: the launch, the spending limit and Codex are as before', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  t.engine.deps.commands = commands;
+  const launch = await t.engine.command('start an agent to fix the login page');
+  assert.equal(launch.confirm.kind, 'start');
+  // the card is the engine's as before; the page adds, while full permissions are on, that it asks only before steps that
+  // name Claude Code's own settings
+  assert.equal(launch.confirm.detail, 'It can spend up to $2.00. It works in its own copy of shop, made from the last commit. Your 2 uncommitted changes are not included.');
+  assert.equal(launch.confirm.agents, 1, 'how many agents it starts, so the page can say it or they');
+  const { id } = await started(t, { task: 'Fix the cart', harness: 'codex' });
+  assert.equal((await t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm a' } })).hookSpecificOutput.permissionDecision, 'deny', 'Codex never asks through the hook');
+  await t.engine.shutdown();
+});
+
+test('full permissions in the demo (real simulator): the yes allows the simulated questions waiting, as automatic approvals', async () => {
+  const d = await realDemo();
+  const before = structuredClone(d.byName('Checkout fix'));
+  assert.equal(before.state, 'needs_ok');
+  assert.equal(before.ask.type, 'permission');
+  const card = (await d.engine.permissions('full')).confirm;
+  assert.equal(card.detail, `${FULL_DETAIL} The 1 question waiting now is allowed too.`);
+  assert.equal((await d.engine.confirm(card.id, true)).reply, 'Full permissions are on. 1 waiting question was allowed.');
+  await until(() => d.byName('Checkout fix').state !== 'needs_ok');
+  const after = d.byName('Checkout fix');
+  assert.equal(after.ask, null);
+  assert.equal(after.approvals.auto, before.approvals.auto + 1);
+  assert.equal(after.approvals.byYou, before.approvals.byYou);
+  await d.engine.shutdown();
+});
+
+test('full permissions in the demo: a simulated permission ask that comes while they are on is answered Allow at once', async () => {
+  const d = demo();
+  const card = (await d.engine.permissions('full')).confirm;
+  await d.engine.confirm(card.id, true);
+  const ask = { id: 'sim-9-abcdef', type: 'permission', sentence: 'Checkout fix wants to run a command', detail: 'npm run db:migrate', options: ['Allow', 'Deny'], primary: 'Allow' };
+  d.engine.ingest({ kind: EV.CREATED, agentId: 's1', parentId: null, name: 'Checkout fix', task: 'Fix the checkout', harness: 'claude', machineId: 'laptop' });
+  d.engine.ingest({ kind: EV.ASK, agentId: 's1', ask });
+  d.engine.ingest({ kind: EV.STATE, agentId: 's1', state: 'needs_ok' });
+  assert.deepEqual(d.sim.answers, [], 'not inside the simulator’s own step: once it has said all of it');
+  await until(() => d.sim.answers.length === 1);
+  assert.equal(d.sim.answers[0].agentId, 's1');
+  assert.equal(d.sim.answers[0].ask.id, ask.id);
+  assert.equal(d.sim.answers[0].answer, 'Allow');
+  assert.deepEqual(d.sim.answers[0].opts, { how: 'auto' });
+  // a question is still the person's, and with full permissions off a permission waits again
+  d.engine.ingest({ kind: EV.ASK, agentId: 's1', ask: { id: 'sim-10-abcdef', type: 'question', sentence: 'Which database?', options: [] } });
+  await d.engine.permissions('ask');
+  d.engine.ingest({ kind: EV.ASK, agentId: 's1', ask: { ...ask, id: 'sim-11-abcdef' } });
+  await pause(30);
+  assert.equal(d.sim.answers.length, 1);
+  await d.engine.shutdown();
+});
+
+test('full permissions: the notice after the yes counts what it allowed, including a question that came after the card', async () => {
+  const t = live({ prefs: prefsStore() });
+  const { id } = await started(t);
+  const a = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm a' } });
+  await until(() => t.store.get(id).ask);
+  const card = (await t.engine.permissions('full')).confirm;
+  assert.equal(card.detail, `${FULL_DETAIL} The 1 question waiting now is allowed too.`, 'the card counts what waits when it is made');
+  const b = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm b' } });
+  const s = t.engine.hookPreToolUse(id, { tool_name: 'Settings', tool_input: {} }); // full permissions would refuse it: not counted
+  await pause();
+  const yes = await t.engine.confirm(card.id, true);
+  assert.equal(yes.reply, 'Full permissions are on. 2 waiting questions were allowed.');
+  assert.ok(t.notices.includes(yes.reply));
+  for (const p of [a, b]) assert.equal((await p).hookSpecificOutput.permissionDecision, 'allow');
+  assert.equal(await settled(s), false, 'the one they would refuse still waits for the person');
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  await s;
+  // one question, and none
+  await t.engine.permissions('ask');
+  const c = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm c' } });
+  await until(() => t.store.get(id).ask);
+  const one = (await t.engine.permissions('full')).confirm;
+  assert.equal((await t.engine.confirm(one.id, true)).reply, 'Full permissions are on. 1 waiting question was allowed.');
+  await c;
+  await t.engine.permissions('ask');
+  const none = (await t.engine.permissions('full')).confirm;
+  assert.equal((await t.engine.confirm(none.id, true)).reply, FULL_ON);
+  await t.engine.shutdown();
+});
+
+test('full permissions: turning them off withdraws a card that would turn them on, and a card from before the last change is refused', async () => {
+  const t = live({ prefs: prefsStore() });
+  t.engine.deps.commands = commands;
+  const CHANGED = 'That changed. Have another look.';
+  const NOT_WAITING = 'That request is no longer waiting. Ask again if you still want it.';
+  // two cards; the yes to one turns them on, so the other is from before the change: neither its yes nor its no acts
+  const first = (await t.engine.permissions('full')).confirm;
+  const second = (await t.engine.permissions('full')).confirm;
+  await t.engine.confirm(second.id, true);
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.deepEqual(await t.engine.confirm(first.id, false), { reply: CHANGED });
+  assert.equal(t.engine.permissionMode, 'full', 'its "Keep asking" did not turn them off');
+  // the same when its yes is said in words
+  await t.engine.permissions('ask');
+  const third = (await t.engine.permissions('full')).confirm;
+  const fourth = (await t.engine.permissions('full')).confirm;
+  await t.engine.confirm(fourth.id, true);
+  assert.deepEqual(await t.engine.command('turn it on', { confirmId: third.id }), { reply: CHANGED });
+  assert.ok(t.notices.includes(CHANGED));
+  // turning them off, by the button or by words, withdraws every card that would turn them on: its yes finds nothing waiting
+  for (const turnOff of [() => t.engine.permissions('ask'), () => t.engine.command('ask first')]) {
+    await t.engine.permissions('ask');
+    const old = (await t.engine.permissions('full')).confirm;
+    const yes = (await t.engine.permissions('full')).confirm;
+    await t.engine.confirm(yes.id, true);
+    assert.equal(t.engine.permissionMode, 'full');
+    await turnOff();
+    assert.equal(t.engine.permissionMode, 'ask');
+    assert.deepEqual(await t.engine.confirm(old.id, true), { reply: NOT_WAITING });
+    assert.equal(t.engine.permissionMode, 'ask', 'a card from before they were turned off never turns them on');
+  }
+  // "ask first" while they are already off withdraws one too: the person said to keep asking
+  const open = (await t.engine.permissions('full')).confirm;
+  assert.deepEqual(await t.engine.permissions('ask'), { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' });
+  assert.deepEqual(await t.engine.confirm(open.id, true), { reply: NOT_WAITING });
+  assert.equal(t.engine.permissionMode, 'ask');
+  await t.engine.shutdown();
+});
+
+test('full permissions: a request being checked when they go on or off is judged again as the mode now on judges it', async () => {
+  const t = live({ prefs: prefsStore() });
+  const { id } = await started(t);
+  // a stand-in policy that answers only when the test lets it: what would ask is allowed with full permissions on
+  const pending = [];
+  t.engine.deps.policy = {
+    decide: (req) => new Promise(resolve => pending.push({ req, answer: () => resolve(req.full
+      ? { decision: 'allow', reason: FULL_REASON, sentence: 'wants to run a command', detail: req.input.command }
+      : { decision: 'ask', reason: 'Needs a person.', sentence: 'wants to run a command', detail: req.input.command }) })),
+  };
+  const next = async () => { await until(() => pending.length); return pending.shift(); };
+  // on while it is checked: allowed, never held
+  const a = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm a' } });
+  const first = await next();
+  assert.equal(first.req.full, false);
+  const card = (await t.engine.permissions('full')).confirm;
+  await t.engine.confirm(card.id, true);
+  first.answer();
+  const again = await next();
+  assert.equal(again.req.full, true, 'judged again with full permissions on');
+  again.answer();
+  assert.equal((await a).hookSpecificOutput.permissionDecision, 'allow');
+  // off while it is checked: it asks, and is not allowed by the answer given while they were on
+  const b = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm b' } });
+  const second = await next();
+  assert.equal(second.req.full, true);
+  await t.engine.permissions('ask');
+  second.answer();
+  const third = await next();
+  assert.equal(third.req.full, false, 'judged again with full permissions off');
+  third.answer();
+  await until(() => t.store.get(id).ask);
+  assert.equal(await settled(b), false, 'it waits for the person');
+  assert.equal(t.store.get(id).ask.why, 'Needs a person.');
+  // and when they go on again, the yes allows it, from what full permissions said while it was checked
+  const back = (await t.engine.permissions('full')).confirm;
+  assert.equal(back.detail, `${FULL_DETAIL} The 1 question waiting now is allowed too.`);
+  await t.engine.confirm(back.id, true);
+  assert.equal((await b).hookSpecificOutput.permissionDecision, 'allow');
+  assert.equal(pending.length, 0, 'each mode was asked about once');
+  await t.engine.shutdown();
+});
+
+test('full permissions: when turning them off cannot be saved, the reply says they will be on again the next time Workbench starts',
+  { skip: process.getuid?.() === 0 ? 'the system administrator can write to a folder that is not writable' : false }, async (ctx) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-home-'));
+    const dir = path.join(home, '.workbench');
+    const file = prefsFile(home);
+    fs.mkdirSync(dir, { mode: 0o700 });
+    fs.writeFileSync(file, `${JSON.stringify({ permissions: 'full' })}\n`, { mode: 0o600 });
+    fs.chmodSync(dir, 0o500); // ~/.workbench can be read, but no file in it can be replaced
+    ctx.after(() => { fs.chmodSync(dir, 0o700); fs.rmSync(home, { recursive: true, force: true }); });
+    const log = { warn() {}, info() {}, error() {}, debug() {} };
+    const t = live({ prefs: createPrefs({ file, log }) });
+    assert.equal(t.engine.permissionMode, 'full', 'read at start');
+    const off = await t.engine.permissions('ask');
+    assert.deepEqual(off, { ok: true, reply: 'Full permissions are off for now, but Workbench could not save that, so they will be on again the next time it starts.', permissions: 'ask' });
+    assert.ok(t.notices.includes(off.reply), 'said as a notice');
+    assert.equal(t.engine.permissionMode, 'ask', 'off for this run');
+    // as said: the next start reads what is kept, and they are on again
+    const nextStart = live({ prefs: createPrefs({ file, log }) });
+    assert.equal(nextStart.engine.permissionMode, 'full');
+    // turned on again in this run: what is kept says on, so nothing more needs saying
+    const card = (await t.engine.permissions('full')).confirm;
+    assert.equal((await t.engine.confirm(card.id, true)).reply, FULL_ON);
+    await t.engine.shutdown();
+    await nextStart.engine.shutdown();
+  });

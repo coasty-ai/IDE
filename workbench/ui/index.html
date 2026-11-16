@@ -1,8 +1,9 @@
 <!doctype html>
-<html lang="en" data-theme="green" data-detail="calm" data-answered="0" class="boot">
+<html lang="en" data-theme="green" data-detail="calm" data-answered="0" data-permissions="ask" class="boot">
 <head>
 <!-- The server replaces data-theme, data-detail and data-answered on <html> with the person's choices as it sends this
-     page (src/core/prefs.mjs), so the first paint already has their look. -->
+     page (src/core/prefs.mjs), so the first paint already has their look, and data-permissions with the permission mode
+     that is on, so the Full permissions button is right from the start. -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Workbench</title>
@@ -76,6 +77,10 @@
   <span class="silk repo" id="repo" hidden data-box="repo"></span>
   <span class="silk link-note" id="conn" hidden role="status" data-box="conn"></span>
   <span class="silk spend" id="spend" hidden data-box="spend" title="What your agents have cost so far today. Agents that have not reported a cost are not included."></span>
+  <!-- Full permissions: quiet while agents ask before risky steps, lit while they ask only before steps that name Claude
+       Code's own settings. Pressed when off, it asks the engine, whose card comes in the middle; pressed when on, it turns
+       them off. -->
+  <button id="permBtn" type="button" hidden aria-pressed="false" data-box="permbtn"><span class="led" aria-hidden="true"></span><span class="lbl">Full permissions</span></button>
   <!-- Agents & keys: its light is calm when an agent is ready for new work, and lit when none is. It opens the panel. -->
   <button id="connectBtn" type="button" hidden aria-haspopup="dialog" aria-controls="connect" data-box="connectbtn"><span class="led" aria-hidden="true"></span><span class="lbl">Agents &amp; keys</span></button>
 </header>

@@ -72,6 +72,11 @@ export const api = {
    */
   prefs: change => call('POST', '/api/prefs', change),
   /**
+   * Full permissions: 'full' answers with the engine's card ({ reply, confirm }), which only its yes turns on; 'ask' turns
+   * them off at once ({ ok, reply, permissions }).
+   */
+  permissions: mode => call('POST', '/api/permissions', { mode }),
+  /**
    * Merge or throw away an agent's work. Neither acts by itself: the engine answers with a card ({ reply, confirm }) the
    * person answers by id. `state` is the state the button was drawn in; the engine refuses when it has changed.
    */

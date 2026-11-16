@@ -8,11 +8,12 @@ export const STATES = { PRIORITY, NEEDS_YOU, DONE, ACTIVE, ENDED, LOOK };
 export const S = {
   agents: new Map(),     // id -> AgentView
   machines: [],
-  meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null },
+  // permissions: 'full' while full permissions are on, else 'ask' (from <html> at first, then from each snapshot)
+  meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null, permissions: 'ask' },
   loaded: false,         // a snapshot has arrived
   focusId: null,         // set when the person picks an agent or steps the queue; null = follow the queue
-  // an engine card on screen: { id, sentence, detail, kind: 'start'|'stop'|'say'|'forget'|'merge'|'discard', yes?, no?,
-  // danger? }, plus agentId (the page's own note) when a lid button for that agent asked for it
+  // an engine card on screen: { id, sentence, detail, kind: 'start'|'stop'|'say'|'forget'|'merge'|'discard'|'permissions',
+  // yes?, no?, danger?, agents? }, plus agentId (the page's own note) when a lid button for that agent asked for it
   confirm: null,
   hoverId: null,         // chip or helper under the pointer or keyboard
   pinId: null,           // card pinned by a click
