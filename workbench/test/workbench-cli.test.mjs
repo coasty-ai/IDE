@@ -17,7 +17,7 @@ import { checkRules } from '../src/core/receipt.mjs';
 import { Engine } from '../src/core/engine.mjs';
 // Imported, the CLI only exports its parts: it starts only when run as a program.
 import { parseArgs, createLogger, displayUrl, cloneFirst, connectGithubMode, githubReposMode, readLine, pathWithLocalBin, agentLines, wireConnect } from '../bin/workbench.mjs';
-import { githubSigninMode, githubStatusMode, openBrowser } from '../bin/workbench.mjs';
+import { githubSigninMode, githubStatusMode, openBrowser, claudeAdapter } from '../bin/workbench.mjs';
 import { ghWrapper, FAKE_CODE, FAKE_REPOS } from './helpers/gh-fake.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -458,6 +458,29 @@ test('full permissions kept from an earlier run are read at start and said in th
   const off = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
   assert.equal(off.code, 0, off.err);
   assert.ok(!off.out.includes(LINE), off.out);
+});
+
+test('the Claude Code adapter is told the folder Workbench started in, with the --claude path, at every lookup', async () => {
+  const calls = [];
+  const mod = {
+    harness: 'claude',
+    available: async (o) => { calls.push(['available', o]); return { ok: true }; },
+    createRunner: (o) => { calls.push(['createRunner', o]); return {}; },
+  };
+  const wrapped = claudeAdapter(mod, 'bin/claude', '/where/it/started');
+  assert.equal(wrapped.harness, 'claude');
+  await wrapped.available({ env: { A: '1' }, timeoutMs: 5 });
+  wrapped.createRunner({ agentId: 'abc123', cwd: '/the/agents/folder' });
+  assert.deepEqual(calls, [
+    ['available', { env: { A: '1' }, timeoutMs: 5, claudePath: 'bin/claude', startedIn: '/where/it/started' }],
+    ['createRunner', { agentId: 'abc123', cwd: '/the/agents/folder', claudePath: 'bin/claude', startedIn: '/where/it/started' }],
+  ]);
+  // Without --claude: the folder still goes (for WORKBENCH_CLAUDE_BIN), and a caller's own claudePath stays.
+  await claudeAdapter(mod, null, '/where/it/started').available({ claudePath: 'other/claude' });
+  assert.deepEqual(calls.at(-1), ['available', { claudePath: 'other/claude', startedIn: '/where/it/started' }]);
+  // A module that lacks one of the two is still incomplete; none is none.
+  assert.equal(claudeAdapter({ available: mod.available }, null, '/x').createRunner, undefined);
+  assert.equal(claudeAdapter(null, 'bin/claude', '/x'), null);
 });
 
 test('the file view is there in both modes: the demo shows its sample project, and a repository its own files', async (t) => {

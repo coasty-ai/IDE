@@ -339,15 +339,19 @@ function sentence(text) {
 }
 
 /**
- * The Claude Code adapter, told the --claude path when one was given. The engine calls available() and
- * createRunner() itself, and every launch looks Claude Code up again from this path.
+ * The Claude Code adapter, told the --claude path when one was given, and the folder Workbench was started in
+ * (`startedIn`), from which a relative path in --claude or WORKBENCH_CLAUDE_BIN is read: never from the working folder
+ * of the moment, which the file view changes for a moment. The engine and Agents & keys call available() and
+ * createRunner() themselves, and every launch looks Claude Code up again from this path.
  */
-function claudeAdapter(mod, claudePath) {
-  if (!mod || !claudePath) return mod;
+export function claudeAdapter(mod, claudePath, startedIn = null) {
+  if (!mod) return mod;
+  const told = { ...(claudePath ? { claudePath } : {}), startedIn };
   return {
     ...mod,
-    available: (o = {}) => mod.available({ ...o, claudePath }),
-    createRunner: (o = {}) => mod.createRunner({ ...o, claudePath }),
+    // Only what the module has: one that lacks either is still incomplete (see `complete`).
+    ...(typeof mod.available === 'function' ? { available: (o = {}) => mod.available({ ...o, ...told }) } : {}),
+    ...(typeof mod.createRunner === 'function' ? { createRunner: (o = {}) => mod.createRunner({ ...o, ...told }) } : {}),
   };
 }
 
@@ -905,6 +909,12 @@ async function main() {
   // Unheard, each failed write (EPIPE) would be an unexpected error whose report is another failed write, a loop that
   // kept the shutdown from running until the forced exit.
   for (const stream of [process.stdout, process.stderr]) stream.on('error', () => {});
+  // The folder Workbench was started in, read once now: relative paths the person gave are read from it later, never
+  // from the working folder of the moment (the file view steps into a project's folder for a moment).
+  let startedIn = null;
+  try {
+    startedIn = process.cwd();
+  } catch { /* that folder was removed: a relative --claude path is then refused in plain words */ }
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     say(USAGE);
@@ -962,6 +972,9 @@ async function main() {
     return 1;
   }
   tightenHome(mods.prefs, log);
+  // Every use of the Claude Code adapter, Agents & keys' included, is told the --claude path and the folder Workbench
+  // was started in.
+  mods.claude = claudeAdapter(mods.claude, args.claude, startedIn);
 
   // --clone: copy the repository first, then go on as --repo <its folder>. For the Mac app, standard input is the
   // lifeline from now on: if it closes after the clone, Workbench stops as soon as it has started (appGone, below).
@@ -1019,7 +1032,7 @@ async function main() {
       }
     }
     ({ connect } = await openConnect(mods, args, log, { repoRoot: repo.root }));
-    const claude = claudeAdapter(mods.claude, args.claude);
+    const claude = mods.claude; // told the --claude path and the folder Workbench was started in (above)
     // Every program Workbench can drive goes to the engine, ready or not: the engine checks each one itself, and one
     // installed or signed in later, from the page, can then start without a restart (connect's 'agents' event).
     if (complete(claude)) adapters.claude = claude;
