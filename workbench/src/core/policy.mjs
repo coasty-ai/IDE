@@ -395,9 +395,6 @@ function editFloor(tool, input, ctx) {
   return null;
 }
 
-/** Programs that run what they are given on their input or take their words from it, so any text in the line may count. */
-const RUNS_INPUT = new Set(['xargs', 'parallel', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'eval', 'source', '.',
-  'python', 'python2', 'python3', 'node', 'perl', 'ruby', 'php', 'deno', 'bun', 'osascript', 'awk', 'gawk', 'pwsh', 'lua', 'tclsh', 'Rscript']);
 
 /** Whether an edit's path names Claude Code's own settings, as written or wherever it leads (links followed). */
 function editNamesClaude(input, ctx) {
@@ -417,16 +414,16 @@ function stepNamesClaude(tool, input, ctx) {
 }
 
 /**
- * Whether a command line names Claude Code's own settings: its text does (textNamesClaude), but for a heredoc's text,
- * which is data unless a part runs what it is given (xargs, a shell, an interpreter: the names can reach it through a
- * pipe or a heredoc); or one of its parts does, by a word as written, by where a word or one of its values leads, links
+ * Whether a command line names Claude Code's own settings: its whole text does (textNamesClaude), a heredoc's text
+ * included; or one of its parts does, by a word as written, by where a word or one of its values leads, links
  * followed, or by what a wildcard matches the loose way, read from the agent's folder and from every folder the line
  * cd's or pushd's into.
  */
 function commandNamesClaude(command, base) {
   const parts = partsOf(command);
-  const runsInput = parts.some(c => RUNS_INPUT.has(c.prog) || c.words.slice(0, c.at ?? 0).includes('xargs'));
-  if (textNamesClaude(runsInput ? command : withoutHeredocs(command))) return true;
+  // The whole text, a heredoc's included: a << that is no heredoc (a here-string, a shift, a comment) would otherwise
+  // hide the lines after it. A heredoc that only mentions them asks only where the step asks without full permissions.
+  if (textNamesClaude(command)) return true;
   const bases = base ? cdBases(parts, base) : [];
   return parts.some(c => partNamesClaude(c, bases, base));
 }
@@ -535,29 +532,6 @@ function dotPatternMatchesClaude(seg) {
   return matchTokens(t.tokens, '.claude', true) || matchTokens(t.tokens, '.mcp.json', true);
 }
 
-/** The command without the text of its heredocs (from the line after <<WORD up to the line WORD), which is data. */
-function withoutHeredocs(command) {
-  const s = String(command);
-  const start = /<<(-?)\s*(['"]?)([A-Za-z0-9_.-]+)\2/g;
-  let out = '';
-  let at = 0; // where the text not yet read starts; each line is read once, however many heredocs the command has
-  for (;;) {
-    start.lastIndex = at;
-    const m = start.exec(s);
-    if (!m) return out + s.slice(at);
-    const nl = s.indexOf('\n', m.index + m[0].length);
-    if (nl < 0) return out + s.slice(at);
-    out += s.slice(at, nl + 1);
-    // the heredoc's text, up to the line that is its end word, which stays
-    for (let line = nl + 1; ; ) {
-      const next = s.indexOf('\n', line);
-      const text = s.slice(line, next < 0 ? s.length : next);
-      if ((m[1] ? text.replace(/^\t+/, '') : text) === m[3]) { at = line; break; }
-      if (next < 0) return out; // no end word: the rest is all its text
-      line = next + 1;
-    }
-  }
-}
 
 /** Every string in a tool's input, a few levels down (at most 200): what a tool of another service could act on. */
 function stringsIn(value, depth = 0, out = []) {

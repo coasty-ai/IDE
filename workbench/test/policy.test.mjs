@@ -1555,6 +1555,8 @@ test('with full permissions on, a command or another tool’s step that names Cl
     bash('rm -rf .c*'), bash('rm -rf .??aude'), bash('rm -rf *'), bash('chmod -R 777 ./*'),
     // inside another command, and in the background
     bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), monitor({ command: 'rm -rf .claude' }),
+    // after a << that is no heredoc (a here-string, a shift, a comment), on a line of its own
+    bash('cat <<< x\nrm -rf .claude'), bash('echo $((1<<2))\nrm -rf .claude'), bash('# <<EOF\nrm -rf .claude'),
     // reading them where the policy asks without full permissions, and mentioning them: the step names them all the same
     bash('cat .claude/settings.json | head -5'), bash('grep -r hooks .claude | wc -l'), () => bash(`cat ${outside}/dir/secret.txt .mcp.json`),
     bash('ls -la ~/.claude && echo done'), bash('git log -- .claude/settings.json | head'), bash("echo '.claude/' >> .gitignore"),
