@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { narrate, describeCommand, describeRequest, commandAction, shellCommands, FILLED, nameFromTask, extractQuestion, firstSentence, plain, baseName, pastTense, quotable, waitingFor } from '../src/shared/narrate.mjs';
+import { narrate, describeCommand, describeRequest, commandAction, shellCommands, nameFromTask, extractQuestion, firstSentence, plain, baseName, pastTense, quotable, waitingFor } from '../src/shared/narrate.mjs';
 import { duration, tokens, money, percent, clip, shortModel, spentText, spentAmount } from '../src/shared/format.mjs';
 import { STATE, LOOK, PRIORITY, NEEDS_YOU, lookOf } from '../src/shared/states.mjs';
 import { EV, newAgentView, SPARK_BUCKETS } from '../src/shared/events.mjs';
@@ -140,116 +140,6 @@ test('shellCommands lists every part with all its words and where the program is
   assert.deepEqual([v.empty, v.at, v.words], [true, 1, ['PATH=/x']]);
   assert.equal(shellCommands('/tmp/evil.sh go')[0].script, true);
   assert.deepEqual(shellCommands(''), []);
-});
-
-test('shellCommands gives each part its redirections, read with the quotes, and its words without them', () => {
-  const one = (cmd) => {
-    const [c, ...rest] = shellCommands(cmd);
-    assert.equal(rest.length, 0, cmd);
-    return { redirects: c.redirects.map(r => [r.op, r.kind, r.target]), bare: c.bare ? c.bare.words : null, words: c.words };
-  };
-  // glued to a word, to an fd number, and to "&": the target is the next word, its quotes taken away
-  assert.deepEqual(one('echo x>.claude/a').redirects, [['>', 'write', '.claude/a']]);
-  assert.deepEqual(one('echo x>.claude/a').bare, ['echo', 'x']);
-  assert.deepEqual(one('npm test 2>>.claude/log').redirects, [['2>>', 'write', '.claude/log']]);
-  assert.deepEqual(one('npm test 2>>.claude/log').bare, ['npm', 'test']);
-  assert.deepEqual(one('make &> "build log.txt"').redirects, [['&>', 'write', 'build log.txt']]);
-  assert.deepEqual(one('echo hi >>"$HOME/.claude/x"').redirects, [['>>', 'write', '$HOME/.claude/x']]);
-  assert.deepEqual(one('exec 3<> .claude/x').redirects, [['3<>', 'write', '.claude/x']]);
-  // quoted or escaped, it is no redirection: the words stay as they were
-  assert.deepEqual(one('git commit -m "a > .claude/x"').redirects, []);
-  assert.deepEqual(one('git commit -m "a > .claude/x"').bare, ['git', 'commit', '-m', 'a > .claude/x']);
-  assert.deepEqual(one("echo 'see -> .claude/x' > notes.md").redirects, [['>', 'write', 'notes.md']]);
-  assert.deepEqual(one('echo a\\>b').redirects, []);
-  // input, copies of a stream and the quiet places write nothing
-  assert.deepEqual(one('cat < .claude/settings.json').redirects, [['<', 'read', '.claude/settings.json']]);
-  assert.deepEqual(one('cat < .claude/settings.json').bare, ['cat']);
-  assert.deepEqual(one('npm test 2>&1').redirects, [['2>&', 'dup', '1']]);
-  assert.deepEqual(one('npm test 2>&1').bare, ['npm', 'test']);
-  assert.deepEqual(one('npm test >/dev/null').redirects, [['>', 'quiet', '/dev/null']]);
-  assert.deepEqual(one('make >&build.log').redirects, [['>&', 'write', 'build.log']]);
-  assert.deepEqual(one('cat <<< hello').redirects, [['<<<', 'string', 'hello']]);
-  // ">|" and "<&" are one redirection each, not a pipe or a new command
-  assert.deepEqual(one('echo x >| out.txt').redirects, [['>|', 'write', 'out.txt']]);
-  assert.deepEqual(one('read line <&3').redirects, [['<&', 'dup', '3']]);
-  // two in a row, and a heredoc, whose text is data
-  assert.deepEqual(one('echo x >a>b').redirects, [['>', 'write', 'a'], ['>', 'write', 'b']]);
-  const h = shellCommands("cat > .claude/settings.json <<'EOF'\n{ \"a\": 1 }\nEOF");
-  assert.equal(h.length, 1);
-  assert.deepEqual(h[0].redirects.map(r => [r.op, r.kind, r.target]), [['>', 'write', '.claude/settings.json'], ["<<'EOF'", 'heredoc', '']]);
-  assert.deepEqual(h[0].bare.words, ['cat']);
-  // a redirection before the program: the bare words find it
-  assert.equal(shellCommands('>out.txt sort data.txt')[0].bare.prog, 'sort');
-  // each part has its own; "writes" says the same as before
-  const [p, q] = shellCommands('sort a > b.txt | tee c.txt');
-  assert.deepEqual([p.writes, p.redirects.length, q.writes, q.redirects.length], [true, 1, false, 0]);
-  assert.deepEqual(shellCommands('npm test > /dev/null 2>&1').map(c => c.writes), [false]);
-});
-
-test('shellCommands read whole, for the floor: another command’s output leaves a hole in its word, and the command goes on past it', () => {
-  const whole = cmd => shellCommands(cmd, { whole: true });
-  const shape = cmd => whole(cmd).map(c => [c.prog, c.args, c.nested, c.sep]);
-  const H = FILLED;
-  assert.equal(H, '\u0000');
-  // $(…), `…`, <(…): the outer command keeps every word, the hole in its place; the commands inside are parts of their own
-  assert.deepEqual(shape('mv $(echo a.txt) .mcp.json'), [['echo', ['a.txt'], true, ''], ['mv', [H, '.mcp.json'], false, '']]);
-  assert.deepEqual(shape('cp `echo a.txt` .claude/settings.json'), [['echo', ['a.txt'], true, ''], ['cp', [H, '.claude/settings.json'], false, '']]);
-  assert.deepEqual(shape('cp <(echo x) .claude/settings.json'), [['echo', ['x'], true, ''], ['cp', [H, '.claude/settings.json'], false, '']]);
-  assert.deepEqual(whole('cp "$(pwd)/.claude/settings.json" /tmp/backup.json').at(-1).args, [`${H}/.claude/settings.json`, '/tmp/backup.json']);
-  assert.deepEqual(whole('mv "$(ls *.json | head -1)" .mcp.json').map(c => [c.prog, c.sep]), [['ls', '|'], ['head', ''], ['mv', '']]);
-  assert.deepEqual(whole('sed -i "s/$(whoami)/x/" .mcp.json').at(-1).args, ['-i', `s/${H}/x/`, '.mcp.json']);
-  // a redirection keeps its target past a hole earlier in the line, and a hole in its target
-  assert.deepEqual(whole('echo "Checked .claude at $(date)" > status.txt').at(-1).redirects.map(r => r.target), ['status.txt']);
-  assert.deepEqual(whole('echo hi > "$(pwd)/out.txt"').at(-1).redirects.map(r => r.target), [`${H}/out.txt`]);
-  // a heredoc inside, as in Claude Code's own commit
-  const commit = whole("git commit -m \"$(cat <<'EOF'\nExplain the .claude folder\nEOF\n)\"");
-  assert.deepEqual(commit.map(c => [c.bare.prog, c.bare.args, c.redirects.map(r => r.kind)]), [['cat', [], ['heredoc']], ['git', ['commit', '-m', H], []]]);
-  // find runs each -exec's command, cut at ";" or "+"; xargs, env and timeout take their options' values first
-  assert.deepEqual(shape('find . -name a.txt -exec cp {} .claude/x \\; -print').map(([p, a, n]) => [p, a, n]),
-    [['find', ['.', '-name', 'a.txt', '-exec', 'cp', '{}', '.claude/x', ';', '-print'], false], ['cp', ['{}', '.claude/x'], true]]);
-  assert.deepEqual(whole("find src -name '*.md' -exec mv {} .claude/ +").map(c => [c.prog, c.args]).at(-1), ['mv', ['{}', '.claude/']]);
-  assert.deepEqual(whole('find src -exec rm {} + -exec cp {} .claude/ \\;').slice(1).map(c => [c.prog, c.args]), [['rm', ['{}']], ['cp', ['{}', '.claude/']]]);
-  for (const [cmd, prog, args] of [['xargs -a list.txt cp -t .claude', 'cp', ['-t', '.claude']], ['xargs -I {} cp {} .claude/', 'cp', ['{}', '.claude/']],
-    ['xargs -0 -n 1 rm', 'rm', []], ['env -u HOME rm -rf .claude', 'rm', ['-rf', '.claude']], ['timeout -s KILL 5 rm x', 'rm', ['x']],
-    ['timeout --signal=KILL 5 rm x', 'rm', ['x']], ['nice -n 5 rm x', 'rm', ['x']]]) {
-    assert.deepEqual([whole(cmd)[0].prog, whole(cmd)[0].args], [prog, args], cmd);
-  }
-  // a subshell and the commands in another's output are nested; a group, a function's body and eval's commands are the shell's own
-  assert.deepEqual(shape('(cd .claude && ls)'), [['cd', ['.claude'], true, '&&'], ['ls', [], true, ')']]);
-  assert.deepEqual(shape('pushd .claude && ls && popd'), [['pushd', ['.claude'], false, '&&'], ['ls', [], false, '&&'], ['popd', [], false, '']]);
-  assert.deepEqual(shape('{ rm -rf .claude; }'), [['rm', ['-rf', '.claude'], false, ';']]);
-  assert.deepEqual(shape('f() { rm -rf .claude; }; f').map(([p, a]) => [p, a]), [['rm', ['-rf', '.claude']], ['f', []]]);
-  assert.deepEqual(shape('function f { rm -rf .claude; }').map(([p, a]) => [p, a]), [['rm', ['-rf', '.claude']]]);
-  assert.deepEqual(shape('cd .claude && ls &').map(c => c[3]), ['&&', '&']);
-  const ev = whole("eval 'cd .claude'");
-  assert.deepEqual(ev.map(c => [c.prog, !!c.nested, !!c.inEval]), [['eval', false, false], ['cd', false, true]]);
-  assert.equal(ev[0].kids[0], ev[1]);
-  assert.deepEqual(whole("sh -c 'cd .claude && ls'").map(c => [c.prog, !!c.nested]), [['sh', false], ['cd', true], ['ls', true]]);
-  // "{}" is a word; a brace of its own ends a command as zsh can read it, and bash's reading, where it is one more word, is kept
-  // as a nested part, once, when the command ends, when words follow it; "(" after a command's first word is zsh's pattern group
-  assert.deepEqual(shape('echo { a }'), [['echo', [], false, '{'], ['a', [], false, '}'], ['echo', ['{', 'a', '}'], true, '']]);
-  assert.deepEqual(shape('echo } a } b; ls').map(c => c.slice(0, 2)), [['echo', []], ['a', []], ['b', []], ['echo', ['}', 'a', '}', 'b']], ['ls', []]]);
-  assert.deepEqual(shape('{ cp a.txt .mcp.json }'), [['cp', ['a.txt', '.mcp.json'], false, '}']]);
-  assert.deepEqual(shape('rm -rf } .claude'), [['rm', ['-rf'], false, '}'], ['.claude', [], false, ''], ['rm', ['-rf', '}', '.claude'], true, '']]);
-  // zsh's short forms open a group at a "{" of their own after a command's words; bash's reading of it as a word is kept too
-  assert.deepEqual(shape('if [[ -d x ]] { rm -rf .claude }').map(c => c.slice(0, 3)),
-    [['[[', ['-d', 'x', ']]'], false], ['rm', ['-rf', '.claude'], false], ['[[', ['-d', 'x', ']]', '{', 'rm', '-rf', '.claude', '}'], true]]);
-  assert.deepEqual(shape('co' + 'proc { rm -rf .claude; }').map(c => c.slice(0, 2)), [['rm', ['-rf', '.claude']]]);
-  assert.deepEqual(shape('rm -rf (.claude|x)'), [['rm', ['-rf', '(.claude|x)'], false, '']]);
-  // a case pattern's "(" and zsh's "for x (a b)" list start the command after them afresh
-  assert.deepEqual(shape('case x in (a) rm -rf .claude;; esac').map(c => c[0]), ['case', 'a', 'rm', 'esac']);
-  assert.deepEqual(shape('for f (a b) rm -rf .claude').map(c => c.slice(0, 2)), [['for', ['f']], ['a', ['b']], ['rm', ['-rf', '.claude']]]);
-  // another command's output inside ${…}, a comment, sudo, doas, zsh's precommand words and env -S
-  assert.deepEqual(shape('echo ${X:-$(rm -rf .claude)}').map(c => c.slice(0, 3)), [['rm', ['-rf', '.claude'], true], ['echo', [`\${X:-${H}}`], false]]);
-  assert.deepEqual(shape('echo "${X:-a}" > b').map(c => c[0]), ['echo']);
-  assert.deepEqual(shape('cp a.txt .mcp.json # copy it in').map(c => c.slice(0, 2)), [['cp', ['a.txt', '.mcp.json']]]);
-  assert.deepEqual(shape('echo a#b').map(c => c[1]), [['a#b']]);
-  for (const cmd of ["sudo -u root sh -c 'x'", "doas sh -c 'x'", "noglob sh -c 'x'", "repeat 2 sh -c 'x'", "env -S 'sh -c x'", 'env -S"sh -c x"']) {
-    assert.equal(whole(cmd)[0].prog, 'sh', cmd);
-  }
-  // read the old way, nothing changes
-  assert.deepEqual(shellCommands('mv $(echo a.txt) .mcp.json').map(c => c.prog), ['mv', 'echo', '.mcp.json']);
-  assert.equal(shellCommands('xargs -a list.txt cp -t .claude')[0].prog, 'list.txt');
 });
 
 test('Monitor is narrated by what it really watches, never by its description', () => {

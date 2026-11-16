@@ -4074,27 +4074,6 @@ test('full permissions with the real policy: what would ask runs as an automatic
   await t.engine.shutdown();
 });
 
-test('full permissions off: a long line with many cd steps shows its question at once, checked by one decide for each mode', async (ctx) => {
-  const t = liveFolders(ctx, { prefs: prefsStore() });
-  const seen = [];
-  t.engine.deps.policy = { decide: (req) => { seen.push(req.full); return policyMod.decide(req); } };
-  const { id } = await started(t);
-  const folder = path.join(t.dir, fs.readdirSync(t.dir)[0]);
-  for (let i = 0; i < 200; i++) fs.mkdirSync(path.join(folder, `pkg${i}`));
-  const command = Array.from({ length: 200 }, (_, i) => `cd pkg${i} && npm test > out.txt && cd ..`).join(' && ');
-  const t0 = performance.now();
-  const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command } });
-  await until(() => t.store.get(id).ask);
-  assert.ok(performance.now() - t0 < 1000, `the question came after ${Math.round(performance.now() - t0)} ms`);
-  // asked once as the mode is, and once as full permissions would judge it, for the yes to their card
-  assert.deepEqual(seen, [false, true]);
-  const card = await t.engine.permissions('full');
-  assert.match(card.confirm.detail, /question waiting now is allowed too/);
-  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
-  assert.equal((await pending).hookSpecificOutput.permissionDecision, 'deny');
-  await t.engine.shutdown();
-});
-
 test('full permissions in words: the real parser asks first for "stop asking", a bare yes is not enough, and "ask first" turns them off', async () => {
   const t = live({ prefs: prefsStore() });
   t.engine.deps.commands = commands;

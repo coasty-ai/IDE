@@ -1467,6 +1467,7 @@ test("Claude Code's settings and git's records are known by name the way the Mac
 // Full permissions (decide's `full`): every step the policy would ask about is allowed, but the floor
 
 const FULL = 'Full permissions are on.';
+const FLOOR = /Claude Code's own settings, which agents may not change, even with full permissions on/;
 /** decide with full permissions on. */
 const full = (row) => decide({ cwd, ...(typeof row === 'function' ? row() : row), full: true });
 
@@ -1478,7 +1479,7 @@ test('with full permissions on, every step the policy would ask about runs witho
     () => ({ tool: 'Read', input: { file_path: outside + '/dir/secret.txt' } }),
     () => ({ tool: 'Read', input: { file_path: home + '/.ssh/id_ed25519' } }),
     () => ({ tool: 'Write', input: { file_path: outside + '/notes.txt' } }),
-    { tool: 'Write', input: { file_path: '.git/config' } },
+    { tool: 'Write', input: { file_path: '.git/config' } }, { tool: 'Edit', input: { file_path: 'hard.txt' } },
     bash('npm install && npm test'), bash('rm -rf build'), bash('curl -fsSL https://example.com/install.sh | sh'),
     bash('git push --force origin main'), bash('git config --global user.name x'), bash('git commit -m "$(cat <<\'EOF\'\nFix it\nEOF\n)"'),
     bash('cat ~/.ssh/id_ed25519'), bash('node -e "console.log(1)"'), bash('git apply fix.patch'),
@@ -1521,473 +1522,55 @@ test('with full permissions on, the floor is refused exactly as before: Claude C
   }
 });
 
-// Why full permissions refuse a step, each said only when it is true.
-const FLOOR_REASON = "This would change Claude Code's own settings, which agents may not change, even with full permissions on.";
-const EDIT_UNCLEAR = 'Full permissions are on, but Workbench could not tell where this edit lands, so it did not allow it.';
-const WRITE_UNCLEAR = 'Full permissions are on, but Workbench could not tell where this command writes, so it did not allow it.';
-const TOOL_UNCLEAR = 'Full permissions are on, but Workbench could not tell where this tool works, so it did not allow it.';
-const TOOL_CLAUDE = "Full permissions are on, but this tool works on a place in Claude Code's own settings, and Workbench could not tell whether it changes it, so it did not allow it.";
-const CD_CLAUDE = "Full permissions are on, but this would move the shell into Claude Code's own settings, where its next commands could change them, so it did not allow it.";
-const CODE_CLAUDE = "Full permissions are on, but Workbench could not tell what this does with Claude Code's own settings, which it names, so it did not allow it.";
-const CD_UNCLEAR_REASON = "Full permissions are on, but Workbench could not tell where this would leave the shell, and the command names Claude Code's own settings, so it did not allow it.";
-
-/** Each row is refused with full permissions on, with exactly this reason. `run` decides one row (full permissions on). */
-function refusedWith(rows, reason, run = full) {
-  const wrong = [];
-  for (const row of rows) {
-    const req = typeof row === 'function' ? row() : row;
-    const d = run(row);
-    if (d.decision !== 'deny' || d.reason !== reason) wrong.push(`${JSON.stringify(req.input)} -> ${d.decision}: ${d.reason}`);
-  }
-  assert.equal(wrong.length, 0, `expected refused, "${reason}":\n  ` + wrong.join('\n  '));
-}
-
-/** Each row runs with full permissions on. */
-function allowedInFull(rows, run = full) {
-  const wrong = [];
-  for (const row of rows) {
-    const req = typeof row === 'function' ? row() : row;
-    const d = run(row);
-    if (d.decision !== 'allow') wrong.push(`${JSON.stringify(req.input)} -> ${d.decision}: ${d.reason}`);
-  }
-  assert.equal(wrong.length, 0, 'expected allowed:\n  ' + wrong.join('\n  '));
-}
-
-/**
- * A second agent folder, for the places no path can be told for: ten links in a row to something missing (more than the
- * policy follows), two links that lead to each other, a file taken for a folder, and a folder that holds a .claude.
- */
-let edgeDir = null;
-function edge() {
-  if (edgeDir) return edgeDir;
-  edgeDir = T + '/edge';
-  for (const d of ['/.claude', '/chain', '/holds/.claude', '/src']) fs.mkdirSync(edgeDir + d, { recursive: true });
-  fs.writeFileSync(edgeDir + '/README.md', 'x\n');
-  for (let i = 0; i < 10; i++) fs.symlinkSync(i < 9 ? `c${i + 1}` : 'nothing-here', `${edgeDir}/chain/c${i}`);
-  fs.symlinkSync('loopB', edgeDir + '/loopA');
-  fs.symlinkSync('loopA', edgeDir + '/loopB');
-  return edgeDir;
-}
-const inEdge = (row) => decide({ cwd: edge(), ...(typeof row === 'function' ? row() : row), full: true });
-
-test('with full permissions on, a step that would write into Claude Code’s own settings is refused, in every form the policy can read', () => {
+test('with full permissions on, a command or tool that names Claude Code’s own settings and does more than read them is refused, never asked', () => {
   const longS = String.fromCharCode(0x17f);
   const joiner = String.fromCharCode(0x200c);
-  const rows = [
-    // redirections, read with the quotes: glued to a word or an fd number, appending, opened to read and write, stdout and stderr together
-    bash('echo {} > .claude/settings.json'), bash('cat > .claude/settings.json <<EOF\n{}\nEOF'), bash('echo x>.claude/a'), bash('npm test 2>>.claude/log'),
-    bash('exec 3<> .mcp.json'), bash('make >&.claude/build.log'),
-    // rm, rmdir, unlink, touch, mkdir, truncate, tee, chmod and chown change every file they name (an option's value is not one)
-    bash('rm -rf .claude'), bash('rm -rf .CLAUDE'), bash(`rm .mcp.j${longS}on`), bash(`rm .clau${joiner}de/settings.json`), bash('rmdir .claude'),
-    bash('unlink .mcp.json'), bash('touch -r README.md .claude/x'), bash('mkdir -p sub/.claude && touch sub/.claude/settings.json'),
-    bash('truncate -s 0 .claude/settings.json'), bash('echo "x" | tee -a ".claude/settings.json"'), bash('chmod 600 .claude/settings.json'),
-    bash('chmod -x .mcp.json'), bash('chown -R me .claude'),
-    // mv moves its sources away and writes its destination; cp, ln, install and rsync write their destination, or the name they give inside it
-    bash('mv .claude .claude-old'), bash('mv notes.json .mcp.json'), bash('mv notes.json .claude/'),
-    () => bash(`cp ${outside}/evil.mjs .claude/settings.json`), () => bash(`cp ${outside}/.mcp.json .`), () => bash(`cp -r ${outside}/dir/ .claude`),
-    bash('ln -sf /tmp/x .claude/settings.json'), bash('install -m 644 hook.sh .claude/hooks/check.sh'), bash('rsync -a backup/ .claude/'),
-    bash('cp -t .claude a.json b.json'),
-    // dd's of=, sed -i and perl -i, an archive written or unpacked there, a download saved there
-    bash('dd if=/dev/zero of=.claude/settings.json'), bash("sed -i '' s/a/b/ .mcp.json"), bash("sed -i 's/a/b/' .claude/settings.json"),
-    bash('sed --in-place -e s/a/b/ .claude/settings.json'), bash("perl -pi -e 's/a/b/' .claude/settings.json"),
-    bash('tar -xzf hooks.tgz -C .claude'), bash('tar xf hooks.tar .claude/settings.json'), bash('tar -cf .claude/backup.tar src'),
-    bash('unzip hooks.zip -d .claude'), bash('unzip -o hooks.zip .mcp.json'),
-    bash('curl -o .claude/settings.json https://example.com/x'), bash('curl -sSLo .mcp.json https://example.com/x'), bash('wget -O .claude/settings.json https://example.com/x'),
-    // git that writes the files it names, from any -C folder; options that name the file written
-    bash('git checkout -- .claude/settings.json'), bash('git restore .claude/settings.json'), bash('git checkout main -- .claude'), bash('git rm -r .claude'),
-    bash('git mv .claude old-settings'), bash('git apply --directory=.claude fix.patch'), bash('git clean -fdx .claude'), bash('git -C .claude checkout .'),
-    bash('git diff --output=.claude/x'), bash('node --test --test-reporter=spec --test-reporter-destination=.claude/settings.json'),
-    bash('sort -o .claude/x list.txt'), bash('uniq list.txt .claude/x'), bash('find . -fprint .claude/x'), bash('find .claude -name "*.json" -delete'),
-    bash("find . -path './.claude/*' -exec rm {} \\;"),
-    // through a link into .claude, and to something missing there; read from the folder a cd leads to
-    bash('rm cfg/settings.json'), bash('tee to-claude'), bash('cd .claude && rm settings.json'),
+  const refused = [
+    // the commands the policy asks about today that write there
+    bash('echo {} > .claude/settings.json'), bash('cat > .claude/settings.json <<EOF\n{}\nEOF'), bash('rm -rf .claude'), bash('mv .claude .claude-old'),
+    bash('rm -rf .CLAUDE'), bash(`rm .mcp.j${longS}on`), bash(`rm .clau${joiner}de/settings.json`), bash("sed -i '' s/a/b/ .mcp.json"),
+    () => bash(`cp ${outside}/evil.mjs .claude/settings.json`), // the place outside does not hide the place it writes
+    bash('git checkout -- .claude/settings.json'), bash('git restore .claude/settings.json'), bash('git checkout main -- .claude'),
+    bash('node --test --test-reporter=spec --test-reporter-destination=.claude/settings.json'), bash('node .claude/x.mjs'),
+    bash('cd .claude && rm settings.json'), bash('cd .claude'), bash('mkdir -p sub/.claude && touch sub/.claude/settings.json'),
+    // through a link into .claude, and to something missing there
+    bash('rm cfg/settings.json'), bash('tee to-claude'),
     // the person's own settings, and the main checkout's
     bash('rm -rf ~/.claude'), bash('echo x >> $HOME/.claude/settings.json'), () => bash(`echo x > ${outside}/.mcp.json`),
-    // written so the shell puts the name together, braces too
-    bash("rm -rf '.cla''ude'"), bash('rm -rf .cl\\aude'), bash('rm -rf .{claude,git}'), bash('rm -rf {.claude,build}'), bash('mkdir -p src/{a,.claude}'),
+    // written so the shell puts the name together
+    bash("rm -rf '.cla''ude'"), bash('rm -rf .cl\\aude'), bash('rm -rf .{claude,git}'), bash('echo "x" | tee ".claude/settings.json"'),
     // wildcards that match it: a dot pattern, and * as zsh matches it with GLOB_DOTS, which the person may have set
     bash('rm -rf .c*'), bash('rm -rf .??aude'), bash('rm -rf *'), bash('chmod -R 777 ./*'),
-    // a folder that holds them, as a whole
-    bash('rm -rf .'), bash('rm -rf ..'),
-    // inside another command, behind sudo or timeout, and in the background
-    bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), bash('sudo rm -rf .claude'), bash('timeout 5 rm -rf .claude'), monitor({ command: 'rm -rf .claude' }),
-    // GNU sed's -i takes no word of its own: the file after it is a file, even one that could be BSD's backup extension
-    bash('sed -e s/a/b/ -i .mcp.json'),
-    // git that makes a folder or writes files where it is told: clone, worktree add, init, submodule add, checkout-index, merge-file
-    bash('git clone https://example.com/x .claude/skills/x'), bash('git clone https://example.com/owner/.claude'), bash('git worktree add .claude/wt'),
-    bash('git init .claude/x'), bash('git submodule add https://example.com/x .claude/x'), bash('git checkout-index -a --prefix=.claude/'),
-    bash('git merge-file .claude/settings.json a.txt b.txt'),
-    // patch, the compressors, which replace the file they are given, and zip's archive
-    bash('patch .claude/settings.json fix.diff'), bash('patch -d .claude -p1 -i fix.diff'), bash('gzip .claude/settings.json'), bash('zip -r .claude/backup.zip src'),
-    bash('zstd README.md -o .mcp.json'),
-    // a brace makes several words of one command: here mv's source and destination
-    bash('mv .claude{,-old}'), bash('mv .mcp.json{,.bak}'),
-    // perl's -l and -0 take only digits, and the rest of their word goes on: -lpi edits in place
-    bash("perl -lpi -e 's/a/b/' .claude/settings.json"), bash("perl -0pi -e 's/a/b/' .mcp.json"), bash("perl -l -0777 -pi -e 's/a/b/' .mcp.json"),
-    // a bundle git writes, and the records --separate-git-dir puts somewhere
-    bash('git bundle create .claude/x.bundle HEAD'), bash('git init --separate-git-dir=.claude/records x'), bash('git clone --separate-git-dir .claude/r https://example.com/x y'),
+    // inside another command, and in the background
+    bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), monitor({ command: 'rm -rf .claude' }),
+    // a tool of another service that names it
+    { tool: 'mcp__fs__write_file', input: { path: '.claude/settings.json', content: '{}' } },
+    { tool: 'mcp__fs__edit', input: { edits: [{ file: 'sub/.mcp.json' }] } },
+    // a path the policy cannot resolve still names it
+    { tool: 'Write', input: { file_path: '~nobody/.claude/settings.json' } }, { tool: 'Write', input: { file_path: 'missing/../.claude/settings.json' } },
   ];
-  refusedWith(rows, FLOOR_REASON);
-  for (const row of rows) {
+  for (const row of refused) {
     const req = typeof row === 'function' ? row() : row;
-    assert.notEqual(decide({ cwd, ...req }).decision, 'allow', JSON.stringify(req.input)); // none runs without asking when they are off
+    const d = full(row);
+    assert.equal(d.decision, 'deny', JSON.stringify(req.input));
+    assert.match(d.reason, FLOOR, JSON.stringify(req.input));
+    // without full permissions, none of these runs without asking either
+    assert.notEqual(decide({ cwd, ...req }).decision, 'allow', JSON.stringify(req.input));
   }
-  // a folder that holds a .claude, removed or moved as a whole
-  refusedWith([bash('rm -rf holds'), bash('mv holds elsewhere')], FLOOR_REASON, inEdge);
 });
 
-test('with full permissions on, a place written out is refused whatever another word holds, and inside find -exec, xargs, groups and wrappers', () => {
+test('with full permissions on, reading Claude Code’s settings, and names that only look like them, run', () => {
   const rows = [
-    // another command's output in another word leaves the written place where it was: mv's destination, git's paths, sed's file
-    bash('mv $(echo a.txt) .mcp.json'), bash('mv "$(ls *.json | head -1)" .mcp.json'), bash('git checkout "$(git rev-parse HEAD)" -- .claude'),
-    bash('git restore --source="$(git rev-parse HEAD~1)" .claude'), bash('git rm "$(echo a.txt)" .mcp.json'), bash('git mv "$(echo a.txt)" .mcp.json'),
-    bash('sed -i "s/$(whoami)/x/" .mcp.json'), bash('perl -pi -e "s/$(whoami)/x/" .mcp.json'), bash('cp `echo a.txt` .claude/settings.json'),
-    bash('cp $(ls a.*) .claude/settings.json'), bash('cp <(echo x) .claude/settings.json'), bash('tar -xzf "$(ls *.tgz)" -C .claude'),
-    bash('unzip "$(ls *.zip)" -d .claude'), bash('dd if="$(echo a.txt)" of=.claude/settings.json'),
-    // the command find runs for each -exec, up to its ";" or "+", and the command xargs runs, past xargs's own options
-    bash('find . -maxdepth 1 -name a.txt -exec cp {} .claude/settings.json \\;'), bash("find src -name '*.md' -exec mv {} .claude/ +"),
-    bash('find . -name a.txt -exec cp {} .claude/x \\; -print'), bash('find src -exec rm {} + -exec cp {} .claude/ \\;'),
-    bash('xargs -a list.txt cp -t .claude'), bash('xargs -I {} cp {} .claude/'), bash('xargs -n 1 -I{} mv {} .mcp.json'),
-    // wrappers' own options and their values, a group, a function's body, an if, and a pattern group as zsh reads it
-    bash('env -u HOME rm -rf .claude'), bash('timeout -s KILL 5 rm -rf .claude'), bash('nice -n 5 rm -rf .claude'), bash('{ rm -rf .claude; }'),
-    bash('{ echo a; rm -rf .claude }'), bash('f() { rm -rf .claude; }; f'), bash('function f { rm -rf .claude; }; f'), bash('if true; then rm -rf .claude; fi'),
-    bash('rm -rf (.claude|x)'),
-    // written inside another command's output, or a process substitution (zsh's =(…) too), and a subshell's or a group's redirection
-    bash('echo "$(rm -rf .claude)"'), bash('tee >(cat > .claude/x) < a.txt'), bash('cp =(rm -rf .claude) x'), bash('(echo x) > .claude/x'),
-    bash('{ echo x; } > .claude/x'),
-    // "{}" stands for what find finds, in the command it runs and in a shell's command it runs; a copy named after a name it looks for
-    bash('find .claude -exec rm {} \\;'), bash("find .claude -exec sh -c 'rm {}' \\;"), bash('find . -name .mcp.json -exec cp {} src/ \\;'),
-    // a case pattern's "(" and zsh's short loops; sudo, doas, env -S and zsh's precommand words before the command; another
-    // command's output inside ${…}; zsh's group that ends at a "}" of its own, and bash's reading of that "}" as a word; a comment
-    bash('case x in (a) rm -rf .claude;; esac'), bash('for f (a b) rm -rf .claude'), bash('foreach f (a b) rm -rf .claude; end'),
-    bash("sudo sh -c 'rm -rf .claude'"), bash("doas sh -c 'rm -rf .claude'"), bash("sudo -u root bash -c 'cd .claude && rm settings.json'"),
-    bash("env -S 'rm -rf .claude'"), bash('noglob rm -rf .claude'), bash('nocorrect rm -rf .claude'), bash('repeat 2 rm -rf .claude'),
-    bash('echo ${X:-$(rm -rf .claude)}'), bash('echo "${X:-$(rm -rf .claude)}"'), bash('{ cp a.txt .mcp.json }'), bash('rm -rf } .claude'),
-    bash('cp a.txt .mcp.json # copy it in'),
-    // zsh's short forms, whose "{" opens a group after a command's words, and coproc
-    bash('if [[ -d x ]] { rm -rf .claude }'), bash('repeat 2 { rm -rf .claude }'), bash('while true { rm -rf .claude; break }'),
-    bash('coproc { rm -rf .claude; }'), bash('coproc (rm -rf .claude)'), bash('coproc rm -rf .claude'),
-  ];
-  refusedWith(rows, FLOOR_REASON);
-  for (const row of rows) assert.notEqual(decide({ cwd, ...row }).decision, 'allow', JSON.stringify(row.input)); // none runs without asking when they are off
-});
-
-test('with full permissions on, reading Claude Code’s settings, mentioning them, and running a script that lives there all run', () => {
-  allowedInFull([
-    // the owner's examples: a copy out, an archive of them, words that mention them, a script given them as an argument, a script that lives there
-    bash('cp .claude/settings.json /tmp/backup.json'), bash('tar -czf /tmp/cfg.tgz .claude'), bash('gh pr create --body "Explains the .claude folder"'),
-    bash(`curl -d '{"note":"see .claude"}' https://example.com`), bash("echo '.claude/' >> .gitignore"), bash('echo "Never edit .claude by hand" > docs/NOTE.md'),
-    bash('python3 scripts/check.py --exclude .claude'), bash('node .claude/x.mjs'),
-    { tool: 'mcp__github__create_issue', input: { owner: 'acme', repo: 'shop', title: 'Explain the .claude folder', body: 'See .claude/settings.json and .mcp.json.' } },
-    // a name in quotes is no redirection; sed's script is no file; input read from there; git that only stages; a heredoc's text is data
-    bash("sed -i '' 's/.claude/.config/' README.md"), bash('git commit -m "a > .claude/x"'), bash('echo "see -> .claude/x" > notes.md'),
-    bash('cat < .claude/settings.json'), bash('git add .claude/x'), bash("git commit -m \"$(cat <<'EOF'\nExplain the .claude folder\nEOF\n)\""),
-    bash('grep -rn hooks .claude > /tmp/hooks.txt'), () => bash(`cp -r .claude ${outside}/settings-backup`), bash('ln -s .claude/settings.json settings-link'),
-    bash('bash .claude/hooks/check.sh'), bash('source .claude/env.sh'), bash('tar -xzf build.tgz -C build'), bash('find .claude -name "*.json" > list.txt'),
-    bash('python3 -c "print(1)" > out.txt'), bash("awk -F, '{print $1}' .claude/x.csv > cols.txt"), bash('npx prettier --check .claude/settings.json'),
-    bash('echo $(cat .claude/settings.json) > /tmp/settings.txt'), bash('node --test 2>&1 | grep .claude'), bash('python3 --version && cat .claude/settings.json'),
-    // git, sed, patch and the compressors that write elsewhere, or only to their output
-    bash('git clone https://example.com/owner/repo.git'), bash('git worktree add ../wt-feature'), bash('git merge-file -p .claude/settings.json a.txt b.txt > merged.json'),
-    bash("sed -i .bak 's/.claude/.config/' README.md"), bash('gzip -c .claude/settings.json > /tmp/settings.json.gz'), bash('zip -r /tmp/cfg.zip .claude'),
-    bash('patch -p1 -i fix.diff'), bash('X=build; rm -rf "$X"'), bash('rm -rf "$TMPDIR/build"'),
-    bash('mv notes{,-old}.md'), bash("perl -lne 'print' .claude/x.txt > lines.txt"), bash('git bundle create /tmp/repo.bundle HEAD'),
-    // reading them, and names that only look like them
     bash('cat .claude/settings.json | head -5'), bash('grep -r hooks .claude | wc -l'), bash('cat ~/.claude/settings.json'),
     bash('ls -la ~/.claude && echo done'), bash('git log -- .claude/settings.json | head'),
     () => ({ tool: 'Read', input: { file_path: home + '/.claude/settings.json' } }),
     bash('rm -rf .claude-notes'), bash('rm CLAUDE.md && echo gone'), bash('rm docs/mcp.json.bak; ls'), bash('rm -rf build/*'), bash('rm *.log'),
-    bash('rm -rf node_modules'), bash('rm -rf src'), bash('mv src lib'), { tool: 'Write', input: { file_path: '.claude-notes/a.md' } },
-    // another command's output beside a read or a mention: where the line writes is still read, and it is elsewhere
-    bash('echo "Checked .claude at $(date)" > status.txt'), bash('cp .claude/settings.json /tmp/backup.json && echo "saved $(date)"'),
-    bash('echo "$(date): see .claude" >> notes.md'), bash('printf "%s\\n" "$(cat .claude/settings.json)" > /tmp/copy.json'),
-    bash('cp "$(pwd)/.claude/settings.json" /tmp/backup.json'), bash('echo "Last checked $(date) for .claude" > status.txt'),
-    bash('diff <(cat .claude/settings.json) <(cat /tmp/x) > /tmp/d.txt'), bash('cp a.txt b.txt && echo "$(cat .claude/settings.json)"'),
-    bash('git commit -m "Update the .claude notes, $(date)"'), bash("find .claude -name '*.json' -exec cat {} \\; > /tmp/all.json"),
-    bash("find . -path './.claude/*' -exec grep -l hooks {} +"), bash('xargs -a list.txt cat > /tmp/out.txt && echo .claude'),
-  ]);
-});
-
-test('with full permissions on, an edit, a command or a tool whose landing place cannot be told is refused, never allowed', () => {
-  const e = edge();
-  // edits: ten links in a row to something missing, a step back out of a folder that is not there, someone else's home folder,
-  // two links that lead to each other, a file taken for a folder, blank space around the path, and no path at all
-  refusedWith([
-    { tool: 'Write', input: { file_path: 'chain/c0' } }, { tool: 'Edit', input: { file_path: 'missing/../notes.md' } },
-    { tool: 'Write', input: { file_path: '~nobody/notes.md' } }, { tool: 'MultiEdit', input: { file_path: 'loopA/x.md' } },
-    { tool: 'Write', input: { file_path: 'README.md/x' } }, { tool: 'NotebookEdit', input: { notebook_path: ' src/a.ipynb' } },
-    { tool: 'Write', input: {} },
-  ], EDIT_UNCLEAR, inEdge);
-  // and an agent's folder that cannot be checked
-  refusedWith([{ tool: 'Write', input: { file_path: 'a.md' } }], EDIT_UNCLEAR, row => decide({ cwd: e + '/no-such-folder', ...row, full: true }));
-  // a path that cannot be resolved but names them is refused for what it names
-  refusedWith([{ tool: 'Write', input: { file_path: '~nobody/.claude/settings.json' } }, { tool: 'Write', input: { file_path: 'missing/../.claude/settings.json' } }],
-    FLOOR_REASON, inEdge);
-  // commands, a value another command fills in cutting the word a command writes to, and a name a variable carries to a
-  // command that writes, in a line that names them
-  refusedWith([bash('echo x > missing/../notes.md'), bash('touch ~nobody/x'), bash('cp a.txt chain/c0'), bash('rm loopA/x'),
-    bash('cp a.txt "$(pwd)/.claude/settings.json"'), bash('echo hi > "$(git rev-parse --show-toplevel)/.mcp.json"'),
-    bash('X=.claude; rm -rf "$X"'), bash('for d in .claude .mcp.json; do rm -rf "$d"; done'), bash('cp .claude/settings.json "$BACKUP"'),
-    // another command's output where a command writes, whole or in part, glued to other words or not, in a line that names them
-    bash('rm -rf "$(echo .claude)"'), bash('rm -rf $(echo .claude)'), bash('mv $(echo a.txt .mcp.json)'), bash('touch "$(pwd)"/.mcp.json'),
-    bash('cp .claude/settings.json "$(mktemp)"'), bash('git -C "$(echo .claude)" checkout -- settings.json'),
-    bash(`find .claude -exec sh -c 'rm "$1"' _ {} \\;`)],
-  WRITE_UNCLEAR, inEdge);
-  // tools of other services
-  refusedWith([{ tool: 'mcp__fs__write_file', input: { path: 'missing/../x' } }, { tool: 'mcp__fs__write_file', input: { path: 'chain/c0' } }], TOOL_UNCLEAR, inEdge);
-  // without full permissions, these ask
-  for (const row of [{ tool: 'Write', input: { file_path: 'chain/c0' } }, { tool: 'Write', input: { file_path: 'loopA/x.md' } }, bash('echo x > missing/../notes.md')]) {
-    assert.equal(decide({ cwd: e, ...row }).decision, 'ask', JSON.stringify(row.input));
-  }
-  // what can be told still runs
-  allowedInFull([bash('echo hi > "$(pwd)/out.txt"'), { tool: 'Write', input: { file_path: 'src/new.md' } }, bash('cp a.txt src/')], inEdge);
-});
-
-test('with full permissions on, code that names Claude Code’s own settings where Workbench cannot follow it, and a cd into them, are refused', () => {
-  refusedWith([
-    bash(`python3 -c "import shutil; shutil.rmtree('.claude')"`), bash(`node -e "require('fs').rmSync('.claude', { recursive: true })"`),
-    bash(`perl -e 'unlink ".mcp.json"'`), bash('echo "rm -rf .claude" | sh'), bash("bash <<'EOF'\nrm -rf .claude\nEOF"),
-    bash('echo .claude | xargs rm -rf'), bash(`awk '{ print > ".claude/x" }' list.txt`), bash(`osascript -e 'do shell script "rm -rf .claude"'`),
-    bash("python3 - <<'EOF'\nimport os; os.remove('.mcp.json')\nEOF"), bash('parallel rm -rf ::: .claude'),
-    // in a word of options, -l and -0 take only digits (perl), and node's -p before -e prints what -e runs
-    bash(`perl -le 'unlink ".mcp.json"'`), bash(`perl -lne 'unlink ".mcp.json"' list.txt`), bash(`node -pe "require('fs').rmSync('.claude', { recursive: true })"`),
-    // a program whose name is put together when the line runs, given their name; code behind sudo
-    bash('$(echo rm) -rf .claude'), bash('$RM -rf .claude'), bash('"$(which rm)" .mcp.json'), bash('`echo rm` -rf .claude'),
-    bash(`sudo python3 -c "import shutil; shutil.rmtree('.claude')"`),
-  ], CODE_CLAUDE);
-  // a folder a variable or another command's output holds, in a line that names them: where the shell is left cannot be told
-  refusedWith([bash('X=.claude; cd "$X"'), bash('cd "$(echo .claude)"'), bash('for d in src .claude; do cd "$d"; done'),
-    bash('cd "$(dirname .claude/settings.json)" && ls')], CD_UNCLEAR_REASON);
-  // the shell would stay there when the line ends: its next command's words are read from the agent's own folder. The line is
-  // read as it runs when each of its commands succeeds; a command after || may run or not; zsh runs a pipe's last command itself
-  refusedWith([bash('cd .claude'), bash('pushd .claude > /dev/null'), bash('cd cfg'), bash('cd ~/.claude && ls'), bash('cd .claude && ls'),
-    bash('false || cd .claude'), bash('cd .claude || exit 1'), bash("eval 'cd .claude'"), bash('echo | cd .claude'), bash('cd .claude && ls || cd ..'),
-    bash('cd src; cd ../.claude'), bash('pushd .claude && pushd src && popd'), bash('cd ~nobody/.claude'), bash('{ cd .claude }'),
-    bash('cd .claude # and stay'), bash('cd "$X/.claude"')], CD_CLAUDE);
-  // a script given as a file, code that names nothing of theirs, and names passed to a program that only reads, run
-  allowedInFull([bash('python3 scripts/x.py .claude'), bash('node -e "console.log(1)"'), bash('echo hi | sh'), bash('ls .claude | xargs -n1 echo'),
-    bash('cd src && rm old.js'), bash('$EDITOR notes.md; cat .claude/settings.json'),
-    // the shell does not stay there: a subshell, a step back out, popd, cd -, a shell of its own, the background, a pipe's first command
-    bash('(cd .claude && ls)'), bash('pushd .claude && ls && popd'), bash('cd .claude/.. && ls'), bash('cd .claude; ls; cd -'), bash('pushd .claude; ls; popd'),
-    bash('cd .claude/hooks && ls && cd ../..'), bash("sh -c 'cd .claude && ls'"), bash('cd .claude && ls &'), bash('x=$(cd .claude && pwd); echo "$x"'),
-    bash('cd .claude | cat'), bash('cd .claude && ls && cd -'), bash('if (cd .claude); then ls; fi'),
-    // a folder held in a variable is not known: it runs, unless they are named where they could reach it (before it, or in it)
-    bash('cd "$REPO" && git status'), bash('cd "$(git rev-parse --show-toplevel)" && npm test'),
-    bash('cd "$(git rev-parse --show-toplevel)" && cat .claude/settings.json'), bash('cd "$REPO" && cp .claude/settings.json /tmp/b.json'),
-    // what comes after a # that starts a word is a comment, which the shell never runs
-    bash('echo hi # ; rm -rf .claude')]);
-});
-
-test('with full permissions on, a tool of another service is judged by the places it is given, not by what its text mentions', () => {
-  refusedWith([
-    { tool: 'mcp__fs__write_file', input: { path: '.claude/settings.json', content: '{}' } },
-    { tool: 'mcp__fs__edit', input: { edits: [{ file: 'sub/.mcp.json', old: 'a', new: 'b' }] } },
-    { tool: 'mcp__fs__move_file', input: { source: 'notes.json', destination: '.claude/settings.json' } },
-    // through a link into .claude: a tool's name does not say whether it only reads
-    { tool: 'mcp__fs__read_file', input: { file_path: 'cfg/settings.json' } },
-    { tool: 'FooTool', input: { target: '~/.claude/settings.json' } }, { tool: 'mcp__x__y', input: { filePath: '.CLAUDE/x' } },
-    { tool: 'mcp__x__y', input: { paths: ['src/a.js', '.mcp.json'] } },
-    // any argument named for a place, however it is written: a source, from and to, an old and a new path, a folder
-    { tool: 'mcp__filesystem__move_file', input: { source: '.claude', destination: '/tmp/x' } },
-    { tool: 'mcp__fs__rename', input: { from: '.mcp.json', to: 'old.json' } }, { tool: 'mcp__fs__rename', input: { old_path: '.claude/settings.json', new_path: 'x.json' } },
-    { tool: 'mcp__fs__copy', input: { src: 'cfg/settings.json', dst: 'b.json' } }, { tool: 'mcp__fs__copy', input: { sourcePath: '.claude', targetDir: 'backup' } },
-    { tool: 'mcp__fs__list', input: { directory: '.claude' } }, { tool: 'mcp__x__run', input: { cwd: '.claude', task: 'build' } },
-    { tool: 'mcp__fs__zip', input: { inputFiles: ['a.txt', '.mcp.json'], outputName: 'x.zip' } },
-  ], TOOL_CLAUDE);
-  // a tool that carries a command or code, whose text names them: Workbench cannot follow what it does with them
-  refusedWith([
-    { tool: 'mcp__shell__run_command', input: { command: 'rm -rf .claude' } }, { tool: 'mcp__desktop-commander__execute_command', input: { command: 'rm .mcp.json' } },
-    { tool: 'PowerShell', input: { command: 'Remove-Item -Recurse -Force .claude' } }, { tool: 'REPL', input: { code: "require('fs').rmSync('.claude', { recursive: true })" } },
-    { tool: 'mcp__exec__run', input: { cmd: 'rm', args: ['-rf', '.claude'] } }, { tool: 'mcp__py__run', input: { script: "import os; os.remove('.mcp.json')" } },
-  ], CODE_CLAUDE);
-  allowedInFull([
-    { tool: 'mcp__github__create_issue', input: { title: 'Explain .claude', body: 'see .mcp.json' } },
-    { tool: 'mcp__slack__send_message', input: { channel: 'dev', text: 'Never edit .claude by hand' } },
-    { tool: 'mcp__fs__write_file', input: { path: 'docs/claude.md', content: 'See .claude/settings.json' } },
-    { tool: 'mcp__github__get_file_contents', input: { owner: 'acme', repo: 'shop', path: 'README.md' } },
-    { tool: 'mcp__docs__search', input: { query: 'claude code settings in .claude' } },
-    // words in an argument named like a place that are no path, and a place there that cannot be told, count for nothing
-    { tool: 'mcp__mail__send', input: { to: '~bob', from: ' me ', subject: 'hi', text: 'see .claude' } },
-    { tool: 'mcp__docs__cite', input: { source: 'the guide to the .claude folder', title: '.claude' } },
-    { tool: 'mcp__fs__move_file', input: { source: 'notes.md', destination: 'docs/notes.md' } },
-    // a command that names nothing of theirs
-    { tool: 'mcp__shell__run_command', input: { command: 'npm test' } }, { tool: 'PowerShell', input: { command: 'Get-ChildItem' } },
-  ]);
-});
-
-const HARD_LINK = "Full permissions are on, but this would link a file in Claude Code's own settings to another place on disk, where it could be changed, so it did not allow it.";
-const LINKED = 'This file is also linked from another place on disk, so Workbench did not allow it.';
-
-test('with full permissions on, a step that deletes what it was given, or writes its output, in Claude Code’s own settings is refused', () => {
-  refusedWith([
-    // zip -m moves what it puts in the archive, rsync and tar delete their sources when told to, pytest empties its --basetemp
-    bash('zip -m /tmp/cfg.zip .claude/settings.json'), bash('zip -rm /tmp/cfg.zip .claude'), bash('zip -r -m /tmp/cfg.zip .claude'), bash('zip --move /tmp/cfg.zip .mcp.json'),
-    bash('rsync -a --remove-source-files .claude/ /tmp/backup/'), bash('tar --remove-files -czf /tmp/cfg.tgz .claude'), bash('tar -cf /tmp/cfg.tar --remove-files .mcp.json'),
-    bash('tar -C .claude -czf /tmp/cfg.tgz --remove-files .'), bash('pytest --basetemp=.claude'), bash('python3 -m pytest --basetemp .claude/tmp tests'),
-    // test and format tools that write an output or the files they are given
-    bash('pytest --junitxml=.claude/settings.json'), bash('pytest --junit-xml .claude/r.xml'), bash('python -m pytest -o cache_dir=.claude/cache'),
-    bash('npx jest --json --outputFile=.claude/settings.json'), bash('npx jest --coverageDirectory .claude/cov'), bash('npx vitest run --outputFile=.claude/x.json'),
-    bash('go test -coverprofile=.claude/settings.json ./...'), bash('go test ./... -cpuprofile .mcp.json'), bash('go test -o .claude/x.test ./pkg'),
-    bash('npx prettier --write .claude/settings.json'), bash('prettier -w .mcp.json'), bash('npx prettier --write src .claude'), bash('npm exec -- prettier --write .mcp.json'),
-    bash('npx eslint --fix .claude/x.mjs'), bash('eslint -o .claude/report.txt src'), bash('npx stylelint --fix .claude/a.css'),
-    bash('black .claude/hooks/check.py'), bash('ruff format .claude'), bash('ruff check --fix .claude/x.py'), bash('gofmt -w .claude/x.go'),
-    bash('clang-format -i .claude/x.c'), bash('rustfmt .claude/x.rs'),
-  ], FLOOR_REASON);
-  // a hard link to a file there: writing through it, later, changes the file
-  refusedWith([bash('ln .claude/settings.json h4.json'), bash('ln .mcp.json'), bash('ln -f -t backup .claude/settings.json'), bash('cp -l .claude/settings.json h5.json'),
-    bash('cp -al .claude backup'), bash('cp --link .mcp.json x.json'), bash('link .claude/settings.json h6.json'), bash('rsync -a --link-dest=.claude src/ dst/'),
-    bash('ln -tbackups .claude/settings.json')], HARD_LINK);
-  // the shell command a package runner runs with -c is code
-  refusedWith([bash("npx -c 'rm -rf .claude'"), bash("npm exec -c 'rm .mcp.json'")], CODE_CLAUDE);
-  for (const row of [bash('ln .claude/settings.json h4.json'), bash('zip -m /tmp/cfg.zip .claude/settings.json'), bash('npx prettier --write .claude/settings.json')]) {
-    assert.notEqual(decide({ cwd, ...row }).decision, 'allow', JSON.stringify(row.input));
-  }
-  // copies out, archives of them, checks that change nothing, and outputs and links elsewhere still run
-  allowedInFull([bash('zip -r /tmp/cfg.zip .claude'), bash('tar -czf /tmp/cfg.tgz .claude'), bash('rsync -a .claude/ /tmp/backup/'),
-    bash('rsync -a --remove-source-files build/ /tmp/backup/'), bash('npx prettier --check .claude/settings.json'), bash('npx prettier --write src'),
-    bash('npx prettier --write --config .claude/prettierrc.json src/a.js'), bash('npx eslint .claude/x.mjs'), bash('npx eslint --fix src'),
-    bash('npx eslint --fix -c .claude/eslint.config.mjs src'), bash('eslint --fix-dry-run .claude/x.mjs'), bash('black --check .claude/hooks'),
-    bash('ruff check .claude'), bash('pytest --junitxml=reports/junit.xml'), bash('pytest .claude/hooks/test_x.py'), bash('go test -coverprofile=cover.out ./...'),
-    bash('npx jest --outputFile=out.json'), bash('ln -s .claude/settings.json settings-link'), bash('ln src/existing.js b.js'), bash('cp -l src/existing.js c.js')]);
-});
-
-test('with full permissions on, listing an archive, testing it or unpacking it to the output runs: nothing is written there', () => {
-  allowedInFull([bash('unzip -l hooks.zip .claude/settings.json'), bash('unzip -lq hooks.zip .claude/settings.json'), bash('unzip -v hooks.zip .claude/settings.json'),
-    bash('unzip -t hooks.zip .mcp.json'), bash('unzip -p hooks.zip .claude/settings.json > /tmp/s.json'), bash('unzip -c hooks.zip .mcp.json'),
-    bash('unzip -Z hooks.zip .claude/settings.json'), bash('unzip -z hooks.zip'), bash('tar -tf hooks.tar .claude/settings.json'), bash('tar tvf hooks.tar .claude'),
-    bash('tar --list -f hooks.tar .claude/settings.json'), bash('tar -xOf hooks.tar .claude/settings.json > /tmp/s.json'), bash('tar -x --to-stdout -f hooks.tar .mcp.json'),
-    bash('tar xOf hooks.tar .claude/settings.json'), bash('tar -df hooks.tar .claude')]);
-  // what unpacks there is still refused; a command tar runs for each file it unpacks is code
-  refusedWith([bash('unzip -o hooks.zip .mcp.json'), bash('unzip -q hooks.zip -d .claude'), bash('tar xf hooks.tar .claude/settings.json'),
-    bash('tar -xzf hooks.tgz -C .claude'),
-    // an option's value glued to its letter is no option of its own: OLD.tar's O, HOOKS.tgz's O, secret's t and c, .c's c
-    bash('tar -xzfHOOKS.tgz -C .claude'), bash('tar -xfOLD.tar .claude/settings.json'), bash('unzip -Psecret hooks.zip -d .claude'),
-    bash('gzip -S.c .claude/settings.json')], FLOOR_REASON);
-  refusedWith([bash("tar -x --to-command='rm -rf .claude' -f hooks.tar")], CODE_CLAUDE);
-  allowedInFull([bash("tar -x --to-command='wc -c' -f hooks.tar .claude/settings.json")]);
-});
-
-test('with full permissions on, an edit to a file that is also linked from another place on disk is refused, as it asks without them', () => {
-  const rows = [{ tool: 'Write', input: { file_path: 'hard.txt' } }, { tool: 'Edit', input: { file_path: 'hard.txt' } },
-    { tool: 'MultiEdit', input: { file_path: 'hard.txt' } }];
-  refusedWith(rows, LINKED);
-  for (const row of rows) assert.deepEqual([decide({ cwd, ...row }).decision, decide({ cwd, ...row }).reason], ['ask', 'The file is also linked from another place on disk.']);
-  allowedInFull([{ tool: 'Write', input: { file_path: 'src/existing.js' } }, { tool: 'Write', input: { file_path: 'src/new.js' } }]);
-});
-
-// ---------------------------------------------------------------------------------------------
-// Bounded: every decide answers in well under a tenth of a second, whatever the command holds, and past a cap it says it
-// could not tell, never something that is not true
-
-const TOO_MUCH = 'Full permissions are on, but this command is too long or too involved for Workbench to tell where it writes, so it did not allow it.';
-/** Reasons that say a step reaches Claude Code's own settings: never given where nothing names them. */
-const SETTINGS_REASONS = [FLOOR_REASON, CD_CLAUDE, CODE_CLAUDE, TOOL_CLAUDE, CD_UNCLEAR_REASON];
-/** A decide may take this long here; on this Mac each takes a few tens of milliseconds at most. */
-const LIMIT_MS = 250;
-
-/** A folder of many packages and folders, link chains longer than anything follows them, and a folder of many files, made once. */
-let bigDir = null;
-function big() {
-  if (bigDir) return bigDir;
-  bigDir = T + '/big';
-  for (const d of ['/.claude', '/links/target', '/many']) fs.mkdirSync(bigDir + d, { recursive: true });
-  for (let i = 0; i < 200; i++) fs.mkdirSync(`${bigDir}/pkg${i}`);
-  for (let i = 0; i < 60; i++) { fs.mkdirSync(`${bigDir}/d${i}`); fs.mkdirSync(`${bigDir}/e${i}`); }
-  // l0 -> l1 -> … -> l39 -> target: more links in a row than the system follows; m0 -> … -> m19 -> nothing: more than the policy follows
-  for (let i = 0; i < 40; i++) fs.symlinkSync(i < 39 ? `l${i + 1}` : 'target', `${bigDir}/links/l${i}`);
-  for (let i = 0; i < 20; i++) fs.symlinkSync(i < 19 ? `m${i + 1}` : 'nothing-here', `${bigDir}/links/m${i}`);
-  for (let i = 0; i < 400; i++) fs.writeFileSync(`${bigDir}/many/f${i}.txt`, '');
-  return bigDir;
-}
-const rep = (n, f, sep = ' && ') => Array.from({ length: n }, (_, i) => f(i)).join(sep);
-const upTo64k = unit => { let s = ''; for (let i = 0; s.length < 65536; i++) s += unit(i); return s; };
-
-test('every decide is bounded: many cd steps, || chains, 64 KB lines, many braces and deep links answer in well under a tenth of a second', () => {
-  const b = big();
-  const json = upTo64k(i => `{"id":${i},"name":"item${i}"},\n`);
-  // each line, and what full permissions decide for it: what they can read is judged, and past a cap they say they could not tell
-  const lines = [
-    [rep(200, i => `cd pkg${i} && npm test && cd ..`), FULL],
-    [rep(200, i => `cd pkg${i} && npm test > out.txt && cd ..`), FULL],
-    [rep(20, i => `cd d${i}`), FULL],
-    [rep(60, i => `cd d${i} || cd e${i}`) + ' && npm test', TOO_MUCH],
-    [rep(8, i => `cd d${i} || cd e${i}`) + ' && npm test', TOO_MUCH],
-    [upTo64k(i => `echo ${i} && `) + 'true', TOO_MUCH],
-    [upTo64k(i => `cd d${i % 60}; `) + 'ls', TOO_MUCH],
-    [upTo64k(() => 'echo a } ') + 'b', TOO_MUCH],
-    ["cat > data.json <<'EOF'\n" + json + 'EOF', FULL],
-    ['ls ' + upTo64k(i => `a${i} `), FULL],
-    ['echo "' + upTo64k(() => '{a,b},') + '" > notes.md', FULL],
-    ['echo ' + rep(300, i => `x{a,b}${i}`, ' '), FULL],
-    ['rm -f ' + rep(300, i => `x{a,b}${i}`, ' '), FULL],
-    ['echo ' + rep(300, () => '{a,b}', ''), TOO_MUCH],
-    ['echo x > links/l0/out.txt', WRITE_UNCLEAR],
-    [rep(30, i => `echo x > links/l${i}/out${i}.txt`, '; '), WRITE_UNCLEAR],
-    ['echo x > links/m0', WRITE_UNCLEAR],
-    ['rm -f many/*.txt many/f*', FULL],
-    [rep(50, () => 'echo x > many/f*', '; '), FULL],
-    // shells and interpreters fed their code, many groups after a long start, one option word of 64 KB
-    [upTo64k(() => 'sh < aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; '), FULL],
-    [upTo64k(() => 'python3 < aaaaaaaaaaaaaaaaaaaaaaaaaaaa; '), FULL],
-    [' '.repeat(30000) + 'x' + '(a)'.repeat(8000), FULL],
-    ['if '.repeat(10000) + 'x' + '(a)'.repeat(8000), FULL],
-    ['ls -' + 'a'.repeat(65000), FULL],
+    bash('rm -rf node_modules'), { tool: 'Write', input: { file_path: '.claude-notes/a.md' } }, { tool: 'mcp__docs__search', input: { query: 'claude code settings' } },
   ];
-  const wrong = [];
-  for (const [command, want] of lines) {
-    for (const full of [true, false]) {
-      const t0 = performance.now();
-      const d = decide({ tool: 'Bash', input: { command }, cwd: b, full });
-      const ms = performance.now() - t0;
-      const label = `${JSON.stringify(command.slice(0, 60))}… (${command.length} characters, full ${full})`;
-      if (ms >= LIMIT_MS) wrong.push(`${label}: ${Math.round(ms)} ms`);
-      if (full && d.reason !== want) wrong.push(`${label}: ${d.decision}: ${d.reason}`);
-      if (full && SETTINGS_REASONS.includes(d.reason)) wrong.push(`${label}: a reason that is not true`);
-    }
+  for (const row of rows) {
+    const req = typeof row === 'function' ? row() : row;
+    assert.equal(full(row).decision, 'allow', JSON.stringify(req.input));
   }
-  assert.equal(wrong.length, 0, wrong.join('\n'));
-});
-
-test('past a cap, full permissions say they could not tell, never that a step reaches Claude Code’s own settings', () => {
-  // eight "cd a || cd b" pairs make more ways than are followed: once refused as moving the shell into the settings
-  refusedWith([bash(rep(8, i => `cd d${i} || cd e${i}`) + ' && ls'), bash(rep(40, i => `pushd d${i % 60}`)),
-    bash(rep(1500, i => `cd d${i % 60}`, '; ')), bash('echo ' + '{a,b}'.repeat(9))], TOO_MUCH, row => decide({ cwd: big(), ...row, full: true }));
-  // shells inside shells inside shells: what the innermost runs is not read
-  refusedWith([bash(`sh -c "sh -c \\"sh -c 'sh -c ls'\\""`)], TOO_MUCH);
-  // without full permissions, a line too long to check every part of asks, and says why
-  const d = decide({ cwd: big(), ...bash('ls ' + upTo64k(i => `a${i} `)) });
-  assert.deepEqual([d.decision, d.reason], ['ask', 'This step has more in it than Workbench can check, so it needs your OK.']);
-});
-
-test('with full permissions on, a heredoc’s text and words in quotes keep their braces: a heredoc is judged by where it writes', () => {
-  const objects = n => '[' + Array.from({ length: n }, (_, i) => `{"id":${i},"name":"item${i}"}`).join(',') + ']';
-  allowedInFull([
-    bash(`cat > data.json <<'EOF'\n${objects(7)}\nEOF`), bash(`cat > data.json <<'EOF'\n${objects(40)}\nEOF`),
-    bash("cat > data.json <<'EOF'\n" + rep(200, i => `  {"id":${i},"name":"item${i}"},`, '\n') + '\nEOF'),
-    bash("cat > f.js <<'EOF'\n" + rep(70, () => 'function f(a,b){return {a,b};}', '\n') + '\nEOF'),
-    bash(`curl -d '${objects(9)}' https://example.com`), bash(`echo "${objects(9)}" > notes.json`), bash("touch '{.claude,x}'"),
-    bash(`python3 - <<'EOF'\nimport json\nprint(json.dumps(${objects(12)}))\nEOF`),
-  ]);
-  // where it writes still counts, and so does a brace the shell expands
-  refusedWith([bash(`cat > .claude/data.json <<'EOF'\n${objects(9)}\nEOF`), bash(`cat > .mcp.json <<EOF\n{"a":1,"b":2}\nEOF`),
-    bash('echo x > .{claude,git}/x'), bash("sh -c 'mv .claude{,-old}'"), bash('bash -c "rm -rf .{claude,git}"'), bash("eval 'mv .mcp.json{,.bak}'"),
-    bash('echo "$(rm -rf .{claude,git})"')], FLOOR_REASON);
-  // a shell given code on its input expands its braces: in a heredoc's text, and in the words another command hands it
-  refusedWith([bash("echo 'rm -rf .{claude,git}' | sh"), bash("bash <<'EOF'\nrm -rf .{claude,git}\nEOF"),
-    { tool: 'mcp__shell__run_command', input: { command: 'rm -rf .{claude,git}' } }], CODE_CLAUDE);
-});
-
-test('with full permissions on, each command is read from the folder the shell is in when it runs', () => {
-  allowedInFull([
-    // a cd in a subshell, another command's output, the background or a pipe's command before its last stays there
-    bash('(cd .claude && ls); rm settings.json'), bash('echo "$(cd .claude && pwd)"; rm settings.json'), bash('cd .claude & rm settings.json'),
-    bash('cd .claude | cat; rm settings.json'), bash('cd .claude; cd ..; rm settings.json'), bash('cd src && touch new.js && cd .. && rm old.txt'),
-    bash(rep(40, i => `cd pkg${i} && npm test > out.txt && cd ..`)),
-  ], row => decide({ cwd: big(), ...row, full: true }));
-  refusedWith([bash('cd .claude; rm settings.json; cd ..'), bash('(cd .claude && rm settings.json)'), bash('pushd .claude && rm settings.json && popd'),
-    bash("eval 'cd .claude' && rm settings.json && cd .."),
-    // a loop or a function may run a command again, from wherever a later one left the shell
-    bash('for x in 1 2; do rm settings.json; cd .claude; done; cd ..'), bash('f() { rm settings.json; }; cd .claude; f; cd ..'),
-    bash('while true; do touch x.json; cd .claude; done')], FLOOR_REASON, row => decide({ cwd: big(), ...row, full: true }));
 });
 
 test('without full permissions, nothing the policy says changes', () => {
