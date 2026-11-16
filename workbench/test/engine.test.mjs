@@ -14,6 +14,7 @@ import * as policyMod from '../src/core/policy.mjs';
 import { createPrefs, prefsFile } from '../src/core/prefs.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
 import { FakeSim, FakeGitSim, FakeMachines, fakeAdapter, fakeDeps, gate, gitError, until, FAKE_BASE, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
+import { slowFolder, slowLines } from './helpers/slow-lines.mjs';
 
 const REPO = { root: '/repos/shop', name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2 };
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${id}` };
@@ -4072,6 +4073,63 @@ test('full permissions with the real policy: what would ask runs as an automatic
   assert.deepEqual(t.store.get(id).approvals, { auto: 3, byYou: 0, denied: 3 });
   assert.equal(t.store.get(id).ask, null, 'nothing asked');
   await t.engine.shutdown();
+});
+
+test('full permissions off: a long line with many cd steps shows its question at once, checked by one decide for each mode', async (ctx) => {
+  const t = liveFolders(ctx, { prefs: prefsStore() });
+  const seen = [];
+  t.engine.deps.policy = { decide: (req) => { seen.push(req.full); return policyMod.decide(req); } };
+  const { id } = await started(t);
+  const folder = path.join(t.dir, fs.readdirSync(t.dir)[0]);
+  for (let i = 0; i < 200; i++) fs.mkdirSync(path.join(folder, `pkg${i}`));
+  const command = Array.from({ length: 200 }, (_, i) => `cd pkg${i} && npm test > out.txt && cd ..`).join(' && ');
+  const t0 = performance.now();
+  const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command } });
+  await until(() => t.store.get(id).ask);
+  // the first request of a fresh engine, before its code is compiled: the 250 ms limit is held by the test of the slow lines below
+  assert.ok(performance.now() - t0 < 1000, `the question came after ${Math.round(performance.now() - t0)} ms`);
+  // asked once as the mode is, and once as full permissions would judge it, for the yes to their card
+  assert.deepEqual(seen, [false, true]);
+  // too involved for full permissions to check in time: their card does not count it, and it waits for the person
+  assert.equal((await t.engine.permissions('full')).confirm.detail, FULL_DETAIL);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await pending).hookSpecificOutput.permissionDecision, 'deny');
+  await t.engine.shutdown();
+});
+
+test('full permissions on and off: each slow line the checkers found is answered or asked within 250 ms, and the engine keeps ticking', async (ctx) => {
+  for (const mode of ['ask', 'full']) {
+    const t = liveFolders(ctx, { prefs: prefsStore({ permissions: mode }) });
+    t.engine.deps.policy = policyMod;
+    const { id } = await started(t);
+    slowFolder(path.join(t.dir, fs.readdirSync(t.dir)[0]));
+    const wrong = [];
+    // one request: how long until it is answered or asked about, and the longest a 100 ms timer had to wait meanwhile
+    const once = async (command) => {
+      let last = performance.now();
+      let gap = 0;
+      const tick = setInterval(() => { const now = performance.now(); gap = Math.max(gap, now - last); last = now; }, 100);
+      const t0 = performance.now();
+      let out = null;
+      const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command } }).then(o => { out = o; });
+      await until(() => out || t.store.get(id).ask);
+      const ms = performance.now() - t0;
+      await pause(10); // a tick held up by the check comes as soon as it ends
+      clearInterval(tick);
+      if (!out) await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+      await pending;
+      return { ms, stood: gap - 100 };
+    };
+    for (const { label, command } of slowLines()) {
+      // the fastest of up to three tries counts, as in policy.test.mjs: other tests running beside this one can slow one down
+      let best = await once(command);
+      for (let i = 1; i < 3 && best.ms >= 250; i++) { const r = await once(command); if (r.ms < best.ms) best = r; }
+      if (best.ms >= 250) wrong.push(`${label}, full permissions ${mode === 'full' ? 'on' : 'off'}: ${Math.round(best.ms)} ms`);
+      if (best.stood >= 250) wrong.push(`${label}, full permissions ${mode === 'full' ? 'on' : 'off'}: the engine stood still for ${Math.round(best.stood)} ms`);
+    }
+    assert.equal(wrong.length, 0, wrong.join('\n'));
+    await t.engine.shutdown();
+  }
 });
 
 test('full permissions in words: the real parser asks first for "stop asking", a bare yes is not enough, and "ask first" turns them off', async () => {

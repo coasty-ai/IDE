@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { decide, splitWords, SAFE_TOOLS } from '../src/core/policy.mjs';
 import { DISALLOWED_TOOLS } from '../src/adapters/claude/args.mjs';
+import { slowFolder, slowLines } from './helpers/slow-lines.mjs';
 
 // A real folder layout: the agent's folder ("work"), a folder outside it, and links between them.
 // os.tmpdir() is under /var on macOS, which is itself a link to /private/var.
@@ -1580,4 +1581,70 @@ test('without full permissions, nothing the policy says changes', () => {
     assert.deepEqual(decide({ cwd, ...row, full: false }), decide({ cwd, ...row }));
     assert.deepEqual(decide({ cwd, ...row, full: 'yes' }), decide({ cwd, ...row }), 'only true turns it on');
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Bounded: each decide answers within 250 ms, with full permissions on and off, and past a cap says only that
+
+/**
+ * How long one decide may take, with full permissions on or off. On the Mac this was written on, each takes tens of
+ * milliseconds at most. Each is timed up to three times, and the fastest counts: other tests running beside this one, and a
+ * first run before the code is compiled, can slow one down, but no check that took seconds before its caps comes in under.
+ */
+const LIMIT_MS = 250;
+/** The fastest of up to three runs of `f`, stopping at the first within LIMIT_MS: { ms, value }. */
+function fastest(f) {
+  let best = null;
+  for (let i = 0; i < 3 && !(best && best.ms < LIMIT_MS); i++) {
+    const t0 = performance.now();
+    const value = f();
+    const ms = performance.now() - t0;
+    if (!best || ms < best.ms) best = { ms, value };
+  }
+  return best;
+}
+const TOO_MUCH = 'This step has more in it than Workbench can check, so it needs your OK.';
+const UNCHECKED = "Whether this would change Claude Code's own settings could not be checked, so it was refused.";
+
+let slowDir = null;
+/** The agent's folder the slow lines are checked in (test/helpers/slow-lines.mjs), made once. */
+function slow() {
+  if (!slowDir) { slowDir = T + '/slow'; fs.mkdirSync(slowDir); slowFolder(slowDir); }
+  return slowDir;
+}
+
+test('every decide answers within 250 ms, with full permissions on and off: many cd steps, wildcards over 5,000 files, 64 KB lines, braces, deep links', () => {
+  const wrong = [];
+  for (const { label, command, full } of slowLines()) {
+    for (const on of [false, true]) {
+      const { ms, value: d } = fastest(() => decide({ tool: 'Bash', input: { command }, cwd: slow(), full: on }));
+      if (ms >= LIMIT_MS) wrong.push(`${label}, full permissions ${on ? 'on' : 'off'}: ${Math.round(ms)} ms`);
+      // with them on: allowed when checked in time, refused as unchecked when not, and never as reaching Claude Code's settings
+      if (on && d.reason !== (full === 'allow' ? FULL : UNCHECKED)) wrong.push(`${label}: ${d.decision}: ${d.reason}`);
+      if (FLOOR.test(d.reason) || / in Claude Code's own settings$/.test(d.sentence)) wrong.push(`${label}: says it reaches Claude Code's settings`);
+    }
+  }
+  assert.equal(wrong.length, 0, wrong.join('\n'));
+});
+
+test('past a cap, the check asks because it has more in it than it can check, and the words are plainer', () => {
+  const b = slow();
+  // 12,000 words to look for on the disk, and a word of 2,000 short options, each of whose tails could name a place
+  const long = 'ls ' + Array.from({ length: 12000 }, (_, i) => `a${i}`).join(' ');
+  const options = 'ls -' + 'a'.repeat(2000);
+  for (const command of [long, options]) {
+    const d = decide({ tool: 'Bash', input: { command }, cwd: b });
+    assert.deepEqual([d.decision, d.reason], ['ask', TOO_MUCH]);
+  }
+  // with full permissions on: the words are too many to look for whether one leads into Claude Code's settings; the options
+  // name no place there
+  assert.deepEqual([full({ ...bash(long), cwd: b }).decision, full({ ...bash(long), cwd: b }).reason], ['deny', UNCHECKED]);
+  assert.equal(full({ ...bash(options), cwd: b }).reason, FULL);
+  // a line the words cannot read in time says only that it runs a command
+  const cds = Array.from({ length: 200 }, (_, i) => `cd pkg${i} && npm test && cd ..`).join(' && ');
+  assert.equal(decide({ tool: 'Bash', input: { command: cds }, cwd: b }).sentence, 'wants to run a command');
+  // what is short still reads, and is judged, as before: one wildcard over the 5,000 files is expanded and checked
+  assert.equal(decide({ tool: 'Bash', input: { command: 'cd pkg1 && npm test' }, cwd: b }).sentence, 'wants to run the tests');
+  const one = decide({ tool: 'Bash', input: { command: 'ls dir/prefix4999*' }, cwd: b });
+  assert.deepEqual([one.decision, one.reason], ['allow', 'This command only reads.']);
 });

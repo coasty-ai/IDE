@@ -485,6 +485,8 @@ const ACTIONS = [
 ];
 
 const WRITES = ACTIONS.findIndex(([does]) => does === 'write to a file');
+/** The most parts a command may have for commandAction to name what it does: past them, plainer words. */
+const ACTION_PARTS = 256;
 
 /**
  * Commands with nothing to tell the person that do not change what the commands after them mean. (`cd` is
@@ -506,6 +508,7 @@ const NOOPS = new Set(['cd', 'pushd', 'popd', 'echo', 'printf', 'true', 'false',
 export function commandAction(command, vouch) {
   let cmds;
   try { cmds = simpleCommands(command); } catch { return null; } // words are a courtesy; never break narration
+  if (cmds.length > ACTION_PARTS) return null; // too many parts to name in a few words, and to read each time
   if (cmds.some(c => DOWNLOADERS.has(c.prog)) && cmds.some(c => RUNS_CODE.has(c.prog))) return { does: FROM_INTERNET[0], doing: FROM_INTERNET[1], routine: false };
   let main = -1; // the most important entry that is not routine
   let routine = -1; // the most important routine entry

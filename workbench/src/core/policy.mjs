@@ -56,6 +56,7 @@ const R = Object.freeze({
   mcp: 'Tools that reach other services need your OK.',
   unknownTool: 'This tool is not on the list of safe tools.',
   broken: 'Something about this request could not be checked, so it needs your OK.',
+  tooMuch: 'This step has more in it than Workbench can check, so it needs your OK.',
   noCwd: "The agent's own folder could not be checked.",
   noFile: 'It did not say which file it wants to change.',
   noRead: 'It did not say which file it wants to read.',
@@ -178,6 +179,58 @@ const deny = (reason, where) => ({ decision: 'deny', reason, where });
 /** What an ask says when the command, or the option that made it ask, has no plainer words. */
 const RUN = 'run a command';
 
+// ---------------------------------------------------------------------------------------------
+// What one decide may do
+
+/**
+ * decide runs on Workbench's main thread for every request, so each of its three phases may do a fixed amount of work:
+ * the check and the floor of full permissions COST_LIMIT each, the words WORDS_LIMIT. A look at the disk (a path
+ * resolved, a link read, a file looked at) costs 1, a folder read 1 and 1 more for every 32 names in it, matching names
+ * against a wildcard 1 for every 2500 steps, expanding one word's braces 1 for every 2048 characters it holds, at each
+ * level, and a path whose answer is already known 0.1: what the disk said, and where each path sits, is kept for the rest
+ * of the decide (`known`). A word of short options longer than OPTION_WORD is too much to check at once. Past a cap, the
+ * phase stops (PAST_CAP), and nothing it found is used: the check asks (R.tooMuch), full permissions refuse as unchecked
+ * (R.fullUnchecked), and the words fall back to plainer ones.
+ */
+const COST_LIMIT = 1500;
+const WORDS_LIMIT = 500;
+/** Thrown when a phase of decide has done all the work it may. */
+const PAST_CAP = Symbol('past the cap');
+/** The longest word of short options whose every tail is read as a place (readPieces): past it, too much to check. */
+const OPTION_WORD = 1024;
+/** The current phase's count and limit, set by phase(); null outside decide. */
+let work = null;
+/**
+ * Set by decide() for one decision: what the disk said (`real`: resolveReal, `place`: placeOf, `present`, `globs`:
+ * globNamesClaude), and the parts of the command line (`parts`: partsOf), read once.
+ */
+let known = null;
+
+/** The simple commands of a command line (narrate's shellCommands), read once in a decide however many phases ask. */
+function partsOf(command) {
+  if (!known) return shellCommands(command);
+  if (!known.parts.has(command)) known.parts.set(command, shellCommands(command));
+  return known.parts.get(command);
+}
+
+/** Count `cost` against the current phase, and stop it past its limit. */
+function charge(cost) {
+  if (!work) return;
+  work.cost += cost;
+  if (work.cost > work.limit) throw PAST_CAP;
+}
+
+/** Run one phase of decide with a count of its own. */
+function phase(f, limit = COST_LIMIT) {
+  const outer = work;
+  work = { cost: 0, limit };
+  try {
+    return f();
+  } finally {
+    work = outer;
+  }
+}
+
 /**
  * Decide on one tool call.
  * @param {{ tool: string, input?: object, cwd: string, extraAllow?: string[],
@@ -197,11 +250,14 @@ export function decide(req) {
   const ctx = { cwd, extraAllow, also: [], recipients };
   let verdict;
   remotesMemo = new Map();
+  known = { real: new Map(), place: new Map(), present: new Map(), globs: new Map(), parts: new Map() };
   try {
-    ctx.also = readRoots(readAlso);
-    verdict = judge(tool, inp, ctx);
-  } catch {
-    verdict = ask(R.broken); // fail closed on anything unexpected
+    verdict = phase(() => {
+      ctx.also = readRoots(readAlso);
+      return judge(tool, inp, ctx);
+    });
+  } catch (e) {
+    verdict = ask(e === PAST_CAP ? R.tooMuch : R.broken); // fail closed on anything unexpected
   }
   if (full === true) verdict = withFull(tool, inp, ctx, verdict);
   let desc;
@@ -210,15 +266,16 @@ export function decide(req) {
   } catch {
     desc = { sentence: 'wants to use a tool', detail: '' };
   }
-  // The words never change the decision: anything that goes wrong here falls back to plainer words.
+  // The words never change the decision: anything that goes wrong here, a cap too, falls back to plainer words.
   let sentence;
   try {
-    sentence = sentenceFor(tool, inp, verdict, desc.sentence, ctx);
+    sentence = phase(() => sentenceFor(tool, inp, verdict, desc.sentence, ctx), WORDS_LIMIT);
   } catch {
     sentence = null;
   }
   if (typeof sentence !== 'string' || !sentence) sentence = tool === 'Bash' && verdict.decision !== 'allow' ? 'wants to ' + RUN : desc.sentence;
   remotesMemo = null;
+  known = null;
   return { decision: verdict.decision, reason: verdict.reason, sentence, detail: desc.detail };
 }
 
@@ -274,15 +331,16 @@ function judgeMonitor(input, ctx) {
  * Full permissions: a step the policy would ask about runs without asking, with the reason "Full permissions are on.",
  * unless it would change Claude Code's own settings (changesClaude): that is refused, as edits there always are. What
  * the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's settings, helpers
- * that would work elsewhere) is refused as before. A check that fails refuses: it never allows by mistake.
+ * that would work elsewhere) is refused as before. A check that fails, or does not finish within its cap (PAST_CAP),
+ * refuses: it never allows by mistake, and never says the step reaches those settings.
  */
 function withFull(tool, input, ctx, verdict) {
   if (verdict.decision !== 'ask') return verdict;
   let floor;
   try {
-    floor = changesClaude(tool, input, ctx);
+    floor = phase(() => changesClaude(tool, input, ctx));
   } catch {
-    return deny(R.fullUnchecked, 'claude');
+    return deny(R.fullUnchecked);
   }
   if (floor) return deny(R.fullClaude, 'claude');
   const out = allow(R.full, verdict.where);
@@ -321,7 +379,7 @@ function changesClaude(tool, input, ctx) {
  * names can reach it through a pipe or a heredoc), any mention refuses it.
  */
 function commandChangesClaude(command, base, ctx) {
-  const parts = shellCommands(command);
+  const parts = partsOf(command);
   const runsInput = parts.some(c => RUNS_INPUT.has(c.prog) || c.words.slice(0, c.at ?? 0).includes('xargs'));
   const named = textNamesClaude(runsInput ? command : withoutHeredocs(command));
   if (!parts.length) return named;
@@ -380,8 +438,12 @@ function placeNamesClaude(p, b, base) {
  * (outside the folders it may search, too many matches) matches nothing: textNamesClaude still reads its dot patterns.
  */
 function globNamesClaude(piece, b, base) {
+  const key = `${b}\0${piece}`;
+  if (known?.globs.has(key)) return known.globs.get(key);
   const x = expandPattern(piece, b, [], true, { entries: 0, matches: 0 });
-  return !x.error && x.paths.some(p => placeNamesClaude(p, b, base));
+  const names = !x.error && x.paths.some(p => placeNamesClaude(p, b, base));
+  known?.globs.set(key, names);
+  return names;
 }
 
 /**
@@ -406,6 +468,7 @@ function textNamesClaude(text) {
 
 /** A word's forms with its braces expanded as the shell would ({a,b} and nested ones, at most 32 forms). */
 function braceForms(word, limit = 32) {
+  charge(word.length / 2048); // each level reads the whole word again
   const m = /\{([^{}]*,[^{}]*)\}/.exec(word);
   if (!m) return [word];
   const out = [];
@@ -420,45 +483,38 @@ function braceForms(word, limit = 32) {
 
 /**
  * Whether a wildcard segment that starts with a dot (or with a bracket that lists one) could match .claude or .mcp.json:
- * a hidden name matches only a pattern that starts with a dot, zsh's default. Any case counts.
+ * a hidden name matches only a pattern that starts with a dot, zsh's default. Any case counts. Matched as the wildcards
+ * of a command are (matchTokens, the loose way), in a time that grows with the pattern's length, however many stars it
+ * has.
  */
 function dotPatternMatchesClaude(seg) {
   if (seg[0] !== '.' && !/^\[[!^]?[^\]]*\.[^\]]*\]/.test(seg)) return false;
-  let re = '';
-  for (let k = 0; k < seg.length; k++) {
-    const ch = seg[k];
-    if (ch === '*') re += '.*';
-    else if (ch === '?') re += '.';
-    else if (ch === '[' && seg.indexOf(']', k + 2) > 0) {
-      const close = seg.indexOf(']', k + 2);
-      let body = seg.slice(k + 1, close);
-      const not = body[0] === '!' || body[0] === '^';
-      if (not) body = body.slice(1);
-      re += `[${not ? '^' : ''}${body.replace(/[\\\]^]/g, '\\$&')}]`;
-      k = close;
-    } else re += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-  try {
-    const r = new RegExp(`^${re}$`, 'i');
-    return r.test('.claude') || r.test('.mcp.json');
-  } catch {
-    return true; // a pattern that cannot be read could match anything
-  }
+  const t = segmentTokens(patternChars(seg));
+  if (!t) return true; // a pattern that cannot be read could match anything
+  return matchTokens(t.tokens, '.claude', true) || matchTokens(t.tokens, '.mcp.json', true);
 }
 
 /** The command without the text of its heredocs (from the line after <<WORD up to the line WORD), which is data. */
 function withoutHeredocs(command) {
+  const s = String(command);
+  const start = /<<(-?)\s*(['"]?)([A-Za-z0-9_.-]+)\2/g;
   let out = '';
-  let rest = String(command);
+  let at = 0; // where the text not yet read starts; each line is read once, however many heredocs the command has
   for (;;) {
-    const m = /<<(-?)\s*(['"]?)([A-Za-z0-9_.-]+)\2/.exec(rest);
-    if (!m) return out + rest;
-    const nl = rest.indexOf('\n', m.index + m[0].length);
-    if (nl < 0) return out + rest;
-    out += rest.slice(0, nl + 1);
-    const lines = rest.slice(nl + 1).split('\n');
-    const end = lines.findIndex(line => (m[1] ? line.replace(/^\t+/, '') : line) === m[3]);
-    rest = end < 0 ? '' : lines.slice(end).join('\n');
+    start.lastIndex = at;
+    const m = start.exec(s);
+    if (!m) return out + s.slice(at);
+    const nl = s.indexOf('\n', m.index + m[0].length);
+    if (nl < 0) return out + s.slice(at);
+    out += s.slice(at, nl + 1);
+    // the heredoc's text, up to the line that is its end word, which stays
+    for (let line = nl + 1; ; ) {
+      const next = s.indexOf('\n', line);
+      const text = s.slice(line, next < 0 ? s.length : next);
+      if ((m[1] ? text.replace(/^\t+/, '') : text) === m[3]) { at = line; break; }
+      if (next < 0) return out; // no end word: the rest is all its text
+      line = next + 1;
+    }
   }
 }
 
@@ -583,7 +639,7 @@ function vouch(c, base, ctx, wheres) {
  * `cd` goes to the home folder) counts as outside by itself.
  */
 function scanWhere(command, base, also) {
-  const cmds = shellCommands(command);
+  const cmds = partsOf(command);
   const home = text => text.replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.homedir());
   const rank = { outside: 3, claude: 2, git: 1 };
   let found;
@@ -626,6 +682,7 @@ function scanWhere(command, base, also) {
 /** The real path of the agent's folder, or null when it is missing or not a folder. */
 function realFolder(cwd) {
   if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || cwd.includes('\0')) return null;
+  charge(1);
   try {
     const real = fs.realpathSync.native(cwd);
     return fs.statSync(real).isDirectory() ? real : null;
@@ -639,10 +696,19 @@ function realFolder(cwd) {
  * The longest existing prefix goes through realpath(3) (fs.realpathSync.native: unlike the JS
  * version it resolves `link/..` after following the link). The missing remainder is appended as
  * text, which is only safe when it has no '..' and does not start with a dangling link.
+ * Within decide, each answer is kept for the rest of it (`known`), and each look at the disk is counted (charge).
  * @returns {{ ok: true, real: string, exists: boolean }
  *   | { ok: false, reason: string, link?: string, rest?: string[] }}  link: the dangling link, and the rest after it
  */
 export function resolveReal(p, baseReal) {
+  if (!known) return resolveOnce(p, baseReal);
+  charge(0.1); // the answer kept, looked up, and what is done with it
+  const key = `${baseReal}\0${p}`;
+  if (!known.real.has(key)) known.real.set(key, resolveOnce(p, baseReal));
+  return known.real.get(key);
+}
+
+function resolveOnce(p, baseReal) {
   if (typeof p !== 'string' || p === '' || p.includes('\0')) return { ok: false, reason: R.pathUnclear };
   let s = p;
   if (s === '~' || s.startsWith('~/')) s = os.homedir() + s.slice(1);
@@ -652,6 +718,7 @@ export function resolveReal(p, baseReal) {
   for (let i = parts.length; i >= 1; i--) {
     const prefix = parts.slice(0, i).join('/') || '/';
     let real;
+    charge(1);
     try {
       real = fs.realpathSync.native(prefix);
     } catch (e) {
@@ -662,6 +729,7 @@ export function resolveReal(p, baseReal) {
     if (rest.includes('..')) return { ok: false, reason: R.pathBack };
     if (rest.length) {
       // realpath said "missing" but the entry is there: a link pointing at something missing.
+      charge(1);
       try {
         fs.lstatSync(path.join(real, rest[0]));
         return { ok: false, reason: R.pathLink, link: path.join(real, rest[0]), rest: rest.slice(1) };
@@ -681,6 +749,7 @@ export function resolveReal(p, baseReal) {
 function throughLinks(r, baseReal) {
   for (let hops = 0; !r.ok && r.link && hops < 8; hops++) {
     let to;
+    charge(1);
     try {
       to = fs.readlinkSync(r.link);
     } catch {
@@ -720,9 +789,17 @@ function claudeSetting(rel) {
 
 /**
  * Where a real path sits relative to the agent's real folder: 'cwd', 'inside', 'git', 'claude' or 'outside'. git's records
- * are a .git folder at any depth, and any folder laid out like one (gitRecordsAt), with everything in them.
+ * are a .git folder at any depth, and any folder laid out like one (gitRecordsAt), with everything in them. Within decide,
+ * each answer is kept for the rest of it.
  */
 function placeOf(real, baseReal) {
+  if (!known) return placeOnce(real, baseReal);
+  const key = `${baseReal}\0${real}`;
+  if (!known.place.has(key)) known.place.set(key, placeOnce(real, baseReal));
+  return known.place.get(key);
+}
+
+function placeOnce(real, baseReal) {
   if (real === baseReal) return 'cwd';
   const prefix = baseReal.endsWith('/') ? baseReal : baseReal + '/';
   if (!real.startsWith(prefix)) return 'outside';
@@ -735,14 +812,22 @@ function placeOf(real, baseReal) {
   return 'inside';
 }
 
-/** Whether something is at `p` (a link to something missing counts). Anything but "not there" counts, to stay careful. */
+/**
+ * Whether something is at `p` (a link to something missing counts). Anything but "not there" counts, to stay careful.
+ * Within decide, each answer is kept for the rest of it, and each look at the disk is counted.
+ */
 function present(p) {
+  if (known?.present.has(p)) return known.present.get(p);
+  charge(1);
+  let there;
   try {
     fs.lstatSync(p);
-    return true;
+    there = true;
   } catch (e) {
-    return !(e && (e.code === 'ENOENT' || e.code === 'ENOTDIR'));
+    there = !(e && (e.code === 'ENOENT' || e.code === 'ENOTDIR'));
   }
+  known?.present.set(p, there);
+  return there;
 }
 
 /**
@@ -778,6 +863,7 @@ function placeWhere(p, base) {
 
 /** A file that shares its contents with another path (a hard link), possibly outside the folder. */
 function linkedFile(real) {
+  charge(1);
   try {
     const st = fs.statSync(real);
     return st.isFile() && st.nlink > 1; // folders always have more than one link
@@ -835,6 +921,7 @@ function readRoots(list) {
   const out = [];
   const real = p => {
     if (typeof p !== 'string' || !path.isAbsolute(p) || p.includes('\0')) return null;
+    charge(1);
     try { return fs.realpathSync.native(p); } catch { return null; } // missing: nothing to read there
   };
   for (const e of Array.isArray(list) ? list : []) {
@@ -994,7 +1081,12 @@ export function splitWords(cmd) {
   for (const ch of cmd) {
     if (quote) {
       if (ch === quote) quote = null;
-      else { cur.text += ch; cur.pattern += '\\' + ch; }
+      else {
+        if (cur.text === '') cur.first = ch;
+        cur.text += ch;
+        cur.pattern += '\\' + ch;
+        cur.last = ch;
+      }
       continue;
     }
     if (ch === ' ' || ch === '\t') {
@@ -1002,23 +1094,27 @@ export function splitWords(cmd) {
       cur = null;
       continue;
     }
-    if (!cur) cur = { text: '', pattern: '', glob: false, globLead: false, quoted: false, eq: -1 };
+    // first and last: the word's first character and the one before this, so a long word is read in a time that grows
+    // with its length alone
+    if (!cur) cur = { text: '', pattern: '', glob: false, globLead: false, quoted: false, eq: -1, first: '', last: '' };
     if (ch === "'" || ch === '"') {
       quote = ch;
       cur.quoted = true;
       continue;
     }
     if (ch === '#' && cur.text === '' && !cur.quoted) return { error: R.comment };
-    if (ch === '=' && cur.eq < 0 && (cur.text === '' || /[=:]$/.test(cur.text))) cur.eq = cur.text.length;
+    if (ch === '=' && cur.eq < 0 && (cur.text === '' || cur.last === '=' || cur.last === ':')) cur.eq = cur.text.length;
     // '^' and '#' are wildcards too when zsh's extendedglob option is on.
     if (GLOB_CHARS.has(ch) || ch === '^' || ch === '#') {
       cur.glob = true;
       // The expansion starts with the literal text before the wildcard. Empty or '-' means it
       // could become an option, such as a file someone named "-delete".
-      if (cur.text === '' || cur.text.startsWith('-')) cur.globLead = true;
+      if (cur.text === '' || cur.first === '-') cur.globLead = true;
     }
+    if (cur.text === '') cur.first = ch;
     cur.text += ch;
     cur.pattern += ch;
+    cur.last = ch;
   }
   if (quote) return { error: R.quotes };
   if (cur) words.push(cur);
@@ -1435,6 +1531,7 @@ function matchTokens(tokens, name, loose) {
 
 /** Whether a list of characters (or bytes) matches the tokens: row[n] says the tokens so far match the first n of them. */
 function matchUnits(tokens, cs, loose, bytes) {
+  charge(tokens.length * (cs.length + 1) / 2500);
   const same = (a, b) => a === b || (loose && (a.toLowerCase() === b.toLowerCase() || a.toUpperCase() === b.toUpperCase()));
   let row = cs.map(() => false);
   row.unshift(true);
@@ -1483,16 +1580,19 @@ function expandPattern(pattern, base, also, loose, budget) {
   const join = (dir, name) => (!dir ? name : dir.endsWith('/') ? dir + name : dir + '/' + name);
   const list = (dir, types) => {
     let names;
+    charge(1);
     try { names = fs.readdirSync(fsPath(dir), types ? { withFileTypes: true } : undefined); } catch { return []; }
+    charge(names.length / 32);
     budget.entries += names.length;
     if (budget.entries > GLOB_LIMIT.entries) throw TOO_MANY;
     return names;
   };
-  const isDir = text => { try { return fs.statSync(fsPath(text)).isDirectory(); } catch { return false; } };
+  const isDir = text => { charge(1); try { return fs.statSync(fsPath(text)).isDirectory(); } catch { return false; } };
   const hidden = name => name.startsWith('.');
   // A folder whose names the agent could have chosen: in its own folder or its scratch folders, not the ones above them.
   const mine = text => {
     let real;
+    charge(1);
     try { real = fs.realpathSync.native(fsPath(text)); } catch { return false; }
     return placeOf(real, base) !== 'outside' || also.some(test => test(real));
   };
@@ -1509,6 +1609,7 @@ function expandPattern(pattern, base, also, loose, budget) {
         if (!(e.isDirectory() || (follow && e.isSymbolicLink() && isDir(text)))) continue;
         if (follow) {
           let real;
+          charge(1);
           try { real = fs.realpathSync.native(fsPath(text)); } catch { continue; }
           if (seen.has(real)) continue;
           seen.add(real);
@@ -1586,8 +1687,12 @@ function readPieces(w) {
     if (w.glob && /[*?[^#]/.test(s)) s = globFolder(s);
     if (s) out.add(s);
   };
-  // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail.
-  if (/^-[^-]/.test(t)) for (let k = 2; k < t.length; k++) add(t.slice(k));
+  // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail; past OPTION_WORD characters,
+  // there are too many tails to check.
+  if (/^-[^-]/.test(t)) {
+    if (t.length > OPTION_WORD) throw PAST_CAP;
+    for (let k = 2; k < t.length; k++) add(t.slice(k));
+  }
   const parts = t.split(/([=:,])/);
   for (let i = 0; i < parts.length; i += 2) {
     if (parts[i - 1] === ':' && /^\/+$/.test(parts[i])) continue;
@@ -1821,7 +1926,8 @@ function initsElsewhere(dir, base) {
   try {
     const real = fs.realpathSync.native(dir + '/.git');
     return !fs.statSync(real).isDirectory() || placeOf(real, base) === 'outside';
-  } catch {
+  } catch (e) {
+    if (e === PAST_CAP) throw e; // the check is over: that is no answer about this .git
     return true; // a link to something missing, or a .git that cannot be read
   }
 }
