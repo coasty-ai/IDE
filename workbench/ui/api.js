@@ -1,6 +1,6 @@
 // Talking to the engine: the access key, JSON requests (the connect panel's too), and the live event stream.
 // Nothing here touches the page when the module loads, so node:test can import it.
-import { plainError } from './link.js';
+import { plainError, tooLongToSend } from './link.js';
 
 let token = null;
 let onRefused = null;
@@ -31,6 +31,8 @@ class RequestError extends Error {
 }
 
 async function call(method, path, body) {
+  // A body over Workbench's limit is not sent: it would be refused (413) once it had all gone. Said the same way.
+  if (tooLongToSend(body)) throw new RequestError(413);
   let res;
   try {
     res = await fetch(path, {

@@ -767,6 +767,7 @@ async function submit(text) {
   // and no command goes to the engine. Anything else, or words bound to nothing, goes on as before.
   const press = !S.reply && !S.confirm ? lidButton(lidAnswer(text, ANSWERS), b) : null;
   if (press) { if (!press.disabled) await actOn(press); return; }
+  const replying = S.reply; // a reply box that was open, so a failed send can open it again with the words
   try {
     if (S.reply) {
       const r = S.reply;
@@ -793,10 +794,11 @@ async function submit(text) {
       if (res.confirm) S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
       else if (shown && S.confirm === shown) S.confirm = null;
       lookAt(res.focusId);
-      // the reply to the person's own words: a new launch question, or the agent it names, shows at once
+      // the reply to the person's own words: a new card, or the agent it names, shows at once (work that started names
+      // none: the centre stays as it is, and the notice says what started)
       if (res.confirm || res.focusId || shown) moved();
       if (b.askId && !res.confirm) answeredOnce();
-      // a new launch question in the core already says it; anything else is said under the core
+      // a new card in the core already says it; anything else is said under the core
       say(res.confirm && (!shown || res.confirm.id !== shown.id) ? '' : (res.reply || ''), lasting(res));
       // "what did search cleanup change": the git screen opens on that agent's branch and its diff
       // also with a merge or throw-away card still shown: the person looks at the work first, then answers the card
@@ -804,7 +806,16 @@ async function submit(text) {
       // "connect", "add a key", "sign in", or work asked for with no agent ready: Agents & keys opens
       if (res.openConnect === true) showConnect(null, res.reply);
     }
-  } catch (err) { say(err.message); }
+  } catch (err) {
+    // nothing was sent (too long: the page checked first), or it failed: the words go back in the box, unless the person
+    // has typed something new there meanwhile, and a reply box that was open opens again with them
+    if (!el.say.value) {
+      const a = replying && S.agents.get(replying.agentId);
+      if (a && !S.reply) startReply(a, replying.mode, replying.askId, replying.state);
+      setSay(text);
+    }
+    say(err.message);
+  }
   render();
 }
 // A textarea sends no form by itself: Enter sends through the box (saybox.js). This catches any other way a form is sent.

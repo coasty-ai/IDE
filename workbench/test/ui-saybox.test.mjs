@@ -102,3 +102,11 @@ test('the page uses a textarea for the board\'s input, one line to begin with, a
   const app = readFileSync(new URL('../ui/app.js', import.meta.url), 'utf8');
   assert.match(app, /setupSayBox\(/, 'app.js wires the box');
 });
+
+test('the input bar shows its focus ring in every look: the ivory look\'s own border does not hide it', () => {
+  const css = readFileSync(new URL('../ui/app.css', import.meta.url), 'utf8');
+  assert.match(css, /#bar:focus-within \{[^}]*inset 0 0 0 2px var\(--lid-focus\)/);
+  // the ivory look sets the bar's own border with a stronger selector, so its focus ring needs one as strong
+  assert.match(css, /:root\[data-theme="ivory"\] #bar \{/);
+  assert.match(css, /:root\[data-theme="ivory"\] #bar:focus-within \{[^}]*inset 0 0 0 2px var\(--lid-focus\)/);
+});

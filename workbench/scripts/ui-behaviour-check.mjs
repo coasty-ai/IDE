@@ -1,9 +1,10 @@
 // What the page does, checked in headless Chrome against the mock API (scripts/ui-mock.mjs): answers bound to what was
 // drawn, the half-second guard after the core changes, holding the core while the person is busy with it, focus never
 // landing on an answer, failed answers that can be retried, "Look later", stepping with "next", typed words bound to the
-// ask on screen, launch questions answered by id and withdrawn when dropped, the look and detail words, the stale key,
+// ask on screen, every prompt going to an agent at once (no card; a card on screen stays), cards answered by id and
+// withdrawn when dropped, the look and detail words, the stale key,
 // rest (no motion while waiting), reduced motion, space to talk, the keyboard rules, merging, the spending limit, the git
-// screen, Agents & keys, and Full permissions (the band's button, its card, the launch card's words, the typed words).
+// screen, Agents & keys, and Full permissions (the band's button, its card, work typed while they are on, the typed words).
 // Prints PASS or FAIL per point, then every request the page sent, with its body (a key's values shown as "••••").
 // Not part of npm test (it needs Chrome). No dependencies.
 //   node scripts/ui-behaviour-check.mjs [--only name] [--log]
@@ -150,19 +151,114 @@ try {
     const after = await lidNow();
     check('→ steps the queue with focus on the sentence', after !== before && /2 of 3/.test(after), `"${before}" -> "${after}"`);
   });
-  await run('a typed launch shows its card at once (pointer on the core), and "yes" then answers the card', async () => {
+  // Every prompt goes to an agent: typed words that are no command start one at once, with no card, and the line under
+  // the board says so; the centre stays as it was.
+  await run('typed text starts an agent at once, with no card, and the line under the board says so', async () => {
+    await open('prompt');
+    await sleep(800);
+    const before = await lidNow();
+    await realClick('#say'); await sleep(150);
+    await b.type('fix the login page'); await b.key('Enter');
+    await sleep(1100);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const words = await b.ev(`document.getElementById('said').textContent`), after = await lidNow();
+    const chip = await b.ev(`[...document.querySelectorAll('.chip')].some(c => /Fix login page/.test(c.textContent))`);
+    check('typed text starts an agent at once, with no card, and the line under the board says so',
+      p.length === 1 && p[0].body.text === 'fix the login page' && p[0].body.confirmId === null && words === 'Started a simulated Claude on “fix the login page”.'
+        && !/^You said/.test(after) && chip,
+      JSON.stringify({ sent: p.map(x => x.body), words, before, after, chip }));
+  });
+  await run('"thanks" starts an agent, as any prompt does', async () => {
+    await open('prompt');
+    await sleep(800);
+    await realClick('#say'); await sleep(150);
+    await b.type('thanks'); await b.key('Enter');
+    await sleep(900);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const words = await b.ev(`document.getElementById('said').textContent`);
+    check('"thanks" starts an agent, as any prompt does', p.length === 1 && p[0].body.text === 'thanks' && words === 'Started a simulated Claude on “thanks”.', JSON.stringify({ sent: p.map(x => x.body), words }));
+  });
+  await run('pasted code arrives intact: its first and last lines, its indentation and its braces', async () => {
+    await open('prompt');
+    await sleep(700);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    const code = 'function total(cart) {\n  return cart.reduce((a, b) => a + b, 0);\n}';
+    await b.send('Browser.grantPermissions', { origin: base, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
+    await b.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await b.ev(`navigator.clipboard.writeText(${JSON.stringify(code)})`);
+    await b.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86, modifiers: 4, commands: ['paste'] });
+    await b.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86, modifiers: 4 });
+    await sleep(200);
+    await b.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+    await b.key('Enter'); await sleep(900);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const words = await b.ev(`document.getElementById('said').textContent`);
+    check('pasted code arrives intact: its first and last lines, its indentation and its braces',
+      p.length === 1 && p[0].body.text === code && words === 'Started a simulated Claude on “function total(cart) { return cart.reduce((a, b) => a + b, 0); }”.',
+      JSON.stringify({ sent: p.map(x => x.body.text), words }));
+  });
+  await run('"what needs me now" shows what needs you', async () => {
+    await open('demo');
+    await sleep(800);
+    const agents = (await ctl('state')).agents.length;
+    await realClick('#say'); await sleep(150);
+    await b.type('what needs me now'); await b.key('Enter');
+    await sleep(900);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const words = await b.ev(`document.getElementById('said').textContent`), lid = await lidNow();
+    check('"what needs me now" shows what needs you', p.length === 1 && words === '3 things need you.' && /Checkout fix/.test(lid) && (await ctl('state')).agents.length === agents,
+      JSON.stringify({ sent: p.map(x => x.body), words, lid }));
+  });
+  await run('a card on screen stays where it is when a prompt starts an agent, and still takes its own words', async () => {
     await open('demo');
     await sleep(800);
     await realClick('#say'); await sleep(150);
-    await b.type('start an agent to fix the login page'); await b.key('Enter');
-    await sleep(1300);
-    const shown = await h1();
-    await b.type('yes'); await b.key('Enter');
+    await b.type('stop the sign-up one'); await b.key('Enter');
+    await sleep(900);
+    const card = await h1();
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('fix the docs'); await b.key('Enter');
+    await sleep(900);
+    const kept = await h1(), words = await b.ev(`document.getElementById('said').textContent`);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('cancel'); await b.key('Enter');
     await sleep(700);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const yes = p.find(x => x.body.text === 'yes');
-    check('a typed launch shows its card at once (pointer on the core), and "yes" then answers the card', /^Start a simulated Claude/.test(shown) && yes && /^c/.test(yes.body.confirmId || '') && yes.body.askId === null,
-      `"${shown}" ${JSON.stringify(p.map(x => x.body))}`);
+    const after = await h1();
+    check('a card on screen stays where it is when a prompt starts an agent, and still takes its own words',
+      card === 'Stop Onboarding?' && kept === card && words === 'Started a simulated Claude on “fix the docs”.' && p.length === 3
+        && p[1].body.text === 'fix the docs' && /^c/.test(p[1].body.confirmId || '') && p[2].body.confirmId === p[1].body.confirmId && after !== card,
+      JSON.stringify({ card, kept, words, after, sent: p.map(x => x.body) }));
+  });
+  await run('words too long to send in one go stay in the box, and nothing is sent', async () => {
+    await open('prompt');
+    await sleep(700);
+    await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = 'x'.repeat(70 * 1024); i.dispatchEvent(new Event('input', { bubbles: true })); return 1; })()`);
+    await b.key('Enter'); await sleep(700);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const kept = await b.ev(`document.getElementById('say').value.length`), words = await b.ev(`document.getElementById('said').textContent`);
+    check('words too long to send in one go stay in the box, and nothing is sent',
+      p.length === 0 && kept === 70 * 1024 && words === 'That is too long to send in one go. The limit is 64 KB.', JSON.stringify({ sent: p.length, kept, words }));
+    await b.ev(`(() => { const i = document.getElementById('say'); i.value = ''; i.dispatchEvent(new Event('input', { bubbles: true })); return 1; })()`);
+  });
+  await run('spoken words that are only "um" or "uh" send nothing, and the page says nothing was heard', async () => {
+    await open('prompt');
+    await sleep(800);
+    await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`);
+    await b.key(' ', { phase: 'down' }); await sleep(300);
+    await b.ev(`window.__sr.last && window.__sr.last.hear('um, uh'), 1`);
+    await b.key(' ', { phase: 'up' }); await sleep(500);
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    const words = await b.ev(`document.getElementById('said').textContent`);
+    check('spoken words that are only "um" or "uh" send nothing, and the page says nothing was heard', p.length === 0 && words === 'Nothing heard.', JSON.stringify({ sent: p.map(x => x.body), words }));
+  });
+  await run('the ivory look shows the input bar\'s focus ring', async () => {
+    await open('prompt', { theme: 'ivory' });
+    await sleep(700);
+    const rest = await b.ev(`getComputedStyle(document.getElementById('bar')).boxShadow`);
+    await b.ev(`document.getElementById('say').focus(), 1`); await sleep(300);
+    const focused = await b.ev(`getComputedStyle(document.getElementById('bar')).boxShadow`);
+    check('the ivory look shows the input bar\'s focus ring', /\b2px\b/.test(focused) && focused !== rest, `rest "${rest}", focused "${focused}"`);
   });
   await run('the input grows with its text: Enter sends, Shift+Enter adds a line, a paste keeps its lines', async () => {
     await open('prompt');
@@ -185,13 +281,13 @@ try {
     await b.send('Emulation.setFocusEmulationEnabled', { enabled: false });
     await b.key('Enter'); await sleep(900);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const card = await h1(), after = [await value(), await lines()];
+    const words = await b.ev(`document.getElementById('said').textContent`), after = [await value(), await lines()];
     const git = await b.ev(`document.getElementById('gitSay').tagName`);
     const want = 'fix the login\nit fails on Safari\nTypeError: total is undefined\n  at render (cart.js:12)';
     check('the input grows with its text: Enter sends, Shift+Enter adds a line, a paste keeps its lines',
       typed === 'fix the login\nit fails on Safari' && two === 2 && early === 0 && pasted === want && four === 4 && p.length === 1 && p[0].body.text === want
-        && /^Start a simulated Claude on “fix the login it fails on Safari TypeError: total is undefined[^\n”]*”\?$/.test(card) && after[0] === '' && after[1] === 1 && git === 'INPUT',
-      JSON.stringify({ typed, two, early, pasted, four, sent: p.map(x => x.body.text), card, after, git }));
+        && /^Started a simulated Claude on “fix the login it fails on Safari TypeError: total is undefined[^\n”]*”\.$/.test(words) && after[0] === '' && after[1] === 1 && git === 'INPUT',
+      JSON.stringify({ typed, two, early, pasted, four, sent: p.map(x => x.body.text), words, after, git }));
   });
   await run('a failed answer keeps the core held on what the person answered, and its button can be tried again', async () => {
     await open('race', { mode: { answer: '500' } });
@@ -209,16 +305,17 @@ try {
       `held "${held}", after the failed answer "${after}", Yes enabled ${enabled}`);
     await b.mouse(5, 5);
   });
-  await run('the agent a confirmed launch starts comes to the core when it arrives (pointer on the core)', async () => {
+  await run('an agent that typed work starts takes no one\'s place in the core: its chip comes on the board (pointer on the core)', async () => {
     await open('demo');
     await sleep(800);
+    const before = await lidNow();
     await realClick('#say'); await sleep(150);
     await b.type('start an agent to tidy the export'); await b.key('Enter');
-    await sleep(1300);
-    await b.type('yes'); await b.key('Enter');
     await sleep(1800);
-    const shown = await lidNow();
-    check('the agent a confirmed launch starts comes to the core when it arrives (pointer on the core)', /is working/.test(shown) && /Tidy the export/i.test(shown) && !/\+also/.test(shown), `"${shown}"`);
+    const shown = await lidNow(), words = await b.ev(`document.getElementById('said').textContent`);
+    const chip = await b.ev(`[...document.querySelectorAll('.chip')].some(c => /Tidy export/.test(c.textContent))`);
+    check('an agent that typed work starts takes no one\'s place in the core: its chip comes on the board (pointer on the core)',
+      shown === before && words === 'Started a simulated Claude on “tidy the export”.' && chip, `"${before}" → "${shown}"; said "${words}"; chip ${chip}`);
   });
   await run('a typed "next" and a reply\'s focusId move the core at once (pointer on the core)', async () => {
     await open('demo');
@@ -379,11 +476,11 @@ try {
     check('typed words go to the ask that was on screen', p.length === 1 && p[0].body.text === 'yes' && p[0].body.focusId === '399e17' && p[0].body.askId === 'sim-1-12a274' && p[0].body.confirmId === null, JSON.stringify(p.map(x => x.body)));
   });
 
-  await run('a launch question is answered by its id, and withdrawn when the page drops it', async () => {
+  await run('a card is answered by its id, and withdrawn when the page drops it', async () => {
     await open('demo');
     await sleep(800);
     await b.ev(`document.getElementById('say').focus(), 1`);
-    await b.type('start an agent to fix the flaky test'); await b.key('Enter');
+    await b.type('stop the sign-up one'); await b.key('Enter');
     await sleep(900);
     const card1 = await h1();
     await b.key('Escape'); await sleep(200);
@@ -393,7 +490,7 @@ try {
     const dropped = p.find(x => x.path.startsWith('/api/confirm/'));
     await clearLog();
     await b.ev(`document.getElementById('say').focus(), 1`);
-    await b.type('start an agent to write the docs'); await b.key('Enter');
+    await b.type('stop the sign-up one'); await b.key('Enter');
     await sleep(1100);
     await b.ev(`document.getElementById('say').focus(), 1`);
     await b.type('yes'); await b.key('Enter');
@@ -402,14 +499,14 @@ try {
     const yes = p.filter(x => x.path === '/api/command').pop();
     await clearLog();
     await b.ev(`document.getElementById('say').focus(), 1`);
-    await b.type('start an agent to tidy the export'); await b.key('Enter');
+    await b.type('stop the sign-up one'); await b.key('Enter');
     await sleep(1100);
     await clickIn('[data-act="confirm"][data-go="1"]');
     await sleep(600);
     p = await posts();
     const doIt = p.find(x => x.path.startsWith('/api/confirm/'));
-    check('a launch question is answered by its id, and withdrawn when the page drops it',
-      /^Start/.test(card1) && dropped && dropped.body.go === false && yes && yes.body.text === 'yes' && yes.body.focusId === null && /^c/.test(yes.body.confirmId || '') && doIt && doIt.body.go === true,
+    check('a card is answered by its id, and withdrawn when the page drops it',
+      /^Stop Onboarding\?/.test(card1) && dropped && dropped.body.go === false && yes && yes.body.text === 'yes' && yes.body.focusId === null && /^c/.test(yes.body.confirmId || '') && doIt && doIt.body.go === true,
       JSON.stringify({ dropped: dropped && [dropped.path, dropped.body], yes: yes && yes.body, doIt: doIt && [doIt.path, doIt.body] }));
   });
 
@@ -594,16 +691,16 @@ try {
       `${JSON.stringify(p.map(x => [x.path, x.body]))} "${first}" → "${next}"`);
   });
 
-  await run('a picked chip dropping a launch question withdraws it', async () => {
+  await run('a picked chip dropping a card withdraws it', async () => {
     await open('demo', { still: true });
     await sleep(600);
     await b.ev(`document.getElementById('say').focus(), 1`);
-    await b.type('start an agent to fix the login page'); await b.key('Enter');
+    await b.type('stop the sign-up one'); await b.key('Enter');
     await sleep(800);
     const r = await b.ev(`(() => { const c = document.querySelector('.chip').getBoundingClientRect(); return [c.left + c.width / 2, c.top + c.height / 2]; })()`);
     await b.mouse(r[0], r[1], true); await sleep(600);
     const p = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
-    check('a picked chip dropping a launch question withdraws it', p.length === 1 && p[0].body.go === false, JSON.stringify(p.map(x => [x.path, x.body])));
+    check('a picked chip dropping a card withdraws it', p.length === 1 && p[0].body.go === false, JSON.stringify(p.map(x => [x.path, x.body])));
   });
 
   await run('a picked agent: "Tell it something" sends a message, "Stop it" stops it', async () => {
@@ -1072,7 +1169,7 @@ try {
     const p = (await posts()).filter(x => x.path === '/api/command' || x.path.startsWith('/api/confirm/'));
     check('Throw it away always asks: no default answer, a bare "yes" is not enough, and Keep it keeps it',
       /^Before it is thrown away \/ Throw away Invoice export’s work\?/.test(card) && row === 'Throw it away,Keep it' && discards.length === 0
-      && afterYes === card && /I did not catch that\. Say “do it” to throw it away, or “cancel”\./.test(saidYes)
+      && afterYes === card && /^Say “do it” to throw it away, or “cancel”\./.test(saidYes)
       && !kept.thrownAway && gone.thrownAway && /^thrown away \/ Invoice export’s work was thrown away\./.test(after)
       && p[0].body.text === 'throw it away' && p[0].body.focusId === 'm1a2b3' && p[1].body.text === 'yes' && /^c/.test(p[1].body.confirmId || '')
       && p.some(x => x.path.startsWith('/api/confirm/') && x.body.go === false) && p.some(x => x.path.startsWith('/api/confirm/') && x.body.go === true),
@@ -1540,7 +1637,7 @@ try {
   await run(GS + 'Merge in the detail first withdraws a card that waits in the lid, so none waits unseen', async () => {
     await open('merge', { still: true });
     await sleep(900);
-    await typeIn('start an agent to fix the flaky test'); await sleep(900);
+    await typeIn('stop the rounding one'); await sleep(900);
     const launch = await h1();
     await click('#dram'); await sleep(700);
     await click('#gitGraph .gr[data-id="work:m1a2b3"]'); await sleep(900);
@@ -1550,7 +1647,7 @@ try {
     const w = p.findIndex(x => x.path.startsWith('/api/confirm/') && x.body.go === false), m = p.findIndex(x => x.path === '/api/agents/m1a2b3/merge');
     const card = await b.ev(`document.querySelector('#gitDetail .dcard .dq')?.textContent || ''`);
     check(GS + 'Merge in the detail first withdraws a card that waits in the lid, so none waits unseen',
-      /^Start a simulated Claude/.test(launch) && w >= 0 && m > w && /Merge Invoice export into main\?/.test(card), `"${launch}" ${JSON.stringify(p.map(x => [x.path, x.body]))} "${card}"`);
+      /^Stop Price rounding\?/.test(launch) && w >= 0 && m > w && /Merge Invoice export into main\?/.test(card), `"${launch}" ${JSON.stringify(p.map(x => [x.path, x.body]))} "${card}"`);
   });
 
   await run(GS + '"<name> needs you" takes that item to the lid even while a card waits, and withdraws the card', async () => {
@@ -1842,21 +1939,20 @@ try {
       `kept ${JSON.stringify(kept)}; on ${JSON.stringify(on)}; said "${words}"; ${a.state} ${JSON.stringify(a.ask)}; confirms ${JSON.stringify(confirms)}`);
   });
 
-  await run(FP + 'while they are on, a launch card says it will not ask; pressed when on, the button turns them off at once, with no card', async () => {
+  await run(FP + 'while they are on, typed work starts at once with no card and nothing about them; pressed when on, the button turns them off at once, with no card', async () => {
+    await clearLog();
     await typeIn('start an agent to fix the flaky checkout test');
     await sleep(1100);
-    const detail = await lidDetail();
-    await clickIn('[data-act="confirm"][data-go="0"]');
-    await sleep(900);
+    const started = await said(), cards = (await posts()).filter(x => x.path === '/api/command').length, lidThen = await lidNow();
     await clearLog();
     await realClick('#permBtn');
     await sleep(1000);
     const off = await permBtn(), lid = await lidNow(), words = await said(), p = await permPosts();
-    check(FP + 'while they are on, a launch card says it will not ask; pressed when on, the button turns them off at once, with no card',
-      /It runs on your laptop\. Full permissions are on, so it will not ask before any step\.$/.test(detail)
+    check(FP + 'while they are on, typed work starts at once with no card and nothing about them; pressed when on, the button turns them off at once, with no card',
+      started === 'Started a simulated Claude on “fix the flaky checkout test”.' && cards === 1 && !/^You said/.test(lidThen)
       && off.pressed === 'false' && !off.on && !/^Before agents stop asking/.test(lid) && /Agents ask again before risky steps\./.test(words)
       && p.length === 1 && JSON.stringify(p[0].body) === '{"mode":"ask"}',
-      `launch "${detail}"; ${JSON.stringify(off)}; lid "${lid}"; said "${words}"; ${JSON.stringify(p.map(x => x.body))}`);
+      `started "${started}", lid then "${lidThen}"; ${JSON.stringify(off)}; lid "${lid}"; said "${words}"; ${JSON.stringify(p.map(x => x.body))}`);
   });
 
   await run(FP + 'the page arrives with the button already right: from <html> before the first snapshot, never drawn the other way', async () => {
@@ -1949,7 +2045,7 @@ try {
   await run(FP + 'a keyboard press takes the keyboard to the card; a card already on screen is withdrawn first', async () => {
     await open('demo');
     await sleep(900);
-    await typeIn('start an agent to fix the flaky checkout test');
+    await typeIn('stop the sign-up one');
     await sleep(1100);
     await b.ev(`document.getElementById('permBtn').focus(), 1`);
     await b.key('Enter');
