@@ -1461,12 +1461,39 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           return reply(shown ? { ...out, confirm: cardOf(shown) } : out);
         };
         const hint = verb => reply({ reply: `Say “do it” to ${verb}, or “cancel”.`, confirm: cardOf(shown) });
+        // A stop word and its target first, whatever follows (src/core/commands.mjs, stopFirst, in short): "stop it, it is
+        // deleting the wrong files" stops the agent in the centre, "stop everything, the build is broken" every agent at
+        // work. A card on screen stays where it is (the page sends no agent in the centre with one), and the line under the
+        // board says what stopped, as the engine's command() does.
+        const stopWords = /^(?:stop|kill|pause|halt)(?: (it|that|this one|the agent|everything|all agents|all of them|them))?(?=\s*[,.!;:]|\s+[-–—]\s|\s*\n|\s+(?:because|before|while|until|it|they)\b|\s*$)/i.exec(text);
+        const stopNow = () => {
+          const what = (stopWords[1] || '').toLowerCase();
+          let out;
+          if (['everything', 'all agents', 'all of them'].includes(what)) {
+            const roots = state.agents.filter(a => !a.parentId && AT_WORK.has(a.state));
+            for (const a of roots) Object.assign(a, { state: 'stopped', endedAt: Date.now(), stateSince: Date.now(), ask: null });
+            if (roots.length) setTimeout(() => changed(roots), 60);
+            out = { reply: !roots.length ? 'Nothing is running.' : roots.length === 1 ? `Stopped ${roots[0].name}.` : `Stopped all ${roots.length} agents.` };
+          } else {
+            const a = what === 'them' || shown ? null : state.agents.find(x => x.id === json?.focusId);
+            if (!a) out = { reply: 'I couldn’t tell which agent to stop.' };
+            else if (!AT_WORK.has(a.state)) out = { reply: `${a.name} is not running.`, focusId: a.id };
+            else {
+              Object.assign(a, { state: 'stopped', endedAt: Date.now(), stateSince: Date.now(), ask: null });
+              setTimeout(() => changed([a]), 60);
+              out = { reply: `Stopped ${a.name}.`, focusId: a.id };
+            }
+          }
+          send('notice', { text: out.reply });
+          return reply(shown ? { reply: out.reply, confirm: cardOf(shown) } : out);
+        };
         if (shown && shown.kind === 'permissions') {
           // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking",
           // "turn it off" and its kin, or a no. A bare "yes" is not enough, and a question answers nothing: the card stays.
           if (/^(turn (it|them) on|turn on full permissions|do it|stop asking|full permissions|allow everything)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
-          if (/^(keep asking|no|cancel|never mind|ask first|ask me first|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if (/^(keep asking|no|cancel|never mind|ask first|ask me first|stop|stop it|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           if (/^(yes|yeah|yep|ok|okay|sure|go ahead|yes please|make it so)[.!]*$/i.test(text) || /\?$/.test(text)) return hint('turn on full permissions');
+          if (stopWords) return stopNow();
           return prompt();
         }
         if (shown) {
@@ -1478,12 +1505,14 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
             : shown.kind === 'stop' ? /^(yes|ok|do it|go ahead|sure|stop|stop it)$/i
             : shown.kind === 'say' ? /^(yes|ok|do it|go ahead|sure|send it)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
           if (yes.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
-          if (/^(no|cancel|never mind|forget it|keep it|don.t)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if (/^(no|cancel|never mind|forget it|keep it|don.t|stop|stop it)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', stop: 'stop it', say: 'send it' }[shown.kind] || 'go ahead';
           if (/^(yes|yeah|yep|ok|okay|sure|go ahead|merge it|land it|start it|send it|stop it|allow it)[.!]*$/i.test(text) || /\?$/.test(text)) return hint(verb);
+          if (stopWords) return stopNow();   // a stop stops, and the card stays
           if (!/^(merge|land|throw|discard|scrap|forget|stop|tell|what needs me)\b/i.test(text)) return prompt();
           confirms.delete(shown.id);   // any other command withdraws the card on screen
         }
+        if (stopWords) return stopNow();
         if (/^(merge|land)\b|^bring its changes in\b/i.test(text) || /^(throw (it|its work|its changes) away|throw away|discard|scrap)\b/i.test(text)) {
           const merge = /^(merge|land|bring)/i.test(text);
           // the agent the words name ("merge search cleanup"), else the one on screen ("merge it"), as the parser does

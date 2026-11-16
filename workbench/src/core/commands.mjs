@@ -770,7 +770,116 @@ const BARE_STOP = new Set(['stop', 'pause', 'halt', 'kill', 'abort', 'it', 'now'
   'already', 'what', 'you', 'are', 'doing', 'immediately', 'at', 'once', 'for', 'a', 'moment', 'sec', 'second', 'everything',
   'that', 'trying', 'this']);
 
-function matchStop(core, c) {
+// A stop word and its target first ----------------------------------------------------------------
+//
+// Every prompt starts a paid agent at once, so a stop said with its reason ("stop it, it is deleting the wrong files")
+// must never become a prompt. The rule is over where the target ends, never over the words of the reason: a stop word,
+// then its target, then something that cannot go on with that target (a break, a word that starts a reason or a time, a
+// sentence of its own) is a stop of that target, whatever follows.
+
+/** How soon, said right after a stop's target: "stop it now, …", "stop everything for now". Longer ones first. */
+const STOP_SOON = [['right', 'now'], ['right', 'away'], ['at', 'once'], ['for', 'now'], ['for', 'a', 'moment'], ['for', 'a', 'second'],
+  ['for', 'a', 'sec'], ['for', 'a', 'minute'], ['for', 'a', 'bit'], ['immediately'], ['now'], ['please'], ['already'], ['again'],
+  ['too'], ['asap']];
+/** Words that start a reason or a time: "stop it because it is looping", "pause onboarding while I check". */
+const STOP_REASON = new Set(['because', 'cause', 'cuz', 'coz', 'cos', 'bc', 'since', 'before', 'until', 'till', 'til', 'while']);
+/** Pronouns that start a sentence of their own after a whole target: "stop everything it is deleting files". */
+const CLAUSE_SUBJECT = new Set(['it', 'they', 'he', 'she', 'i', 'we', 'you', 'there']);
+/** Words that start another noun after a target that ends with one: "stop all agents the build is broken". */
+const NEW_NOUN = new Set(['the', 'a', 'an', 'my', 'our', 'your', 'their', 'these', 'those']);
+/** Agents' names are short: a target is at most this many words. Keeps long dictation fast. */
+const MAX_STOP_TARGET = 12;
+/** Words for an agent that may end a reference to one: "the onboarding agent", "the stuck one". */
+const AGENT_END = new Set(['agent', 'agents', 'one', 'ones', 'helper', 'helpers']);
+
+/** A dash set off by spaces between two words: "pause it - I need to check", "kill onboarding — wrong branch". */
+function dashBetween(a, b) {
+  return !!a && !!b && a.src === b.src && /(?:^|\s)[-–—]+(?:\s|$)/.test(a.src.slice(a.end, b.start));
+}
+
+/** The last word of "everything", "all agents", "all of them", "the agents": what a stop of everything ends with. */
+const ALL_END = new Set([...STOP_ALL_WORDS, 'agents', 'them', 'helpers', 'jobs', 'tasks', 'things', 'stuff']);
+
+/**
+ * The target of a stop word, and how it may end:
+ * - `open`: "it", "them", which no word can go on from, so anything but "from" (what to prevent) may follow;
+ * - `clause`: "the agent", "this one", "everything", "all agents", which a break, a word of reason or time, a pronoun, or
+ *   the first word of another noun ends ("stop all agents the build is broken");
+ * - `name`: an agent's name, which may be a word that takes a noun after it ("stop onboarding the new users twice" is
+ *   work), so a break, a word of reason or time or a pronoun ends it, never another noun;
+ * - `tight`: "that", "this", "all", "every", which may go on into a noun ("all the zombie processes", "every request"),
+ *   so only a break, a word of reason or time or a pronoun ends them;
+ * - `strict`: an agent found by its task or state words, not its name ("the one fixing", "the stuck one"), which may go
+ *   on in any way ("the one fixing the flaky test"), so only a break or a word of reason or time ends it.
+ * Null when the words are no target. After "cancel", "that" and "this" are a never-mind, not an agent.
+ */
+function stopTarget(toks, c, cancel) {
+  const ws = toks.map(t => t.w);
+  const s = ws.join(' ');
+  const last = ws[ws.length - 1];
+  const focus = { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] };
+  if (s === 'it' || s === 'him' || s === 'her') return { intent: focus, strong: !!c.focusId, level: 'open' };
+  if (s === 'them' || s === 'they') return { intent: { kind: 'stop', agentIds: [] }, strong: false, level: 'open' };
+  if (s === 'that' || s === 'this') return cancel ? null : { intent: focus, strong: !!c.focusId, level: 'tight' };
+  if (s === 'all' || s === 'every') return { intent: { kind: 'stop_all' }, strong: true, level: 'tight' };
+  if (PRONOUN_REFS.has(s)) return { intent: focus, strong: !!c.focusId, level: 'clause' };
+  if (ALL_END.has(last) && matchStopAll(['stop', ...ws])) return { intent: { kind: 'stop_all' }, strong: true, level: 'clause' };
+  if (launchPhrase(ws)) return null; // "stop an agent to fix the login" says what a new agent should do
+  // a name ends with a word of it, or with a word for an agent ("the onboarding agent"), never with a little word that
+  // the next words go on from ("the invoice export when the account is closed" names nothing)
+  if (REF_STOP.has(last) && !AGENT_END.has(last)) return null;
+  const r = resolveList(toks, c);
+  if (!r.ids.length || !r.full || r.pronoun) return null;
+  if (!r.named) return { intent: { kind: 'stop', agentIds: r.ids, sure: false }, strong: false, level: 'strict' }; // the engine asks first
+  return { intent: { kind: 'stop', agentIds: r.ids }, strong: true, level: 'name' };
+}
+
+/**
+ * A reason or a time starts at toks[k]: "because …", "before …", "while …", and "so" before a sentence of its own ("so I
+ * can check"), never "so many users".
+ */
+function reasonAt(toks, k) {
+  const w = toks[k]?.w;
+  return STOP_REASON.has(w) || (w === 'so' && (CLAUSE_SUBJECT.has(toks[k + 1]?.w) || toks[k + 1]?.w === 'that'));
+}
+
+/** Whether what starts at toks[k] cannot go on with a target of this `level` (see stopTarget). */
+function endsTarget(toks, k, level) {
+  const prev = toks[k - 1];
+  const next = toks[k];
+  if (prev.tail || dashBetween(prev, next)) return true;
+  if (level === 'open') return next.w !== 'from';
+  if (reasonAt(toks, k)) return true;
+  if (level === 'strict') return false;
+  return CLAUSE_SUBJECT.has(next.w) || (level === 'clause' && NEW_NOUN.has(next.w));
+}
+
+/**
+ * A stop word (stop, kill, pause, halt, abort, terminate, and "cancel" with an agent's target) and its target first,
+ * then words that cannot go on with that target: a stop of the target, whatever follows ("stop it, it is deleting the
+ * wrong files", "pause it - I need to check", "stop the agent because it is looping", "stop everything it is deleting
+ * files", "stop onboarding before it deletes the files"). Longer targets are tried first, so "stop onboarding and the
+ * flaky test, they are looping" stops both. Null when the target is all that is said (matchStop reads that, as before),
+ * or when the words go on with the target ("kill the help pages popup on mobile", "kill all the zombie processes").
+ */
+function stopFirst(core, c) {
+  const cancel = core[0].w === 'cancel';
+  if (!cancel && !STOP_WORDS.has(core[0].w)) return null;
+  for (let n = Math.min(core.length - 1, MAX_STOP_TARGET); n >= 1; n--) {
+    const target = stopTarget(core.slice(1, 1 + n), c, cancel);
+    if (!target) continue;
+    let k = 1 + n;
+    for (let m = 1; m && k < core.length && !core[k - 1].tail; k += m) m = startsWithSeq(core.slice(k).map(t => t.w), STOP_SOON);
+    if (k >= core.length) {
+      if (k > 1 + n) return { intent: target.intent, strong: target.strong }; // "stop everything for now"
+      continue; // the target is all that is said: as before
+    }
+    if (endsTarget(core, k, target.level)) return { intent: target.intent, strong: target.strong };
+  }
+  return null;
+}
+
+function matchStop(core, c, base = core) {
   let ws = core.map(t => t.w);
   // "shut it down", "shut everything off", "make it stop": a stop said the other way round
   const around = /^(?:shut (it|this|that|everything|them all|all of them) (?:down|off)|make (it|everything) stop)$/.exec(ws.join(' '));
@@ -786,11 +895,18 @@ function matchStop(core, c) {
   if (ws.filter(w => !REF_STOP.has(w)).length > 1 && bareName(ws, c)) return null;
   // "stop checkout test?" asks about the agent of that name; "can you stop the flaky test?" still stops
   if (/[?？]["'”’)]*$/.test(core[core.length - 1].raw) && c.agents.some(a => saysWhole(ws, a))) return null;
+  // A stop word and its target, then words that cannot go on with it: a stop of that target, whatever follows. Read from
+  // the words as said, which still end with what was taken off as politeness ("stop everything for now").
+  const at = base.indexOf(core[0]);
+  const first = stopFirst(at >= 0 ? base.slice(at) : core, c);
+  if (first) return first;
   let rest = core.slice(v);
   // "stop, it's deleting the wrong files": after the stop and its comma comes why, not which agent
-  // only after a comma, a full stop or the end of a line ("stop", then the reason on the next line), and not when the
-  // words name the agent ("stop, stop the flaky test", "stop, onboarding"); "kill: (1234) No such process" is pasted output
-  if (core[v - 1].tail && (/[,.!，。！]["'”’)]*$/.test(core[v - 1].raw) || core[v - 1].nl) && rest.length && STOP_WORDS.has(ws[0]) && !rest.some(t => STOP_ALL_WORDS.has(t.w))) {
+  // only after a comma, a full stop or the end of a line ("stop", then the reason on the next line), a dash ("stop - wrong
+  // branch") or a word of reason or time ("stop because it is looping"), and not when the words name the agent ("stop, stop
+  // the flaky test", "stop, onboarding"); "kill: (1234) No such process" is pasted output
+  const broke = core[v - 1].tail ? /[,.!，。！]["'”’)]*$/.test(core[v - 1].raw) || core[v - 1].nl : dashBetween(core[v - 1], core[v]) || reasonAt(core, v);
+  if (broke && rest.length && STOP_WORDS.has(ws[0])) {
     if (startsWithSeq(rest.map(t => t.w), STOP_VERBS)) {
       const again = matchStop(rest, c); // "stop, stop the flaky test"; "stop, stop deleting the files" is still a bare stop
       if (again && (again.intent.kind === 'stop' || again.intent.kind === 'stop_all') && again.intent.agentIds?.length !== 0) return again;
@@ -809,7 +925,7 @@ function matchStop(core, c) {
     return { intent: { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] }, strong: !!c.focusId };
   }
   const refWords = rest.map(t => t.w).join(' ');
-  if (ws[0] === 'cancel' && PRONOUN_REFS.has(refWords)) return null; // "cancel that" is not about an agent
+  if (ws[0] === 'cancel' && (refWords === 'that' || refWords === 'this')) return null; // "cancel that" is a never-mind, not about an agent
   // "stop them": which ones is not clear, so the engine says so; never one agent picked by its spelling
   if (refWords === 'them' || refWords === 'they') return { intent: { kind: 'stop', agentIds: [] }, strong: false };
   // "stop its work", "stop the work": the agent in the centre, as "stop it"
@@ -2678,7 +2794,7 @@ function matchCommand(core, c, base = core) {
   return matchConnect(core)
     || matchPermissions(base, c)
     || matchMachines(core, c)
-    || matchStop(core, c)
+    || matchStop(core, c, base)
     || matchForget(core, c)
     || matchContinue(core, c)
     || matchChanges(core, c)

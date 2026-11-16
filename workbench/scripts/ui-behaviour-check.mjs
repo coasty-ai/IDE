@@ -232,6 +232,32 @@ try {
         && p[1].body.text === 'fix the docs' && /^c/.test(p[1].body.confirmId || '') && p[2].body.confirmId === p[1].body.confirmId && after !== card,
       JSON.stringify({ card, kept, words, after, sent: p.map(x => x.body) }));
   });
+  // A stop word and its target first stop that target, whatever follows: nothing starts, and a card on screen stays.
+  await run('a stop with its reason after it stops what it names and starts nothing; on a card it still stops, and the card stays', async () => {
+    await open('demo');
+    await sleep(800);
+    const agents = (await ctl('state')).agents.length;
+    await realClick('#say'); await sleep(150);
+    await b.type('stop it, it is deleting the wrong files'); await b.key('Enter');
+    await sleep(900);
+    const words1 = await saidAll();
+    const first = (await posts()).filter(x => x.path === '/api/command')[0]?.body;
+    const stopped = first?.focusId ? (await agentOf(first.focusId))?.state : null;
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('stop the sign-up one'); await b.key('Enter');
+    await sleep(900);
+    const card = await h1();
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('stop everything, the build is broken'); await b.key('Enter');
+    await sleep(900);
+    const kept = await h1(), words2 = await saidAll(), st = await ctl('state');
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check('a stop with its reason after it stops what it names and starts nothing; on a card it still stops, and the card stays',
+      /^Stopped .+\.$/.test(words1) && stopped === 'stopped' && card === 'Stop Onboarding?' && kept === card && /^Stopped (all \d+ agents|.+)\.$/.test(words2)
+        && st.agents.length === agents && st.agents.every(a => a.parentId || !['starting', 'working'].includes(a.state))
+        && p.length === 3 && /^c/.test(p[2].body.confirmId || '') && p[2].body.focusId === null,
+      JSON.stringify({ words1, stopped, card, kept, words2, sent: p.map(x => x.body) }));
+  });
   await run('words too long to send in one go stay in the box, and nothing is sent', async () => {
     await open('prompt');
     await sleep(700);

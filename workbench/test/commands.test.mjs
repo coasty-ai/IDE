@@ -2517,3 +2517,133 @@ test('Workbench\'s verbs with words that point at an agent never start work, in 
   }
   assert.deepEqual(failures, []);
 });
+
+// ------------------------------------------------------------------ rules over the words
+// Every prompt starts a paid agent at once, so a misread is no longer a card the person can cancel: what the words are is
+// read by rules over them, not by lists of whole phrases.
+
+const stopOf = (...agentIds) => ({ kind: 'stop', agentIds });
+const stopAll = { kind: 'stop_all' };
+
+test('a stop word with an agent target first stops that target, whatever follows it: a reason after a break, "because", "before", or a sentence of its own', () => {
+  sweptRows([
+    // the owner's six, beside an agent in the centre
+    ['stop it, it is deleting the wrong files', 'onboarding', stopOf('7a8b9c')],
+    ['kill it\nwrong branch', 'onboarding', stopOf('7a8b9c')],
+    ['pause it - I need to check', 'onboarding', stopOf('7a8b9c')],
+    ['stop the agent because it is looping', 'onboarding', stopOf('7a8b9c')],
+    ['stop all agents, the build is broken', 'onboarding', stopAll],
+    ['stop everything it is deleting files', 'onboarding', stopAll],
+    // with no agent in the centre, which one is not clear (the engine says so): never a prompt, and never an agent picked by
+    // a word of the reason ("check" is no part of Checkout fix's name)
+    ['stop it, it is deleting the wrong files', 'none', stopOf()],
+    ['kill it\nwrong branch', 'none', stopOf()],
+    ['pause it - I need to check', 'none', stopOf()],
+    ['stop the agent because it is looping', 'none', stopOf()],
+    ['stop all agents, the build is broken', 'none', stopAll],
+    ['stop everything it is deleting files', 'none', stopAll],
+    // an agent's name on the board, then a break, a reason, a time, or a sentence of its own
+    ['stop onboarding, it is looping', 'none', stopOf('7a8b9c')],
+    ['kill onboarding - wrong branch', 'none', stopOf('7a8b9c')],
+    ['stop onboarding before it deletes the files', 'none', stopOf('7a8b9c')],
+    ['pause the flaky test because it keeps timing out', 'none', stopOf('0a0b0c')],
+    ['halt onboarding\nit is on the wrong branch', 'none', stopOf('7a8b9c')],
+    ['stop onboarding it keeps failing', 'none', stopOf('7a8b9c')],
+    ['stop onboarding and the flaky test, they are looping', 'none', stopOf('7a8b9c', '0a0b0c')],
+    ['stop onboarding now, it is looping', 'none', stopOf('7a8b9c')],
+    ['pause onboarding so I can check the logs', 'none', stopOf('7a8b9c')],
+    ['cancel onboarding, it is looping', 'none', stopOf('7a8b9c')],
+    // them: which ones is not clear, as "stop them" alone
+    ['stop them, they are looping', 'none', stopOf()],
+    ['stop them, they are looping', 'onboarding', stopOf()],
+    // the other targets
+    ['stop that, it is deleting files', 'onboarding', stopOf('7a8b9c')],
+    ['stop this one because it is stuck', 'onboarding', stopOf('7a8b9c')],
+    ['stop it before it deletes the files', 'onboarding', stopOf('7a8b9c')],
+    ['stop it it is deleting the wrong files', 'onboarding', stopOf('7a8b9c')],
+    ['kill it now - wrong branch', 'onboarding', stopOf('7a8b9c')],
+    ['please stop it, it is deleting the wrong files', 'onboarding', stopOf('7a8b9c')],
+    ['ok stop it, it is deleting the wrong files', 'onboarding', stopOf('7a8b9c')],
+    ['stop, it is all wrong', 'onboarding', stopOf('7a8b9c')],
+    ['stop because it is looping', 'onboarding', stopOf('7a8b9c')],
+    ['stop - wrong branch', 'onboarding', stopOf('7a8b9c')],
+    ['pause everything while I check the logs', 'none', stopAll],
+    ['stop everything for now', 'onboarding', stopAll],
+    ['stop all, the build is broken', 'none', stopAll],
+    ['kill everything, it is all wrong', 'none', stopAll],
+    ['stop all of them because the build is broken', 'none', stopAll],
+    ['halt all agents the build is broken', 'none', stopAll],
+    // "cancel" is a stop with a target that is an agent's
+    ['cancel it', 'onboarding', stopOf('7a8b9c')],
+    ['cancel it, wrong branch', 'onboarding', stopOf('7a8b9c')],
+    ['cancel this one', 'onboarding', stopOf('7a8b9c')],
+    ['cancel everything, the build is broken', 'none', stopAll],
+    // found by its task or state words, not its name: a stop all the same, asked first
+    ['stop the stuck one, it keeps failing', 'none', { kind: 'stop', agentIds: ['0a0b0c'], sure: false }],
+  ]);
+});
+
+test('a stop word whose words go on past any target is read as before: work, a never-mind, pasted output, or an answer', () => {
+  sweptRows([
+    // the words after the stop word go on into something that is no agent ("the help pages popup"), or say what to prevent
+    ['kill the help pages popup on mobile', 'none', said('kill the help pages popup on mobile')],
+    ['stop onboarding the new users twice', 'none', said('stop onboarding the new users twice')], // a name that takes a noun
+    ['stop onboarding so many users at once', 'none', said('stop onboarding so many users at once')],
+    ['stop the one fixing the flaky test from timing out', 'none', said('stop the one fixing the flaky test from timing out')],
+    ['cancel the invoice export when the account is closed', 'none', said('cancel the invoice export when the account is closed')],
+    ['stop the flaky test from timing out', 'none', said('stop the flaky test from timing out')],
+    ['stop it from crashing on startup', 'onboarding', said('stop it from crashing on startup')],
+    ['kill all the zombie processes on startup', 'none', said('kill all the zombie processes on startup')],
+    ['stop every request to the old API', 'none', said('stop every request to the old API')],
+    ['kill everything in the cache', 'none', said('kill everything in the cache')],
+    ['stop the tests from failing', 'W', said('stop the tests from failing')],
+    ['stop an agent to fix the login, it is broken', 'dogNone', said('stop an agent to fix the login, it is broken')],
+    // "cancel that" is a never-mind, and "cancel" alone too vague to stop anything, as before
+    ['cancel that deploy job', 'none', said('cancel that deploy job')],
+    ['cancel that', 'onboarding', said('cancel that')],
+    ['cancel', 'onboarding', said('cancel')],
+    // a colon after a stop word alone is pasted output
+    ['kill: (1234) - No such process', 'pairFocus', said('kill: (1234) - No such process')],
+    // while a question waits, a stop that names no agent is its answer, as before
+    ['stop after the first failure', 'question', answer('stop after the first failure')],
+    // an agent's whole name that begins with a stop word, asked, is about that agent
+    ['stop checkout test?', 'W', { kind: 'status', agentId: 'e5f005' }],
+  ]);
+});
+
+test('on a card a stop of an agent still stops it (the engine keeps the card); the page sends no agent in the centre with a card', () => {
+  for (const [ctx, name, id] of [['pendingMerge', 'onboarding', '7a8b9c'], ['pendingDiscard', 'onboarding', '7a8b9c'],
+    ['pendingPermissions', 'onboarding', '7a8b9c'], ['boardCard', 'search cleanup', 'w00001']]) {
+    sweptRows([
+      [`stop ${name}, it is looping`, ctx, stopOf(id)],
+      [`stop ${name}`, ctx, stopOf(id)],
+      ['stop everything, the build is broken', ctx, stopAll],
+      ['stop all agents', ctx, stopAll],
+      // "it" on a card is no agent at work: which one is not clear, and nothing starts
+      ['stop it, it is deleting the wrong files', ctx, stopOf()],
+      // a stop word alone, or with "it", is still the card's no
+      ['stop', ctx, { kind: 'confirm', go: false }],
+      ['stop it', ctx, { kind: 'confirm', go: false }],
+    ]);
+  }
+});
+
+test('a stop word with an agent target first never starts work, whatever follows it, in any context', () => {
+  const tails = [', it is deleting the wrong files', '\nwrong branch', ' - I need to check', ' because it is looping', ' before it deletes the files',
+    '. The build is broken.', ' it keeps failing'];
+  const texts = [];
+  for (const verb of ['stop', 'kill', 'pause', 'halt']) {
+    for (const target of ['', 'it', 'them', 'that', 'everything', 'all', 'all agents', 'the agent', 'this one', 'all of them']) {
+      for (const tail of tails) texts.push(`${verb}${target ? ` ${target}` : ''}${tail}`);
+    }
+  }
+  for (const target of ['it', 'them', 'everything', 'all agents', 'the agent']) for (const tail of tails) texts.push(`cancel ${target}${tail}`);
+  const failures = [];
+  for (const [name, ctx] of Object.entries(ALL_CONTEXTS())) {
+    for (const text of texts) {
+      const got = parseCommand(text, ctx);
+      if (got.kind === 'task' || (got.kind === 'start' && got.tasks?.length)) failures.push(`${JSON.stringify(text)} [${name}] -> ${JSON.stringify(got)}`);
+    }
+  }
+  assert.deepEqual(failures, []);
+});

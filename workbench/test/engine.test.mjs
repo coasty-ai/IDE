@@ -4617,3 +4617,39 @@ test('words no parser could read are a prompt too; with a permission in the cent
   await pending;
   await t.engine.shutdown();
 });
+
+// ------------------------------------------------------------------ rules over the words: a misread starts a paid agent now
+
+test('a stop with its reason after it stops that agent and starts nothing; with a card on screen it still stops, and the card stays', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const docs = await started(t, { task: 'Update the docs' });
+  const readme = await started(t, { task: 'Tidy the readme' });
+  // beside the agent in the centre
+  const out = await t.engine.command('stop it, it is deleting the wrong files', { focusId: id });
+  assert.equal(out.reply, 'Stopped Fix login redirect.');
+  assert.equal(t.store.get(id).state, 'stopped');
+  // with no agent in the centre, which one is not clear: nothing stops, and nothing starts
+  for (const text of ['kill it\nwrong branch', 'pause it - I need to check', 'stop the agent because it is looping']) {
+    assert.equal((await t.engine.command(text)).reply, 'I couldn’t tell which agent to stop.', text);
+  }
+  assert.equal(t.claude.runners.length, 3, 'nothing started');
+  // a card on screen (the page sends no agent in the centre with it): a stop of a named agent stops it, and the card stays
+  const card = await t.engine.command('stop the readme one');
+  assert.equal(card.confirm.kind, 'stop');
+  const before = t.notices.length;
+  const stop = await t.engine.command('stop update docs, it is looping', { confirmId: card.confirm.id });
+  assert.deepEqual(stop, { reply: 'Stopped Update docs.', confirm: card.confirm }, 'the card stays in the centre, and the centre stays on it');
+  assert.deepEqual(t.notices.slice(before), [stop.reply], 'what stopped is said under the board, though the card is in the centre');
+  assert.equal(t.store.get(docs.id).state, 'stopped');
+  assert.notEqual(t.store.get(readme.id).state, 'stopped');
+  // the card still takes its own words
+  assert.equal((await t.engine.command('cancel', { confirmId: card.confirm.id })).reply, 'OK, I won’t stop it.');
+  // a stop of everything keeps a card too
+  const again = await t.engine.command('stop the readme one');
+  const all = await t.engine.command('stop all agents, the build is broken', { confirmId: again.confirm.id });
+  assert.deepEqual(all, { reply: 'Stopped Tidy readme.', confirm: again.confirm });
+  assert.equal(t.claude.runners.length, 3, 'nothing started');
+  await t.engine.shutdown();
+});
