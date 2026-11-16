@@ -1090,7 +1090,7 @@ test('the list looks inside each folder an ignore rule names for its env files, 
   assert.deepEqual([env.kind, env.text], ['secret', 'KEY=••••\n']);
 });
 
-test('a project with thousands of folders an ignore rule names (a __pycache__ and a dist in every package) still has its env files listed, soon', async () => {
+test('a project with thousands of folders an ignore rule names (a __pycache__ and a dist in every package) has their env files found in one look', async (t) => {
   const { root } = repo({ '.gitignore': '__pycache__/\ndist/\n', 'a.txt': 'a\n' });
   const many = {};
   for (let i = 0; i < 2500; i++) {
@@ -1100,8 +1100,28 @@ test('a project with thousands of folders an ignore rule names (a __pycache__ an
   }
   many['packages/p999/dist/.env.production'] = 'KEY=1\n'; // in the last of them, by name
   put(root, many);
-  // Within the look's own time (1.5 s): looking folder by folder, a few at a time, never got that far.
-  assert.deepEqual((await listFiles({ root })).ignored, ['packages/p999/dist/.env.production']);
+  // A stand-in for git that counts the looks (ls-files with --ignored, without --directory), and hands every call to the
+  // real git. Looking folder by folder, a few at a time, took longer than the look's time here (5,000 folders).
+  const realGit = process.env.PATH.split(path.delimiter).map(d => path.join(d, 'git')).find(p => fs.existsSync(p));
+  const bin = path.join(T, `bin-${++made}`);
+  fs.mkdirSync(bin);
+  const looks = path.join(bin, 'looks');
+  fs.writeFileSync(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    'ignored=; directory=',
+    'for a in "$@"; do',
+    '  [ "$a" = "--ignored" ] && ignored=1',
+    '  [ "$a" = "--directory" ] && directory=1',
+    'done',
+    `if [ -n "$ignored" ] && [ -z "$directory" ]; then echo look >> '${looks}'; fi`,
+    `exec '${realGit}' "$@"`,
+  ].join('\n') + '\n', { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${PATH}`;
+  t.after(() => { process.env.PATH = PATH; });
+  // Time enough for a busy machine: what is counted is the looks.
+  assert.deepEqual((await listFiles({ root, hiddenTimeoutMs: 30_000 })).ignored, ['packages/p999/dist/.env.production']);
+  assert.equal(fs.readFileSync(looks, 'utf8'), 'look\n', 'one look for all of them');
 });
 
 test('a look inside the ignored folders that takes too long is let go: the list comes in time, without what it would have found', async (t) => {
