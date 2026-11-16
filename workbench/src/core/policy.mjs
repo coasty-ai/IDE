@@ -13,7 +13,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describeRequest, commandAction, shellCommands } from '../shared/narrate.mjs';
+import { describeRequest, commandAction, shellCommands, FILLED } from '../shared/narrate.mjs';
 
 /**
  * Tools that only plan, look up tools or skills, report, search the web or manage the agent's own
@@ -370,59 +370,69 @@ function landing(p, b, base, { deep = false, into = null } = {}) {
 
 /**
  * A command line, as far as the policy can tell. Refused when a part would write into Claude Code's own settings (its
- * redirections, and the files its program writes: writeTargets), when a cd or pushd would leave the shell in them (the
- * next command's words are read from the agent's own folder), when a part runs code it is given whose text names them
- * (codeNamesClaude, xargs and parallel too), or when the policy cannot tell where a part writes (a place that cannot be
- * resolved, a word another command's output cuts in two). Reads, mentions in the words of commands that write elsewhere,
- * and a script run from there all run. The line is read with its braces expanded into the words they make (expandBraces),
- * and every part, also inside sh -c '…', eval, $(…) and backticks (narrate's shellCommands); relative words are read from
- * the agent's folder and from each folder the line cd's into.
+ * redirections, and the files its program writes: writeTargets), when the shell would be left in them when the line ends
+ * (staysInClaude: the next command's words are read from the agent's own folder), when a part runs code it is given whose
+ * text names them (codeNamesClaude, xargs and parallel too) or a program whose name is put together when it runs and is
+ * given their name (`$(echo rm) -rf .claude`), or when the policy cannot tell where a part writes (a place that cannot be
+ * resolved; in a line that names them outside a heredoc's text, a place that holds a variable or another command's
+ * output). Reads, mentions in the words of commands that write elsewhere, and a script run from there all run.
+ *
+ * The line is read with its braces expanded into the words they make (expandBraces) and each part whole (narrate's
+ * shellCommands, `whole`): another command's output ($(…), `…`, <(…)) leaves a hole (FILLED) in its word and the command
+ * goes on past it, so the places it writes stay where they are written; the commands inside, those of sh -c '…' and eval,
+ * and those find -exec and xargs run are parts of their own. Relative words are read from the agent's folder and from
+ * each folder the line cd's into.
  */
 function commandFloor(command, base) {
   const line = expandBraces(command);
   if (line === null) return R.fullWriteUnclear;
   let unclear = false;
-  let cd = false;
   let code = false;
-  let writes = false;
-  let carried = false; // a place a command writes holds a value the shell fills in ("$X", "$d")
-  const parts = shellCommands(line);
+  let carried = false; // a place a command writes holds a value the shell fills in: "$X", another command's output
+  const named = textNamesClaude(withoutHeredocs(command)); // the line names them, outside a heredoc's text
+  const parts = shellCommands(line, { whole: true });
   const bases = base ? cdFolders(parts, base) : [];
   for (const c of parts) {
-    const targets = writeTargets(c);
-    if (targets.length) writes = true;
-    for (const t of targets) {
-      if (/[$`]/.test(withHome(t.word))) carried = true;
+    for (const t of writeTargets(c)) {
       const v = targetLanding(t, bases, base);
       if (v === 'claude') return R.fullClaude;
       if (v === 'unclear') unclear = true;
+      if (v === 'carried') carried = true;
     }
-    if (base && entersClaude(c, bases, base)) cd = true;
-    if (codeNamesClaude(c, line)) code = true;
+    if (codeNamesClaude(c, line) || builtProgram(c)) code = true;
   }
   if (!code && feedsNames(parts) && textNamesClaude(line)) code = true;
-  if (cd) return R.fullCdClaude;
+  if (base && staysInClaude(parts, base)) return R.fullCdClaude;
   if (code) return R.fullCodeClaude;
   if (unclear) return R.fullWriteUnclear;
-  // Where a line that names them (outside a heredoc's text) writes cannot be read when a place it writes holds a variable
-  // ("X=.claude; rm -rf "$X"", "for d in .claude …; do rm -rf "$d"; done"), or when another command's output ($(…), `…`) is
-  // glued into a word and cuts it in two ("$(pwd)/.claude/x").
-  if ((carried || (writes && GLUED.test(command))) && textNamesClaude(withoutHeredocs(command))) return R.fullWriteUnclear;
+  // Where a line that names them writes cannot be read when a place it writes holds a variable or another command's output:
+  // "X=.claude; rm -rf "$X"", "for d in .claude …; do rm -rf "$d"; done", "rm -rf "$(echo .claude)"", "$(pwd)/.claude/x".
+  if (carried && named) return R.fullWriteUnclear;
   return null;
 }
 
-/** A $(…) or `…` with more of its word right before or after it ("$(pwd)/x", x`date`), as opposed to one that is a word of its own. */
-const GLUED = /[^\s;&|(]\$\(|[^\s;&|(]`|\)[^\s;&|)<>]/;
+/** Whether a word holds a value the shell fills in when the line runs: a variable ($X, ${X}), or another command's output. */
+const filled = w => typeof w === 'string' && (w.includes(FILLED) || /[$`]/.test(w));
+
+/**
+ * Whether a part runs a program whose name is put together when the line runs ($RM, $(echo rm), "$(which rm)") and gives it
+ * Claude Code's own settings by name: what that program does with them cannot be told.
+ */
+function builtProgram(c) {
+  const p = c.bare === undefined ? c : c.bare;
+  return !!p && !p.empty && filled(p.words[p.at]) && textNamesClaude(p.args.join(' '));
+}
 
 /**
  * Where one place a command writes lands, read from each folder of the line (or from the folders git's -C words lead to):
- * 'claude', 'unclear', or null when it is clear. A word another command's output cut in two (empty here) says nothing by
- * itself: commandFloor reads the line around it. A wildcard is judged by what it matches the loose way (any case, hidden
- * names, as zsh's NO_CASE_GLOB and GLOB_DOTS); one that cannot be expanded here by its dot patterns (textNamesClaude).
+ * 'claude', 'unclear', 'carried' when the place, or the folder it is read from, holds a value the shell fills in (commandFloor
+ * reads the line around it), or null when it is clear. A wildcard is judged by what it matches the loose way (any case,
+ * hidden names, as zsh's NO_CASE_GLOB and GLOB_DOTS); one that cannot be expanded here by its dot patterns (textNamesClaude).
  */
 function targetLanding(t, bases, base) {
   const word = withHome(t.word);
   if (!word || word === '-' || /^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(word)) return null;
+  if (filled(word) || filled(t.into) || (t.chain ?? []).some(w => filled(withHome(w)))) return 'carried';
   if (textNamesClaude(word)) return 'claude';
   if (!base) return 'unclear';
   const folders = t.chain ? chainFolders(t.chain, bases) : bases;
@@ -458,15 +468,18 @@ function chainFolders(chain, bases) {
   return out;
 }
 
-/** The folders a line's relative words are read from: the agent's own, and each folder it cd's or pushd's into (a bare cd: home). */
+/**
+ * The folders a line's relative words are read from: the agent's own, and each folder it cd's or pushd's into (a bare cd:
+ * home), also one it makes first (`mkdir -p x && cd x`), in a subshell or not.
+ */
 function cdFolders(parts, base) {
   const out = [base];
   for (const c of parts) {
     const to = cdTo(c);
-    if (to === null) continue;
+    if (to === null || filled(to)) continue;
     for (const b of [...out]) {
       const r = resolveReal(withHome(to), b);
-      if (r.ok && r.exists && isFolder(r.real) && !out.includes(r.real)) out.push(r.real);
+      if (r.ok && (!r.exists || isFolder(r.real)) && !out.includes(r.real)) out.push(r.real);
     }
   }
   return out;
@@ -479,12 +492,96 @@ function cdTo(c) {
   return p.args.filter(a => !a.startsWith('-')).at(-1) ?? (p.prog === 'cd' && !p.args.includes('-') ? '~' : null);
 }
 
-/** Whether a cd or pushd would leave the shell in Claude Code's own settings, read from each folder of the line. */
-function entersClaude(c, bases, base) {
-  const to = cdTo(c);
-  if (to === null) return false;
-  const word = withHome(to);
-  return textNamesClaude(word) || bases.some(b => landing(word, b, base) === 'claude');
+/** A folder in Claude Code's own settings that a cd leads to, though its path cannot be resolved (~nobody/.claude). */
+const IN_CLAUDE = Symbol('in Claude Code’s settings');
+
+/**
+ * Whether the shell would be left in Claude Code's own settings when the line ends, so that its next commands, whose words
+ * are read from the agent's own folder, would run there. Only the shell's own commands count: a cd in a subshell, in
+ * another command's output, in a shell of its own (sh -c), in the background, or before the last command of a pipe stays
+ * there (zsh runs a pipe's last command in the shell itself; eval runs its commands there too). The line is read as it runs
+ * when each of its commands succeeds, a command after || may run or not, and cd, cd -, pushd and popd are followed, each
+ * folder resolved before it is judged (`cd .claude/..` is the agent's folder). A folder held in a variable is not known.
+ */
+function staysInClaude(parts, base) {
+  const key = s => [s.dir, s.prev, ...s.stack].map(d => (typeof d === 'symbol' ? '\u0001' : String(d))).join('\n');
+  const uniq = list => [...new Map(list.map(s => [key(s), s])).values()];
+  const walk = (list, start) => {
+    let states = start;
+    let listStart = start;
+    let cond = '';
+    for (const c of list) {
+      if (c.sep === '|') continue; // before the last command of a pipe: a subshell of its own
+      const next = c.kids ? walk(c.kids.filter(kid => !kid.nested), states) : uniq(states.flatMap(s => moveDir(s, c, base)));
+      if (next === null) return null;
+      states = cond === '||' ? uniq([...states, ...next]) : next;
+      if (states.length > 64) return null;
+      cond = c.sep;
+      if (c.sep === '&') states = listStart; // the list before & runs in the background
+      if (c.sep !== '&&' && c.sep !== '||') listStart = states;
+    }
+    return states;
+  };
+  const end = walk(parts.filter(c => !c.nested && !c.inEval), [{ dir: base, prev: null, stack: [] }]);
+  if (end === null) return true; // more ways than can be followed
+  return end.some(s => {
+    if (typeof s.dir !== 'string') return s.dir === IN_CLAUDE;
+    const r = throughLinks(resolveReal(s.dir, base), base); // links followed: `cd cfg`, where cfg leads into .claude
+    return r.ok ? settingsPlace(r.real, base) : textNamesClaude(s.dir);
+  });
+}
+
+/**
+ * Where one command leaves the shell, from one state `{ dir, prev, stack }` (dir null: not known): a list of states, one for
+ * each way it can go. cd (none: home; "-": where it was), pushd (none: swap; +N or -N: any folder on the stack) and popd
+ * (+N or -N: any folder on the stack; none on the stack: it stays). Each cd is taken to succeed, as the line is read.
+ */
+function moveDir(s, c, base) {
+  const p = c.bare === undefined ? c : c.bare;
+  if (!p || !['cd', 'pushd', 'popd'].includes(p.prog)) return [s];
+  let k = 0;
+  for (; k < p.args.length; k++) {
+    const a = p.args[k];
+    if (a === '--') { k++; break; }
+    if (a === '-' || !a.startsWith('-') || /^-\d+$/.test(a)) break;
+  }
+  const ops = p.args.slice(k);
+  const noMove = p.args.slice(0, k).some(a => /^-[A-Za-z]*n/.test(a)); // pushd -n and popd -n change only the stack
+  const to = (dir, stack = s.stack) => ({ dir, prev: s.dir, stack });
+  const anyOnStack = () => [s, ...[...s.stack, s.dir].map(d => to(d))];
+  if (p.prog === 'popd') {
+    if (noMove) return [s];
+    if (ops.length) return anyOnStack();
+    return s.stack.length ? [to(s.stack.at(-1), s.stack.slice(0, -1))] : [s];
+  }
+  if (p.prog === 'pushd') {
+    if (noMove) return [s];
+    if (!ops.length) return s.stack.length ? [to(s.stack.at(-1), [...s.stack.slice(0, -1), s.dir])] : [s];
+    if (/^[+-]\d+$/.test(ops[0])) return anyOnStack();
+  }
+  if (p.prog === 'cd' && ops.length > 1) return [to(null)]; // zsh's cd OLD NEW: a folder not known
+  if (p.prog === 'cd' && ops[0] === '-') return [to(s.prev)];
+  const dir = dirOf(ops.length ? ops[0] : '~', s.dir);
+  return [p.prog === 'pushd' ? to(dir, [...s.stack, s.dir]) : to(dir)];
+}
+
+/**
+ * The folder a cd to `word` leads to from folder `from`, as the shell's cd reads it: the path, with each ".." taking away the
+ * folder before it (links are followed when it is judged), a folder the line makes first included. IN_CLAUDE for ~user/.claude
+ * and the like, which cannot be resolved but name Claude Code's settings; null when it cannot be known (a variable, another
+ * command's output, ~user, a relative path from a folder not known).
+ */
+function dirOf(word, from) {
+  if (filled(word)) return null;
+  let w = withHome(word);
+  if (w === '~' || w.startsWith('~/')) w = os.homedir() + w.slice(1);
+  else if (w.startsWith('~')) return textNamesClaude(w) ? IN_CLAUDE : null;
+  if (!w.startsWith('/')) {
+    // from a folder not known, a relative path is not known either; from inside the settings, one that never steps back stays there
+    if (typeof from !== 'string') return from === IN_CLAUDE && !w.split('/').includes('..') ? IN_CLAUDE : null;
+    w = from + '/' + w;
+  }
+  return path.resolve(w);
 }
 
 /** Programs that run code they are given: inline, on their input, or as a script file (which runs, wherever it lives). */
@@ -667,7 +764,8 @@ function writeTargets(c) {
     prog = String(args[k] ?? '').replace(/^.*\//, '');
     args = args.slice(k + 1);
   }
-  return out.concat(programTargets(prog, args));
+  const targets = out.concat(programTargets(prog, args));
+  return c.finder ? foundTargets(targets, c.finder) : targets;
 }
 
 function programTargets(prog, args) {
@@ -689,6 +787,8 @@ function programTargets(prog, args) {
     case 'mv': {
       const { operands, opts } = argsOf(args, 'tS', ['target-directory', 'suffix']);
       const dir = optValue(opts, 't', 'target-directory');
+      // one word that holds another command's output may stand for several, the last of them where it moves them
+      if (dir === undefined && operands.length === 1 && filled(operands[0])) return [{ word: operands[0], deep: true }];
       const dest = dir ?? (operands.length > 1 ? operands.at(-1) : undefined);
       const sources = dir !== undefined ? operands : operands.slice(0, -1);
       return [...each(sources, { deep: true }), ...(dest === undefined ? [] : [{ word: dest }, ...sources.map(s => ({ word: dest, into: path.basename(s) }))])];
@@ -892,18 +992,44 @@ function optionTargets(args, valueShort, writeShort, writeLong) {
 }
 
 /**
- * find: what -fprint and its kin write, and with -delete, -exec, -execdir, -ok or -okdir (which change what it finds): where
- * it searches (the words before its first test) and the names it looks for, when they name Claude Code's settings.
+ * find: what -fprint and its kin write, and with -delete (or bfs's -rm), which deletes what it finds, findPlaces. What -exec,
+ * -execdir, -ok and -okdir change is what the command they run writes, read as a part of its own (narrate's findRuns), with
+ * "{}" standing for findPlaces: `find .claude -exec cat {} \;` only reads.
  */
 function findTargets(args) {
   const out = [];
   args.forEach((a, i) => { if (FIND_WRITES.has(a) && args[i + 1] !== undefined) out.push({ word: args[i + 1] }); });
-  if (!args.some(a => FIND_BAD.has(a) && !FIND_WRITES.has(a))) return out;
+  if (!args.some(a => a === '-delete' || a === '-rm')) return out;
+  const { roots, names } = findPlaces(args);
+  return out.concat([...roots, ...names].map(word => ({ word })));
+}
+
+/**
+ * What find finds, as far as its words say: where it searches (`roots`, the words before its first test; "." with none) and
+ * the names it looks for that name Claude Code's settings (`names`: -name, -path and their kin).
+ */
+function findPlaces(args) {
+  const roots = [];
   let i = 0;
   while (i < args.length && /^-[HLPEXdsx]+$/.test(args[i])) i++;
-  for (; i < args.length && !/^[-(!]/.test(args[i]); i++) out.push({ word: args[i] });
-  args.forEach((a, k) => { if (k > 0 && /^-(?:i?name|i?path|i?wholename|i?regex|i?lname)$/.test(args[k - 1]) && textNamesClaude(a)) out.push({ word: a }); });
-  return out;
+  for (; i < args.length && !/^[-(!]/.test(args[i]); i++) roots.push(args[i]);
+  if (!roots.length) roots.push('.');
+  const names = args.filter((a, k) => k > 0 && /^-(?:i?name|i?path|i?wholename|i?regex|i?lname)$/.test(args[k - 1]) && textNamesClaude(a));
+  return { roots, names };
+}
+
+/**
+ * The places a command find runs writes (-exec and its kin), "{}" standing for what find finds: a place written at "{}" is
+ * each folder find searches and each name it looks for that names Claude Code's settings (`find .claude -exec rm {} \;`);
+ * the name a copy gets inside a folder ("{}" as cp's source) is each such name (`find . -name .mcp.json -exec cp {} backup/ \;`).
+ */
+function foundTargets(targets, finder) {
+  const { roots, names } = findPlaces(finder.args);
+  return targets.flatMap(t => {
+    if (t.word.includes('{}')) return [...roots, ...names].map(place => ({ word: t.word.replaceAll('{}', place) }));
+    if (!(t.into ?? '').includes('{}')) return [t];
+    return [t, ...names.map(n => ({ ...t, into: t.into.replaceAll('{}', path.basename(n)) }))];
+  });
 }
 
 /**
@@ -995,35 +1121,61 @@ function reporterTargets(args) {
 }
 
 /**
- * A tool of another service, or one the policy does not know, by the places it is given: the values of its path-like
- * arguments (PATH_KEYS, a few levels down, lists too). One that leads into Claude Code's settings, or names them, is refused,
- * since a tool's name does not say whether it only reads; one that cannot be resolved is refused too. What its other words
- * mention (a title, a message, a query) counts for nothing.
+ * A tool of another service, or one the policy does not know, by the places it is given and the code it carries (toolArgs,
+ * a few levels down, lists too):
+ * - an argument named for a place that names Claude Code's settings or leads into them is refused, since a tool's name does
+ *   not say whether it only reads. For a name that only ever holds a place (a path, a file, a folder, a target, a
+ *   destination), one that cannot be resolved is refused too; for one that may hold other words (a source, from, to, an
+ *   output), only a value written as a path counts (no blank space in it), and one that cannot be resolved counts for nothing,
+ *   so a message's `to: "~bob"` runs;
+ * - an argument that carries a command or code (`command`, `cmd`, `script`, `code`…, and the `args` given with it) whose text
+ *   names them is refused: what the tool does with them cannot be followed.
+ * What its other words mention (a title, a message, a query) counts for nothing.
  */
 function toolFloor(input, base) {
   let unclear = false;
-  for (const p of pathArgs(input)) {
-    if (textNamesClaude(p)) return R.fullToolClaude;
-    if (!base || padded(p)) { unclear = true; continue; }
-    const v = landing(p, base, base);
+  const { places, code } = toolArgs(input);
+  for (const { value, strict } of places) {
+    if ((strict || !/\s/.test(value)) && textNamesClaude(value)) return R.fullToolClaude;
+    if (!base || padded(value)) { if (strict) unclear = true; continue; }
+    const v = landing(value, base, base);
     if (v === 'claude') return R.fullToolClaude;
-    if (v === 'unclear') unclear = true;
+    if (v === 'unclear' && strict) unclear = true;
   }
+  if (code.some(textNamesClaude)) return R.fullCodeClaude;
   return unclear ? R.fullToolUnclear : null;
 }
 
-/** The names of a tool's arguments that hold a place on disk. */
-const PATH_KEYS = new Set(['path', 'paths', 'file', 'files', 'file_path', 'filePath', 'notebook_path', 'target', 'destination', 'dest']);
+/** The last word of an argument's name that says it holds a place on disk, and nothing else (`file_path`, `targetDir`, `dst`). */
+const PLACE_WORDS = new Set(['path', 'paths', 'file', 'files', 'filename', 'filenames', 'filepath', 'filepaths', 'dir', 'dirs', 'directory',
+  'directories', 'folder', 'folders', 'target', 'targets', 'destination', 'destinations', 'dest', 'dst', 'cwd', 'workdir']);
+/** An argument's whole name that may hold a place, or other words. */
+const MAYBE_PLACE = new Set(['source', 'sources', 'src', 'from', 'to', 'output', 'out', 'root', 'location']);
+/** The last word of an argument's name that says it carries a command or code; with one, `args` and the like are its words. */
+const CODE_WORDS = new Set(['command', 'commands', 'cmd', 'cmds', 'script', 'scripts', 'code', 'shell', 'bash', 'powershell', 'pwsh', 'exec']);
+const ARG_WORDS = new Set(['args', 'argv', 'arguments']);
 
-/** The values of a tool's path-like arguments (PATH_KEYS), a few levels down (at most 200): strings, and strings in lists. */
-function pathArgs(value, depth = 0, out = []) {
-  if (out.length >= 200 || depth > 4 || !value || typeof value !== 'object') return out;
-  for (const [k, v] of Object.entries(value)) {
-    if (PATH_KEYS.has(k)) {
-      if (typeof v === 'string' && v) out.push(v);
-      else if (Array.isArray(v)) for (const x of v) if (typeof x === 'string' && x) out.push(x);
-    }
-    if (v && typeof v === 'object') pathArgs(v, depth + 1, out);
+/** The words of an argument's name, however it is written: `old_path`, `sourcePath`, `target-dir`. */
+const nameWords = k => String(k).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+/**
+ * A tool's arguments named for a place (`places`: `{ value, strict }`, strict for a name that only ever holds a place) and
+ * the text of those that carry a command or code (`code`), a few levels down (at most 200): strings, and strings in lists.
+ */
+function toolArgs(value, depth = 0, out = { places: [], code: [] }) {
+  if (out.places.length + out.code.length >= 200 || depth > 4 || !value || typeof value !== 'object') return out;
+  const entries = Object.entries(value);
+  const runs = entries.some(([k]) => CODE_WORDS.has(nameWords(k).at(-1)));
+  for (const [k, v] of entries) {
+    const words = nameWords(k);
+    const last = words.at(-1);
+    const strings = (typeof v === 'string' ? [v] : Array.isArray(v) ? v.filter(x => typeof x === 'string') : []).filter(Boolean);
+    if (PLACE_WORDS.has(last) || (last === 'name' && ['file', 'dir', 'folder', 'directory'].includes(words.at(-2)))) {
+      for (const s of strings) out.places.push({ value: s, strict: true });
+    } else if (words.length === 1 && MAYBE_PLACE.has(last)) {
+      for (const s of strings) out.places.push({ value: s, strict: false });
+    } else if ((CODE_WORDS.has(last) || (runs && ARG_WORDS.has(last))) && strings.length) out.code.push(strings.join(' '));
+    if (v && typeof v === 'object') toolArgs(v, depth + 1, out);
   }
   return out;
 }
@@ -1120,12 +1272,13 @@ function braceBody(line, open) {
 
 /**
  * Whether text names Claude Code's settings by name: a piece of it between spaces, the shell's punctuation, slashes, =,
- * : and commas, that the disk takes for .claude or .mcp.json (foldName), after the shell's quotes and backslashes are
- * taken away and its braces expanded; or a wildcard piece that starts with a dot and could match one of them.
+ * : and commas (and the holes another command's output leaves, FILLED), that the disk takes for .claude or .mcp.json
+ * (foldName), after the shell's quotes and backslashes are taken away and its braces expanded; or a wildcard piece that
+ * starts with a dot and could match one of them.
  */
 function textNamesClaude(text) {
   const t = String(text ?? '').replace(/[\\'"]/g, '');
-  for (const word of t.split(/[ \t\n\r;&|<>()`$]+/)) {
+  for (const word of t.split(/[ \t\n\r;&|<>()`$\0]+/)) {
     for (const form of braceForms(word)) {
       for (const seg of form.split(/[/=:,{}]+/)) {
         if (!seg) continue;

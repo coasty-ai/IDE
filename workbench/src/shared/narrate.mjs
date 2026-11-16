@@ -31,8 +31,8 @@ function hostOf(url) { try { return new URL(url).hostname.replace(/^www\./, '');
  * not taken for a command. Each part notes whether it sends its output into a file (`writes`), and its
  * redirections (`redir`: where each operator is in its text, and what kind it is), read with the quotes, so
  * `echo "a > b"` has none and `echo x>b` has one (see partRedirects).
- * Used to put a command into words, and by the permission policy's floor for full permissions, which reads where
- * a command writes from it (src/core/policy.mjs); the policy's other rules never rely on it.
+ * Used to put a command into words. The permission policy's floor for full permissions reads a line with lineParts below,
+ * which keeps each command whole (src/core/policy.mjs); the policy's other rules never rely on either.
  * @returns {{ text: string, writes: boolean, redir: { start: number, end: number, kind: string }[] }[]}
  */
 function shellParts(cmd) {
@@ -43,8 +43,6 @@ function shellParts(cmd) {
   const outer = []; // the quote to go back to when a $( ), ( ) or ` ` ends
   let heredoc = null; // { word, tabs }: the text from the next line up to `word` is data, not commands
   const end = () => { if (cur.text.trim()) parts.push(cur); cur = fresh(); };
-  // A redirection's own fd number ("2>", "10<") starts it, when the number is a word of its own so far.
-  const fdStart = () => { const m = /(?:^|[ \t])(\d+)$/.exec(cur.text); return cur.text.length - (m ? m[1].length : 0); };
   for (let k = 0; k < cmd.length; k++) {
     const ch = cmd[k];
     if (q === "'") { if (ch === "'") q = null; cur.text += ch; continue; }
@@ -56,59 +54,166 @@ function shellParts(cmd) {
       continue;
     }
     if (ch === '$' && cmd[k + 1] === '(') { end(); outer.push({ q, tick: false }); q = null; k++; continue; }
-    if (ch === '$' && cmd[k + 1] === '{') { // ${NAME} is part of a word
-      const close = cmd.indexOf('}', k);
-      const to = close < 0 ? cmd.length : close + 1;
-      cur.text += cmd.slice(k, to);
-      k = to - 1;
-      continue;
-    }
+    if (ch === '$' && cmd[k + 1] === '{') { k = paramEnd(cmd, k, cur); continue; } // ${NAME} is part of a word
     if (q === '"') { if (ch === '"') q = null; cur.text += ch; continue; }
     if (ch === "'" || ch === '"') { q = ch; cur.text += ch; continue; }
     if (ch === '(') { end(); outer.push({ q: null, tick: false }); continue; }
     if (ch === ')') { end(); if (outer.length && !outer.at(-1).tick) q = outer.pop().q; continue; }
-    if (ch === '\n' && heredoc) { // skip the heredoc's text, up to its end word
-      end();
-      let at = k + 1;
-      for (;;) {
-        const nl = cmd.indexOf('\n', at);
-        const line = cmd.slice(at, nl < 0 ? cmd.length : nl);
-        if ((heredoc.tabs ? line.replace(/^\t+/, '') : line) === heredoc.word || nl < 0) { k = nl < 0 ? cmd.length : nl; break; }
-        at = nl + 1;
-      }
-      heredoc = null;
-      continue;
-    }
-    if (ch === '<' && cmd[k + 1] === '<' && cmd[k + 2] !== '<') {
-      const m = /^<<(-?)\s*(['"]?)([A-Za-z0-9_.-]+)\2/.exec(cmd.slice(k, k + 200));
-      if (m) {
-        heredoc = { word: m[3], tabs: m[1] === '-' };
-        const start = fdStart();
-        cur.text += m[0];
-        k += m[0].length - 1;
-        cur.redir.push({ start, end: cur.text.length, kind: 'heredoc' }); // its word is its end line, not a file
-        continue;
-      }
-    }
-    if (ch === '>' || ch === '<' || (ch === '&' && cmd[k + 1] === '>')) {
-      // One redirection, its operator whole: `&>` is no "&", `>|` no pipe and `<&3` no new command. `> file`, `>> file`,
-      // `&> file`, `<> file` and `>&file` write a file; `2>&1`, `<&3`, `> /dev/null` and `<` do not.
-      const op = /^(?:&>>?|<<<|<>|<&|<|>>|>\||>&|>)/.exec(cmd.slice(k, k + 3))[0];
-      const start = ch === '&' ? cur.text.length : fdStart();
-      cur.text += op;
-      k += op.length - 1;
-      const after = cmd.slice(k + 1, k + 41);
-      let kind = op === '<' ? 'read' : op === '<<<' ? 'string' : op === '<&' ? 'dup' : 'write';
-      if (op === '>&' && /^\s*(?:\d+|-)(?:$|[\s;&|<>()])/.test(after)) kind = 'dup';
-      if (kind === 'write' && /^\s*\/dev\/(?:null|stdout|stderr|tty)(?:$|[\s;&|<>()])/.test(after)) kind = 'quiet';
-      if (kind === 'write') cur.writes = true;
-      cur.redir.push({ start, end: cur.text.length, kind });
-      continue;
-    }
+    if (ch === '\n' && heredoc) { end(); k = heredocEnd(cmd, k, heredoc); heredoc = null; continue; } // skip its text, up to its end word
+    const h = heredocAt(cmd, k);
+    if (h) { heredoc = h; k = takeHeredoc(cur, h, k); continue; }
+    if (ch === '>' || ch === '<' || (ch === '&' && cmd[k + 1] === '>')) { k = takeRedirect(cmd, k, cur); continue; }
     if (';&|{}\n\r'.includes(ch)) { end(); continue; }
     cur.text += ch;
   }
   end();
+  return parts;
+}
+
+/** ${NAME} (and ${NAME:-…}) is part of the word it is in: it goes into the part's text whole. Where it ends, as an index. */
+function paramEnd(cmd, k, cur) {
+  const close = cmd.indexOf('}', k);
+  const to = close < 0 ? cmd.length : close + 1;
+  cur.text += cmd.slice(k, to);
+  return to - 1;
+}
+
+/** A heredoc that starts at cmd[k] (<<WORD, <<-WORD, <<'WORD'): its text, its end word and whether tabs go, or null. */
+function heredocAt(cmd, k) {
+  if (cmd[k] !== '<' || cmd[k + 1] !== '<' || cmd[k + 2] === '<') return null;
+  const m = /^<<(-?)\s*(['"]?)([A-Za-z0-9_.-]+)\2/.exec(cmd.slice(k, k + 200));
+  return m ? { text: m[0], word: m[3], tabs: m[1] === '-' } : null;
+}
+
+/** Where a heredoc's text ends, from the new line at cmd[k] that starts it: the new line after its end word, or the end. */
+function heredocEnd(cmd, k, heredoc) {
+  let at = k + 1;
+  for (;;) {
+    const nl = cmd.indexOf('\n', at);
+    const line = cmd.slice(at, nl < 0 ? cmd.length : nl);
+    if ((heredoc.tabs ? line.replace(/^\t+/, '') : line) === heredoc.word || nl < 0) return nl < 0 ? cmd.length : nl;
+    at = nl + 1;
+  }
+}
+
+/** A redirection's own fd number ("2>", "10<") starts it, when the number is a word of its own so far: where it starts. */
+function fdStart(text) {
+  const m = /(?:^|[ \t])(\d+)$/.exec(text);
+  return text.length - (m ? m[1].length : 0);
+}
+
+/** A heredoc's operator goes into the part as a redirection of its own, whose word is its end line, not a file. */
+function takeHeredoc(cur, h, k) {
+  const start = fdStart(cur.text);
+  cur.text += h.text;
+  cur.redir.push({ start, end: cur.text.length, kind: 'heredoc' });
+  return k + h.text.length - 1;
+}
+
+/**
+ * One redirection, its operator whole, into the part: `&>` is no "&", `>|` no pipe and `<&3` no new command. `> file`,
+ * `>> file`, `&> file`, `<> file` and `>&file` write a file; `2>&1`, `<&3`, `> /dev/null` and `<` do not. Where it ends.
+ */
+function takeRedirect(cmd, k, cur) {
+  const op = /^(?:&>>?|<<<|<>|<&|<|>>|>\||>&|>)/.exec(cmd.slice(k, k + 3))[0];
+  const start = cmd[k] === '&' ? cur.text.length : fdStart(cur.text);
+  cur.text += op;
+  const after = cmd.slice(k + op.length, k + op.length + 40);
+  let kind = op === '<' ? 'read' : op === '<<<' ? 'string' : op === '<&' ? 'dup' : 'write';
+  if (op === '>&' && /^\s*(?:\d+|-)(?:$|[\s;&|<>()])/.test(after)) kind = 'dup';
+  if (kind === 'write' && /^\s*\/dev\/(?:null|stdout|stderr|tty)(?:$|[\s;&|<>()])/.test(after)) kind = 'quiet';
+  if (kind === 'write') cur.writes = true;
+  cur.redir.push({ start, end: cur.text.length, kind });
+  return k + op.length - 1;
+}
+
+/**
+ * What stands, in the reading for the floor (lineParts), for another command's output in a word: `$(…)`, `` `…` ``, `<(…)`,
+ * `>(…)` and zsh's `=(…)` each leave this hole where they are. No file name can hold it.
+ */
+export const FILLED = '\u0000';
+
+/** Keywords after which a command still starts: a `{` or a `(` there opens a group or a subshell. */
+const COMMAND_START = /^\s*(?:(?:then|do|else|elif|if|while|until|!|time)\s+)*$/;
+
+/**
+ * The parts of a command line as the floor for full permissions reads them (src/core/policy.mjs): each a whole command,
+ * whatever its words hold. Another command's output (`$(…)`, `` `…` ``, `<(…)`, `>(…)`, `=(…)`) leaves a hole (FILLED) in its word,
+ * and the outer command goes on past it: `mv $(echo a.txt) .mcp.json` is one mv with two words, the commands inside are
+ * parts of their own. `(` opens a subshell only where a command starts; after a command's first word it opens a pattern
+ * group or an array, part of the word up to its `)` (zsh's `rm -rf (.claude|x)`), and after a function's name it is the
+ * `()` of its definition. `{` and `}` split only as words of their own where a command starts (a group, or a function's
+ * body); elsewhere, `{}` included, they are words (`find … -exec cp {} … \;`). Quotes, backslashes, `${…}`, heredocs and
+ * redirections are read as shellParts reads them. Each part also says whether the shell runs it itself (`nested` false) or a
+ * subshell does (inside `( )`, `$( )`, `` ` ` ``, `<( )` or `>( )`), and what ended it (`sep`: ';', '&&', '||', '|', '&',
+ * a new line, ')' at a subshell's end, or '').
+ * @returns {{ text: string, writes: boolean, redir: object[], nested: boolean, sep: string }[]}
+ */
+function lineParts(cmd) {
+  const parts = [];
+  const frames = []; // what is open: a subshell ('paren'), another command's output ('sub', 'tick') or a pattern group ('group')
+  let nested = 0; // how many subshells and outputs the current part is in
+  const fresh = () => ({ text: '', writes: false, redir: [], nested: nested > 0, sep: '' });
+  let cur = fresh();
+  let q = null; // the open quote, ' or "
+  let heredoc = null;
+  const end = (sep) => { if (cur.text.trim()) { cur.sep = sep; parts.push(cur); } cur = fresh(); };
+  const starts = () => COMMAND_START.test(cur.text);
+  // another command's output: a hole in this word, which goes on after it; the commands inside are parts of their own
+  const open = (kind) => { cur.text += FILLED; frames.push({ kind, q, saved: cur }); q = null; nested++; cur = fresh(); };
+  const close = () => { const f = frames.pop(); end(''); nested--; cur = f.saved; q = f.q; };
+  // a word of its own: a blank, the start or the end, or the shell's punctuation on each side
+  const alone = k => /^[\s;&|()]?$/.test(cmd[k - 1] ?? '') && /^[\s;&|()]?$/.test(cmd[k + 1] ?? '');
+  for (let k = 0; k < cmd.length; k++) {
+    const ch = cmd[k];
+    if (q === "'") { if (ch === "'") q = null; cur.text += ch; continue; }
+    if (ch === '\\') { cur.text += ch + (cmd[k + 1] || ''); k++; continue; }
+    if (ch === '`') { if (frames.at(-1)?.kind === 'tick') close(); else open('tick'); continue; }
+    if (ch === '$' && cmd[k + 1] === '(') { open('sub'); k++; continue; }
+    if (ch === '$' && cmd[k + 1] === '{') { k = paramEnd(cmd, k, cur); continue; }
+    if (q === '"') { if (ch === '"') q = null; cur.text += ch; continue; }
+    if (ch === "'" || ch === '"') { q = ch; cur.text += ch; continue; }
+    // <(…) and >(…), and zsh's =(…) at the start of a word: another command's output, as a file
+    if ((ch === '<' || ch === '>' || (ch === '=' && /^\s?$/.test(cmd[k - 1] ?? ''))) && cmd[k + 1] === '(') { open('sub'); k++; continue; }
+    if (frames.at(-1)?.kind === 'group') { // a pattern group's words and bars are its word's, up to its ")"
+      if (ch === '(') frames.push({ kind: 'group' });
+      else if (ch === ')') frames.pop();
+      cur.text += ch;
+      continue;
+    }
+    if (ch === '(') {
+      if (starts()) { end(''); frames.push({ kind: 'paren' }); nested++; cur = fresh(); continue; }
+      const fn = /^\(\s*\)/.exec(cmd.slice(k));
+      if (fn && /^\s*(?:function\s+)?[^\s;&|()<>]+\s*$/.test(cur.text)) { cur.text = ''; k += fn[0].length - 1; continue; } // NAME(): its body follows
+      frames.push({ kind: 'group' });
+      cur.text += ch;
+      continue;
+    }
+    if (ch === ')') {
+      const f = frames.at(-1);
+      if (f?.kind === 'sub') { close(); continue; }
+      if (f?.kind === 'paren') { end(')'); frames.pop(); nested--; cur = fresh(); continue; }
+      end(')'); // a case pattern's end
+      continue;
+    }
+    if (ch === '\n' && heredoc) { end('\n'); k = heredocEnd(cmd, k, heredoc); heredoc = null; continue; }
+    const h = heredocAt(cmd, k);
+    if (h) { heredoc = h; k = takeHeredoc(cur, h, k); continue; }
+    if (ch === '>' || ch === '<' || (ch === '&' && cmd[k + 1] === '>')) { k = takeRedirect(cmd, k, cur); continue; }
+    if ((ch === '{' || ch === '}') && alone(k) && (starts() || (ch === '{' && /^\s*function\s+[^\s;&|()<>]+\s*$/.test(cur.text)))) {
+      cur.text = ''; // a group, or a function's body: its commands are the shell's own
+      end(ch);
+      continue;
+    }
+    if (ch === ';') { end(';'); continue; }
+    if (ch === '&') { if (cmd[k + 1] === '&') { end('&&'); k++; } else end('&'); continue; }
+    if (ch === '|') { if (cmd[k + 1] === '|') { end('||'); k++; } else { end('|'); if (cmd[k + 1] === '&') k++; } continue; }
+    if (ch === '\n' || ch === '\r') { end('\n'); continue; }
+    cur.text += ch;
+  }
+  // what is left open at the end: the commands inside end there, and the words around them go on
+  while (frames.length) { const f = frames.pop(); if (f.saved) { end(''); cur = f.saved; q = f.q; } }
+  end('');
   return parts;
 }
 
@@ -197,17 +302,50 @@ const GIT_LOOK = new Set(['status', 'diff', 'log', 'show', 'blame', 'grep', 'ls-
 const GIT_VALUE_OPTS = /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--super-prefix|--attr-source)$/;
 
 /**
+ * The options of wrappers that take a value, for the reading for the floor: the word after `xargs -a list.txt`,
+ * `xargs -I {}` or `env -u HOME` is that value, not the program. `short`: letters, whose value is the rest of their word or
+ * the next word; `long`: names, whose value comes after "=" or as the next word. (GNU xargs's -e, -i and -l take a value
+ * only in their own word.)
+ */
+const WRAPPER_VALUES = Object.freeze({
+  env: { short: 'uCSP', long: ['unset', 'chdir', 'split-string'] },
+  timeout: { short: 'sk', long: ['signal', 'kill-after'] },
+  nice: { short: 'n', long: ['adjustment'] },
+  stdbuf: { short: 'ioe', long: ['input', 'output', 'error'] },
+  xargs: { short: 'adEIJLnPRsS', long: ['arg-file', 'delimiter', 'max-args', 'max-procs', 'max-chars', 'process-slot-var'] },
+  exec: { short: 'a', long: [] },
+  caffeinate: { short: 'tw', long: [] },
+  time: { short: 'fo', long: ['format', 'output'] },
+});
+
+/** Past a wrapper's options and their values (WRAPPER_VALUES), and the numbers it takes (timeout's 5s): where its program is. */
+function pastOptions(words, k, spec) {
+  while (k < words.length) {
+    const w = words[k];
+    if (w === '--') return k + 1;
+    if (/^\d/.test(w)) { k++; continue; }
+    if (!w.startsWith('-') || w === '-') return k;
+    if (w.startsWith('--')) { k += !w.includes('=') && spec.long.includes(w.slice(2)) ? 2 : 1; continue; }
+    let step = 1;
+    for (let j = 1; j < w.length; j++) if (spec.short.includes(w[j])) { if (j === w.length - 1) step = 2; break; }
+    k += step;
+  }
+  return k;
+}
+
+/**
  * One simple command: its program (without a folder), the words after it, and what git or a package tool is asked
  * to do. `words` keeps every word of the part, and `at` is where the program is among them (after NAME=value and
- * wrappers such as `timeout 10`).
+ * wrappers such as `timeout 10`). Read `whole` (for the floor), a wrapper's options that take a value take it first.
  */
-function simpleCommand(words, writes) {
+function simpleCommand(words, writes, whole = false) {
   let k = 0;
   for (;;) {
     while (k < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k])) k++; // NAME=value before the command
     if (k < words.length && WRAPPERS.has(words[k])) {
-      k++;
-      while (k < words.length && /^(-|\d)/.test(words[k])) k++;
+      const wrapper = words[k++];
+      if (whole && Object.hasOwn(WRAPPER_VALUES, wrapper)) k = pastOptions(words, k, WRAPPER_VALUES[wrapper]);
+      else while (k < words.length && /^(-|\d)/.test(words[k])) k++;
       continue;
     }
     break;
@@ -236,23 +374,30 @@ function simpleCommand(words, writes) {
  * command, so it is marked `inline` and is not counted as a script of its own. A part that only sets
  * variables (`PATH=/x:$PATH`) runs nothing itself, but it can change what the parts after it run; it is
  * kept, marked `empty`.
+ *
+ * Read `whole`, for the floor under full permissions: the parts come from lineParts, so each is a whole command (another
+ * command's output is a hole in its word, FILLED), with `nested` and `sep`; wrappers take their options' values first;
+ * each of find's `-exec`, `-execdir`, `-ok` and `-okdir` runs the command up to its `;` or `{} +` (`finder`: the find
+ * part); a shell given its command inline runs it in a shell of its own (its commands are `nested`), and eval runs its
+ * commands in this shell (`kids` on the eval part, `inEval` on each).
  */
-function simpleCommands(command, depth = 0) {
+function simpleCommands(command, depth = 0, whole = false) {
   const out = [];
-  for (const part of shellParts(String(command || ''))) {
+  for (const part of (whole ? lineParts : shellParts)(String(command || ''))) {
     const words = shellWords(part.text);
-    const c = simpleCommand(words, part.writes);
+    const c = simpleCommand(words, part.writes, whole);
     // where the part redirects to, and the command without its redirections (null when that leaves no program)
     const { redirects, bare } = partRedirects(part);
-    const own = { redirects, bare: simpleCommand(shellWords(bare), part.writes) };
+    const own = { redirects, bare: simpleCommand(shellWords(bare), part.writes, whole) };
+    if (whole) Object.assign(own, { nested: part.nested, sep: part.sep });
     if (!c) {
       if (words.length) out.push({ empty: true, prog: '', script: false, args: [], writes: part.writes, sub: '', subArgs: [], gitOpts: false, words, at: words.length, ...own });
       continue;
     }
     Object.assign(c, own);
     out.push(c);
-    const dashC = SHELLS.has(c.prog) ? c.args.findIndex(a => /^-[a-z]*c[a-z]*$/.test(a)) : -1;
-    const inner = dashC >= 0 && c.args[dashC + 1] !== undefined ? c.args[dashC + 1] : c.prog === 'eval' ? c.args.join(' ') : null;
+    if (whole) { out.push(...wholeKids(c, depth)); continue; }
+    const inner = inlineOf(c);
     if (inner !== null) c.inline = true;
     if (depth > 2) continue;
     if (inner !== null) out.push(...simpleCommands(inner, depth + 1));
@@ -261,6 +406,52 @@ function simpleCommands(command, depth = 0) {
       const inner = simpleCommand(c.args.slice(exec + 1), false);
       if (inner) out.push(inner);
     }
+  }
+  return out;
+}
+
+/** The command a shell is given inline (`sh -c '…'`) or eval's words, or null. */
+function inlineOf(c) {
+  const dashC = SHELLS.has(c.prog) ? c.args.findIndex(a => /^-[a-z]*c[a-z]*$/.test(a)) : -1;
+  return dashC >= 0 && c.args[dashC + 1] !== undefined ? c.args[dashC + 1] : c.prog === 'eval' ? c.args.join(' ') : null;
+}
+
+/**
+ * The commands one part runs besides itself, read whole: those of a shell given its command inline, in a shell of its own
+ * (`nested`); those of eval, in this shell (`kids` on the eval part, `inEval` on each); and those find runs (findRuns).
+ */
+function wholeKids(c, depth) {
+  const out = [];
+  const inner = inlineOf(c);
+  if (inner !== null) c.inline = true;
+  if (depth > 2) return out;
+  if (inner !== null) {
+    const kids = simpleCommands(inner, depth + 1, true);
+    if (c.prog === 'eval') {
+      c.kids = kids.filter(kid => !kid.inEval);
+      for (const kid of kids) { kid.inEval = true; kid.nested = kid.nested || c.nested; }
+    } else for (const kid of kids) kid.nested = true;
+    if (c.finder) for (const kid of kids) kid.finder ??= c.finder; // find puts what it finds at "{}" in the shell's command too
+    out.push(...kids);
+  }
+  if (c.prog === 'find') for (const run of findRuns(c)) out.push(run, ...wholeKids(run, depth + 1));
+  return out;
+}
+
+/**
+ * The commands a find part runs, read whole: each -exec, -execdir, -ok and -okdir, up to its ";" or the "+" after "{}" (or a
+ * "+" that ends the words), each `nested`, with `finder`: the find part, whose "{}" each stands for what find finds.
+ */
+function findRuns(c) {
+  const out = [];
+  for (let e = 0; e < c.args.length; e++) {
+    if (!/^-(?:exec|execdir|ok|okdir)$/.test(c.args[e])) continue;
+    let stop = e + 1;
+    while (stop < c.args.length && c.args[stop] !== ';' && !(c.args[stop] === '+' && c.args[stop - 1] === '{}')) stop++;
+    if (stop >= c.args.length && c.args.at(-1) === '+') stop = c.args.length - 1;
+    const run = simpleCommand(c.args.slice(e + 1, stop), false, true);
+    if (run) out.push(Object.assign(run, { redirects: [], nested: true, sep: '', finder: c }));
+    e = stop;
   }
   return out;
 }
@@ -615,9 +806,11 @@ export function commandAction(command, vouch) {
  * fields, or null when only redirections and variables are left); `find -exec`'s inner command has neither. For the
  * permission policy's wording, and for its floor under full permissions, which reads where a command writes from
  * `redirects` and `bare`: the policy's other decisions never come from this reading.
+ * `whole` (the floor's reading, see simpleCommands and lineParts): each part is a whole command, and another command's
+ * output is a hole (FILLED) in its word.
  */
-export function shellCommands(command) {
-  try { return simpleCommands(command); } catch { return []; }
+export function shellCommands(command, { whole = false } = {}) {
+  try { return simpleCommands(command, 0, whole === true); } catch { return []; }
 }
 
 /** A script name worth reading out: no spaces or slashes, so it is the name and nothing else. */

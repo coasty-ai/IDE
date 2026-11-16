@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { narrate, describeCommand, describeRequest, commandAction, shellCommands, nameFromTask, extractQuestion, firstSentence, plain, baseName, pastTense, quotable, waitingFor } from '../src/shared/narrate.mjs';
+import { narrate, describeCommand, describeRequest, commandAction, shellCommands, FILLED, nameFromTask, extractQuestion, firstSentence, plain, baseName, pastTense, quotable, waitingFor } from '../src/shared/narrate.mjs';
 import { duration, tokens, money, percent, clip, shortModel, spentText, spentAmount } from '../src/shared/format.mjs';
 import { STATE, LOOK, PRIORITY, NEEDS_YOU, lookOf } from '../src/shared/states.mjs';
 import { EV, newAgentView, SPARK_BUCKETS } from '../src/shared/events.mjs';
@@ -184,6 +184,53 @@ test('shellCommands gives each part its redirections, read with the quotes, and 
   const [p, q] = shellCommands('sort a > b.txt | tee c.txt');
   assert.deepEqual([p.writes, p.redirects.length, q.writes, q.redirects.length], [true, 1, false, 0]);
   assert.deepEqual(shellCommands('npm test > /dev/null 2>&1').map(c => c.writes), [false]);
+});
+
+test('shellCommands read whole, for the floor: another command’s output leaves a hole in its word, and the command goes on past it', () => {
+  const whole = cmd => shellCommands(cmd, { whole: true });
+  const shape = cmd => whole(cmd).map(c => [c.prog, c.args, c.nested, c.sep]);
+  const H = FILLED;
+  assert.equal(H, '\u0000');
+  // $(…), `…`, <(…): the outer command keeps every word, the hole in its place; the commands inside are parts of their own
+  assert.deepEqual(shape('mv $(echo a.txt) .mcp.json'), [['echo', ['a.txt'], true, ''], ['mv', [H, '.mcp.json'], false, '']]);
+  assert.deepEqual(shape('cp `echo a.txt` .claude/settings.json'), [['echo', ['a.txt'], true, ''], ['cp', [H, '.claude/settings.json'], false, '']]);
+  assert.deepEqual(shape('cp <(echo x) .claude/settings.json'), [['echo', ['x'], true, ''], ['cp', [H, '.claude/settings.json'], false, '']]);
+  assert.deepEqual(whole('cp "$(pwd)/.claude/settings.json" /tmp/backup.json').at(-1).args, [`${H}/.claude/settings.json`, '/tmp/backup.json']);
+  assert.deepEqual(whole('mv "$(ls *.json | head -1)" .mcp.json').map(c => [c.prog, c.sep]), [['ls', '|'], ['head', ''], ['mv', '']]);
+  assert.deepEqual(whole('sed -i "s/$(whoami)/x/" .mcp.json').at(-1).args, ['-i', `s/${H}/x/`, '.mcp.json']);
+  // a redirection keeps its target past a hole earlier in the line, and a hole in its target
+  assert.deepEqual(whole('echo "Checked .claude at $(date)" > status.txt').at(-1).redirects.map(r => r.target), ['status.txt']);
+  assert.deepEqual(whole('echo hi > "$(pwd)/out.txt"').at(-1).redirects.map(r => r.target), [`${H}/out.txt`]);
+  // a heredoc inside, as in Claude Code's own commit
+  const commit = whole("git commit -m \"$(cat <<'EOF'\nExplain the .claude folder\nEOF\n)\"");
+  assert.deepEqual(commit.map(c => [c.bare.prog, c.bare.args, c.redirects.map(r => r.kind)]), [['cat', [], ['heredoc']], ['git', ['commit', '-m', H], []]]);
+  // find runs each -exec's command, cut at ";" or "+"; xargs, env and timeout take their options' values first
+  assert.deepEqual(shape('find . -name a.txt -exec cp {} .claude/x \\; -print').map(([p, a, n]) => [p, a, n]),
+    [['find', ['.', '-name', 'a.txt', '-exec', 'cp', '{}', '.claude/x', ';', '-print'], false], ['cp', ['{}', '.claude/x'], true]]);
+  assert.deepEqual(whole("find src -name '*.md' -exec mv {} .claude/ +").map(c => [c.prog, c.args]).at(-1), ['mv', ['{}', '.claude/']]);
+  assert.deepEqual(whole('find src -exec rm {} + -exec cp {} .claude/ \\;').slice(1).map(c => [c.prog, c.args]), [['rm', ['{}']], ['cp', ['{}', '.claude/']]]);
+  for (const [cmd, prog, args] of [['xargs -a list.txt cp -t .claude', 'cp', ['-t', '.claude']], ['xargs -I {} cp {} .claude/', 'cp', ['{}', '.claude/']],
+    ['xargs -0 -n 1 rm', 'rm', []], ['env -u HOME rm -rf .claude', 'rm', ['-rf', '.claude']], ['timeout -s KILL 5 rm x', 'rm', ['x']],
+    ['timeout --signal=KILL 5 rm x', 'rm', ['x']], ['nice -n 5 rm x', 'rm', ['x']]]) {
+    assert.deepEqual([whole(cmd)[0].prog, whole(cmd)[0].args], [prog, args], cmd);
+  }
+  // a subshell and the commands in another's output are nested; a group, a function's body and eval's commands are the shell's own
+  assert.deepEqual(shape('(cd .claude && ls)'), [['cd', ['.claude'], true, '&&'], ['ls', [], true, ')']]);
+  assert.deepEqual(shape('pushd .claude && ls && popd'), [['pushd', ['.claude'], false, '&&'], ['ls', [], false, '&&'], ['popd', [], false, '']]);
+  assert.deepEqual(shape('{ rm -rf .claude; }'), [['rm', ['-rf', '.claude'], false, ';']]);
+  assert.deepEqual(shape('f() { rm -rf .claude; }; f').map(([p, a]) => [p, a]), [['rm', ['-rf', '.claude']], ['f', []]]);
+  assert.deepEqual(shape('function f { rm -rf .claude; }').map(([p, a]) => [p, a]), [['rm', ['-rf', '.claude']]]);
+  assert.deepEqual(shape('cd .claude && ls &').map(c => c[3]), ['&&', '&']);
+  const ev = whole("eval 'cd .claude'");
+  assert.deepEqual(ev.map(c => [c.prog, !!c.nested, !!c.inEval]), [['eval', false, false], ['cd', false, true]]);
+  assert.equal(ev[0].kids[0], ev[1]);
+  assert.deepEqual(whole("sh -c 'cd .claude && ls'").map(c => [c.prog, !!c.nested]), [['sh', false], ['cd', true], ['ls', true]]);
+  // "{" and "}" are words but where a command starts; "{}" always; "(" after a command's first word is zsh's pattern group
+  assert.deepEqual(shape('echo { a }')[0].slice(0, 2), ['echo', ['{', 'a', '}']]);
+  assert.deepEqual(shape('rm -rf (.claude|x)'), [['rm', ['-rf', '(.claude|x)'], false, '']]);
+  // read the old way, nothing changes
+  assert.deepEqual(shellCommands('mv $(echo a.txt) .mcp.json').map(c => c.prog), ['mv', 'echo', '.mcp.json']);
+  assert.equal(shellCommands('xargs -a list.txt cp -t .claude')[0].prog, 'list.txt');
 });
 
 test('Monitor is narrated by what it really watches, never by its description', () => {

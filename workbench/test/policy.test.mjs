@@ -1635,6 +1635,32 @@ test('with full permissions on, a step that would write into Claude Code’s own
   refusedWith([bash('rm -rf holds'), bash('mv holds elsewhere')], FLOOR_REASON, inEdge);
 });
 
+test('with full permissions on, a place written out is refused whatever another word holds, and inside find -exec, xargs, groups and wrappers', () => {
+  const rows = [
+    // another command's output in another word leaves the written place where it was: mv's destination, git's paths, sed's file
+    bash('mv $(echo a.txt) .mcp.json'), bash('mv "$(ls *.json | head -1)" .mcp.json'), bash('git checkout "$(git rev-parse HEAD)" -- .claude'),
+    bash('git restore --source="$(git rev-parse HEAD~1)" .claude'), bash('git rm "$(echo a.txt)" .mcp.json'), bash('git mv "$(echo a.txt)" .mcp.json'),
+    bash('sed -i "s/$(whoami)/x/" .mcp.json'), bash('perl -pi -e "s/$(whoami)/x/" .mcp.json'), bash('cp `echo a.txt` .claude/settings.json'),
+    bash('cp $(ls a.*) .claude/settings.json'), bash('cp <(echo x) .claude/settings.json'), bash('tar -xzf "$(ls *.tgz)" -C .claude'),
+    bash('unzip "$(ls *.zip)" -d .claude'), bash('dd if="$(echo a.txt)" of=.claude/settings.json'),
+    // the command find runs for each -exec, up to its ";" or "+", and the command xargs runs, past xargs's own options
+    bash('find . -maxdepth 1 -name a.txt -exec cp {} .claude/settings.json \\;'), bash("find src -name '*.md' -exec mv {} .claude/ +"),
+    bash('find . -name a.txt -exec cp {} .claude/x \\; -print'), bash('find src -exec rm {} + -exec cp {} .claude/ \\;'),
+    bash('xargs -a list.txt cp -t .claude'), bash('xargs -I {} cp {} .claude/'), bash('xargs -n 1 -I{} mv {} .mcp.json'),
+    // wrappers' own options and their values, a group, a function's body, an if, and a pattern group as zsh reads it
+    bash('env -u HOME rm -rf .claude'), bash('timeout -s KILL 5 rm -rf .claude'), bash('nice -n 5 rm -rf .claude'), bash('{ rm -rf .claude; }'),
+    bash('{ echo a; rm -rf .claude }'), bash('f() { rm -rf .claude; }; f'), bash('function f { rm -rf .claude; }; f'), bash('if true; then rm -rf .claude; fi'),
+    bash('rm -rf (.claude|x)'),
+    // written inside another command's output, or a process substitution (zsh's =(…) too), and a subshell's or a group's redirection
+    bash('echo "$(rm -rf .claude)"'), bash('tee >(cat > .claude/x) < a.txt'), bash('cp =(rm -rf .claude) x'), bash('(echo x) > .claude/x'),
+    bash('{ echo x; } > .claude/x'),
+    // "{}" stands for what find finds, in the command it runs and in a shell's command it runs; a copy named after a name it looks for
+    bash('find .claude -exec rm {} \\;'), bash("find .claude -exec sh -c 'rm {}' \\;"), bash('find . -name .mcp.json -exec cp {} src/ \\;'),
+  ];
+  refusedWith(rows, FLOOR_REASON);
+  for (const row of rows) assert.notEqual(decide({ cwd, ...row }).decision, 'allow', JSON.stringify(row.input)); // none runs without asking when they are off
+});
+
 test('with full permissions on, reading Claude Code’s settings, mentioning them, and running a script that lives there all run', () => {
   allowedInFull([
     // the owner's examples: a copy out, an archive of them, words that mention them, a script given them as an argument, a script that lives there
@@ -1660,6 +1686,13 @@ test('with full permissions on, reading Claude Code’s settings, mentioning the
     () => ({ tool: 'Read', input: { file_path: home + '/.claude/settings.json' } }),
     bash('rm -rf .claude-notes'), bash('rm CLAUDE.md && echo gone'), bash('rm docs/mcp.json.bak; ls'), bash('rm -rf build/*'), bash('rm *.log'),
     bash('rm -rf node_modules'), bash('rm -rf src'), bash('mv src lib'), { tool: 'Write', input: { file_path: '.claude-notes/a.md' } },
+    // another command's output beside a read or a mention: where the line writes is still read, and it is elsewhere
+    bash('echo "Checked .claude at $(date)" > status.txt'), bash('cp .claude/settings.json /tmp/backup.json && echo "saved $(date)"'),
+    bash('echo "$(date): see .claude" >> notes.md'), bash('printf "%s\\n" "$(cat .claude/settings.json)" > /tmp/copy.json'),
+    bash('cp "$(pwd)/.claude/settings.json" /tmp/backup.json'), bash('echo "Last checked $(date) for .claude" > status.txt'),
+    bash('diff <(cat .claude/settings.json) <(cat /tmp/x) > /tmp/d.txt'), bash('cp a.txt b.txt && echo "$(cat .claude/settings.json)"'),
+    bash('git commit -m "Update the .claude notes, $(date)"'), bash("find .claude -name '*.json' -exec cat {} \\; > /tmp/all.json"),
+    bash("find . -path './.claude/*' -exec grep -l hooks {} +"), bash('xargs -a list.txt cat > /tmp/out.txt && echo .claude'),
   ]);
 });
 
@@ -1682,7 +1715,12 @@ test('with full permissions on, an edit, a command or a tool whose landing place
   // command that writes, in a line that names them
   refusedWith([bash('echo x > missing/../notes.md'), bash('touch ~nobody/x'), bash('cp a.txt chain/c0'), bash('rm loopA/x'),
     bash('cp a.txt "$(pwd)/.claude/settings.json"'), bash('echo hi > "$(git rev-parse --show-toplevel)/.mcp.json"'),
-    bash('X=.claude; rm -rf "$X"'), bash('for d in .claude .mcp.json; do rm -rf "$d"; done'), bash('cp .claude/settings.json "$BACKUP"')], WRITE_UNCLEAR, inEdge);
+    bash('X=.claude; rm -rf "$X"'), bash('for d in .claude .mcp.json; do rm -rf "$d"; done'), bash('cp .claude/settings.json "$BACKUP"'),
+    // another command's output where a command writes, whole or in part, glued to other words or not, in a line that names them
+    bash('rm -rf "$(echo .claude)"'), bash('rm -rf $(echo .claude)'), bash('mv $(echo a.txt .mcp.json)'), bash('touch "$(pwd)"/.mcp.json'),
+    bash('cp .claude/settings.json "$(mktemp)"'), bash('git -C "$(echo .claude)" checkout -- settings.json'),
+    bash(`find .claude -exec sh -c 'rm "$1"' _ {} \\;`)],
+  WRITE_UNCLEAR, inEdge);
   // tools of other services
   refusedWith([{ tool: 'mcp__fs__write_file', input: { path: 'missing/../x' } }, { tool: 'mcp__fs__write_file', input: { path: 'chain/c0' } }], TOOL_UNCLEAR, inEdge);
   // without full permissions, these ask
@@ -1701,12 +1739,21 @@ test('with full permissions on, code that names Claude Code’s own settings whe
     bash("python3 - <<'EOF'\nimport os; os.remove('.mcp.json')\nEOF"), bash('parallel rm -rf ::: .claude'),
     // in a word of options, -l and -0 take only digits (perl), and node's -p before -e prints what -e runs
     bash(`perl -le 'unlink ".mcp.json"'`), bash(`perl -lne 'unlink ".mcp.json"' list.txt`), bash(`node -pe "require('fs').rmSync('.claude', { recursive: true })"`),
+    // a program whose name is put together when the line runs, given their name
+    bash('$(echo rm) -rf .claude'), bash('$RM -rf .claude'), bash('"$(which rm)" .mcp.json'), bash('`echo rm` -rf .claude'),
   ], CODE_CLAUDE);
-  // the shell would stay there: its next command's words are read from the agent's own folder
-  refusedWith([bash('cd .claude'), bash('pushd .claude > /dev/null'), bash('cd cfg'), bash('cd ~/.claude && ls')], CD_CLAUDE);
+  // the shell would stay there when the line ends: its next command's words are read from the agent's own folder. The line is
+  // read as it runs when each of its commands succeeds; a command after || may run or not; zsh runs a pipe's last command itself
+  refusedWith([bash('cd .claude'), bash('pushd .claude > /dev/null'), bash('cd cfg'), bash('cd ~/.claude && ls'), bash('cd .claude && ls'),
+    bash('false || cd .claude'), bash('cd .claude || exit 1'), bash("eval 'cd .claude'"), bash('echo | cd .claude'), bash('cd .claude && ls || cd ..'),
+    bash('cd src; cd ../.claude'), bash('pushd .claude && pushd src && popd'), bash('cd ~nobody/.claude')], CD_CLAUDE);
   // a script given as a file, code that names nothing of theirs, and names passed to a program that only reads, run
   allowedInFull([bash('python3 scripts/x.py .claude'), bash('node -e "console.log(1)"'), bash('echo hi | sh'), bash('ls .claude | xargs -n1 echo'),
-    bash('cd src && rm old.js')]);
+    bash('cd src && rm old.js'), bash('$EDITOR notes.md; cat .claude/settings.json'),
+    // the shell does not stay there: a subshell, a step back out, popd, cd -, a shell of its own, the background, a pipe's first command
+    bash('(cd .claude && ls)'), bash('pushd .claude && ls && popd'), bash('cd .claude/.. && ls'), bash('cd .claude; ls; cd -'), bash('pushd .claude; ls; popd'),
+    bash('cd .claude/hooks && ls && cd ../..'), bash("sh -c 'cd .claude && ls'"), bash('cd .claude && ls &'), bash('x=$(cd .claude && pwd); echo "$x"'),
+    bash('cd .claude | cat'), bash('cd .claude && ls && cd -'), bash('if (cd .claude); then ls; fi')]);
 });
 
 test('with full permissions on, a tool of another service is judged by the places it is given, not by what its text mentions', () => {
@@ -1718,13 +1765,31 @@ test('with full permissions on, a tool of another service is judged by the place
     { tool: 'mcp__fs__read_file', input: { file_path: 'cfg/settings.json' } },
     { tool: 'FooTool', input: { target: '~/.claude/settings.json' } }, { tool: 'mcp__x__y', input: { filePath: '.CLAUDE/x' } },
     { tool: 'mcp__x__y', input: { paths: ['src/a.js', '.mcp.json'] } },
+    // any argument named for a place, however it is written: a source, from and to, an old and a new path, a folder
+    { tool: 'mcp__filesystem__move_file', input: { source: '.claude', destination: '/tmp/x' } },
+    { tool: 'mcp__fs__rename', input: { from: '.mcp.json', to: 'old.json' } }, { tool: 'mcp__fs__rename', input: { old_path: '.claude/settings.json', new_path: 'x.json' } },
+    { tool: 'mcp__fs__copy', input: { src: 'cfg/settings.json', dst: 'b.json' } }, { tool: 'mcp__fs__copy', input: { sourcePath: '.claude', targetDir: 'backup' } },
+    { tool: 'mcp__fs__list', input: { directory: '.claude' } }, { tool: 'mcp__x__run', input: { cwd: '.claude', task: 'build' } },
+    { tool: 'mcp__fs__zip', input: { inputFiles: ['a.txt', '.mcp.json'], outputName: 'x.zip' } },
   ], TOOL_CLAUDE);
+  // a tool that carries a command or code, whose text names them: Workbench cannot follow what it does with them
+  refusedWith([
+    { tool: 'mcp__shell__run_command', input: { command: 'rm -rf .claude' } }, { tool: 'mcp__desktop-commander__execute_command', input: { command: 'rm .mcp.json' } },
+    { tool: 'PowerShell', input: { command: 'Remove-Item -Recurse -Force .claude' } }, { tool: 'REPL', input: { code: "require('fs').rmSync('.claude', { recursive: true })" } },
+    { tool: 'mcp__exec__run', input: { cmd: 'rm', args: ['-rf', '.claude'] } }, { tool: 'mcp__py__run', input: { script: "import os; os.remove('.mcp.json')" } },
+  ], CODE_CLAUDE);
   allowedInFull([
     { tool: 'mcp__github__create_issue', input: { title: 'Explain .claude', body: 'see .mcp.json' } },
     { tool: 'mcp__slack__send_message', input: { channel: 'dev', text: 'Never edit .claude by hand' } },
     { tool: 'mcp__fs__write_file', input: { path: 'docs/claude.md', content: 'See .claude/settings.json' } },
     { tool: 'mcp__github__get_file_contents', input: { owner: 'acme', repo: 'shop', path: 'README.md' } },
     { tool: 'mcp__docs__search', input: { query: 'claude code settings in .claude' } },
+    // words in an argument named like a place that are no path, and a place there that cannot be told, count for nothing
+    { tool: 'mcp__mail__send', input: { to: '~bob', from: ' me ', subject: 'hi', text: 'see .claude' } },
+    { tool: 'mcp__docs__cite', input: { source: 'the guide to the .claude folder', title: '.claude' } },
+    { tool: 'mcp__fs__move_file', input: { source: 'notes.md', destination: 'docs/notes.md' } },
+    // a command that names nothing of theirs
+    { tool: 'mcp__shell__run_command', input: { command: 'npm test' } }, { tool: 'PowerShell', input: { command: 'Get-ChildItem' } },
   ]);
 });
 
