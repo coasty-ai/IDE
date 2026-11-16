@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   prepareRepo, createWorkspace, removeWorkspace, diffStats, readRepoConfig, normalizeConfig, slugify, workspacesFolder,
-  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp, fillWorkspace, envValues,
+  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp, fillWorkspace, envValues, envValuesIn,
 } from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
 
@@ -3354,6 +3354,21 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     assert.deepEqual([odd.files, odd.values], [0, []]);
     assert.deepEqual(await envValues({ path: 'relative', copied: r.copied }), { values: [], files: 0 });
     assert.deepEqual(await envValues({}), { values: [], files: 0 });
+  });
+
+  test('envValuesIn reads again, in an agent’s folder, the env files a fill would choose there: its copies, for an agent continued in a later run', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\n.env.*\nnode_modules/\n', 'src/a.js': 'x\n' }, {
+      '.env': 'API_TOKEN=api-token-value-1\n', 'apps/web/.env.local': 'WEB=web-value-12345\n', 'node_modules/x/.env': 'PKG=package-value-1\n',
+    });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy });
+    assert.deepEqual(pathsOf(r.copied), ['.env', 'apps/web/.env.local', 'node_modules']);
+    const again = await envValuesIn({ path: t.ws });
+    assert.deepEqual([again.files, [...again.values].sort()], [2, ['api-token-value-1', 'web-value-12345']]);
+    assert.ok(Object.isFrozen(again.values));
+    // nothing there, a folder that is not one, or git that cannot list it: nothing, never a rejection
+    assert.deepEqual(await envValuesIn({ path: await t.agent() }), { values: [], files: 0 });
+    assert.deepEqual(await envValuesIn({ path: path.join(T, 'no-such-folder') }), { values: [], files: 0 });
+    assert.deepEqual(await envValuesIn({ path: t.ws, run: async () => { throw new Error('git broke'); } }), { values: [], files: 0 });
   });
 });
 

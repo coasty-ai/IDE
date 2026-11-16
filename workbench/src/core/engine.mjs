@@ -2059,6 +2059,15 @@ export class Engine extends EventEmitter {
       // The earlier run's spend: the new process counts from zero (see _withEarlierSpend).
       earlierSpend: { ...rec.usage },
     };
+    // Its copy got its env files in the run that started it: their values are read again, so that they are hidden in what
+    // it prints now, as they were then (see "Agents' copies").
+    if (this.mode === 'live' && typeof this.deps.workspace?.envValuesIn === 'function') {
+      try {
+        this._addEnvSecrets((await this.deps.workspace.envValuesIn({ path: workspace.path }))?.values);
+      } catch (err) {
+        this.log.warn('Workbench could not read the env files in an agent’s folder:', err?.message || String(err));
+      }
+    }
     try {
       run.runner = this.adapters[rec.harness].createRunner({
         agentId: v.id, name: v.name, task: rec.task, cwd: workspace.path, model: v.model, budgetUsd: budget,
@@ -2426,7 +2435,8 @@ export class Engine extends EventEmitter {
   async startAgent(opts = {}) {
     const v = await this._startAgent(opts);
     if (v.state === STATE.FAILED) this._notice(`${v.name} could not start. ${v.stateReason || ''}`.trim(), v.id);
-    else if (v.state !== STATE.STOPPED) this._notice(`Started ${v.name}.`, v.id);
+    // Nothing for one stopped while its copy was made ready, or whose runner never started because Workbench closed.
+    else if (v.state !== STATE.STOPPED && this.runs.get(v.id)?.runner) this._notice(`Started ${v.name}.`, v.id);
     return v;
   }
 

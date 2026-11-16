@@ -1477,7 +1477,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         const text = String(json?.text || '').trim();
         // the setup card on screen: its own words (src/core/commands.mjs), and a near miss keeps it; other words leave it
         if (state.setup && json?.confirmId === state.setup.id) {
-          if (/^(run it|yes|ok|okay|do it|go ahead|sure)$/i.test(text)) return reply(answerSetup(true));
+          if (/^(run it|do it)$/i.test(text)) return reply(answerSetup(true));
           if (/^(not now|no|cancel|skip it|never mind)$/i.test(text)) return reply(answerSetup(false));
           if (!/^(what|status|stop|merge|throw|start)\b/i.test(text)) return reply({ reply: 'I did not catch that. Say “run it” or “not now”.', confirm: { ...state.setup } });
         }

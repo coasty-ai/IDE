@@ -492,6 +492,7 @@ test('an agent stopped while its copy is made ready never starts; shutdown answe
   assert.equal(x.state, 'stopped');
   assert.equal(x.stateReason, 'Workbench was closed');
   assert.equal(t.claude.runners.length, 0);
+  assert.deepEqual(t.notices.filter(n => /^Started /.test(n)), [], 'none of them is said to have started');
   assert.equal(t.engine.snapshot().setup, undefined);
   assert.ok(Array.isArray(kept.kept));
 });
@@ -526,6 +527,32 @@ test('the demo copies nothing and runs no setup command, whatever workbench.json
   assert.equal(engine.snapshot().setup, undefined);
   assert.equal(store.get(v.id).now, 'Starting');
   await engine.shutdown();
+});
+
+test('the real chain: an ignored .env lands in the agent’s copy with its value hidden, and the committed setup command runs there once said yes to', async (ctx) => {
+  const t = await realGit(ctx);
+  fs.writeFileSync(path.join(t.repo, '.gitignore'), '.env\n');
+  const setup = 'printf "ran in %s\\n" "$(basename "$PWD")" > setup-ran.txt && test -n "$WORKBENCH_AGENT_ID" && test -d "$WORKBENCH_ROOT/.git"';
+  fs.writeFileSync(path.join(t.repo, 'workbench.json'), JSON.stringify({ setup }));
+  t.git('add', '-A');
+  t.git('commit', '-q', '-m', 'Ignore .env, and set up each copy');
+  const value = ['db', 'pass', 'Zq81mNw2Lk'].join('-');
+  fs.writeFileSync(path.join(t.repo, '.env'), `DATABASE_PASSWORD=${value}\n`);
+  t.deps.receipt.runSetup = receiptMod.runSetup; // the real one: sh in the agent's folder
+  const launch = t.engine.startAgent({ task: 'Fix the login redirect' });
+  const card = await until(() => t.engine.snapshot().setup, { timeout: 10_000 });
+  assert.equal(card.command, setup);
+  assert.deepEqual(await t.engine.confirm(card.id, true), { reply: SETUP_RAN });
+  const v = await launch;
+  assert.equal(fs.readFileSync(path.join(v.workspace, '.env'), 'utf8'), `DATABASE_PASSWORD=${value}\n`, 'the ignored .env is in its copy');
+  assert.equal(fs.readFileSync(path.join(v.workspace, 'setup-ran.txt'), 'utf8'), `ran in ${path.basename(v.workspace)}\n`, 'the command ran in its copy');
+  assert.equal(v.now, 'Its copy has your .env. The setup command ran in it.');
+  assert.ok(t.notices.includes(COPIES_NOTICE));
+  const runner = t.claude.runners.at(-1);
+  assert.equal(runner.started, true);
+  runner.emit({ kind: EV.SAYS, text: `The password is ${value}.` });
+  assert.equal(t.store.get(v.id).says, 'The password is •••• w2Lk.');
+  await t.engine.shutdown();
 });
 
 // ------------------------------------------------------------------ end of a turn

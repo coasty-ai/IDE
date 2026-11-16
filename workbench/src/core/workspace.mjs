@@ -811,6 +811,25 @@ export async function envValues({ path: wsPath, copied } = {}) {
 }
 
 /**
+ * The values in the env files of an agent's folder `path` that a fill would choose there (see fillWorkspace): the env
+ * files git ignores in it, which are its copies, for an agent continued in a later run, whose fill was in another. Read
+ * by envValues' rules, within `timeoutMs` (a minute unless given) for git's listing. `run` stands in for git() in tests.
+ * Never rejects: nothing there, or nothing git can list, gives nothing.
+ * @param {{ path: string, run?: typeof git, timeoutMs?: number }} opts
+ * @returns {Promise<{ values: readonly string[], files: number }>}
+ */
+export async function envValuesIn({ path: wsPath, run = git, timeoutMs = 60_000 } = {}) {
+  try {
+    if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath)) throw new Error('no folder');
+    const ws = fs.realpathSync.native(wsPath);
+    const chosen = await chooseFill(run, ws, Date.now() + (Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 60_000));
+    return await envValues({ path: ws, copied: chosen.entries });
+  } catch {
+    return { values: Object.freeze([]), files: 0 };
+  }
+}
+
+/**
  * Which of `paths` (copied into the agent's folder `ws`) git there would not ignore: each that is, or holds, a path
  * `git ls-files --others --exclude-standard` lists there (a new file no ignore rule of the agent's folder hides, or a
  * repository inside it). Rejects when git cannot say before `end`.

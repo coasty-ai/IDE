@@ -372,6 +372,25 @@ test('a message to an earlier agent resumes its session in the same folder, with
   assert.equal(second.calls.diffStats.at(-1).base, BASE, 'what is not merged yet: since the commit it started from (it was never merged)');
 });
 
+test('an earlier agent continued in a later run has the values of the env files in its copy hidden, as when it started', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const rec = readFile(first).agents[0];
+  const value = ['db', 'pass', 'Zq81mNw2Lk'].join('-');
+  const second = world(t, dir);
+  const read = [];
+  second.deps.workspace.envValuesIn = async (o) => { read.push(o); return { values: Object.freeze([value]), files: 1 }; };
+  await second.engine.start();
+  assert.equal((await second.engine.say(id, 'Print the database password')).ok, true);
+  assert.deepEqual(read, [{ path: rec.workspace.path }], 'the env files in its own folder are read again, before its runner is made');
+  const runner = second.claude.runners.at(-1);
+  assert.equal(typeof runner.opts.mask, 'function');
+  runner.emit({ kind: EV.SAYS, text: `The password is ${value}.` });
+  assert.equal(second.store.get(id).says, 'The password is •••• w2Lk.');
+});
+
 test('the Continue button’s message, and the words "continue <name>", pick it up', async (t) => {
   const dir = tmp(t);
   const first = world(t, dir);

@@ -494,7 +494,7 @@ function confirmReply(toks, kind, c) {
   }
   // Before the fillers go: "so" is one. Throwing work away and full permissions take their own words, so "make it so"
   // keeps those cards.
-  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : kind === 'discard' || kind === 'permissions' ? 'keep' : true;
+  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : kind === 'discard' || kind === 'permissions' || kind === 'setup' ? 'keep' : true;
   // "don't merge it", "do not throw it away": a no, though the card's own word is in it.
   const first = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w));
   const negated = first[0] === "don't" ? 1 : first[0] === 'do' && first[1] === 'not' ? 2 : first[0] === 'never' ? 1 : 0;
@@ -525,6 +525,12 @@ function confirmReply(toks, kind, c) {
     // Turning full permissions on takes its own words too: "turn it on", "turn on full permissions" or "do it".
     if (kind === 'permissions') {
       const explicit = ws.some((w, i) => w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || (ws.some(w => own.includes(w)) && ws.includes('on'));
+      if (!explicit) return 'keep';
+    }
+    // So does running a setup command, which comes by itself after a launch's yes: "run it" or "do it", so a second
+    // "yes" said out of habit never runs one (and never keeps that answer).
+    if (kind === 'setup') {
+      const explicit = ws.some((w, i) => w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || ws.some(w => own.includes(w));
       if (!explicit) return 'keep';
     }
     return true;
