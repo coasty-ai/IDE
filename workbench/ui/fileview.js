@@ -1132,9 +1132,11 @@ async function poll() {
   if (!f.hash && r.kind === f.kind && (r.size || 0) === f.size && !r.hash) return;
   if (st.edit) {
     if (st.ask && st.ask.kind === 'changed') return;
-    // what the person was told about already (they chose Keep editing): nothing new until it changes again
-    if (r.hash && r.hash === st.edit.seen) return;
-    st.edit.seen = r.hash || null;
+    // what the person was told about already (they chose Keep editing): nothing new until it changes again. A file with
+    // no hash now (gone from disk) is known by what it is, so Keep editing is not asked again every 2 seconds.
+    const mark = r.hash || `${r.kind}:${r.size || 0}`;
+    if (mark === st.edit.seen) return;
+    st.edit.seen = mark;
     const who = agentOf(f.in);
     st.ask = { kind: 'changed', text: `${who ? `${visibleControls(who.name)} changed this file.` : 'This file changed on disk.'} Your edit is still here.`, theirs: r, buttons: [['Load theirs', 'theirs', false], ['Keep editing', 'keep', true]] };
     paint();
