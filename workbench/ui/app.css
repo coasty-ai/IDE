@@ -639,7 +639,8 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitGraph .ref { flex: none; padding: 0 5px; border: 1px solid var(--silk-2); border-radius: 3px; font-size: var(--g-l2); font-weight: 600; line-height: 1.35; color: var(--silk); }
 #gitGraph .ref.yours { border-color: var(--g-trunk); }
 #gitGraph .ref.agent { border-color: var(--g-lane); }
-#gitGraph .ref.more { border-style: dashed; }
+/* "+2" for the badges cut off a row: a badge in the row like the others, never the board's absolute ".more" label */
+#gitGraph .ref.more { position: static; height: auto; border-style: dashed; }
 
 /* ---------- the detail: an agent's branch (its work, its actions, its diff) or a commit, over the text column ---------- */
 #gitDetail { position: absolute; z-index: 5; display: flex; flex-direction: column; padding: 14px 16px 12px; border: 1px solid var(--card-line); border-radius: 6px;
