@@ -48,7 +48,16 @@ export function visibleText(s) {
  * and each tab a ⇥ that keeps the indentation (to the next stop of 4).
  */
 export function visibleHtml(s) {
-  let out = '', col = 0;
+  return visibleHtmlAt(s, 0).html;
+}
+
+/**
+ * visibleHtml for a piece of a line that starts at column `col` (the file view colours a line in pieces): its tabs stop
+ * where the whole line's would. Returns the HTML and the column the piece ends at.
+ * @returns {{ html: string, col: number }}
+ */
+export function visibleHtmlAt(s, col = 0) {
+  let out = '';
   for (const p of hiddenParts(s)) {
     if (!p.hidden) { out += esc(p.text); col += Array.from(p.text).length; continue; }
     if (p.text === '\t') {
@@ -60,7 +69,22 @@ export function visibleHtml(s) {
     out += `<span class="vc" title="${esc(nameOf(p.text))}">${esc(p.hidden)}</span>`;
     col += Array.from(p.hidden).length;
   }
-  return out;
+  return { html: out, col };
+}
+
+/**
+ * The first line of the file as it is now that a change added or changed (where a file opens from the git screen): the
+ * first added line, else where the first lines were taken away, else line 1.
+ */
+export function firstChangedLine(patch) {
+  let at = null;
+  for (const l of patchLines(patch)) {
+    if (l.t === 'hunk') { at = l.line || 1; continue; }
+    if (at == null) continue;
+    if (l.t === 'add' || l.t === 'del') return Math.max(1, at);
+    if (l.t === 'ctx') at++;
+  }
+  return 1;
 }
 
 const n0 = n => (Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0);
@@ -159,18 +183,23 @@ function noLinesWords(f, facts) {
 /**
  * The diff as HTML.
  * @param {{ files?: object[], left?: { path: string, why: string }[], cut?: boolean, omitted?: number }} diff  workDiff's shape
- * @param {{ maxLines?: number }} [o]  past maxLines, the rest is "and 1,240 more lines"; every file still gets its header
+ * @param {{ maxLines?: number, open?: boolean }} [o]  past maxLines, the rest is "and 1,240 more lines"; every file still
+ *   gets its header. With `open`, a file still in the copy (not deleted) has its path as a button that carries its place
+ *   in `diff.files` and its first changed line (data-file-index, data-line): the git screen opens it in the file view.
  */
-export function diffHtml(diff, { maxLines = 4000 } = {}) {
+export function diffHtml(diff, { maxLines = 4000, open = false } = {}) {
   const files = Array.isArray(diff?.files) ? diff.files.filter(f => f && typeof f === 'object') : [];
   const left = Array.isArray(diff?.left) ? diff.left.filter(x => x && typeof x === 'object') : [];
   const omitted = n0(diff?.omitted);
   let html = '', shown = 0, rest = 0, stopped = false;
-  for (const f of files) {
+  for (const [index, f] of files.entries()) {
     const facts = patchFacts(f.patch);
     const lines = f.binary || f.large ? [] : patchLines(f.patch);
     const words = fileWords(f, facts);
-    html += `<section class="df"><h3 class="dh"><span class="dp">${visibleHtml(f.path)}</span> <span class="dn">${esc(words)}</span></h3>`;
+    const line = open && f.status !== 'deleted' && typeof f.path === 'string' && f.path ? firstChangedLine(f.patch) : null;
+    const head = line ? `<button type="button" class="dp dopen" data-file-index="${index}" data-line="${line}" data-key="open:${index}" title="${esc(`Open ${visibleText(f.path)} at line ${line}`)}">${visibleHtml(f.path)}</button>`
+      : `<span class="dp">${visibleHtml(f.path)}</span>`;
+    html += `<section class="df"><h3 class="dh">${head} <span class="dn">${esc(words)}</span></h3>`;
     if (stopped) { rest += textLines(lines); html += '</section>'; continue; }
     if (!f.binary && !f.large && !textLines(lines)) html += `<p class="dq">${esc(noLinesWords(f, facts))}</p>`;
     if (textLines(lines)) {
