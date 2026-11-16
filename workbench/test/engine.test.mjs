@@ -4715,13 +4715,21 @@ test('the file view in the demo: a sample project in memory, the simulated Invoi
   const exp = await t.engine.file(inv.id, 'src/invoices/export.ts');
   assert.deepEqual([exp.kind, exp.editable, exp.changedLines], ['text', true, [2, 4, 6, 7, 8, 9]]);
   assert.equal((await t.engine.file(inv.id, 'src/invoices/batch.ts')).changedLines.length, 15);
+  // Every file its record names (what the git screen shows of its work) opens in its copy, with the lines it changed.
+  const recorded = inv.files.list.map(f => f.path);
+  assert.ok(recorded.includes('migrations/0042_invoice_lookup_index.sql') && recorded.length >= 5, recorded.join(', '));
+  for (const rel of recorded) {
+    const f = await t.engine.file(inv.id, rel);
+    assert.deepEqual([f.kind, f.changedLines?.length > 0], ['text', true], rel);
+  }
   assert.equal((await t.engine.file('you', 'src/invoices/export.ts')).changedLines, undefined);
   const env = await t.engine.file('you', '.env');
   assert.deepEqual([env.kind, env.editable], ['secret', false]);
   assert.doesNotMatch(env.text, /sk_test_[0-9a-f]{24}/);
   assert.equal((await t.engine.file('you', 'src/invoices/sample.csv')).eol, 'crlf');
   assert.match((await t.engine.file('you', 'src/cart.ts')).text, /​/);
-  assert.deepEqual((await t.engine.search(inv.id, 'inBatches')).results.map(r => `${r.path}:${r.line}`), ['src/invoices/batch.ts:6', 'src/invoices/export.ts:2', 'src/invoices/export.ts:7']);
+  assert.deepEqual((await t.engine.search(inv.id, 'inBatches')).results.map(r => `${r.path}:${r.line}`),
+    ['src/invoices/batch.ts:6', 'src/invoices/export.ts:2', 'src/invoices/export.ts:7', 'test/invoices/large-account.test.ts:3', 'test/invoices/large-account.test.ts:12']);
   // A save is kept for this run, and said so once.
   const readme = await t.engine.file('you', 'README.md');
   const first = await t.engine.saveFile('you', 'README.md', { text: '# Storefront\n\nChanged in the demo.\n', hash: readme.hash });

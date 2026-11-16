@@ -1246,7 +1246,9 @@ test('the demo’s sample project: a handful of files in two folders, a CRLF fil
   assert.equal(crlf.length, 1);
   assert.equal((await p.readFile({ rel: crlf[0] })).eol, 'crlf');
   assert.equal(paths.filter(rel => /[​-‏‪-‮⁠-⁤﻿]/.test(s.files[rel])).length, 1, 'one file has a hidden character');
-  // The simulated agent's copy changes files and adds one; its changed lines are worked out from the texts.
+  // The simulated agent's copy changes two files and adds three; its changed lines are worked out from the texts.
+  assert.deepEqual(Object.keys(s.agent.files).filter(rel => !(rel in s.files)).sort(),
+    ['migrations/0042_invoice_lookup_index.sql', 'src/invoices/batch.ts', 'test/invoices/large-account.test.ts']);
   for (const [rel, text] of Object.entries(s.agent.files)) {
     const lines = changedLinesBetween(s.files[rel] ?? null, text);
     assert.ok(lines.length > 0, rel);

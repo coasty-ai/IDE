@@ -1160,8 +1160,9 @@ export function memoryProject(files = {}) {
  * The demo's sample project, made afresh at each call: "storefront" on main, seven files in two folders (src and
  * src/invoices). One is CRLF (src/invoices/sample.csv), one holds a hidden character (a zero-width space in
  * src/cart.ts), and .env holds a made-up Stripe test key, made at run time so no file of Workbench's holds one.
- * `agent` is what the simulated agent Invoice export changed in its own copy, as its recorded files name them: two
- * files changed and one added.
+ * `agent` is what the simulated agent Invoice export changed in its own copy, every file its record names (so each path
+ * the git screen shows of its work opens): two files changed, and three added in two more folders (a batch reader, a
+ * migration and a test).
  * @returns {{ name: string, branch: string, files: Record<string, string>, agent: { name: string, files: Record<string, string> } }}
  */
 export function sampleProject() {
@@ -1260,6 +1261,31 @@ export function sampleProject() {
           '    if (batch.length < BATCH_SIZE) return;',
           '  }',
           '}',
+          '',
+        ].join('\n'),
+        'migrations/0042_invoice_lookup_index.sql': [
+          "-- Large accounts read their invoices a page at a time, by account and date: this index keeps each page quick.",
+          'CREATE INDEX IF NOT EXISTS invoices_account_date ON invoices (account_id, date);',
+          '',
+        ].join('\n'),
+        'test/invoices/large-account.test.ts': [
+          "import { test } from 'node:test';",
+          "import assert from 'node:assert/strict';",
+          "import { inBatches, BATCH_SIZE } from '../../src/invoices/batch';",
+          "import type { Invoice } from '../../src/invoices/query';",
+          '',
+          '// An account with more invoices than one batch holds.',
+          "const invoices: Invoice[] = Array.from({ length: 1234 }, (_, i) => ({ number: `INV-${i}`, date: '2026-10-01', total: '1.00' }));",
+          'const query = async (_accountId: string, offset: number, limit: number) => invoices.slice(offset, offset + limit);',
+          '',
+          "test('a large account is read in batches, and every invoice comes back once', async () => {",
+          '  const seen: Invoice[] = [];',
+          "  for await (const batch of inBatches(query, 'acct_large')) {",
+          '    assert.ok(batch.length <= BATCH_SIZE);',
+          '    seen.push(...batch);',
+          '  }',
+          '  assert.equal(seen.length, invoices.length);',
+          '});',
           '',
         ].join('\n'),
       },
