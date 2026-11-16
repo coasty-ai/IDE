@@ -455,6 +455,19 @@ try {
           if (!shown) failures.push(`${tag} (${sc}): the done tray did not open its list`);
           await check(`${tag} (${sc})`);
         }
+        // a dense board whose left side is full (23 at work, laptop and cloud by turns), and one more laptop agent: the
+        // tray holds only it ("1 more working"), and its list names it
+        await load('done-waits');
+        const st = await (await fetch(base + '/ctl/state')).json(), w1 = st.agents.find(a => a.id === 'w1'), at = Date.now();
+        const one = (i, machineId) => ({ ...w1, id: 'z' + i, rootId: 'z' + i, name: `Crowd ${i} fix`, machineId, state: 'working', endedAt: null, stateSince: at,
+          startedAt: at - (90 - i) * 60000, now: 'Reading the code', says: null, checks: null, files: null, work: null });
+        await ctl('push', { event: 'snapshot', data: { ...st, agents: Array.from({ length: 23 }, (_, i) => one(i, i % 2 ? 'cloud-1' : 'laptop')) } }); await sleep(500); await settle(100);
+        await ctl('push', { event: 'agents', data: [one(40, 'laptop')] }); await sleep(500); await settle(100);
+        const words = await trayReads();
+        if (words !== '1 more working') failures.push(`${tag} (no room): the one with no room on the board is not in the tray alone (the tray reads "${words}")`);
+        await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
+        if (!(await b.ev(`!document.getElementById('trayList').hidden`))) failures.push(`${tag} (no room): the done tray did not open its list`);
+        await check(`${tag} (no room)`);
       } else if (v === 'earlier') {
         // agents from an earlier run: in the lid (one that can continue, one that cannot), the tray's list, the forget
         // question, and a card pinned on one

@@ -379,8 +379,9 @@ function renderNow(o = {}) {
   const machines = showData ? S.machines.map(m => ({ id: m.id, name: m.name, awake: m.awake !== false, note: machineNote(m), noteText: machineNote(m) })) : [];
   G = layoutBoard({ W, H, P, detail: prefs.detail, roots, laneOf, nRows, dense, lidNeed: needForLayout(v), machines, tray, measure });
   G.queueLength = bm.queue.length;
-  // the tray is drawn only while it holds agents of this run or an earlier one (board.js paintTray): when it empties, its
-  // list closes and the keyboard there goes to the lid's sentence before the tray is hidden
+  // the tray is drawn while it holds anyone (board.js paintTray): this run's agents, an earlier run's, or agents at work
+  // with no room on the board; when it empties, its list closes and the keyboard there goes to the lid's sentence before
+  // the tray is hidden
   if (!G.tray) trayEmptied();
   const hoverRoot = board.card.rootId || null;
   const left = board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
@@ -518,9 +519,9 @@ el.pages.addEventListener('click', e => {
  * was in (data-state), where its work was (data-work) and the branch a merge was offered into (data-into); anything
  * else says "That changed. Have another look." and sends nothing. Buttons outside the lid that carry the same data-*
  * (the git screen's detail: Merge, Throw it away, a card's yes and no) can be handed to this too; the swap guard stays
- * with the caller.
+ * with the caller. `o.answer`: the words typed or said for it ("Not now" at a lid whose "Looks good" answers both).
  */
-async function actOn(b) {
+async function actOn(b, o = {}) {
   const act = b.dataset.act;
   touch();
   if (act === 'next') { stepQueue(1); moved(); render(); return; }
@@ -626,14 +627,17 @@ async function actOn(b) {
       // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is ("Not now"
       // says so in its own words, so it never sounds like approval)
       busy(b);
-      const r = await api.answer(a.id, null, b.dataset.answer === 'Not now' ? 'Not now' : 'Looks good');
+      // its own answer, or the words typed or said for it ("not now" at a lid whose "Looks good" answers both)
+      const r = await api.answer(a.id, null, (o.answer || b.dataset.answer) === 'Not now' ? 'Not now' : 'Looks good');
       markReviewed(a);
       answeredOnce();
       say(r.reply || '', 4000);
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
     } else if (act === 'reviewed') {
-      markReviewed(a);
+      // a Dismiss drawn for the work as it is now (its data-work, checked above) also lets a merge that did not go
+      // through go; one drawn before that problem came (a stopped or failed agent's) marks only the finish
+      markReviewed(a, { problem: b.dataset.work != null });
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
     } else if (act === 'later') {
@@ -714,16 +718,19 @@ function applyPref(kind, value, { quietly = false } = {}) {
   if (hasToken()) api.prefs({ [kind]: v }).catch(e => { if (e?.refused) say(e.message); });
 }
 
+/** The data-words (focus.js) of what lidAnswer names: the lid's buttons say which of these words they answer. */
+const LID_WORDS = { 'Looks good': 'looks-good', 'Not now': 'not-now' };
+
 /**
- * The lid's own button that typed or spoken words stand for ("Looks good", "Not now": lidAnswer), on the page shown now
- * (not one fading out, nor one still to rise), drawn for the agent the words were bound to when they began. null when
- * the words stand for no button, are bound to nothing (begun during a swap), or the lid has no such button for them.
+ * The lid's own button that "looks good" or "not now", typed or spoken (lidAnswer), stand for at a finished agent's lid:
+ * the one that carries those words in data-words, on the page shown now (not one fading out, nor one still to rise),
+ * drawn for the agent the words were bound to when they began. null when the lid has none for them.
  */
 function lidButton(label, b) {
-  if (!label || !b || !b.agentId) return null;
+  const words = LID_WORDS[label];
+  if (!words || !b || !b.agentId) return null;
   const page = el.pages.querySelector('.page:not(.old):not([data-hidden])');
-  const keys = label === 'Looks good' ? ['looksgood:Looks good'] : ['looksgood:Not now', 'later:Not now'];
-  return [...(page ? page.querySelectorAll('button[data-act]') : [])].find(x => x.dataset.agent === b.agentId && keys.includes(x.dataset.key)) || null;
+  return [...(page ? page.querySelectorAll('button[data-words]') : [])].find(x => x.dataset.agent === b.agentId && x.dataset.words.split(' ').includes(words)) || null;
 }
 
 async function submit(text) {
@@ -747,11 +754,19 @@ async function submit(text) {
     return;
   }
   if (cannotSend(linkNow())) return;
-  // "looks good" or "not now" (the engine's own words for them) at a finished agent's lid: the page presses that lid's
-  // "Looks good" or "Not now", drawn for the agent the words were begun for, so they do exactly what the button does,
-  // and no command goes to the engine. Anything else, or words bound to nothing, goes on as before.
-  const press = !S.reply && !S.confirm ? lidButton(lidAnswer(text, ANSWERS), b) : null;
-  if (press) { if (!press.disabled) await actOn(press); return; }
+  // "looks good" or "not now" (the engine's own words for them) at a finished agent's lid never go to the engine: the
+  // page presses the button that stands for them there (its data-words, drawn for the agent the words were begun for),
+  // so they do exactly what it does. Where none stands for "looks good" (work that can merge, a failed check, a merge
+  // that did not go through, a stopped or failed agent, one from an earlier run), it says which answers the lid has, and
+  // does nothing more: words that sound like approval never merge work, continue or retry an agent, nor let it go where
+  // the lid has no "Looks good". Anything else, or words bound to nothing (begun before the lid changed), goes on as before.
+  const said = !S.reply && !S.confirm && b.finished ? lidAnswer(text, ANSWERS) : null;
+  if (said) {
+    const press = lidButton(said, b);
+    if (!press) say(b.hint, 6000);
+    else if (!press.disabled) await actOn(press, { answer: said });
+    return;
+  }
   try {
     if (S.reply) {
       const r = S.reply;
@@ -1019,8 +1034,10 @@ function renderTrayList() {
   const done = trayIds.done.map(id => row(id, a => doneWords(a, STATES.LOOK))).join('');
   const early = (trayIds.earlier || []).map(id => row(id, a => agoText(Date.now() - (a.endedAt || a.stateSince)))).join('');
   const over = trayIds.over.map(id => row(id, (a, m) => m.label)).join('');
+  // "Done" heads the list when it holds this run's agents, and stands alone ("Nothing yet.") only when it holds no one
+  const lone = !done && !early && !over;
   // a row that held the keyboard and went (its agent back on the board) hands it to the list's first row, else the tray
-  const lost = patchChildren(el.trayList, `${done || !early ? `<h2>Done</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  const lost = patchChildren(el.trayList, `${done || lone ? `<h2>Done</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
   if (lost) (el.trayList.querySelector('button') || el.tray).focus({ preventScroll: true });
   const r = el.tray.getBoundingClientRect();
   // above the tray, inside the board and beside the core (never on it, never on the top band)

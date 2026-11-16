@@ -67,7 +67,12 @@ test('"looks good" or "not now", typed or said at a finished agent\'s lid, stand
   for (const s of ['looks good, merge it', 'merge it', 'not now, ask me tomorrow', 'later', 'look later', 'dismiss', '', null]) assert.equal(lidAnswer(s, phrases), null, String(s));
   // which lid the words reach is app.js's to decide: "not now" is never one of the page's own words wherever it is said
   assert.equal(pageCommand('not now'), null);
-  // and app.js presses the drawn button, bound to the agent the words were begun for, rather than send a command
+  // and app.js presses the drawn button, bound to the agent the words were begun for, rather than send a command: the one
+  // the lid says they stand for (data-words, from focus.js), never one picked by its label; where there is none, it says
+  // the lid's hint
   const app = readFileSync(new URL('../ui/app.js', import.meta.url), 'utf8');
   assert.match(app, /lidAnswer\(text, ANSWERS\)/);
+  assert.match(app, /querySelectorAll\('button\[data-words\]'\)/);
+  assert.match(app, /if \(!press\) say\(b\.hint, \d+\);/);
+  assert.doesNotMatch(app, /'(looksgood|later):Not now'/);
 });

@@ -19,7 +19,7 @@ export const S = {
   pinId: null,           // card pinned by a click
   reply: null,           // { agentId, mode: 'answer'|'say', askId }
   // Both kept in this tab's sessionStorage, as the page's key is, so a reload that brings the board back brings them back.
-  reviewed: Q.readMarks(tab(), 'wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Not now", "Dismiss"): such a root leaves the board
+  reviewed: Q.readMarks(tab(), 'wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Not now", "Dismiss"), and problemKeys of merges that did not go through they dismissed: such a root leaves the board
   later: Q.readMarks(tab(), 'wb-later'),         // finishKeys set aside: a failed check, or a merge that did not go through ("Look later")
 };
 
@@ -27,8 +27,18 @@ function tab() { try { return sessionStorage; } catch { return null; } }
 
 export const finishKey = Q.finishKey;
 
-/** "Looks good" / "Not now" / "Dismiss": this finish has been looked at. */
-export function markReviewed(a) { S.reviewed.add(finishKey(a)); Q.keepMarks(tab(), 'wb-reviewed', S.reviewed); }
+/**
+ * "Looks good" / "Not now" / "Dismiss": this finish has been looked at. `problem`: it was the "Dismiss" of a merge that
+ * did not go through, drawn for that very problem (its data-work, checked against the agent before this), so that
+ * problem goes too (Q.problemKey): it leaves the board, and stays off it if the problem clears. A look drawn before the
+ * problem came never lets the problem go.
+ */
+export function markReviewed(a, { problem = false } = {}) {
+  S.reviewed.add(finishKey(a));
+  const pk = problem ? Q.problemKey(a) : null;
+  if (pk) S.reviewed.add(pk);
+  Q.keepMarks(tab(), 'wb-reviewed', S.reviewed);
+}
 /** "Look later" on a failed check, or on a merge that did not go through: not now, for this finish. */
 export function setAside(a) { S.later.add(finishKey(a)); Q.keepMarks(tab(), 'wb-later', S.later); }
 
@@ -40,7 +50,7 @@ const ctx = () => ({ NEEDS_YOU, PRIORITY, later: S.later });
 export const needsPerson = a => Q.needsPerson(a, ctx());
 export const needsQueue = () => Q.needsQueue(S.agents.values(), ctx());
 export const reviewQueue = () => Q.reviewQueue(S.agents.values(), { reviewed: S.reviewed, later: S.later });
-export const setAsideList = () => Q.setAsideList(S.agents.values(), { later: S.later });
+export const setAsideList = () => Q.setAsideList(S.agents.values(), { later: S.later, reviewed: S.reviewed });
 
 // An agent's work (AgentView.work), against the person's repository as the last snapshot or `repo` event told it. The
 // git screen's detail (ui/gitscreen.js) uses the same rules for its Merge and Throw it away.

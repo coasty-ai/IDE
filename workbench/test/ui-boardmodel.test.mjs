@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { boardModel, splitBoard, boardAndTray, trayWords, doneWords } from '../ui/boardmodel.js';
 import { Lanes, ROWS } from '../ui/lanes.js';
-import { finishKey, readMarks, keepMarks } from '../ui/queue.js';
+import { finishKey, problemKey, readMarks, keepMarks } from '../ui/queue.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
 
 const STATES = { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY };
@@ -209,6 +209,76 @@ test('one with no lane of its own keeps the board dense, though twelve or fewer 
   assert.equal(ids(b.roots).length, 11, 'all eleven drawn');
 });
 
+/**
+ * Agents that start one at a time, each drawn before the next comes (as the page draws them): twelve laptop agents and
+ * eleven cloud ones, taking turns. maxRows 12 holds twelve a side, as at every window size the layout test uses.
+ */
+function crowd(lanes, lap) {
+  const list = [];
+  for (let i = 0; i < 12; i++) {
+    for (const [id, machineId] of [['L' + i, 'laptop'], ['C' + i, 'cloud-1']]) {
+      if (id === 'C11') continue;
+      list.push(agent(id, 'working', { machineId, startedAt: T - 90 * MIN + list.length * 1000 }));
+      boardAndTray(model(list).roots, lanes, { laptop: lap, maxRows: 12 });
+    }
+  }
+  return list;
+}
+
+test('a working agent with no room on a dense board waits in the tray, which shows for it alone and says so', () => {
+  const lanes = new Lanes(memory()), lap = r => r.machineId === 'laptop';
+  const list = crowd(lanes, lap);
+  let b = boardAndTray(model(list).roots, lanes, { laptop: lap, maxRows: 12 });
+  const side = s => list.filter(a => lanes.get(a.id).side === s).length;
+  assert.deepEqual([b.dense, b.nRows, ids(b.roots).length, side('L'), side('R'), b.tray], [true, 12, 23, 12, 11, null], 'the left full, one row free on the right');
+  // one more on the laptop: its side is full, and it never takes the row on the other side
+  const n = agent('new', 'working', { machineId: 'laptop', startedAt: T });
+  b = boardAndTray(model([...list, n]).roots, lanes, { laptop: lap, maxRows: 12 });
+  assert.deepEqual([ids(b.roots).length, b.trayIds.over, lanes.get('new').side], [23, ['new'], 'L']);
+  assert.ok(b.tray, 'the tray shows, though nothing in it is done or from earlier');
+  assert.deepEqual([b.tray.count, b.tray.over, b.tray.done, b.tray.earlier], [1, 1, 0, 0]);
+  assert.deepEqual([b.tray.lead, b.tray.rest, b.tray.text], ['1 more working', '', '1 more working']);
+  assert.equal(b.tray.sum, '1 more working with no room on the board');
+  assert.equal(b.tray.aria, '1 more working with no room on the board. Show them.');
+  assert.deepEqual(b.tray.ids, ['new']);
+  assert.deepEqual(b.tray.marks, [{ shape: 'work', tone: 'work' }], 'its mark in the tray, one for each agent the tray holds');
+  // it starts to ask: it takes the row of the newest one at work on its side, which waits in the tray in its place
+  const asks = { ...n, state: 'needs_ok', ask: asking('new') };
+  b = boardAndTray(model([...list, asks]).roots, lanes, { laptop: lap, maxRows: 12 });
+  assert.ok(ids(b.roots).includes('new') && b.laneOf('new').side === 'L');
+  assert.deepEqual(b.trayIds.over, ['L11'], 'the newest one at work on the left');
+  assert.deepEqual([b.tray && b.tray.count, b.tray && b.tray.text], [1, '1 more working']);
+  // with something done in the tray too, both are counted, and the marks follow the order of the list
+  const done = agent('D', 'done_checked', { endedAt: T, stateSince: T });
+  b = boardAndTray(model([...list, n, done], { reviewed: new Set([finishKey(done)]) }).roots, lanes, { laptop: lap, maxRows: 12 });
+  assert.deepEqual([b.tray.text, b.tray.count, b.tray.marks.map(m => m.shape)], ['1 done, 1 more working', 2, ['ok', 'work']]);
+});
+
+test('twelve at work on each side and one more: the one with no room is in the tray, never drawn nowhere', () => {
+  const lanes = new Lanes(memory()), lap = r => r.machineId === 'laptop';
+  const list = crowd(lanes, lap);
+  list.push(agent('C11', 'working', { machineId: 'cloud-1', startedAt: T - MIN }));
+  let b = boardAndTray(model(list).roots, lanes, { laptop: lap, maxRows: 12 });
+  assert.deepEqual([ids(b.roots).length, b.tray], [24, null], 'twelve a side, all drawn');
+  b = boardAndTray(model([...list, agent('X', 'working', { machineId: 'cloud-1', startedAt: T })]).roots, lanes, { laptop: lap, maxRows: 12 });
+  assert.deepEqual([ids(b.roots).length, b.trayIds.over, b.tray && b.tray.text], [24, ['X'], '1 more working']);
+});
+
+test('the tray\'s words never say "0": whatever it holds leads, and the rest follow in their order', () => {
+  const words = [['done', 'done'], ['notMerged', 'not merged'], ['earlier', 'from earlier'], ['over', 'more working']];
+  for (let mask = 1; mask < 16; mask++) {
+    const counts = Object.fromEntries(words.map(([k], i) => [k, mask & (1 << i) ? i + 2 : 0]));
+    const t = trayWords(counts), tag = JSON.stringify(counts);
+    const want = words.filter(([k]) => counts[k]).map(([k, w]) => `${counts[k]} ${w}`);
+    assert.equal(t.text, want.join(', '), tag);
+    assert.equal(t.lead, want[0], tag);
+    assert.equal(t.lead + t.rest, t.text, tag);
+    assert.equal(t.short.lead, t.lead, tag);
+    for (const s of [t.text, t.short.lead + t.short.rest, t.sum]) assert.doesNotMatch(s, /(^|, )0 /, `${tag}: "${s}"`);
+    assert.ok(t.short.lead.length + t.short.rest.length <= t.text.length, tag);
+  }
+});
+
 test('the tray\'s words: short, "3 done", with earlier agents and working ones with no room counted as before', () => {
   assert.deepEqual(trayWords({ done: 3 }), { lead: '3 done', rest: '', text: '3 done', sum: '3 done', aria: '3 done. Show them.', short: { lead: '3 done', rest: '' } });
   assert.equal(trayWords({ done: 1 }).text, '1 done');
@@ -303,6 +373,22 @@ test('picked from the tray, a merge that does not go through brings it back to t
   // the problem clears (Try again went through): merged with nothing new, it is finished with again
   const merged = { ...p, work: W({ merged: { ...MERGED, at: T + MIN } }), files: files(0) };
   assert.deepEqual(boardAndTray(model([merged, agent('B', 'working')], { reviewed }).roots, lanes, { laptop }).trayIds.done, ['A']);
+});
+
+test('a merge that did not go through, dismissed, waits in the tray saying "not merged", whatever state its agent is in', () => {
+  const lanes = new Lanes(null);
+  const problem = { why: 'conflict', sentence: 'It does not merge cleanly into main.', paths: ['src/a.js'], at: T };
+  for (const [st, f] of [['done_checked', files(3)], ['done_claimed', null], ['stopped', null], ['failed', files(2)]]) {
+    const p = agent('A', st, { endedAt: T - MIN, work: W({ problem }), files: f });
+    let b = boardAndTray(model([p, agent('B', 'working')]).roots, lanes, { laptop });
+    assert.deepEqual(ids(b.roots), ['A', 'B'], st + ': on the board until it is dismissed');
+    // "Dismiss" on the problem's lid, as model.js marks it
+    const reviewed = new Set([finishKey(p), problemKey(p)]);
+    b = boardAndTray(model([p, agent('B', 'working')], { reviewed }).roots, lanes, { laptop });
+    assert.deepEqual([ids(b.roots), b.trayIds.done], [['B'], ['A']], st);
+    assert.equal(doneWords(p, LOOK), 'not merged', st + ': never words that read like work that is in');
+    assert.equal(b.tray.text, '1 not merged', st);
+  }
 });
 
 test('an agent in the tray that is continued, told something or asked for a change comes back to the board, on a lane, at work', () => {

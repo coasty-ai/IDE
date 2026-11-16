@@ -856,6 +856,38 @@ try {
       `${Object.keys(before).length} chips, then ${Object.keys(after).length}; moved ${JSON.stringify(moved.map(id => [id, before[id], after[id]]))}`);
   });
 
+  await run(DT + 'on a dense board whose side is full, a newcomer with no room waits in the tray, which shows for it alone and names it', async () => {
+    // 23 at work, laptop and cloud by turns: the left holds twelve, as many as a side holds at this height, the right eleven
+    await open('done-waits');
+    await sleep(700);
+    const st = await ctl('state'), w1 = st.agents.find(a => a.id === 'w1'), at = Date.now();
+    const one = (i, machineId, o = {}) => ({ ...w1, id: 'z' + i, rootId: 'z' + i, name: `Crowd ${i}`, machineId, state: 'working', endedAt: null, stateSince: at,
+      startedAt: at - (90 - i) * 60000, now: 'Reading the code', says: null, checks: null, files: null, work: null, ...o });
+    await push('snapshot', { ...st, agents: Array.from({ length: 23 }, (_, i) => one(i, i % 2 ? 'cloud-1' : 'laptop')) });
+    await sleep(1300);
+    const sides = () => b.ev(`(() => { const c = document.getElementById('core').getBoundingClientRect(), mid = c.left + c.width / 2, out = { L: 0, R: 0 };
+      for (const e of document.querySelectorAll('#parts .node:not(.leaving) .chip')) { const r = e.getBoundingClientRect(); out[r.left + r.width / 2 < mid ? 'L' : 'R']++; } return out; })()`);
+    const listed = async () => { await click('#tray'); await sleep(300); const r = await b.ev(`[...document.querySelectorAll('#trayList h2, #trayList .row, #trayList .note')].map(r => (r.dataset.agent ? r.dataset.agent + ':' : '') + r.textContent.trim()).join(' | ')`); await b.key('Escape'); await sleep(250); return r; };
+    const s0 = await sides(), t0 = await trayNow(), p0 = await placesNow();
+    // one more laptop agent: the left is full, and it never takes the free row on the right
+    await push('agents', [one(40, 'laptop', { startedAt: Date.now() })]);
+    await sleep(1300);
+    const chips1 = await chipsNow(), s1 = await sides(), t1 = await trayNow(), p1 = await placesNow();
+    const names = await b.ev(`[document.getElementById('tray').getAttribute('aria-label'), document.getElementById('parts').getAttribute('aria-label')]`);
+    const rows1 = await listed();
+    // it asks: it takes the row of the newest one at work on its side, which waits in the tray in its place
+    await push('agents', [one(40, 'laptop', { startedAt: Date.now(), state: 'needs_ok', ask: { id: 'kz', type: 'permission', sentence: 'Crowd 40 wants to run a command', detail: 'npm test', options: ['Allow', 'Deny'], createdAt: Date.now() } })]);
+    await sleep(1300);
+    const chips2 = await chipsNow(), t2 = await trayNow(), rows2 = await listed();
+    const moved = Object.keys(p0).filter(id => p1[id] !== p0[id]);
+    check(DT + 'on a dense board whose side is full, a newcomer with no room waits in the tray, which shows for it alone and names it',
+      s0.L === 12 && s0.R === 11 && t0 === '' && !/z40/.test(chips1) && s1.L === 12 && s1.R === 11 && moved.length === 0 && t1 === '1 more working'
+      && names[0] === '1 more working with no room on the board. Show them.' && names[1] === 'Your agents and their helpers. 1 more working with no room on the board.'
+      && rows1 === 'Working, with no room on the board | z40:Crowd 40 · working'
+      && /z40/.test(chips2) && !/z22\b/.test(chips2) && t2 === '1 more working' && rows2 === 'Working, with no room on the board | z22:Crowd 22 · working',
+      `sides ${JSON.stringify(s0)}, tray "${t0}" → chips ${chips1.split(',').length} (z40 ${/z40/.test(chips1)}), sides ${JSON.stringify(s1)}, moved ${JSON.stringify(moved)}, tray "${t1}", names ${JSON.stringify(names)}, list "${rows1}"; asking: z40 ${/z40/.test(chips2)}, z22 ${/z22\b/.test(chips2)}, tray "${t2}", list "${rows2}"`);
+  });
+
   await run(DT + 'the keyboard on a chip that leaves goes to the core\'s sentence, and a card pinned to it goes too', async () => {
     await open('done-waits');
     await sleep(900);
@@ -901,6 +933,57 @@ try {
       `"${shown}" → chips ${chips}, tray "${tray}"; after Look later: chips ${chips2}, tray "${tray2}"`);
   });
 
+  await run(DT + 'a merge that did not go through keeps its agent on the board, set aside or not, until "Dismiss" lets it go: the tray says "not merged"', async () => {
+    // Invoice export, let go with "Not now", is picked in the tray and merged; the merge conflicts
+    await open('done-waits', { mode: { merge: 'conflict' } });
+    await sleep(900);
+    await clickIn('[data-act="looksgood"]'); await sleep(1300);
+    const tray0 = await trayNow();
+    await click('#tray'); await sleep(300);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="w1"]').click(), 1`); await sleep(900);
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    await clickIn('[data-act="confirm"][data-go="1"]'); await sleep(1500);
+    const chips1 = await chipsNow(), lid1 = await lidNow(), quiet = await b.ev(`[...(${page()}?.querySelectorAll('.links button') || [])].map(x => x.textContent).join(',')`);
+    // "Look later": set aside, it stays at the board's edge
+    await clickIn('[data-act="later"]'); await sleep(1300);
+    const chips2 = await chipsNow(), lid2 = await lidNow();
+    // picked on the board, "Dismiss": off the board, into the tray, and its row says its work is not merged
+    await click('.chip[data-id="w1"]'); await sleep(900);
+    const lid3 = await lidNow();
+    await clickIn('[data-act="reviewed"]'); await sleep(1300);
+    const chips4 = await chipsNow(), tray4 = await trayNow(), lid4 = await lidNow();
+    await click('#tray'); await sleep(300);
+    const row = await b.ev(`document.querySelector('#trayList .row[data-agent="w1"]')?.textContent.trim() || ''`);
+    // a reload keeps it there, and it is neither asked about again nor offered as set aside
+    await b.goto(`${base}/?t=k`, 1600);
+    const reChips = await chipsNow(), reTray = await trayNow(), reLid = await lidNow();
+    check(DT + 'a merge that did not go through keeps its agent on the board, set aside or not, until "Dismiss" lets it go: the tray says "not merged"',
+      tray0 === '1 not merged' && chips1 === 'w1~' && /Invoice export’s work does not merge cleanly into main\./.test(lid1) && quiet === 'Review the changes,Dismiss'
+      && chips2 === 'w1~' && /^1 set aside/.test(lid2) && /does not merge cleanly/.test(lid3)
+      && chips4 === '' && tray4 === '1 not merged' && /^All clear/.test(lid4) && row === 'Invoice export · not merged'
+      && reChips === '' && reTray === '1 not merged' && /^All clear/.test(reLid),
+      `tray "${tray0}"; merged from the tray: chips ${chips1}, lid "${lid1}" [${quiet}]; Look later: chips ${chips2}, lid "${lid2}"; picked "${lid3}"; Dismiss: chips "${chips4}", tray "${tray4}", lid "${lid4}", row "${row}"; reload: chips "${reChips}", tray "${reTray}", lid "${reLid}"`);
+  });
+
+  await run(DT + 'a "Not now" drawn before a merge went wrong does not dismiss what went wrong: its agent stays on the board', async () => {
+    // done-waits' Invoice export, its lid drawn with "Not now"; a merge of it conflicts (from elsewhere) before the lid is
+    // drawn again, and the old "Not now" is clicked
+    await open('done-waits');
+    await sleep(900);
+    const w1 = await agentOf('w1');
+    await b.ev(`window.__frames.hold = true, 1`);
+    await push('agents', [{ ...w1, work: { ...w1.work, problem: { why: 'conflict', sentence: 'Invoice export’s work does not merge cleanly into main.', paths: ['src/invoices/batch.ts'], into: 'main', at: Date.now() } } }]);
+    await sleep(500);   // the stream has brought it; the lid has not been drawn again
+    const drawn = await b.ev(`${page()}?.querySelector('[data-act="looksgood"]')?.textContent || ''`);
+    await clickIn('[data-act="looksgood"]');
+    await sleep(300);
+    await b.ev(`window.__frames.release(), 1`);
+    await sleep(1300);
+    const chips = await chipsNow(), tray = await trayNow(), lid = await lidNow();
+    check(DT + 'a "Not now" drawn before a merge went wrong does not dismiss what went wrong: its agent stays on the board',
+      drawn === 'Not now' && chips === 'w1~' && tray === '' && /does not merge cleanly into main\./.test(lid), `clicked "${drawn}" → chips "${chips}", tray "${tray}", lid "${lid}"`);
+  });
+
   await run(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent', async () => {
     const typeIt = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); };
     const sent = async () => (await posts()).filter(x => x.path === '/api/command' || /\/answer$/.test(x.path)).map(x => [x.path, x.body]);
@@ -924,18 +1007,48 @@ try {
     await sleep(900);
     await typeIt('looks good, merge it'); await sleep(1000);
     const p3 = await sent();
-    // so does "looks good" where the lid has no "Looks good": work that can merge offers Merge and "Not now", and words
-    // that sound like approval never press "Not now", which would send work not merged yet to the tray
+    // "looks good" where no button stands for it: work that can merge offers Merge and "Not now", and words that sound
+    // like approval neither merge it nor press "Not now" (which would send work not merged yet to the tray). Nothing is
+    // sent, and the page says which answers the lid has
+    const saidNow = () => b.ev(`document.getElementById('said').textContent`);
     await open('done-waits');
     await sleep(900);
     await typeIt('looks good'); await sleep(1000);
-    const p4 = await sent(), chips4 = await chipsNow();
+    const p4 = await sent(), chips4 = await chipsNow(), said4 = await saidNow();
+    // "not now" sets aside what its lid sets aside, whatever that button says: "Look later" at a merge that conflicts,
+    // and at a failed check
+    const notNowAt = async (sc, id) => {
+      await open(sc); await b.goto(`${base}/?t=k&focus=${id}`, 1600); await clearLog();
+      await typeIt('not now'); await sleep(1000);
+      return { p: await sent(), said: await saidNow(), later: await b.ev(`sessionStorage.getItem('wb-later') || ''`) };
+    };
+    const conflict = await notNowAt('merge', 'm7e8f9'), failedCheck = await notNowAt('merge-more', 'n1');
+    // "ok" at a stopped agent's lid could as well mean Continue: nothing is pressed or sent, and the lid's answers are
+    // named; "not now" there is its Dismiss, and it goes to the tray. "ok" beside "Give it $2.00 more" sends nothing either
+    await open('done-tray'); await b.goto(`${base}/?t=k&focus=t4`, 1600); await clearLog();
+    await typeIt('ok'); await sleep(1000);
+    const p6 = (await posts()).map(x => [x.path, x.body]), chips6 = await chipsNow(), said6 = await saidNow();
+    await typeIt('not now'); await sleep(1300);
+    const p7 = (await posts()).map(x => [x.path, x.body]), chips7 = await chipsNow(), tray7 = await trayNow();
+    await open('limit'); await sleep(900); await clearLog();
+    const limitLid = await h1();
+    await typeIt('ok'); await sleep(1000);
+    const pLimit = (await posts()).map(x => [x.path, x.body]), saidLimit = await saidNow();
+    // "not now" where "Looks good" answers both (the demo merges nothing): that button, with "Not now" for its answer
+    await open('demo'); await b.goto(`${base}/?t=k&focus=228202`, 1600); await clearLog();
+    await typeIt('not now'); await sleep(1300);
+    const p8 = await sent();
     check(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent',
       p1.length === 1 && p1[0][0] === '/api/agents/w1/answer' && p1[0][1].answer === 'Not now' && !('askId' in p1[0][1]) && chips1 === '' && tray1 === '1 not merged'
       && /Invoice export is done and checked\./.test(lid) && p2.length === 1 && p2[0][0] === '/api/agents/228202/answer' && p2[0][1].answer === 'Looks good' && tray2 === '1 done'
       && p3.length === 1 && p3[0][0] === '/api/command' && p3[0][1].text === 'looks good, merge it'
-      && p4.length === 1 && p4[0][0] === '/api/command' && p4[0][1].text === 'looks good' && chips4 === 'w1~',
-      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" with no such button: ${JSON.stringify(p4)}, chips "${chips4}"`);
+      && p4.length === 0 && chips4 === 'w1~' && said4 === 'Choose “Merge into main” or “Not now”.'
+      && conflict.p.length === 0 && conflict.said === 'OK, Search cleanup can wait.' && /"m7e8f9@/.test(conflict.later)
+      && failedCheck.p.length === 0 && /^OK, .+ can wait\.$/.test(failedCheck.said) && /"n1@/.test(failedCheck.later)
+      && p6.length === 0 && chips6 === 't1,t4~' && said6 === 'Choose “Continue” or “Dismiss”.' && p7.length === 0 && chips7 === 't1' && tray7 === '3 done'
+      && /stopped with an error\.$/.test(limitLid) && pLimit.length === 0 && saidLimit === 'Choose “Give it $2.00 more” or “Dismiss”.'
+      && p8.length === 1 && p8[0][0] === '/api/agents/228202/answer' && p8[0][1].answer === 'Not now',
+      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" with no such button: ${JSON.stringify(p4)}, chips "${chips4}", said "${said4}"; "not now" at a conflict: ${JSON.stringify(conflict)}; at a failed check: ${JSON.stringify(failedCheck)}; "ok" at a stopped agent: ${JSON.stringify(p6)}, chips "${chips6}", said "${said6}"; then "not now": ${JSON.stringify(p7)}, chips "${chips7}", tray "${tray7}"; "ok" at "${limitLid}": ${JSON.stringify(pLimit)}, said "${saidLimit}"; "not now" in the demo: ${JSON.stringify(p8)}`);
   });
 
   // ---------------------------------------------------------------- D2: merge, review and throw away (the 'merge' scenarios)
