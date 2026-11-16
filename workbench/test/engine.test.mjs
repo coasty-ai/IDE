@@ -601,6 +601,99 @@ test('a prompt is answered as soon as its agent is on the board, while its copy 
   await t.engine.shutdown();
 });
 
+test('every prompt and agents’ copies: a typed prompt starts its agent at once, and its copy is made before it runs; the setup card comes by itself, one for prompts typed while it waits, and each start is said once', async () => {
+  const t = copies({ setup: 'npm ci' });
+  t.engine.deps.commands = commands;
+  const g = gate();
+  t.git.fillGate = g;
+  let told = 0;
+  t.engine.on('setup', () => { told += 1; });
+  const out = await t.engine.command('the login page is broken');
+  assert.equal(out.confirm, undefined, 'no card before work starts');
+  assert.equal(out.reply, 'Started Claude on “the login page is broken”.');
+  const [v] = t.store.list();
+  assert.equal(v.state, 'starting');
+  assert.equal(t.store.get(v.id).now, 'Copying .env, apps/web/.env.local and node_modules into its copy', 'the chip says what is being copied');
+  // the setup command has no OK yet: its card comes by itself, while the copy is made
+  const card = await setupCard(t);
+  assert.equal(card.command, 'npm ci');
+  // another prompt while it waits starts at once too, and waits on the same card
+  const two = await t.engine.command('the cart total is wrong');
+  assert.equal(two.reply, 'Started Claude on “the cart total is wrong”.');
+  g.open();
+  await until(() => t.store.list().length === 2 && t.store.list().every(a => a.now === SETUP_WAITING));
+  assert.equal(told, 1, 'one setup card, never one per agent');
+  assert.equal(t.engine.snapshot().setup.id, card.id);
+  assert.equal(t.claude.runners.length, 0, 'no runner before the answer');
+  assert.equal((await t.engine.command('run it', { confirmId: card.id })).reply, SETUP_RAN);
+  await until(() => t.claude.runners.length === 2 && t.claude.runners.every(r => r.started));
+  // in order: the copies, then the setup command in each, then the runners
+  const order = t.calls.order;
+  assert.deepEqual(order.slice(0, 2), ['fill', 'fill']);
+  assert.equal(order.filter(x => x === 'setup').length, 2);
+  assert.ok(order.lastIndexOf('setup') > order.lastIndexOf('fill') && order.indexOf('runner') > order.indexOf('setup'), order.join(' '));
+  assert.deepEqual(t.notices.filter(n => /^Started /.test(n)), ['Started Claude on “the login page is broken”.', 'Started Claude on “the cart total is wrong”.'], 'each start said once, quoting its prompt');
+  assert.match(t.store.get(v.id).now, /The setup command ran in it\.$/);
+  await t.engine.shutdown();
+});
+
+test('every prompt and agents’ copies: the start card of several agents starts them only on its yes; then each copy is made, and one setup card asks for all of them', async () => {
+  const t = copies({ setup: 'npm ci' });
+  t.engine.deps.commands = commands;
+  let told = 0;
+  t.engine.on('setup', () => { told += 1; });
+  const ask = await t.engine.command('start three agents on the login page');
+  assert.equal(ask.confirm.kind, 'start');
+  assert.equal(ask.confirm.sentence, 'Start three Claude agents on “the login page”?');
+  assert.equal(t.store.list().length, 0, 'nothing starts before its yes');
+  const yes = await t.engine.command('do it', { confirmId: ask.confirm.id });
+  assert.equal(yes.reply, 'Started three Claude agents on “the login page”.');
+  assert.equal(t.store.list().length, 3);
+  const setup = await setupCard(t);
+  await until(() => t.calls.fillWorkspace.length === 3 && t.store.list().every(a => a.now === SETUP_WAITING));
+  assert.equal(told, 1, 'one setup card for the three');
+  assert.equal(t.claude.runners.length, 0);
+  // a "yes" said out of habit keeps it, with its hint
+  const habit = await t.engine.command('yes', { confirmId: setup.id });
+  assert.equal(habit.reply, 'Say “run it” or “not now”.');
+  assert.deepEqual(habit.confirm, { ...setup });
+  assert.equal(t.calls.runSetup.length, 0);
+  assert.equal((await t.engine.command('run it', { confirmId: setup.id })).reply, SETUP_RAN);
+  await until(() => t.claude.runners.length === 3 && t.claude.runners.every(r => r.started));
+  assert.equal(t.calls.runSetup.length, 3);
+  assert.deepEqual(t.notices.filter(n => /^Started /.test(n)), ['Started three Claude agents on “the login page”.'], 'said once');
+  await t.engine.shutdown();
+});
+
+test('every prompt and agents’ copies: the setup card takes only its own words; a yes alone, or one that goes on, keeps it and starts nothing; a prompt typed at it starts work that waits on it; its no lets them all start', async () => {
+  const t = copies({ setup: 'npm ci' });
+  t.engine.deps.commands = commands;
+  await t.engine.command('fix the login redirect');
+  const card = await setupCard(t);
+  for (const said of ['yes', 'sure', 'okay', 'yes please', 'go ahead', 'yes, and then tell me', 'yeah, add tests too', 'ok hold on']) {
+    const r = await t.engine.command(said, { confirmId: card.id });
+    assert.equal(r.reply, 'Say “run it” or “not now”.', said);
+    assert.equal(r.confirm.id, card.id, said);
+    assert.equal(t.engine.snapshot().setup.id, card.id, said);
+  }
+  assert.equal(t.store.list().length, 1, 'none of those started work');
+  assert.equal(t.calls.runSetup.length, 0);
+  const typed = await t.engine.command('the cart total is wrong', { confirmId: card.id });
+  assert.equal(typed.reply, 'Started Claude on “the cart total is wrong”.');
+  assert.equal(t.engine.snapshot().setup.id, card.id, 'the card stays');
+  await until(() => t.store.list().length === 2 && t.store.list().every(a => a.now === SETUP_WAITING));
+  assert.equal((await t.engine.command('not now', { confirmId: card.id })).reply, 'OK. The agents start without it, and Workbench asks again next time.');
+  await until(() => t.claude.runners.length === 2 && t.claude.runners.every(r => r.started));
+  assert.equal(t.calls.runSetup.length, 0);
+  // Not now keeps nothing: the next prompt asks again, and "skip it" is its no too
+  await t.engine.command('fix the tax rounding');
+  const again = await until(() => t.engine.snapshot().setup?.id !== card.id && t.engine.snapshot().setup);
+  assert.equal((await t.engine.command('skip it', { confirmId: again.id })).reply, 'OK. The agent starts without it, and Workbench asks again next time.');
+  await until(() => t.claude.runners.length === 3);
+  assert.equal(t.calls.runSetup.length, 0);
+  await t.engine.shutdown();
+});
+
 test('the demo copies nothing and runs no setup command, whatever workbench.json says', async () => {
   const store = new Store();
   const sim = new FakeSim();

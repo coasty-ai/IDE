@@ -2096,12 +2096,30 @@ test('the setup card takes its buttons’ words, "run it" and "not now", "do it"
   for (const s of ['not now', 'Not now.', 'no', 'cancel', 'skip it', 'skip the setup', 'no thanks', "don't run it"]) {
     assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: false }, s);
   }
-  // a "yes" said out of habit after a launch's yes never runs it: the card stays
+  // a "yes" said out of habit after starting work never runs it: the card stays
   for (const s of ['yes', 'okay', 'sure', 'go ahead', 'yes please', 'make it so']) assert.equal(parseCommand(s, ctx).kind, 'unknown', s);
-  // asked, not said: it stays; "start it" is a yes to launches only
+  // asked, not said: it stays; "start it" is a yes to a start card only
   for (const s of ['run it?', 'start it']) assert.notEqual(parseCommand(s, ctx).kind, 'confirm', s);
   // without its card, "run it" is no answer to anything
   assert.notDeepEqual(parseCommand('run it', CTX.none), { kind: 'confirm', go: true });
+});
+
+test('beside every prompt, the setup card still takes only its own words: a yes first that goes on keeps it, its own words or a no first answer it whatever follows, and other words are a prompt', () => {
+  const ctx = { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c30', kind: 'setup' } };
+  // a yes word is no answer to it, alone or with more after it, so what follows starts nothing either: the card stays
+  for (const s of ['yes, and then tell me', 'yeah, add tests too', 'ok, and tell me when it is done', 'sure, thanks a lot', 'okay whatever', 'ok hold on', 'sure, never mind']) {
+    assert.equal(parseCommand(s, ctx).kind, 'unknown', s);
+  }
+  for (const s of ['do that', 'do it, thanks', 'run it because we need the packages', 'run it, and then tell me', 'okay run it']) {
+    assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: true }, s);
+  }
+  for (const s of ['not now, I am on a train', 'no, because it takes ten minutes', 'run it, wait']) assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: false }, s);
+  // anything else is a prompt, as typed: it starts its agent, which waits on the same card
+  assert.deepEqual(parseCommand('the cart total is wrong', ctx), { kind: 'task', task: 'the cart total is wrong' });
+  // the throw-away and full permissions cards, whose bare yes keeps them too, take a yes that goes on
+  for (const kind of ['discard', 'permissions']) {
+    assert.deepEqual(parseCommand('yes, and then tell me', { ...ctx, pendingConfirm: { id: 'c31', kind } }), { kind: 'confirm', go: true }, kind);
+  }
 });
 
 
