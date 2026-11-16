@@ -205,6 +205,17 @@ function copies({ fill = FILLED, setup, env = { values: [], files: 2 }, prefs, o
 /** The setup card the engine waits on, once it shows (the snapshot's `setup`). */
 const setupCard = (t) => until(() => t.engine.snapshot().setup);
 
+test('the tidy-up hears what an agent’s copy got, so a folder holding only those copies can go at shutdown', async () => {
+  const t = copies();
+  const v = await t.engine.startAgent({ task: 'Fix the login redirect' });
+  await until(() => t.calls.order.includes('runner'));
+  await t.engine.shutdown();
+  const call = t.calls.removeWorkspace.find(o => o.path === v.workspace);
+  assert.ok(call, 'its folder is offered to the tidy-up');
+  assert.deepEqual(call.copied, ['.env', 'apps/web/.env.local', 'node_modules']);
+  assert.equal(call.onlyIfUnchanged, true);
+});
+
 test('a new agent’s copy is filled first, then its setup command runs, then its runner starts; it says what it copies, and then what came of it', async () => {
   const t = copies({ setup: 'npm ci', prefs: memoryPrefs({ setupOk: { [REPO.root]: sha('npm ci') } }) });
   const g = gate();
@@ -955,7 +966,7 @@ test('an agent that could not start has its unchanged folder and branch removed'
   const t = live({ adapters: { claude: fakeAdapter('claude', { failStart: new Error('spawn claude ENOENT') }) } });
   const v = await t.engine.startAgent({ task: 'Fix the login' });
   assert.equal(v.state, 'failed');
-  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: v.workspace, base: FAKE_BASE, onlyIfUnchanged: true, deleteBranch: true }]);
+  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: v.workspace, base: FAKE_BASE, onlyIfUnchanged: true, deleteBranch: true, copied: [] }]);
   const { kept } = await t.engine.shutdown();
   assert.equal(t.calls.removeWorkspace.length, 1, 'not asked again at shutdown');
   assert.deepEqual(kept, []);
@@ -1011,7 +1022,7 @@ test('a launch still making its folder when Workbench closes starts no agent, an
   await refused;
   assert.equal(t.claude.runners.length, 0, 'no agent was started');
   assert.deepEqual(t.store.list(), []);
-  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: t.ws.path, base: FAKE_BASE, onlyIfUnchanged: true, deleteBranch: true }]);
+  assert.deepEqual(t.calls.removeWorkspace, [{ repoRoot: REPO.root, path: t.ws.path, base: FAKE_BASE, onlyIfUnchanged: true, deleteBranch: true, copied: [] }]);
   assert.deepEqual(kept, []);
   assert.deepEqual(t.engine.keptFolders(), []);
 });

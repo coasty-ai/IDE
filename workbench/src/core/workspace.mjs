@@ -1342,7 +1342,7 @@ async function listWorktrees(root, run = git) {
  * may be the only copy of its work.
  * @returns {Promise<{ removed: boolean, branch?: string|null, kept?: true }>}
  */
-export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = false, onlyIfUnchanged = false, base = null, since = null } = {}) {
+export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = false, onlyIfUnchanged = false, base = null, since = null, copied = [] } = {}) {
   const root = realRoot(repoRoot);
   if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath)) throw plainError('No workspace folder was given.');
   const target = canonical(wsPath);
@@ -1356,8 +1356,10 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
   if (onlyIfUnchanged) {
     const head = await git(['rev-parse', 'HEAD'], { cwd: entry.path }).then(r => r.stdout.trim(), () => null);
     if (head !== start) return { removed: false, kept: true }; // the agent made commits, or the folder is unreadable
-    const status = await git(['status', '--porcelain', '--ignored', '--untracked-files=all'], { cwd: entry.path }).then(r => r.stdout, () => null);
+    const status = await git(['status', '--porcelain', '--untracked-files=all'], { cwd: entry.path }).then(r => r.stdout, () => null);
     if (status !== '') return { removed: false, kept: true };
+    // Files git ignores may be work too (a build, a log), unless they are what Workbench copied in (fillWorkspace).
+    if (!(await onlyCopiesIgnored(entry.path, copied))) return { removed: false, kept: true };
     if (!(await filesAsCommitted(entry.path, start))) return { removed: false, kept: true }; // an edit git status cannot see
     if (merged && !(await inPersonsBranch(root, start))) return { removed: false, kept: true }; // the merge was undone
     try {
@@ -1386,6 +1388,36 @@ export async function removeWorkspace({ repoRoot, path: wsPath, deleteBranch = f
     fs.rmdirSync(path.dirname(entry.path)); // the per-repository folder, only if now empty
   } catch {}
   return { removed: true, branch: entry.branch };
+}
+
+/**
+ * Whether every file git ignores in an agent's folder is one Workbench copied in, or inside one: `copied` is
+ * fillWorkspace's list of paths, relative to the folder. A folder git shows whole because it ignores all of it is a
+ * copy when it is one of them; when it only holds copies (an env file inside a folder git hides), every file in it must
+ * be one. Anything else git ignores there (a build, a log, a file the agent hid) may be work, and keeps the folder.
+ * Never rejects: false when git cannot say.
+ */
+async function onlyCopiesIgnored(cwd, copied) {
+  const mine = (Array.isArray(copied) ? copied : [])
+    .filter(p => typeof p === 'string' && p !== '' && !p.startsWith('/') && !p.includes('\0') && !p.split('/').includes('..'))
+    .map(p => p.replace(/\/+$/, ''));
+  const within = p => { const q = p.replace(/\/+$/, ''); return mine.some(c => q === c || q.startsWith(c + '/')); };
+  const holds = p => { const q = p.replace(/\/+$/, ''); return mine.some(c => c.startsWith(q + '/')); };
+  const list = async (args) => {
+    const out = await git(['status', '--porcelain', '-z', ...args], { cwd }).then(r => r.stdout, () => null);
+    return out === null ? null : out.split('\0').filter(Boolean);
+  };
+  const top = await list(['--ignored=traditional', '--untracked-files=normal']);
+  if (top === null) return false;
+  for (const e of top) {
+    if (!e.startsWith('!! ')) return false;
+    const p = e.slice(3);
+    if (within(p)) continue;
+    if (!p.endsWith('/') || !holds(p)) return false;
+    const inside = await list(['--ignored=traditional', '--untracked-files=all', '--', `:(literal)${p}`]);
+    if (inside === null || inside.some(x => !x.startsWith('!! ') || !within(x.slice(3)))) return false;
+  }
+  return true;
 }
 
 /**

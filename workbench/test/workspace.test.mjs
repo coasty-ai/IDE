@@ -537,6 +537,37 @@ test('removeWorkspace with onlyIfUnchanged removes an untouched workspace and it
   for (const ws of [ignoredOnly, untracked, edited, committed]) await removeWorkspace({ repoRoot: repo, path: ws.path, deleteBranch: true });
 });
 
+test('removeWorkspace with onlyIfUnchanged takes away a folder whose only extra files are the ones Workbench copied in, and keeps anything else', async () => {
+  const t = await fillRepo(
+    { '.gitignore': '.env\nnode_modules/\n.vercel/\nbuild.log\n', 'a.txt': 'a\n' },
+    { '.env': 'K=value\n', 'node_modules/pkg/index.js': 'x\n', '.vercel/.env.development.local': 'V=1\n' },
+  );
+  const base = git(t.ws, 'rev-parse', 'HEAD');
+  const filled = await fillWorkspace({ repoRoot: t.root, path: t.ws, copy: cpStandIn() });
+  const copied = filled.copied.map(c => c.path);
+  for (const p of ['.env', 'node_modules', '.vercel/.env.development.local']) assert.ok(copied.includes(p), `${p} was copied: ${copied}`);
+  const tidy = (more = {}) => removeWorkspace({ repoRoot: t.root, path: t.ws, base, onlyIfUnchanged: true, deleteBranch: true, ...more });
+  // Without the list of what was copied, the copies may be work, as before.
+  assert.deepEqual(await tidy(), { removed: false, kept: true });
+  // An ignored file the agent made itself still keeps the folder, beside the copies and inside a folder git hides whole.
+  write(path.join(t.ws, 'build.log'), 'made by the agent\n');
+  assert.deepEqual(await tidy({ copied }), { removed: false, kept: true });
+  fs.rmSync(path.join(t.ws, 'build.log'));
+  write(path.join(t.ws, '.vercel/output.json'), '{}\n');
+  assert.deepEqual(await tidy({ copied }), { removed: false, kept: true });
+  fs.rmSync(path.join(t.ws, '.vercel/output.json'));
+  // A change git sees keeps it too.
+  write(path.join(t.ws, 'a.txt'), 'changed\n');
+  assert.deepEqual(await tidy({ copied }), { removed: false, kept: true });
+  git(t.ws, 'checkout', '--', 'a.txt');
+  // A package added inside the copied node_modules is part of the copy: with only copies left, the folder goes.
+  write(path.join(t.ws, 'node_modules/added/index.js'), 'y\n');
+  const branch = git(t.ws, 'branch', '--show-current');
+  assert.deepEqual(await tidy({ copied }), { removed: true, branch });
+  assert.equal(fs.existsSync(t.ws), false);
+  assert.equal(git(t.root, 'branch', '--list', branch), '');
+});
+
 test('a workspace that cannot be finished after git made it is taken away again, with its branch', async () => {
   const realpath = fs.realpathSync.native;
   let calls = 0;

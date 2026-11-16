@@ -581,6 +581,9 @@ test('what is loaded is cleaned: commit ids are full ids, an agent’s branch st
     workspace: { path: '/w/w2', branch: 'main', base: 'abc1234', since: 'zz'.repeat(20), from: '-rf' },
   };
   assert.deepEqual(historyMod.cleanRecord(raw).workspace, { path: '/w/w2', branch: null, base: null, since: null, from: null });
+  // What Workbench copied into the folder is kept, for a later run's tidy-up; anything that is not a relative path goes.
+  assert.deepEqual(historyMod.cleanRecord({ ...raw, workspace: { path: '/w/w2', branch: 'workbench/w2', copied: ['.env', 'node_modules', '/etc/passwd', '../x', 7, ''] } }).workspace.copied, ['.env', 'node_modules']);
+  assert.equal('copied' in historyMod.cleanRecord({ ...raw, workspace: { path: '/w/w2', branch: 'workbench/w2' } }).workspace, false);
   assert.equal(historyMod.cleanRecord({ ...raw, workspace: { path: 'relative/w2', branch: 'workbench/w2' } }).workspace, null);
   assert.equal(historyMod.cleanRecord({ ...raw, workspace: { path: '/w/\0w2', branch: 'workbench/w2' } }).workspace, null);
   for (const bad of ['feature/x', 'workbench/../x', 'workbench/x.lock', 'workbench/.x', 'workbench//x', 'workbench/x/', 'workbench/x y',
@@ -726,7 +729,7 @@ test('an earlier agent merged in this run is tidied at shutdown like one of this
   await second.engine.shutdown();
   // Asked once, only if nothing changed since its merged work commit (since), with its branch.
   assert.deepEqual(second.calls.removeWorkspace.filter(c => c.path === folder).map(c => ({ ...c, repoRoot: null })), [
-    { repoRoot: null, path: folder, base: BASE, since: FAKE_WORK, onlyIfUnchanged: true, deleteBranch: true },
+    { repoRoot: null, path: folder, base: BASE, since: FAKE_WORK, onlyIfUnchanged: true, deleteBranch: true, copied: [] },
   ]);
   const w = second.store.get(id).work;
   assert.deepEqual([w.folder, w.branch, w.merged.merge], [false, null, FAKE_MERGE]);

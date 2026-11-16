@@ -2738,6 +2738,8 @@ export class Engine extends EventEmitter {
       return ['Workbench could not copy your ignored files into its copy.'];
     }
     const copied = Array.isArray(r?.copied) ? r.copied : [];
+    // What it copied, so the tidy-up knows these ignored files are Workbench's, not the agent's work (removeWorkspace).
+    if (run.workspace) run.workspace.copied = copied.map(c => c?.path).filter(p => typeof p === 'string' && p !== '');
     const skipped = Array.isArray(r?.skipped) ? r.skipped : [];
     if (copied.length && typeof this.deps.workspace?.envValues === 'function') {
       try {
@@ -2913,7 +2915,7 @@ export class Engine extends EventEmitter {
       // where it started (base) and, once it was merged, where its unmerged work starts (since, its merged work
       // commit): then the folder goes only while that commit is still in another branch, so a merge the person undid
       // never takes the only copy of the work with it.
-      const args = { repoRoot: this.repoInfo.root, path: ws.path, base: ws.base ?? null, onlyIfUnchanged: true, deleteBranch: true };
+      const args = { repoRoot: this.repoInfo.root, path: ws.path, base: ws.base ?? null, onlyIfUnchanged: true, deleteBranch: true, copied: Array.isArray(ws.copied) ? ws.copied : [] };
       if (ws.since && ws.since !== ws.base) args.since = ws.since;
       const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace(args)), this.options.stopTimeoutMs);
       if (out?.removed) {
