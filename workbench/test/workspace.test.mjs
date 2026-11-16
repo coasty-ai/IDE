@@ -2517,6 +2517,14 @@ const readText = f => fs.readFileSync(f, 'utf8');
 const present = f => { try { fs.lstatSync(f); return true; } catch { return false; } };
 const modeOf = f => fs.statSync(f).mode & 0o777;
 const pathsOf = list => list.map(e => e.path);
+/** Make every real folder at or in `p` open to its owner again, so that the tests' folder can be removed at the end. */
+function openAll(p) {
+  let st;
+  try { st = fs.lstatSync(p); } catch { return; }
+  if (!st.isDirectory()) return;
+  fs.chmodSync(p, 0o755);
+  for (const name of fs.readdirSync(p)) openAll(path.join(p, name));
+}
 
 // Each has repositories of its own, and none changes process.env, so they run a few at a time.
 describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
@@ -2911,6 +2919,101 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     for (const f of ['.env.local', '.envrc', 'packages/a/node_modules']) assert.equal(present(t.w(f)), false, f);
     assert.equal(readText(t.w('src/.env')), 'S=1\n');
     assert.equal(readText(t.w('node_modules/x/index.js')), 'x\n');
+  });
+
+  test('a half-made copy is taken away even where cp kept a folder read-only, as the person’s is', async () => {
+    const t = await fillRepo({ '.gitignore': 'node_modules/\n', 'packages/a/package.json': '{}\n' },
+      { 'node_modules/aa/sub/file.js': 'x\n', 'node_modules/zz/locked.js': 'z\n', 'packages/a/node_modules/y/index.js': 'y\n' });
+    const cp = cpStandIn(({ dst }) => {
+      if (dst !== t.w('node_modules')) return;
+      // cp -p kept aa/ read-only (Go's module cache is), then could not read zz/locked.js and gave up.
+      fs.mkdirSync(path.join(dst, 'aa/sub/none'), { recursive: true });
+      fs.writeFileSync(path.join(dst, 'aa/sub/file.js'), 'x\n');
+      fs.chmodSync(path.join(dst, 'aa/sub/none'), 0o000);
+      fs.chmodSync(path.join(dst, 'aa/sub'), 0o555);
+      fs.chmodSync(path.join(dst, 'aa'), 0o555);
+      throw cpError(`cp: ${t.p('node_modules/zz/locked.js')}: Permission denied\n`);
+    });
+    try {
+      const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy });
+      assert.deepEqual(r.skipped, [{ path: 'node_modules', why: 'failed' }]);
+      assert.deepEqual(pathsOf(r.copied), ['packages/a/node_modules']);
+      assert.equal(present(t.w('node_modules')), false, 'the half-made copy is gone');
+    } finally {
+      openAll(t.w('node_modules'));
+    }
+  });
+
+  test('a half-made copy that cannot be taken away is named as left', { skip: process.platform !== 'darwin' && 'chflags is the Mac’s' }, async () => {
+    const t = await fillRepo(...SMALL);
+    const stuck = t.w('node_modules/x/index.js');
+    const cp = cpStandIn(({ dst }) => {
+      if (dst !== t.w('node_modules')) return;
+      put(dst, { 'x/index.js': 'x\n' });
+      execFileSync('/usr/bin/chflags', ['uchg', stuck]); // cp -p keeps a locked file locked: nothing can remove it
+      throw cpError(`cp: ${dst}: Input/output error\n`);
+    });
+    try {
+      const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy });
+      assert.deepEqual(r.skipped, [{ path: 'node_modules', why: 'failed', left: true }]);
+      assert.deepEqual(pathsOf(r.copied), ['.env', 'packages/a/node_modules']);
+    } finally {
+      if (present(stuck)) execFileSync('/usr/bin/chflags', ['nouchg', stuck]);
+    }
+  });
+
+  test('what git in the agent’s folder would not ignore is taken away again: it would be the agent’s work, and a merge would bring it in', async () => {
+    // The commit ignores node_modules only: the person added .env to .gitignore without committing it.
+    const t = await fillRepo({ '.gitignore': 'node_modules/\n', 'index.js': 'x\n' },
+      { '.env': 'SECRET=1\n', 'cfg/.env.local': 'L=1\n', 'node_modules/m/index.js': 'm\n' });
+    fs.appendFileSync(t.p('.gitignore'), '.env\n.env.*\n');
+    const base = git(t.ws, 'rev-parse', 'HEAD');
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy });
+    assert.deepEqual(r.copied, [{ path: 'node_modules', kind: 'deps', cloned: true }]);
+    assert.deepEqual(r.skipped, [{ path: '.env', why: 'not-ignored' }, { path: 'cfg/.env.local', why: 'not-ignored' }]);
+    for (const f of ['.env', 'cfg']) assert.equal(present(t.w(f)), false, f);
+    assert.equal(statusOf(t.ws), '');
+    assert.deepEqual((await snapshotWork({ repoRoot: t.root, path: t.ws, since: base })).files, []);
+    assert.deepEqual((await diffStats({ path: t.ws, base })).list, []);
+
+    // No .gitignore committed at all: the person's own, never committed, ignores everything that is copied.
+    const u = await fillRepo({ 'index.js': 'x\n' }, { '.gitignore': '.env\nnode_modules/\n', '.env': 'S=1\n', 'node_modules/m/index.js': 'm\n' });
+    const r2 = await fillWorkspace({ repoRoot: u.root, path: u.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy });
+    assert.deepEqual([r2.copied, r2.skipped], [[], ['.env', 'node_modules'].map(p => ({ path: p, why: 'not-ignored' }))]);
+    assert.equal(statusOf(u.ws), '');
+
+    // A folder copied whole goes as a whole when git there would see any file in it.
+    const v = await fillRepo({ '.gitignore': '*.pem\n', '.worktreeinclude': 'secrets/\n' }, { 'secrets/key.pem': 'k\n', 'secrets/notes.txt': 'n\n' });
+    fs.appendFileSync(v.p('.gitignore'), '/secrets/\n');
+    const r3 = await fillWorkspace({ repoRoot: v.root, path: v.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy });
+    assert.deepEqual([r3.copied, r3.skipped], [[], [{ path: 'secrets', why: 'not-ignored' }]]);
+    assert.equal(present(v.w('secrets')), false);
+  });
+
+  test('the check at the end has time kept for it, and when git cannot make it, nothing copied stays', async () => {
+    const t = await fillRepo({ '.gitignore': 'node_modules/\n' }, { '.env': 'S=1\n', 'node_modules/m/index.js': 'm\n' });
+    fs.appendFileSync(t.p('.gitignore'), '.env\n');
+    // node_modules takes the copies' whole time and is stopped: the check still finds .env, which git there would see.
+    const quick = cpStandIn();
+    const limits = [];
+    const copy = (file, args, o) => {
+      limits.push(o.timeout);
+      if (args.at(-1) !== t.w('node_modules')) return quick.copy(file, args, o);
+      return new Promise((_, reject) => setTimeout(() => reject(cpError('', { code: null, killed: true, signal: 'SIGTERM' })), o.timeout));
+    };
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy, timeoutMs: 3000 });
+    assert.deepEqual(r.copied, []);
+    assert.deepEqual(r.skipped, [{ path: '.env', why: 'not-ignored' }, { path: 'node_modules', why: 'failed' }]);
+    assert.ok(limits.every(ms => ms <= 2400), String(limits));
+
+    // git cannot list what it would see there: everything copied is taken away again.
+    const u = await fillRepo({ '.gitignore': '.env\nnode_modules/\n' }, { '.env': 'S=1\n', 'node_modules/m/index.js': 'm\n' });
+    const run = (args, o) => (args[0] === 'ls-files' && !args.includes('--ignored')
+      ? Promise.reject(Object.assign(new Error('Command failed'), { code: 128, stderr: 'fatal: index file corrupt' }))
+      : runGit(args, o));
+    const r2 = await fillWorkspace({ repoRoot: u.root, path: u.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy, run });
+    assert.deepEqual([r2.copied, r2.skipped], [[], ['.env', 'node_modules'].map(p => ({ path: p, why: 'failed' }))]);
+    for (const f of ['.env', 'node_modules']) assert.equal(present(u.w(f)), false, f);
   });
 
   test('when git cannot list the folder, or .worktreeinclude cannot be read, nothing is copied, and skipped says so', async () => {

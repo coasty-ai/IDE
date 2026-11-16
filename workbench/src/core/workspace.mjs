@@ -360,6 +360,7 @@ async function takeBack(root, wsPath, branch) {
 // person's folder with cp (an argument array, never a shell), as clones where the disk can make them.
 
 const FILL_TIMEOUT_MS = 10 * 60_000; // the whole fill
+const FILL_FINISH_MS = 30_000; // the most of it kept back from the copies for the check at the end (a fifth, at most)
 const CP_TIMEOUT_MS = 5 * 60_000; // one cp
 const CP_START_MS = 1000; // no cp starts with less of the fill's time left than this
 const CP_AT_ONCE = 8;
@@ -405,7 +406,13 @@ const VCS_FOLDERS = new Set(['.git', '.hg', '.svn', '.bzr', '.jj', '.sl', '_darc
  * Never with Node: on a Mac, fs.copyFile makes a full copy even when asked to clone, and fs.cp makes relative links
  * absolute unless told not to. A folder made on the way gets the mode of the person's folder it stands for.
  *
- * An entry that fails is left out (its half-made copy removed) and the others go on. Only bad arguments reject: a
+ * Then git in the workspace must ignore every copy: one it would see (the rule that ignores it may be one the person
+ * has not committed) would become the agent's work, and a merge would bring it into the person's branch, so it is
+ * taken away again (why 'not-ignored'); when git cannot say, every copy is (why 'failed'). The copies get the limit
+ * less a fifth of it (at most FILL_FINISH_MS), which this check has.
+ *
+ * An entry that fails is left out (its half-made copy taken away, read-only folders and all; `left: true` when it
+ * could not be) and the others go on. Only bad arguments reject: a
  * `repoRoot` that is not the top folder of a checkout, or a `path` that git does not list as one of its worktrees.
  * When git cannot list the folder, nothing is copied and `skipped` is [{ path: '.', why: 'failed' }]; when
  * .worktreeinclude cannot be read, [{ path: '.worktreeinclude', why: 'failed' }]; a folder git ignores as a whole
@@ -418,7 +425,7 @@ const VCS_FOLDERS = new Set(['.git', '.hg', '.svn', '.bzr', '.jj', '.sl', '_darc
  *   timeoutMs: the whole fill's limit (10 minutes unless given); clones: whether the disk makes clones, as tests
  *   say it (a Mac looks, and elsewhere cp says, unless given)
  * @returns {Promise<{ copied: { path: string, kind: 'env'|'deps'|'listed', cloned: boolean }[],
- *   skipped: { path: string, why: 'exists'|'link-outside'|'noclone'|'failed'|'venv' }[], ms: number }>}
+ *   skipped: { path: string, why: 'exists'|'link-outside'|'noclone'|'failed'|'venv'|'not-ignored', left?: true }[], ms: number }>}
  *   paths relative to the repository (a folder's without its "/"), each list in path order; cloned: made with clones
  *   (`cp -c` on a Mac, where the disk makes them, `--reflink=always` elsewhere), which take almost no disk
  */
@@ -428,9 +435,12 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
   if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath) || !isFolder(wsPath)) throw plainError('No workspace folder was given.');
   const ws = fs.realpathSync.native(wsPath);
   if (ws === root) throw plainError('That is the main folder of the repository, not a workspace.');
-  const deadline = started + (Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : FILL_TIMEOUT_MS);
+  const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : FILL_TIMEOUT_MS;
+  const end = started + limit;
+  const deadline = end - Math.min(FILL_FINISH_MS, limit / 5); // for git's listings and the copies; the rest is the check's
   const copied = [];
   const skipped = [];
+  const skip = (p, why, left = false) => skipped.push(left ? { path: p, why, left: true } : { path: p, why });
   const done = () => ({ copied: copied.sort(byPath), skipped: skipped.sort(byPath), ms: Date.now() - started });
 
   // Only into a worktree of this repository, from the top folder of the person's checkout: git names paths from the
@@ -471,20 +481,22 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
   const canClone = st => (typeof clones === 'boolean' ? clones : mac ? apfs && st.dev === wsDev : !noClones);
   const made = new Map(); // folders made on the way in the workspace -> the person's folder each stands for
 
-  /** One cp within the time left: { ok }, or { ok: false, noClone } with its half-made copy removed. */
+  /**
+   * One cp within the time left: { ok }, or { ok: false, noClone, left } with its half-made copy taken away (nothing was
+   * there before), `left` when that could not be done.
+   */
   const cp = async (args, dst) => {
     const left = deadline - Date.now();
-    if (left < CP_START_MS) return { ok: false, noClone: false }; // too late to start one
+    if (left < CP_START_MS) return { ok: false, noClone: false, left: false }; // too late to start one
     try {
       await cpWith(program, args, { timeout: Math.min(CP_TIMEOUT_MS, left) });
       return { ok: true };
     } catch (e) {
-      await fs.promises.rm(dst, { recursive: true, force: true }).catch(() => {}); // nothing was there before
-      return { ok: false, noClone: !mac && NO_CLONE.test(String((e && e.stderr) || '')) };
+      return { ok: false, noClone: !mac && NO_CLONE.test(String((e && e.stderr) || '')), left: !removeTree(dst) };
     }
   };
 
-  /** Copy one entry: the reason it was left out, or null when it was copied. */
+  /** Copy one entry: why it was left out (a word, or { why, left }), or null when it was copied. */
   const fillOne = async ({ path: rel, kind, venvs = [] }) => {
     const parts = safeParts(rel);
     if (!parts || parts.some(x => x.toLowerCase() === '.git')) return 'failed';
@@ -509,24 +521,14 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
     const inTheWay = foldersFor(ws, parts, made, root);
     if (inTheWay) return inTheWay;
     if (!nothingAt(dst)) return 'exists';
-    let cloned;
-    if (mac) {
-      // A clone takes almost no disk, and seconds for a node_modules.
-      if (!(await cp(clone ? ['-c', '-R', '-p', src, dst] : ['-R', '-p', src, dst], dst)).ok) return 'failed';
-      cloned = clone;
-    } else if (!cloneOnly) {
-      if (!(await cp(['-a', '--reflink=auto', src, dst], dst)).ok) return 'failed'; // a clone or a copy: cp knows
-      cloned = false;
-    } else {
-      const r = await cp(['-a', '--reflink=always', src, dst], dst);
-      if (!r.ok) {
-        if (!r.noClone) return 'failed';
-        noClones = true;
-        return 'noclone';
-      }
-      cloned = true;
+    // A clone takes almost no disk, and seconds for a node_modules. GNU cp with --reflink=auto clones or copies: it knows.
+    const r = await cp(mac ? [...(clone ? ['-c'] : []), '-R', '-p', src, dst] : ['-a', cloneOnly ? '--reflink=always' : '--reflink=auto', src, dst], dst);
+    if (!r.ok) {
+      if (!r.noClone || !cloneOnly) return { why: 'failed', left: r.left };
+      noClones = true;
+      return { why: 'noclone', left: r.left };
     }
-    copied.push({ path: rel, kind, cloned });
+    copied.push({ path: rel, kind, cloned: mac ? clone : cloneOnly });
     if (folder) for (const v of venvs) skipped.push({ path: v, why: 'venv' }); // copied as asked: say what it is
     return null;
   };
@@ -543,11 +545,97 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
       } catch {
         why = 'failed';
       }
-      if (why) skipped.push({ path: entry.path, why });
+      if (why) skip(entry.path, why.why || why, !!why.left);
     }
   }));
+
+  // What git in the agent's folder would not ignore would become the agent's work (snapshotWork's `git add -A`), and
+  // a merge would bring it into the person's branch: the rule that ignores it in the person's folder may be one they
+  // have not committed. So each copy git there would see (or that holds a path it would) is taken away again; when git
+  // cannot say, every copy is. This check has the time kept back from the copies.
+  if (copied.length) {
+    let shown;
+    let why = 'not-ignored';
+    try {
+      shown = await notIgnored(run, ws, copied.map(e => e.path), end);
+    } catch {
+      shown = new Set(copied.map(e => e.path));
+      why = 'failed';
+    }
+    for (const p of shown) {
+      copied.splice(copied.findIndex(e => e.path === p), 1);
+      for (let k = skipped.length - 1; k >= 0; k--) if (atOrUnder(p, skipped[k].path)) skipped.splice(k, 1); // a venv in it, say
+      skip(p, why, !removeTree(path.join(ws, ...p.split('/'))));
+    }
+  }
   settleFolders(made);
   return done();
+}
+
+/**
+ * Which of `paths` (copied into the agent's folder `ws`) git there would not ignore: each that is, or holds, a path
+ * `git ls-files --others --exclude-standard` lists there (a new file no ignore rule of the agent's folder hides, or a
+ * repository inside it). Rejects when git cannot say before `end`.
+ */
+async function notIgnored(run, ws, paths, end) {
+  const asked = new Set(paths);
+  const shown = new Set();
+  for (let i = 0; i < paths.length; i += ARG_BATCH) {
+    const out = (await run(['ls-files', '-z', '--others', '--exclude-standard', '--', ...paths.slice(i, i + ARG_BATCH).map(p => `:(literal)${p}`)],
+      { cwd: ws, timeout: Math.max(1, end - Date.now()) })).stdout;
+    for (const f of nulList(out)) {
+      const p = f.replace(/\/+$/, '');
+      const hit = [p, ...foldersAbove(p).map(d => d.slice(0, -1))].find(x => asked.has(x));
+      if (hit) shown.add(hit);
+    }
+  }
+  return shown;
+}
+
+/**
+ * Take away what is at `p` in the agent's folder (a copy cp made there): true once nothing is there. cp -p keeps a
+ * read-only folder read-only, and nothing can be taken out of one, so when the first try fails, every real folder in it
+ * (never through a link) is made writable for its owner, and so is the folder that holds it, for that moment.
+ */
+function removeTree(p) {
+  const rm = () => fs.rmSync(p, { recursive: true, force: true });
+  try {
+    rm();
+  } catch {
+    try {
+      writableWhile(path.dirname(p), () => { openUp(p); rm(); });
+    } catch { /* still there: the caller says so */ }
+  }
+  return nothingAt(p);
+}
+
+/** Make each real folder at or in `p` writable and searchable for its owner, never through a link. */
+function openUp(p) {
+  let st;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    return;
+  }
+  if (!st.isDirectory()) return;
+  if ((st.mode & 0o700) !== 0o700) fs.chmodSync(p, (st.mode & 0o7777) | 0o700);
+  for (const name of fs.readdirSync(p)) openUp(path.join(p, name));
+}
+
+/** Run `fn`; when the folder `dir` refuses it (EACCES, EPERM), once more with `dir` writable for its owner, then its mode back. */
+function writableWhile(dir, fn) {
+  try {
+    return fn();
+  } catch (e) {
+    if (e.code !== 'EACCES' && e.code !== 'EPERM') throw e;
+  }
+  const mode = fs.lstatSync(dir).mode & 0o7777;
+  fs.chmodSync(dir, mode | 0o700);
+  try {
+    return fn();
+  } finally {
+    try { fs.chmodSync(dir, mode); } catch { /* gone */ }
+  }
 }
 
 /**
@@ -722,6 +810,8 @@ const globEscape = s => s.replace(/[*?[\]\\]/g, '\\$&');
 
 /** Whether `p` is `top` or inside it. */
 const within = (top, p) => p === top || p.startsWith(top + path.sep);
+/** The same for paths relative to the repository, which always use "/". */
+const atOrUnder = (top, p) => p === top || p.startsWith(`${top}/`);
 
 /**
  * Whether the folder `p` is on a disk of the same kind as the startup disk: APFS, which makes clones, on every macOS
