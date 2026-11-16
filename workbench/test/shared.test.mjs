@@ -425,3 +425,17 @@ test('agent.work is an event of its own, and a new view has no work until a root
   assert.equal(newAgentView({ agentId: 'abc123', name: 'X', harness: 'claude' }, 1000).work, null);
   assert.equal(newAgentView({ agentId: 'abc123-h1', parentId: 'abc123', name: 'Y', harness: 'claude' }, 1000).work, null);
 });
+
+test('the words that answer a finished agent\'s lid are one list, for the engine and the page alike', async () => {
+  const { LOOKS_GOOD_RE, NOT_NOW_RE } = await import('../src/shared/answers.mjs');
+  for (const s of ['Looks good', 'looks good.', 'LGTM', 'thanks!', 'Thank you', 'ok', 'Okay', 'fine', 'all good', 'great!!']) assert.ok(LOOKS_GOOD_RE.test(s), s);
+  for (const s of ['Not now', 'not now.', 'NOT NOW!']) assert.ok(NOT_NOW_RE.test(s), s);
+  for (const s of ['looks good, merge it', 'not now, but later', 'good job on the parser', 'ok go ahead and stop it', 'later', 'look later', '']) {
+    assert.ok(!LOOKS_GOOD_RE.test(s) && !NOT_NOW_RE.test(s), JSON.stringify(s));
+  }
+  // the engine takes its answers from this list, not from a copy of its own
+  const { readFileSync } = await import('node:fs');
+  const engine = readFileSync(new URL('../src/core/engine.mjs', import.meta.url), 'utf8');
+  assert.match(engine, /import \{ LOOKS_GOOD_RE, NOT_NOW_RE \} from '\.\.\/shared\/answers\.mjs';/);
+  assert.doesNotMatch(engine, /const (LOOKS_GOOD_RE|NOT_NOW_RE)\b/);
+});

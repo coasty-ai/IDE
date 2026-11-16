@@ -742,11 +742,10 @@ function placeBands(G, { machines, tray }) {
   // sections as narrow as their names
   const narrow = () => machines.map(mc => Math.ceil(nameNeed(mc) + 6));
   if (!xs && widths.length) { widths = narrow(); xs = tryAll(widths, gap); }
-  // the tray's words shorten ("12 done, 6 from earlier, 1 more"; its list and its accessible name keep all of them)
-  if (!xs && widths.length && G.tray && tray.lead != null) {
-    const { done = 0, earlier = 0, over = 0 } = tray;
-    const lead = done ? `${done} done` : `${earlier} from earlier`;
-    const rest = (done && earlier ? `, ${earlier} from earlier` : '') + (over ? `, ${over} more` : '');
+  // the tray's words shorten ("12 done, 6 from earlier, 1 more": trayWords' short; its list and its accessible name keep
+  // all of them)
+  if (!xs && widths.length && G.tray && tray.short) {
+    const { lead, rest } = tray.short;
     if (lead + rest !== G.tray.lead + G.tray.rest) {
       G.tray = trayBox(lead, rest);
       lo = G.tray.x + G.tray.w + 18;

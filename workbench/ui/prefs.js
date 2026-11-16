@@ -55,6 +55,21 @@ export function plainWords(text) {
 }
 
 /**
+ * "looks good" or "not now", typed or said: the label of the lid's own button these words stand for ("Looks good",
+ * "Not now"), so the page can press that button when the lid shows a finished agent, rather than send the words to the
+ * engine as a command (app.js). The phrases are the engine's own (LOOKS_GOOD_RE and NOT_NOW_RE in /shared/answers.mjs),
+ * passed in, so the two never disagree. null for anything else.
+ * @returns {'Looks good'|'Not now'|null}
+ */
+export function lidAnswer(text, { LOOKS_GOOD_RE, NOT_NOW_RE }) {
+  const t = String(text ?? '').trim();
+  if (!t) return null;
+  if (NOT_NOW_RE.test(t)) return 'Not now';
+  if (LOOKS_GOOD_RE.test(t)) return 'Looks good';
+  return null;
+}
+
+/**
  * Words the page answers itself. Never sent to the engine.
  * @returns {{ kind: 'theme', theme: string } | { kind: 'detail', detail: string } | { kind: 'next' } | null}
  */

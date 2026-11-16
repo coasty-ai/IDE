@@ -21,6 +21,8 @@ import { STATE, ENDED, ACTIVE, DONE, NEEDS_YOU } from '../shared/states.mjs';
 import { nameFromTask, firstSentence, extractQuestion, plain, describeRequest, quotable } from '../shared/narrate.mjs';
 import { money, spentAmount, duration, clip } from '../shared/format.mjs';
 import { looksLikeSecret } from '../shared/secretshape.mjs';
+// "Looks good" and "Not now", and the words that mean the same for finished work; the page uses the same list
+import { LOOKS_GOOD_RE, NOT_NOW_RE } from '../shared/answers.mjs';
 import { StuckDetector } from './stuck.mjs';
 
 const MIN = 60_000;
@@ -89,9 +91,6 @@ const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
 const ALLOW_LABEL_RE = /^allow$/i;
 const DENY_LABEL_RE = /^deny$/i;
-const LOOKS_GOOD_RE = /^(looks good|look good|lgtm|great|thanks|thank you|good|fine|ok|okay|all good)[.!]*$/i;
-// The lid's "Not now" on work that can be merged: the agent stays as it is, and the reply does not sound like approval.
-const NOT_NOW_RE = /^not now[.!]*$/i;
 const HELP = 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.';
 // The answer to "help", "hi" or "what can you do": short enough for three lines under the DRAM on the narrowest board.
 const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';

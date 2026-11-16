@@ -4,7 +4,7 @@
 // exactly what the person read.
 import { clip, money, duration } from '/shared/format.mjs';
 import { LOOK, ACTIVE } from '/shared/states.mjs';
-import { S, machineName, harnessLabel, mergeApplies, gitReason, canReview, workKey, workSettled, unmergedWork } from './model.js';
+import { S, machineName, harnessLabel, mergeApplies, gitReason, canReview, workKey, workSettled, unmergedWork, finishedSinceSettled } from './model.js';
 import { markOfAgent } from './look.js';
 import { spentWords } from './numbers.js';
 import { visibleControls, clipMiddle, cutMiddle, whoAsks, headlineClass } from './words.js';
@@ -72,14 +72,16 @@ const LIMIT_REASON = 'It reached its spending limit.';
 
 /**
  * Where a root's work went, when that is what the lid is about: thrown away, a merge that did not go through, merged
- * with nothing new. An agent from an earlier run keeps its own lid (Continue, Forget): the git screen shows its work.
+ * with nothing new. An agent from an earlier run keeps its own lid (Continue, Forget): the git screen shows its work. A
+ * merged agent that finished again since, with nothing new, and is not looked at yet has the lid of its finish instead
+ * (what it said, "Looks good", "Ask for a change"): the merge is old news, its reply is not.
  */
 function workLid(a) {
   const w = a.work;
   if (!w || a.parentId || a.earlier || ACTIVE.has(a.state)) return null;
   if (w.thrownAway) return 'thrown';
   if (w.problem) return 'problem';
-  if (w.merged && workSettled(a)) return 'merged';
+  if (w.merged && workSettled(a) && !finishedSinceSettled(a)) return 'merged';
   return null;
 }
 const WORK_COUNT = { thrown: 'thrown away', problem: 'not merged', merged: 'merged' };

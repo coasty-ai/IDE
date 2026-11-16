@@ -1,19 +1,21 @@
 // Workbench, as a circuit board. You are the core: it shows one thing at a time and holds the one place to type or
 // talk. Each agent is a chip on its own lane: beside you when it needs you, mid-board while it works, at the edge once
-// it is done. This file wires the data, the board (board.js), the lid (focus.js), the card and the input together.
+// it is done, and in the done tray once you are finished with it. This file wires the data, the board (board.js), the
+// lid (focus.js), the card and the input together.
 import { debugSwitches } from './address.js';
 import { money, clip } from '/shared/format.mjs';
 import { initToken, hasToken, whenRefused, api, connect } from './api.js';
 import { linkState, cannotSend } from './link.js';
 import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName, workKey } from './model.js';
-import { boardModel, splitEarlier, trayWords, agoText } from './boardmodel.js';
-import { Lanes, denseLanes } from './lanes.js';
+import { boardModel, boardAndTray, agoText, doneWords } from './boardmodel.js';
+import { Lanes } from './lanes.js';
 import { sizeClass, frame, layoutBoard, maxDenseRows } from './layout.js';
 import { Board } from './board.js';
 import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
-import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand } from './prefs.js';
+import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand, lidAnswer } from './prefs.js';
+import * as ANSWERS from '/shared/answers.mjs';   // "looks good" and "not now", as the engine reads them
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { balanceHeading } from './balance.js';
@@ -86,6 +88,9 @@ whenRefused(() => { if (!link.refused) { link.refused = true; renderSoon(); } })
 // ---------------------------------------------------------------- the board
 const lanes = new Lanes(safeStorage('sessionStorage'));
 let G = null, lastFirst = true, fontsReady = false;
+// The keyboard goes to the lid's sentence when what held it leaves (a chip leaving the board, the done tray emptying),
+// as other moves do; a swap that follows carries it to the new sentence.
+const lidHome = () => el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
 const board = new Board({
   boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, dram: el.dram, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
   still: () => debug.still, reduced,
@@ -96,6 +101,8 @@ const board = new Board({
     more: rootId => { S.pinId = rootId; S.hoverId = rootId; renderCard(); },
     machine: (id, anchor) => toggleMachines(anchor),
     tray: anchor => toggleTray(anchor),
+    // a chip that held the keyboard leaves the board: the keyboard goes to the lid's sentence, as other moves do
+    home: () => lidHome(),
   },
 });
 let leaveTimer = null;
@@ -354,39 +361,36 @@ function renderNow(o = {}) {
   const showData = S.loaded && linkS !== 'no-key';
   const { f, also } = showData ? shownFocus() : { f: { empty: true }, also: false };
   const agents = showData ? [...S.agents.values()] : [];
-  const bm = boardModel(agents, { ...STATES, later: S.later, currentId: f.agent ? f.agent.id : null, machineName });
-  // agents from an earlier run wait in the done tray: they never take a lane
-  const { current, earlier } = splitEarlier(bm.roots);
-  if (current.length) lanes.assign(current.map(r => ({ id: r.id, startedAt: r.startedAt, laptop: (S.machines.find(m => m.id === r.machineId)?.kind || (r.machineId === 'laptop' ? 'laptop' : 'cloud')) === 'laptop' })));
-  // past twelve agents, finished work moves to the done tray and each lane splits in two
-  const dense = current.length > 12;
-  let roots = current, laneOf = id => lanes.get(id), nRows = 6, tray = null, overflow = [];
-  let done = [];
-  if (dense) {
-    done = roots.filter(r => r.ghost);
-    // newcomers take the free rows in this order: whatever needs the person first, so an asker always has a chip
-    const active = roots.filter(r => !r.ghost).sort((a, b) => (b.stop === 'inner') - (a.stop === 'inner'));
-    const d = denseLanes(active, id => lanes.get(id), maxDenseRows(H, P));
-    overflow = d.overflow;
-    roots = active.filter(r => !overflow.includes(r.id));
-    laneOf = id => d.at.get(id) || null;
-    nRows = d.rows;
-  }
-  if (done.length || earlier.length || overflow.length) {
-    const marks = done.concat(earlier).map(r => markOf(r.state, STATES.LOOK));
-    const words = trayWords({ done: done.length, earlier: earlier.length, over: overflow.length });
-    tray = { count: done.length + earlier.length, done: done.length, earlier: earlier.length, over: overflow.length, ids: done.map(r => r.id).concat(earlier.map(r => r.id), overflow), marks, ...words };
-  }
-  trayIds = tray ? { done: tray.ids.slice(0, tray.done), earlier: tray.ids.slice(tray.done, tray.count), over: overflow.slice() } : { done: [], earlier: [], over: [] };
+  const bm = boardModel(agents, { ...STATES, later: S.later, reviewed: S.reviewed, currentId: f.agent ? f.agent.id : null, machineName });
+  // Who takes a lane and who waits in the done tray (boardmodel.js): agents from an earlier run never take a lane, nor do
+  // agents the person is finished with; past twelve on the board, finished work there waits in the tray too and each
+  // lane splits in two. Lanes are freed only while there is data: the first draw after a reload, before the snapshot,
+  // and a page with no key have no agents, and must not free anyone's lane.
+  const laptop = r => (S.machines.find(m => m.id === r.machineId)?.kind || (r.machineId === 'laptop' ? 'laptop' : 'cloud')) === 'laptop';
+  const placed = boardAndTray(bm.roots, lanes, { laptop, maxRows: maxDenseRows(H, P), prune: showData });
+  const { roots, laneOf, nRows, dense, tray } = placed;
+  trayIds = placed.trayIds;
+  // the board's name for a screen reader says how many wait in the done tray
+  const boardName = `Your agents and their helpers${tray ? `. ${tray.sum}.` : ''}`;
+  if (el.parts.getAttribute('aria-label') !== boardName) el.parts.setAttribute('aria-label', boardName);
   const fr = frame(W, H, P, { nRows, dense });
   const maxPage = fr.lidMaxH - P.lid.padT - P.lid.padB - P.lid.inh - P.lid.gap3;
   const v = buildLid(f, also, P, maxPage);
   const machines = showData ? S.machines.map(m => ({ id: m.id, name: m.name, awake: m.awake !== false, note: machineNote(m), noteText: machineNote(m) })) : [];
   G = layoutBoard({ W, H, P, detail: prefs.detail, roots, laneOf, nRows, dense, lidNeed: needForLayout(v), machines, tray, measure });
   G.queueLength = bm.queue.length;
+  // the tray is drawn only while it holds agents of this run or an earlier one (board.js paintTray): when it empties, its
+  // list closes and the keyboard there goes to the lid's sentence before the tray is hidden
+  if (!G.tray) trayEmptied();
   const hoverRoot = board.card.rootId || null;
-  board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
+  const left = board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
   lastFirst = false;
+  // a card pinned to (or shown for) a chip that left the board goes with it, rather than move beside the tray
+  if (left.length) {
+    const gone = id => { const a = id && S.agents.get(id); return !!id && (left.includes(id) || (!!a && left.includes(a.rootId || a.parentId))); };
+    if (gone(S.pinId)) S.pinId = null;
+    if (gone(S.hoverId)) S.hoverId = null;
+  }
   paintLid(v, f);
   paintTop(P, linkS);
   paintSaid();
@@ -710,6 +714,18 @@ function applyPref(kind, value, { quietly = false } = {}) {
   if (hasToken()) api.prefs({ [kind]: v }).catch(e => { if (e?.refused) say(e.message); });
 }
 
+/**
+ * The lid's own button that typed or spoken words stand for ("Looks good", "Not now": lidAnswer), on the page shown now
+ * (not one fading out, nor one still to rise), drawn for the agent the words were bound to when they began. null when
+ * the words stand for no button, are bound to nothing (begun during a swap), or the lid has no such button for them.
+ */
+function lidButton(label, b) {
+  if (!label || !b || !b.agentId) return null;
+  const page = el.pages.querySelector('.page:not(.old):not([data-hidden])');
+  const keys = label === 'Looks good' ? ['looksgood:Looks good'] : ['looksgood:Not now', 'later:Not now'];
+  return [...(page ? page.querySelectorAll('button[data-act]') : [])].find(x => x.dataset.agent === b.agentId && keys.includes(x.dataset.key)) || null;
+}
+
 async function submit(text) {
   text = String(text || '').trim();
   if (!text) return;
@@ -731,6 +747,11 @@ async function submit(text) {
     return;
   }
   if (cannotSend(linkNow())) return;
+  // "looks good" or "not now" (the engine's own words for them) at a finished agent's lid: the page presses that lid's
+  // "Looks good" or "Not now", drawn for the agent the words were begun for, so they do exactly what the button does,
+  // and no command goes to the engine. Anything else, or words bound to nothing, goes on as before.
+  const press = !S.reply && !S.confirm ? lidButton(lidAnswer(text, ANSWERS), b) : null;
+  if (press) { if (!press.disabled) await actOn(press); return; }
   try {
     if (S.reply) {
       const r = S.reply;
@@ -959,7 +980,8 @@ el.pop.addEventListener('click', async e => {
   btn.removeAttribute('aria-disabled');
 });
 
-// ---------------------------------------------------------------- the done tray (past twelve agents)
+// ---------------------------------------------------------------- the done tray (agents you are finished with, earlier
+// runs' agents, and finished or waiting work with no room on a dense board)
 function toggleTray(anchor) {
   if (!el.trayList.hidden) { closeTray(); return; }
   el.trayList.hidden = false;
@@ -974,17 +996,32 @@ function closeTray() {
   el.tray.setAttribute('aria-expanded', 'false');
   if (inside) el.tray.focus({ preventScroll: true });
 }
+/**
+ * The tray is about to be hidden: it holds nothing any more (its last agent is back on the board, or no data is shown).
+ * An open list closes, and the keyboard on the tray or in its list goes to the lid's sentence first, so it is never
+ * dropped (closeTray would hand it to the tray, which is going).
+ */
+function trayEmptied() {
+  const had = el.tray.contains(document.activeElement) || el.trayList.contains(document.activeElement);
+  if (!el.trayList.hidden) { el.trayList.hidden = true; el.tray.setAttribute('aria-expanded', 'false'); }
+  if (had) lidHome();
+}
 let trayIds = { done: [], earlier: [], over: [] };
 function renderTrayList() {
-  const row = id => {
+  // each row: its mark, its name, and a few words: where its work went or how it ended ("merged", "thrown away", "not
+  // merged", "checks failed", "stopped"), how long ago for an earlier run's agent, or its state for one at work with no room
+  const row = (id, words) => {
     const a = S.agents.get(id);
     if (!a) return '';
     const m = markOf(a.state, STATES.LOOK);
-    const note = a.earlier ? agoText(Date.now() - (a.endedAt || a.stateSince)) : m.label;
-    return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(visibleControls(a.name))} <em>· ${esc(note)}</em></span></button>`;
+    return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(visibleControls(a.name))} <em>· ${esc(words(a, m))}</em></span></button>`;
   };
-  const done = trayIds.done.map(row).join(''), over = trayIds.over.map(row).join(''), early = (trayIds.earlier || []).map(row).join('');
-  patchChildren(el.trayList, `${done || !early ? `<h2>Done or stopped</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  const done = trayIds.done.map(id => row(id, a => doneWords(a, STATES.LOOK))).join('');
+  const early = (trayIds.earlier || []).map(id => row(id, a => agoText(Date.now() - (a.endedAt || a.stateSince)))).join('');
+  const over = trayIds.over.map(id => row(id, (a, m) => m.label)).join('');
+  // a row that held the keyboard and went (its agent back on the board) hands it to the list's first row, else the tray
+  const lost = patchChildren(el.trayList, `${done || !early ? `<h2>Done</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  if (lost) (el.trayList.querySelector('button') || el.tray).focus({ preventScroll: true });
   const r = el.tray.getBoundingClientRect();
   // above the tray, inside the board and beside the core (never on it, never on the top band)
   const top = G ? G.board.y + G.P.topBand : 8;
@@ -1004,7 +1041,7 @@ el.trayList.addEventListener('click', e => {
   const kb = el.trayList.contains(document.activeElement);
   closeTray();
   // the agent goes to the core; a keyboard user follows it there (its sentence), a mouse user's focus stays put
-  if (kb) el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+  if (kb) lidHome();
   moved();
   render();
 });
@@ -1045,8 +1082,7 @@ function onSnapshot(snap) {
   for (const id of [...S.agents.keys()]) if (!fresh.has(id)) S.agents.delete(id);
   upsert(snap.agents || []);
   lookArrived();
-  // a full list: lanes of agents that no longer exist are forgotten (only here, never on a partial update)
-  lanes.prune(new Set([...fresh.values()].filter(a => !a.parentId).map(a => a.id)));
+  // lanes of agents that are gone, or not on the board any more, are freed as the board is drawn (boardAndTray)
   S.machines = snap.machines || [];
   const wasLoaded = S.loaded;
   S.loaded = true;

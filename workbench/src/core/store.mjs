@@ -395,7 +395,10 @@ export class Store extends EventEmitter {
         break;
 
       case EV.ENDED:
-        v.endedAt = ev.ts;
+        // The first finish of a run stands: a process that ends after its agent finished (Claude Code exits a little after
+        // its last turn; a stopped one after the stop) leaves endedAt as it was, so a look the page keyed on that finish
+        // still holds. While the agent still works, its process ending sets it, and the state that follows sets its own.
+        if (!(ENDED.has(v.state) && v.endedAt != null)) v.endedAt = ev.ts;
         v.error = ev.error ? String(ev.error) : null;
         meta.openTools.clear();
         v.thinking = false;
