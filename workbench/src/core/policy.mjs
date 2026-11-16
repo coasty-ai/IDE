@@ -192,7 +192,7 @@ const RUN = 'run a command';
  * decide runs on Workbench's main thread for every request, so each of its three phases may do a fixed amount of work:
  * the check and the floor of full permissions COST_LIMIT each, the words WORDS_LIMIT. A look at the disk (a path
  * resolved, a link read, a file looked at) costs 1, a folder read 1 and 1 more for every 32 names in it, matching names
- * against a wildcard 1 for every 2500 steps, expanding one word's braces 1 for every 2048 characters it holds, at each
+ * against a wildcard 1 for every 2500 steps it takes, expanding one word's braces 1 for every 2048 characters it holds, at each
  * level, and a path whose answer is already known 0.1: what the disk said, and where each path sits, is kept for the rest
  * of the decide (`known`). A word of short options longer than OPTION_WORD is too much to check at once. Past a cap, the
  * phase stops (PAST_CAP), and nothing it found is used: the check asks (R.tooMuch); full permissions refuse an edit as
@@ -1524,27 +1524,36 @@ function setHas(set, c, loose, bytes = false) {
  */
 function matchTokens(tokens, name, loose) {
   const ascii = s => /^[\x00-\x7f]*$/.test(s);
-  const plainAscii = ascii(name) && tokens.every(t => (t.c === undefined || ascii(t.c)) && (!t.set || t.set.items.every(it => it.cls || it.to < 0x80)));
+  // what depends on the tokens alone is read once, however many names they are matched against
+  tokens.ascii ??= tokens.every(t => (t.c === undefined || ascii(t.c)) && (!t.set || t.set.items.every(it => it.cls || it.to < 0x80)));
+  const plainAscii = ascii(name) && tokens.ascii;
   const byChar = matchUnits(tokens, [...name], loose, false);
   if (plainAscii) return byChar;
   const asBytes = s => [...new TextEncoder().encode(s)].map(b => String.fromCharCode(b));
-  const byteTokens = tokens.flatMap(t => (t.c !== undefined && !ascii(t.c) ? asBytes(t.c).map(c => ({ c })) : [t]));
-  const byByte = matchUnits(byteTokens, asBytes(name), loose, true);
+  tokens.bytes ??= tokens.flatMap(t => (t.c !== undefined && !ascii(t.c) ? asBytes(t.c).map(c => ({ c })) : [t]));
+  const byByte = matchUnits(tokens.bytes, asBytes(name), loose, true);
   return loose ? byChar || byByte : byChar && byByte;
 }
 
-/** Whether a list of characters (or bytes) matches the tokens: row[n] says the tokens so far match the first n of them. */
+/**
+ * Whether a list of characters (or bytes) matches the tokens: row[n] says the tokens so far match the first n of them.
+ * Once no n is left, no token after can bring one back, and the answer is no: every token but a star takes a character,
+ * and stars never come two in a row, so a long pattern is read only as far as the name lets it.
+ */
 function matchUnits(tokens, cs, loose, bytes) {
-  charge(tokens.length * (cs.length + 1) / 2500);
   const same = (a, b) => a === b || (loose && (a.toLowerCase() === b.toLowerCase() || a.toUpperCase() === b.toUpperCase()));
   let row = cs.map(() => false);
   row.unshift(true);
   for (const t of tokens) {
+    charge((cs.length + 1) / 2500);
     const next = new Array(cs.length + 1).fill(false);
+    let left = false;
     for (let n = 0; n <= cs.length; n++) {
       if (t.star) next[n] = row[n] || (n > 0 && next[n - 1]);
       else if (n > 0 && row[n - 1]) next[n] = t.one || (t.set ? setHas(t.set, cs[n - 1], loose, bytes) : same(t.c, cs[n - 1]));
+      if (next[n]) left = true;
     }
+    if (!left) return false;
     row = next;
   }
   return row[cs.length];
