@@ -1517,7 +1517,7 @@ test('anything else that says something is work, as a prompt is to a coding agen
     ['claude code fix the readme', 'none', start(['fix the readme', 'claude'])],
     ['codex: why is the build slow?', 'none', start(['why is the build slow?', 'codex'])],
     ['codex, the login page is broken', 'none', start(['the login page is broken', 'codex'])],
-    ['Claude Code, please add tests', 'none', start(['add tests', 'claude'])],
+    ['Claude Code, please add tests', 'none', start(['please add tests', 'claude'])], // only the address comes off
     // Bare acknowledgements start nothing; words that only talk about an agent are no work; anything else is a prompt.
     ['ok', 'none', task('ok')],
     ['thanks', 'none', task('thanks')],
@@ -2099,8 +2099,38 @@ test('a program named first, or asked by name, starts that program; its name is 
     ['the login page is broken, codex', 'none', start(['the login page is broken', 'codex'])],
     ['claude: fix this\n```\nfoo()\n```', 'oneAtWork', start(['fix this\n```\nfoo()\n```', 'claude'])],
     ['codex, hello', 'none', start(['hello', 'codex'])],
-    ['codex, thanks', 'none', noTask('codex')], // a "thanks" at the end is politeness: the engine asks what Codex should work on
+    // only the address comes off: "please", "thanks", "now" and "for me" are the prompt's own, before it and after it
+    ['codex, thanks', 'none', start(['thanks', 'codex'])],
+    ['codex, thank you', 'none', start(['thank you', 'codex'])],
+    ['claude, please', 'none', start(['please', 'claude'])],
+    ['codex, please fix the login page, thanks', 'none', start(['please fix the login page, thanks', 'codex'])],
+    ['Claude Code, please add tests', 'none', start(['please add tests', 'claude'])],
+    ['codex: can you fix the login page for me?', 'none', start(['can you fix the login page for me?', 'codex'])],
+    ['ask codex to fix the login page please', 'none', start(['fix the login page please', 'codex'])],
+    ['ask codex to please fix the login page', 'none', start(['please fix the login page', 'codex'])],
+    ['claude please fix the readme', 'none', start(['please fix the readme', 'claude'])],
+    ['codex fix the login page now', 'none', start(['fix the login page now', 'codex'])],
+    ['start codex on the login page, thanks', 'none', start(['the login page, thanks', 'codex'])],
+    ['can you fix the login page with codex', 'none', start(['can you fix the login page', 'codex'])],
+    ['please fix the login page using codex', 'none', start(['please fix the login page', 'codex'])],
+    ['codex, the total is off:\n  expected 42.10\n}', 'none', start(['the total is off:\n  expected 42.10\n}', 'codex'])],
+    ['codex, thanks!\nthe footer is broken too', 'none', start(['thanks!\nthe footer is broken too', 'codex'])],
+    // the words that start an agent, and a machine taken off after the work, are Workbench's: they still come off
+    ['please start codex on the login page', 'none', start(['the login page', 'codex'])],
+    ['fix the login page on cloud 1, please', 'none', start(['fix the login page', null, 'cloud-1'])],
+    ['codex thanks', 'none', noTask('codex')], // no comma: a program named, and politeness; the engine asks what Codex should work on
   ]);
+});
+
+test('a message keeps the words after it: "please", "thanks" and "now" go to the agent too', () => {
+  for (const [text, words] of [
+    ['tell onboarding to use the new copy please', 'use the new copy please'],
+    ['tell onboarding to use the new copy now', 'use the new copy now'],
+    ['Onboarding: use the new copy on step 2, thanks', 'use the new copy on step 2, thanks'],
+  ]) {
+    const got = parseCommand(text, CTX.none);
+    assert.deepEqual([got.kind, got.agentId, got.text], ['say', '7a8b9c', words], text);
+  }
 });
 
 test('an agent named alone asks what it should work on; the engine names it, and takes the next words as its prompt', () => {

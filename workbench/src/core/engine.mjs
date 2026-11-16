@@ -91,8 +91,6 @@ const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
 const ALLOW_LABEL_RE = /^allow$/i;
 const DENY_LABEL_RE = /^deny$/i;
-// A confirm with no card on screen: a parser that sends one anyway hears this (the real parser sends none).
-const NOTHING_TO_ANSWER = 'There is nothing waiting for a yes or no.';
 // What a `help` intent gets, from a parser that still sends one (the real parser does not: "help" is a prompt there):
 // short enough for three lines under the DRAM on the narrowest board.
 const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
@@ -3857,8 +3855,9 @@ export class Engine extends EventEmitter {
       case 'sleep_idle':
         return this._sleepIdle();
       case 'confirm': {
-        // Only the card on screen: never "the latest one".
-        if (!shown) return { reply: NOTHING_TO_ANSWER };
+        // Only the card on screen: never "the latest one". With none, a yes or a no is a prompt like any other words (the
+        // real parser sends no confirm then; one that does is not answered "there is nothing waiting").
+        if (!shown) return this._startNow([{ task: said }]);
         const r = await this._confirm(shown.id, !!intent.go);
         // A typed or spoken yes that started agents puts the first one in the centre, so a second "yes" said out of
         // habit finds nothing to answer, rather than whatever asks next.

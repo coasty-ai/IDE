@@ -16,7 +16,8 @@
 // agent: { kind: 'task', task } with the person's words exactly as typed (only the spaces around them go), and the
 // engine starts it at once. "thanks", "ok", "hi", "help", an emoji, a never-mind: all prompts. `unknown` is left for
 // nothing said, a yes that is not enough for the card on screen (or asked), and words that answer nothing while a
-// permission waits. Answers, messages and a start's task keep their edges too (asTyped).
+// permission waits. Answers, messages and a start's task keep their edges too (asTyped), and a start for a program
+// named ("codex, …", "ask codex to …", "… with codex") takes off only Workbench's words: "please" and "thanks" stay.
 // Extra fields some intents carry: askId (allow, deny, answer), text (deny: the person's words, such as
 // "no, use the staging database"), conditional (deny: a yes that came with conditions, "yes but only in the
 // tests folder"; text is the whole reply), sure: false (stop, say: the words found the agent but did not name
@@ -171,23 +172,44 @@ function together(toks) {
  * The person's own words for a run of tokens, as typed: an answer, a message, a task after the words that start it.
  * When nothing was taken out between them, it is the text itself from the first to the last, reaching to the start of the
  * text when nothing before the first is a word, and to the end when nothing after the last is one (an opening brace, a
- * code fence, a closing quote or full stop: a pasted snippet keeps its edges). Only the spaces around it go. The first
- * word may have been put in its base form ("an agent that fixes" -> "fix"). Words taken out of the middle (a program's
- * name, a machine) leave the rest joined as spanText joins them.
+ * code fence, a closing quote or full stop: a pasted snippet keeps its edges). Words of politeness after the last
+ * ("please", "thanks", "thank you", "now", "for me") are the words' own, and stay; so, with `lead`, are soft and polite
+ * openers before the first ("can you", "please", "okay so"), for work whose program or machine is named after it ("can you
+ * fix the login page with codex"). Only the spaces around it go. The first word may have been put in its base form ("an
+ * agent that fixes" -> "fix"). Words taken out of the middle (a program's name, a machine) leave the rest joined as
+ * spanText joins them.
  */
-function asTyped(toks) {
+function asTyped(toks, { lead = false } = {}) {
   if (!toks.length) return '';
   if (!together(toks)) return tidy(spanText(toks));
   const first = toks[0];
   const last = toks[toks.length - 1];
   const src = first.src;
-  const from = WORDY.test(src.slice(0, first.start)) ? first.start : 0;
-  const more = WORDY.test(src.slice(last.end)); // words follow: a machine, a program or a "please" taken off after it
+  const before = src.slice(0, first.start), after = src.slice(last.end);
+  const from = WORDY.test(before) && !(lead && politeLead(before)) ? first.start : 0;
+  const more = WORDY.test(after) && !politeTail(after); // words follow: a machine or a program taken off after it
   const to = more ? last.end : src.length;
   const head = src.slice(first.start, first.end) === first.raw ? '' : first.raw; // a word put in its base form
   const text = (head ? src.slice(from, first.start) + head + src.slice(first.end, to) : src.slice(from, to)).trim();
   // the comma that set off the words taken off after it is no part of it ("the checkout bug, each on its own machine")
   return more ? text.replace(/[\s,;:]+$/, '') : text;
+}
+
+/** The words of TRAILING ("please", "thanks", "thank you", "now", "for me", "asap", "if you can") and filler, and nothing else. */
+const POLITE_TAIL = new Set(TRAILING.flat());
+function politeTail(text) {
+  return lex(text).every(t => POLITE_TAIL.has(t.w) || DISFLUENCY.has(t.w));
+}
+
+/** Soft openers, the polite openers of POLITE and filler, and nothing else: "okay so", "can you", "please", "I need you to". */
+function politeLead(text) {
+  let toks = lex(text).filter(t => !DISFLUENCY.has(t.w));
+  for (let k = -1; toks.length && k !== 0;) {
+    const ws = toks.map(t => t.w);
+    k = SOFT_LEAD.has(ws[0]) ? 1 : startsWithSeq(ws, POLITE);
+    toks = toks.slice(k);
+  }
+  return !toks.length;
 }
 
 function seqAt(ws, i, seq) {
@@ -1827,12 +1849,12 @@ function matchStart(core, c) {
     return null; // a word for agents used as a noun's modifier: "add an agents page to the dashboard"
   }
   if (noun.hasNoun && noun.definite && !noun.harnesses.length) return null; // "start the agent" refers to one that exists
-  let rest = core.slice(noun.end);
+  const rest = core.slice(noun.end);
   if (!v && core[noun.end - 1]?.tail && !ws.some(w => NEW_WORDS.has(w))) {
-    // "claude, please add tests": the politeness after the name goes too; "claude, stop" says no work (see parse:
-    // the words after the name are tried as a command). "new agent for this" and "codex on it" still ask for work.
-    rest = stripPolite(stripSoft(rest));
-    if (!rest.some(t => !NOTHING_WORDS.has(t.w))) return null;
+    // "claude, please add tests": only the name comes off, and the rest is the prompt as typed, its politeness too.
+    // Words after the name that say nothing ("codex, hello") are read as free text; "claude, stop" says no work (see
+    // parse: the words after the name are tried as a command). "new agent for this" and "codex on it" still ask for work.
+    if (!stripPolite(stripSoft(rest)).some(t => !NOTHING_WORDS.has(t.w))) return null;
   }
   const tasks = buildTasks(rest, noun, c);
   // A start verb with no work after it ("start an agent", "start codex", "start", "add an agent on cloud 2"): the
@@ -2003,7 +2025,8 @@ function matchTask(core, c) {
     return { kind: 'start', tasks: [], task: null, harness: har.harness };
   }
   if (mach.machine || har.harness) {
-    const task = asTyped(har.toks);
+    // the program or machine named after the work comes off; "can you" or "please" before it are the prompt's own
+    const task = asTyped(har.toks, { lead: words === core });
     if (task && !emptyTask(har.toks)) {
       return { kind: 'start', tasks: [{ task, harness: har.harness || null, machine: mach.machine || laptopId(c) }] };
     }
@@ -2050,7 +2073,7 @@ function matchAddressed(core, c) {
   const named = core[end - 1];
   const rest = stripTrailing(stripPolite(stripSoft(core.slice(end))));
   if (!workAfterName(rest, named, c)) return null;
-  const task = asTyped(rest);
+  const task = asTyped(core.slice(end)); // only the name comes off: "claude please fix the readme" keeps its "please"
   if (!task) return null;
   // weak only when the words may be said to the agent asking: no comma or colon after the name (as for
   // "claude, fix the login page", read by matchStart), and a program the asker runs, when its program is known
@@ -2232,14 +2255,23 @@ function matchFreeWork(core, c, base) {
     }
   }
   const noun = parseNoun(ws, startsWithSeq(ws, START_STRONG));
-  if (noun.named && noun.end === ws.length) return NO_TASK_START(noun.harnesses.length === 1 ? noun.harnesses[0] : null);
+  if (noun.named && noun.end === ws.length) {
+    const named = noun.harnesses.length === 1 ? noun.harnesses[0] : null;
+    // "codex, thanks", "claude, please": a program addressed, and words after it that the commands set aside as
+    // politeness. They are its prompt, as typed.
+    const after = named ? addressedRest(stripSoft(base)) : null;
+    const task = after ? asTyped(after) : '';
+    return task ? { kind: 'start', tasks: [{ task, harness: named, machine: laptopId(c) }] } : NO_TASK_START(named);
+  }
   const har = harnessInFree(core);
   if (!har.harness) return null;
   const name = har.first ? core[harnessAt(ws, 0).len - 1] : null;
   const words = har.first ? stripPolite(stripSoft(har.toks)) : har.toks;
   // "claude is stuck", "claude broke the build": said about a program, not to it
   if (name && !name.tail && !workAfterName(words, name, c)) return null;
-  const task = har.last ? asTyped(words).replace(/[\s,;:]+$/, '') : asTyped(words);
+  // only the program's name comes off: the words before it or after it are the prompt as typed, politeness and all
+  const said = har.first ? har.toks : words;
+  const task = har.last ? asTyped(said, { lead: true }).replace(/[\s,;:]+$/, '') : asTyped(said, { lead: !har.first });
   return task ? { kind: 'start', tasks: [{ task, harness: har.harness, machine: laptopId(c) }] } : null;
 }
 

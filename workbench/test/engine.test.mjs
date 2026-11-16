@@ -4313,7 +4313,7 @@ test('every prompt goes to an agent: whatever is no command starts one at once, 
   const t = live();
   t.engine.deps.commands = commands;
   const prompts = ['what do you think of this workbench', 'who are you', 'thanks', 'ok', 'hi', 'hello', 'help', 'what can you do', '👍', 'hmm',
-    'is this right?', 'go on', 'yes', 'no', 'do it', 'cool', 'never mind', 'never mind, the login page is broken', 'good job', 'blorp',
+    'is this right?', 'go on', 'yes', 'no', 'do it', 'cancel', 'cool', 'never mind', 'never mind, the login page is broken', 'good job', 'blorp',
     'status of the repo', 'what needs me to approve this PR?', 'discard the old migrations folder', 'readme', 'claude is stuck',
     'Hello! Can you help me build a website?', 'Update the docs for the new API.', 'function total(cart) {\n  return cart.sum();\n}'];
   const replies = [];
@@ -4360,6 +4360,62 @@ test('a prompt while a card is on screen starts its agent and leaves the card, w
   assert.equal(t.claude.runners.length, 5, 'a question about the card starts nothing');
   assert.equal((await t.engine.command('cancel', { confirmId: card.confirm.id })).reply, 'OK, I won’t stop it.');
   assert.notEqual(t.store.get(id).state, 'stopped');
+  await t.engine.shutdown();
+});
+
+test('after a card ran out, a yes or a no hears that it is no longer waiting and other words are a prompt; nothing is a word back in place of work', async () => {
+  let now = 1_700_000_000_000;
+  const t = live({ options: { now: () => now } });
+  t.engine.deps.commands = commands;
+  await started(t);
+  const card = await t.engine.command('stop the redirect one');
+  assert.ok(card.confirm, card.reply);
+  now += 10 * 60_000 + 1;
+  const replies = [];
+  for (const said of ['yes', 'no', 'ok', 'do it', 'cancel']) {
+    const out = await t.engine.command(said, { confirmId: card.confirm.id });
+    replies.push(out.reply);
+    assert.equal(out.reply, 'That request is no longer waiting. Ask again if you still want it.', said);
+  }
+  const asked = await t.engine.command('who are you', { confirmId: card.confirm.id });
+  replies.push(asked.reply);
+  assert.equal(asked.reply, 'Started Claude on “who are you”.');
+  // with nothing on screen, each of them is a prompt
+  for (const said of ['yes', 'no', 'ok', 'do it', 'cancel', 'help']) {
+    const out = await t.engine.command(said);
+    replies.push(out.reply);
+    assert.equal(out.reply, `Started Claude on “${said}”.`, said);
+  }
+  assert.deepEqual(t.claude.runners.slice(1).map(r => r.opts.task), ['who are you', 'yes', 'no', 'ok', 'do it', 'cancel', 'help']);
+  for (const r of [...replies, ...t.notices]) for (const s of NEVER_SAID) assert.ok(!r.includes(s), `${JSON.stringify(r)} says ${JSON.stringify(s)}`);
+  await t.engine.shutdown();
+});
+
+test('a yes from a parser of its own, with no card on screen, is a prompt too, never "there is nothing waiting"', async () => {
+  const t = live();
+  t.deps.commands.intent = () => ({ kind: 'confirm', go: true });
+  const out = await t.engine.command('yes');
+  assert.equal(out.reply, 'Started Claude on “yes”.');
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['yes']);
+  for (const s of NEVER_SAID) assert.ok(!out.reply.includes(s));
+  await t.engine.shutdown();
+});
+
+test('a prompt said to a program by name loses only the name: the rest reaches that agent as typed, "please" and "thanks" too', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const rows = [
+    ['codex, please fix the login page, thanks', 'please fix the login page, thanks'],
+    ['ask codex to fix the login page please', 'fix the login page please'],
+    ['codex, thanks', 'thanks'],
+    ['codex: the total is off:\n  expected 42.10\n}', 'the total is off:\n  expected 42.10\n}'],
+  ];
+  for (const [said, task] of rows) {
+    const out = await t.engine.command(said);
+    assert.equal(out.reply, `Started Codex on “${commandsClip(task)}”.`, said);
+  }
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), rows.map(([, task]) => task));
+  assert.equal(t.claude.runners.length, 0);
   await t.engine.shutdown();
 });
 
