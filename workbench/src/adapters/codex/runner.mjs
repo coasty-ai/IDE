@@ -19,6 +19,7 @@
 //   for Codex to commit, fetch, pull and push. The network is then open for anything, not only git.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
@@ -45,9 +46,27 @@ const WORKBENCH_SECRETS = new Set(['WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN']
 // The Claude adapter removes the same ones.
 const HOST_VARS = /^(VSCODE_.*|ELECTRON_RUN_AS_NODE|GIT_EDITOR|WORKBENCH_CLAUDE_BIN|WORKBENCH_CODEX_BIN)$/;
 
-/** The Codex binary: `WORKBENCH_CODEX_BIN` (read at call time, so tests can point it at a fake) or `codex`. */
+/**
+ * Where Codex is: `WORKBENCH_CODEX_BIN` (read at each call, so tests can point it at a fake), else `codex`, which, like
+ * any bare name, is looked up on the PATH. An absolute path is taken as it is, and `~/` is the home folder. A relative
+ * path is refused: Codex starts in the agent's folder, where the agent could put a program of its own at that path,
+ * and the working folder of the moment is not the place either (the file view changes it for a moment). The CLI reads
+ * one from the folder Workbench was started in, once, and puts the whole path in its place (bin/workbench.mjs).
+ * @returns {{ path: string|null, reason?: string }}  `reason`, a plain sentence, when `path` is null
+ */
+export function findCodex(env = process.env) {
+  const e = env || {};
+  let v = typeof e.WORKBENCH_CODEX_BIN === 'string' ? e.WORKBENCH_CODEX_BIN : '';
+  if (!v) return { path: 'codex' };
+  const home = e.HOME || (env === process.env ? os.homedir() : '');
+  if ((v === '~' || v.startsWith('~/')) && home) v = path.join(home, v.slice(1));
+  if (!v.includes('/') || path.isAbsolute(v)) return { path: v };
+  return { path: null, reason: `Workbench cannot tell where ${e.WORKBENCH_CODEX_BIN} is: the path in WORKBENCH_CODEX_BIN must start with / or ~.` };
+}
+
+/** The Codex program to start, as findCodex finds it, or null when the path it was given cannot be used. */
 export function codexBin(env = process.env) {
-  return env.WORKBENCH_CODEX_BIN || 'codex';
+  return findCodex(env).path;
 }
 
 /** Variables buildEnv removes: a key by one of these names is not given to Codex either. */
@@ -210,7 +229,9 @@ function readLogin(res) {
  * @returns {Promise<{ ok: boolean, version?: string, loggedIn: boolean|null, reason?: string }>}
  */
 export async function available({ timeoutMs = 5000 } = {}) {
-  const bin = codexBin();
+  const where = findCodex(process.env);
+  if (!where.path) return { ok: false, loggedIn: null, reason: where.reason };
+  const bin = where.path;
   const env = buildEnv(process.env);
   const [ver, login] = await Promise.all([
     runQuick(bin, ['--version'], env, timeoutMs),
@@ -372,7 +393,14 @@ export function createRunner(opts = {}) {
       finalize(p, null, null);
       return Promise.resolve();
     }
-    const [file, argv] = commandFor(codexBin(baseEnv), args);
+    // Looked up at each launch, never by a relative path: Codex starts in the agent's folder (see findCodex).
+    const where = findCodex(baseEnv);
+    if (!where.path) {
+      p.failReason = where.reason;
+      finalize(p, null, null);
+      return Promise.resolve();
+    }
+    const [file, argv] = commandFor(where.path, args);
     try {
       p.child = spawn(file, argv, { cwd, env: buildEnv(baseEnv, agentId, keysEnv), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     } catch (err) {

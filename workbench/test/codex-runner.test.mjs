@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { harness, available, createRunner, buildEnv, startArgs, resumeArgs, sandboxArgs, gitFolders, tomlString } from '../src/adapters/codex/runner.mjs';
+import { harness, available, createRunner, buildEnv, startArgs, resumeArgs, sandboxArgs, gitFolders, tomlString, findCodex } from '../src/adapters/codex/runner.mjs';
 import { EV } from '../src/shared/events.mjs';
 
 // Codex's own sandbox, as every turn widens it: the network on (the git folders follow, when there are any).
@@ -104,6 +104,33 @@ test('available() gives a plain reason when Codex does not answer or is missing'
   process.env.WORKBENCH_CODEX_BIN = path.join(s.dir, 'no-such-codex');
   t.after(() => { process.env.WORKBENCH_CODEX_BIN = FAKE; });
   assert.deepEqual(await available(), { ok: false, loggedIn: null, reason: 'Codex is not installed, or the codex command could not be found.' });
+});
+
+test('a relative path in WORKBENCH_CODEX_BIN is never read from the agent’s folder, where Codex starts: it is refused in plain words', async t => {
+  const s = setup(t);
+  // What an agent could write in its own folder at that path, to run outside Codex's sandbox: it must never run.
+  const ran = path.join(s.dir, 'impostor-ran');
+  fs.mkdirSync(path.join(s.ws, 'tools'));
+  fs.writeFileSync(path.join(s.ws, 'tools', 'codex.mjs'), `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(ran)}, process.cwd());\n`);
+  process.env.WORKBENCH_CODEX_BIN = 'tools/codex.mjs';
+  t.after(() => { process.env.WORKBENCH_CODEX_BIN = FAKE; });
+  const unknown = v => `Workbench cannot tell where ${v} is: the path in WORKBENCH_CODEX_BIN must start with / or ~.`;
+  assert.deepEqual(findCodex(), { path: null, reason: unknown('tools/codex.mjs') });
+  assert.deepEqual(await available(), { ok: false, loggedIn: null, reason: unknown('tools/codex.mjs') });
+  const runner = createRunner({ agentId: 'a1b2c3', name: 'Explain repo', task: 'Explain this repo', cwd: s.ws, emit: s.emit });
+  await runner.start();
+  await waitFor(() => s.events.some(e => e.kind === EV.STATE && e.state === 'failed'), 5000, 'the refusal');
+  assert.equal(s.events.find(e => e.kind === EV.STATE && e.state === 'failed').reason, unknown('tools/codex.mjs'));
+  assert.equal(fs.existsSync(ran), false, 'the file in its folder never ran');
+  assert.deepEqual(s.calls(), [], 'nothing was started');
+  // A bare name is looked up on the PATH; an absolute path is taken as it is, and ~/ is the home folder.
+  assert.deepEqual(findCodex({}), { path: 'codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '' }), { path: 'codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: 'codex-beta' }), { path: 'codex-beta' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '/opt/codex/bin/codex' }), { path: '/opt/codex/bin/codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '~/bin/codex', HOME: '/home/someone' }), { path: '/home/someone/bin/codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '~/bin/codex' }), { path: null, reason: unknown('~/bin/codex') }, 'no home folder to read it from');
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: './codex' }), { path: null, reason: unknown('./codex') });
 });
 
 test('start() runs codex exec in the workspace with the checked flags, stdin ignored and a clean environment', async t => {

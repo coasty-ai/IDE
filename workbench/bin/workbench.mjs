@@ -339,6 +339,18 @@ function sentence(text) {
 }
 
 /**
+ * WORKBENCH_CODEX_BIN as it is read from anywhere: a relative path (one with a "/" that does not start with "~") is
+ * read from the folder Workbench was started in (`startedIn`), once, at start, and the whole path takes its place. The
+ * Codex adapter and Agents & keys read the variable when they look, and refuse a relative path: Codex starts in an
+ * agent's folder, where the agent could put a program of its own at that path. Without that folder (it was removed
+ * before Workbench started), the path is left as it is, and so refused. Anything else is left as it is.
+ */
+export function placedCodexBin(value, startedIn) {
+  if (typeof value !== 'string' || !value.includes('/') || path.isAbsolute(value) || value === '~' || value.startsWith('~/')) return value;
+  return typeof startedIn === 'string' && path.isAbsolute(startedIn) ? path.resolve(startedIn, value) : value;
+}
+
+/**
  * The Claude Code adapter, told the --claude path when one was given, and the folder Workbench was started in
  * (`startedIn`), from which a relative path in --claude or WORKBENCH_CLAUDE_BIN is read: never from the working folder
  * of the moment, which the file view changes for a moment. The engine and Agents & keys call available() and
@@ -915,6 +927,10 @@ async function main() {
   try {
     startedIn = process.cwd();
   } catch { /* that folder was removed: a relative --claude path is then refused in plain words */ }
+  // A relative path to Codex is placed from the same folder, now: Agents & keys and every launch read the variable.
+  const codexGiven = process.env.WORKBENCH_CODEX_BIN;
+  const codexPlaced = placedCodexBin(codexGiven, startedIn);
+  if (codexPlaced !== codexGiven) process.env.WORKBENCH_CODEX_BIN = codexPlaced;
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     say(USAGE);

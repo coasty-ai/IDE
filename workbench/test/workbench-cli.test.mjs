@@ -17,7 +17,7 @@ import { checkRules } from '../src/core/receipt.mjs';
 import { Engine } from '../src/core/engine.mjs';
 // Imported, the CLI only exports its parts: it starts only when run as a program.
 import { parseArgs, createLogger, displayUrl, cloneFirst, connectGithubMode, githubReposMode, readLine, pathWithLocalBin, agentLines, wireConnect } from '../bin/workbench.mjs';
-import { githubSigninMode, githubStatusMode, openBrowser, claudeAdapter } from '../bin/workbench.mjs';
+import { githubSigninMode, githubStatusMode, openBrowser, claudeAdapter, placedCodexBin } from '../bin/workbench.mjs';
 import { ghWrapper, FAKE_CODE, FAKE_REPOS } from './helpers/gh-fake.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -126,8 +126,8 @@ function setup(t, { files = { 'README.md': '# test\n' }, fakeGit = false } = {})
  * Start the CLI, wait until it is running (or has stopped by itself), then stop it with Ctrl-C.
  * @returns {Promise<{ code: number|null, out: string, err: string, lines: string[] }>}
  */
-async function start(t, args, env) {
-  const proc = spawn(process.execPath, [BIN, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+async function start(t, args, env, { cwd } = {}) {
+  const proc = spawn(process.execPath, [BIN, ...args], { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
   let err = '';
   proc.stdout.on('data', (d) => { out += d; });
@@ -458,6 +458,24 @@ test('full permissions kept from an earlier run are read at start and said in th
   const off = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
   assert.equal(off.code, 0, off.err);
   assert.ok(!off.out.includes(LINE), off.out);
+});
+
+test('a relative path in WORKBENCH_CODEX_BIN is read from the folder Workbench was started in, once, at start', async (t) => {
+  // placedCodexBin: only a relative path with a "/" is placed; without a folder to read it from, it is left to be refused.
+  assert.equal(placedCodexBin('tools/codex', '/where/it/started'), '/where/it/started/tools/codex');
+  assert.equal(placedCodexBin('./codex', '/where/it/started'), '/where/it/started/codex');
+  assert.equal(placedCodexBin('/opt/codex', '/where/it/started'), '/opt/codex');
+  assert.equal(placedCodexBin('codex', '/where/it/started'), 'codex', 'a bare name is looked up on the PATH');
+  assert.equal(placedCodexBin('~/bin/codex', '/where/it/started'), '~/bin/codex', 'the home folder is the adapter’s to read');
+  assert.equal(placedCodexBin('tools/codex', null), 'tools/codex');
+  assert.equal(placedCodexBin(undefined, '/where/it/started'), undefined);
+  // Started from the tests' folder with helpers/codex-fake.mjs: Agents & keys finds that one, and so does every launch.
+  const w = setup(t);
+  const from = path.dirname(path.dirname(CODEX_FAKE));
+  const env = { ...w.env, WORKBENCH_CODEX_BIN: path.relative(from, CODEX_FAKE), FAKE_CODEX_LOGIN: 'in' };
+  const out = await start(t, ['--repo', w.repo, '--no-open', '--port', '0'], env, { cwd: from });
+  assert.equal(out.code, 0, out.err);
+  assert.equal(out.lines[1], 'Codex 0.166.0 is ready, signed in with your ChatGPT account. Found in WORKBENCH_CODEX_BIN.');
 });
 
 test('the Claude Code adapter is told the folder Workbench started in, with the --claude path, at every lookup', async () => {

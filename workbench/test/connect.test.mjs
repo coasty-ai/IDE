@@ -470,6 +470,25 @@ test('a program Workbench was pointed at that is not there, or that will not sta
   assert.ok(!JSON.stringify([s, two.events]).includes('vendor words'));
 });
 
+test('a relative path in WORKBENCH_CODEX_BIN is refused in plain words, never read from the working folder of the moment', async (t) => {
+  // A Codex at that path from where Workbench stands now: the file view stands in a project's folder for a moment, and
+  // Codex itself starts in an agent's folder, so neither is where the path was meant.
+  const dir = scratch(t);
+  const ran = path.join(dir, 'ran');
+  program(path.join(dir, 'tools'), 'codex', `: > '${ran}'\necho 'codex-cli 0.166.0'`);
+  const was = process.cwd();
+  process.chdir(dir);
+  t.after(() => process.chdir(was));
+  setEnv(t, { WORKBENCH_CODEX_BIN: 'tools/codex' });
+  const { c, events } = makeConnect(t);
+  const a = byId(await c.status(), 'codex');
+  const unknown = 'Workbench cannot tell where tools/codex is: the path in WORKBENCH_CODEX_BIN must start with / or ~.';
+  assert.deepEqual([a.found, a.ready, a.from, a.sentence], [false, false, null, unknown]);
+  const [, map] = events.find((e) => e[0] === 'agents');
+  assert.deepEqual([map.codex.ok, map.codex.reason], [false, unknown]);
+  assert.equal(fs.existsSync(ran), false, 'it never ran');
+});
+
 test('a new Connect probes the agents by itself, so the default agent is known before anyone opens the panel', async (t) => {
   let n = 0;
   const claude = { available: async (o) => { n++; return claudeAdapter.available(o); } };

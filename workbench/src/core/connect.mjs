@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { scrubEnv, withNodeOnPath, onPath, shellQuote } from '../adapters/claude/args.mjs';
-import { buildEnv as codexEnv, codexBin } from '../adapters/codex/runner.mjs';
+import { buildEnv as codexEnv, findCodex } from '../adapters/codex/runner.mjs';
 import { KEY_PRESETS } from '../shared/keypresets.mjs';
 import { maskSecrets, readPrivateFile } from './keys.mjs';
 import { SignIns, SIGNIN_CHECK_MS, SIGNIN_TIMEOUT_MS } from './signin.mjs';
@@ -657,15 +657,17 @@ export class Connect extends EventEmitter {
       : { ok: false, reason: 'Codex support could not be loaded.' };
     const safe = info && typeof info === 'object' ? info : { ok: !!info };
     const env = this._agentEnv('codex', repoRoot);
-    const bin = codexBin(this.env);
+    // As the adapter finds it: a relative path is refused, never read from the working folder of the moment.
+    const where = findCodex(this.env);
+    const bin = where.path;
     const given = typeof this.env.WORKBENCH_CODEX_BIN === 'string' && this.env.WORKBENCH_CODEX_BIN !== '';
-    const p = bin.includes('/') ? (isFile(path.resolve(bin)) ? path.resolve(bin) : null) : onPath(bin, env.PATH);
+    const p = !bin ? null : bin.includes('/') ? (isFile(bin) ? bin : null) : onPath(bin, env.PATH);
     const a = {
-      id: d.id, name: d.name, info: safe, path: p, from: given ? 'env' : p ? 'path' : null, found: !!p, runs: safe.ok === true,
+      id: d.id, name: d.name, info: safe, path: p, from: given ? 'env' : p ? 'path' : null, found: !!p, runs: !!bin && safe.ok === true,
       version: safe.ok === true && VERSION_RE.test(String(safe.version || '')) ? safe.version : null, signedIn: 'unknown', how: null,
     };
     if (given) a.fromWords = 'WORKBENCH_CODEX_BIN';
-    if (given && !p) a.missing = `Codex is not at ${oneLine(path.resolve(bin), 300)}, the path in WORKBENCH_CODEX_BIN.`;
+    if (given && !p) a.missing = where.reason || `Codex is not at ${oneLine(bin, 300)}, the path in WORKBENCH_CODEX_BIN.`;
     if (!a.runs) return this._finish(a);
     const r = await runQuick(p || bin, ['login', 'status'], { env, cwd: this._probeFolder(), timeoutMs: this.probeTimeoutMs });
     if (r.timedOut) this._log('warn', 'Codex took too long to say whether it is signed in.');
