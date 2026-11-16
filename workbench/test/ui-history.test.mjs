@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import * as nodeModule from 'node:module';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { needsPerson, needsQueue, reviewQueue } from '../ui/queue.js';
-import { boardModel, splitEarlier, agoText, trayWords } from '../ui/boardmodel.js';
+import { boardModel, splitBoard, agoText, trayWords } from '../ui/boardmodel.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
 
 const SHARED = fileURLToPath(new URL('../src/shared/', import.meta.url));
@@ -39,18 +39,18 @@ test('the board model marks earlier roots; they go to the tray, not to a lane', 
   const list = [earlier('e1', 'done_checked'), earlier('e2', 'stopped', { canContinue: false }), agent('n1', 'working'), agent('n2', 'needs_ok', { ask: { id: 'k', type: 'permission', createdAt: NOW } })];
   const bm = boardModel(list, { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY });
   assert.deepEqual(bm.roots.map(r => [r.id, r.earlier, r.ghost]), [['e1', true, true], ['e2', true, true], ['n1', false, false], ['n2', false, false]]);
-  const { current, earlier: old } = splitEarlier(bm.roots);
-  assert.deepEqual(current.map(r => r.id), ['n1', 'n2']);
+  const { on, earlier: old } = splitBoard(bm.roots);
+  assert.deepEqual(on.map(r => r.id), ['n1', 'n2']);
   assert.deepEqual(old.map(r => r.id), ['e1', 'e2']);
   assert.equal(bm.queue.length, 1, 'only the live ask is in the queue');
 });
 
 test('the tray says what is in it, plainly', () => {
-  assert.deepEqual(trayWords({ done: 3 }), { lead: '3 done', rest: ' or stopped', text: '3 done or stopped', aria: '3 done or stopped. Show them.' });
+  assert.deepEqual(trayWords({ done: 3 }), { lead: '3 done', rest: '', text: '3 done', sum: '3 done', aria: '3 done. Show them.', short: { lead: '3 done', rest: '' } });
   assert.equal(trayWords({ earlier: 5 }).text, '5 from earlier');
-  assert.equal(trayWords({ done: 2, earlier: 5, over: 1 }).text, '2 done or stopped, 5 from earlier, 1 more working');
-  assert.equal(trayWords({ done: 2, earlier: 5 }).aria, '2 done or stopped, 5 from an earlier run. Show them.');
-  assert.equal(trayWords({ done: 4, over: 2 }).text, '4 done or stopped, 2 more working', 'as before, without earlier agents');
+  assert.equal(trayWords({ done: 2, earlier: 5, over: 1 }).text, '2 done, 5 from earlier, 1 more working');
+  assert.equal(trayWords({ done: 2, earlier: 5 }).aria, '2 done, 5 from an earlier run. Show them.');
+  assert.equal(trayWords({ done: 4, over: 2 }).text, '4 done, 2 more working', 'as before, without earlier agents');
 });
 
 test('"time ago" is coarse, and never a percentage or a finish time', () => {

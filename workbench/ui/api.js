@@ -1,6 +1,6 @@
 // Talking to the engine: the access key, JSON requests (the connect panel's too), and the live event stream.
 // Nothing here touches the page when the module loads, so node:test can import it.
-import { plainError } from './link.js';
+import { plainError, tooLongToSend } from './link.js';
 
 let token = null;
 let onRefused = null;
@@ -31,6 +31,8 @@ class RequestError extends Error {
 }
 
 async function call(method, path, body) {
+  // A body over Workbench's limit is not sent: it would be refused (413) once it had all gone. Said the same way.
+  if (tooLongToSend(body)) throw new RequestError(413);
   let res;
   try {
     res = await fetch(path, {
@@ -53,7 +55,7 @@ async function call(method, path, body) {
 export const api = {
   state: () => call('GET', '/api/state'),
   /**
-   * What the person typed or said. focusId: what the core showed; confirmId: the launch question on screen, if any;
+   * What the person typed or said. focusId: what the core showed; confirmId: the card on screen (a stop, a message, a merge…), if any;
    * askId: the ask on screen when they started typing or talking, so the engine applies the words only to that ask.
    */
   command: (text, { focusId = null, confirmId = null, askId = null } = {}) =>
@@ -72,6 +74,11 @@ export const api = {
    */
   prefs: change => call('POST', '/api/prefs', change),
   /**
+   * Full permissions: 'full' answers with the engine's card ({ reply, confirm }), which only its yes turns on; 'ask' turns
+   * them off at once ({ ok, reply, permissions }).
+   */
+  permissions: mode => call('POST', '/api/permissions', { mode }),
+  /**
    * Merge or throw away an agent's work. Neither acts by itself: the engine answers with a card ({ reply, confirm }) the
    * person answers by id. `state` is the state the button was drawn in; the engine refuses when it has changed.
    */
@@ -80,7 +87,54 @@ export const api = {
   /** Read-only, for the git screen: the commit graph, and one agent's diff. */
   git: () => call('GET', '/api/git'),
   changes: (agentId) => call('GET', `/api/agents/${encodeURIComponent(agentId)}/changes`),
+  /**
+   * The file view. `where` is 'you' (your folder) or an agent's id (its copy). Each answers what the engine says, read by
+   * filesCall: the answer itself, or a refusal as data ({ ok: false, reply, why, hash? }), never thrown.
+   * - files(where): { ok, in, name, branch, files: [{ path, changedBy?, ignored? }], truncated? }
+   * - file(where, path, { check }): the file ({ ok, in, path, kind, text?, hash, size, lines?, link?, eol, bom,
+   *   changedLines?, editable, why? }), or { ok: true, same: true } while it still has the hash `check` names
+   * - search(where, words): { ok, in, results: [{ path, line, text }], truncated? }
+   * - saveFile(where, path, { text, hash, force }): { ok, hash, size, reply? }; a file that changed on disk is
+   *   { ok: false, why: 'changed', hash } (its hash now), which a save with force and that hash goes past
+   */
+  files: where => filesCall('GET', `/api/files?${query({ in: where })}`),
+  file: (where, path, { check = null } = {}) => filesCall('GET', `/api/file?${query({ in: where, path, check })}`),
+  search: (where, words) => filesCall('GET', `/api/search?${query({ in: where, q: words })}`),
+  saveFile: (where, path, { text, hash, force = false }) => filesCall('POST', '/api/file', { in: where, path, text, hash, ...(force === true ? { force: true } : {}) }),
 };
+
+/** An address's query from its fields; a field that is null or empty is left out. */
+const query = o => Object.entries(o).filter(([, v]) => v != null && v !== '').map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&');
+
+/**
+ * The file view's requests. The engine refuses with { ok: false, reply, why } and a 4xx code (404 for a copy that is not
+ * there, 409 for a file that changed on disk, with its hash now, 400 otherwise, 413 for too much text): that comes back
+ * as data, its reply word for word (a path may hold any word, "token" included), so the sheet can say it and act on
+ * `why`. A 401 means this page's key no longer works, and no answer at all, or anything else, is an Error in plain words.
+ */
+async function filesCall(method, path, body) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'X-Workbench-Token': token || '' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new RequestError(null);
+  }
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  if (res.status === 401) { onRefused?.(); throw new RequestError(401); }
+  const obj = data && typeof data === 'object' && !Array.isArray(data) ? data : null;
+  if (obj && obj.ok === false && typeof obj.reply === 'string') {
+    const out = { ok: false, reply: obj.reply, why: obj.why === 'changed' || obj.why === 'gone' ? obj.why : 'refused', status: res.status };
+    if (typeof obj.hash === 'string') out.hash = obj.hash;
+    return out;
+  }
+  if (res.ok && obj) return obj;
+  throw new RequestError(res.status, obj && typeof obj.error === 'string' ? obj.error : undefined);
+}
 
 /**
  * The connect panel's requests ("Agents & keys"). Each answers { ok, sentence, status }: a refusal (ok: false) comes back

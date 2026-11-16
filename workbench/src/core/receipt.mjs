@@ -1,9 +1,10 @@
 // The receipt for a finished agent: which of the repository's rules its changes kept or broke, and
-// the results of the checks the repository declares in workbench.json.
+// the results of the checks the repository declares in workbench.json. And the repository's setup command
+// (workbench.json's `setup`), which an agent's new copy runs once before the agent starts.
 //
-// Checks are the one place the workbench runs shell strings: commands the repository owner wrote.
-// Each runs through /bin/sh -c in the agent's folder, in its own process group, with a scrubbed
-// environment and a timeout that kills the whole group.
+// The checks and the setup command are the places the workbench runs shell strings it did not write: commands the
+// repository owner wrote. Each runs through /bin/sh -c in the agent's folder, in its own process group, with a
+// scrubbed environment and a timeout that kills the whole group.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,6 +20,8 @@ const SECRETS = ['WORKBENCH_HOOK_TOKEN'];
 /** A variable name a key may use: letters, digits and _, not starting with a digit. */
 const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const TAIL_BYTES = 2048;
+const SETUP_TAIL_BYTES = 4096; // what the log keeps of the setup command's output
+const SETUP_TIMEOUT_SEC = 600;
 /**
  * With a mask, the output kept has this many bytes to spare before the tail shown, so that a key at the start of the
  * tail is whole when it is masked (a key is at most 2000 characters, of up to 4 bytes each); where a key may have been
@@ -259,11 +262,11 @@ function checkName(check, i) {
  * Run one check. Never rejects.
  * @returns {Promise<{ name: string, ok: boolean, ms: number, tail: string, exitCode: number|null, timedOut: boolean }>}
  */
-function runOne(check, name, cwd, env, signal, mask) {
+function runOne(check, name, cwd, env, signal, mask, tailBytes = TAIL_BYTES) {
   const sec = Number(check.timeoutSec) > 0 ? Number(check.timeoutSec) : DEFAULT_TIMEOUT_SEC;
   return new Promise(resolve => {
     const started = Date.now();
-    const tail = new Tail(TAIL_BYTES, mask);
+    const tail = new Tail(tailBytes, mask);
     if (typeof cwd !== 'string' || !fs.existsSync(cwd)) {
       resolve({ name, ok: false, ms: 0, tail: `Could not start this check because the folder ${cwd} does not exist.`, exitCode: null, timedOut: false });
       return;
@@ -367,4 +370,23 @@ export async function runChecks({ cwd, checks, onProgress, env, keysEnv, mask, s
     progress({ phase: 'end', index: i, total: list.length, name, result, results: [...results] });
   }
   return { state: results.every(r => r.ok) ? 'passed' : 'failed', results };
+}
+
+/**
+ * Run the repository's setup command (workbench.json's `setup`) once in an agent's new copy, before the agent starts:
+ * through /bin/sh -c in `cwd`, in its own process group, with the scrubbed environment (node first on its PATH when it
+ * has none) and nothing else: no key, unlike the checks. The engine adds WORKBENCH_ROOT and WORKBENCH_AGENT_ID in `env`.
+ * Stopped with everything it started after `timeoutSec` (600 unless given), when `signal` aborts, and by
+ * killChecksSync at exit. `mask` hides the person's keys and copied env values in what it printed, before the tail is
+ * cut (4 KB kept, for the log). Never rejects.
+ * @param {{ cwd: string, run: string, env?: object, mask?: (text: string) => string, signal?: AbortSignal, timeoutSec?: number }} opts
+ * @returns {Promise<{ ok: boolean, exitCode: number|null, timedOut: boolean, ms: number, tail: string }>}
+ */
+export async function runSetup({ cwd, run, env, mask, signal, timeoutSec = SETUP_TIMEOUT_SEC } = {}) {
+  if (typeof run !== 'string' || !run.trim()) return { ok: false, exitCode: null, timedOut: false, ms: 0, tail: 'There is no setup command to run.' };
+  const sec = Number(timeoutSec) > 0 ? Number(timeoutSec) : SETUP_TIMEOUT_SEC;
+  const r = signal && signal.aborted
+    ? { ok: false, ms: 0, tail: 'Not run because the agent was stopped.', exitCode: null, timedOut: false }
+    : await runOne({ run, timeoutSec: sec }, 'Setup', cwd, withNodeOnPath(scrubEnv(env || process.env)), signal, safeMask(mask), SETUP_TAIL_BYTES);
+  return { ok: r.ok, exitCode: r.exitCode, timedOut: r.timedOut, ms: r.ms, tail: r.tail };
 }

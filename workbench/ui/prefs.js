@@ -3,25 +3,30 @@
 //
 // Workbench keeps the choices, not the page (src/core/prefs.mjs, in ~/.workbench/prefs.json): the server puts them on
 // <html> as it sends the page (data-theme, data-detail, data-answered), and the page saves a change through
-// POST /api/prefs. The lists match the server's.
+// POST /api/prefs. The lists match the server's. The server also puts the permission mode there (data-permissions), so
+// the top band's Full permissions button is right from the first paint; the page changes it only through the engine
+// (POST /api/permissions), never through its own choices.
 
 export const THEMES = ['green', 'black-gold', 'ivory'];
 export const THEME_NAMES = { green: 'Green', 'black-gold': 'Black and gold', ivory: 'Ivory' };
 export const DETAILS = ['calm', 'more'];
 export const DETAIL_NAMES = { calm: 'Calm', more: 'More' };
 export const DEFAULT_PREFS = Object.freeze({ theme: 'green', detail: 'calm' });
+/** ask: agents ask before risky steps; full: full permissions are on. */
+export const PERMISSIONS = ['ask', 'full'];
 
 export const normalTheme = v => (THEMES.includes(v) ? v : DEFAULT_PREFS.theme);
 export const normalDetail = v => (DETAILS.includes(v) ? v : DEFAULT_PREFS.detail);
 
 /**
  * The choices Workbench put on <html>: `dataset` is document.documentElement.dataset, or anything with the same
- * fields. Anything unknown is the default; `answered` (the person has answered something once) only when it is "1".
- * @returns {{ theme: string, detail: string, answered: boolean }}
+ * fields. Anything unknown is the default; `answered` (the person has answered something once) only when it is "1",
+ * and `permissions` is 'full' only when it says exactly that.
+ * @returns {{ theme: string, detail: string, answered: boolean, permissions: 'ask'|'full' }}
  */
 export function pagePrefs(dataset) {
   const d = dataset && typeof dataset === 'object' ? dataset : {};
-  return { theme: normalTheme(d.theme), detail: normalDetail(d.detail), answered: d.answered === '1' };
+  return { theme: normalTheme(d.theme), detail: normalDetail(d.detail), answered: d.answered === '1', permissions: d.permissions === 'full' ? 'full' : 'ask' };
 }
 
 // The words, matched against the whole utterance only, so "make the login button green" still reaches the agents.
@@ -47,6 +52,21 @@ export function plainWords(text) {
   t = t.replace(/^(switch|change|go|turn) (back )?(it |the board |the look |the page )?(back )?to /, '')
     .replace(/^(use|show me) /, '');
   return t.trim();
+}
+
+/**
+ * "looks good" or "not now", typed or said: which of the two answers these words are ("Looks good", "Not now"), so at a
+ * finished agent's lid the page presses the button that stands for them (its data-words, focus.js) or says which answers
+ * the lid has, and never sends the words to the engine as a command (app.js). The phrases are the engine's own
+ * (LOOKS_GOOD_RE and NOT_NOW_RE in /shared/answers.mjs), passed in, so the two never disagree. null for anything else.
+ * @returns {'Looks good'|'Not now'|null}
+ */
+export function lidAnswer(text, { LOOKS_GOOD_RE, NOT_NOW_RE }) {
+  const t = String(text ?? '').trim();
+  if (!t) return null;
+  if (NOT_NOW_RE.test(t)) return 'Not now';
+  if (LOOKS_GOOD_RE.test(t)) return 'Looks good';
+  return null;
 }
 
 /**

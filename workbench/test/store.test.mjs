@@ -272,6 +272,59 @@ test('a root picked up again by a message drops the error of its earlier run', (
   assert.equal(s.get('r1').error, 'Exit code 4', 'a later failure says its own error');
 });
 
+test('a process that ends after its agent finished leaves the finish as it was: endedAt stays the first of that run', () => {
+  const { s } = recording();
+  s.apply([created('r1'), state('r1', 'working', T0 + 1000)]);
+  s.apply(state('r1', 'done_checked', T0 + 5000));
+  assert.equal(s.get('r1').endedAt, T0 + 5000);
+  // Claude Code's process exits a little after its last turn: the finish the page keys its looks on does not move
+  s.apply({ kind: EV.ENDED, ts: T0 + 9000, agentId: 'r1', outcome: 'ok' });
+  assert.equal(s.get('r1').endedAt, T0 + 5000);
+  assert.equal(s.get('r1').state, 'done_checked');
+  assert.equal(s.get('r1').error, null);
+  // picked up again, it finishes again: a new finish, which its own late process end leaves alone too
+  s.apply({ kind: EV.TURN, ts: T0 + 10000, agentId: 'r1', phase: 'start' });
+  assert.equal(s.get('r1').endedAt, null);
+  s.apply(state('r1', 'done_claimed', T0 + 12000));
+  s.apply({ kind: EV.ENDED, ts: T0 + 15000, agentId: 'r1', outcome: 'ok' });
+  assert.equal(s.get('r1').endedAt, T0 + 12000);
+  // a stopped agent, whose process ends after the stop
+  s.apply([created('r2'), state('r2', 'working', T0 + 1000), state('r2', 'stopped', T0 + 2000)]);
+  s.apply({ kind: EV.ENDED, ts: T0 + 6000, agentId: 'r2', outcome: 'stopped' });
+  assert.equal(s.get('r2').endedAt, T0 + 2000);
+  // a process that ends while its agent still works sets endedAt, as before, and the state that follows sets its own
+  s.apply([created('r3'), state('r3', 'working', T0 + 1000)]);
+  s.apply({ kind: EV.ENDED, ts: T0 + 3000, agentId: 'r3', outcome: 'error', error: 'Exit code 1' });
+  assert.equal(s.get('r3').endedAt, T0 + 3000);
+  assert.equal(s.get('r3').error, 'Exit code 1');
+  s.apply(state('r3', 'failed', T0 + 3500));
+  assert.equal(s.get('r3').endedAt, T0 + 3500);
+});
+
+test('agent.state with again: an ended agent that ended again (a recheck after a save) has a new finish, though its state stays', () => {
+  const { s, emitted } = recording();
+  s.apply([created('r1'), state('r1', 'working', T0 + 1000), state('r1', 'done_claimed', T0 + 5000, { reason: null })]);
+  s.apply({ kind: EV.FILES, ts: T0 + 6000, agentId: 'r1', files: { changed: 1, adds: 1, dels: 0, list: [{ path: 'a.js', adds: 1, dels: 0 }] } });
+  // the same state again moves nothing by itself
+  s.apply(state('r1', 'done_claimed', T0 + 7000));
+  assert.deepEqual([s.get('r1').endedAt, s.get('r1').stateSince], [T0 + 5000, T0 + 5000]);
+  // with again: a new finish, and nothing else of a change of state (its files, says and ask stay)
+  const before = emitted.length;
+  s.apply(state('r1', 'done_claimed', T0 + 9000, { again: true, reason: 'Still done.' }));
+  const v = s.get('r1');
+  assert.deepEqual([v.state, v.endedAt, v.stateSince, v.stateReason], ['done_claimed', T0 + 9000, T0 + 9000, 'Still done.']);
+  assert.equal(v.files.changed, 1, 'its receipt stays');
+  assert.ok(emitted.length > before, 'the page hears of it');
+  // when its state changes as well, the finish is that change's, as without it
+  s.apply(state('r1', 'done_checked', T0 + 11000, { again: true }));
+  assert.deepEqual([s.get('r1').endedAt, s.get('r1').stateSince], [T0 + 11000, T0 + 11000]);
+  // only true counts, and only for a state that ends a run
+  s.apply(state('r1', 'done_checked', T0 + 12000, { again: 'yes' }));
+  assert.equal(s.get('r1').endedAt, T0 + 11000);
+  s.apply([created('r2'), state('r2', 'working', T0 + 1000), state('r2', 'working', T0 + 4000, { again: true })]);
+  assert.deepEqual([s.get('r2').endedAt, s.get('r2').stateSince], [null, T0 + 1000]);
+});
+
 test('plan, says, files, checks, rules, model, session, approvals and ended', () => {
   const { s } = recording();
   s.apply(created('r1'));
@@ -537,6 +590,28 @@ test('any output moves a starting root to working: init, a turn, thinking, text'
   s.apply(state('s2', 'starting', T0 + 500));
   s.apply({ kind: EV.THINKING, ts: T0 + 1000, agentId: 's2', on: false });
   assert.equal(s.get('s2').state, 'starting', 'thinking switching off is not output');
+});
+
+test('a starting root’s reason is what it is doing: the engine’s words while its copy is made ready show as its now, until it does something', () => {
+  const { s } = recording();
+  s.apply(created('s1'));
+  s.apply(state('s1', 'starting', T0 + 100, { reason: null }));
+  assert.equal(s.get('s1').now, 'Starting', 'no reason: as it always was');
+  s.apply(state('s1', 'starting', T0 + 200, { reason: 'Copying .env and node_modules into its copy' }));
+  assert.deepEqual([s.get('s1').state, s.get('s1').now, s.get('s1').stateReason, s.get('s1').stateSince],
+    ['starting', 'Copying .env and node_modules into its copy', 'Copying .env and node_modules into its copy', T0], 'still starting since it was made');
+  s.apply(state('s1', 'starting', T0 + 300, { reason: 'Its copy has your .env and node_modules.' }));
+  assert.equal(s.get('s1').now, 'Its copy has your .env and node_modules.');
+  s.apply(state('s1', 'starting', T0 + 350, { reason: null }));
+  assert.equal(s.get('s1').now, 'Its copy has your .env and node_modules.', 'a starting state without words leaves them');
+  // its first output moves it to working; its first step says what it does now
+  s.apply({ kind: EV.SESSION, ts: T0 + 400, agentId: 's1', sessionId: 'x' });
+  assert.equal(s.get('s1').state, 'working');
+  s.apply(act('s1', 'start', 'Reading login.ts', T0 + 500));
+  assert.equal(s.get('s1').now, 'Reading login.ts');
+  // the reason of any other state is never its now
+  s.apply(state('s1', 'failed', T0 + 600, { reason: 'It could not start: boom' }));
+  assert.equal(s.get('s1').now, 'Reading login.ts');
 });
 
 test('a view has fullName: the event\'s whole description, or the name itself', () => {

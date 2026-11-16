@@ -193,6 +193,7 @@ test('Merge and Throw it away in the detail follow the lid\'s rules', () => {
   assert.deepEqual(workActions({ ...done, work: w({ folder: false }) }, live), { merge: false, discard: true }, 'a branch whose folder is gone can still be thrown away, as the lid\'s rule says');
   assert.deepEqual(workActions({ ...done, work: w({ branch: null, folder: false, thrownAway: { at: 1 } }) }, live), { merge: false, discard: false });
   assert.deepEqual(workActions({ ...done, parentId: 'p' }, live), { merge: false, discard: false }, 'a helper: its agent is merged instead');
+  assert.deepEqual(workActions({ ...done, state: 'done_claimed', checks: { state: 'running', results: [] } }, live), { merge: false, discard: true }, 'checked again after a save: not merged while its checks run');
   assert.deepEqual(workActions(done, { ...live, mode: 'demo' }), { merge: false, discard: false });
 });
 

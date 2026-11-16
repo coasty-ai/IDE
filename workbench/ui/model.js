@@ -8,32 +8,43 @@ export const STATES = { PRIORITY, NEEDS_YOU, DONE, ACTIVE, ENDED, LOOK };
 export const S = {
   agents: new Map(),     // id -> AgentView
   machines: [],
-  meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null },
+  // permissions: 'full' while full permissions are on, else 'ask' (from <html> at first, then from each snapshot)
+  meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null, permissions: 'ask' },
   loaded: false,         // a snapshot has arrived
   focusId: null,         // set when the person picks an agent or steps the queue; null = follow the queue
-  // an engine card on screen: { id, sentence, detail, kind: 'start'|'stop'|'say'|'forget'|'merge'|'discard', yes?, no?,
-  // danger? }, plus agentId (the page's own note) when a lid button for that agent asked for it
+  // an engine card on screen: { id, sentence, detail, kind: 'stop'|'say'|'forget'|'merge'|'discard'|'permissions'|'start', yes?,
+  // no?, danger?, agentId? } (one agent starts at once; only more than one from one sentence is asked about, with a 'start'
+  // card), plus agentId (the page's own note) when a lid button for that agent asked for it. The setup card is `setup`.
   confirm: null,
+  // the setup card the engine waits on (the snapshot's `setup`: { id, kind: 'setup', sentence, command, detail, yes, no }):
+  // launches wait for its answer, so it stays in the core, after a card on screen, until it is answered
+  setup: null,
   hoverId: null,         // chip or helper under the pointer or keyboard
   pinId: null,           // card pinned by a click
   reply: null,           // { agentId, mode: 'answer'|'say', askId }
-  reviewed: load('wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Not now", "Dismiss")
-  later: load('wb-later'),         // finishKeys set aside: a failed check, or a merge that did not go through ("Look later")
+  // Both kept in this tab's sessionStorage, as the page's key is, so a reload that brings the board back brings them back.
+  reviewed: Q.readMarks(tab(), 'wb-reviewed'),   // finishKeys the person has looked at ("Looks good", "Not now", "Dismiss"), and problemKeys of merges that did not go through they dismissed: such a root leaves the board
+  later: Q.readMarks(tab(), 'wb-later'),         // finishKeys set aside: a failed check, or a merge that did not go through ("Look later")
 };
 
-function load(key) {
-  try { const v = JSON.parse(sessionStorage.getItem(key) || '[]'); return new Set(Array.isArray(v) ? v.filter(x => typeof x === 'string') : []); } catch { return new Set(); }
-}
-function keep(key, set) {
-  try { sessionStorage.setItem(key, JSON.stringify([...set].slice(-300))); } catch { /* full or private */ }
-}
+function tab() { try { return sessionStorage; } catch { return null; } }
 
 export const finishKey = Q.finishKey;
 
-/** "Looks good" / "Not now" / "Dismiss": this finish has been looked at. */
-export function markReviewed(a) { S.reviewed.add(finishKey(a)); keep('wb-reviewed', S.reviewed); }
+/**
+ * "Looks good" / "Not now" / "Dismiss": this finish has been looked at. `problem`: it was the "Dismiss" of a merge that
+ * did not go through, drawn for that very problem (its data-work, checked against the agent before this), so that
+ * problem goes too (Q.problemKey): it leaves the board, and stays off it if the problem clears. A look drawn before the
+ * problem came never lets the problem go.
+ */
+export function markReviewed(a, { problem = false } = {}) {
+  S.reviewed.add(finishKey(a));
+  const pk = problem ? Q.problemKey(a) : null;
+  if (pk) S.reviewed.add(pk);
+  Q.keepMarks(tab(), 'wb-reviewed', S.reviewed);
+}
 /** "Look later" on a failed check, or on a merge that did not go through: not now, for this finish. */
-export function setAside(a) { S.later.add(finishKey(a)); keep('wb-later', S.later); }
+export function setAside(a) { S.later.add(finishKey(a)); Q.keepMarks(tab(), 'wb-later', S.later); }
 
 export function upsert(list) {
   for (const a of list) if (a && a.id) S.agents.set(a.id, a);
@@ -43,12 +54,14 @@ const ctx = () => ({ NEEDS_YOU, PRIORITY, later: S.later });
 export const needsPerson = a => Q.needsPerson(a, ctx());
 export const needsQueue = () => Q.needsQueue(S.agents.values(), ctx());
 export const reviewQueue = () => Q.reviewQueue(S.agents.values(), { reviewed: S.reviewed, later: S.later });
-export const setAsideList = () => Q.setAsideList(S.agents.values(), { later: S.later });
+export const setAsideList = () => Q.setAsideList(S.agents.values(), { later: S.later, reviewed: S.reviewed });
 
 // An agent's work (AgentView.work), against the person's repository as the last snapshot or `repo` event told it. The
 // git screen's detail (ui/gitscreen.js) uses the same rules for its Merge and Throw it away.
 const workCtx = () => ({ ACTIVE, meta: S.meta });
 export const { unmergedWork, workSettled, workKey, canReview } = Q;
+/** Settled work that finished again since, unseen (a merged agent asked for a change that brought nothing new): see queue.js. */
+export const finishedSinceSettled = a => Q.finishedSinceSettled(a, { reviewed: S.reviewed });
 /** Merge into the person's branch is offered: live mode, a root at rest, its folder there, a branch and an identity, unmerged work. */
 export const mergeApplies = a => Q.mergeApplies(a, workCtx());
 /** Throw it away is offered: live mode, a root whose work was not thrown away, with its branch or its folder still there. */
@@ -66,12 +79,13 @@ export function helpersOf(root) {
 export const helpersAtWork = a => Q.helpersAtWork(childrenOf(a.id), ACTIVE);
 
 /**
- * What the core shows, in this order: a launch question on screen; the agent the person picked or stepped to (with its
- * place in a queue, when it is in one); the most urgent thing that needs the person; finished work not yet looked at;
- * otherwise nothing.
+ * What the core shows, in this order: an engine card on screen; the setup card launches wait on; the agent the person
+ * picked or stepped to (with its place in a queue, when it is in one); the most urgent thing that needs the person;
+ * finished work not yet looked at; otherwise nothing.
  */
 export function currentFocus() {
   if (S.confirm) return { confirm: S.confirm };
+  if (S.setup) return { confirm: S.setup };
   const q = needsQueue();
   if (S.focusId && S.agents.has(S.focusId)) {
     const a = S.agents.get(S.focusId);

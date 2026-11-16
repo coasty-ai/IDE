@@ -112,13 +112,13 @@ async function setup(t, extraEnv = {}, { config = null, claudeSettings = null, a
 }
 
 async function startAgent(w) {
-  const asked = await w.post('/api/command', { text: 'start an agent to look at greet.js and leave a marker file' });
-  assert.equal(asked.status, 200, JSON.stringify(asked.body));
-  assert.ok(asked.body.confirm?.id, `a confirm was expected, got ${JSON.stringify(asked.body)}`);
-  assert.match(asked.body.confirm.detail, /\$0\.50/); // the --budget reaches the agent
-  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  // a start is never asked: the agent starts at once, and the reply carries it
+  const go = await w.post('/api/command', { text: 'start an agent to look at greet.js and leave a marker file' });
   assert.equal(go.status, 200, JSON.stringify(go.body));
-  assert.equal(go.body.agentIds?.length, 1);
+  assert.equal(go.body.confirm, undefined, `no card was expected, got ${JSON.stringify(go.body)}`);
+  assert.equal(go.body.agentIds?.length, 1, JSON.stringify(go.body));
+  const v = (await w.agents()).find((a) => a.id === go.body.agentIds[0]);
+  assert.equal(v?.budgetUsd, 0.5); // the --budget reaches the agent
   return go.body.agentIds[0];
 }
 
@@ -371,30 +371,27 @@ test('one agent cannot ask in another agent’s name, and a stopped agent’s to
   await stopEngine(w);
 });
 
-test('a work request that starts with "stop" is offered as new work; only the agent’s name stops it', async (t) => {
+test('a work request that starts with "stop" is new work for a new agent; only the agent’s name stops it', async (t) => {
   const w = await setup(t);
-  const asked = await w.post('/api/command', { text: 'start an agent to fix the flaky checkout test' });
-  // The launch question's own "yes", typed: it carries the id of the card on screen.
-  const go = await w.post('/api/command', { text: 'yes', confirmId: asked.body.confirm.id });
-  assert.equal(go.body.reply, 'Started Fix flaky checkout test.');
-  const id = go.body.focusId;
+  const go = await w.post('/api/command', { text: 'start an agent to fix the flaky checkout test' });
+  assert.equal(go.body.reply, 'Started Claude on “fix the flaky checkout test”.');
+  const id = go.body.agentIds[0];
   const { root, helper } = await helperAsks(w);
   assert.equal(root.id, id);
   const fakePid = Number(readFileSync(w.pidfile, 'utf8'));
 
   const work = await w.post('/api/command', { text: 'stop the flaky checkout test from timing out' });
   assert.equal(work.status, 200, JSON.stringify(work.body));
-  assert.equal(work.body.confirm?.sentence, 'Start Claude on “stop the flaky checkout test from timing out”?');
+  assert.equal(work.body.reply, 'Started Claude on “stop the flaky checkout test from timing out”.');
+  assert.equal(work.body.confirm, undefined);
   await sleep(300);
   assert.ok(alive(fakePid), 'the running agent was not stopped');
   const now = await w.agents();
   assert.equal(now.find((a) => a.id === id).state, 'waiting_helpers');
   assert.equal(now.find((a) => a.id === helper.id).state, 'needs_ok', 'its held request still waits for the person');
-  // The page let go of the card without a command (the person picked an agent): it withdraws it.
-  assert.equal((await w.post(`/api/confirm/${encodeURIComponent(work.body.confirm.id)}`, { go: false })).body.reply, 'OK, I won’t start it.');
 
-  // Its name alone still stops it in one step.
-  const stop = await w.post('/api/command', { text: 'stop the flaky checkout test' });
+  // Its whole name still stops it in one step, the new agent beside it.
+  const stop = await w.post('/api/command', { text: 'stop fix flaky checkout test' });
   assert.equal(stop.body.reply, 'Stopped Fix flaky checkout test.');
   await until('the fake agent to be gone', () => !alive(fakePid), { timeoutMs: 5000 });
   await stopEngine(w);
@@ -482,8 +479,7 @@ async function relaunch(t, w) {
 test('history: stop Workbench, start it again, and the agent is there to continue in the same folder', async (t) => {
   // No recorded run: the stand-in answers each message with one line, so a turn ends at once.
   const w = await setup(t, { FAKE_CLAUDE_FIXTURE: '' });
-  const asked = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
-  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  const go = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
   const id = go.body.agentIds[0];
   const first = await until('the agent to finish', async () => (await w.agents()).find((a) => a.id === id && a.state === 'done_claimed'));
   assert.match(first.says, /^You said: /);
@@ -544,8 +540,7 @@ test('history: stop Workbench, start it again, and the agent is there to continu
 
 test('history: an earlier agent whose folder was removed is shown, and refuses to continue in plain words', async (t) => {
   const w = await setup(t, { FAKE_CLAUDE_FIXTURE: '' });
-  const asked = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
-  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  const go = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
   const id = go.body.agentIds[0];
   const first = await until('the agent to finish', async () => (await w.agents()).find((a) => a.id === id && a.state === 'done_claimed'));
   writeFileSync(path.join(first.workspace, 'notes.txt'), 'x\n');
@@ -567,8 +562,7 @@ test('the spending limit, live: an agent at its limit is given one more for this
   // The stand-in keeps to its own limit, as Claude Code does: its first reply costs $0.60 of the run's $0.50, and that
   // process refuses every message after it, at once.
   const w = await setup(t, { FAKE_CLAUDE_FIXTURE: '', FAKE_CLAUDE_SPEND: '0.6' });
-  const asked = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
-  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  const go = await w.post('/api/command', { text: 'start an agent to say hello in the greeting file' });
   const id = go.body.agentIds[0];
   const first = await until('the agent to reach its limit', async () => (await w.agents()).find((a) => a.id === id && a.state === 'failed'));
   assert.deepEqual([first.stateReason, first.atLimit, first.budgetUsd, first.usage.costUsd], ['It reached its spending limit.', true, 0.5, 0.6]);

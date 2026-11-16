@@ -51,10 +51,15 @@ export async function launch({ width = 1440, height = 900, dpr = 1 } = {}) {
       await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       if (click) { await send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }); await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }); }
     },
-    /** Press a key; `phase` 'down' or 'up' sends only that half (holding space). */
-    key: async (k, { phase = 'both', shift = false } = {}) => {
-      const base = { key: k, code: code(k), windowsVirtualKeyCode: keyCode(k), modifiers: shift ? 8 : 0 };
-      if (phase !== 'up') await send('Input.dispatchKeyEvent', { type: 'keyDown', ...base, text: k.length === 1 ? k : k === 'Enter' ? '\r' : undefined });
+    /**
+     * Press a key; `phase` 'down' or 'up' sends only that half (holding space). `meta` (⌘), `ctrl`, `alt` and `shift` hold
+     * those keys with it; with ⌘, Ctrl or Alt held nothing is typed, as on a keyboard.
+     */
+    key: async (k, { phase = 'both', shift = false, meta = false, ctrl = false, alt = false } = {}) => {
+      const modifiers = (alt ? 1 : 0) | (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
+      const base = { key: k, code: code(k), windowsVirtualKeyCode: keyCode(k), modifiers };
+      const typed = meta || ctrl || alt ? undefined : k.length === 1 ? k : k === 'Enter' ? '\r' : undefined;
+      if (phase !== 'up') await send('Input.dispatchKeyEvent', { type: 'keyDown', ...base, text: typed });
       if (phase !== 'down') await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
     },
     type: async text => { for (const ch of text) await b.key(ch); },

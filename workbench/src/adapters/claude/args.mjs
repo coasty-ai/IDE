@@ -131,13 +131,15 @@ export function newestExtensionClaude(home) {
  * Where Claude Code is, looked up afresh on every call (the VS Code extension moves to a new folder with each
  * update). In this order: the --claude path (`flag`), WORKBENCH_CLAUDE_BIN (`env`), `claude` on the PATH (`path`),
  * then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor (`vscode`). A path that was given but
- * is not there is reported as it is, never swapped for another Claude Code. A given path is read from `cwd`; a bare
- * name is looked up on the PATH.
- * @param {{ flag?: string|null, env?: Record<string,string|undefined>, cwd?: string }} [o]
+ * is not there is reported as it is, never swapped for another Claude Code. A bare name is looked up on the PATH. A
+ * relative path is read from `cwd`, the folder Workbench was started in, which every caller passes: never from the
+ * working folder of the moment, which the file view changes for a moment (src/core/files.mjs). Without an absolute
+ * `cwd`, a relative path is refused in plain words.
+ * @param {{ flag?: string|null, env?: Record<string,string|undefined>, cwd?: string|null }} [o]
  * @returns {{ path: string|null, from: 'flag'|'env'|'path'|'vscode'|null, reason?: string }}
  *   `reason`, a plain sentence, is there when no usable Claude Code was found; `path` then says what was tried
  */
-export function findClaude({ flag, env = process.env, cwd = process.cwd() } = {}) {
+export function findClaude({ flag, env = process.env, cwd = null } = {}) {
   const e = env || {};
   const home = e.HOME || (env === process.env ? os.homedir() : '');
   const given = (value, from) => {
@@ -148,7 +150,10 @@ export function findClaude({ flag, env = process.env, cwd = process.cwd() } = {}
       return found ? { path: found, from } : { path: null, from, reason: `There is no ${v} command on the PATH (the name ${where}).` };
     }
     if ((v === '~' || v.startsWith('~/')) && home) v = path.join(home, v.slice(1));
-    const p = path.resolve(cwd, v);
+    if (!path.isAbsolute(v) && !(typeof cwd === 'string' && path.isAbsolute(cwd))) {
+      return { path: null, from, reason: `Workbench cannot tell where ${v} is: the path ${where} must start with / or ~.` };
+    }
+    const p = path.resolve(path.isAbsolute(v) ? '/' : cwd, v);
     let st = null;
     try { st = fs.statSync(p); } catch { /* not there */ }
     if (!st) return { path: p, from, reason: `Claude Code is not at ${p}, the path ${where}.` };
@@ -164,9 +169,9 @@ export function findClaude({ flag, env = process.env, cwd = process.cwd() } = {}
   return { path: null, from: null, reason: CLAUDE_NOT_FOUND };
 }
 
-/** The Claude Code program to start: what findClaude finds, or `claude` when it finds nothing. */
-export function claudeBin(env = process.env, { flag } = {}) {
-  return findClaude({ flag, env }).path || 'claude';
+/** The Claude Code program to start: what findClaude finds (a relative path read from `cwd`), or `claude` when it finds nothing. */
+export function claudeBin(env = process.env, { flag, cwd = null } = {}) {
+  return findClaude({ flag, env, cwd }).path || 'claude';
 }
 
 /** Quote one word for a POSIX shell. Claude Code runs hook commands through a shell. */
@@ -260,20 +265,54 @@ export function safeMask(mask) {
 }
 
 /**
+ * Where an agent's output names things rather than says them: the fields that the parser reads back as kinds and ids
+ * (`keep`), at each level of a line it walks into (`inside`, by field; `each`: every item of a list there), and
+ * `toolName`: a tool call's name, on a block whose type ends in tool_use. See maskParsed.
+ * @typedef {{ keep?: Set<string>, inside?: Record<string, OutputFormat>, each?: boolean, toolName?: boolean }} OutputFormat
+ */
+
+/**
+ * Claude Code's stream-json format: a line's own fields (its type and subtype, the session's and the task's ids, a
+ * task's status, the model of system/init), its message's (id, type, role, model, stop_reason), and each block of that
+ * message's content (type, id, tool_use_id, and a tool call's name). Nothing below a tool's input, a tool result's
+ * content or tool_use_result: those hold what the agent and its tools wrote, whatever their fields are called.
+ * @type {OutputFormat}
+ */
+export const CLAUDE_FORMAT = Object.freeze({
+  keep: new Set(['type', 'subtype', 'uuid', 'session_id', 'parent_tool_use_id', 'tool_use_id', 'task_id', 'task_type', 'status', 'last_tool_name', 'model']),
+  inside: {
+    message: {
+      keep: new Set(['id', 'type', 'role', 'model', 'stop_reason']),
+      inside: { content: { each: true, keep: new Set(['id', 'type', 'tool_use_id']), toolName: true } },
+    },
+  },
+});
+
+/**
  * Hide the person's keys in output read as JSON, in place: every string of 8 or more characters (no key is shorter)
  * goes through `mask`. Done before the parser reads the output, so a key the parser or narrate() later cuts short is
- * never shown in part.
+ * never shown in part. With `format`, the format's own words are left as they are (see OutputFormat), so a hidden
+ * value that happens to be one of them (a copied .env's CHAT_ROLE=assistant, a model's name) cannot change how a line
+ * reads: `{"type":"assistant"}` stays a message of the agent's. Those fields are written by the agent's program, not by
+ * the agent or its tools, so no key reaches them.
  * @param {unknown} value  freshly parsed JSON
  * @param {(s: string) => string} mask
+ * @param {OutputFormat|null} [format]
  * @returns {unknown} the value, with its strings masked (a string is returned masked)
  */
-export function maskParsed(value, mask, depth = 0) {
+export function maskParsed(value, mask, format = null, depth = 0) {
   if (typeof value === 'string') return value.length >= 8 ? mask(value) : value;
   if (!value || typeof value !== 'object' || depth > 64) return value;
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) value[i] = maskParsed(value[i], mask, depth + 1);
-  } else {
-    for (const k of Object.keys(value)) value[k] = maskParsed(value[k], mask, depth + 1);
+    const each = format?.each ? format : null;
+    for (let i = 0; i < value.length; i++) value[i] = maskParsed(value[i], mask, each, depth + 1);
+    return value;
+  }
+  for (const k of Object.keys(value)) {
+    if (format && typeof value[k] === 'string' && (format.keep?.has(k)
+      || (k === 'name' && format.toolName && typeof value.type === 'string' && value.type.endsWith('tool_use')))) continue;
+    const inner = format?.inside && Object.hasOwn(format.inside, k) ? format.inside[k] : null;
+    value[k] = maskParsed(value[k], mask, inner, depth + 1);
   }
   return value;
 }

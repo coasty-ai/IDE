@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { matchGlob, checkRules, runChecks, scrubEnv, killChecksSync, withNodeOnPath, withKeys } from '../src/core/receipt.mjs';
+import { matchGlob, checkRules, runChecks, runSetup, scrubEnv, killChecksSync, withNodeOnPath, withKeys } from '../src/core/receipt.mjs';
 
 let T;
 before(() => { T = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-receipt-')); });
@@ -292,4 +292,61 @@ test('killChecksSync ends every running check at once, even one that ignores SIG
   const res = await out;
   assert.ok(Date.now() - t0 < 2000, `took ${Date.now() - t0} ms`);
   assert.equal(res.results[0].ok, false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// The setup command (workbench.json's `setup`), run once in an agent's new copy before it starts
+
+test('runSetup runs the setup command through sh in the folder, with the scrubbed environment and what the engine adds, never a key', async () => {
+  const dir = fs.mkdtempSync(path.join(T, 'setup-'));
+  const value = ['sk', 'test', 'Ab12Cd34Ef56'].join('-');
+  const saved = { CLAUDECODE: process.env.CLAUDECODE, WORKBENCH_HOOK_TOKEN: process.env.WORKBENCH_HOOK_TOKEN };
+  Object.assign(process.env, { CLAUDECODE: '1', WORKBENCH_HOOK_TOKEN: 'hook-secret' });
+  try {
+    const r = await runSetup({
+      cwd: dir,
+      run: `pwd; echo "\${CLAUDECODE-unset} \${WORKBENCH_HOOK_TOKEN-unset} \${WORKBENCH_ROOT-unset} \${WORKBENCH_AGENT_ID-unset} \${WB_TEST_SETTING-unset}"; echo "${value}"; touch made-by-setup`,
+      env: { ...process.env, WORKBENCH_ROOT: '/the/person/folder', WORKBENCH_AGENT_ID: 'abc123' },
+      keysEnv: { WB_TEST_SETTING: 'a key it must not get' },
+      mask: s => s.split(value).join('•••• Ef56'),
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.timedOut, false);
+    assert.ok(Number.isFinite(r.ms));
+    assert.equal(r.tail, `${fs.realpathSync(dir)}\nunset unset /the/person/folder abc123 unset\n•••• Ef56`);
+    assert.ok(fs.existsSync(path.join(dir, 'made-by-setup')), 'it ran in the agent’s folder');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+  // a failure says its exit code; nothing to run, or no folder, fails plainly without running anything
+  const failed = await runSetup({ cwd: dir, run: 'echo "npm ERR! missing script: ci" >&2; exit 3' });
+  assert.deepEqual([failed.ok, failed.exitCode, failed.timedOut, failed.tail], [false, 3, false, 'npm ERR! missing script: ci']);
+  const missing = await runSetup({ cwd: path.join(T, 'no-such-folder'), run: 'true' });
+  assert.deepEqual([missing.ok, missing.exitCode], [false, null]);
+  assert.match(missing.tail, /does not exist/);
+  for (const run of ['', '   ', null, 7]) assert.equal((await runSetup({ cwd: dir, run })).ok, false, String(run));
+});
+
+test('runSetup stops the command with everything it started at its time limit, when the agent is stopped, and when Workbench exits', async () => {
+  const pidFile = path.join(T, 'setup-child.pid');
+  const slow = await runSetup({ cwd: T, run: `sleep 30 & echo $! > ${pidFile}; sleep 30`, timeoutSec: 1 });
+  assert.deepEqual([slow.ok, slow.timedOut], [false, true]);
+  assert.match(slow.tail, /Stopped after 1 second because it took too long\.$/);
+  assert.ok(await goneWithin(Number(fs.readFileSync(pidFile, 'utf8')), 2000), 'the background child went with the group');
+
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 200);
+  const t0 = Date.now();
+  const stopped = await runSetup({ cwd: T, run: 'sleep 30', signal: ac.signal });
+  assert.ok(Date.now() - t0 < 3000);
+  assert.deepEqual([stopped.ok, stopped.timedOut], [false, false]);
+  assert.match(stopped.tail, /Stopped because the agent was stopped\./);
+
+  const stubborn = path.join(T, 'setup-stubborn.pid');
+  const out = runSetup({ cwd: T, run: `trap '' TERM; echo $$ > ${stubborn}; sleep 30` });
+  for (const t1 = Date.now(); !(fs.existsSync(stubborn) && fs.readFileSync(stubborn, 'utf8').trim()) && Date.now() - t1 < 3000;) await sleep(20);
+  killChecksSync();
+  assert.ok(await goneWithin(Number(fs.readFileSync(stubborn, 'utf8')), 500), 'the exit handler reaches a setup command as it reaches checks');
+  assert.equal((await out).ok, false);
 });

@@ -115,12 +115,11 @@ const CONFIG = {
 };
 
 async function launch(w, text) {
-  const asked = await w.post('/api/command', { text });
-  assert.equal(asked.status, 200, JSON.stringify(asked.body));
-  assert.ok(asked.body.confirm?.id, `a confirm was expected, got ${JSON.stringify(asked.body)}`);
-  const go = await w.post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  // a start of one agent is never asked: it starts at once, and the reply says so and carries it
+  const go = await w.post('/api/command', { text });
   assert.equal(go.status, 200, JSON.stringify(go.body));
-  return { asked: asked.body.confirm, ids: go.body.agentIds };
+  assert.equal(go.body.confirm, undefined, `no card was expected, got ${JSON.stringify(go.body)}`);
+  return { reply: go.body.reply, ids: go.body.agentIds };
 }
 
 async function stopEngine(w) {
@@ -137,8 +136,8 @@ const lastCall = (w) => w.calls().at(-1);
 test('Codex, live: start, plain steps, receipt, "not reported", resume in its sandbox, clean stop', async (t) => {
   // Markers a surrounding Claude Code or Codex session would leave in the environment.
   const w = await setup(t, { CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', CODEX_THREAD_ID: 'old', CODEX_SANDBOX: 'seatbelt', CODEX_HOME: path.join(tmpdir(), 'wb-codex-home-not-used') }, { config: CONFIG });
-  const { asked, ids } = await launch(w, 'start Codex on looking at greet.js and leaving a marker file');
-  assert.match(asked.sentence, /^Start Codex on /);
+  const { reply, ids } = await launch(w, 'start Codex on looking at greet.js and leaving a marker file');
+  assert.match(reply, /^Started Codex on /);
   assert.equal(ids.length, 1);
   const id = ids[0];
 
@@ -226,11 +225,18 @@ test('stopping Codex, or Workbench, mid-turn ends its process and the commands i
   await until('everything to be gone', () => !alive(c2.pid) && !alive(c2.grandchild), { timeoutMs: 3000 });
 });
 
-test('"start Claude and Codex on …" gives two agents, one of each', async (t) => {
+test('"start Claude and Codex on …" asks first, and its yes gives two agents, one of each', async (t) => {
   const w = await setup(t);
-  const { asked, ids } = await launch(w, 'start Claude and Codex on the checkout bug');
+  // more than one agent from one sentence asks first, with a card
+  const card = await w.post('/api/command', { text: 'start Claude and Codex on the checkout bug' });
+  assert.equal(card.status, 200, JSON.stringify(card.body));
+  assert.equal(card.body.confirm?.sentence, 'Start Claude and Codex on “the checkout bug”?');
+  assert.equal(w.calls().length, 0, 'nothing started yet');
+  const go = await w.post(`/api/confirm/${card.body.confirm.id}`, { go: true });
+  assert.equal(go.status, 200, JSON.stringify(go.body));
+  const { reply, agentIds: ids } = go.body;
   assert.equal(ids.length, 2);
-  assert.equal(asked.sentence, 'Start Claude and Codex on “the checkout bug”?');
+  assert.equal(reply, 'Started Claude and Codex on “the checkout bug”.');
   const all = await until('both agents', async () => { const a = await w.agents(); return a.length === 2 && a.every((x) => x.state.startsWith('done')) ? a : null; });
   assert.deepEqual(all.map((a) => a.harness).sort(), ['claude', 'codex']);
   assert.notEqual(all[0].workspace, all[1].workspace);

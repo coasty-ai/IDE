@@ -90,7 +90,9 @@ export function workActions(a, { mode = null, repo = null, ACTIVE = ACTIVE_DEFAU
   if (mode !== 'live' || !w || a.parentId || w.thrownAway) return { merge: false, discard: false };
   const discard = !!(w.branch || w.folder);
   const unmerged = a.files ? (Number(a.files.changed) || 0) > 0 : (a.state === 'stopped' || a.state === 'failed' || !!a.earlier);
-  const merge = !!(w.branch && w.folder) && !ACTIVE.has(a.state) && !!(repo && repo.branch) && repo.identity !== false && unmerged;
+  // not while it is checked again after a save into its copy (done_claimed with its checks running): the engine refuses it
+  const again = a.state === 'done_claimed' && !!(a.checks && a.checks.state === 'running');
+  const merge = !!(w.branch && w.folder) && !ACTIVE.has(a.state) && !again && !!(repo && repo.branch) && repo.identity !== false && unmerged;
   return { merge, discard };
 }
 

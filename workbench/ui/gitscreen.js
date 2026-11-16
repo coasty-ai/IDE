@@ -20,6 +20,7 @@ import { markOfAgent } from './look.js';
 import * as model from './model.js';
 import { api } from './api.js';
 import { agoText } from './boardmodel.js';
+import { sayKey } from './saybox.js';
 
 const { S, STATES } = model;
 const $ = id => document.getElementById(id);
@@ -64,9 +65,10 @@ export const gitShown = () => st.shown;
 
 /**
  * @param {object} c  { boardScreen, board, getG, measure, still, reduced, say, act, moved, render, command, onShow,
- *   listening, pick }. command(text, binding) sends words typed or spoken here, with the binding taken when they began;
- *   listening() is true while voice listens (Esc then throws the words away, so it is not the git screen's); pick(id)
- *   puts that agent in the lid as picking a chip does (a card on screen is withdrawn first).
+ *   listening, pick, openFile }. command(text, binding) sends words typed or spoken here, with the binding taken when
+ *   they began; listening() is true while voice listens (Esc then throws the words away, so it is not the git screen's);
+ *   pick(id) puts that agent in the lid as picking a chip does (a card on screen is withdrawn first); openFile({ agentId,
+ *   path, line, opener }) opens a file of an agent's copy in the file view (a path clicked in its diff).
  */
 export function setupGitScreen(c) {
   ctx = c;
@@ -79,6 +81,8 @@ export function setupGitScreen(c) {
   el.back.addEventListener('click', () => closeGit());
   el.wireEnd.addEventListener('click', () => closeGit());
   el.needs.addEventListener('click', () => {
+    // the setup card launches wait on: the lid shows it first (it comes from the stream), so back to the board
+    if (el.needs.dataset.setup && S.setup && S.setup.id === el.needs.dataset.setup) { closeGit({ toLid: true }); ctx.render(); return; }
     const id = el.needs.dataset.agent;
     if (!id || !S.agents.has(id)) { paintBand(); return; }
     // "<Name> needs you" puts that item in the lid, as picking its chip does: a card on screen is withdrawn first
@@ -86,14 +90,17 @@ export function setupGitScreen(c) {
     closeGit({ toLid: true });
     ctx.render();
   });
-  // Typed words go with what the screen showed when the person began (the first key), as the core's input does
-  el.bar.addEventListener('submit', e => {
-    e.preventDefault();
+  // Typed words go with what the screen showed when the person began (the first key), as the core's input does. The input
+  // is a box one line high that keeps a paste's lines, as the board's box does: Enter sends (saybox.js sayKey), and
+  // Shift+Enter adds a line. Words that could not be sent come back (gitPutBack).
+  const send = () => {
     const t = el.say.value, b = st.bound || bindingNow();
     st.bound = null;
     el.say.value = ''; el.bar.classList.remove('typed');
     ctx.command(t, b);
-  });
+  };
+  el.bar.addEventListener('submit', e => { e.preventDefault(); send(); });
+  el.say.addEventListener('keydown', e => { if (sayKey(e) === 'send') { e.preventDefault(); send(); } });
   el.say.addEventListener('input', () => {
     el.bar.classList.toggle('typed', !!el.say.value);
     if (el.say.value && !st.bound) st.bound = bindingNow();
@@ -408,10 +415,22 @@ function paintBand(z = sizes()) {
   if (el.state.dataset.html !== stateHtml) { el.state.innerHTML = stateHtml; el.state.dataset.html = stateHtml; }
   el.state.hidden = !stateHtml;
   el.state.style.fontSize = P.silkSub + 'px';
-  // what needs you: the first in the queue, lit; it takes you back to the board with that item in the lid
+  // what needs you, lit; it takes you back to the board with that in the lid. The setup card that launches wait on comes
+  // first, as the lid shows it before anything picked: a prompt typed here starts its agent at once, and the card that
+  // agent's copy waits on opens in the lid, behind this screen. Else the first in the queue.
   const q = model.needsQueue();
-  const first = q[0] || null;
-  if (first) {
+  const setup = S.setup && typeof S.setup.id === 'string' ? S.setup : null;
+  const first = setup ? null : q[0] || null;
+  if (setup) {
+    const label = 'Before agents start';
+    if (el.needs.dataset.label !== label) {
+      el.needs.dataset.label = label;
+      el.needs.innerHTML = `<svg class="g" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-need"/></svg><span>${esc(label)}</span>`;
+      el.needs.setAttribute('aria-label', 'Before agents start, Workbench asks whether to run the setup command in each agent’s copy. Back to the board, to answer it.');
+    }
+    el.needs.dataset.setup = setup.id;
+    el.needs.dataset.agent = '';
+  } else if (first) {
     const nm = visibleText(first.name || 'An agent');
     const label = `${cutMiddle(nm, 24)} needs you`;
     if (el.needs.dataset.label !== label + q.length) {
@@ -420,9 +439,10 @@ function paintBand(z = sizes()) {
       el.needs.setAttribute('aria-label', `${nm} needs you${q.length > 1 ? `, and ${q.length - 1} more` : ''}. Back to the board, to answer it.`);
     }
     el.needs.dataset.agent = first.id;
+    el.needs.dataset.setup = '';
   }
-  el.needs.hidden = !first;
-  tellNeeds(q);
+  el.needs.hidden = !first && !setup;
+  tellNeeds(q, setup);
   el.needs.style.fontSize = P.silkSub + 'px';
   el.back.style.fontSize = P.silkSub + 'px';
   el.say.style.fontSize = P.silkSub + 'px';
@@ -438,13 +458,14 @@ function paintBand(z = sizes()) {
  * (the lid's own live region is on the board, hidden while this screen shows). What needs you as the screen opens is
  * not news; a new head of the queue is, and so is one more behind it.
  */
-function tellNeeds(q) {
+function tellNeeds(q, setup = null) {
   const first = q[0] || null;
-  const now = { head: first ? `${first.id}|${first.ask ? first.ask.id : first.state}` : '', n: q.length };
+  const now = { head: setup ? `setup|${setup.id}` : first ? `${first.id}|${first.ask ? first.ask.id : first.state}` : '', n: q.length };
   const was = st.needKey;
   st.needKey = now;
-  if (!st.shown || st.moving || !was || !first) return;
-  if (now.head !== was.head) announce(`${visibleText(first.name || 'An agent')} needs you. The button at the top goes back to the board, to answer it.`);
+  if (!st.shown || st.moving || !was || (!first && !setup)) return;
+  if (now.head !== was.head && setup) announce('Before agents start, Workbench asks whether to run the setup command. The button at the top goes back to the board, to answer it.');
+  else if (now.head !== was.head) announce(`${visibleText(first.name || 'An agent')} needs you. The button at the top goes back to the board, to answer it.`);
   else if (now.n > was.n) announce('Another one needs you. The button at the top goes back to the board.');
 }
 
@@ -785,6 +806,15 @@ export function gitTake() {
 }
 /** A voice session on the git screen ended with nothing heard: its binding goes (typed words keep theirs). */
 export function gitRelease() { if (el && !el.say.value) st.bound = null; }
+/**
+ * Words typed or spoken here that could not be sent (too long, Workbench not answering, a failed request) go back in the
+ * input, line breaks and all, unless the person has typed something new there meanwhile, as the board's box does.
+ */
+export function gitPutBack(text) {
+  if (!el || el.say.value || !text) return;
+  el.say.value = text;
+  el.bar.classList.add('typed');
+}
 /** The band shows that voice listens (the wave and the words heard take the input's place). */
 export function gitListening(on) { if (el) el.bar.classList.toggle('listening', !!on); }
 
@@ -836,6 +866,15 @@ function onDetailClick(e) {
   const b = e.target.closest('button');
   if (!b || b.disabled) return;
   if (b.dataset.gitAct === 'close') { closeDetail(); return; }
+  if (b.classList.contains('dopen')) {
+    // a file's path in the diff: that file in this agent's copy, at its first changed line (the file view checks again)
+    const d = st.detail, ch = st.changes;
+    const files = ch && ch.data && ch.data.diff && Array.isArray(ch.data.diff.files) ? ch.data.diff.files.filter(f => f && typeof f === 'object') : [];
+    const f = files[Number(b.dataset.fileIndex)];
+    if (!d || d.kind !== 'agent' || ch.agentId !== d.agentId || !f || typeof f.path !== 'string' || typeof ctx.openFile !== 'function') return;
+    ctx.openFile({ agentId: d.agentId, path: f.path, line: Math.max(1, Number(b.dataset.line) || 1), opener: b });
+    return;
+  }
   if (b.dataset.gitAct === 'agent') {
     // the agent's own row, the tip of its branch or its merge; when none is drawn, the selection stays where it was
     const row = rowOfAgent(b.dataset.agent);
@@ -1034,8 +1073,10 @@ function agentDetail(agentId, z) {
   else if (ch.error) body = `<p class="dq">${esc(ch.error)}</p>`;
   else if (ch.data && ch.data.ok === false) body = `<p class="dq">${esc(visibleControls(ch.data.reply || 'Workbench could not read its changes.'))}</p>`;
   else {
-    // made once per answer: a long diff is not rebuilt on every render
-    if (ch.htmlOf !== ch.data) { ch.html = diffHtml(diff || { files: [] }, { maxLines: 4000 }); ch.htmlOf = ch.data; }
+    // made once per answer: a long diff is not rebuilt on every render. While its copy is there, each file's path opens
+    // that file in the file view, at its first changed line
+    const open = typeof ctx.openFile === 'function' && !!(w.folder !== false && !w.thrownAway && (w.branch || a.branch));
+    if (ch.htmlOf !== ch.data || ch.htmlOpen !== open) { ch.html = diffHtml(diff || { files: [] }, { maxLines: 4000, open }); ch.htmlOf = ch.data; ch.htmlOpen = open; }
     body = ch.html;
   }
   h += `<div class="gdiff" data-scroll="1" tabindex="0" aria-label="${esc(name)}’s changes, in full">${body}</div>`;

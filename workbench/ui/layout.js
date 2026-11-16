@@ -15,6 +15,9 @@ const lid = o => o;
 // pitch), the gap to #said, the wire's place from its right end and the gap the edge connector leaves for the wire, the
 // designator U2 (type size and room) and the type size of "git" on its body.
 const dram = o => o;
+// The files chip beside it (U3, the file view): a smaller flash package, as wide as `w` (never under `min`), `h` high, a
+// `gap` from the DRAM, with `pins` pins on each long edge at `pitch`, and "files" on its body at type size `files`.
+const flash = o => o;
 export const SIZES = Object.freeze({
   L: {
     name: 'L', margin: 12, boardR: 18, topBand: 54, botBand: 80, rowPad: 8, pitchMax: 112,
@@ -27,6 +30,7 @@ export const SIZES = Object.freeze({
     title: 13.5, silkSub: 12, mName: 12, mNote: 11.5, fingerH: 24, machMin: 120, machGap: 26, holeClear: 64, trayX: 58,
     lid: lid({ padT: 22, padX: 22, padB: 18, count: 12.5, h1: 21, h1m: 18, h1l: 16, h1xl: 14.5, meta: 12.5, small: 11.5, btn: 13.5, btnh: 38, btnmin: 112, quiet: 12.5, input: 13, inh: 40, gap1: 11, gap2: 15, gap3: 14 }),
     dram: dram({ w: 188, min: 104, h: 32, bus: 19, pin: 4, pitch: 6, gap: 8, wireIn: 16, wireGap: 12, label: 11, labelW: 24, git: 20, lines: 2 }),
+    flash: flash({ w: 60, min: 52, h: 26, gap: 12, pins: 4, pitch: 9, files: 13 }),
   },
   M: {
     name: 'M', margin: 10, boardR: 16, topBand: 46, botBand: 70, rowPad: 6, pitchMax: 98,
@@ -39,6 +43,7 @@ export const SIZES = Object.freeze({
     title: 13, silkSub: 11.5, mName: 11.5, mNote: 11, fingerH: 20, machMin: 104, machGap: 20, holeClear: 58, trayX: 52,
     lid: lid({ padT: 18, padX: 18, padB: 14, count: 12, h1: 18, h1m: 16, h1l: 15, h1xl: 13.5, meta: 12, small: 11, btn: 13, btnh: 36, btnmin: 104, quiet: 12, input: 12.5, inh: 36, gap1: 9, gap2: 13, gap3: 12 }),
     dram: dram({ w: 164, min: 96, h: 25, bus: 13, pin: 3, pitch: 5, gap: 4, wireIn: 14, wireGap: 12, label: 10.5, labelW: 22, git: 16, lines: 2 }),
+    flash: flash({ w: 54, min: 48, h: 21, gap: 10, pins: 4, pitch: 8, files: 12 }),
   },
   S: {
     name: 'S', margin: 8, boardR: 14, topBand: 44, botBand: 64, rowPad: 6, pitchMax: 96,
@@ -51,6 +56,7 @@ export const SIZES = Object.freeze({
     title: 12.5, silkSub: 11.5, mName: 11, mNote: 10.5, fingerH: 18, machMin: 88, machGap: 14, holeClear: 50, trayX: 46,
     lid: lid({ padT: 16, padX: 16, padB: 12, count: 11.5, h1: 16.5, h1m: 15, h1l: 14, h1xl: 13, meta: 11.5, small: 11, btn: 12.5, btnh: 34, btnmin: 96, quiet: 11.5, input: 12, inh: 34, gap1: 8, gap2: 11, gap3: 10 }),
     dram: dram({ w: 144, min: 92, h: 26, bus: 16, pin: 3, pitch: 5, gap: 6, wireIn: 13, wireGap: 10, label: 10.5, labelW: 22, git: 16, lines: 3 }),
+    flash: flash({ w: 48, min: 46, h: 22, gap: 9, pins: 4, pitch: 7, files: 11 }),
   },
 });
 
@@ -298,7 +304,8 @@ function chipShape(G, r, maxW) {
  * @param {boolean} input.dense
  * @param {number} input.lidNeed    height the lid's content needs, without the input
  * @param {object[]} input.machines [{ id, name, awake, note }]
- * @param {{ count: number, text: string }|null} input.tray
+ * @param {{ count: number, text: string }|null} input.tray  boardAndTray's tray: count is how many agents it holds (one mark
+ *   each, the ones at work with no room on the board too); none, and it is not drawn
  * @param {(text: string, px: number) => number} [input.measure]
  */
 export function layoutBoard(input) {
@@ -355,7 +362,16 @@ function placeDram(G) {
   G.downPins = { inset, step };
   const free = room(inset, step);
   const label = free - D.labelW >= D.w / 2;
-  const half = Math.max(D.min / 4, Math.min(D.w / 2, free));
+  let half = Math.max(D.min / 4, Math.min(D.w / 2, free));
+  // The files chip (U3) goes on the DRAM's right, which gives it room down to its own least width. Its place comes from
+  // the most rows this frame can have below the core (the core at its smallest), so it never comes and goes, or moves,
+  // as the lid changes size; where even that leaves no room (a dense board), it is not drawn, and ⌘P still opens files.
+  const Fl = P.flash;
+  const belowMost = Math.max(below, G.rows.filter(y => y > G.cy + G.coreHalfMin).length);
+  const roomMost = room(inset, step) - (Math.max(0, belowMost - 1) - Math.max(0, below - 1)) * step;
+  const wf = Fl ? Math.min(Fl.w, roomMost - Fl.gap - D.min / 2) : 0;
+  const withFlash = !!Fl && wf >= Fl.min - 0.01;
+  if (withFlash) half = Math.min(half, roomMost - Fl.gap - wf);
   const p = D.pitch, x = G.cx - half, y = c.b + D.bus, w = 2 * half, h = D.h;
   // pin k sits at cx + (k + 0.5) * pitch: clear of the notch on the left end and of the right end
   const kMin = Math.ceil((8 - half) / p - 0.5), kMax = Math.floor((half - 5) / p - 0.5);
@@ -367,6 +383,21 @@ function placeDram(G) {
   const wire = { x: r1(G.cx + (kw + 0.5) * p), y0: r1(y + h + D.pin), y1: G.board.b };
   const lab = label ? { x: r1(x - 7), y: r1(y + h / 2), size: D.label, box: { x: r1(x - D.labelW), y: r1(y + h / 2 - D.label * 0.75), w: D.labelW - 6, h: r1(D.label * 1.5) } } : null;
   G.dram = { x: r1(x), y: r1(y), w: r1(w), h, cx: G.cx, pin: D.pin, pitch: p, pins, bus, busTop: c.b, wire, label: lab, git: D.git };
+  G.flash = withFlash ? flashAt(G, r1(G.cx + half + Fl.gap), r1(wf), y) : null;
+}
+
+/**
+ * The files chip (U3) at `x`, `w` wide, level with the DRAM (whose top is `dy`): its package, a bus of 4 traces from the
+ * core's bottom edge to its top pins, the same number of pins along its bottom edge, and the designator U3 under it.
+ */
+function flashAt(G, x, w, dy) {
+  const P = G.P, Fl = P.flash, D = P.dram, c = G.core;
+  const h = Fl.h, y = r1(dy + (D.h - h) / 2), mid = x + w / 2;
+  const pitch = Math.min(Fl.pitch, (w - 14) / (Fl.pins - 1));
+  const pins = Array.from({ length: Fl.pins }, (_, k) => r1(mid + (k - (Fl.pins - 1) / 2) * pitch));
+  const size = D.label;
+  const label = { x, y: r1(y + h + D.pin + 3 + size * 0.8), size, box: { x, y: r1(y + h + D.pin + 2), w: Math.ceil(size * 0.6 * 2 + 4), h: r1(size * 1.3) } };
+  return { x, y, w, h, pin: D.pin, pins, bus: pins.slice(), busTop: c.b, label, files: Fl.files };
 }
 
 function nodeGeom(G, r, l) {
@@ -532,6 +563,11 @@ export function boardBoxes(G) {
     out.push({ k: 'dram', id: 'dram', x: d.x - 1, y: d.y - d.pin, w: d.w + 2, h: d.h + 2 * d.pin });
     if (d.label) out.push({ k: 'dram-label', id: 'U2', ...d.label.box });
   }
+  if (G.flash) {
+    const f = G.flash;
+    out.push({ k: 'flash', id: 'files', x: f.x - 1, y: f.y - f.pin, w: f.w + 2, h: f.h + 2 * f.pin });
+    out.push({ k: 'flash-label', id: 'U3', ...f.label.box });
+  }
   return out;
 }
 
@@ -558,6 +594,12 @@ export function dramSegments(G) {
   const segs = d.bus.map(x => [[x, d.busTop], [x, d.y - d.pin], 'dram bus']);
   segs.push([[d.wire.x, d.wire.y0], [d.wire.x, d.wire.y1], 'dram wire']);
   return segs;
+}
+
+/** The files chip's bus (window coordinates): 4 traces from the core's bottom edge to its top pins. */
+export function flashSegments(G) {
+  const f = G.flash;
+  return f ? f.bus.map(x => [[x, f.busTop], [x, f.y - f.pin], 'flash bus']) : [];
 }
 
 /** Do two segments cross or touch (beyond `tol` px from their ends)? */
@@ -605,15 +647,18 @@ export function boardProblems(G) {
     if (x.x < bd.x - 0.5 || x.y < bd.y - 0.5 || x.x + x.w > bd.r + 0.5 || x.y + x.h > bd.b + 0.5) bad.push(`${x.k} ${x.id} off the board`);
   }
   const segs = boardSegments(G);
-  for (const t of boxes.filter(x => x.k === 'label' || x.k === 'more' || x.k === 'tray' || x.k === 'machine' || x.k === 'dram' || x.k === 'dram-label')) {
+  for (const t of boxes.filter(x => x.k === 'label' || x.k === 'more' || x.k === 'tray' || x.k === 'machine' || x.k === 'dram' || x.k === 'dram-label' || x.k === 'flash' || x.k === 'flash-label')) {
     for (const [p, q, who] of segs) if (segHitsBox(p, q, t)) { bad.push(`${t.k} ${t.id} on copper of ${who}`); break; }
   }
-  // the DRAM's bus and wire: clear of every box but the DRAM itself (and the core, where the bus starts), and of all
-  // other copper by at least 4 px
-  const dsegs = dramSegments(G);
+  // the DRAM's bus and wire, and the files chip's bus: clear of every box but their own part (and the core, where the
+  // buses start), and of all other copper by at least 4 px
+  const dsegs = dramSegments(G).concat(flashSegments(G));
   for (const t of boxes) {
-    if (t.k === 'dram' || t.k === 'core') continue;
-    for (const [p, q, who] of dsegs) if (segHitsBox(p, q, t)) { bad.push(`${who} × ${t.k} ${t.id}`); break; }
+    if (t.k === 'core') continue;
+    for (const [p, q, who] of dsegs) {
+      if ((t.k === 'dram' && who.startsWith('dram')) || (t.k === 'flash' && who.startsWith('flash'))) continue;
+      if (segHitsBox(p, q, t)) { bad.push(`${who} × ${t.k} ${t.id}`); break; }
+    }
   }
   for (const [p, q, who] of dsegs) {
     for (const [a, b2, other] of segs) if (segsMeet([p, q], [a, b2]) || segGap([p, q], [a, b2]) < 4) { bad.push(`${who} near copper of ${other}`); break; }
@@ -742,11 +787,10 @@ function placeBands(G, { machines, tray }) {
   // sections as narrow as their names
   const narrow = () => machines.map(mc => Math.ceil(nameNeed(mc) + 6));
   if (!xs && widths.length) { widths = narrow(); xs = tryAll(widths, gap); }
-  // the tray's words shorten ("12 done, 6 from earlier, 1 more"; its list and its accessible name keep all of them)
-  if (!xs && widths.length && G.tray && tray.lead != null) {
-    const { done = 0, earlier = 0, over = 0 } = tray;
-    const lead = done ? `${done} done` : `${earlier} from earlier`;
-    const rest = (done && earlier ? `, ${earlier} from earlier` : '') + (over ? `, ${over} more` : '');
+  // the tray's words shorten ("12 done, 6 from earlier, 1 more": trayWords' short; its list and its accessible name keep
+  // all of them)
+  if (!xs && widths.length && G.tray && tray.short) {
+    const { lead, rest } = tray.short;
     if (lead + rest !== G.tray.lead + G.tray.rest) {
       G.tray = trayBox(lead, rest);
       lo = G.tray.x + G.tray.w + 18;

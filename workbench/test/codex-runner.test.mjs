@@ -5,8 +5,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { harness, available, createRunner, buildEnv, startArgs, resumeArgs, sandboxArgs, gitFolders, tomlString } from '../src/adapters/codex/runner.mjs';
+import { harness, available, createRunner, buildEnv, startArgs, resumeArgs, sandboxArgs, gitFolders, tomlString, CODEX_FORMAT, findCodex } from '../src/adapters/codex/runner.mjs';
+import { maskParsed } from '../src/adapters/claude/args.mjs';
 import { EV } from '../src/shared/events.mjs';
+import { maskSecrets } from '../src/shared/mask.mjs';
 
 // Codex's own sandbox, as every turn widens it: the network on (the git folders follow, when there are any).
 const NET = ['-c', 'sandbox_workspace_write.network_access=true'];
@@ -104,6 +106,41 @@ test('available() gives a plain reason when Codex does not answer or is missing'
   process.env.WORKBENCH_CODEX_BIN = path.join(s.dir, 'no-such-codex');
   t.after(() => { process.env.WORKBENCH_CODEX_BIN = FAKE; });
   assert.deepEqual(await available(), { ok: false, loggedIn: null, reason: 'Codex is not installed, or the codex command could not be found.' });
+});
+
+test('a relative path in WORKBENCH_CODEX_BIN is never read from the agent’s folder, where Codex starts: it is refused in plain words', async t => {
+  const s = setup(t);
+  // What an agent could write in its own folder at that path, to run outside Codex's sandbox: it must never run. A
+  // script's name alone is such a path too: node, which runs it, reads it from the folder it starts in.
+  const ran = path.join(s.dir, 'impostor-ran');
+  const impostor = `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(ran)}, process.cwd());\n`;
+  fs.mkdirSync(path.join(s.ws, 'tools'));
+  fs.writeFileSync(path.join(s.ws, 'tools', 'codex.mjs'), impostor);
+  fs.writeFileSync(path.join(s.ws, 'codex.mjs'), impostor);
+  t.after(() => { process.env.WORKBENCH_CODEX_BIN = FAKE; });
+  const unknown = v => `Workbench cannot tell where ${v} is: the path in WORKBENCH_CODEX_BIN must start with / or ~.`;
+  for (const given of ['tools/codex.mjs', 'codex.mjs']) {
+    process.env.WORKBENCH_CODEX_BIN = given;
+    assert.deepEqual(findCodex(), { path: null, reason: unknown(given) });
+    assert.deepEqual(await available(), { ok: false, loggedIn: null, reason: unknown(given) });
+    const events = [];
+    const runner = createRunner({ agentId: 'a1b2c3', name: 'Explain repo', task: 'Explain this repo', cwd: s.ws, emit: e => events.push(e) });
+    await runner.start();
+    await waitFor(() => events.some(e => e.kind === EV.STATE && e.state === 'failed'), 5000, 'the refusal');
+    assert.equal(events.find(e => e.kind === EV.STATE && e.state === 'failed').reason, unknown(given));
+    assert.equal(fs.existsSync(ran), false, `the file in its folder never ran (${given})`);
+    assert.deepEqual(s.calls(), [], 'nothing was started');
+  }
+  // A bare name is looked up on the PATH; an absolute path is taken as it is, and ~/ is the home folder.
+  assert.deepEqual(findCodex({}), { path: 'codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '' }), { path: 'codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: 'codex-beta' }), { path: 'codex-beta' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '/opt/codex/bin/codex' }), { path: '/opt/codex/bin/codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '~/bin/codex', HOME: '/home/someone' }), { path: '/home/someone/bin/codex' });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '~/bin/codex' }), { path: null, reason: unknown('~/bin/codex') }, 'no home folder to read it from');
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: './codex' }), { path: null, reason: unknown('./codex') });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: 'Codex.JS' }), { path: null, reason: unknown('Codex.JS') });
+  assert.deepEqual(findCodex({ WORKBENCH_CODEX_BIN: '~/codex.cjs', HOME: '/home/someone' }), { path: '/home/someone/codex.cjs' });
 });
 
 test('start() runs codex exec in the workspace with the checked flags, stdin ignored and a clean environment', async t => {
@@ -345,6 +382,32 @@ test('a mask hides the person’s keys in Codex’s output before it is read, an
   await waitFor(() => f.events.some(e => e.kind === EV.STATE) && !failing.info().alive, 5000, 'the failure');
   const ended = f.events.find(e => e.kind === EV.ENDED);
   assert.equal(ended.error, 'Codex is not signed in, or its sign-in has expired.\n\nERROR: unexpected status 401 [hidden]');
+});
+
+test('a mask that hides a word of Codex’s format ("completed", "agent_message") changes nothing of what the board is told', async t => {
+  // A copied .env may hold such a word: hidden in "item.completed", every item of the turn would be lost.
+  const words = ['completed', 'agent_message', 'command_execution', 'in_progress', RUN_THREAD];
+  const replay = async (mask) => {
+    const s = setup(t);
+    const runner = createRunner({ agentId: 'f1', name: 'Explain repo', task: 'Explain this repo', cwd: s.ws, emit: s.emit, ...(mask ? { mask } : {}) });
+    await runner.start();
+    await waitFor(() => turnEnds(s.events).length === 1 && !runner.info().alive, 5000, 'the first turn');
+    return s.events;
+  };
+  const kinds = (events) => {
+    const n = {};
+    for (const e of events) n[e.kind] = (n[e.kind] || 0) + 1;
+    return n;
+  };
+  const plain = await replay(null);
+  const masked = await replay((text) => maskSecrets(text, words));
+  assert.ok(kinds(plain)[EV.ACTIVITY] > 2 && kinds(plain)[EV.SAYS] >= 1, 'the turn has steps and words to lose');
+  assert.deepEqual(kinds(masked), kinds(plain));
+  assert.deepEqual(masked.filter(e => e.kind === EV.SESSION).map(e => e.sessionId), [RUN_THREAD], 'its thread, to resume it');
+  // What a tool was given, or gave back, is hidden whatever its fields are called.
+  const line = { type: 'item.completed', item: { id: 'item_9', type: 'mcp_tool_call', status: 'completed', arguments: { type: 'completed', id: 'agent_message' }, result: { status: 'completed' } } };
+  maskParsed(line, (text) => maskSecrets(text, words), CODEX_FORMAT);
+  assert.deepEqual(line, { type: 'item.completed', item: { id: 'item_9', type: 'mcp_tool_call', status: 'completed', arguments: { type: '••••', id: '•••• sage' }, result: { status: '••••' } } });
 });
 
 // ---------------------------------------------------------------------------------------------

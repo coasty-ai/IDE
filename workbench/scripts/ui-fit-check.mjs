@@ -4,7 +4,13 @@
 // marked scroll box that holds a long command or question in full ([data-scroll]), and one-line clips whose full text is
 // elsewhere ([data-clip-ok]). Agents & keys is an overlay and a text layer of its own: its button sits in the top band in
 // the 'connect-*' scenarios, and its panel (#connect), which opens by itself in 'connect-none', is checked at every size,
-// detail level and look there. Not part of npm test (it needs Chrome). No dependencies.
+// detail level and look there. The Full permissions button sits in the top band on every live page, lit in the 'full'
+// scenarios ('full-live' has both buttons, the widest the band gets), and its card is the 'perm-card' view. The setup card
+// launches wait on, with a long command, and the card of an agent whose start detail is long, are the 'setup-card' view.
+// The file view's sheet is the 'files' and 'files-edit' views. The board's input box grows with its text: a prompt of
+// three lines is the 'prompt' view, and in the scenarios where the box meets the file view, the setup card, the full
+// permissions button and the done tray (BOX_SCENARIOS), each check is made again with three lines in the box.
+// Not part of npm test (it needs Chrome). No dependencies.
 //
 //   node scripts/ui-fit-check.mjs [--size 1280x680] [--scenario demo] [--theme ivory] [--detail more] [--view card] [--quick] [--verbose]
 //
@@ -15,17 +21,29 @@ import { launch, sleep } from './ui-cdp.mjs';
 const SIZES = ['960x900', '1024x700', '1280x680', '1440x789', '1512x862', '1728x1000', '1920x970', '2560x1300'];
 const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
-const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
+const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'prompt', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
   // D2: an agent's work in the lid, and the engine's cards for it (the 'merge' scenarios of scripts/ui-mock.mjs)
   'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids',
   // what an agent controls, with characters that hide text or turn it: shown by their codes on the board and in the lid
   'taint',
   // a crowded board with a long done tray: the edge connector's sections keep clear of the DRAM's wire
-  'wire'];
+  'wire',
+  // full permissions: the card the band's button brings
+  'perm-card',
+  // agents' copies: the setup card launches wait on (a long command), and a starting agent's long start detail on its card
+  'setup-card'];
+
+// A prompt of three lines, as typed or pasted, each short enough for one line of the box at the narrowest board
+const PROMPT3 = 'The checkout total is off:\nexpected 42.10\nbut got 42.09';
+// A message found by its agent's task, so it is asked first: the longest card that typed words bring
+const LONG_TELL = 'tell the sign-up one to use the new copy on every step of the welcome screens, and in the emails that follow them, before the release on Thursday';
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
 const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
 VIEWS.push(...GIT_VIEWS);
+// the file view: the sheet in the middle, in each look and at each size (the 'files' scenario of scripts/ui-mock.mjs)
+const FILE_VIEWS = ['files', 'files-edit'];
+VIEWS.push(...FILE_VIEWS);
 const args = process.argv.slice(2);
 const opt = k => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : null; };
 const only = (list, k) => (opt(k) ? list.filter(x => opt(k).split(',').includes(x)) : list);
@@ -74,10 +92,19 @@ const CHECK = String.raw`(() => {
     });
     const scroll = p.closest('[data-scroll]');
     // overlays are text layers of their own: they may cover the board's words, never their own (Agents & keys, #connect,
-    // covers the whole board while it is open)
-    const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail, #connect')?.id || 'board';
-    for (const r of rects) {
-      if (scroll) { const s = scroll.getBoundingClientRect(); if (r.bottom < s.top || r.top > s.bottom) continue; }
+    // and the file view, #fileSheet, cover the whole board while they are open)
+    const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail, #connect, #fileSheet')?.id || 'board';
+    for (let r of rects) {
+      // in a scroll box only what shows in it counts, above and below; and in the file view's code, to either side too
+      // (a long line of a file scrolls sideways there, and is not cut). Everywhere else nothing may run off sideways.
+      if (scroll) {
+        const s = scroll.getBoundingClientRect();
+        if (r.bottom < s.top || r.top > s.bottom) continue;
+        if (scroll.id === 'fvCode') {
+          if (r.right < s.left || r.left > s.right) continue;
+          r = { left: Math.max(r.left, s.left), right: Math.min(r.right, s.right), top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+        }
+      }
       texts.push({ r, p, n, layer });
       if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) { out.push('off-screen text: ' + label(p)); break; }
       let bad = null;
@@ -109,13 +136,13 @@ const CHECK = String.raw`(() => {
     if ((cx || ell) && e.scrollWidth > e.clientWidth + 1) out.push('clipped text: ' + label(e) + ' (' + e.scrollWidth + ' > ' + e.clientWidth + ')');
     else if (cy && e.scrollHeight > e.clientHeight + 1) out.push('clipped text: ' + label(e) + ' (' + e.scrollHeight + ' > ' + e.clientHeight + ' high)');
   }
-  // 3. nothing off-screen. Inside Agents & keys' scroll box (#connectBody, which holds buttons) only the part shown in the
-  //    box counts: what is scrolled out of it is not on screen
+  // 3. nothing off-screen. Inside a scroll box (Agents & keys' #connectBody, the git screen's diff, the file view's code
+  //    and list, which hold buttons) only the part shown in the box counts: what is scrolled out of it is not on screen
   for (const e of document.querySelectorAll('[data-box], button, .chip, .part, .hl, .mach, .more')) {
     if (sr(e) || !vis(e)) continue;
     let r = e.getBoundingClientRect();
     if (r.width < 0.5 && r.height < 0.5) continue;
-    const sb = e.parentElement && e.parentElement.closest('#connect [data-scroll]');
+    const sb = e.parentElement && e.parentElement.closest('[data-scroll]');
     if (sb) {
       const s = sb.getBoundingClientRect();
       r = { left: Math.max(r.left, s.left), top: Math.max(r.top, s.top), right: Math.min(r.right, s.right), bottom: Math.min(r.bottom, s.bottom) };
@@ -135,7 +162,7 @@ const CHECK = String.raw`(() => {
   const boxes = [];
   const add = (k, e, r) => boxes.push({ k, e, r: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } });
   for (const e of document.querySelectorAll('.chip')) if (vis(e)) { const r = e.getBoundingClientRect(); add('chip', e, { left: r.left - lead, top: r.top - lead, right: r.right + lead, bottom: r.bottom + lead }); }
-  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend, #connectBtn, #dram')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
+  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend, #connectBtn, #permBtn, #dram, #filesChip')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
   for (const e of document.querySelectorAll('#said > span:not(.sr), #said > i')) if (vis(e)) for (const r of e.getClientRects()) add('said', e, r);
   for (const e of document.querySelectorAll('#wires .pad, #wires .you, #board .you')) add(e.classList.contains('pad') ? 'pad' : 'you', e, e.getBoundingClientRect());
   const pkg = document.querySelector('#board .pkg');
@@ -153,12 +180,12 @@ const CHECK = String.raw`(() => {
   // 5. overlays: inside the window, never on the core, and never on the top band (the workbench mark opens the look menu;
   //    Agents & keys has its button there). Agents & keys itself (#connect) is a modal dialog: it covers the board on
   //    purpose, with the board inert behind it, so it has only to be inside the window
-  const top = [...document.querySelectorAll('#brand, #mode, #repo, #conn, #spend, #connectBtn')].filter(vis).map(e => [e, e.getBoundingClientRect()]);
-  for (const e of document.querySelectorAll('#card, #pop, #trayList, #look, #connect')) {
+  const top = [...document.querySelectorAll('#brand, #mode, #repo, #conn, #spend, #connectBtn, #permBtn')].filter(vis).map(e => [e, e.getBoundingClientRect()]);
+  for (const e of document.querySelectorAll('#card, #pop, #trayList, #look, #connect, #fileSheet')) {
     if (!vis(e)) continue;
     const r = e.getBoundingClientRect();
     if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) out.push('off-screen: ' + label(e));
-    if (e.id === 'connect') continue;
+    if (e.id === 'connect' || e.id === 'fileSheet') continue;
     if (ov(r, core) > 1) out.push(e.id + ' covers the core');
     for (const [t, tr] of top) if (ov(r, tr) > 1) out.push(e.id + ' covers ' + label(t));
   }
@@ -177,7 +204,9 @@ const errors = [];
 b.on(m => {
   if (m.method === 'Runtime.exceptionThrown') errors.push('exception: ' + (m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text).slice(0, 300));
   if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') errors.push('console: ' + m.params.args.map(a => a.value || a.description).join(' ').slice(0, 300));
-  if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error' && !/status of 401/.test(m.params.entry.text)) errors.push('log: ' + m.params.entry.text.slice(0, 300) + ' ' + (m.params.entry.url || ''));
+  // a 401 (a stale key, on purpose) and a 409 from the file view's save (a file that changed on disk, on purpose) are expected
+  if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error' && !/status of 401/.test(m.params.entry.text)
+    && !(/status of 409/.test(m.params.entry.text) && /\/api\/file$/.test(m.params.entry.url || ''))) errors.push('log: ' + m.params.entry.text.slice(0, 300) + ' ' + (m.params.entry.url || ''));
 });
 // The git-tangles view serves its own histories as GET /api/git (Chrome holds the request and answers it); every other
 // request goes on to the mock.
@@ -211,6 +240,59 @@ async function check(tag) {
 const size = async s => { const [w, h] = s.split('x').map(Number); await b.size(w, h); };
 
 /**
+ * Where the board's growing input box meets what the later changes drew, with a prompt of three lines in it (typed, not
+ * sent): the file view, opened over it by ⌘P, through a search in the files, a file read, then edited and saved
+ * ('files'); the setup card launches wait on ('setup-card'); the full permissions button ('full', 'full-live'); the done
+ * tray and its list ('done-tray', 'done-waits'); and a calm board ('prompt', 'setup'). It runs after each scenario's own
+ * check, at every size, detail level and look (with --quick, at two sizes).
+ */
+const BOX_SCENARIOS = ['files', 'setup', 'setup-card', 'prompt', 'full', 'full-live', 'done-tray', 'done-waits'];
+async function fillBox(text) {
+  await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await settle(120);
+}
+async function boxPass(sc, tag) {
+  await fillBox(PROMPT3);
+  const box = await b.ev(`(() => { const i = document.getElementById('say'), line = parseFloat(getComputedStyle(i).lineHeight); return { all: Math.round(i.scrollHeight / line), shown: Math.round(i.clientHeight / line) }; })()`);
+  if (box.all !== 3) failures.push(`${tag}: the box should hold three lines of text (${box.all})`);
+  if (box.shown < 1) failures.push(`${tag}: the box shows none of its lines`);
+  await check(`${tag} (three lines in the box)`);
+  if (sc === 'done-tray' || sc === 'done-waits') {
+    await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
+    if (await b.ev(`document.getElementById('trayList').hidden`)) failures.push(`${tag}: the done tray did not open its list beside the box`);
+    await check(`${tag} (three lines in the box, the done tray's list)`);
+    await b.ev(`document.getElementById('tray').click(), true`); await settle(120);
+  }
+  if (sc === 'files') {
+    const sheet = () => b.ev(`document.getElementById('fileSheet').open`);
+    const find = async (text, ms) => { await b.ev(`(() => { const i = document.getElementById('fvFind'); i.focus(); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input')); return 1; })()`); await sleep(ms); await settle(60); };
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.key('p', { meta: true }); await sleep(700); await settle(80);
+    if (!(await sheet())) { failures.push(`${tag}: ⌘P did not open the file view over the box`); await fillBox(''); return; }
+    await find('inv', 1100);
+    if (!(await b.ev(`!!document.querySelector('#fvList .fv-hit')`))) failures.push(`${tag}: the file view's search found no lines in the files`);
+    await check(`${tag} (three lines in the box, the file view's search)`);
+    await find('src/invoices/export.ts', 700);
+    await b.ev(`(() => { const o = [...document.querySelectorAll('#fvList [role="option"]')].find(x => x.querySelector('.fv-nm')?.textContent === 'export.ts'); o?.click(); return !!o; })()`);
+    await sleep(800); await settle(80);
+    if (!/export\.ts$/.test(await b.ev(`document.getElementById('fvTitle').textContent`))) failures.push(`${tag}: the file view did not read export.ts`);
+    await check(`${tag} (three lines in the box, a file read)`);
+    await b.ev(`document.querySelector('#fvActs [data-fv="edit"]')?.click(), 1`); await sleep(500); await settle(80);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setRangeText('// a change\\n', 0, 0, 'end'); t.dispatchEvent(new Event('input')); return 1; })()`); await sleep(150);
+    await check(`${tag} (three lines in the box, a file edited)`);
+    await b.ev(`document.querySelector('#fvActs [data-fv="save"]')?.click(), 1`); await sleep(900); await settle(80);
+    if (!(await b.ev(`document.getElementById('fvEdit').hidden`))) failures.push(`${tag}: Save did not save the file and leave the editor`);
+    await check(`${tag} (three lines in the box, a file saved)`);
+    for (let k = 0; k < 4 && await sheet(); k++) { await b.key('Escape'); await sleep(450); }
+    await settle(80);
+    if (await sheet()) failures.push(`${tag}: Esc did not close the file view`);
+    if (await b.ev(`document.getElementById('say').value`) !== PROMPT3) failures.push(`${tag}: the box lost its lines while the file view was open`);
+    await check(`${tag} (three lines in the box, back from the file view)`);
+  }
+  await fillBox('');
+}
+
+/**
  * D1: the git screen's views. Each opens the git screen the way a person does, by clicking the DRAM, and checks it:
  *   git         the graph of a repository (and of one with 48 commits and six agents, and of one not on a branch),
  *               at its top and scrolled to its end
@@ -239,6 +321,10 @@ async function gitView(v, s, d) {
       await open(sc); await check(`${tag} (${sc})`);
       await scrollEnd('#gitGraph'); await check(`${tag} (${sc}, scrolled to the end)`);
     }
+    // while launches wait on the setup card, the band lights "Before agents start" in place of "<Name> needs you"
+    await open('setup-card');
+    if (await b.ev(`document.getElementById('gitNeeds').hidden || document.getElementById('gitNeeds').textContent.trim() !== 'Before agents start'`)) failures.push(`${tag}: the band did not light "Before agents start" while the setup card waits`);
+    await check(`${tag} (setup-card, the band lit for the setup card)`);
   } else if (v === 'git-detail') {
     await open('git');
     await pick('#gitGraph .gr[data-id="work:g1"]');
@@ -279,6 +365,81 @@ async function gitView(v, s, d) {
       gitServed = null;
       await b.send('Fetch.disable');
     }
+  }
+}
+
+/**
+ * The file view's views, in the 'files' scenario of scripts/ui-mock.mjs, opened the way a person opens them (the files
+ * chip, the field, a crumb, the link to an agent's copy, Edit):
+ *   files       the top folder; a file in an agent's copy with its changed lines; the finder with files and lines found;
+ *               the env file shown masked, with why it is not edited; a path too long for the head; a binary file; the
+ *               file of 25,000 lines scrolled to its middle; the needs-you pill when something needs you, and the pill
+ *               beside why a file is not edited (an env file, mixed line endings, one over 1 MB), where the path must keep
+ *               to its own box (#fvTitle carries data-box, so text outside it is a failure)
+ *   files-edit  the editor; the question when Esc would leave an edit; the conflict line when the file changed on disk
+ */
+async function filesView(v, s, d) {
+  const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
+  const tag = `view ${v} ${s} ${d} ${t}`;
+  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, delay: null, files: null }); await ctl('scenario', { name: 'files' }); await size(s);
+  await b.goto(`${base}/?t=k&still=1`, 1300); await setLook(t, d); await settle(100);
+  const shown = () => b.ev(`document.getElementById('fileSheet').open`);
+  const click = async (sel, ms = 500) => { const ok = await b.ev(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return false; e.click(); return true; })()`); await sleep(ms); await settle(80); return ok; };
+  const find = async (text, ms = 700) => { await b.ev(`(() => { const i = document.getElementById('fvFind'); i.focus(); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input')); return 1; })()`); await sleep(ms); await settle(60); };
+  const choose = async (path, ms = 700) => { await find(path); await b.ev(`(() => { const o = [...document.querySelectorAll('#fvList [role="option"]')].find(x => x.querySelector('.fv-nm')?.textContent === ${JSON.stringify(path.split('/').pop())}); o?.click(); return !!o; })()`); await sleep(ms); await settle(80); };
+  const title = () => b.ev(`document.getElementById('fvTitle').textContent`);
+  if (!(await click('#filesChip', 700)) || !(await shown())) { failures.push(`${tag}: the files chip did not open the file view`); return; }
+  if (v === 'files') {
+    await check(`${tag} (the top folder)`);
+    await choose('src/invoices/export.ts');
+    if (!/export\.ts$/.test(await title())) failures.push(`${tag}: export.ts did not open (${await title()})`);
+    await click('#fvWhose [data-fv="switch"]', 800);
+    const whose = await b.ev(`document.getElementById('fvWhose').textContent`);
+    if (!/In Invoice export’s copy/.test(whose) || !(await b.ev(`document.querySelectorAll('#fvRows .fv-row.chg').length`))) failures.push(`${tag}: Invoice export's copy did not show its changed lines (${whose})`);
+    await check(`${tag} (an agent's copy, its changed lines)`);
+    await find('inv', 1100);
+    if (!(await b.ev(`!!document.querySelector('#fvList .fv-hit')`))) failures.push(`${tag}: the finder found no lines in the files`);
+    await check(`${tag} (the finder: files, and lines in files)`);
+    await b.ev(`(() => { const i = document.getElementById('fvFind'); i.value = ''; i.dispatchEvent(new Event('input')); return 1; })()`); await sleep(200);
+    await click('#fvWhose [data-fv="switch"]', 700);
+    await choose('.env');
+    if (!/holds keys/.test(await b.ev(`document.getElementById('fvActs').textContent`))) failures.push(`${tag}: the env file did not say why it is not edited`);
+    await check(`${tag} (the env file, masked)`);
+    await choose('src/very/deeply/nested/folders/for/the/crumbs/to/give/way/invoice-export-batch-sender-for-large-accounts.ts');
+    await check(`${tag} (a path too long for the head)`);
+    await choose('assets/invoice-logo.png');
+    await check(`${tag} (a binary file)`);
+    await choose('src/generated/rates.ts', 1200);
+    await b.ev(`(() => { const c = document.getElementById('fvCode'); c.scrollTop = c.scrollHeight / 2; return 1; })()`); await sleep(400); await settle(80);
+    if (!(await b.ev(`document.querySelectorAll('#fvRows .fv-row').length < 200 && +document.querySelector('#fvRows .fv-row .no').textContent > 10000`))) failures.push(`${tag}: the long file did not draw a window of rows in its middle`);
+    await check(`${tag} (25,000 lines, scrolled to the middle)`);
+    const st = await (await fetch(base + '/ctl/state')).json();
+    const a = st.agents.find(x => x.id === 'f2');
+    await ctl('push', { event: 'agents', data: [{ ...a, state: 'needs_ok', ask: { id: 'fp1', type: 'permission', sentence: 'Price rounding wants to run a command', detail: 'npm run db:migrate', options: ['Allow', 'Deny'], createdAt: Date.now() } }] });
+    await sleep(500); await settle(80);
+    if (await b.ev(`document.getElementById('fvNeeds').hidden`)) failures.push(`${tag}: the needs-you pill did not show`);
+    await check(`${tag} (the needs-you pill)`);
+    // the pill beside why a file is not edited: the path keeps to its own box (#fvTitle is measured), never under them
+    for (const [path, why] of [['.env', /holds keys/], ['src/legacy/mixed.txt', /mixes line endings/], ['data/fixtures/large-accounts.json', /too large/]]) {
+      await choose(path);
+      if (!why.test(await b.ev(`document.getElementById('fvActs').textContent`))) failures.push(`${tag}: ${path} did not say why it is not edited`);
+      if (await b.ev(`document.getElementById('fvNeeds').hidden`)) failures.push(`${tag}: the needs-you pill went with ${path}`);
+      await check(`${tag} (the needs-you pill beside why ${path.split('/').pop()} is not edited)`);
+    }
+  } else if (v === 'files-edit') {
+    await choose('src/invoices/export.ts');
+    await click('#fvActs [data-fv="edit"]', 500);
+    if (await b.ev(`document.getElementById('fvEdit').hidden`)) failures.push(`${tag}: Edit did not open the editor`);
+    await check(`${tag} (the editor)`);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setRangeText('// a change\\n', 0, 0, 'end'); t.dispatchEvent(new Event('input')); return 1; })()`); await sleep(150);
+    await b.key('Escape'); await sleep(300); await settle(60);
+    if (!/not saved/.test(await b.ev(`document.getElementById('fvWhose').textContent`))) failures.push(`${tag}: Esc did not ask before leaving the edit`);
+    await check(`${tag} (leave the edit?)`);
+    await click('#fvWhose [data-fv="keep"]', 200);
+    await fetch(base + '/ctl/files', { method: 'POST', body: JSON.stringify({ in: 'you', path: 'src/invoices/export.ts', text: 'export const changedOnDisk = true;\n' }) });
+    await click('#fvActs [data-fv="save"]', 700);
+    if (!/changed on disk while you were editing/.test(await b.ev(`document.getElementById('fvWhose').textContent`))) failures.push(`${tag}: the conflict line did not show`);
+    await check(`${tag} (the conflict line)`);
   }
 }
 
@@ -376,19 +537,21 @@ try {
         await setLook(t, d);
         await settle(90);
         await check(`${sc} ${s} ${d} ${t}`);
+        if (BOX_SCENARIOS.includes(sc) && (!quick || ['960x900', '1440x789'].includes(s))) await boxPass(sc, `${sc} ${s} ${d} ${t}`);
       }
     }
     process.stdout.write(`${sc} `);
   }
   if (scenarios.length) console.log('');
 
-  // views: hover cards, menus, opened details, the reply chip, notices, launch questions, and the link states
+  // views: hover cards, menus, opened details, the reply chip, notices, cards from typed words, and the link states
   for (const v of views) {
     for (const s of sizes) for (const d of details) {
       // these two do not depend much on the window: two sizes, unless one is asked for
       if ((v === 'taint' || v === 'git-tangles') && sizes.length > 2 && !['960x900', '1440x789'].includes(s)) continue;
       if (v === 'wire' && sizes.length > 2 && !['960x900', '1024x700', '1280x680'].includes(s)) continue;   // where the room runs out
       if (GIT_VIEWS.includes(v)) { await gitView(v, s, d); continue; }   // D1
+      if (FILE_VIEWS.includes(v)) { await filesView(v, s, d); continue; }
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
       const load = async (sc, q = '') => { await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, merge: 'ok' }); await ctl('scenario', { name: sc }); await size(s); await b.goto(`${base}/?t=k&still=1${q}`, 1300); await setLook(t, d); await settle(100); };
@@ -428,11 +591,42 @@ try {
         await b.ev(`document.querySelector('.mach')?.click(), true`); await settle(150); await check(tag);
         await b.ev(`[...document.querySelectorAll('.mach')].pop()?.click(), true`); await settle(150); await check(tag);
       } else if (v === 'tray') {
-        await load('many');
+        // a dense board's tray, and the tray of agents the person is finished with (merged, thrown away); then rows for
+        // work the person looked at: "Dismiss" on done-tray's stopped agent with a long name ("· stopped"), and "Not now"
+        // on done-waits' work, not merged yet ("Invoice export · not merged")
+        const trayReads = () => b.ev(`document.getElementById('tray').hidden ? '' : document.getElementById('tray').textContent.trim()`);
+        for (const sc of ['many', 'done-tray', 'done-waits']) {
+          // the looks this tab kept from an earlier view must not decide what this one shows
+          await b.ev(`(() => { try { sessionStorage.removeItem('wb-reviewed'); sessionStorage.removeItem('wb-later'); } catch (e) {} return 1; })()`).catch(() => {});
+          await load(sc, sc === 'done-tray' ? '&focus=t4' : '');
+          if (sc === 'done-tray') {
+            await clickLid('[data-act="reviewed"]');
+            const words = await trayReads();
+            if (words !== '3 done') failures.push(`${tag} (${sc}): "Dismiss" did not send the stopped agent to the tray (the tray reads "${words}")`);
+          }
+          if (sc === 'done-waits') {
+            await clickLid('[data-act="looksgood"][data-answer="Not now"]');
+            const words = await trayReads();
+            if (words !== '1 not merged') failures.push(`${tag} (${sc}): "Not now" did not send its work to the tray as not merged (the tray reads "${words}")`);
+          }
+          await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
+          const shown = await b.ev(`!document.getElementById('trayList').hidden`);
+          if (!shown) failures.push(`${tag} (${sc}): the done tray did not open its list`);
+          await check(`${tag} (${sc})`);
+        }
+        // a dense board whose left side is full (23 at work, laptop and cloud by turns), and one more laptop agent: the
+        // tray holds only it ("1 more working"), and its list names it
+        await load('done-waits');
+        const st = await (await fetch(base + '/ctl/state')).json(), w1 = st.agents.find(a => a.id === 'w1'), at = Date.now();
+        const one = (i, machineId) => ({ ...w1, id: 'z' + i, rootId: 'z' + i, name: `Crowd ${i} fix`, machineId, state: 'working', endedAt: null, stateSince: at,
+          startedAt: at - (90 - i) * 60000, now: 'Reading the code', says: null, checks: null, files: null, work: null });
+        await ctl('push', { event: 'snapshot', data: { ...st, agents: Array.from({ length: 23 }, (_, i) => one(i, i % 2 ? 'cloud-1' : 'laptop')) } }); await sleep(500); await settle(100);
+        await ctl('push', { event: 'agents', data: [one(40, 'laptop')] }); await sleep(500); await settle(100);
+        const words = await trayReads();
+        if (words !== '1 more working') failures.push(`${tag} (no room): the one with no room on the board is not in the tray alone (the tray reads "${words}")`);
         await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
-        const shown = await b.ev(`!document.getElementById('trayList').hidden`);
-        if (!shown) failures.push(`${tag}: the done tray did not open its list`);
-        await check(tag);
+        if (!(await b.ev(`!document.getElementById('trayList').hidden`))) failures.push(`${tag} (no room): the done tray did not open its list`);
+        await check(`${tag} (no room)`);
       } else if (v === 'earlier') {
         // agents from an earlier run: in the lid (one that can continue, one that cannot), the tray's list, the forget
         // question, and a card pinned on one
@@ -468,13 +662,60 @@ try {
         await ctl('push', { event: 'notice', data: { text: 'Search cleanup has your answer and is carrying on. It will tell you when the old search address is gone and the redirect to the new search page works for saved links.' } });
         await settle(200); await check(tag);
       } else if (v === 'confirm') {
+        // a card from typed words, the longest the lid gets from them: a message whose words found its agent by its task,
+        // so it asks first, quoting a long message and the agent's task (work itself starts with no card)
         await load('demo');
-        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = 'start eight agents on the backlog'; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return true; })()`);
+        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(LONG_TELL)}; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return true; })()`);
         await sleep(900); await settle(100);
         const h1 = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
-        if (!/^Start 8 agents/.test(h1)) failures.push(`${tag}: the launch question did not show (${h1.slice(0, 40)})`);
+        if (!/^Tell Onboarding “/.test(h1)) failures.push(`${tag}: the message card did not show (${h1.slice(0, 40)})`);
         await check(tag);
         await b.ev(`document.querySelector('#pages .page:not(.old) [data-act="readall"]')?.click(), true`); await sleep(600); await settle(100); await check(tag + ' (all of it)');
+      } else if (v === 'perm-card') {
+        // the band's Full permissions button, pressed: the engine's card, with its warning, in the lid
+        await load('demo');
+        await b.ev(`document.getElementById('permBtn')?.click(), true`);
+        await sleep(1100); await settle(100);
+        const h1 = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
+        if (h1 !== 'Let agents do anything without asking?') failures.push(`${tag}: the full permissions card did not show (${h1.slice(0, 40)})`);
+        await check(tag);
+      } else if (v === 'prompt') {
+        // a prompt of three lines in the board's input, in a calm board ('prompt') and over a question with its answers
+        // ('demo', the permission first): the box grows to show its lines where the lid has room and scrolls inside where it
+        // has not, never over the lid's words; then Enter starts its agent at once, with no card, and the line under the
+        // board quotes the prompt on one line
+        for (const sc of ['prompt', 'longq']) {
+          await load(sc);
+          await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(PROMPT3)}; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+          await settle(120);
+          const box = await b.ev(`(() => { const i = document.getElementById('say'), line = parseFloat(getComputedStyle(i).lineHeight); return { shown: Math.round(i.clientHeight / line), all: Math.round(i.scrollHeight / line) }; })()`);
+          if (box.all !== 3) failures.push(`${tag}: the box should hold three lines of text (${sc}: ${box.all})`);
+          if (sc === 'prompt' && box.shown !== 3) failures.push(`${tag}: the box did not grow to show its three lines on a calm board (${box.shown})`);
+          await check(`${tag} (${sc}, three lines in the box)`);
+        }
+        await load('prompt');
+        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(PROMPT3)}; i.dispatchEvent(new Event('input', { bubbles: true }));
+          i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); return true; })()`);
+        await sleep(900); await settle(100);
+        // the whole notice: where the line under the board is narrow it shows cut to its lines, whole for screen readers
+        const said = await b.ev(`(() => { const e = document.getElementById('said'); return e.querySelector('.sr')?.textContent || e.textContent; })()`);
+        const card = await b.ev(`!!document.querySelector('#pages .page:not(.old) [data-act="confirm"]')`);
+        if (card) failures.push(`${tag}: a prompt brought a card`);
+        if (said !== 'Started a simulated Claude on “The checkout total is off: expected 42.10 but got 42.09”.') failures.push(`${tag}: the notice did not quote the prompt on one line (${said.slice(0, 70)})`);
+        await check(tag + ' (its notice)');
+      } else if (v === 'setup-card') {
+        // the setup card launches wait on, from the snapshot: its question, its whole command (or its tail with "See all
+        // of it"), Run it and Not now; then, pinned, the card of an agent whose start detail is long
+        await load('setup-card');
+        const h1 = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
+        const code = await b.ev(`document.querySelector('#pages .page:not(.old) .exact code')?.textContent || ''`);
+        if (h1 !== 'Run this setup command in each agent’s copy before it starts?') failures.push(`${tag}: the setup card did not show (${h1.slice(0, 40)})`);
+        else if (!/--quiet --reset$/.test(code)) failures.push(`${tag}: the end of the setup command is not shown (${code.slice(-40)})`);
+        await check(tag);
+        await load('setup-card', '&pin=s7e8f9');
+        const detail = await b.ev(`document.querySelector('#card .now')?.textContent || ''`);
+        if (!/The setup command failed \(exit 1\), so its copy may not run yet\.$/.test(detail)) failures.push(`${tag}: the start detail is not whole on its card (${detail.slice(-40)})`);
+        await check(tag + ' (a start detail)');
       } else if (v === 'stale') {
         await ctl('scenario', { name: 'demo' }); await size(s); await b.goto(`${base}/?t=bad&still=1`, 1300); await setLook(t, d); await settle(100);
         const l = await check(tag);
@@ -555,7 +796,7 @@ try {
         await load('merge-detached', '&focus=d1'); await check(tag + ' (not on a branch)');
         await load('merge-noid', '&focus=d2'); await check(tag + ' (no name and email)');
       } else if (v === 'wire') {
-        // A crowded board whose done tray reads "12 done or stopped, 6 from earlier, 7 more working" (the reviewer's board
+        // A crowded board whose done tray reads "12 done, 6 from earlier, 7 more working" (the reviewer's board
         // at 960×900), with the demo's four machines; then a fuller one whose machines have long names. No section of the
         // edge connector may lie on the DRAM's wire, and every word must fit its box (the fit check above).
         const crowd = async ({ working, done, earlier, rename }) => {
@@ -578,8 +819,8 @@ try {
           for (const m of document.querySelectorAll('.mach')) { const b = m.getBoundingClientRect(); if (b.left < x + 6 && b.right > x - 6) on.push(m.getAttribute('aria-label')); }
           return { on, tray: document.getElementById('tray').textContent.trim(), names: [...document.querySelectorAll('.mach')].map(m => [m.querySelector('.lb b span')?.textContent || '', m.title || '']) };
         })()`;
-        for (const [what, o, tray] of [['12 done, 6 from earlier, more working', { working: 31, done: 12, earlier: 6 }, /^12 done or stopped, 6 from earlier, \d+ more working$/],
-          ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }, /^60 done(, | or stopped, )40 from earlier, \d+ more/]]) {
+        for (const [what, o, tray] of [['12 done, 6 from earlier, more working', { working: 31, done: 12, earlier: 6 }, /^12 done, 6 from earlier, \d+ more working$/],
+          ['a fuller board, long machine names', { working: 60, done: 60, earlier: 40, rename: true }, /^60 done, 40 from earlier, \d+ more/]]) {
           await load('many'); await crowd(o);
           const r = await b.ev(WIRE);
           if (!tray.test(r.tray)) failures.push(`${tag} (${what}): the crowded board did not show (its tray reads "${r.tray}")`);

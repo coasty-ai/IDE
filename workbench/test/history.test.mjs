@@ -372,6 +372,25 @@ test('a message to an earlier agent resumes its session in the same folder, with
   assert.equal(second.calls.diffStats.at(-1).base, BASE, 'what is not merged yet: since the commit it started from (it was never merged)');
 });
 
+test('an earlier agent continued in a later run has the values of the env files in its copy hidden, as when it started', async (t) => {
+  const dir = tmp(t);
+  const first = world(t, dir);
+  const { id } = await finishOne(first);
+  await first.engine.shutdown();
+  const rec = readFile(first).agents[0];
+  const value = ['db', 'pass', 'Zq81mNw2Lk'].join('-');
+  const second = world(t, dir);
+  const read = [];
+  second.deps.workspace.envValuesIn = async (o) => { read.push(o); return { values: Object.freeze([value]), files: 1 }; };
+  await second.engine.start();
+  assert.equal((await second.engine.say(id, 'Print the database password')).ok, true);
+  assert.deepEqual(read, [{ path: rec.workspace.path }], 'the env files in its own folder are read again, before its runner is made');
+  const runner = second.claude.runners.at(-1);
+  assert.equal(typeof runner.opts.mask, 'function');
+  runner.emit({ kind: EV.SAYS, text: `The password is ${value}.` });
+  assert.equal(second.store.get(id).says, 'The password is •••• w2Lk.');
+});
+
 test('the Continue button’s message, and the words "continue <name>", pick it up', async (t) => {
   const dir = tmp(t);
   const first = world(t, dir);
@@ -562,6 +581,9 @@ test('what is loaded is cleaned: commit ids are full ids, an agent’s branch st
     workspace: { path: '/w/w2', branch: 'main', base: 'abc1234', since: 'zz'.repeat(20), from: '-rf' },
   };
   assert.deepEqual(historyMod.cleanRecord(raw).workspace, { path: '/w/w2', branch: null, base: null, since: null, from: null });
+  // What Workbench copied into the folder is kept, for a later run's tidy-up; anything that is not a relative path goes.
+  assert.deepEqual(historyMod.cleanRecord({ ...raw, workspace: { path: '/w/w2', branch: 'workbench/w2', copied: ['.env', 'node_modules', '/etc/passwd', '../x', 7, ''] } }).workspace.copied, ['.env', 'node_modules']);
+  assert.equal('copied' in historyMod.cleanRecord({ ...raw, workspace: { path: '/w/w2', branch: 'workbench/w2' } }).workspace, false);
   assert.equal(historyMod.cleanRecord({ ...raw, workspace: { path: 'relative/w2', branch: 'workbench/w2' } }).workspace, null);
   assert.equal(historyMod.cleanRecord({ ...raw, workspace: { path: '/w/\0w2', branch: 'workbench/w2' } }).workspace, null);
   for (const bad of ['feature/x', 'workbench/../x', 'workbench/x.lock', 'workbench/.x', 'workbench//x', 'workbench/x/', 'workbench/x y',
@@ -707,7 +729,7 @@ test('an earlier agent merged in this run is tidied at shutdown like one of this
   await second.engine.shutdown();
   // Asked once, only if nothing changed since its merged work commit (since), with its branch.
   assert.deepEqual(second.calls.removeWorkspace.filter(c => c.path === folder).map(c => ({ ...c, repoRoot: null })), [
-    { repoRoot: null, path: folder, base: BASE, since: FAKE_WORK, onlyIfUnchanged: true, deleteBranch: true },
+    { repoRoot: null, path: folder, base: BASE, since: FAKE_WORK, onlyIfUnchanged: true, deleteBranch: true, copied: [] },
   ]);
   const w = second.store.get(id).work;
   assert.deepEqual([w.folder, w.branch, w.merged.merge], [false, null, FAKE_MERGE]);

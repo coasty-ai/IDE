@@ -1,19 +1,23 @@
 // Workbench, as a circuit board. You are the core: it shows one thing at a time and holds the one place to type or
 // talk. Each agent is a chip on its own lane: beside you when it needs you, mid-board while it works, at the edge once
-// it is done. This file wires the data, the board (board.js), the lid (focus.js), the card and the input together.
+// it is done, and in the done tray once you are finished with it. This file wires the data, the board (board.js), the
+// lid (focus.js), the card and the input together.
 import { debugSwitches } from './address.js';
 import { money, clip } from '/shared/format.mjs';
 import { initToken, hasToken, whenRefused, api, connect } from './api.js';
 import { linkState, cannotSend } from './link.js';
 import { S, STATES, upsert, currentFocus, needsQueue, markReviewed, setAside, stepQueue, spendToday, machineName, workKey } from './model.js';
-import { boardModel, splitEarlier, trayWords, agoText } from './boardmodel.js';
-import { Lanes, denseLanes } from './lanes.js';
+import { boardModel, boardAndTray, agoText, doneWords } from './boardmodel.js';
+import { Lanes } from './lanes.js';
 import { sizeClass, frame, layoutBoard, maxDenseRows } from './layout.js';
 import { Board } from './board.js';
 import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
-import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand } from './prefs.js';
+import { setupSayBox } from './saybox.js';
+import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand, lidAnswer } from './prefs.js';
+import * as ANSWERS from '/shared/answers.mjs';   // "looks good" and "not now", as the engine reads them
+import { onlyFiller } from '/shared/filler.mjs'; // spoken "um" or "uh" alone sends nothing
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { balanceHeading } from './balance.js';
@@ -21,7 +25,7 @@ import { buttonRow } from './words.js';
 import { visibleControls } from './words.js'; // say(): what is said shows hidden characters as the lid does
 import { spentAmountWords } from './numbers.js';
 // D1: the git screen below the board, reached by the DRAM (gitscreen.js draws it; this file switches screens)
-import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitTick, gitHold, gitTake, gitRelease, gitListening, gitHome } from './gitscreen.js';
+import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitTick, gitHold, gitTake, gitRelease, gitListening, gitHome, gitPutBack } from './gitscreen.js';
 import { gitScreenWords } from './gitgraph.js';
 import { visibleText } from './diffview.js';
 import { clipToLines } from './layout.js';
@@ -29,7 +33,12 @@ import { clipToLines } from './layout.js';
 // keys out of the board's input). The shared module is read as a whole: a name it lacks is never a broken page.
 import { setupConnect, openConnect, closeConnect, connectShown, connectNeeds } from './connect.js';
 import { connectMeta, bandView, keyRefusal } from './connectview.js';
+// Full permissions: the top band's button beside Agents & keys (its words and state), sent to the engine when pressed.
+import { permButtonView } from './permissions.js';
 import * as secretShape from '/shared/secretshape.mjs';
+// The file view: the files chip (U3) beside the DRAM opens it, and so do ⌘P, ⌘⇧F and a path on the git screen
+// (fileview.js draws the sheet; this file opens it, hands it the keys while it shows, and holds the lid).
+import { setupFiles, openFiles, filesShown, filesKey, filesNeeds, filesRender, filesEscape } from './fileview.js';
 
 // The address is read once, before the key is taken out of it. Switches count only with the key (see address.js).
 const debug = debugSwitches(location.search);
@@ -42,7 +51,10 @@ const el = {
   parts: $('parts'), machines: $('machines'), tray: $('tray'), card: $('card'), pop: $('pop'), trayList: $('trayList'), look: $('look'),
   brand: $('brand'), mode: $('mode'), repo: $('repo'), conn: $('conn'), spend: $('spend'), wires: $('wires'), board: $('board'),
   dram: $('dram'), boardScreen: $('boardScreen'), gitScreen: $('gitScreen'), gitSay: $('gitSay'), connectBtn: $('connectBtn'),
+  permBtn: $('permBtn'), files: $('filesChip'),
 };
+/** ⌘ on a Mac, Ctrl elsewhere: ⌘P (Ctrl+P) finds a file, ⌘⇧F words in the files, ⌘S saves in the file view. */
+const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '');
 if (debug.still) el.body.classList.add('still');
 
 const RM = matchMedia('(prefers-reduced-motion: reduce)');
@@ -51,6 +63,9 @@ const reduced = () => RM.matches;
 const prefs = pagePrefs(el.html.dataset);
 el.html.dataset.theme = prefs.theme;
 el.html.dataset.detail = prefs.detail;
+// Whether full permissions are on, as Workbench put it on <html>, so the band's button is right before the first
+// snapshot; each snapshot's meta says it after that.
+Object.assign(S.meta, { permissions: prefs.permissions });
 
 function safeStorage(name) { try { return window[name]; } catch { return null; } }
 
@@ -80,8 +95,11 @@ whenRefused(() => { if (!link.refused) { link.refused = true; renderSoon(); } })
 // ---------------------------------------------------------------- the board
 const lanes = new Lanes(safeStorage('sessionStorage'));
 let G = null, lastFirst = true, fontsReady = false;
+// The keyboard goes to the lid's sentence when what held it leaves (a chip leaving the board, the done tray emptying),
+// as other moves do; a swap that follows carries it to the new sentence.
+const lidHome = () => el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
 const board = new Board({
-  boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, dram: el.dram, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
+  boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, dram: el.dram, files: el.files, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
   still: () => debug.still, reduced,
   hooks: {
     enter: (id, parentId) => { clearTimeout(leaveTimer); if (S.hoverId !== id) { S.hoverId = id; renderCard(); } },
@@ -90,6 +108,8 @@ const board = new Board({
     more: rootId => { S.pinId = rootId; S.hoverId = rootId; renderCard(); },
     machine: (id, anchor) => toggleMachines(anchor),
     tray: anchor => toggleTray(anchor),
+    // a chip that held the keyboard leaves the board: the keyboard goes to the lid's sentence, as other moves do
+    home: () => lidHome(),
   },
 });
 let leaveTimer = null;
@@ -145,6 +165,7 @@ const touch = () => { lastInputAt = performance.now(); };
 function engaged() {
   if (gitShown()) return true;   // D1: the lid keeps what it shows while the git screen is shown
   if (connectShown()) return true;   // and while Agents & keys covers it
+  if (filesShown()) return true;   // and while the file view does
   if (performance.now() - lastInputAt > 20000 && !voice.listening && !el.say.value) return false;
   const ae = document.activeElement;
   return pointer.inCore || (ae && ae !== document.body && el.core.contains(ae) && ae !== el.say) || !!el.say.value || voice.listening || !!S.reply;
@@ -175,7 +196,7 @@ function shownFocus() {
   letGo = false;
   if (!lidFocus || own || !engaged() || keyOf(want) === lidKey) return { f: want, also: false };
   const held = lidFocus;
-  // something else waits behind what is held: an agent that needs the person, or a launch question
+  // something else waits behind what is held: an agent that needs the person, or an engine card
   const also = x => !!(want.confirm || (want.agent && want.agent.id !== x && STATES.NEEDS_YOU.has(want.agent.state)));
   if (held.confirm) return S.confirm && S.confirm.id === held.confirm.id ? { f: { confirm: S.confirm }, also: also(null) } : { f: want, also: false };
   if (held.empty) return { f: want, also: false };
@@ -348,53 +369,55 @@ function renderNow(o = {}) {
   const showData = S.loaded && linkS !== 'no-key';
   const { f, also } = showData ? shownFocus() : { f: { empty: true }, also: false };
   const agents = showData ? [...S.agents.values()] : [];
-  const bm = boardModel(agents, { ...STATES, later: S.later, currentId: f.agent ? f.agent.id : null, machineName });
-  // agents from an earlier run wait in the done tray: they never take a lane
-  const { current, earlier } = splitEarlier(bm.roots);
-  if (current.length) lanes.assign(current.map(r => ({ id: r.id, startedAt: r.startedAt, laptop: (S.machines.find(m => m.id === r.machineId)?.kind || (r.machineId === 'laptop' ? 'laptop' : 'cloud')) === 'laptop' })));
-  // past twelve agents, finished work moves to the done tray and each lane splits in two
-  const dense = current.length > 12;
-  let roots = current, laneOf = id => lanes.get(id), nRows = 6, tray = null, overflow = [];
-  let done = [];
-  if (dense) {
-    done = roots.filter(r => r.ghost);
-    // newcomers take the free rows in this order: whatever needs the person first, so an asker always has a chip
-    const active = roots.filter(r => !r.ghost).sort((a, b) => (b.stop === 'inner') - (a.stop === 'inner'));
-    const d = denseLanes(active, id => lanes.get(id), maxDenseRows(H, P));
-    overflow = d.overflow;
-    roots = active.filter(r => !overflow.includes(r.id));
-    laneOf = id => d.at.get(id) || null;
-    nRows = d.rows;
-  }
-  if (done.length || earlier.length || overflow.length) {
-    const marks = done.concat(earlier).map(r => markOf(r.state, STATES.LOOK));
-    const words = trayWords({ done: done.length, earlier: earlier.length, over: overflow.length });
-    tray = { count: done.length + earlier.length, done: done.length, earlier: earlier.length, over: overflow.length, ids: done.map(r => r.id).concat(earlier.map(r => r.id), overflow), marks, ...words };
-  }
-  trayIds = tray ? { done: tray.ids.slice(0, tray.done), earlier: tray.ids.slice(tray.done, tray.count), over: overflow.slice() } : { done: [], earlier: [], over: [] };
+  const bm = boardModel(agents, { ...STATES, later: S.later, reviewed: S.reviewed, currentId: f.agent ? f.agent.id : null, machineName });
+  // Who takes a lane and who waits in the done tray (boardmodel.js): agents from an earlier run never take a lane, nor do
+  // agents the person is finished with; past twelve on the board, finished work there waits in the tray too and each
+  // lane splits in two. Lanes are freed only while there is data: the first draw after a reload, before the snapshot,
+  // and a page with no key have no agents, and must not free anyone's lane.
+  const laptop = r => (S.machines.find(m => m.id === r.machineId)?.kind || (r.machineId === 'laptop' ? 'laptop' : 'cloud')) === 'laptop';
+  const placed = boardAndTray(bm.roots, lanes, { laptop, maxRows: maxDenseRows(H, P), prune: showData });
+  const { roots, laneOf, nRows, dense, tray } = placed;
+  trayIds = placed.trayIds;
+  // the board's name for a screen reader says how many wait in the done tray
+  const boardName = `Your agents and their helpers${tray ? `. ${tray.sum}.` : ''}`;
+  if (el.parts.getAttribute('aria-label') !== boardName) el.parts.setAttribute('aria-label', boardName);
   const fr = frame(W, H, P, { nRows, dense });
   const maxPage = fr.lidMaxH - P.lid.padT - P.lid.padB - P.lid.inh - P.lid.gap3;
   const v = buildLid(f, also, P, maxPage);
   const machines = showData ? S.machines.map(m => ({ id: m.id, name: m.name, awake: m.awake !== false, note: machineNote(m), noteText: machineNote(m) })) : [];
   G = layoutBoard({ W, H, P, detail: prefs.detail, roots, laneOf, nRows, dense, lidNeed: needForLayout(v), machines, tray, measure });
   G.queueLength = bm.queue.length;
+  // the tray is drawn while it holds anyone (board.js paintTray): this run's agents, an earlier run's, or agents at work
+  // with no room on the board; when it empties, its list closes and the keyboard there goes to the lid's sentence before
+  // the tray is hidden
+  if (!G.tray) trayEmptied();
+  // the input grows into the lid's spare height only, so it never covers the lid's words (saybox.js)
+  sayBox.room(G.lidPageH - needForLayout(v));
   const hoverRoot = board.card.rootId || null;
-  board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
+  const left = board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
   lastFirst = false;
+  // a card pinned to (or shown for) a chip that left the board goes with it, rather than move beside the tray
+  if (left.length) {
+    const gone = id => { const a = id && S.agents.get(id); return !!id && (left.includes(id) || (!!a && left.includes(a.rootId || a.parentId))); };
+    if (gone(S.pinId)) S.pinId = null;
+    if (gone(S.hoverId)) S.hoverId = null;
+  }
   paintLid(v, f);
   paintTop(P, linkS);
   paintSaid();
   paintPlaceholder(P);
-  for (const x of [el.parts, el.wires, el.machines, el.dram]) x.classList.toggle('dim', linkS === 'stale');
+  for (const x of [el.parts, el.wires, el.machines, el.dram, el.files]) x.classList.toggle('dim', linkS === 'stale');
   el.parts.inert = linkS === 'stale' || linkS === 'no-key';
   el.machines.inert = linkS === 'stale' || linkS === 'no-key';
   paintDram(linkS);
+  el.files.inert = linkS === 'stale' || linkS === 'no-key';
   renderCard(true);
   if (!el.pop.hidden) renderMachinesPop();
   if (!el.trayList.hidden) renderTrayList();
   if (S.loaded && firstSnap) { firstSnap = false; applyDebug(); }
   gitRender();
   if (connectShown()) connectNeeds(needsInfo());
+  if (filesShown()) { filesNeeds(needsInfo()); filesRender(); }
 }
 const render = () => renderSoon();
 
@@ -446,6 +469,7 @@ function paintTop(P, linkS) {
   }
   if (G) board.placeTop(G, el);
   paintConnectBtn(P, live);
+  paintPermBtn(P, live);
 }
 
 // ---------------------------------------------------------------- the card
@@ -507,9 +531,9 @@ el.pages.addEventListener('click', e => {
  * was in (data-state), where its work was (data-work) and the branch a merge was offered into (data-into); anything
  * else says "That changed. Have another look." and sends nothing. Buttons outside the lid that carry the same data-*
  * (the git screen's detail: Merge, Throw it away, a card's yes and no) can be handed to this too; the swap guard stays
- * with the caller.
+ * with the caller. `o.answer`: the words typed or said for it ("Not now" at a lid whose "Looks good" answers both).
  */
-async function actOn(b) {
+async function actOn(b, o = {}) {
   const act = b.dataset.act;
   touch();
   if (act === 'next') { stepQueue(1); moved(); render(); return; }
@@ -524,13 +548,13 @@ async function actOn(b) {
   if (act === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
   // "Connect a coding agent to start.": Connect opens Agents & keys, and sends nothing
   if (act === 'connect') { showConnect(b); return; }
-  // A starter task on a first run's empty board: the same as typing those words, so the engine's "Start Claude on …?"
-  // card follows and nothing starts until the person answers it.
+  // A starter task on a first run's empty board: the same as typing those words, so an agent starts on it at once,
+  // as any prompt does.
   if (act === 'starter') { moved(); submit(b.dataset.text || ''); return; }
   if (act === 'confirm') {
     const id = b.dataset.confirm;
-    const c = S.confirm;
-    if (!c || c.id !== id) { changed(); return; }
+    const c = cardShown(id);
+    if (!c) { changed(); return; }
     const go = b.dataset.go === '1';
     busy(b);
     // the outcome of a merge or a throw-away shows on that agent: the engine's reply names it (focusId), or the page
@@ -539,6 +563,10 @@ async function actOn(b) {
     try {
       const r = await api.confirm(id, go);
       if (S.confirm && S.confirm.id === id) S.confirm = null;
+      // the setup card goes at once (the stream's snapshot says so too)
+      if (S.setup && S.setup.id === id) S.setup = null;
+      // the yes to full permissions: the band's button lights at once (the stream's snapshot says so too)
+      if (r) modeIs(r.permissions);
       say(r.reply || '', lasting(r));
       after(r);
       moved();
@@ -600,7 +628,7 @@ async function actOn(b) {
       // Merge (also "Merge anyway" and "Try again") and Throw it away never act by themselves: the engine answers with a
       // card in its own words, bound by id, and the person answers that. Its outcome then shows on this agent.
       busy(b);
-      // A card already on screen (a launch question in the lid while the git screen's detail is used, another agent's
+      // A card already on screen (a card in the lid while the git screen's detail is used, another agent's
       // card) is withdrawn first, as picking a chip does, so none waits unseen. If that does not go through, it stays,
       // nothing is asked, and this button can be tried again.
       const old = S.confirm;
@@ -616,14 +644,17 @@ async function actOn(b) {
       // finished work has no ask, so this answer goes without an askId; the engine leaves the agent as it is ("Not now"
       // says so in its own words, so it never sounds like approval)
       busy(b);
-      const r = await api.answer(a.id, null, b.dataset.answer === 'Not now' ? 'Not now' : 'Looks good');
+      // its own answer, or the words typed or said for it ("not now" at a lid whose "Looks good" answers both)
+      const r = await api.answer(a.id, null, (o.answer || b.dataset.answer) === 'Not now' ? 'Not now' : 'Looks good');
       markReviewed(a);
       answeredOnce();
       say(r.reply || '', 4000);
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
     } else if (act === 'reviewed') {
-      markReviewed(a);
+      // a Dismiss drawn for the work as it is now (its data-work, checked above) also lets a merge that did not go
+      // through go; one drawn before that problem came (a stopped or failed agent's) marks only the finish
+      markReviewed(a, { problem: b.dataset.work != null });
       if (S.focusId === a.id) S.focusId = null;
       if (S.pinId === a.id) S.pinId = null;
     } else if (act === 'later') {
@@ -662,6 +693,16 @@ el.core.addEventListener('pointerleave', () => { pointer.inCore = false; render(
 el.core.addEventListener('focusout', e => { if (!el.core.contains(e.relatedTarget)) render(); });
 
 // ---------------------------------------------------------------- typing and talking
+// The input is a box that grows with its text, never over the lid's words (renderNow gives it the lid's spare height),
+// then scrolls inside. Enter sends; Shift+Enter adds a line; pasted text keeps its lines.
+const sayBox = setupSayBox({ field: el.say, bar: el.bar, send: text => submit(text), lineHeight: () => Math.ceil(parseFloat(getComputedStyle(el.say).lineHeight) || 19) });
+/** Put text in the input (or empty it), as typing would leave it. */
+function setSay(text) {
+  el.say.value = text;
+  el.bar.classList.toggle('typed', !!text);
+  sayBox.fit();
+}
+
 function startReply(a, mode, askId, state) {
   // the reply keeps the agent, the ask, and the state it was opened in: a message is sent only while that still holds
   S.reply = { agentId: a.id, mode, askId: mode === 'answer' ? askId : null, state: state || a.state };
@@ -673,12 +714,14 @@ function startReply(a, mode, askId, state) {
   el.to.title = `${mode === 'answer' ? 'Your answer goes to' : 'This goes to'} ${visibleControls(a.name)}`;
   el.bar.classList.add('replying');
   el.say.setAttribute('aria-label', mode === 'answer' ? `Your answer to ${visibleControls(a.name)}` : `What to tell ${visibleControls(a.name)}`);
+  sayBox.fit(); // the chip takes room from the field: its lines wrap again
   el.say.focus();
 }
 function endReply() {
   S.reply = null;
   el.bar.classList.remove('replying');
   el.say.setAttribute('aria-label', 'Type what you want, or hold the space bar to talk');
+  sayBox.fit();
 }
 el.toCancel.addEventListener('click', () => { endReply(); el.say.focus(); render(); });
 
@@ -704,6 +747,36 @@ function applyPref(kind, value, { quietly = false } = {}) {
   if (hasToken()) api.prefs({ [kind]: v }).catch(e => { if (e?.refused) say(e.message); });
 }
 
+/** The data-words (focus.js) of what lidAnswer names: the lid's buttons say which of these words they answer. */
+const LID_WORDS = { 'Looks good': 'looks-good', 'Not now': 'not-now' };
+
+/**
+ * The lid's own button that "looks good" or "not now", typed or spoken (lidAnswer), stand for at a finished agent's lid:
+ * the one that carries those words in data-words, on the page shown now (not one fading out, nor one still to rise),
+ * drawn for the agent the words were bound to when they began. null when the lid has none for them.
+ */
+function lidButton(label, b) {
+  const words = LID_WORDS[label];
+  if (!words || !b || !b.agentId) return null;
+  const page = el.pages.querySelector('.page:not(.old):not([data-hidden])');
+  return [...(page ? page.querySelectorAll('button[data-words]') : [])].find(x => x.dataset.agent === b.agentId && x.dataset.words.split(' ').includes(words)) || null;
+}
+
+/**
+ * "looks good" or "not now" that the engine took as a finished agent's own answer, with no button on its lid standing for
+ * them (`looked` in the reply to /api/command, on the board or the git screen): this finish is looked at, as its button
+ * would have marked it, and the centre lets go of it.
+ */
+function lookedAt(res) {
+  const a = typeof res?.looked === 'string' && ID_RE.test(res.looked) ? S.agents.get(res.looked) : null;
+  if (!a) return;
+  markReviewed(a);
+  answeredOnce();
+  if (S.focusId === a.id) S.focusId = null;
+  if (S.pinId === a.id) S.pinId = null;
+  moved();
+}
+
 async function submit(text) {
   text = String(text || '').trim();
   if (!text) return;
@@ -711,8 +784,7 @@ async function submit(text) {
   if (refuseKey(text, true)) return;
   const b = bound || bindingNow();
   bound = null;
-  el.say.value = '';
-  el.bar.classList.remove('typed');
+  setSay('');
   // D1: "git", "show git", "open git", "source control", "show the graph" open the git screen (never sent to the engine)
   if (!S.reply && gitScreenWords(text) === 'open') { openGit({ opener: el.dram }); return; }
   // the page's own words: the look, the detail, and stepping through the queue. They never reach the engine.
@@ -725,6 +797,20 @@ async function submit(text) {
     return;
   }
   if (cannotSend(linkNow())) return;
+  // "looks good" or "not now" (the engine's own words for them) at a finished agent's lid never go to the engine: the
+  // page presses the button that stands for them there (its data-words, drawn for the agent the words were begun for),
+  // so they do exactly what it does. Where none stands for "looks good" (work that can merge, a failed check, a merge
+  // that did not go through, a stopped or failed agent, one from an earlier run), it says which answers the lid has, and
+  // does nothing more: words that sound like approval never merge work, continue or retry an agent, nor let it go where
+  // the lid has no "Looks good". Anything else, or words bound to nothing (begun before the lid changed), goes on as before.
+  const said = !S.reply && !S.confirm && b.finished ? lidAnswer(text, ANSWERS) : null;
+  if (said) {
+    const press = lidButton(said, b);
+    if (!press) say(b.hint, 6000);
+    else if (!press.disabled) await actOn(press, { answer: said });
+    return;
+  }
+  const replying = S.reply; // a reply box that was open, so a failed send can open it again with the words
   try {
     if (S.reply) {
       const r = S.reply;
@@ -732,11 +818,11 @@ async function submit(text) {
       const a = S.agents.get(r.agentId);
       let res;
       if (r.mode === 'answer' && r.askId) {
-        if (!a || !a.ask || a.ask.id !== r.askId) { el.say.value = text; say(`${a ? a.name : 'That agent'} asked something new. Have a look first.`); render(); return; }
+        if (!a || !a.ask || a.ask.id !== r.askId) { setSay(text); say(`${a ? a.name : 'That agent'} asked something new. Have a look first.`); render(); return; }
         res = await api.answer(r.agentId, r.askId, text);
       } else {
         // a message carries no ask id, so it goes only while the agent is as it was when the reply opened
-        if (!a || a.state !== r.state) { el.say.value = text; el.bar.classList.add('typed'); say('That changed. Have another look.', 5000); render(); return; }
+        if (!a || a.state !== r.state) { setSay(text); say('That changed. Have another look.', 5000); render(); return; }
         res = await api.say(r.agentId, text);
       }
       answeredOnce();
@@ -744,17 +830,19 @@ async function submit(text) {
       if (S.focusId === r.agentId) S.focusId = null;
       if (res.openConnect === true) showConnect(null, res.reply);
     } else {
-      const shown = S.confirm && b.confirmId === S.confirm.id ? S.confirm : null;
+      const shown = cardShown(b.confirmId);
       const res = await api.command(text, { focusId: shown ? null : (b.agentId || null), confirmId: shown ? shown.id : (b.confirmId || null), askId: shown ? null : (b.askId || null) });
       // the card shown, back again (words not understood, or a look at the work it is about): it stays, still bound to
-      // the agent it was drawn for
-      if (res.confirm) S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
-      else if (shown && S.confirm === shown) S.confirm = null;
+      // the agent it was drawn for. The setup card stays where it is (S.setup, from the stream) until it is answered.
+      if (res.confirm && res.confirm.kind !== 'setup') S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
+      else if (!res.confirm && shown && S.confirm === shown) S.confirm = null;
+      lookedAt(res);
       lookAt(res.focusId);
-      // the reply to the person's own words: a new launch question, or the agent it names, shows at once
+      // the reply to the person's own words: a new card, or the agent it names, shows at once (work that started names
+      // none: the centre stays as it is, and the notice says what started)
       if (res.confirm || res.focusId || shown) moved();
       if (b.askId && !res.confirm) answeredOnce();
-      // a new launch question in the core already says it; anything else is said under the core
+      // a new card in the core already says it; anything else is said under the core
       say(res.confirm && (!shown || res.confirm.id !== shown.id) ? '' : (res.reply || ''), lasting(res));
       // "what did search cleanup change": the git screen opens on that agent's branch and its diff
       // also with a merge or throw-away card still shown: the person looks at the work first, then answers the card
@@ -762,9 +850,19 @@ async function submit(text) {
       // "connect", "add a key", "sign in", or work asked for with no agent ready: Agents & keys opens
       if (res.openConnect === true) showConnect(null, res.reply);
     }
-  } catch (err) { say(err.message); }
+  } catch (err) {
+    // nothing was sent (too long: the page checked first), or it failed: the words go back in the box, unless the person
+    // has typed something new there meanwhile, and a reply box that was open opens again with them
+    if (!el.say.value) {
+      const a = replying && S.agents.get(replying.agentId);
+      if (a && !S.reply) startReply(a, replying.mode, replying.askId, replying.state);
+      setSay(text);
+    }
+    say(err.message);
+  }
   render();
 }
+// A textarea sends no form by itself: Enter sends through the box (saybox.js). This catches any other way a form is sent.
 el.bar.addEventListener('submit', e => { e.preventDefault(); submit(el.say.value); });
 
 // Voice is bound to what the screen the microphone turned on over showed (the lid, or the git screen's detail), and what
@@ -774,7 +872,8 @@ let voiceOver = null;   // 'board' | 'git' while listening, and until what was h
 const voice = setupVoice({
   mic: el.mic, heard: [el.heard, $('gitHeard')],
   onFinal: t => { const over = voiceOver; voiceOver = null; if (over === 'git') gitCommand(t, gitTake()); else submit(t); },
-  onNotice: t => say(t),
+  onNotice: (t, ms) => say(t, ms),
+  onlyFiller,
   onListening: (on, words) => {
     el.bar.classList.toggle('listening', on);
     gitListening(on);
@@ -792,12 +891,27 @@ const voice = setupVoice({
   },
 });
 
-// A launch question the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot start it.
+/** The card with this id the core may show: the card on screen, or the setup card launches wait on; else null. */
+function cardShown(id) {
+  return [S.confirm, S.setup].find(c => c && typeof id === 'string' && c.id === id) || null;
+}
+
+/**
+ * The setup card a snapshot carries (launches wait on it), with only the fields the core draws; null when there is none.
+ * It is not dropped like another card (Esc, picking a chip): it stays until it is answered.
+ */
+function setupCardOf(c) {
+  if (!c || typeof c !== 'object' || c.kind !== 'setup' || typeof c.id !== 'string' || !ID_RE.test(c.id) || typeof c.sentence !== 'string' || typeof c.command !== 'string') return null;
+  return { id: c.id, kind: 'setup', sentence: c.sentence, command: c.command, detail: typeof c.detail === 'string' ? c.detail : null,
+    yes: typeof c.yes === 'string' && c.yes ? c.yes : 'Run it', no: typeof c.no === 'string' && c.no ? c.no : 'Not now' };
+}
+
+// A card the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot answer it.
 function dropConfirm() {
   const c = S.confirm;
   if (!c) return;
   S.confirm = null;
-  // if the withdrawal does not go through, the card stays: no launch question waits unseen
+  // if the withdrawal does not go through, the card stays: no card waits unseen
   api.confirm(c.id, false).then(r => say(r.reply || ''), err => { if (!S.confirm) S.confirm = c; say(err.message); render(); });
 }
 
@@ -821,6 +935,15 @@ document.addEventListener('keydown', e => {
   // While Agents & keys is open the board takes no keys at all: no typing into the board's input (a key typed with a
   // button focused must not land there), no talking, no arrows. Esc closes the panel and does nothing else.
   if (connectShown()) { if (e.key === 'Escape') { e.preventDefault(); closeConnect(); } return; }
+  // While the file view shows, it takes the keys (Esc, ⌘P, ⌘⇧F, ⌘S, letters to its field), and the board takes none:
+  // space types a space in its field and its editor, and never starts listening.
+  if (filesShown()) { filesKey(e); return; }
+  // ⌘P (Ctrl+P off a Mac) finds a file, ⌘⇧F words in the files: the file view, its field focused
+  if ((isMac ? e.metaKey : e.ctrlKey) && !e.altKey && !cannotSend(linkNow())) {
+    const k = String(e.key).toLowerCase();
+    if (k === 'p' && !e.shiftKey) { e.preventDefault(); showFiles({ mode: 'find' }); return; }
+    if (k === 'f' && e.shiftKey) { e.preventDefault(); showFiles({ mode: 'search' }); return; }
+  }
   if (e.key === 'Escape') { escape(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const ae = document.activeElement;
@@ -857,6 +980,7 @@ document.addEventListener('visibilitychange', () => {
 
 function escape() {
   if (connectShown()) { closeConnect(); return; }   // Agents & keys first: it covers everything else
+  if (filesShown()) { filesEscape(); return; }   // then the file view, over either screen
   if (gitShown() && !voice.listening && gitEscape()) return;   // D1: the detail closes, then back to the board
   if (!el.look.hidden) { closeLook(true); return; }
   if (!el.pop.hidden) { closePop(); return; }
@@ -875,7 +999,7 @@ document.addEventListener('click', e => {
   if (!el.pop.hidden && !el.pop.contains(e.target) && !e.target.closest('.mach')) closePop();
   if (!el.trayList.hidden && !el.trayList.contains(e.target) && !el.tray.contains(e.target)) closeTray();
   if (!el.look.hidden && !el.look.contains(e.target) && !el.brand.contains(e.target)) closeLook(false);
-  if (S.pinId && !e.target.closest('#parts, #card, #core, .pop, .mach, #tray, #brand, #connect, #connectBtn')) { S.pinId = null; render(); }
+  if (S.pinId && !e.target.closest('#parts, #card, #core, .pop, .mach, #tray, #brand, #connect, #connectBtn, #permBtn')) { S.pinId = null; render(); }
 });
 
 // ---------------------------------------------------------------- the look menu (the workbench mark)
@@ -953,7 +1077,8 @@ el.pop.addEventListener('click', async e => {
   btn.removeAttribute('aria-disabled');
 });
 
-// ---------------------------------------------------------------- the done tray (past twelve agents)
+// ---------------------------------------------------------------- the done tray (agents you are finished with, earlier
+// runs' agents, and finished or waiting work with no room on a dense board)
 function toggleTray(anchor) {
   if (!el.trayList.hidden) { closeTray(); return; }
   el.trayList.hidden = false;
@@ -968,17 +1093,34 @@ function closeTray() {
   el.tray.setAttribute('aria-expanded', 'false');
   if (inside) el.tray.focus({ preventScroll: true });
 }
+/**
+ * The tray is about to be hidden: it holds nothing any more (its last agent is back on the board, or no data is shown).
+ * An open list closes, and the keyboard on the tray or in its list goes to the lid's sentence first, so it is never
+ * dropped (closeTray would hand it to the tray, which is going).
+ */
+function trayEmptied() {
+  const had = el.tray.contains(document.activeElement) || el.trayList.contains(document.activeElement);
+  if (!el.trayList.hidden) { el.trayList.hidden = true; el.tray.setAttribute('aria-expanded', 'false'); }
+  if (had) lidHome();
+}
 let trayIds = { done: [], earlier: [], over: [] };
 function renderTrayList() {
-  const row = id => {
+  // each row: its mark, its name, and a few words: where its work went or how it ended ("merged", "thrown away", "not
+  // merged", "checks failed", "stopped"), how long ago for an earlier run's agent, or its state for one at work with no room
+  const row = (id, words) => {
     const a = S.agents.get(id);
     if (!a) return '';
     const m = markOf(a.state, STATES.LOOK);
-    const note = a.earlier ? agoText(Date.now() - (a.endedAt || a.stateSince)) : m.label;
-    return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(visibleControls(a.name))} <em>· ${esc(note)}</em></span></button>`;
+    return `<button type="button" class="row${a.earlier ? ' earlier' : ''}" data-agent="${esc(a.id)}" data-key="t:${esc(a.id)}"><svg class="g c-${m.tone}" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-${m.shape}"/></svg><span>${esc(visibleControls(a.name))} <em>· ${esc(words(a, m))}</em></span></button>`;
   };
-  const done = trayIds.done.map(row).join(''), over = trayIds.over.map(row).join(''), early = (trayIds.earlier || []).map(row).join('');
-  patchChildren(el.trayList, `${done || !early ? `<h2>Done or stopped</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  const done = trayIds.done.map(id => row(id, a => doneWords(a, STATES.LOOK))).join('');
+  const early = (trayIds.earlier || []).map(id => row(id, a => agoText(Date.now() - (a.endedAt || a.stateSince)))).join('');
+  const over = trayIds.over.map(id => row(id, (a, m) => m.label)).join('');
+  // "Done" heads the list when it holds this run's agents, and stands alone ("Nothing yet.") only when it holds no one
+  const lone = !done && !early && !over;
+  // a row that held the keyboard and went (its agent back on the board) hands it to the list's first row, else the tray
+  const lost = patchChildren(el.trayList, `${done || lone ? `<h2>Done</h2>${done || '<p class="note">Nothing yet.</p>'}` : ''}${early ? `<h2>From earlier runs</h2>${early}` : ''}${over ? `<h2>Working, with no room on the board</h2>${over}` : ''}`);
+  if (lost) (el.trayList.querySelector('button') || el.tray).focus({ preventScroll: true });
   const r = el.tray.getBoundingClientRect();
   // above the tray, inside the board and beside the core (never on it, never on the top band)
   const top = G ? G.board.y + G.P.topBand : 8;
@@ -998,7 +1140,7 @@ el.trayList.addEventListener('click', e => {
   const kb = el.trayList.contains(document.activeElement);
   closeTray();
   // the agent goes to the core; a keyboard user follows it there (its sentence), a mouse user's focus stays put
-  if (kb) el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+  if (kb) lidHome();
   moved();
   render();
 });
@@ -1015,15 +1157,33 @@ function applyDebug() {
   renderSoon();
 }
 
+/** The permission mode a snapshot gives ('full' or 'ask'); an engine that says neither keeps what the page had. */
+const snapMode = (snap, was) => (snap.permissions === 'full' || snap.permissions === 'ask' ? snap.permissions : was);
+
+/**
+ * The permission mode as the engine says it now. When it changes, a card that would turn full permissions on goes: the
+ * engine withdrew it (they were turned off) or would refuse it (it asks about the mode as it was), here or in another tab.
+ */
+function modeIs(mode) {
+  if (mode !== 'full' && mode !== 'ask') return;
+  if (mode !== S.meta.permissions && S.confirm?.kind === 'permissions') S.confirm = null;
+  S.meta.permissions = mode;
+}
+
 function onSnapshot(snap) {
-  // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board
-  S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap) };
+  // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board.
+  // meta.permissions: whether full permissions are on, for the band's button (no card speaks of them).
+  const was = S.meta.permissions;
+  S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap),
+    permissions: was };
+  modeIs(snapMode(snap, was));
+  // the setup card launches wait on, here or answered in another tab
+  S.setup = setupCardOf(snap.setup);
   const fresh = new Map((snap.agents || []).map(a => [a.id, a]));
   for (const id of [...S.agents.keys()]) if (!fresh.has(id)) S.agents.delete(id);
   upsert(snap.agents || []);
   lookArrived();
-  // a full list: lanes of agents that no longer exist are forgotten (only here, never on a partial update)
-  lanes.prune(new Set([...fresh.values()].filter(a => !a.parentId).map(a => a.id)));
+  // lanes of agents that are gone, or not on the board any more, are freed as the board is drawn (boardAndTray)
   S.machines = snap.machines || [];
   const wasLoaded = S.loaded;
   S.loaded = true;
@@ -1095,7 +1255,7 @@ setInterval(() => {
 function refuseKey(text, board) {
   const said = keyRefusal(text, secretShape.looksLikeSecret);
   if (!said) return false;
-  if (board) { el.say.value = ''; el.bar.classList.remove('typed'); bound = null; }
+  if (board) { el.say.value = ''; el.bar.classList.remove('typed'); sayBox.fit(); bound = null; }
   say(said);
   showConnect(null, said);
   return true;
@@ -1118,7 +1278,7 @@ function showConnect(opener = null, said = '') {
 let connectAutoOpened = false;
 function autoOpenConnect() {
   const c = S.meta.connect;
-  if (connectAutoOpened || !c || c.ready !== false || S.meta.mode === 'demo' || linkNow() !== 'live' || connectShown()) return;
+  if (connectAutoOpened || !c || c.ready !== false || S.meta.mode === 'demo' || linkNow() !== 'live' || connectShown() || filesShown()) return;
   connectAutoOpened = true;
   showConnect(null);
 }
@@ -1153,6 +1313,89 @@ function paintConnectBtn(P, live) {
   b.style.top = Math.round(G.brand.y - b.offsetHeight / 2) + 'px';
 }
 el.connectBtn.addEventListener('click', () => showConnect(el.connectBtn));
+
+/**
+ * The top band's Full permissions button, just left of Agents & keys (or where it would be, in the demo): quiet while
+ * agents ask before risky steps, lit while full permissions are on, with aria-pressed saying which. It carries the mode it
+ * was drawn for (data-state). Where the band has no room for both buttons' words, Agents & keys takes its short word
+ * first, then this one. On a live link only.
+ */
+function paintPermBtn(P, live) {
+  const b = el.permBtn;
+  const v = permButtonView(S.meta.permissions);
+  // Its look before it shows, and before anything below measures it: on a page that loads with full permissions on (from
+  // <html> at first), it is lit from its first frame, rather than drawn quiet and faded to lit by its transition.
+  b.classList.toggle('on', v.on);
+  b.hidden = !live;
+  if (!live || !G) return;
+  b.style.fontSize = P.silkSub + 'px';
+  const draw = label => {
+    const html = `<span class="led${v.on ? ' on' : ''}" aria-hidden="true"></span><span class="lbl">${esc(label)}</span>`;
+    if (b.dataset.html !== html) { b.innerHTML = html; b.dataset.html = html; }
+  };
+  const c = el.connectBtn, left = G.fiducials[0][0] + 7 + 14;
+  const rightOf = () => (c.hidden ? G.fiducials[1][0] - 7 - 14 : c.offsetLeft - 10);
+  draw(v.label);
+  if (b.offsetWidth > rightOf() - left && !c.hidden) {
+    // Agents & keys takes its short word, staying where it ends
+    const cv = bandView(S.meta.connect), end = c.offsetLeft + c.offsetWidth;
+    if (cv) {
+      const html = `<span class="led ${cv.light}" aria-hidden="true"></span><span class="lbl">${esc(cv.short)}</span>`;
+      if (c.dataset.html !== html) { c.innerHTML = html; c.dataset.html = html; }
+      c.style.left = Math.round(end - c.offsetWidth) + 'px';
+    }
+  }
+  if (b.offsetWidth > rightOf() - left) draw(v.short);
+  b.dataset.state = v.state;
+  if (b.getAttribute('aria-pressed') !== v.pressed) b.setAttribute('aria-pressed', v.pressed);
+  if (b.getAttribute('aria-label') !== v.name) b.setAttribute('aria-label', v.name);
+  if (b.title !== v.title) b.title = v.title;
+  b.style.left = Math.round(Math.max(left, rightOf() - b.offsetWidth)) + 'px';
+  b.style.top = Math.round(G.brand.y - b.offsetHeight / 2) + 'px';
+}
+
+/**
+ * Pressed when off, it asks the engine, whose card ("Let agents do anything without asking?") comes in the middle; only
+ * that card's yes turns them on. Pressed when on, it turns them off at once. A button drawn for the other mode sends
+ * nothing ("That changed. Have another look."). Another card already on screen is withdrawn first, as for Merge, so none
+ * waits unseen; its own card stays as it is, with nothing said, and the focus goes to it. A keyboard press takes the
+ * keyboard to the card.
+ */
+el.permBtn.addEventListener('click', async () => {
+  const b = el.permBtn;
+  if (b.getAttribute('aria-disabled') === 'true') return;
+  touch();
+  if (b.dataset.state !== S.meta.permissions) { changed(); return; }
+  if (b.dataset.state !== 'full' && S.confirm?.kind === 'permissions') {
+    el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+    return;
+  }
+  if (cannotSend(linkNow())) return;
+  const drawn = b.dataset.state;
+  const keyboard = document.activeElement === b;
+  b.setAttribute('aria-disabled', 'true');
+  try {
+    if (drawn !== 'full' && S.confirm) {
+      const old = S.confirm;
+      const w = await api.confirm(old.id, false);
+      if (S.confirm === old) S.confirm = null;
+      say(w.reply || '');
+    }
+    const r = await api.permissions(drawn === 'full' ? 'ask' : 'full');
+    if (r.confirm) {
+      S.confirm = r.confirm;
+      S.focusId = null;
+      moved();
+      renderNow();
+      if (keyboard) el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+    } else {
+      modeIs(r.permissions);
+      say(r.reply || '');
+    }
+  } catch (err) { say(err.message); }
+  b.removeAttribute('aria-disabled');
+  render();
+});
 
 setupConnect({
   looksLikeSecret: t => secretShape.looksLikeSecret?.(t),
@@ -1192,12 +1435,13 @@ const gitAct = b => actOn(b);
  * gitscreen.js): the card in the detail by its id, or the agent whose detail is open, or nothing. A card the reply brings
  * shows in that agent's detail only when the card itself names that agent (its agentId); any other card is shown where it
  * can be answered: in the lid, back on the board. A card that was on screen and that the words were not sent to is
- * still waiting in the engine: it is withdrawn, so none waits unseen.
+ * still waiting in the engine: it is withdrawn, so none waits unseen. Words that could not be sent (too long: the page
+ * checks first; Workbench not answering; a failed request) go back in the git screen's input, as the board's box does.
  */
 async function gitCommand(text, b = {}) {
   text = String(text || '').trim();
   if (!text) return;
-  // as on the board: a key is never sent (the git screen's input is already empty)
+  // as on the board: a key is never sent, and never put back (the git screen's input is already empty)
   if (refuseKey(text, false)) return;
   touch();
   const words = gitScreenWords(text);
@@ -1206,7 +1450,7 @@ async function gitCommand(text, b = {}) {
   const pc = pageCommand(text);
   if (pc && (pc.kind === 'theme' || pc.kind === 'detail')) { applyPref(pc.kind, pc[pc.kind]); return; }
   if (pc && pc.kind === 'next') { say('“Next” steps through what needs you, on the board. Say “back” to go there.', 6000); return; }
-  if (cannotSend(linkNow())) { say('Workbench is not answering, so that was not sent.'); return; }
+  if (cannotSend(linkNow())) { gitPutBack(text); say('Workbench is not answering, so that was not sent.'); return; }
   // as submit() does: a card is answered only by the id it had when the person began
   const shown = S.confirm && b.confirmId && b.confirmId === S.confirm.id ? S.confirm : null;
   const focusId = shown ? null : (b.agentId || null);
@@ -1221,6 +1465,7 @@ async function gitCommand(text, b = {}) {
       S.confirm = same ? { ...res.confirm, agentId: shown.agentId } : mine ? { ...res.confirm, agentId: focusId } : res.confirm;
       if (!mine) closeGit({ toLid: true });
     } else if (shown && S.confirm === shown) S.confirm = null;
+    lookedAt(res);
     lookAt(res.focusId);
     // as the core's input does: a new card says itself; anything else is said
     say(res.confirm && !same ? '' : (res.reply || ''));
@@ -1228,7 +1473,11 @@ async function gitCommand(text, b = {}) {
     moved();
     // Agents & keys opens over the git screen too
     if (res.openConnect === true) showConnect(null, res.reply);
-  } catch (err) { say(err.message); }
+  } catch (err) {
+    // nothing was sent, or it failed: the words go back in the input, unless the person has typed something new there
+    gitPutBack(text);
+    say(err.message);
+  }
   render();
 }
 
@@ -1240,10 +1489,51 @@ setupGitScreen({
   pick: id => { if (S.confirm) dropConfirm(); S.focusId = id; moved(); },
   // going down: the board's menus and card close (they belong to the board); either way the board renders afresh
   onShow: shown => { if (shown) { closePop(); closeTray(); closeLook(false); S.pinId = null; S.hoverId = null; board.hideCard(); } renderSoon(); },
+  // a file's path in an agent's diff: that file in the agent's copy, at its first changed line, growing out of the path
+  openFile: o => showFiles({ where: o.agentId, path: o.path, line: o.line, opener: o.opener, origin: o.opener ? o.opener.getBoundingClientRect() : null }),
+});
+
+// ---------------------------------------------------------------- the file view: the files chip, ⌘P and ⌘⇧F, and the git screen's paths
+/**
+ * Open the file view over whichever screen shows. The board's menus and card close and voice stops (onShow), as for
+ * Agents & keys. `mode` 'find' (⌘P), 'search' (⌘⇧F) or 'browse' (the files chip); with `path`, that file in `where`'s copy.
+ */
+function showFiles(o = {}) {
+  if (cannotSend(linkNow())) return;
+  openFiles(o);
+}
+el.files.addEventListener('click', () => showFiles({ opener: el.files, mode: 'browse' }));
+el.files.setAttribute('aria-keyshortcuts', isMac ? 'Meta+P' : 'Control+P');
+
+setupFiles({
+  getG: () => G, measure, still: () => debug.still, reduced, isMac,
+  looksLikeSecret: t => secretShape.looksLikeSecret?.(t)?.secret === true,
+  startsLikeSecret: t => secretShape.startsLikeSecret?.(t) === true,
+  onShow: shown => {
+    if (shown) {
+      closePop(); closeTray(); closeLook(false);
+      if (S.pinId || S.hoverId) { S.pinId = null; S.hoverId = null; board.hideCard(); }
+      if (voice.listening) voice.cancel();
+      holding = false;
+      filesNeeds(needsInfo());
+    }
+    renderSoon();
+  },
+  // "<Name> needs you" at the top of the sheet: that item in the lid, as picking its chip does (a card on screen is
+  // withdrawn), back on the board when the git screen shows
+  toLid: id => {
+    if (id && S.agents.has(id)) { if (S.confirm) dropConfirm(); S.focusId = id; moved(); }
+    if (gitShown()) { closeGit({ toLid: true }); return; }
+    renderNow();
+    el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+  },
+  // where the keyboard goes when what opened the sheet is gone: the git screen's heading, else the files chip, else the lid
+  home: () => (gitShown() ? (document.querySelector('#gitDetail h2') || document.getElementById('gitTitle'))
+    : (!el.files.hidden && !el.files.inert ? el.files : el.pages.querySelector('.page:not(.old) h1'))),
 });
 
 RM.addEventListener('change', () => { if (RM.matches) board.settle(); renderNow({ snap: true }); });
-addEventListener('resize', () => { closePop(); closeTray(); renderNow({ snap: true }); });
+addEventListener('resize', () => { closePop(); closeTray(); renderNow({ snap: true }); sayBox.fit(); });
 document.fonts?.addEventListener?.('loadingdone', () => { widths.clear(); if (fontsReady) renderNow({ snap: true }); });
 
 // Boot: wait for the four weights of JetBrains Mono (the board is measured in it), then draw.

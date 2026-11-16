@@ -7,7 +7,7 @@ import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
 import {
   buildClaudeLaunch, findClaude, scrubEnv, withNodeOnPath, userMessage, sessionFolders, sessionExists,
-  safeMask, maskParsed, maskedTail, DEFAULT_BUDGET_USD, DISALLOWED_TOOLS, CLAUDE_NOT_FOUND, MASK_MARGIN,
+  safeMask, maskParsed, maskedTail, DEFAULT_BUDGET_USD, DISALLOWED_TOOLS, CLAUDE_NOT_FOUND, MASK_MARGIN, CLAUDE_FORMAT,
 } from './args.mjs';
 import { createClaudeParser } from './parse.mjs';
 
@@ -31,14 +31,15 @@ const firstLine = (s) => String(s || '').trim().split('\n')[0].trim().slice(0, 2
 const DISALLOWED = new Set(DISALLOWED_TOOLS.split(' '));
 
 /**
- * Is Claude Code here? Finds it (see findClaude in args.mjs: `claudePath` is the --claude flag), then runs
+ * Is Claude Code here? Finds it (see findClaude in args.mjs: `claudePath` is the --claude flag, and a relative path in
+ * it or in WORKBENCH_CLAUDE_BIN is read from `startedIn`, the folder Workbench was started in), then runs
  * `<path> --version` with a 5 second timeout.
  * @returns {Promise<{ ok: boolean, version?: string, path?: string, from?: 'flag'|'env'|'path'|'vscode', reason?: string, timedOut?: true }>}
  *   `path` and `from` say which Claude Code it found and how, also when that one cannot be used; `timedOut` when
  *   `--version` did not answer within `timeoutMs`
  */
-export async function available({ env = process.env, timeoutMs = 5000, claudePath } = {}) {
-  const where = findClaude({ flag: claudePath, env });
+export async function available({ env = process.env, timeoutMs = 5000, claudePath, startedIn = null } = {}) {
+  const where = findClaude({ flag: claudePath, env, cwd: startedIn });
   const found = where.path ? { path: where.path, from: where.from } : {};
   if (!where.path || where.reason) return { ok: false, reason: where.reason || CLAUDE_NOT_FOUND, ...found };
   return new Promise((resolve) => {
@@ -145,7 +146,8 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
  *   `sessionId` continues an earlier session (from history) instead of starting one: call send(), not start(); the
  *   first message resumes it with `--resume` and the whole of `budgetUsd` (the new process has spent nothing).
  *   `claudePath` is the --claude flag: Claude Code is looked up again at each launch (findClaude in args.mjs), since
- *   the VS Code extension moves to a new folder with each update.
+ *   the VS Code extension moves to a new folder with each update. `startedIn` is the folder Workbench was started in:
+ *   a relative path in the flag or in WORKBENCH_CLAUDE_BIN is read from there, never from the agent's folder (`cwd`).
  *   `keysEnv` ({ NAME: value }) is the person's keys for this agent: each process gets them after the scrub and before
  *   the WORKBENCH_* variables. They never feed the lookup of Claude Code or of its own folders (`readAlso`).
  *   `mask` (text -> text) hides the person's keys: every output line goes through it before the parser reads it, and
@@ -161,6 +163,7 @@ export function createRunner(opts = {}) {
   const hide = typeof opts.mask === 'function' ? safeMask(opts.mask) : null; // null: nothing to hide
   const mask = hide || ((s) => s);
   const claudePath = typeof opts.claudePath === 'string' ? opts.claudePath : null;
+  const startedIn = typeof opts.startedIn === 'string' ? opts.startedIn : null;
   let budgetUsd = opts.budgetUsd == null ? DEFAULT_BUDGET_USD : Number(opts.budgetUsd); // for this run; setLimit raises it
   const graceMs = opts.killGraceMs ?? STOP_GRACE_MS;
   const log = makeLog(opts.log, agentId);
@@ -210,7 +213,7 @@ export function createRunner(opts = {}) {
     let obj;
     // Keys are hidden before anything is cut short: the log's 120 characters here, the parser's and narrate()'s later.
     try { obj = JSON.parse(line); } catch { log('debug', `ignored output that is not JSON: ${mask(line).slice(0, 120)}`); return; }
-    if (hide) obj = maskParsed(obj, hide);
+    if (hide) obj = maskParsed(obj, hide, CLAUDE_FORMAT); // never the format's own words: a line would no longer read
     if (obj && obj.type === 'system' && obj.subtype === 'init') {
       if (obj.session_id) sessionId = String(obj.session_id);
       tellTools(obj);
@@ -272,7 +275,7 @@ export function createRunner(opts = {}) {
       // Looked up again for every process: an update of the VS Code extension moves Claude Code to a new folder.
       // Nothing was started when it is not found, so this is said as a plain refusal, like the spending limit: the
       // engine reports it, and an agent from an earlier run stays as it was.
-      const where = findClaude({ flag: claudePath, env: baseEnv });
+      const where = findClaude({ flag: claudePath, env: baseEnv, cwd: startedIn });
       if (!where.path || where.reason) throw Object.assign(new Error(where.reason || CLAUDE_NOT_FOUND), { plain: true });
       const spec = buildClaudeLaunch({
         name, model, budgetUsd: budget, hook, agentId, env: baseEnv, keysEnv, bin: where.path,

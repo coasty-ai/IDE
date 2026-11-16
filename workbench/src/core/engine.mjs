@@ -7,6 +7,8 @@
 //   connect:  optional, the Connect service (src/core/connect.mjs): the person's keys for agents and checks
 //             (envFor), hiding those keys (mask), and the default agent (defaultAgent). Absent: no keys, nothing
 //             hidden, and new work goes to the first agent that is ready.
+//   prefs:    optional, the person's kept choices ({ get(), set(change) }, createPrefs in src/core/prefs.mjs): live mode
+//             reads full permissions from it at start and keeps them there when they change. The demo never does.
 // This file must not import those modules directly. Each git function it uses (snapshotWork, workDiff, mergeWork,
 // discardWork, gitGraph, gitIdentity, ...) is checked with typeof first, so an older workspace module gives a plain
 // refusal instead of a crash.
@@ -19,6 +21,9 @@ import { STATE, ENDED, ACTIVE, DONE, NEEDS_YOU } from '../shared/states.mjs';
 import { nameFromTask, firstSentence, extractQuestion, plain, describeRequest, quotable } from '../shared/narrate.mjs';
 import { money, spentAmount, duration, clip } from '../shared/format.mjs';
 import { looksLikeSecret } from '../shared/secretshape.mjs';
+import { maskSecrets } from '../shared/mask.mjs';
+// "Looks good" and "Not now", and the words that mean the same for finished work; the page uses the same list
+import { LOOKS_GOOD_RE, NOT_NOW_RE } from '../shared/answers.mjs';
 import { StuckDetector } from './stuck.mjs';
 
 const MIN = 60_000;
@@ -87,13 +92,51 @@ const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]{0,79}$/;
 // A permission's buttons say exactly these. Typed or spoken words reach a permission only through command().
 const ALLOW_LABEL_RE = /^allow$/i;
 const DENY_LABEL_RE = /^deny$/i;
-const LOOKS_GOOD_RE = /^(looks good|look good|lgtm|great|thanks|thank you|good|fine|ok|okay|all good)[.!]*$/i;
-// The lid's "Not now" on work that can be merged: the agent stays as it is, and the reply does not sound like approval.
-const NOT_NOW_RE = /^not now[.!]*$/i;
-const HELP = 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.';
-// The answer to "help", "hi" or "what can you do": short enough for three lines under the DRAM on the narrowest board.
+// What a `help` intent gets, from a parser that still sends one (the real parser does not: "help" is a prompt there):
+// short enough for three lines under the DRAM on the narrowest board.
 const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
+// Full permissions: the card that asks first, and what is said when they go on and off.
+const FULL_SENTENCE = 'Let agents do anything without asking?';
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
+const FULL_OFF = 'Agents ask again before risky steps.';
+const FULL_REASON = 'Full permissions are on.';
+// When the choice cannot be saved and what is kept says otherwise, the next start differs from this run, and the reply says so.
+const ON_NOT_KEPT = 'Full permissions are on for now, but Workbench could not save that, so agents will ask again the next time it starts.';
+const OFF_NOT_KEPT = 'Full permissions are off for now, but Workbench could not save that, so they will be on again the next time it starts.';
+// A full permissions card made before the mode last changed: its question is not the one it asked.
+const MODE_CHANGED = 'That changed. Have another look.';
+const MODE_WORDS = 'Say whether agents should ask first or have full permissions.';
+// Agents' copies: the ignored files a new copy gets (fillWorkspace), and the setup command workbench.json may hold.
+const COPIES_NOTICE = 'Agents’ copies now get your .env files, keys included, and node_modules, so they can run the project. A .worktreeinclude file at the top of the repository chooses what is copied.';
+const SETUP_SENTENCE = 'Run this setup command in each agent’s copy before it starts?';
+const SETUP_DETAIL = 'It comes from workbench.json, and runs before each new agent starts. Workbench asks again if it changes.';
+const SETUP_RAN = 'OK. Each agent’s copy runs it before the agent starts.';
+const SETUP_NOT_KEPT = 'Workbench could not save that, so it asks again the next time it starts.';
+const SETUP_RUNNING = 'Running the setup command in its copy';
+const SETUP_SKIPPED = 'It starts without the setup command.';
+const SETUP_WAITING = 'Waiting for your answer about the setup command';
+const SETUP_EXPIRED = 'Nobody answered whether to run the setup command, so the agents waiting for it start without it.';
+const SETUP_TIMEOUT_SEC = 600;
+// The most values of copied env files the engine hides (the newest are kept).
+const ENV_SECRETS_MAX = 1000;
+// What was not copied into an agent's copy, and why, in the order the start detail says it (see copiesWords).
+const SKIP_WORDS = [
+  ['noclone', (n, many) => `${n} ${many ? 'were' : 'was'} not copied: this disk cannot make quick copies.`],
+  ['not-ignored', (n, many) => `${n} ${many ? 'were' : 'was'} not copied: the rule that hides ${many ? 'them' : 'it'} from git is not committed.`],
+  ['nested-repo', (n, many) => `${n} ${many ? 'were' : 'was'} not copied: ${many ? 'they are repositories' : 'it is a repository'} of ${many ? 'their' : 'its'} own.`],
+  ['link-outside', (n, many) => `${n} ${many ? 'were' : 'was'} left out: ${many ? 'they lead' : 'it leads'} outside the repository.`],
+  ['failed', (n) => `${n} could not be copied.`],
+  ['venv', (n, many) => `${n} still ${many ? 'run' : 'runs'} the Python in your folder.`],
+];
+// The file view (files, file, search, saveFile).
+const NO_FILES_MODULE = 'Workbench cannot show files right now.';
+const WHOSE_COPY = 'Say whose copy to show: yours, or an agent’s.';
+const DEMO_SAVED = 'This is the demo, so your change is kept only until Workbench closes.';
+const MERGING_INTO_YOURS = 'Workbench is merging into your folder now. Save again once it is done.';
+/** The most text a save takes, in bytes of UTF-8: 1 MB, the most the file view shows. */
+const MAX_SAVE_BYTES = 1024 * 1024;
 
 /** How a state reads after an agent's name: "Checkout fix needs your OK". */
 const PHRASE = Object.freeze({
@@ -135,6 +178,22 @@ function lowerFirst(s) {
   return s ? s.charAt(0).toLowerCase() + s.slice(1) : s;
 }
 
+function upperFirst(s) {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+/**
+ * Work in these words for agent `h`, when the words name no agent: the person was just asked what `h` should work on.
+ * Anything else (a command, work that names its agent) is as it was.
+ */
+function forHarness(intent, h) {
+  if (intent.kind === 'task' && !intent.harness) return { ...intent, harness: h };
+  if (intent.kind === 'start' && Array.isArray(intent.tasks) && intent.tasks.length) {
+    return { ...intent, tasks: intent.tasks.map(t => (t && !t.harness ? { ...t, harness: h } : t)) };
+  }
+  return intent;
+}
+
 function joinAnd(items) {
   const a = items.filter(Boolean);
   if (a.length <= 1) return a.join('');
@@ -150,6 +209,46 @@ function joinOr(items) {
 
 function harnessName(h) {
   return HARNESS_NAMES[h] || 'That kind of agent';
+}
+
+// The programs as the notice of a start names them, short, as people say them: "Started Claude on “fix the login”."
+const PROGRAM_SAID = { claude: 'Claude', codex: 'Codex' };
+const COUNT_WORD = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+
+/**
+ * The notice of a start: "Started Claude on “fix the login”.", "Started two Claude agents on “…”.", "Started Claude on
+ * “a” and Codex on “b”."; in the demo, "a simulated Claude". Each task is quoted on one line (clip makes line breaks
+ * spaces). `started`: [{ harness, task }], in the order they started.
+ */
+function startedSentence(started, demo) {
+  return `Started ${startPhrase(started, demo)}.`;
+}
+
+/**
+ * The question of the card that asks before more than one agent starts from one sentence, in the notice's words: "Start
+ * three Claude agents on “the login page”?", "Start Codex on “write tests” and Claude on “fix the parser”?" ("simulated"
+ * in the demo). A quoted task that is a question already ends the sentence.
+ */
+function startQuestion(tasks, demo) {
+  const s = `Start ${startPhrase(tasks, demo)}`;
+  return /\?”$/.test(s) ? s : `${s}?`;
+}
+
+/** Who starts on what: "Claude on “fix the login”", "two Claude agents on “…”", "Codex on “…” and Claude on “…”". */
+function startPhrase(starts, demo) {
+  const byTask = new Map();
+  for (const s of starts) byTask.set(s.task, [...(byTask.get(s.task) || []), s.harness]);
+  const sim = demo ? 'simulated ' : '';
+  const who = (hs) => {
+    const counts = new Map();
+    for (const h of hs) counts.set(h, (counts.get(h) || 0) + 1);
+    return joinAnd([...counts].map(([h, n]) => {
+      const name = PROGRAM_SAID[h] || harnessName(h);
+      return n === 1 ? `${demo ? 'a simulated ' : ''}${name}` : `${COUNT_WORD[n] || n} ${sim}${name} agents`;
+    }));
+  };
+  const width = byTask.size > 1 ? 50 : 80;
+  return joinAnd([...byTask].map(([task, hs]) => `${who(hs)} on “${clip(task, width)}”`));
 }
 
 /**
@@ -212,17 +311,30 @@ function maskValue(value, mask, skip = null, depth = 0) {
   return out;
 }
 
-/** What "do it" does to a confirm card: "start it", "stop them", "send it", "merge it", "throw it away". */
+/** What "do it" does to a confirm card: "stop them", "send it", "merge it", "throw it away". */
 function confirmVerb(c) {
   switch (c.kind) {
     case 'say': return 'send it';
     case 'forget': return 'forget it';
     case 'merge': return 'merge it';
     case 'discard': return 'throw it away';
+    case 'permissions': return 'turn on full permissions';
+    case 'setup': return 'run it';
     case 'stop': return `stop ${c.agentIds?.length > 1 ? 'them' : 'it'}`;
-    case 'start': return `start ${c.tasks?.length > 1 ? 'them' : 'it'}`;
+    case 'start': return 'start them';
     default: return 'go ahead';
   }
+}
+
+/**
+ * The work of a start, as the engine takes it: each task's words trimmed (none empty), its agent only when it is one the
+ * engine knows (else null: the default agent's), its machine, and at most eight.
+ */
+function startList(tasks) {
+  return (Array.isArray(tasks) ? tasks : [])
+    .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
+    .filter(t => t.task)
+    .slice(0, 8);
 }
 
 /** "2.1.322" -> [2, 1, 322]; null when it does not start like a version. */
@@ -284,6 +396,48 @@ function pathWords(paths, max = 3) {
   const list = (Array.isArray(paths) ? paths : []).filter(p => typeof p === 'string' && p).map(p => quotable(p, 80));
   if (list.length <= max) return joinAnd(list);
   return `${list.slice(0, max).join(', ')} and ${list.length - max} more`;
+}
+
+/**
+ * The names of what an agent's copy gets from fillWorkspace's list: each env file and each path .worktreeinclude chose,
+ * by its path, and "node_modules" once for every folder of installed packages.
+ */
+function copyNames(entries) {
+  const list = (Array.isArray(entries) ? entries : []).filter(e => e && typeof e.path === 'string' && e.path);
+  const names = list.filter(e => e.kind !== 'deps').map(e => e.path);
+  if (list.some(e => e.kind === 'deps')) names.push('node_modules');
+  return names;
+}
+
+/** What a starting agent shows while its copy is filled ("Copying .env and node_modules into its copy"); null for nothing. */
+function copyingWords(entries) {
+  const names = copyNames(entries);
+  return names.length ? `Copying ${pathWords(names, names.length > 3 ? 2 : 3)} into its copy` : null;
+}
+
+/**
+ * The start detail's sentences about a fill: what the copy has ("Its copy has your .env, apps/web/.env.local and
+ * node_modules."), then what was not copied and why (SKIP_WORDS). Something that was there already is not news.
+ */
+function copiesWords(copied, skipped) {
+  const out = [];
+  const names = copyNames(copied);
+  if (names.length) out.push(`Its copy has your ${pathWords(names, 3)}.`);
+  const list = (Array.isArray(skipped) ? skipped : []).filter(e => e && typeof e.path === 'string' && e.path);
+  const whole = (e) => e.why === 'failed' && (e.path === '.' || e.path === '.worktreeinclude');
+  if (list.some(e => whole(e) && e.path === '.')) out.push('Workbench could not list the files to copy into its copy.');
+  if (list.some(e => whole(e) && e.path === '.worktreeinclude')) out.push('Workbench could not read .worktreeinclude, so nothing was copied.');
+  for (const [why, words] of SKIP_WORDS) {
+    const paths = list.filter(e => e.why === why && !whole(e)).map(e => e.path);
+    if (paths.length) out.push(words(pathWords(paths, 3), paths.length > 1));
+  }
+  return out;
+}
+
+/** A program's output for one log line: its lines joined by " | ", hidden characters as "?", its last 2000 characters. */
+function logTail(s) {
+  const t = String(s ?? '').split(/\r\n|[\r\n]/).map(l => l.replace(/\t/g, ' ').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '?').trim()).filter(Boolean).join(' | ');
+  return t.length > 2000 ? `…${t.slice(-2000)}` : t;
 }
 
 /**
@@ -417,6 +571,12 @@ function errorReason(e) {
   return firstSentence(text, 160) || 'It stopped because of an error.';
 }
 
+/** The done state a receipt's checks lead to: all passed, one failed, or none ran. */
+function doneState(checksState) {
+  if (checksState === 'passed') return STATE.DONE_CHECKED;
+  return checksState === 'failed' ? STATE.CHECKS_FAILED : STATE.DONE_CLAIMED;
+}
+
 /** Check results without anything unexpected; tails stay short. */
 function cleanResults(results) {
   return (Array.isArray(results) ? results : []).map(r => {
@@ -455,8 +615,10 @@ export class Engine extends EventEmitter {
    * @param {object|null} [o.connect]  the Connect service, or null: envFor({ repoRoot, harness }) gives the keys an
    *        agent (and the checks of its work) get, mask(text) hides the stored keys in everything the engine applies,
    *        and defaultAgent() says where new work goes.
+   * @param {object|null} [o.prefs]  the person's kept choices ({ get(), set(change) }): live mode reads full permissions
+   *        from them at start (`permissions: 'full'`), and keeps a change there
    */
-  constructor({ store, mode = 'demo', repo = null, hook = null, defaultBudgetUsd = 2, defaultModel = null, adapters = {}, machines = null, deps = {}, connect = null, log = null, options = {} } = {}) {
+  constructor({ store, mode = 'demo', repo = null, hook = null, defaultBudgetUsd = 2, defaultModel = null, adapters = {}, machines = null, deps = {}, connect = null, prefs = null, log = null, options = {} } = {}) {
     super();
     if (!store) throw new Error('The engine needs a store.');
     this.store = store;
@@ -470,9 +632,19 @@ export class Engine extends EventEmitter {
     this.machines = machines;
     this.deps = deps || {};
     this.connect = connect && typeof connect === 'object' ? connect : null;
-    // Hides the person's stored keys in text: for the runners, the checks and every event applied. Null without one.
-    this._mask = typeof this.connect?.mask === 'function' ? (s) => this._maskText(s) : null;
+    // Hides the person's stored keys, and the values of the env files copied into agents' copies, in text (see _mask).
+    this._maskFn = (s) => this._maskText(s);
+    // The values of the env files copied into agents' copies, frozen (maskSecrets keeps the plan of a frozen list).
+    this._envSecrets = Object.freeze([]);
     this.log = makeLog(log);
+    this.prefs = prefs && typeof prefs === 'object' ? prefs : null;
+    // Full permissions ('full'), or agents ask before risky steps ('ask'). Live mode starts with what the person kept;
+    // the demo always starts asking, and what is turned on there lasts for its own run only.
+    this.permissionMode = this.mode === 'live' ? this._keptMode() : 'ask';
+    // What the kept choices say (live mode), as far as the engine knows: what the next start will read.
+    this._savedMode = this.permissionMode;
+    // Counts each change of mode: a full permissions card is answered only while the mode is as it was when it was made.
+    this._modeChanges = 0;
     this.options = { ...DEFAULTS, ...options };
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.stuck = new StuckDetector({ silenceMs: this.options.stuckSilenceMs });
@@ -485,7 +657,8 @@ export class Engine extends EventEmitter {
     this.later = new Map();     // agentId -> { ask?, state? }: decisions that wait until its held requests are answered
     this._checkingHeld = false;
     this.asks = new Map();      // askId -> { agentId, type } for asks the engine created
-    this.confirms = new Map();  // confirmId -> a launch, stop or message waiting for "yes"
+    this.confirms = new Map();  // confirmId -> a stop, message, forget, merge, throw-away or full permissions card waiting for "yes"
+    this._askedFor = null;      // { harness, at }: the agent the person was just asked work for ("What should Codex work on?")
     this.stopped = new Set();   // agents the person stopped; late events from them are filtered
     this.stopAsked = new Set(); // live helpers whose root was asked to stop them: no more tools, but their events count
     this.harnessInfo = Object.fromEntries([...AGENT_HARNESSES, 'sim'].map(h => [h, null]));
@@ -495,6 +668,11 @@ export class Engine extends EventEmitter {
     this._shuttingDown = false;
     this._shutdownPromise = null;
     this._launching = new Set(); // launches under way (_startAgent): shutdown lets them finish first
+    // Agents' copies. The setup cards open now: id -> { id, key, root, command, hash, createdAt, waiters, bursts,
+    // promise, settle }, one per repository and command, shared by every launch that waits on it (_setupAnswer).
+    this._setupAsks = new Map();
+    this._setupKept = new Map(); // root -> the hash of the setup command said Run it to in this run (kept or not)
+    this._copiesSaid = new Set(); // repositories whose notice about agents' copies was said in this run
     // Merging and throwing away. Every job touches the same repository (the person's own folder, for a merge), so
     // they run one at a time, engine-wide (_gitJob). While an agent's job waits or runs, the agent is busy: nothing
     // else may wake, stop, continue or forget it. Shutdown waits for the jobs under way.
@@ -502,6 +680,11 @@ export class Engine extends EventEmitter {
     this._gitChain = Promise.resolve();
     this._gitWork = new Set();   // git jobs under way
     this._mergedEarlier = new Set(); // earlier agents merged in this run: the shutdown tidy looks at their folders too
+    // The file view. An earlier agent has no run to hold the receipt a save into its copy starts (_recheck): it is held
+    // here, rootId -> { id, workspace, config, harness, receipt, deciding, checksDone, saves }, while it is built.
+    this._rechecks = new Map();
+    this._demoFiles = null;      // the demo's sample project, made when the file view first asks (_demo)
+    this._demoSaved = false;     // the demo's first save says that it lasts for this run only; later ones do not
     this.repoIdentity = null;    // live mode: does git know the person's name and email (true/false); null: not known
     this._repoKey = null;        // the repository as the page last heard of it (see _setRepo)
     this._repoReading = null;    // a periodic refresh of the repository under way
@@ -565,6 +748,9 @@ export class Engine extends EventEmitter {
       for (const held of [...this.held.values()]) {
         this._resolveHeld(held, { decision: 'deny', how: 'auto', reason: 'Workbench is shutting down.', silent: true });
       }
+      // A copy being made ready starts nothing now: its setup command stops, and every open setup card counts as Not now.
+      for (const r of this.runs.values()) r.prep?.abort();
+      for (const d of [...this._setupAsks.values()]) this._closeSetup(d, 'skip');
       // A launch under way (git still making its folder, a process starting) finishes first, so no agent starts unseen
       // after this: one whose folder was made too late starts nothing and gives the folder back (_launch), and one
       // already starting is stopped below with the others.
@@ -580,9 +766,10 @@ export class Engine extends EventEmitter {
         r.stopped = true;
         this.stopped.add(r.id);
       }
-      // Checks end alongside the agents (SIGTERM now, SIGKILL 2 s later in receipt.mjs): wait for them too.
+      // Checks end alongside the agents (SIGTERM now, SIGKILL 2 s later in receipt.mjs): wait for them too, an earlier
+      // agent's after a save included.
       const checks = [];
-      for (const r of this.runs.values()) {
+      for (const r of [...this.runs.values(), ...this._rechecks.values()]) {
         this._cancelReceipt(r);
         if (r.checksDone) checks.push(r.checksDone);
       }
@@ -600,11 +787,17 @@ export class Engine extends EventEmitter {
         }
         batch.push({ kind: EV.STATE, agentId: v.id, state: STATE.STOPPED, reason: 'Workbench was closed' });
       }
+      // An agent whose runner never started (its copy was being made ready) is stopped too.
+      for (const r of this.runs.values()) {
+        const v = r.runner ? null : this.store.get(r.id);
+        if (v && ACTIVE.has(v.state)) batch.push({ kind: EV.STATE, agentId: v.id, state: STATE.STOPPED, reason: 'Workbench was closed' });
+      }
       if (batch.length) this._apply(batch);
       // Folders where nothing changed go; the others stay, so the person can look at the work afterwards.
-      // A runner that would not stop may still be writing in its folder: that one stays.
+      // A runner that would not stop may still be writing in its folder: that one stays, and so does a folder whose
+      // copy was still being made (cp may still be writing in it).
       const tidy = [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved && !this._busy.has(r.id)
-        && this._runnerInfo(r)?.alive !== true);
+        && !r.prep && this._runnerInfo(r)?.alive !== true);
       tidy.push(...this._earlierToTidy());
       if (tidy.length) {
         await withTimeout(Promise.all(tidy.map(r => this._removeUnchanged(r))), this.options.tidyTimeoutMs)
@@ -649,6 +842,12 @@ export class Engine extends EventEmitter {
     try { this._checkStuck(now); } catch (err) { this.log.error('Stuck check failed:', err); }
     try { this._checkWaiting(now); } catch (err) { this.log.error('Background check failed:', err); }
     for (const [id, c] of this.confirms) if (now - c.createdAt > this.options.confirmTtlMs) this.confirms.delete(id);
+    // A setup card nobody answered counts as Not now: the launches waiting on it start without the setup command.
+    for (const d of [...this._setupAsks.values()]) {
+      if (now - d.createdAt <= this.options.confirmTtlMs) continue;
+      this.log.warn(SETUP_EXPIRED);
+      this._closeSetup(d, 'skip');
+    }
     if (now - this._lastMachinesAt >= this.options.machinesEveryMs) {
       this._lastMachinesAt = now;
       this._refreshMachines();
@@ -713,7 +912,7 @@ export class Engine extends EventEmitter {
     if (!list.length) return;
     const failing = this.mode === 'live' ? this._newlyFailed(list) : [];
     this.store.apply(list);
-    // A yes to a launch is logged when Claude Code or Codex is spawned ("1 of 1 started"). What goes wrong after that
+    // A start is logged when Claude Code or Codex is spawned ("1 of 1 started"). What goes wrong after that
     // (it exits, or its first turn ends in an error) is logged here, with the reason the page gives.
     for (const id of failing) {
       const v = this.store.get(id);
@@ -823,9 +1022,31 @@ export class Engine extends EventEmitter {
 
   // ================================================================ keys
 
-  /** Text with the person's stored keys hidden (Connect's mask), or as it is when there is nothing to hide. */
+  /**
+   * The mask for text (text -> text): the person's stored keys (Connect's) and the values of the env files copied into
+   * agents' copies, hidden. For the runners, the checks, the setup command and every event applied. Null while there is
+   * nothing to hide: no Connect, and no env file copied yet.
+   */
+  get _mask() {
+    return typeof this.connect?.mask === 'function' || this._envSecrets.length ? this._maskFn : null;
+  }
+
+  /** Text with the person's stored keys and the copied env values hidden, or as it is when there is nothing to hide. */
   _maskText(s) {
-    if (typeof s !== 'string' || s.length < 8 || !this._mask) return s;
+    if (typeof s !== 'string' || s.length < 8) return s;
+    const out = typeof this.connect?.mask === 'function' ? this._maskStored(s) : s;
+    return this._envSecrets.length ? maskSecrets(out, this._envSecrets) : out;
+  }
+
+  /** The values of copied env files to hide from now on (8 characters or more), the newest ENV_SECRETS_MAX kept. */
+  _addEnvSecrets(values) {
+    const fresh = (Array.isArray(values) ? values : []).filter(v => typeof v === 'string' && v.length >= 8 && !this._envSecrets.includes(v));
+    if (fresh.length) this._envSecrets = Object.freeze([...this._envSecrets, ...fresh].slice(-ENV_SECRETS_MAX));
+  }
+
+  /** Text with the person's stored keys hidden (Connect's mask), or as it is when there is nothing to hide. */
+  _maskStored(s) {
+    if (typeof s !== 'string' || s.length < 8 || typeof this.connect?.mask !== 'function') return s;
     try {
       const out = this.connect.mask(s);
       return typeof out === 'string' ? out : s;
@@ -887,7 +1108,8 @@ export class Engine extends EventEmitter {
     try {
       if (looksLikeSecret(t)?.secret === true) return true;
     } catch { /* the mask may still know it */ }
-    return !!this._mask && this._mask(t) !== t;
+    // Stored keys only: a copied .env holds plain words too ("production"), which the person may well type.
+    return typeof this.connect?.mask === 'function' && this._maskStored(t) !== t;
   }
 
   _react(e) {
@@ -919,6 +1141,10 @@ export class Engine extends EventEmitter {
         }
         break;
       }
+      case EV.ASK:
+        // The demo, with full permissions on: a simulated permission ask is answered Allow by Workbench itself.
+        if (this.mode === 'demo' && this.permissionMode === 'full' && e.ask?.type === 'permission' && !this.asks.has(e.ask.id)) this._allowSimSoon(e.agentId, e.ask.id);
+        break;
       default:
         break;
     }
@@ -945,9 +1171,8 @@ export class Engine extends EventEmitter {
    */
   async _decide(agentId, run, e, seq) {
     const finalText = String(e.finalText ?? '');
-    let receipt = null; // this turn's receipt once it starts; a new turn, a message, a stop or shutdown cancels it
-    const stale = () => this._shuttingDown || !this.store.get(agentId)
-      || (run && (run.stopped || run.turnSeq !== seq)) || !!receipt?.ctl.signal.aborted;
+    // A new turn, a message, a stop or shutdown makes what this turn decides out of date.
+    const stale = () => this._shuttingDown || !this.store.get(agentId) || (run && (run.stopped || run.turnSeq !== seq));
     this._dropEngineAsk(agentId);
 
     let background = Number(e.backgroundTasks) || 0;
@@ -972,74 +1197,127 @@ export class Engine extends EventEmitter {
       return;
     }
 
+    // The checks judge finished work: a turn that ends with a question runs none, but what it changed is recorded.
+    const question = extractQuestion(finalText);
+    const got = await this._receipt(agentId, run, { question, stale });
+    if (!got) return;
+    if (question) {
+      const ask = this._newAsk(agentId, 'question', { sentence: question, options: [] });
+      const batch = [];
+      const intro = firstSentence(finalText);
+      if (intro && intro !== question) batch.push({ kind: EV.SAYS, agentId, text: intro });
+      // Results of earlier checks would sit beside newer files.
+      if (this.store.get(agentId)?.checks) batch.push({ kind: EV.CHECKS, agentId, checks: null });
+      batch.push({ kind: EV.ASK, agentId, ask }, { kind: EV.STATE, agentId, state: STATE.QUESTION, reason: null });
+      this._apply(batch);
+      return;
+    }
+    const batch = [];
+    const says = firstSentence(finalText);
+    if (says) batch.push({ kind: EV.SAYS, agentId, text: says });
+    batch.push({ kind: EV.STATE, agentId, state: doneState(got.checksState), reason: got.reason });
+    this._apply(batch);
+    this._lookAgainIfSaved(agentId, run, got.saves);
+  }
+
+  /**
+   * One receipt: steps 3 and 5 of a turn's end ("Agent lifecycle"), and the same after a save from the file view
+   * (_recheck). What is not merged yet (files, from `diffStats`) and the rules it broke, then, unless the turn ended with
+   * a question, the declared checks. One receipt at a time per agent: a newer one cancels this one (_cancelReceipt), and
+   * so do a new turn, a message the agent took, a stop and shutdown. `run` holds it (`receipt`, `deciding`,
+   * `checksDone`; an earlier agent's recheck record stands in for a run); `stale()` says when what it would apply is out
+   * of date. A save into the agent's copy while it is built (`run.saves` counts them) stops the checks under way, which
+   * did not see it, and the receipt looks again from the start: no result is kept of what the checks did not see.
+   * Resolves { checksState, reason, saves } (see doneState; saves: the count of saves it saw), or null when it went
+   * stale: then nothing more is applied.
+   */
+  async _receipt(agentId, run, { question = null, stale = () => false } = {}) {
+    let receipt = null; // this receipt once it starts; a newer one, a new turn, a message, a stop or shutdown cancels it
+    const gone = () => stale() || !!receipt?.ctl.signal.aborted;
+    const saves = () => run?.saves || 0;
     // One receipt at a time per agent, the record made before a question included.
     if (run) {
       this._cancelReceipt(run);
-      receipt = { ctl: new AbortController() };
+      receipt = { ctl: new AbortController(), pass: null };
       run.receipt = receipt;
       run.deciding = true; // a clean exit while this runs is not a failure (Codex exits after every turn)
     }
-    // The checks judge finished work: a turn that ends with a question runs none, but what it changed is recorded.
-    const question = extractQuestion(finalText);
     let checksState = 'none';
     let reason = null;
+    let seen = saves();
     try {
       const ws = run && run.workspace;
       if (ws && typeof this.deps.workspace?.diffStats === 'function') {
-        // What is not merged yet: since its last merge, else since the commit it started from.
-        const files = await this.deps.workspace.diffStats({ path: ws.path, base: sinceOf(ws) });
-        if (stale()) return;
-        if (files) this._apply([{ kind: EV.FILES, agentId, files }]);
-        const config = (await run.config) || DEFAULT_CONFIG;
-        if (stale()) return;
-        const changedPaths = (files?.list || []).map(f => f.path);
-        if (Array.isArray(config.rules) && config.rules.length && typeof this.deps.receipt?.checkRules === 'function') {
-          const rules = await this.deps.receipt.checkRules(config.rules, changedPaths);
-          if (stale()) return;
-          if (rules) this._apply([{ kind: EV.RULES, agentId, rules }]);
-        }
-        if (!question && Array.isArray(config.checks) && config.checks.length && typeof this.deps.receipt?.runChecks === 'function') {
-          const partial = [];
-          // Checks of a receipt that was cancelled can take a moment to end: never run two sets in one folder.
-          if (run.checksDone) await run.checksDone;
-          if (stale()) return;
-          this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: [] } }]);
-          const onProgress = (p) => {
-            if (!p || typeof p !== 'object' || stale()) return;
-            if (Array.isArray(p.results)) partial.splice(0, partial.length, ...p.results);
-            else if (p.name != null && typeof p.ok === 'boolean') {
-              const i = partial.findIndex(r => r.name === p.name);
-              if (i >= 0) partial[i] = p; else partial.push(p);
-            } else return;
-            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: cleanResults(partial) } }]);
-          };
-          let res;
-          try {
-            // The checks run the agent's own code (its package.json, its tests), so they carry its marker as its shell
-            // does: a Workbench or an acceptance run started from a check then refuses, as it would in the agent.
-            // They get the keys that agent gets (added after the scrub), and their output is masked before it is cut.
-            const env = { ...process.env, WORKBENCH_AGENT_ID: agentId };
-            const keys = this._keysFor(run.harness);
-            const more = { ...(keys ? { keysEnv: keys } : {}), ...(this._mask ? { mask: this._mask } : {}) };
-            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal, env, ...more }));
-            const done = running.then(() => {}, () => {});
-            run.checksDone = done;
-            done.then(() => { if (run.checksDone === done) run.checksDone = null; });
-            res = await running;
-          } catch (err) {
-            if (stale()) return;
-            this.log.warn('The checks could not run:', err);
-            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'none', results: [] } }]);
-            throw plainError('Workbench could not run the checks.');
+        for (;;) {
+          seen = saves();
+          checksState = 'none';
+          reason = null;
+          // What is not merged yet: since its last merge, else since the commit it started from.
+          const files = await this.deps.workspace.diffStats({ path: ws.path, base: sinceOf(ws) });
+          if (gone()) return null;
+          if (files) this._apply([{ kind: EV.FILES, agentId, files }]);
+          const config = (await run.config) || DEFAULT_CONFIG;
+          if (gone()) return null;
+          const changedPaths = (files?.list || []).map(f => f.path);
+          if (Array.isArray(config.rules) && config.rules.length && typeof this.deps.receipt?.checkRules === 'function') {
+            const rules = await this.deps.receipt.checkRules(config.rules, changedPaths);
+            if (gone()) return null;
+            if (rules) this._apply([{ kind: EV.RULES, agentId, rules }]);
           }
-          if (stale()) return;
-          checksState = res?.state === 'passed' || res?.state === 'failed' ? res.state : 'none';
-          const results = cleanResults(res?.results);
-          this._apply([{ kind: EV.CHECKS, agentId, checks: { state: checksState, results } }]);
-          if (checksState === 'failed') {
-            const failed = results.filter(r => !r.ok).map(r => `“${r.name}”`);
-            reason = failed.length ? `The ${failed.length === 1 ? 'check' : 'checks'} ${joinAnd(failed)} did not pass.` : null;
+          if (!question && Array.isArray(config.checks) && config.checks.length && typeof this.deps.receipt?.runChecks === 'function') {
+            const partial = [];
+            // Checks of a receipt that was cancelled, or of a pass a save stopped, can take a moment to end: never run
+            // two sets in one folder.
+            if (run.checksDone) await run.checksDone;
+            if (gone()) return null;
+            // This pass's checks stop when the receipt is cancelled, and when a save comes (see _afterSave).
+            const pass = new AbortController();
+            const stopPass = () => pass.abort();
+            receipt.pass = pass;
+            receipt.ctl.signal.addEventListener('abort', stopPass, { once: true });
+            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: [] } }]);
+            const onProgress = (p) => {
+              if (!p || typeof p !== 'object' || gone() || pass.signal.aborted) return;
+              if (Array.isArray(p.results)) partial.splice(0, partial.length, ...p.results);
+              else if (p.name != null && typeof p.ok === 'boolean') {
+                const i = partial.findIndex(r => r.name === p.name);
+                if (i >= 0) partial[i] = p; else partial.push(p);
+              } else return;
+              this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: cleanResults(partial) } }]);
+            };
+            let res;
+            try {
+              // The checks run the agent's own code (its package.json, its tests), so they carry its marker as its shell
+              // does: a Workbench or an acceptance run started from a check then refuses, as it would in the agent.
+              // They get the keys that agent gets (added after the scrub), and their output is masked before it is cut.
+              const env = { ...process.env, WORKBENCH_AGENT_ID: agentId };
+              const keys = this._keysFor(run.harness);
+              const more = { ...(keys ? { keysEnv: keys } : {}), ...(this._mask ? { mask: this._mask } : {}) };
+              const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: pass.signal, env, ...more }));
+              const done = running.then(() => {}, () => {});
+              run.checksDone = done;
+              done.then(() => { if (run.checksDone === done) run.checksDone = null; });
+              res = await running;
+            } catch (err) {
+              if (gone()) return null;
+              if (saves() !== seen) continue; // a save stopped them: look again
+              this.log.warn('The checks could not run:', err);
+              this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'none', results: [] } }]);
+              throw plainError('Workbench could not run the checks.');
+            } finally {
+              receipt.ctl.signal.removeEventListener('abort', stopPass);
+            }
+            if (gone()) return null;
+            if (saves() !== seen) continue; // they did not see all of it: look again
+            checksState = res?.state === 'passed' || res?.state === 'failed' ? res.state : 'none';
+            const results = cleanResults(res?.results);
+            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: checksState, results } }]);
+            if (checksState === 'failed') {
+              const failed = results.filter(r => !r.ok).map(r => `“${r.name}”`);
+              reason = failed.length ? `The ${failed.length === 1 ? 'check' : 'checks'} ${joinAnd(failed)} did not pass.` : null;
+            }
           }
+          if (saves() === seen) break; // else a save came while it looked: look again
         }
       } else if (!question) {
         // No workspace (the demo): use whatever checks the simulator reported.
@@ -1056,26 +1334,8 @@ export class Engine extends EventEmitter {
         run.deciding = false;
       }
     }
-    if (stale()) return;
-    if (question) {
-      const ask = this._newAsk(agentId, 'question', { sentence: question, options: [] });
-      const batch = [];
-      const intro = firstSentence(finalText);
-      if (intro && intro !== question) batch.push({ kind: EV.SAYS, agentId, text: intro });
-      // Results of earlier checks would sit beside newer files.
-      if (this.store.get(agentId)?.checks) batch.push({ kind: EV.CHECKS, agentId, checks: null });
-      batch.push({ kind: EV.ASK, agentId, ask }, { kind: EV.STATE, agentId, state: STATE.QUESTION, reason: null });
-      this._apply(batch);
-      return;
-    }
-    const state = checksState === 'passed' ? STATE.DONE_CHECKED
-      : checksState === 'failed' ? STATE.CHECKS_FAILED
-      : STATE.DONE_CLAIMED;
-    const batch = [];
-    const says = firstSentence(finalText);
-    if (says) batch.push({ kind: EV.SAYS, agentId, text: says });
-    batch.push({ kind: EV.STATE, agentId, state, reason });
-    this._apply(batch);
+    if (gone()) return null;
+    return { checksState, reason, saves: seen };
   }
 
   /** End a receipt still being built: its checks stop, nothing from it is applied, "checks running" goes away. */
@@ -1195,9 +1455,11 @@ export class Engine extends EventEmitter {
   // ================================================================ stuck agents
 
   _checkStuck(now) {
+    // An agent whose copy is being made ready is quiet because Workbench is busy for it (or waits for the person's
+    // answer to the setup card), not because it is stuck.
     const views = this.store.list().filter(v => (v.state === STATE.WORKING || v.state === STATE.STARTING)
       && !this.stopped.has(v.id) && !this.stopped.has(v.rootId)
-      && !this.runs.get(v.id)?.deciding);
+      && !this.runs.get(v.id)?.deciding && !this.runs.get(v.id)?.prep);
     for (const f of this.stuck.check(now, views)) {
       const ask = this._newAsk(f.agentId, 'stuck', {
         sentence: f.sentence,
@@ -1274,9 +1536,10 @@ export class Engine extends EventEmitter {
     let config = DEFAULT_CONFIG;
     try { config = (await run.config) || DEFAULT_CONFIG; } catch { config = DEFAULT_CONFIG; }
     let d;
+    let inFull = 'deny'; // for a request that waits: what full permissions would decide, should the person turn them on
     try {
       if (typeof this.deps.policy?.decide !== 'function') throw new Error('No permission policy is loaded.');
-      d = await this.deps.policy.decide({
+      const req = {
         tool,
         input,
         cwd: run.workspace?.path ?? null, // the engine's workspace, never the payload's cwd
@@ -1285,7 +1548,26 @@ export class Engine extends EventEmitter {
         readAlso: this._readAlso(run),
         // Who SendMessage may reach without asking: the main agent and this agent's own helpers, as its output named them.
         recipients: this._recipients(root, run),
-      });
+      };
+      // With full permissions on, the policy allows what would ask, refuses the floor, and asks only about a step that names
+      // Claude Code's own settings. The mode is read again once the policy has answered: turned on or off while it checked,
+      // the request is judged as the mode now on judges it. Each mode is asked about once, so this ends after two answers
+      // at most.
+      const verdicts = new Map();
+      let full = this.permissionMode === 'full';
+      for (;;) {
+        if (!verdicts.has(full)) verdicts.set(full, await this.deps.policy.decide({ ...req, full }));
+        const now = this.permissionMode === 'full';
+        if (now === full) break;
+        full = now;
+      }
+      d = verdicts.get(full);
+      if (d?.decision === 'ask') {
+        // what full permissions would decide, kept on the held request, should the person turn them on while it waits
+        const f = verdicts.has(true) ? verdicts.get(true) : await this.deps.policy.decide({ ...req, full: true });
+        inFull = f?.decision === 'allow' ? 'allow' : 'deny';
+        if (this.permissionMode === 'full') d = f; // turned on while that was checked: judged as full permissions judge it
+      }
     } catch (err) {
       this.log.error('The permission policy failed:', err);
       return hookResponse('deny', 'Workbench could not check this request, so it said no.');
@@ -1296,6 +1578,7 @@ export class Engine extends EventEmitter {
     const shownInput = this._mask ? maskValue(input, this._mask) : input;
     const described = describeRequest(tool, shownInput);
     const sentence = `${asker.name} ${d?.sentence || described.sentence}`;
+    // Allowed, also by full permissions ("Full permissions are on."): an automatic approval.
     if (d?.decision === 'allow') {
       this._apply([{ kind: EV.APPROVAL, agentId: asker.id, how: 'auto', decision: 'allow', sentence }]);
       return hookResponse('allow', d.reason || 'Allowed by the workbench rules.');
@@ -1312,7 +1595,7 @@ export class Engine extends EventEmitter {
     if (asker.parentId && (!askerNow || ENDED.has(askerNow.state))) return hookResponse('deny', 'The helper is no longer running.');
     const why = typeof d.reason === 'string' && d.reason.trim() ? clip(d.reason, 300) : null;
     const detail = shownInput !== input ? described.detail : (d.detail ?? described.detail);
-    return this._hold({ asker, root, sentence, detail, why, signal });
+    return this._hold({ asker, root, sentence, detail, why, signal, inFull });
   }
 
   /** The runner's info(), or null when it has none or it fails. */
@@ -1370,15 +1653,16 @@ export class Engine extends EventEmitter {
     }
   }
 
-  _hold({ asker, root, sentence, detail, why = null, signal }) {
-    // `why` is the permission check's own reason, so the page can say why it asks.
+  _hold({ asker, root, sentence, detail, why = null, signal, inFull = 'deny' }) {
+    // `why` is the permission check's own reason, so the page can say why it asks. `inFull`: whether full permissions
+    // would allow it ('allow'), so turning them on allows it too; anything else keeps waiting for the person.
     const ask = { id: `ok-${hex(4)}`, type: 'permission', sentence, detail: String(detail ?? ''), ...(why ? { why } : {}), options: ['Allow', 'Deny'], primary: 'Allow' };
     return new Promise((resolve) => {
       // Remember the state to go back to: a root asked on behalf of an unknown helper may be waiting on helpers.
       const cur0 = this.store.get(asker.id);
       const showing = cur0?.ask ? this.held.get(cur0.ask.id) : null;
       const prevState = showing ? showing.prevState : cur0?.state;
-      const held = { askId: ask.id, agentId: asker.id, rootId: root.id, ask, resolve, timer: null, done: false, prevState };
+      const held = { askId: ask.id, agentId: asker.id, rootId: root.id, ask, resolve, timer: null, done: false, prevState, inFull };
       this.held.set(ask.id, held);
       this.asks.set(ask.id, { agentId: asker.id, type: 'permission' });
       const ms = this.options.permissionTimeoutMs;
@@ -1445,6 +1729,121 @@ export class Engine extends EventEmitter {
         this._resolveHeld(held, { decision: 'deny', how: 'auto', reason, silent: true });
       }
     }
+  }
+
+  // ================================================================ full permissions
+
+  /**
+   * Full permissions on or off (POST /api/permissions { mode }, and the words for them). 'full' never turns them on by
+   * itself: it answers with a card, and only its yes turns them on (_fullOn). 'ask' turns them off at once. Said as a
+   * notice when there is no card.
+   * @returns {Promise<{ reply: string, confirm: object } | { ok: true, reply: string, permissions: 'ask'|'full' }>}
+   */
+  async permissions(mode) {
+    const out = await this._permissions(mode);
+    if (!out.confirm) this._notice(out.reply);
+    return out;
+  }
+
+  async _permissions(mode) {
+    if (mode !== 'full' && mode !== 'ask') throw plainError(MODE_WORDS);
+    if (mode === 'ask') return this._askAgain();
+    if (this.permissionMode === 'full') return { ok: true, reply: 'Full permissions are already on.', permissions: 'full' };
+    const n = this._allowableHeld().length + this._simPermissionAsks().length;
+    const detail = n ? `${FULL_DETAIL} The ${n} question${n === 1 ? '' : 's'} waiting now ${n === 1 ? 'is' : 'are'} allowed too.` : FULL_DETAIL;
+    // modeAt: the mode's changes so far, so a yes or no that comes after the mode changed again acts on nothing (_confirm)
+    return this._newConfirm({ kind: 'permissions', sentence: FULL_SENTENCE, detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true,
+      modeAt: this._modeChanges });
+  }
+
+  /**
+   * The yes to the card: full permissions are on, kept for the next start, and every question waiting now that they allow is
+   * allowed, as an automatic approval: held hook requests, helpers' too, and the demo's own asks, also those that came after
+   * the card was made. A request they would refuse, or still ask about, keeps waiting for the person. The reply counts what it allowed ("Full
+   * permissions are on. 2 waiting questions were allowed."), and says so when the next start will not have them on.
+   */
+  _fullOn() {
+    this.permissionMode = 'full';
+    this._modeChanges += 1;
+    const lasts = this._keepMode('full') || this._savedMode === 'full';
+    const held = this._allowableHeld();
+    const sims = this._simPermissionAsks();
+    for (const h of held) this._resolveHeld(h, { decision: 'allow', how: 'auto', reason: FULL_REASON });
+    for (const { v, ask } of sims) {
+      this._answerSim(v, ask, 'Allow', { how: 'auto' }).catch(err => this.log.warn('The demo could not take an answer:', err));
+    }
+    this.log.warn("Full permissions are on: agents ask only before steps that name Claude Code's own settings.");
+    this.emit('permissions', 'full');
+    const n = held.length + sims.length;
+    const allowed = n ? `${n} waiting question${n === 1 ? ' was' : 's were'} allowed.` : '';
+    const reply = lasts ? (allowed ? `Full permissions are on. ${allowed}` : FULL_ON) : [ON_NOT_KEPT, allowed].filter(Boolean).join(' ');
+    return { reply, permissions: 'full' };
+  }
+
+  /**
+   * Full permissions off, at once: agents ask again from their next step. Any card that would turn them on is withdrawn
+   * (the person said to keep asking), also when they were off already. When the change cannot be saved and what is kept
+   * says on, the reply says they will be on again the next time Workbench starts.
+   */
+  _askAgain() {
+    for (const [id, c] of this.confirms) if (c.kind === 'permissions') this.confirms.delete(id);
+    if (this.permissionMode !== 'full') return { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' };
+    this.permissionMode = 'ask';
+    this._modeChanges += 1;
+    const lasts = this._keepMode('ask') || this._savedMode !== 'full';
+    this.log.warn('Full permissions are off: agents ask again before risky steps.');
+    this.emit('permissions', 'ask');
+    return { ok: true, reply: lasts ? FULL_OFF : OFF_NOT_KEPT, permissions: 'ask' };
+  }
+
+  /** The mode the person kept: 'full' only when the kept choices say exactly that. Live mode reads it at start. */
+  _keptMode() {
+    try {
+      return this.prefs?.get?.()?.permissions === 'full' ? 'full' : 'ask';
+    } catch (err) {
+      this.log.warn('Workbench could not read whether full permissions are on, so agents ask:', err?.message || err);
+      return 'ask';
+    }
+  }
+
+  /**
+   * Keep the mode for the next start (live mode: the demo's is for its own run). False when it could not be kept; what is
+   * kept (_savedMode) then stays as it was.
+   */
+  _keepMode(mode) {
+    if (this.mode !== 'live' || typeof this.prefs?.set !== 'function') return true;
+    let kept = false;
+    try {
+      kept = this.prefs.set({ permissions: mode })?.ok !== false;
+    } catch (err) {
+      this.log.warn('Workbench could not keep full permissions for its next start:', err?.message || err);
+    }
+    if (kept) this._savedMode = mode;
+    return kept;
+  }
+
+  /** The held hook requests that full permissions allow (every one but those they refuse or still ask about: `inFull`). */
+  _allowableHeld() {
+    return [...this.held.values()].filter(h => !h.done && h.inFull === 'allow');
+  }
+
+  /** The demo: the permission asks its simulated agents are waiting on (none in live mode). */
+  _simPermissionAsks() {
+    if (this.mode !== 'demo' || !this.adapters.sim) return [];
+    return this.store.list().filter(v => v.ask?.type === 'permission' && !this.asks.has(v.ask.id)).map(v => ({ v, ask: v.ask }));
+  }
+
+  /**
+   * The demo, with full permissions on: a simulated permission ask is answered Allow, once the simulator has said all of
+   * it (its state comes right after the ask), and only if it still waits and full permissions are still on.
+   */
+  _allowSimSoon(agentId, askId) {
+    setImmediate(() => {
+      if (this._shuttingDown || this.permissionMode !== 'full') return;
+      const v = this.store.get(agentId);
+      if (!v?.ask || v.ask.id !== askId || v.ask.type !== 'permission') return;
+      this._answerSim(v, v.ask, 'Allow', { how: 'auto' }).catch(err => this.log.warn('The demo could not take an answer:', err));
+    });
   }
 
   // ================================================================ answers
@@ -1630,20 +2029,73 @@ export class Engine extends EventEmitter {
     return { ok: true, reply: `Passed your message to ${v.name}.` };
   }
 
+  /**
+   * "looks good" (and the engine's other words for it, LOOKS_GOOD_RE) or "not now", said at a finished agent's lid
+   * (command(): the parser's `answer` with no ask, as from the git screen's input; the board's page presses the lid's
+   * button itself): never a prompt, and nothing is sent to the agent. Only where the lid's own button for those words
+   * marks the finish looked at (ui/focus.js lidView: its "Not now" on work that could be merged, its "Looks good" with
+   * nothing to merge, "Dismiss" on work thrown away) does the reply carry `looked`, so the page marks it looked at and it
+   * goes to the done tray, as the button sends it. Elsewhere (the done tray's rule) the words change nothing: words that
+   * sound like approval never let work that could be merged go, and a failed check's or a merge problem's "Look later"
+   * only sets it aside, which is the page's own mark; the reply then names the lid's answers (_lidChoices).
+   */
+  async _lookedAt(v, text) {
+    const choices = this._lidChoices(v, LOOKS_GOOD_RE.test(text));
+    if (choices) return { reply: choices };
+    const r = await this._answerDone(v, text);
+    return { reply: r.reply, looked: v.id };
+  }
+
+  /**
+   * The answers a finished root's lid offers, in its words ("Choose “Merge into main” or “Not now”."), when its own button
+   * for "looks good" (`good`) or "not now" would not mark the finish looked at: a merge that did not go through, a failed
+   * check, and "looks good" on work that could be merged. Null where it would.
+   */
+  _lidChoices(v, good) {
+    const w = v.work || null;
+    const into = this._repoView()?.branch || null;
+    // an earlier run's agent: its lid is Continue (when it can) or Forget, and its Close stands for "not now"
+    if (v.earlier) return good ? (v.canContinue ? 'Choose “Continue” or “Forget”.' : 'Choose “Forget”.') : null;
+    if (w?.thrownAway || (w?.merged && workSettled(v))) return null;
+    if (w?.problem && typeof w.problem === 'object') {
+      const target = (typeof w.problem.into === 'string' && w.problem.into) || into || w.from || null;
+      return w.problem.why === 'conflict' ? `Choose “Ask it to bring in ${target || 'my work'}” or “Look later”.` : 'Choose “Try again” or “Not now”.';
+    }
+    if (v.state === STATE.CHECKS_FAILED) return 'Choose “Ask it to fix that” or “Look later”.';
+    if (good && this._mergeOffered(v)) return `Choose “Merge into ${into}” or “Not now”.`;
+    return null;
+  }
+
+  /**
+   * Whether the lid offers Merge for this root, by the page's rule (ui/queue.js mergeApplies): live mode, at rest and not
+   * being checked again after a save into its copy (done_claimed with its checks running: checkedAgain), its folder and
+   * branch there and not thrown away, work not merged yet, and the person on a branch, with a name and email git is not
+   * known to lack.
+   */
+  _mergeOffered(v) {
+    const w = v && !v.parentId ? v.work : null;
+    const repo = this._repoView();
+    const again = v?.state === STATE.DONE_CLAIMED && v.checks?.state === 'running';
+    return this.mode === 'live' && !!w && !!w.branch && !!w.folder && !w.thrownAway && !ACTIVE.has(v.state) && !again
+      && !!repo?.branch && repo.identity !== false && unmergedWork(v);
+  }
+
   async _answerDone(v, text) {
     if (!text || LOOKS_GOOD_RE.test(text)) return { ok: true, reply: `Good. ${v.name} stays as it is.` };
-    if (NOT_NOW_RE.test(text)) return { ok: true, reply: v.work?.branch ? `OK. ${v.name}’s work stays on its branch for now.` : `OK. ${v.name} stays as it is.` };
+    // what happened, and no bare "OK." before it: words the person said are never answered with a word back
+    if (NOT_NOW_RE.test(text)) return { ok: true, reply: v.work?.branch ? `${v.name}’s work stays on its branch for now.` : `${v.name} stays as it is.` };
     const sent = await this._sendTo(v, text);
     if (!sent.ok) return sent;
     return { ok: true, reply: sent.reply || `Sent your follow-up to ${v.name}.` };
   }
 
-  async _answerSim(v, ask, text) {
+  /** `opts.how`: 'auto' when Workbench answers by itself (full permissions), so the simulator counts no yes of yours. */
+  async _answerSim(v, ask, text, opts = null) {
     const sim = this.adapters.sim;
     if (typeof sim.onAnswer !== 'function') return { ok: false, reply: 'The demo cannot take that answer.' };
     let res;
     try {
-      res = await sim.onAnswer(v.id, ask, text);
+      res = await (opts ? sim.onAnswer(v.id, ask, text, opts) : sim.onAnswer(v.id, ask, text));
     } catch (err) {
       this.log.warn('The simulator could not take an answer:', err);
       return { ok: false, reply: 'The demo could not take that answer.' };
@@ -1782,6 +2234,15 @@ export class Engine extends EventEmitter {
       // The earlier run's spend: the new process counts from zero (see _withEarlierSpend).
       earlierSpend: { ...rec.usage },
     };
+    // Its copy got its env files in the run that started it: their values are read again, so that they are hidden in what
+    // it prints now, as they were then (see "Agents' copies").
+    if (this.mode === 'live' && typeof this.deps.workspace?.envValuesIn === 'function') {
+      try {
+        this._addEnvSecrets((await this.deps.workspace.envValuesIn({ path: workspace.path }))?.values);
+      } catch (err) {
+        this.log.warn('Workbench could not read the env files in an agent’s folder:', err?.message || String(err));
+      }
+    }
     try {
       run.runner = this.adapters[rec.harness].createRunner({
         agentId: v.id, name: v.name, task: rec.task, cwd: workspace.path, model: v.model, budgetUsd: budget,
@@ -1803,6 +2264,14 @@ export class Engine extends EventEmitter {
     }
     this._resuming.delete(v.id);
     this.earlierRecs.delete(v.id);
+    // It took the message: checks a save started in its copy no longer describe the work it takes up (they stop, and
+    // end before any of this run's begin).
+    const prior = this._rechecks.get(v.id);
+    if (prior) {
+      this._cancelReceipt(prior);
+      this._rechecks.delete(v.id);
+      run.checksDone = prior.checksDone;
+    }
     this._apply([
       { kind: EV.RESUMED, agentId: v.id, budgetUsd: budget },
       { kind: EV.STATE, agentId: v.id, state: STATE.WORKING, reason: null },
@@ -1878,6 +2347,8 @@ export class Engine extends EventEmitter {
         continue;
       }
       if (this._folderKept(v)) kept += 1;
+      this._cancelReceipt(this._rechecks.get(id)); // checks a save started in its copy stop with it
+      this._rechecks.delete(id);
       this.earlierRecs.delete(id);
       this.history?.forget(id);
       this.store.remove(id);
@@ -2055,7 +2526,9 @@ export class Engine extends EventEmitter {
     const run = this.runs.get(v.id);
     this.stopped.add(v.id);
     if (run) run.stopped = true;
-    this._cancelReceipt(run); // stopping an agent stops the checks it is running
+    // While its copy is made ready: its setup command stops, it waits on no setup card, and its runner never starts.
+    run?.prep?.abort();
+    this._cancelReceipt(run || this._rechecks.get(v.id)); // stopping an agent stops the checks it is running
     // What a turn decided while a request was held would otherwise show for a moment before "stopped".
     for (const a of [v, ...this.store.descendants(v.id)]) this._dropLater(a.id);
     this._denyHeldFor(v.id, 'The agent was stopped.', true);
@@ -2140,23 +2613,46 @@ export class Engine extends EventEmitter {
 
   // ================================================================ launching
 
-  /** Launch a root agent. Does not ask first: command() and the UI confirm before calling this. */
+  /**
+   * Launch a root agent, and resolve once its runner has started (or could not): in live mode, after its copy got its
+   * files and its setup command ran. Does not ask first: one agent's work never is, and command() asks first before
+   * more than one from one sentence (_proposeStart).
+   */
   async startAgent(opts = {}) {
     const v = await this._startAgent(opts);
-    this._notice(v.state === STATE.FAILED ? `${v.name} could not start. ${v.stateReason || ''}`.trim() : `Started ${v.name}.`, v.id);
+    if (v.state === STATE.FAILED) this._notice(`${v.name} could not start. ${v.stateReason || ''}`.trim(), v.id);
+    // Nothing for one stopped while its copy was made ready, or whose runner never started because Workbench closed.
+    else if (v.state !== STATE.STOPPED && this.runs.get(v.id)?.runner) this._notice(`Started ${v.name}.`, v.id);
     return v;
   }
 
-  /** A launch, tracked while it is under way so that shutdown can wait for it (see shutdown). */
-  _startAgent(opts) {
-    const p = this._launch(opts);
-    this._launching.add(p);
-    const done = () => this._launching.delete(p);
-    p.then(done, done);
-    return p;
+  /** A whole launch (see _begin): resolves to the agent's view once its runner has started, or could not. */
+  _startAgent(opts, burst = null) {
+    return this._begin(opts, burst).then(l => l.started);
   }
 
-  async _launch({ task, harness, model, machineId, budgetUsd, name } = {}) {
+  /**
+   * Begin a launch. Resolves to `{ view, started, done }` as soon as the agent is on the board and either its runner
+   * has started (`done`) or it does something slow first: its copy is filled, it waits for the setup card, or its setup
+   * command runs. `started` resolves to its view once the runner has started or could not. Both parts are tracked
+   * while they are under way, so that shutdown can wait for them (see shutdown). `burst`: what the launches of one
+   * start share (the words that started them, or a start card's yes: the answer to a setup card, see _setupAnswer).
+   */
+  _begin(opts, burst = null) {
+    const track = (p) => {
+      this._launching.add(p);
+      const done = () => this._launching.delete(p);
+      p.then(done, done);
+      return p;
+    };
+    return track(this._launch(opts, burst)).then(async ({ view, started, slow }) => {
+      track(started);
+      const first = await Promise.race([started.then(v => ({ v, done: true })), slow.then(() => ({ done: false }))]);
+      return { view: first.done ? first.v : (this.store.get(view.id) || view), started, done: first.done };
+    });
+  }
+
+  async _launch({ task, harness, model, machineId, budgetUsd, name } = {}, burst = null) {
     if (this._shuttingDown) throw plainError('Workbench is shutting down.');
     const text = String(task ?? '').trim();
     if (!text) throw plainError('Tell me what the agent should work on.');
@@ -2221,41 +2717,310 @@ export class Engine extends EventEmitter {
       turnSeq: 0, inTurn: false, deciding: false, stopped: false, lastText: '',
       receipt: null, checksDone: null, // the receipt being built (cancellable) and when its checks have ended
       waiting: null, background: null, backgroundAt: 0, accepted: null, // background work left running
+      prep: null, // while its copy is made ready (live): the AbortController that stops its setup command
     };
     this.runs.set(id, run);
+    // The task and the name are the person's own words: only their stored keys are hidden in them, never a value of a
+    // copied env file, which may be a word they use ("production"). The rest of the batch holds no text to hide.
     this._apply([
-      { kind: EV.CREATED, agentId: id, parentId: null, name: agentName, task: text, harness: h, model: mdl, machineId: mach, budgetUsd: budget, workspace: workspace?.path ?? null },
+      { kind: EV.CREATED, agentId: id, parentId: null, name: this._maskStored(agentName), task: this._maskStored(text), harness: h, model: mdl, machineId: mach, budgetUsd: budget, workspace: workspace?.path ?? null },
       ...(workspace ? [{ kind: EV.WORK, agentId: id, work: { branch: workspace.branch, from: workspace.from, folder: true, merged: null, problem: null, thrownAway: null } }] : []),
       { kind: EV.STATE, agentId: id, state: STATE.STARTING, reason: null },
-    ]);
+    ], { masked: true });
+    const opts = {
+      agentId: id,
+      name: agentName,
+      task: text,
+      cwd: workspace?.path ?? null,
+      model: mdl,
+      budgetUsd: budget,
+      emit: (ev) => this.ingest(ev),
+      // Only a real Claude Code agent has the hook, with its own token. Codex and the simulator get none.
+      hook: this.mode === 'live' && h === 'claude' ? { url: this.hook?.url ?? null, token: this._hookToken(id) } : null,
+      log: this.log,
+      harness: h,
+      machineId: mach,
+    };
+    let slowNow;
+    const slow = new Promise(r => { slowNow = r; });
+    const started = this._finishLaunch(run, factory, opts, { burst, slow: slowNow });
+    return { view: this.store.get(id), started, slow };
+  }
+
+  /**
+   * The rest of a launch, once the agent is on the board: its copy made ready (live mode: _prepare), then its runner
+   * started. `o.slow` is called when something slow begins. Resolves to the agent's view; never rejects.
+   */
+  async _finishLaunch(run, factory, opts, o) {
+    let ready = true;
+    try {
+      ready = await this._prepare(run, o);
+    } catch (err) {
+      this.log.error(`Workbench could not make the copy of ${run.id} ready:`, err);
+    } finally {
+      run.prep = null;
+    }
+    if (!ready || run.stopped || this._shuttingDown) return this.store.get(run.id);
     try {
       run.runner = factory({
-        agentId: id,
-        name: agentName,
-        task: text,
-        cwd: workspace?.path ?? null,
-        model: mdl,
-        budgetUsd: budget,
-        emit: (ev) => this.ingest(ev),
-        // Only a real Claude Code agent has the hook, with its own token. Codex and the simulator get none.
-        hook: this.mode === 'live' && h === 'claude' ? { url: this.hook?.url ?? null, token: this._hookToken(id) } : null,
-        log: this.log,
-        harness: h,
-        machineId: mach,
-        ...this._runnerKeys(h), // live only: the person's keys for this agent, and the mask that hides them
+        ...opts,
+        ...this._runnerKeys(run.harness), // live only: the person's keys for this agent, and the mask that hides them
       });
       await run.runner.start();
     } catch (err) {
-      this.log.error(`Agent ${id} could not start:`, err);
+      this.log.error(`Agent ${run.id} could not start:`, err);
       const why = plainReason(err);
       this._apply([
-        { kind: EV.ENDED, agentId: id, outcome: 'error', error: why },
-        { kind: EV.STATE, agentId: id, state: STATE.FAILED, reason: `It could not start: ${why}` },
+        { kind: EV.ENDED, agentId: run.id, outcome: 'error', error: why },
+        { kind: EV.STATE, agentId: run.id, state: STATE.FAILED, reason: `It could not start: ${why}` },
       ]);
       if (this._runnerInfo(run)?.alive !== true) await this._removeUnchanged(run); // nothing ran in its folder
     }
     this._refreshMachines();
-    return this.store.get(id);
+    return this.store.get(run.id);
+  }
+
+  // ---------------------------------------------------------------- an agent's copy, before it starts
+
+  /**
+   * Live mode, for an agent with a folder: make its copy ready before its runner starts. In this order: its copy gets
+   * the ignored files it needs (fillWorkspace: .env files and node_modules, or what .worktreeinclude lists), whose env
+   * values are hidden from then on; then workbench.json's setup command runs in it, once the person has said Run it to
+   * that command (the setup card, asked while the copy is made); then the start detail says what came of both, as the
+   * agent's reason (its `now`, the line its chip shows on hover) and in the log. Neither a failed copy nor a failed
+   * setup command stops the launch. False when the agent was stopped meanwhile or Workbench is closing: nothing more is
+   * done for it.
+   */
+  async _prepare(run, { burst = null, slow = () => {} } = {}) {
+    const ws = run.workspace;
+    const root = this.repoInfo?.root;
+    if (this.mode !== 'live' || !ws || !root) return true;
+    const fill = typeof this.deps.workspace?.fillWorkspace === 'function';
+    const canSetup = typeof this.deps.receipt?.runSetup === 'function';
+    if (!fill && !canSetup) return true;
+    run.prep = new AbortController();
+    const gone = () => run.stopped || this._shuttingDown;
+    const name = this.store.get(run.id)?.name || 'The agent';
+    const said = [];
+    // The setup card is asked first, so that it shows while the copy is made, and so that every launch of a burst
+    // finds it open. The command runs after the copy.
+    const config = canSetup ? await run.config : null;
+    if (gone()) return false;
+    const setup = canSetup && typeof config?.setup === 'string' && config.setup.trim() ? config.setup : null;
+    let answer = null;
+    if (setup) {
+      answer = this._setupAnswer(run, root, setup, burst);
+      if (answer.asks) slow();
+    }
+    if (fill) {
+      slow();
+      said.push(...await this._fill(run, root, name));
+      if (gone()) return false;
+    }
+    // Its copy is made (or there was none to make), and the setup card still waits: it waits for the person, and its
+    // line says so, not "Copying …" for as long as the card is open.
+    if (answer?.asks && answer.waiting()) {
+      this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason: SETUP_WAITING }], { masked: true });
+    }
+    if (answer) {
+      if (await answer === 'run') {
+        if (gone()) return false;
+        slow();
+        said.push(await this._runSetup(run, root, setup, name));
+      } else {
+        said.push(SETUP_SKIPPED);
+      }
+      if (gone()) return false;
+    }
+    const detail = said.filter(Boolean).join(' ');
+    if (detail) {
+      // Workbench's own words, made of file names: never masked (a copied value such as "production" is in ".env.production").
+      this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason: detail }], { masked: true });
+      // A warning, as the launch's own lines are: the page shows it only until the agent's first step, and the log shows
+      // info lines only with --verbose, which the Mac app does not pass.
+      this.log.warn(`${logText(name)} is starting. ${detail}`);
+    }
+    return true;
+  }
+
+  /**
+   * Fill the agent's new copy (fillWorkspace), saying what it copies while it does, and hide the values of the env files
+   * it copied. The first time a repository's agents get an env file, the notice says so (once, kept in prefs). Returns
+   * the start detail's sentences about it; never rejects.
+   */
+  async _fill(run, root, name) {
+    const say = (reason) => {
+      if (reason && !run.stopped && !this._shuttingDown) this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason }], { masked: true });
+    };
+    let r;
+    try {
+      r = await this.deps.workspace.fillWorkspace({ repoRoot: root, path: run.workspace.path, onChosen: (entries) => say(copyingWords(entries)) });
+    } catch (err) {
+      this.log.warn(`Workbench could not copy the files ${logText(name)} needs into its folder, so it starts without them:`, err?.message || String(err));
+      return ['Workbench could not copy your ignored files into its copy.'];
+    }
+    const copied = Array.isArray(r?.copied) ? r.copied : [];
+    // What it copied, so the tidy-up knows these ignored files are Workbench's, not the agent's work (removeWorkspace).
+    if (run.workspace) run.workspace.copied = copied.map(c => c?.path).filter(p => typeof p === 'string' && p !== '');
+    const skipped = Array.isArray(r?.skipped) ? r.skipped : [];
+    if (copied.length && typeof this.deps.workspace?.envValues === 'function') {
+      try {
+        const env = await this.deps.workspace.envValues({ path: run.workspace.path, copied });
+        this._addEnvSecrets(env?.values);
+        if (env?.files > 0) this._sayCopies(root);
+      } catch (err) {
+        this.log.warn('Workbench could not read the env files it copied:', err?.message || String(err));
+      }
+    }
+    return copiesWords(copied, skipped);
+  }
+
+  /** The notice about agents' copies, once per repository: said the first time its agents get an env file, and kept. */
+  _sayCopies(root) {
+    if (this._copiesSaid.has(root)) return;
+    this._copiesSaid.add(root);
+    let kept = [];
+    try {
+      kept = this.prefs?.get?.()?.copiesSaid || [];
+    } catch { /* not readable: said again */ }
+    if (Array.isArray(kept) && kept.includes(root)) return;
+    // Workbench's own words: never masked.
+    this._apply([{ kind: EV.NOTICE, text: COPIES_NOTICE }], { masked: true });
+    try {
+      this.prefs?.set?.({ copiesSaid: [root] });
+    } catch (err) {
+      this.log.warn('Workbench could not keep that it told you about agents’ copies:', err?.message || err);
+    }
+  }
+
+  /**
+   * Run the setup command in the agent's copy (receipt's runSetup): its own process group, ten minutes at most, the
+   * scrubbed environment with WORKBENCH_ROOT and WORKBENCH_AGENT_ID, stopped with the agent. Its output goes to the
+   * log only, masked. Returns the start detail's sentence about it; never rejects.
+   */
+  async _runSetup(run, root, command, name) {
+    this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason: SETUP_RUNNING }], { masked: true });
+    let r;
+    try {
+      r = await this.deps.receipt.runSetup({
+        cwd: run.workspace.path, run: command,
+        env: { ...process.env, WORKBENCH_ROOT: root, WORKBENCH_AGENT_ID: run.id },
+        ...(this._mask ? { mask: this._mask } : {}),
+        signal: run.prep?.signal, timeoutSec: SETUP_TIMEOUT_SEC,
+      });
+    } catch (err) {
+      r = { ok: false, exitCode: null, timedOut: false, ms: 0, tail: err?.message || '' };
+    }
+    if (run.stopped || this._shuttingDown) return '';
+    const printed = logTail(r?.tail);
+    const end = printed ? ` The end of what it printed: ${printed}` : '';
+    if (r?.ok) {
+      // A warning too (see _prepare): what it printed is in the log only.
+      const took = Number(r.ms) >= 500 ? duration(Number(r.ms)) : 'under a second';
+      this.log.warn(`The setup command ran in the copy of ${logText(name)} (${took}).${end}`);
+      return 'The setup command ran in it.';
+    }
+    const how = r?.timedOut ? 'it took more than 10 minutes' : Number.isInteger(r?.exitCode) ? `exit ${r.exitCode}` : 'it could not start';
+    this.log.warn(`The setup command failed in the copy of ${logText(name)} (${how}).${end}`);
+    if (r?.timedOut) return 'The setup command took more than 10 minutes, so its copy may not run yet.';
+    if (Number.isInteger(r?.exitCode)) return `The setup command failed (exit ${r.exitCode}), so its copy may not run yet.`;
+    return 'The setup command could not start, so its copy may not run yet.';
+  }
+
+  /**
+   * Whether the setup command `command` of the repository at `root` runs in this agent's copy: 'run' or 'skip'. It runs
+   * at once when the person said Run it to this very text before (kept in prefs by root, as its SHA-256, or said in this
+   * run), or when the setup card of the start this launch came from (`burst`: _startNow's) was answered already. Otherwise
+   * the setup card asks: one per repository and command, open until answered, and every launch that comes meanwhile
+   * waits on the same card. Run it is kept; Not now keeps nothing, so the next launch asks again; a card nobody answers
+   * counts as Not now after confirmTtlMs, and so does shutdown. An agent stopped meanwhile stops waiting ('skip'), and a
+   * card nobody waits on any more goes.
+   */
+  _setupAnswer(run, root, command, burst) {
+    const hash = crypto.createHash('sha256').update(command).digest('hex');
+    const key = `${root}\n${hash}`;
+    if (this._setupKeptFor(root) === hash) return Promise.resolve('run');
+    if (burst?.setup?.has(key)) return Promise.resolve(burst.setup.get(key));
+    let d = [...this._setupAsks.values()].find(x => x.key === key);
+    if (!d) {
+      d = { id: hex(6), key, root, command, hash, createdAt: this.now(), waiters: new Set(), bursts: new Set() };
+      d.promise = new Promise(r => { d.settle = r; });
+      this._setupAsks.set(d.id, d);
+      this.emit('setup', this._setupCard());
+    }
+    d.waiters.add(run.id);
+    if (burst) d.bursts.add(burst);
+    const signal = run.prep?.signal;
+    const waits = new Promise(resolve => {
+      const onAbort = () => {
+        d.waiters.delete(run.id);
+        if (!d.waiters.size) this._closeSetup(d, 'skip');
+        resolve('skip');
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      d.promise.then(a => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve(a);
+      });
+    });
+    waits.asks = true; // it waits for the person
+    // Whether it still does: its card is open, and it was not stopped (_closeSetup and onAbort change both at once).
+    waits.waiting = () => this._setupAsks.has(d.id) && d.waiters.has(run.id);
+    return waits;
+  }
+
+  /** The hash of the setup command said Run it to for `root`: in this run, else as kept in prefs; null when none. */
+  _setupKeptFor(root) {
+    if (this._setupKept.has(root)) return this._setupKept.get(root);
+    try {
+      const h = this.prefs?.get?.()?.setupOk?.[root];
+      return typeof h === 'string' ? h : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Close an open setup card with its answer ('run' or 'skip'): every launch waiting on it, and its bursts, have it. */
+  _closeSetup(d, answer) {
+    if (!this._setupAsks.has(d.id)) return;
+    this._setupAsks.delete(d.id);
+    for (const b of d.bursts) {
+      if (!b.setup) b.setup = new Map();
+      b.setup.set(d.key, answer);
+    }
+    d.settle(answer);
+    this.emit('setup', this._setupCard());
+  }
+
+  /** The person's answer to a setup card: Run it (kept by repository and command) or Not now (kept nowhere). */
+  _answerSetup(d, go) {
+    const many = d.waiters.size > 1;
+    if (!go) {
+      this._closeSetup(d, 'skip');
+      return { reply: `OK. The ${many ? 'agents start' : 'agent starts'} without it, and Workbench asks again next time.` };
+    }
+    this._setupKept.set(d.root, d.hash);
+    let kept = true;
+    if (typeof this.prefs?.set === 'function') {
+      try {
+        kept = this.prefs.set({ setupOk: { [d.root]: d.hash } })?.ok !== false;
+      } catch (err) {
+        kept = false;
+        this.log.warn('Workbench could not keep your answer about the setup command:', err?.message || err);
+      }
+    }
+    this._closeSetup(d, 'run');
+    return { reply: kept ? SETUP_RAN : `${SETUP_RAN} ${SETUP_NOT_KEPT}` };
+  }
+
+  /** The setup card the page shows (the oldest one open), or null. */
+  _setupCard() {
+    const d = this._setupAsks.values().next().value;
+    return d ? { id: d.id, kind: 'setup', sentence: SETUP_SENTENCE, command: d.command, detail: SETUP_DETAIL, yes: 'Run it', no: 'Not now' } : null;
   }
 
   /**
@@ -2272,7 +3037,7 @@ export class Engine extends EventEmitter {
       // where it started (base) and, once it was merged, where its unmerged work starts (since, its merged work
       // commit): then the folder goes only while that commit is still in another branch, so a merge the person undid
       // never takes the only copy of the work with it.
-      const args = { repoRoot: this.repoInfo.root, path: ws.path, base: ws.base ?? null, onlyIfUnchanged: true, deleteBranch: true };
+      const args = { repoRoot: this.repoInfo.root, path: ws.path, base: ws.base ?? null, onlyIfUnchanged: true, deleteBranch: true, copied: Array.isArray(ws.copied) ? ws.copied : [] };
       if (ws.since && ws.since !== ws.base) args.since = ws.since;
       const out = await withTimeout(Promise.resolve().then(() => this.deps.workspace.removeWorkspace(args)), this.options.stopTimeoutMs);
       if (out?.removed) {
@@ -2570,7 +3335,7 @@ export class Engine extends EventEmitter {
    */
   _isWorking(v) {
     if (ACTIVE.has(v.state) || this._resuming.has(v.id)) return true;
-    const run = this.runs.get(v.id);
+    const run = this.runs.get(v.id) || this._rechecks.get(v.id); // an earlier agent's receipt after a save, too
     return !!(run && (run.deciding || run.receipt));
   }
 
@@ -2748,6 +3513,334 @@ export class Engine extends EventEmitter {
     return out;
   }
 
+  // ---------------------------------------------------------------- the file view
+
+  /**
+   * The files of a copy (GET /api/files): yours (`where` "you", the person's repository) or an agent's. Each file says
+   * which agents changed it, from what each recorded (`changedBy`: in yours, every agent whose copy is still there; in
+   * an agent's copy, that agent), and whether an ignore rule hides it (`ignored`, the env files the list adds).
+   * @returns {Promise<{ ok: true, in: string, name: string|null, branch: string|null, files: { path: string,
+   *   changedBy?: { agentId: string, name: string, state: string }[], ignored?: true }[], truncated?: true }
+   *   | { ok: false, reply: string, why: 'refused'|'gone' }>}
+   */
+  async files(where) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    let got;
+    try {
+      got = c.project ? await c.project.listFiles() : await this.deps.files.listFiles({ root: c.root });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not list the files.');
+    }
+    const marks = this._changedBy(c);
+    const hidden = new Set(Array.isArray(got?.ignored) ? got.ignored : []);
+    const files = (Array.isArray(got?.files) ? got.files : []).map((p) => {
+      const f = { path: p };
+      if (marks.has(p)) f.changedBy = marks.get(p);
+      if (hidden.has(p)) f.ignored = true;
+      return f;
+    });
+    return { ok: true, in: c.in, name: c.name, branch: c.branch, files, ...(got?.truncated ? { truncated: true } : {}) };
+  }
+
+  /**
+   * One file of a copy (GET /api/file), as the core reads it (`kind`, `text`, `hash`, `size`, `lines`, `link`, `eol`,
+   * `bom`), with `changedLines` in an agent's copy (the lines its unmerged work added or changed), and whether the person
+   * may edit it (`editable`, else `why`, one line). `check`: the hash the page shows; when the file still has it, the
+   * answer is { ok: true, same: true } and nothing else.
+   */
+  async file(where, rel, { check = null } = {}) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    let got;
+    try {
+      this.deps.files.checkPath(rel); // the engine checks the path again
+      got = c.project ? await c.project.readFile({ rel }) : await this.deps.files.readFile({ root: c.root, rel });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not read that file.');
+    }
+    if (typeof check === 'string' && got.hash && got.hash === check) return { ok: true, same: true };
+    const out = { ok: true, in: c.in, path: rel, ...got };
+    if (c.v && (got.kind === 'text' || got.kind === 'secret') && got.lines) {
+      const lines = await this._changedLines(c, rel);
+      if (lines) out.changedLines = lines;
+    }
+    const why = this._notEditable(c, got);
+    out.editable = !why;
+    if (why) out.why = why;
+    return out;
+  }
+
+  /**
+   * The lines of a copy's files that hold `query` (GET /api/search): 2 to 200 characters, fixed, in any case unless they
+   * hold a capital. At most 200 results, each cut to 400 characters around the match; env files are left out.
+   * @returns {Promise<{ ok: true, in: string, results: { path: string, line: number, text: string }[], truncated?: true }
+   *   | { ok: false, reply: string, why: 'refused'|'gone' }>}
+   */
+  async search(where, query) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    let got;
+    try {
+      got = c.project ? await c.project.searchFiles({ query }) : await this.deps.files.searchFiles({ root: c.root, query });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not search the files.');
+    }
+    return { ok: true, in: c.in, results: Array.isArray(got?.results) ? got.results : [], ...(got?.truncated ? { truncated: true } : {}) };
+  }
+
+  /**
+   * Save the person's text over one file of a copy (POST /api/file). `hash`: the one the file was read with, or, with
+   * `force`, the one a `changed` refusal gave. In your folder the save is an uncommitted change, and the repository is
+   * read again so the page's count of those is right. In an agent's copy whose run has ended, what it changed is
+   * recorded and its checks run again, as at the end of a turn (_afterSave). In the demo it lasts for this run only,
+   * and the first save says so (`reply`).
+   * @returns {Promise<{ ok: true, hash: string, size: number, reply?: string }
+   *   | { ok: false, reply: string, why: 'refused'|'gone'|'changed', hash?: string }>}
+   */
+  async saveFile(where, rel, { text, hash, force = false } = {}) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    try {
+      this.deps.files.checkPath(rel); // the engine checks the path again
+    } catch (err) {
+      return this._filesRefusal(err);
+    }
+    // Git may be taking an agent's work from its copy, or bringing it into your folder: not now.
+    if (c.v && this._busy.has(c.v.id)) return { ok: false, reply: this._busyReply(c.v), why: 'refused' };
+    if (c.in === 'you' && this.mode === 'live' && [...this._busy.values()].includes('merge')) return { ok: false, reply: MERGING_INTO_YOURS, why: 'refused' };
+    if (typeof text === 'string' && Buffer.byteLength(text) > MAX_SAVE_BYTES) return { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' };
+    let saved;
+    try {
+      const o = { rel, text, hash, force: force === true };
+      saved = c.project ? await c.project.writeFile(o) : await this.deps.files.writeFile({ root: c.root, ...o });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not save that file.');
+    }
+    const out = { ok: true, hash: saved.hash, size: saved.size };
+    if (c.project) {
+      if (!this._demoSaved) out.reply = DEMO_SAVED;
+      this._demoSaved = true;
+    } else if (c.in === 'you') {
+      this.refreshRepo(); // never rejects: the page hears your folder's new count of uncommitted changes
+    } else {
+      this._afterSave(c);
+    }
+    return out;
+  }
+
+  /**
+   * Which copy a file view request names: "you" (your repository; the demo's sample project) or an agent's id, a
+   * helper's meaning its agent's. An agent's copy is there only while its folder is: its work not thrown away, its
+   * folder neither removed nor gone from the disk. { in, name, branch, root | project, v?, ws?, run?, rec? }, or
+   * { refusal } in plain words: `why` 'gone' for an agent or a copy that is not there, 'refused' for anything else.
+   */
+  _copyOf(where) {
+    const refusal = (reply, why = 'refused') => ({ refusal: { ok: false, reply, why } });
+    if (this._shuttingDown) return refusal('Workbench is shutting down.');
+    const F = this.deps.files;
+    const demo = this.mode === 'demo';
+    if (demo ? typeof F?.memoryProject !== 'function' || typeof F?.sampleProject !== 'function' || typeof F?.checkPath !== 'function'
+      : ['listFiles', 'readFile', 'writeFile', 'searchFiles', 'changedLines', 'checkPath'].some(fn => typeof F?.[fn] !== 'function')) {
+      return refusal(NO_FILES_MODULE);
+    }
+    if (where === 'you') {
+      if (demo) {
+        const d = this._demo();
+        return { in: 'you', name: d.sample.name, branch: d.sample.branch, project: d.you };
+      }
+      if (!this.repoInfo?.root) return refusal('Workbench is not working on a repository.');
+      return { in: 'you', name: this.repoInfo.name ?? null, branch: this.repoInfo.branch ?? null, root: this.repoInfo.root };
+    }
+    if (typeof where !== 'string' || !where) return refusal(WHOSE_COPY);
+    const v = this._rootOf(where);
+    if (!v) return refusal('I can’t find that agent.', 'gone');
+    if (v.work?.thrownAway) return refusal(`${v.name}’s work was thrown away, so its copy is gone.`, 'gone');
+    const goneFolder = `${v.name}’s folder is not on this computer any more.`;
+    if (demo) {
+      if (v.work && v.work.folder === false) return refusal(goneFolder, 'gone');
+      return { in: v.id, name: this._demo().sample.name, branch: v.work?.branch ?? null, project: this._demoCopy(v), v };
+    }
+    const at = this._workspaceOf(v);
+    if (!at?.ws || at.removed || !folderThere(at.ws.path)) {
+      if (at?.ws && !at.removed) this._markFolderGone(v);
+      return refusal(goneFolder, 'gone');
+    }
+    return { in: v.id, name: this.repoInfo?.name ?? null, branch: at.ws.branch ?? v.work?.branch ?? null, root: at.ws.path, v, ws: at.ws, run: at.run, rec: at.rec };
+  }
+
+  /** A refusal of the file view from what the core threw: its plain sentence (git's words go to the log only). */
+  _filesRefusal(err, fallback = 'Workbench could not do that.') {
+    if (err?.plain && typeof err.message === 'string' && err.message.trim()) {
+      if (err.detail) this.log.debug('The file view was refused:', err.message, err.detail);
+      const out = { ok: false, reply: err.message, why: err.why === 'changed' ? 'changed' : 'refused' };
+      if (err.why === 'changed' && typeof err.hash === 'string') out.hash = err.hash;
+      return out;
+    }
+    this.log.warn('The file view could not do that:', err);
+    return { ok: false, reply: fallback, why: 'refused' };
+  }
+
+  /**
+   * Which agents changed each path, from the files each recorded (its last receipt): in your copy, every agent whose copy
+   * is still there (not thrown away, its folder not known to be gone); in an agent's copy, that agent alone.
+   * @returns {Map<string, { agentId: string, name: string, state: string }[]>}
+   */
+  _changedBy(c) {
+    const marks = new Map();
+    const roots = c.v ? [this.store.get(c.v.id) || c.v] : this.store.list().filter(v => !v.parentId && !v.work?.thrownAway && v.work?.folder !== false);
+    for (const v of roots) {
+      const list = Array.isArray(v.files?.list) ? v.files.list : [];
+      for (const f of list) {
+        if (typeof f?.path !== 'string') continue;
+        if (!marks.has(f.path)) marks.set(f.path, []);
+        marks.get(f.path).push({ agentId: v.id, name: v.name, state: v.state });
+      }
+    }
+    return marks;
+  }
+
+  /** The lines of a file in an agent's copy that its unmerged work added or changed, or null when that is not known. */
+  async _changedLines(c, rel) {
+    if (c.project) {
+      const now = c.project.textOf(rel);
+      return now == null ? null : this.deps.files.changedLinesBetween(this._demo().pristine.textOf(rel), now);
+    }
+    const since = sinceOf(c.ws);
+    if (!since) return null;
+    try {
+      return await this.deps.files.changedLines({ root: c.root, since, rel });
+    } catch (err) {
+      this.log.debug(`Could not tell which lines of a file ${c.v.id} changed:`, err?.message ?? err);
+      return null;
+    }
+  }
+
+  /** Why the person may not edit this file, in one line, or null when they may. */
+  _notEditable(c, got) {
+    switch (got.kind) {
+      case 'binary': return 'This is a binary file.';
+      case 'large': return 'This file is too large to show here.';
+      case 'notutf8': return 'This file is not UTF-8 text, so Workbench does not show it.';
+      case 'link': return `This is a link to ${quotable(String(got.link ?? ''), 200)}.`;
+      case 'secret': return 'This file holds keys, so Workbench shows only their last four characters and does not edit it.';
+      case 'missing': return 'This file is not there any more.';
+      default: break;
+    }
+    if (got.eol === 'mixed') return 'This file mixes line endings, so Workbench does not edit it.';
+    if (c.v && this._busy.has(c.v.id)) return this._busyReply(c.v);
+    return null;
+  }
+
+  /**
+   * After a save into an agent's copy. A receipt being built (a turn's end, or a recheck) looks again: its checks under
+   * way stop, since they did not see the change (_receipt). Otherwise an agent whose run has ended (done, done and
+   * checked, or a failed check), of this run or an earlier one, is recorded and checked again (_recheck). An agent at
+   * work sees the change itself, and the end of its turn records it; a stopped or failed one claims nothing about its
+   * checks.
+   */
+  _afterSave(c) {
+    const v = this.store.get(c.v.id);
+    if (!v) return;
+    const held = c.run || this._rechecks.get(v.id) || null;
+    if (held) held.saves = (held.saves || 0) + 1;
+    if (held?.receipt) {
+      held.receipt.pass?.abort();
+      return;
+    }
+    if (!DONE.has(v.state) || this._resuming.has(v.id)) return;
+    this._recheck(v, c).catch(err => this.log.error('Could not check the work again after a save:', err));
+  }
+
+  /**
+   * Record an ended agent's work and run its checks again, as the end of a turn does (_receipt), then give it the done
+   * state they lead to. Its "done and checked" (or "a check failed") goes at once, before any check runs, so no card
+   * says checked about content its checks did not see: it says it is done, with its checks running. Its own words stay.
+   * An earlier agent's receipt is held in _rechecks, and its record for the next start is written again with what was
+   * found. A new turn, a message it takes, a stop, a throw-away, being picked up again and shutdown cancel it.
+   */
+  async _recheck(v, c) {
+    const id = v.id;
+    const run = c.run || null;
+    let held = run;
+    if (!held) {
+      held = this._rechecks.get(id) || { id, workspace: c.ws, config: this._loadConfig(c.ws), harness: v.harness, receipt: null, deciding: false, checksDone: null, saves: 0 };
+      this._rechecks.set(id, held);
+    }
+    // What its checks found is about content that is gone: its state and its results go together, at once.
+    const drop = [];
+    if (v.state === STATE.DONE_CHECKED || v.state === STATE.CHECKS_FAILED) drop.push({ kind: EV.STATE, agentId: id, state: STATE.DONE_CLAIMED, reason: null });
+    if (v.checks && v.checks.state !== 'none') drop.push({ kind: EV.CHECKS, agentId: id, checks: { state: 'none', results: [] } });
+    if (drop.length) {
+      this._apply(drop);
+      // The history says so at once too, before the save is answered, for this run's agents and earlier ones (whose
+      // record is built again first): a Workbench stopped before its checks end, even stopped hard within the history's
+      // wait before it writes, must not come back checked.
+      if (!run && c.rec) this._replaceEarlier(id, c.ws);
+      this._saveHistory();
+    }
+    const seq = run ? run.turnSeq : 0;
+    // Not run.stopped: closing a finished agent's idle process (a merge, Stop) marks it stopped, and its copy is checked all the same.
+    const stale = () => this._shuttingDown || !this.store.get(id) || this._busy.has(id)
+      || (run ? run.turnSeq !== seq : this.store.get(id).earlier !== true);
+    let got;
+    try {
+      got = await this._receipt(id, held, { stale });
+    } finally {
+      if (!run && this._rechecks.get(id) === held && !held.receipt) this._rechecks.delete(id);
+    }
+    // A newer receipt (a save that came just now started one) decides instead: this one's outcome is already old.
+    if (!got || held.receipt) return;
+    // A new finish, as the end of a turn gives, though the state may be the one it had (done, with no checks to run).
+    this._apply([{ kind: EV.STATE, agentId: id, state: doneState(got.checksState), reason: got.reason, again: true }]);
+    if (!run && c.rec) this._keepEarlier(id, c.ws); // the next start knows what its checks found
+    this._lookAgainIfSaved(id, held, got.saves);
+  }
+
+  /** An earlier agent's record is built again from its view as it is now, and the history is written (soon). */
+  _keepEarlier(id, workspace) {
+    this._replaceEarlier(id, workspace);
+    try { this.history?.schedule(); } catch (err) { this.log.warn('Could not save the history:', err); }
+  }
+
+  /** The history is written now, not after its wait (history.save() never throws: it logs what it could not write). */
+  _saveHistory() {
+    try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
+  }
+
+  /**
+   * A save that came after a receipt last looked, but before its done state went out (they are one step apart): record
+   * and check again, so the done state describes what is there.
+   */
+  _lookAgainIfSaved(agentId, held, seen) {
+    if (!held || (held.saves || 0) === seen) return;
+    const v = this.store.get(agentId);
+    if (!v || !DONE.has(v.state)) return;
+    const c = this._copyOf(agentId);
+    if (c.refusal || !c.v) return;
+    this._recheck(v, c).catch(err => this.log.error('Could not check the work again after a save:', err));
+  }
+
+  /** The demo's sample project, made the first time the file view asks: yours, the sample as it started, and each agent's copy. */
+  _demo() {
+    if (!this._demoFiles) {
+      const F = this.deps.files;
+      const sample = F.sampleProject();
+      this._demoFiles = { sample, you: F.memoryProject(sample.files), pristine: F.memoryProject(sample.files), copies: new Map() };
+    }
+    return this._demoFiles;
+  }
+
+  /** An agent's copy in the demo: the sample, with what the simulated agent of that name changed in it, made when first asked. */
+  _demoCopy(v) {
+    const d = this._demo();
+    if (!d.copies.has(v.id)) {
+      const theirs = v.name === d.sample.agent.name ? d.sample.agent.files : {};
+      d.copies.set(v.id, this.deps.files.memoryProject({ ...d.sample.files, ...theirs }));
+    }
+    return d.copies.get(v.id);
+  }
+
   // ---------------------------------------------------------------- merge
 
   /**
@@ -2913,20 +4006,24 @@ export class Engine extends EventEmitter {
     // Nothing may write in its folder while git takes its work: close its idle process (and what it left running), and
     // let stopped checks end. It cannot start a turn by itself after this: _closeIdle marks it stopped first.
     await this._closeIdle(v);
-    if (run?.checksDone) await run.checksDone;
+    const checking = run || this._rechecks.get(id);
+    if (checking?.checksDone) await checking.checksDone;
     if (run && this._runnerInfo(run)?.alive === true) return { reply: `Workbench could not pause ${v.name}, so nothing was merged.`, focusId: id };
     v = this.store.get(id);
     const again = this._mergeRefusal(v, { state: c.state, ownJob: true });
     if (again) return { reply: again.reply, focusId: id };
     // The commit outlives the page: its words go through the mask too, for text kept from before a key was stored.
-    // Masked before they are cut (a key the cut splits no longer matches), and again after.
+    // Masked before they are cut (a key the cut splits no longer matches), and again after. The subject and the name are
+    // made of the person's own words (the task, and its name): only stored keys are hidden in them, never a value of a
+    // copied env file ("production"), as when they were typed. The body is the agent's words: the whole mask.
     const m = this._mask || ((s) => s);
+    const typed = (s) => this._maskStored(s);
     let res;
     try {
       res = await this.deps.workspace.mergeWork({
         repoRoot: this.repoInfo.root, path: ws.path, branch: ws.branch, since: sinceOf(ws),
         expect: { workId: c.expect.workId, into: c.expect.into, intoHead: c.expect.intoHead },
-        message: { subject: m(commitSubject(m(v.task), `Work by ${m(v.name)}`)), body: m(commitBody(m(v.says))), name: m(v.name) },
+        message: { subject: typed(commitSubject(typed(v.task), `Work by ${typed(v.name)}`)), body: m(commitBody(m(v.says))), name: typed(v.name) },
         agentId: v.id, harness: v.harness,
       });
     } catch (err) {
@@ -3117,7 +4214,8 @@ export class Engine extends EventEmitter {
     } else {
       await this._closeIdle(v);
     }
-    if (run?.checksDone) await run.checksDone;
+    const checking = run || this._rechecks.get(id);
+    if (checking?.checksDone) await checking.checksDone;
     // A process that will not stop may still be writing there: its folder stays.
     if (run && this._runnerInfo(run)?.alive === true) return { reply: `Workbench could not stop ${v.name}, so its work was not thrown away.`, focusId: id };
     v = this.store.get(id) || v;
@@ -3393,8 +4491,9 @@ export class Engine extends EventEmitter {
   // ================================================================ commands and confirms
 
   /**
-   * Plain-language command from the bar at the bottom (typed or spoken). Launches need a confirm, and so do stops and
-   * messages whose words found the agent without naming it.
+   * Plain-language command from the bar at the bottom (typed or spoken). One agent's work starts at once, never asked
+   * first; more than one agent from one sentence needs a confirm, and so do stops and messages whose words found the
+   * agent without naming it, forgetting, merging and throwing away.
    * The page sends what it showed when the person began: `focusId`, the agent in the centre; `confirmId`, the confirm
    * card on screen; `askId`, the ask on screen. A yes or no settles only that confirm, and an answer (allow, deny,
    * free text) reaches only that ask. Commands (stop, tell, status, start, ...) act on what the words and the focus
@@ -3402,6 +4501,10 @@ export class Engine extends EventEmitter {
    */
   async command(text, { focusId = null, confirmId = null, askId = null } = {}) {
     const t = String(text ?? '').trim();
+    // "codex" alone asked what Codex should work on (_startNow): these words are its prompt, once, if they come soon. Any
+    // words use the question up, whatever they are.
+    const askedFor = t && this._askedFor && this.now() - this._askedFor.at <= this.options.confirmTtlMs ? this._askedFor.harness : null;
+    if (t) this._askedFor = null;
     let out;
     if (!t) {
       out = { reply: 'Type or say what you would like to do.' };
@@ -3420,27 +4523,48 @@ export class Engine extends EventEmitter {
         this.log.warn('Could not understand a command:', err);
       }
       if (!intent || typeof intent !== 'object') intent = { kind: 'unknown', text: t };
+      if (askedFor) intent = forHarness(intent, askedFor);
       if (shown && intent.kind === 'unknown') {
-        // A near miss ("yes start the agent") keeps the card in the centre, so saying "yes" again still answers it,
-        // and not whatever would have taken its place.
+        // A yes that is not enough for the card, or one asked rather than said ("yes start it" to a stop, a bare "yes" to
+        // a throw-away, "is that right?"), keeps the card in the centre, so saying "do it" still answers it, and not
+        // whatever would have taken its place. The reply says how to answer it.
         out = shown.gone
           ? { reply: GONE }
-          : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
+          : shown.kind === 'setup'
+            ? { reply: 'Say “run it” or “not now”.', confirm: this._card(shown) }
+            : { reply: `Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
       } else {
-        // Any other command withdraws the card on screen, without a notice: the page lets go of it. A look at an
-        // agent's changes does not: it is read-only, so the card keeps waiting, and the reply carries it, as for words
-        // not caught, so the page keeps it too ("show me the changes" before saying yes to a merge).
-        const keep = intent.kind === 'changes' && shown && !shown.gone;
+        // Any other command withdraws the card on screen, without a notice: the page lets go of it. Four do not, and the
+        // reply carries the card, as for words not caught, so the page keeps it too. A look at an agent's changes is
+        // read-only, so the card keeps waiting ("show me the changes" before saying yes to a merge). A prompt starts its
+        // agent at once, and the card stays where it is: it was not answered. A stop stops what it names, and the card
+        // stays too ("stop everything, the build is broken" while a merge card waits). A program named alone ("codex", "the
+        // agent", "ask claude") asks what it should work on, and the card stays for its own answer. Nor does anything
+        // withdraw a setup card: launches wait on it, and only its own answer (or its time running out) lets them go on.
+        // It is not in `confirms`, so nothing here deletes it or carries it, and the page keeps it from the snapshot.
+        const prompt = intent.kind === 'task' || (intent.kind === 'start' && Array.isArray(intent.tasks) && intent.tasks.length > 0);
+        const stopping = intent.kind === 'stop' || intent.kind === 'stop_all';
+        const asking = intent.kind === 'start' && !prompt && !intent.task;
+        const keep = (intent.kind === 'changes' || prompt || stopping || asking) && shown && !shown.gone;
         if (shown && !shown.gone && intent.kind !== 'confirm' && !keep) this.confirms.delete(shown.id);
         try {
           // With a card on screen, no ask was: the centre shows one thing at a time.
-          out = await this._runIntent(intent, { focusId, askId: shown ? null : askId, shown });
+          out = await this._runIntent(intent, { focusId, askId: shown ? null : askId, shown, said: t });
         } catch (err) {
           this.log.error('A command failed:', err);
           out = { reply: err?.plain ? err.message : 'Something went wrong while doing that. The details are in the log.' };
         }
         const kept = keep ? this.confirms.get(shown.id) : null;
-        if (kept) out = { ...out, confirm: this._card(kept) };
+        if (kept && out.confirm && out.confirm.id !== kept.id) {
+          // the words asked first with a card of their own ("stop the stuck one"): that card takes the centre
+          this.confirms.delete(kept.id);
+        } else if (kept) {
+          // what a prompt started, a stop stopped, or the question of what a program named alone should work on, is said
+          // under the board all the same: the card in the centre does not say it, and the centre stays on the card
+          if ((prompt || stopping || asking) && out.reply) this._notice(out.reply, null);
+          if (stopping) delete out.focusId;
+          out = { ...out, confirm: this._card(kept) };
+        }
       }
     }
     if (out.reply && !out.confirm) this._notice(out.reply, out.focusId || null);
@@ -3468,8 +4592,14 @@ export class Engine extends EventEmitter {
   _shownConfirm(confirmId) {
     const id = typeof confirmId === 'string' ? confirmId : '';
     if (!id) return null;
+    const d = this._setupAsks.get(id);
+    if (d) return { id: d.id, kind: 'setup', sentence: SETUP_SENTENCE, detail: SETUP_DETAIL, command: d.command, yes: 'Run it', no: 'Not now' };
     const c = this.confirms.get(id);
-    if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) return { id, gone: true };
+    // One that ran out says which agent's work it was about (a merge or throw-away card), so "throw it away" said to it
+    // asks about that agent again rather than about whatever else
+    if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) {
+      return { id, gone: true, ...(c && (c.kind === 'merge' || c.kind === 'discard') && typeof c.agentId === 'string' && c.agentId ? { agentId: c.agentId } : {}) };
+    }
     const agentIds = c.agentIds ?? c.intent?.agentIds ?? (c.agentId ? [c.agentId] : undefined);
     return {
       id: c.id, kind: c.kind, sentence: c.sentence, detail: c.detail, tasks: c.tasks, agentIds,
@@ -3479,15 +4609,17 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId? }. `kind` is always there (start,
-   * stop, say, forget, merge or discard); yes and no are the buttons' own words when they are not "Do it" and "Cancel";
-   * agentId (merge and discard cards only) is the agent the card is about.
+   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId?, command? }. `kind` is always
+   * there (stop, say, forget, merge, discard, permissions, start or setup); yes and no are the buttons' own words when they
+   * are not "Do it" and "Cancel"; agentId (merge and discard cards only) is the agent the card is about; command (setup
+   * cards only) is the setup command it asks about.
    */
   _card(c) {
     const out = { id: c.id, sentence: c.sentence, detail: c.detail ?? null, kind: c.kind };
     if (c.yes) out.yes = c.yes;
     if (c.no) out.no = c.no;
     if (typeof c.danger === 'boolean') out.danger = c.danger;
+    if (c.kind === 'setup' && typeof c.command === 'string') out.command = c.command;
     // a merge or throw-away card names the agent it is about, so the git screen can show it in that agent's detail
     if ((c.kind === 'merge' || c.kind === 'discard') && typeof c.agentId === 'string' && c.agentId) out.agentId = c.agentId;
     return out;
@@ -3501,27 +4633,44 @@ export class Engine extends EventEmitter {
     return { reply: c.sentence, confirm: this._card(c) };
   }
 
-  async _runIntent(intent, { focusId = null, askId = null, shown = null } = {}) {
+  async _runIntent(intent, { focusId = null, askId = null, shown = null, said = '' } = {}) {
     const get = (id) => (id ? this.store.get(id) : null);
     switch (intent.kind) {
-      case 'start':
-        // "start an agent" with no task comes as { kind: 'start', tasks: [], task: null, harness }: the reply asks what
-        // to work on, naming the agent the words named ("start codex"), or says why that one cannot start.
-        return this._proposeStart(Array.isArray(intent.tasks) ? intent.tasks
-          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : [], intent.harness);
+      case 'start': {
+        // One agent starts at once, never asked. More than one from one sentence ("start three agents on …", "claude and
+        // codex on …") multiplies what is spent, so a card asks first (_proposeStart). "start an agent" with no task comes
+        // as { kind: 'start', tasks: [], task: null, harness }: the reply asks what to work on, naming the agent the words
+        // named ("start codex"), or says why that one cannot start.
+        const tasks = Array.isArray(intent.tasks) ? intent.tasks
+          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : [];
+        if (startList(tasks).length > 1) return this._proposeStart(startList(tasks));
+        return this._startNow(tasks, intent.harness);
+      }
       case 'task':
-        return this._proposeStart([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
+        return this._startNow([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
       case 'help': {
-        // The parser's own words for it when it has them (commands.mjs HELP_REPLY), else the same words kept here.
+        // A parser that still sends `help` (the real one does not): its own words for it when it has them, else these.
         const words = this.deps.commands?.HELP_REPLY;
         return { reply: typeof words === 'string' && words.trim() ? words.trim() : HELP_REPLY };
       }
       case 'connect':
         // "connect", "add a key", "sign in", "agents": the page opens Agents & keys.
         return { reply: CONNECT_REPLY, openConnect: true };
+      case 'permissions': {
+        // "full permissions", "stop asking": a card first. "ask first": off at once.
+        const r = await this._permissions(intent.mode);
+        return r.confirm ? r : { reply: r.reply };
+      }
       case 'answer':
       case 'allow':
       case 'deny': {
+        // A yes or a no to an agent that asks nothing while more than one of its helpers waits: which one is not clear.
+        const root = get(intent.agentId || focusId);
+        const waitingHelpers = root && !root.parentId && !root.ask && intent.kind !== 'answer' ? this._helpersWaiting(root.id) : [];
+        if (waitingHelpers.length > 1) {
+          const n = waitingHelpers.length;
+          return { reply: `${upperFirst(COUNT_WORD[n] || String(n))} helpers are waiting: ${joinAnd(waitingHelpers.map(h => h.name))}. Say which one.`, focusId: root.id };
+        }
         const target = intent.kind === 'answer' ? { v: get(intent.agentId || focusId) } : this._permissionTarget(intent.agentId || focusId);
         const v = target.v;
         if (!v) return { reply: target.reply || 'Which agent is that for?' };
@@ -3530,6 +4679,11 @@ export class Engine extends EventEmitter {
         const named = this._askFor(v, askId);
         if (named.reply) return { reply: named.reply, focusId: v.id };
         const ask = named.ask;
+        // A finished agent's lid: "looks good" (and its kin) or "not now", said, does what its button does, and starts nothing
+        const words = String(intent.text ?? '').trim();
+        if (!ask && intent.kind === 'answer' && !v.parentId && DONE.has(v.state) && (LOOKS_GOOD_RE.test(words) || NOT_NOW_RE.test(words))) {
+          return this._lookedAt(v, words);
+        }
         if (!ask) return { reply: `${v.name} is not waiting for an answer.`, focusId: v.id };
         if (intent.askId && intent.askId !== ask.id) return { reply: `${v.name} is asking something else now. Have a look, then answer again.`, focusId: v.id };
         let r;
@@ -3572,15 +4726,17 @@ export class Engine extends EventEmitter {
         if (!v) return { reply: WHICH_ONE };
         return this._reviewReply(v);
       }
+      // A bare one (`bare`: "merge them", "throw it away" with no agent in the centre): the one finished agent whose work
+      // it could act on, or a question that names them.
       case 'merge': {
-        const v = this._rootOf(intent.agentId);
-        if (!v) return { reply: WHICH_ONE };
+        const v = this._rootOf(intent.agentId) || (intent.bare ? this._bareWork('merge') : null);
+        if (!v || v.reply) return { reply: v?.reply || WHICH_ONE };
         const r = await this._proposeMerge(v, { into: typeof intent.into === 'string' && intent.into.trim() ? intent.into.trim() : null });
         return r.confirm ? r : { reply: r.reply, focusId: v.id };
       }
       case 'discard': {
-        const v = this._rootOf(intent.agentId);
-        if (!v) return { reply: WHICH_ONE };
+        const v = this._rootOf(intent.agentId) || (intent.bare ? this._bareWork('discard') : null);
+        if (!v || v.reply) return { reply: v?.reply || WHICH_ONE };
         const r = await this._proposeDiscard(v);
         return r.confirm ? r : { reply: r.reply, focusId: v.id };
       }
@@ -3617,19 +4773,46 @@ export class Engine extends EventEmitter {
       case 'sleep_idle':
         return this._sleepIdle();
       case 'confirm': {
-        // Only the card on screen: never "the latest one".
-        if (!shown) return { reply: 'There is nothing waiting for a yes or no.' };
+        // Only the card on screen: never "the latest one". With none, a yes or a no is a prompt like any other words (the
+        // real parser sends no confirm then; one that does is not answered "there is nothing waiting").
+        if (!shown) return this._startNow([{ task: said }]);
         const r = await this._confirm(shown.id, !!intent.go);
         // A typed or spoken yes that started agents puts the first one in the centre, so a second "yes" said out of
         // habit finds nothing to answer, rather than whatever asks next.
         return r.agentIds?.length && !r.focusId ? { ...r, focusId: r.agentIds[0] } : r;
       }
       default: {
-        // With a request for permission in the centre, words that are no answer say so, not the general hint.
+        // With a request for permission in the centre, words that are no answer say so.
         const asking = this._permissionInFocus(focusId);
-        return { reply: asking ? `${asking.name} is waiting for your OK. Say “yes” or “no” to it first.` : HELP };
+        if (asking) return { reply: `${asking.name} is waiting for your OK. Say “yes” or “no” to it first.` };
+        // Anything else is a prompt: there is no dead end. Words a parser did not read go to an agent as they were said.
+        const words = (typeof intent.text === 'string' && intent.text.trim()) || said;
+        return this._startNow([{ task: words }]);
       }
     }
+  }
+
+  /** The helpers of a root that wait on the person (a question, a permission, a stuck ask). */
+  _helpersWaiting(rootId) {
+    return this.store.list().filter(a => a.parentId && (a.rootId === rootId || a.parentId === rootId) && a.ask && typeof a.ask === 'object');
+  }
+
+  /**
+   * The agent a bare merge or throw-away means ("merge them", "throw it away" with no agent in the centre): the one
+   * finished root whose work it could act on now (_mergeRefusal or _discardRefusal says nothing against it, and its work
+   * is not settled), or { reply } naming them ("Merge which? Invoice export or Price rounding."), or saying there is none.
+   */
+  _bareWork(verb) {
+    const merge = verb === 'merge';
+    const can = this.store.list().filter(v => !v.parentId && (ENDED.has(v.state) || v.earlier) && !workSettled(v)
+      && !(merge ? this._mergeRefusal(v) : this._discardRefusal(v)))
+      .sort((a, b) => (Number(a.startedAt) || 0) - (Number(b.startedAt) || 0)); // in the order they started
+    if (can.length === 1) return this.store.get(can[0].id);
+    const what = merge ? 'merge' : 'throw away';
+    if (!can.length) return { reply: `No finished agent has work to ${what} right now.` };
+    const names = can.slice(0, 4).map(v => v.name);
+    const rest = can.length - names.length;
+    return { reply: `${upperFirst(what)} which? ${rest ? `${names.join(', ')} or ${rest} more` : joinOr(names)}.` };
   }
 
   /** The agent in the centre, or its one helper, when it waits for permission; else null. */
@@ -3678,23 +4861,29 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * A launch card for these tasks. A task whose words name no agent goes to the default agent (_defaultHarness). With no
-   * agent ready, or one named that cannot run here, the reply says so and carries `openConnect`, so the page opens
-   * Agents & keys. With no task, the reply asks what to work on: `named`, the agent the words named ("start codex"),
-   * is asked about by name when it can start, and is refused as a task naming it would be when it cannot.
+   * Start these tasks' agents at once, whether full permissions are on or off: one agent is never asked about, and more
+   * than one from one sentence comes here after its card's yes (_proposeStart). A task whose
+   * words name no agent goes to the default agent (_defaultHarness). With no agent ready, or one named that cannot run
+   * here, nothing starts, and the reply says so and carries `openConnect`, so the page opens Agents & keys. With no task,
+   * the reply asks what to work on: `named`, the agent the words named ("start codex"), is asked about by name when it
+   * can start, and is refused as a task naming it would be when it cannot. The reply is the notice of what started
+   * (startedSentence), said once, then anything that could not start; `agentIds`: the agents that started, first to
+   * last. It comes once each agent is on the board, before its copy is made ready (see _begin). It names no agent to put
+   * in the centre: what is there stays.
    */
-  _proposeStart(tasks, named = null) {
-    const list = (Array.isArray(tasks) ? tasks : [])
-      .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
-      .filter(t => t.task)
-      .slice(0, 8);
+  async _startNow(tasks, named = null) {
+    const list = startList(tasks);
     let def; // looked up once, and only when a task names no agent
     const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
     if (!list.length) {
+      // Nothing to work on yet: with no agent ready, that comes first, since nothing could start it. Otherwise ask, naming
+      // the agent (the one the words named, else the default), and the next words are its prompt (command(): _askedFor).
       const h = AGENT_HARNESSES.includes(named) ? named : null;
-      if (h) return this._canRun(h) ? { reply: `What should ${harnessName(h)} work on?` } : this._cannotRunReply(h);
-      // Nothing to work on yet: with no agent ready, that comes first, since nothing could start it.
-      return fallback() === null ? { reply: NO_AGENT, openConnect: true } : { reply: 'What should the agent work on?' };
+      if (h && !this._canRun(h)) return this._cannotRunReply(h);
+      const who = h || fallback();
+      if (!who) return { reply: NO_AGENT, openConnect: true };
+      this._askedFor = { harness: who, at: this.now() };
+      return { reply: `What should ${harnessName(who)} work on?` };
     }
     for (const t of list) {
       if (!t.harness) t.harness = fallback();
@@ -3703,53 +4892,75 @@ export class Engine extends EventEmitter {
     for (const t of list) {
       if (!this._canRun(t.harness)) return this._cannotRunReply(t.harness);
     }
-    const detail = this._startDetail(list);
-    // Live mode has no cloud machines: launches go to the laptop, and the question should not say otherwise.
+    // Live mode has no cloud machines: its agents run on the laptop.
     if (this.mode !== 'demo') for (const t of list) t.machine = null;
-    let sentence = null;
-    if (typeof this.deps.commands?.describeIntent === 'function') {
+    // Every start is in the log, when it came and how it ended, so "I pressed Enter and nothing happened" can be read
+    // from it: no line, the page never sent it; this line alone, the start has not ended.
+    this.log.warn(`Words came that start work: starting ${list.length === 1 ? 'one agent' : `${list.length} agents`}.`);
+    const used = new Set();
+    const started = [];
+    const problems = [];
+    let openConnect = false; // an agent went away since it was found ready: Agents & keys is where to bring it back
+    // In live mode each agent's copy is made ready before it starts (_prepare: its files, then the setup command once the
+    // person said Run it to it). These launches share the answer to a setup card (`burst`, see _setupAnswer), so a start
+    // card's yes asks it once, and each is waited for only until it is on the board and has started or begun something
+    // slow (its copy, the setup card, its setup command): the reply never waits on those, and one that then cannot start
+    // says so in a notice of its own.
+    const burst = { setup: new Map() };
+    for (const t of list) {
       try {
-        const s = this.deps.commands.describeIntent({ kind: 'start', tasks: list }, this._commandContext(null));
-        if (typeof s === 'string' && s.trim()) sentence = s.trim();
+        const machineId = await this._pickMachine(t.machine, used);
+        used.add(machineId);
+        const l = await this._begin({ task: t.task, harness: t.harness, machineId }, burst);
+        const v = l.view;
+        if (v.state === STATE.FAILED) {
+          problems.push(`${v.name} could not start. ${v.stateReason || ''}`.trim());
+          continue;
+        }
+        started.push({ v, harness: t.harness, task: t.task });
+        if (!l.done) {
+          l.started.then(after => {
+            if (after?.state === STATE.FAILED) this._notice(`${after.name} could not start. ${after.stateReason || ''}`.trim(), after.id);
+          }, () => {});
+        }
       } catch (err) {
-        this.log.debug('describeIntent failed:', err);
+        if (err?.openConnect && this.mode === 'live') openConnect = true;
+        // A task refused for holding a key is not quoted: a reply is never masked.
+        if (err?.message === SECRET_REFUSED) {
+          if (!problems.includes(SECRET_REFUSED)) problems.push(SECRET_REFUSED);
+        } else {
+          problems.push(`I could not start the agent for “${clip(t.task, 50)}”: ${plainReason(err)}`);
+        }
       }
     }
-    if (!sentence) {
-      const label = (t) => (this.mode === 'demo' ? `a simulated ${harnessName(t.harness)}` : harnessName(t.harness));
-      sentence = list.length === 1
-        ? `Start ${label(list[0])} on “${clip(list[0].task, 90)}”${/\?$/.test(clip(list[0].task, 90)) ? '' : '?'}`
-        : `Start ${list.length} agents: ${joinAnd(list.map(t => `${label(t)} on “${clip(t.task, 50)}”`))}?`;
-    }
-    return this._newConfirm({ kind: 'start', tasks: list, sentence, detail });
-  }
-
-  _startDetail(list) {
-    const many = list.length > 1;
-    const cloud = list.some(t => t.machine && t.machine !== 'laptop');
-    if (this.mode === 'demo') {
-      const where = cloud ? (many ? 'Each one gets its own cloud machine.' : 'It runs on a cloud machine.') : (many ? 'They run on your laptop.' : 'It runs on your laptop.');
-      return `This is the demo: the agents are simulated and nothing is spent. ${where}`;
-    }
-    // Codex reports no cost, so a Codex agent has no spending limit; Claude Code's is the run's default.
-    const codex = list.filter(t => t.harness === 'codex').length;
-    const limit = money(this.defaultBudgetUsd);
-    const parts = [codex === 0 ? `${many ? 'Each one' : 'It'} can spend up to ${limit}.`
-      : codex === list.length ? `Codex reports no cost, so ${many ? 'they have' : 'it has'} no spending limit.`
-        : `Each Claude Code agent can spend up to ${limit}. Codex reports no cost, so it has no spending limit.`];
-    const repo = this.repoInfo;
-    if (repo) {
-      parts.push(`${many ? 'Each works' : 'It works'} in its own copy of ${repo.name || 'the repository'}, made from the last commit.`);
-      const dirty = Number(repo.dirty) || 0;
-      if (dirty > 0) parts.push(`Your ${dirty} uncommitted change${dirty === 1 ? ' is' : 's are'} not included.`);
-    }
-    if (cloud) parts.push('Cloud machines exist only in the demo, so it runs on your laptop.');
-    return parts.join(' ');
+    const parts = [];
+    if (started.length) parts.push(startedSentence(started, this.mode === 'demo'));
+    parts.push(...problems);
+    this.log.warn(`Of the work asked for, ${started.length} of ${list.length} started.${problems.length ? ` ${problems.join(' ')}` : ''}`);
+    return { reply: parts.join(' '), agentIds: started.map(s => s.v.id), ...(openConnect ? { openConnect: true } : {}) };
   }
 
   /**
-   * A stop or a message whose words found the agent without naming it ("stop the stuck one"): ask first, with the
-   * same kind of confirm card as a launch.
+   * More than one agent from one sentence ("start three agents on the login page", "start claude and codex on the
+   * parser"): asked first, with a card, since each one spends on its own. What would refuse the start refuses it now,
+   * with no card: no agent ready, or one named that cannot run here. The card names the agents that would start (the
+   * default one for work that names none), in the words of the notice of a start ("Start three Claude agents on “the login
+   * page”?"); its yes starts them (_startNow checks everything again), its no starts nothing. `list`: startList's tasks.
+   */
+  _proposeStart(list) {
+    let def;
+    const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
+    const tasks = list.map(t => ({ ...t, harness: t.harness || fallback() }));
+    if (tasks.some(t => !t.harness)) return { reply: NO_AGENT, openConnect: true };
+    for (const t of tasks) if (!this._canRun(t.harness)) return this._cannotRunReply(t.harness);
+    const limit = tasks.some(t => t.harness === 'claude') ? ` A Claude agent can spend up to ${money(this.defaultBudgetUsd)}.` : '';
+    const detail = this.mode === 'demo' ? 'This is the demo, so nothing is spent.' : `Each one works in its own folder and spends on its own.${limit}`;
+    return this._newConfirm({ kind: 'start', tasks, sentence: startQuestion(tasks, this.mode === 'demo'), detail, yes: 'Start them', no: 'Cancel' });
+  }
+
+  /**
+   * A stop or a message whose words found the agent without naming it ("stop the stuck one"): ask first, with a
+   * confirm card.
    */
   _proposeIntent(intent) {
     let sentence = null;
@@ -3769,7 +4980,7 @@ export class Engine extends EventEmitter {
     return this._newConfirm({ kind: intent.kind, intent, sentence, detail });
   }
 
-  /** Execute (go = true) or cancel a launch, stop or message proposed by command(). */
+  /** Carry out (go = true) or cancel a card command() or a button proposed: a stop, a message, forget, merge, throw away or full permissions. */
   async confirm(confirmId, go) {
     const out = await this._confirm(confirmId, go);
     this._notice(out.reply, out.focusId || null);
@@ -3777,6 +4988,9 @@ export class Engine extends EventEmitter {
   }
 
   async _confirm(confirmId, go) {
+    // A setup card: Run it or Not now, for every launch waiting on it.
+    const d = this._setupAsks.get(String(confirmId ?? ''));
+    if (d) return this._answerSetup(d, go);
     const c = this.confirms.get(String(confirmId ?? ''));
     if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) {
       if (c) this.confirms.delete(c.id);
@@ -3803,43 +5017,27 @@ export class Engine extends EventEmitter {
       case 'discard':
         if (!go) return { reply: 'OK, I won’t throw it away.' };
         return this._discardConfirmed(c);
-      case 'start':
-        if (Array.isArray(c.tasks)) break;
-      // falls through: a launch card without its tasks cannot be one
+      case 'permissions':
+        // A card made before the mode last changed asked another question than the one on now: neither answer acts.
+        if (c.modeAt !== this._modeChanges) return { reply: MODE_CHANGED };
+        if (!go) return { reply: 'OK, agents still ask before risky steps.' };
+        return this._fullOn();
+      case 'start': {
+        // More than one agent from one sentence, asked first (_proposeStart). Only a card that holds them starts them:
+        // a start card without its tasks is none.
+        const tasks = startList(c.tasks);
+        if (tasks.length < 2) {
+          this.log.warn('A start card without the work it asked about was answered; nothing was done.');
+          return { reply: GONE };
+        }
+        if (!go) return { reply: 'OK, I won’t start them.' };
+        return this._startNow(tasks);
+      }
       default:
+        // One agent starts at once (_startNow), and only a start card starts more: a kind nobody knows does nothing.
         this.log.warn(`A confirm card of an unknown kind (${String(c.kind)}) was answered; nothing was done.`);
         return { reply: GONE };
     }
-    if (!go) return { reply: c.tasks.length === 1 ? 'OK, I won’t start it.' : 'OK, I won’t start them.' };
-    // Every yes to a launch is in the log, when it came and how it ended, so "I pressed Do it and nothing happened" can
-    // be read from it: no line, the page never sent it; this line alone, the launch has not ended.
-    this.log.warn(`A yes to a launch question came: starting ${c.tasks.length === 1 ? 'one agent' : `${c.tasks.length} agents`}.`);
-    const used = new Set();
-    const started = [];
-    const problems = [];
-    let openConnect = false; // an agent was gone by the time of the yes: Agents & keys is where to bring it back
-    for (const t of c.tasks) {
-      try {
-        const machineId = await this._pickMachine(t.machine, used);
-        used.add(machineId);
-        const v = await this._startAgent({ task: t.task, harness: t.harness, machineId });
-        if (v.state === STATE.FAILED) problems.push(`${v.name} could not start. ${v.stateReason || ''}`.trim());
-        else started.push(v);
-      } catch (err) {
-        if (err?.openConnect && this.mode === 'live') openConnect = true;
-        // A task refused for holding a key (stored after the card was made) is not quoted: a reply is never masked.
-        if (err?.message === SECRET_REFUSED) {
-          if (!problems.includes(SECRET_REFUSED)) problems.push(SECRET_REFUSED);
-        } else {
-          problems.push(`I could not start the agent for “${clip(t.task, 50)}”: ${plainReason(err)}`);
-        }
-      }
-    }
-    const parts = [];
-    if (started.length) parts.push(`Started ${joinAnd(started.map(v => v.name))}.`);
-    parts.push(...problems);
-    this.log.warn(`After a yes to a launch question, ${started.length} of ${c.tasks.length} started.${problems.length ? ` ${problems.join(' ')}` : ''}`);
-    return { reply: parts.join(' '), agentIds: started.map(v => v.id), ...(openConnect ? { openConnect: true } : {}) };
   }
 
   /** Demo only: 'cloud' picks a free cloud machine (waking one if needed); live is always the laptop. */
@@ -4063,6 +5261,11 @@ export class Engine extends EventEmitter {
       spendTodayUsd: s.spendTodayUsd,
       spendTodayEstimated: !!s.spendTodayEstimated, // part of it is Workbench's estimate: say "about"
       defaultBudgetUsd: this.defaultBudgetUsd,
+      // 'full' while full permissions are on, else 'ask': the top band's Full permissions button
+      permissions: this.permissionMode,
+      // Live only, while launches wait on it: the setup card ({ id, kind: 'setup', sentence, command, detail, yes, no }),
+      // which the page shows in the core until it is answered (POST /api/confirm/:id).
+      ...(this._setupAsks.size ? { setup: this._setupCard() } : {}),
     };
   }
 }

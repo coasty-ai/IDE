@@ -2092,9 +2092,11 @@ export class Simulator {
    * @param {string} agentId
    * @param {{ id?: string, type?: string }|null} ask  the ask being answered, as the store holds it
    * @param {string} answer
+   * @param {{ how?: 'auto' }} [opts]  how: 'auto' when Workbench answered by itself (full permissions are on): its
+   *        approval is an automatic one, not the person's
    * @returns {{ ok: boolean, reply: string }}
    */
-  onAnswer(agentId, ask, answer) {
+  onAnswer(agentId, ask, answer, { how = 'person' } = {}) {
     this._sync();
     const a = this._agents.get(agentId);
     if (!a) return { ok: false, reply: 'That agent is not part of the demo.' };
@@ -2103,7 +2105,7 @@ export class Simulator {
     if (askId && this._answered.has(askId)) return { ok: true, reply: 'That was already answered.' };
     const own = a.pendingAsk;
     // Its own ask is answered only by its id; words that name no ask are a message, as in the engine.
-    if (own && askId === own.id) return this._resolveOwnAsk(a, own, text);
+    if (own && askId === own.id) return this._resolveOwnAsk(a, own, text, how);
     if (askId) this._answered.add(askId);
     const type = ask ? ask.type : null;
     if (type === 'stuck') {
@@ -2123,14 +2125,14 @@ export class Simulator {
     return this._message(a, String(text ?? '').trim(), null);
   }
 
-  _resolveOwnAsk(a, ask, text) {
+  _resolveOwnAsk(a, ask, text, how = 'person') {
     this._answered.add(ask.id);
     a.pendingAsk = null;
     a.lastAnswer = { text, at: this._now() };
     this._ev(a, EV.ASK_CLEARED, { askId: ask.id, answer: text });
     if (ask.type === 'permission') {
       const allow = isAllow(text);
-      this._ev(a, EV.APPROVAL, { how: 'person', decision: allow ? 'allow' : 'deny', sentence: ask.sentence });
+      this._ev(a, EV.APPROVAL, { how: how === 'auto' ? 'auto' : 'person', decision: allow ? 'allow' : 'deny', sentence: ask.sentence });
       this._ev(a, EV.STATE, { state: STATE.WORKING });
       a.phase = 'working';
       this._resume(a, { allow, text });

@@ -4,6 +4,7 @@ import { narrate, describeCommand, describeRequest, commandAction, shellCommands
 import { duration, tokens, money, percent, clip, shortModel, spentText, spentAmount } from '../src/shared/format.mjs';
 import { STATE, LOOK, PRIORITY, NEEDS_YOU, lookOf } from '../src/shared/states.mjs';
 import { EV, newAgentView, SPARK_BUCKETS } from '../src/shared/events.mjs';
+import { FILLER, onlyFiller } from '../src/shared/filler.mjs';
 
 test('narrate turns tool calls into short sentences', () => {
   assert.equal(narrate('Read', { file_path: '/repo/src/greet.js' }).sentence, 'Reading greet.js');
@@ -380,4 +381,39 @@ test('agent.work is an event of its own, and a new view has no work until a root
   assert.equal(new Set(Object.values(EV)).size, Object.values(EV).length, 'every event kind is its own');
   assert.equal(newAgentView({ agentId: 'abc123', name: 'X', harness: 'claude' }, 1000).work, null);
   assert.equal(newAgentView({ agentId: 'abc123-h1', parentId: 'abc123', name: 'Y', harness: 'claude' }, 1000).work, null);
+});
+
+test('the words that answer a finished agent\'s lid are one list, for the engine and the page alike', async () => {
+  const { LOOKS_GOOD_RE, NOT_NOW_RE } = await import('../src/shared/answers.mjs');
+  for (const s of ['Looks good', 'looks good.', 'LGTM', 'thanks!', 'Thank you', 'ok', 'Okay', 'fine', 'all good', 'great!!']) assert.ok(LOOKS_GOOD_RE.test(s), s);
+  for (const s of ['Not now', 'not now.', 'NOT NOW!']) assert.ok(NOT_NOW_RE.test(s), s);
+  for (const s of ['looks good, merge it', 'not now, but later', 'good job on the parser', 'ok go ahead and stop it', 'later', 'look later', '']) {
+    assert.ok(!LOOKS_GOOD_RE.test(s) && !NOT_NOW_RE.test(s), JSON.stringify(s));
+  }
+  // the engine takes its answers from this list, not from a copy of its own
+  const { readFileSync } = await import('node:fs');
+  const engine = readFileSync(new URL('../src/core/engine.mjs', import.meta.url), 'utf8');
+  assert.match(engine, /import \{ LOOKS_GOOD_RE, NOT_NOW_RE \} from '\.\.\/shared\/answers\.mjs';/);
+  assert.doesNotMatch(engine, /const (LOOKS_GOOD_RE|NOT_NOW_RE)\b/);
+});
+
+test('how a secret shows and how text is masked are one rule, in src/shared/mask.mjs: the key store and the engine both use it', async () => {
+  const shared = await import('../src/shared/mask.mjs');
+  const keys = await import('../src/core/keys.mjs');
+  assert.equal(keys.shownValue, shared.shownValue, 'the key store gives the shared one');
+  assert.equal(keys.maskSecrets, shared.maskSecrets);
+  const value = ['sk', 'test', 'Zq81mNw2'].join('-');
+  assert.equal(shared.maskSecrets(`DATABASE_PASSWORD=${value} done`, Object.freeze([value])), 'DATABASE_PASSWORD=•••• mNw2 done');
+  assert.equal(shared.shownValue('short'), '••••');
+  const { readFileSync } = await import('node:fs');
+  const text = readFileSync(new URL('../src/shared/mask.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(text, /from 'node:/, 'the page may load it as it is');
+  const engine = readFileSync(new URL('../src/core/engine.mjs', import.meta.url), 'utf8');
+  assert.match(engine, /import \{ maskSecrets \} from '\.\.\/shared\/mask\.mjs';/);
+});
+
+test('filler: words heard that are only um, uh or hmm, or nothing at all, send nothing; anything more is said', () => {
+  for (const t of ['um', 'Uh.', 'uh uh', 'hmm...', 'Hmm?', 'erm, um', '', '   ', '…']) assert.equal(onlyFiller(t), true, JSON.stringify(t));
+  for (const t of ['um yes', 'hmm stop', 'uh, fix the login', 'thanks', 'ok', 'no', '👍 hm', 'umbrella']) assert.equal(onlyFiller(t), false, JSON.stringify(t));
+  assert.ok(FILLER.has('um') && FILLER.has('hmm') && !FILLER.has('ok'));
 });

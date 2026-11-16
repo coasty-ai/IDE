@@ -110,7 +110,11 @@ function cleanUsage(u) {
 function cleanWorkspace(w) {
   if (!w || typeof w !== 'object' || typeof w.path !== 'string' || !path.isAbsolute(w.path)) return null;
   if (w.path.length > 4096 || w.path.includes('\0')) return null;
-  return { path: w.path, branch: agentBranch(w.branch), base: sha(w.base), since: sha(w.since), from: branchName(w.from) };
+  // What Workbench copied into it (fillWorkspace): repository-relative paths, at most 200, so a later run's tidy-up knows them.
+  const copied = Array.isArray(w.copied)
+    ? w.copied.filter(p => typeof p === 'string' && p !== '' && p.length <= 4096 && !p.includes('\0') && !p.startsWith('/') && !p.split('/').includes('..')).slice(0, 200)
+    : [];
+  return { path: w.path, branch: agentBranch(w.branch), base: sha(w.base), since: sha(w.since), from: branchName(w.from), ...(copied.length ? { copied } : {}) };
 }
 
 /** What became of an agent's work in git (AgentView.work), field by field. */

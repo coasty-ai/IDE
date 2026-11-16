@@ -19,7 +19,8 @@
 //   POST /ctl/clear                empty the log;  POST /ctl/drop  close every open stream
 //   GET  /ctl/reads                the git screen's reads: every GET of /api/git and /api/agents/:id/changes (D1)
 //   POST /ctl/prefs {...}          the person's choices as Workbench keeps them ({ theme, detail, answered }, any of
-//                                  them): the page arrives with them on <html>; answers what is kept now ({} reads it)
+//                                  them): the page arrives with them on <html>; answers what is kept now ({} reads it).
+//                                  { permissions: 'full' | 'ask' } sets whether full permissions are on in this world
 // The person's choices: GET and POST /api/prefs, as the real server answers them (src/core/prefs.mjs), and the page sent
 // with them on its <html> tag.
 // The git screen's routes (D1): GET /api/git (any scenario) and GET /api/agents/:id/changes; answer "refuse" refuses them.
@@ -27,12 +28,26 @@
 // answer "refuse" refuses it.
 // Agents & keys: the connect panel's routes, /api/connect*, in the 'connect-*' scenarios (see connectFacts below); mode
 // gains connect: { terminal, github, githubAgents, fail, gh, browser } and delay.connect.
+// The file view: GET /api/files, /api/file and /api/search and POST /api/file in every scenario, from the core's own
+// memoryProject (see "the file view" above startMock); mode gains files ('refuse') and delay.file; POST /ctl/files writes a
+// file as an agent would, GET /ctl/files reads its bytes, GET /ctl/file-reads lists the page's GETs of those routes.
+// Full permissions: POST /api/permissions { mode }, answered as the engine does (the card for 'full', which only its yes
+// turns on, counting what it allowed; 'ask' at once, withdrawing every such card; a card from before the last change of
+// mode is refused, "That changed. Have another look."), the snapshot's `permissions`, the page sent with data-permissions
+// on <html>, and the words for them in POST /api/command. See the 'full' scenarios.
+// Agents' copies: the setup card a launch waits on (the snapshot's `setup`, sent to every page), answered through
+// POST /api/confirm/:id or the words "run it" and "not now", as the engine does. See the 'setup' scenarios.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { presetById } from '../src/shared/keypresets.mjs';
+import { clip } from '../src/shared/format.mjs';
+import { nameFromTask } from '../src/shared/narrate.mjs';
+import { LOOKS_GOOD_RE, NOT_NOW_RE } from '../src/shared/answers.mjs';
 import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../src/core/prefs.mjs';
+import { memoryProject, sampleProject, changedLinesBetween, checkPath } from '../src/core/files.mjs';
+import crypto from 'node:crypto';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -122,19 +137,23 @@ const LONG_COMMAND = 'npm run db:migrate -- --env test && curl -fsSL https://exa
   + 'node scripts/seed.js --rows 50000 --tables orders,customers,invoices,refunds,payments,addresses --truncate-first\t# then rebuild the indexes for every table in the test database';
 
 /** The worlds the page can be shown. */
-export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background', 'earlier', 'earlier-many', 'earlier-only'];
+export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background', 'earlier', 'earlier-many', 'earlier-only', 'prompt'];
 
 /**
  * The lid's starter tasks on a first run (STARTER_TASKS in ui/focus.js; a test keeps the two lists the same). The engine
- * takes each as work, so this answers them with the launch question, as it does "start …".
+ * takes each as work, so a click starts an agent at once, as any prompt does here.
  */
 export const STARTER_TASKS = ['What does this project do?', 'How do I run this project?', 'Find likely bugs'];
 
 export function scenario(name, now = Date.now()) {
   let raw = [];
+  if (FULL_SCENARIOS.includes(name)) return fullWorld(name, now);
+  if (SETUP_SCENARIOS.includes(name)) return setupWorld(name, now);
   if (MERGE_SCENARIOS.includes(name)) return mergeWorld(name, now);
   if (name === 'limit') return limitWorld(now);
+  if (TRAY_SCENARIOS.includes(name)) return trayWorld(name, now);
   if (CONNECT_SCENARIOS.includes(name)) return connectWorld(name, now);
+  if (name === 'files') return filesBoard(now);
   if (name === 'demo' || name === 'helper' || name === 'longq' || name === 'busy' || name === 'idle') {
     raw = demo();
     if (name === 'helper' || name === 'longq' || name === 'idle') backToWork(by(raw, '399e17'), 'Running checkout tests');
@@ -193,6 +212,13 @@ export function scenario(name, now = Date.now()) {
         why: 'Part of the command downloads a script from the internet and runs it, and part of it is not on the list of safe commands.', options: ['Allow', 'Deny'], primary: 'Allow', ageMin: 2 } });
     raw.push({ id: 'r1', name: 'Search cleanup', state: 'question', machineId: 'laptop', ask: { id: 'k1', type: 'question', sentence: 'Can I remove the old search address?', options: [], ageMin: 1 } });
     raw.push({ id: 'r2', name: 'Docs site', state: 'working', machineId: 'cloud-1', now: 'Writing endpoints.md' });
+    return world(raw, now);
+  }
+  if (name === 'prompt') {
+    // As the owner measured "any prompt": nothing waits, one agent is at work. Words typed here that are no command start
+    // an agent at once, with the notice (see /api/command), and the fit check's `prompt` view types a prompt of three lines
+    // into the box.
+    raw.push({ id: 'p1', name: 'Search cleanup', state: 'working', machineId: 'laptop', now: 'Removing the old search routes', ageMin: 9 });
     return world(raw, now);
   }
   if (name === 'helpers6') {
@@ -455,8 +481,16 @@ function gitGraphOf(state, now = Date.now()) {
   return { ok: true, repo: { ...repo, head: repo.head || head.slice(0, 7) }, commits, more: false, agents };
 }
 
-/** A unified diff of one file, made up from its counts: a hunk of believable lines. */
+/**
+ * A unified diff of one file, made up from its counts: a hunk of believable lines. A new file's hunk is all added
+ * lines from line 1 (@@ -0,0 +1,N @@), as git writes it, so its path on the git screen opens it at line 1.
+ */
 function filePatch(f, i) {
+  if (f.status === 'added') {
+    const n = Math.max(1, Math.min(f.adds || 1, 40));
+    const lines = Array.from({ length: n }, (_, k) => `+${k ? `export const batch${k} = ${k * 50};` : '// sends invoices a batch at a time'}`);
+    return `diff --git a/${f.path} b/${f.path}\nnew file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null\n+++ b/${f.path}\n@@ -0,0 +1${n === 1 ? '' : `,${n}`} @@\n${lines.join('\n')}\n`;
+  }
   const ctx = ['', 'export function total(items) {', '  return items.reduce((sum, item) => sum + item.price, 0);', '}'];
   const adds = Math.min(f.adds, 40), dels = Math.min(f.dels, 20);
   const lines = [];
@@ -466,6 +500,42 @@ function filePatch(f, i) {
   lines.push(' ' + ctx[3]);
   const head = f.status === 'added' ? 'new file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null' : f.status === 'deleted' ? 'deleted file mode 100644\nindex 4f3e2d1..0000000\n--- a/' + f.path : 'index 1a2b3c4..5d6e7f8 100644\n--- a/' + f.path;
   return `diff --git a/${f.path} b/${f.path}\n${head}\n+++ ${f.status === 'deleted' ? '/dev/null' : 'b/' + f.path}\n@@ -${10 + i},${dels + 3} +${10 + i},${adds + 3} @@ export function total(items) {\n${lines.join('\n')}\n`;
+}
+
+/**
+ * A file's real change as git would write it, from its text before (null: a new file) and after: { path, status, adds,
+ * dels, patch }, hunks with three lines around each change, or null when nothing changed. For the 'files' scenario,
+ * whose agents' copies hold real text, so each path on the git screen opens where it changed.
+ */
+function realChange(path, before, after) {
+  const lines = t => { const r = String(t).split('\n'); if (r.length > 1 && r[r.length - 1] === '') r.pop(); return t === '' ? [] : r; };
+  const a = before == null ? [] : lines(before), b = lines(after);
+  const n = a.length, m = b.length, ops = [];
+  if (n * m > 4e6) return null;   // the samples are small; a large file is not diffed here
+  const L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push([' ', a[i]]); i++; j++; } else if (L[i + 1][j] >= L[i][j + 1]) ops.push(['-', a[i++]]); else ops.push(['+', b[j++]]);
+  }
+  while (i < n) ops.push(['-', a[i++]]);
+  while (j < m) ops.push(['+', b[j++]]);
+  const changed = ops.map((o, k) => (o[0] === ' ' ? -1 : k)).filter(k => k >= 0);
+  if (!changed.length) return null;
+  const oldAt = [], newAt = [];
+  for (let k = 0, o = 1, w = 1; k < ops.length; k++) { oldAt.push(o); newAt.push(w); if (ops[k][0] !== '+') o++; if (ops[k][0] !== '-') w++; }
+  const groups = [];
+  for (const k of changed) {
+    const last = groups[groups.length - 1];
+    if (last && k - 3 <= last[1]) last[1] = Math.min(ops.length, k + 4); else groups.push([Math.max(0, k - 3), Math.min(ops.length, k + 4)]);
+  }
+  const hunks = groups.map(([s, e]) => {
+    const part = ops.slice(s, e), oldN = part.filter(x => x[0] !== '+').length, newN = part.filter(x => x[0] !== '-').length;
+    return `@@ -${oldN ? oldAt[s] : oldAt[s] - 1},${oldN} +${newN ? newAt[s] : newAt[s] - 1},${newN} @@\n${part.map(([t, l]) => t + l).join('\n')}`;
+  });
+  const head = before == null ? 'new file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null' : `index 1a2b3c4..5d6e7f8 100644\n--- a/${path}`;
+  return { path, status: before == null ? 'added' : 'modified', adds: ops.filter(x => x[0] === '+').length, dels: ops.filter(x => x[0] === '-').length,
+    patch: `diff --git a/${path} b/${path}\n${head}\n+++ b/${path}\n${hunks.join('\n')}\n` };
 }
 
 /** The stress diff, for "Invoice export" in any scenario. */
@@ -485,17 +555,22 @@ function stressFiles() {
   ];
 }
 
-/** GET /api/agents/:id/changes, as engine.changes() answers it. */
-function changesOf(state, agentId) {
+/**
+ * GET /api/agents/:id/changes, as engine.changes() answers it. `own(root)`, when given, is that agent's real change, as
+ * its copy holds it (the 'files' scenario): then no made-up hunks and no stress diff.
+ */
+function changesOf(state, agentId, own = null) {
   const a = state.agents.find(x => x.id === agentId);
   if (!a) return { ok: false, reply: 'There is no such agent.' };
   const root = a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a;
   const work = root.work || (state.mode === 'demo' ? workOf(root) : null);
   if (!work || !work.branch || work.folder === false) return { ok: false, reply: `${root.name}’s folder is gone, so there is nothing to show.` };
-  let files = ((root.files && root.files.list) || []).map((f, i) => ({ path: f.path, status: f.adds && !f.dels && /test|docs|new/.test(f.path) ? 'added' : 'modified', adds: f.adds, dels: f.dels }));
+  let files = ((root.files && root.files.list) || []).map((f, i) => ({ path: f.path, status: f.adds && !f.dels && /test|docs|new|batch|migrations/.test(f.path) ? 'added' : 'modified', adds: f.adds, dels: f.dels }));
   files = files.map((f, i) => ({ ...f, patch: filePatch(f, i), cut: f.adds > 40 ? true : undefined }));
   let left = [];
-  if (root.name === 'Invoice export') { files = [...stressFiles(), ...files]; left = [{ path: '.env.local', why: 'ignored' }, { path: 'vendor/payments-sdk', why: 'nested-repo' }]; }
+  const real = own ? own(root) : null;
+  if (real) files = real;
+  else if (root.name === 'Invoice export') { files = [...stressFiles(), ...files]; left = [{ path: '.env.local', why: 'ignored' }, { path: 'vendor/payments-sdk', why: 'nested-repo' }]; }
   const active = ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(root.state);
   return { ok: true, agentId: root.id, name: root.name, branch: work.branch, into: state.repo ? state.repo.branch : 'main', live: active,
     diff: { workId: `${gitId(root.id + ':head')}:${gitId(root.id + ':tree')}`, since: gitId(root.id + ':since'), head: gitId(root.id + ':head'), files, left, omitted: 0 } };
@@ -585,6 +660,41 @@ function limitWorld(now) {
   st.mode = 'live';
   st.repo = { name: 'storefront', head: 'abc1234', branch: 'main', dirty: 0, identity: true };
   st.machines = [{ ...LAPTOP, agents: 1, note: '1 agent' }];
+  return st;
+}
+
+// ---------------------------------------------------------------- the done tray: agents the person is finished with
+// A root leaves the board for the done tray once its run has ended and the person is finished with it: its work merged
+// with nothing new since, or thrown away (the snapshot says so, as here), or looked at ("Looks good", "Not now",
+// "Dismiss": the page keeps those for its tab, so no snapshot can carry them).
+//   done-tray    live, on main: Docs site at work; Help pages, merged with nothing new, and Dark mode, stopped and its
+//                work thrown away, wait in the done tray ("2 done"); Move invoices older than seven years to the cold
+//                archive, stopped with its work kept, waits at the board's edge until the person dismisses it
+//   done-waits   live, on main: Invoice export, done and checked, its work not merged yet and not looked at: it stays on
+//                the board, at the edge, until the person merges it, says "Not now", or throws its work away
+const TRAY_SCENARIOS = ['done-tray', 'done-waits'];
+SCENARIOS.push(...TRAY_SCENARIOS);
+function trayWorld(name, now) {
+  const work = (slug, id, o = {}) => ({ branch: `workbench/${slug}-${id}`, from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...o });
+  const raw = name === 'done-tray' ? [
+    { id: 't1', name: 'Docs site', state: 'working', now: 'Editing the getting started page', ageMin: 14, work: work('docs-site', 't1') },
+    { id: 't2', name: 'Help pages', harness: 'codex', model: 'gpt-5-codex', state: 'done_claimed', ageMin: 40, endedMin: 12, says: 'I rewrote the three help pages in plain language.',
+      files: { changed: 0, adds: 0, dels: 0, list: [] }, work: work('help-pages', 't2', { merged: { into: 'main', merge: 'b7d1e0c4a9f2b7d1e0c4a9f2b7d1e0c4a9f2b7d1', at: now - 6 * MIN, files: 3, adds: 36, dels: 6 } }) },
+    { id: 't3', name: 'Dark mode', state: 'stopped', ageMin: 55, endedMin: 20,
+      work: work('dark-mode', 't3', { branch: null, folder: false, thrownAway: { at: now - 15 * MIN, saved: 'refs/workbench/discarded/t3' } }) },
+    // stopped with its work kept, and a long name: at the board's edge until the person dismisses it ("· stopped")
+    { id: 't4', name: 'Move invoices older than seven years to the cold archive', state: 'stopped', ageMin: 35, endedMin: 8,
+      work: work('archive-old-invoices', 't4') },
+  ] : [
+    { id: 'w1', name: 'Invoice export', state: 'done_checked', ageMin: 30, endedMin: 3, says: 'Invoices now go out in small batches, so large accounts can export without timing out.',
+      files: { changed: 3, adds: 40, dels: 2, list: [{ path: 'src/invoices/batch.ts', adds: 22, dels: 0 }, { path: 'src/invoices/export.ts', adds: 8, dels: 2 }, { path: 'test/invoices/large-account.test.ts', adds: 10, dels: 0 }] },
+      checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 48200 }] }, work: work('invoice-export', 'w1') },
+  ];
+  const st = world(raw, now);
+  st.mode = 'live';
+  st.repo = { name: 'invoices-api', head: 'abc1234', branch: 'main', dirty: 0, identity: true };
+  const n = st.agents.filter(a => !a.parentId && ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(a.state)).length;
+  st.machines = [{ ...LAPTOP, agents: n, note: n ? `${n} agent${n === 1 ? '' : 's'}` : 'idle' }];
   return st;
 }
 
@@ -790,6 +900,159 @@ function connectWorld(name, now) {
   return st;
 }
 
+// ---------------------------------------------------------------- full permissions (POST /api/permissions)
+//   full        the demo with full permissions on: the band's Full permissions button is lit, and nothing waits for an OK
+//               (Checkout fix's migration was allowed by itself, as an automatic approval)
+//   full-live   a live repository with Agents & keys beside it (connect-github's), full permissions on: both of the top
+//               band's buttons, the widest the band gets
+// Every other world starts with them off. The card's words, and what is said when they go on and off, are the engine's.
+const FULL_SCENARIOS = ['full', 'full-live'];
+SCENARIOS.push(...FULL_SCENARIOS);
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
+const FULL_OFF = 'Agents ask again before risky steps.';
+function fullWorld(name, now) {
+  const st = name === 'full-live' ? connectWorld('connect-github', now) : scenario('demo', now);
+  for (const a of st.agents) {
+    if (a.ask?.type !== 'permission') continue;
+    Object.assign(a, { ask: null, state: 'working', now: 'Updating the test database', stateSince: now - 20000, approvals: { ...a.approvals, auto: a.approvals.auto + 1 } });
+  }
+  st.permissions = 'full';
+  return st;
+}
+// ---------------------------------------------------------------- agents' copies: the setup card
+//   setup       a live repository whose workbench.json holds a setup command (npm ci) nobody has said Run it to yet: a
+//               prompt starts its agent at once (and a start card's yes its agents), on the board copying its files, and
+//               the setup card opens in the core; every start meanwhile waits on it; Run it runs it in each copy waiting
+//               (and later starts run it without asking), Not now starts them without it and asks again next time
+//   setup-card  the card already open, for a long command, with two agents waiting on it (one still copying, one whose
+//               copy is made says it waits for the answer) and one whose start detail says the setup command failed: the
+//               fit check's view
+const SETUP_SCENARIOS = ['setup', 'setup-card'];
+SCENARIOS.push(...SETUP_SCENARIOS);
+const SETUP_SENTENCE = 'Run this setup command in each agent’s copy before it starts?';
+const SETUP_DETAIL = 'It comes from workbench.json, and runs before each new agent starts. Workbench asks again if it changes.';
+const COPYING = 'Copying .env, apps/web/.env.local and node_modules into its copy';
+const COPIED = 'Its copy has your .env, apps/web/.env.local and node_modules.';
+const SETUP_WAITING = 'Waiting for your answer about the setup command';
+function setupWorld(name, now) {
+  const st = mergeWorld('merge', now);
+  st.setupCommand = 'npm ci';
+  st.setupWaiting = [];
+  if (name === 'setup-card') {
+    st.setupCommand = 'npm ci && npm run build --workspace=apps/web && npx prisma generate && cp .env.example .env.local && node scripts/seed-test-db.mjs --quiet --reset';
+    const mk = (id, nm, task, o = {}) => view({ id, name: nm, task, state: 'starting', now: COPYING, ageMin: 0.3, sinceMin: 0.3, toolCalls: 0, work: workOf({ id, name: nm }), ...o }, now);
+    st.agents.push(mk('s1a2b3', 'Login redirect', 'Fix the login redirect loop', { now: SETUP_WAITING }), mk('s4c5d6', 'Cart rounding', 'Fix the cart total rounding'),
+      mk('s7e8f9', 'Search speed', 'Make the search page faster', { now: `${COPIED} The setup command failed (exit 1), so its copy may not run yet.` }));
+    countHelpers(st.agents);
+    st.setupWaiting = ['s1a2b3', 's4c5d6'];
+    st.setup = { id: 's00a001', kind: 'setup', sentence: SETUP_SENTENCE, command: st.setupCommand, detail: SETUP_DETAIL, yes: 'Run it', no: 'Not now' };
+  }
+  return st;
+}
+
+/** A world as a scenario gives it, with full permissions off unless the scenario turns them on. */
+function worldOf(name) {
+  const st = scenario(name);
+  if (st.permissions !== 'full') st.permissions = 'ask';
+  return st;
+}
+/** Agents & keys' facts for a world: full-live has connect-github's. */
+const factsOf = name => connectFacts(name === 'full-live' ? 'connect-github' : name);
+
+// ---------------------------------------------------------------- the file view (GET /api/files, /api/file, /api/search; POST /api/file)
+// As the engine answers them (src/core/engine.mjs: files, file, search, saveFile), from the core's own memoryProject
+// (src/core/files.mjs), which the engine's demo uses too. Every scenario has files: the demo's sample project
+// ('storefront'), with Invoice export's changes in its copy; the 'files' scenario has a richer one:
+//   files   live, on main, nothing needing you: Invoice export done and checked with work not merged yet (its copy
+//           changes export.ts and query.ts and adds batch.ts, a migration and a test, which carry changedLines), Price
+//           rounding at work in its copy (it changed src/cart.ts), and Help pages saying it is done (it changed README.md).
+//           Their counts, and their diffs on the git screen, are their copies' real changes (realChange), so each path there
+//           opens where it changed, a new file at line 1. The project holds a
+//           CRLF file (src/invoices/sample.csv), a file with hidden characters (src/cart.ts, a zero-width space) and a path
+//           with one (docs/notes/readme<U+202E>txt.exe), an env file shown masked (.env), a binary (assets/invoice-logo.png),
+//           one over 1 MB (data/fixtures/large-accounts.json), one of 25,000 lines just under 1 MB (src/generated/rates.ts), a
+//           link (config/keys), one not UTF-8, one with mixed line endings, a CSS file with a BOM, tabs (src/server/main.go)
+//           and a deep path.
+// POST /ctl/files { in, path, text } writes a file as an agent would (its line endings kept): a file that changes on disk
+// while it is shown, or while it is edited (a conflict). GET /ctl/files?in=&path= reads its bytes ({ raw, hash, bom }).
+// GET /ctl/file-reads lists the page's GETs of the file routes. mode.delay.file slows every file answer (ms);
+// mode.files 'refuse' refuses them.
+const FILE_READS = [];
+const sha256 = b => crypto.createHash('sha256').update(b).digest('hex');
+const DEMO_SAVED = 'This is the demo, so your change is kept only until Workbench closes.';
+const FILES_REPO = { name: 'storefront', root: '/Users/someone/code/storefront', head: 'a1b2c3d', branch: 'main', dirty: 0, identity: true };
+
+/** What each agent of the 'files' scenario changed in its copy, as git would count it: { name: [realChange, …] }. */
+let SAMPLE_WORK = null;
+function sampleWork() {
+  if (SAMPLE_WORK) return SAMPLE_WORK;
+  const s = filesSample();
+  SAMPLE_WORK = Object.fromEntries(Object.entries(s.agents).map(([name, files]) => [name, Object.entries(files)
+    .map(([path, text]) => realChange(path, typeof s.files[path] === 'string' ? s.files[path] : null, text)).filter(Boolean)]));
+  return SAMPLE_WORK;
+}
+
+/** The 'files' board: calm, live, on main; nothing needs you, so a question pushed later lights the sheet's pill. */
+function filesBoard(now) {
+  const work = (a, o) => workOf(a, o);
+  // each agent's files and counts are its copy's real changes, so the board, the git screen and the file view agree
+  const counted = name => filesOf(sampleWork()[name].map(c => ({ path: c.path, adds: c.adds, dels: c.dels })));
+  const raw = [
+    { id: 'f1', name: 'Invoice export', state: 'done_checked', machineId: 'laptop', endedMin: 4, says: 'Invoices now go out in small batches, so large accounts can export without timing out.',
+      files: counted('Invoice export'), checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 41000 }] } },
+    { id: 'f2', name: 'Price rounding', state: 'working', machineId: 'laptop', now: 'Editing cart.ts', files: counted('Price rounding') },
+    { id: 'f3', name: 'Help pages', state: 'done_claimed', machineId: 'laptop', endedMin: 12, harness: 'codex', says: 'I rewrote the README in plain language.',
+      files: counted('Help pages'), checks: { state: 'none', results: [] } },
+  ];
+  for (const a of raw) a.work = work(a);
+  const st = world(raw, now);
+  st.mode = 'live';
+  st.repo = { ...FILES_REPO };
+  st.machines = [{ ...LAPTOP, agents: 1, note: '1 agent' }];
+  return st;
+}
+SCENARIOS.push('files');
+
+/** The 'files' scenario's project: yours, each agent's changes, and the links in it. */
+function filesSample() {
+  const s = sampleProject();
+  const U = n => String.fromCodePoint(n);
+  const rates = ['// Rates for every country and currency, as the tax office lists them. Made by tools/rates.py: do not edit.', ''];
+  for (let i = 1; rates.length < 25000; i++) rates.push(`export const R${String(i).padStart(5, '0')} = ${(i * 37) % 100000}; // ${i % 7 ? 'cents' : 'whole'}`);
+  const large = '{\n  "accounts": [\n' + Array.from({ length: 20000 }, (_, i) => `    { "id": "acct_${i}", "invoices": ${i % 900}, "total": "${(i * 3.7).toFixed(2)}" }`).join(',\n') + '\n  ]\n}\n';
+  const deep = 'src/very/deeply/nested/folders/for/the/crumbs/to/give/way/invoice-export-batch-sender-for-large-accounts.ts';
+  const files = {
+    ...s.files,
+    'README.md': ['# Storefront', '', "The shop's code: the cart, the checkout and the invoice export for accounts.", '', '## Run it', '', 'Run `npm test` before you merge.', ''].join('\n'),
+    'src/server/main.go': ['package main', '', 'import (', '\t"fmt"', '\t"net/http"', ')', '', '// main serves the shop on port 3000.', 'func main() {', '\thttp.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {',
+      '\t\tfmt.Fprintln(w, "storefront")', '\t})', '\thttp.ListenAndServe(":3000", nil)', '}', ''].join('\n'),
+    'src/styles/cart.css': '\ufeff' + ['/* The cart, on every screen size */', '.cart { display: grid; gap: 12px; color: #1f1d1a; }', '@media (max-width: 520px) {', '  .cart { gap: 8px; }', '}', ''].join('\n'),
+    'tools/rates.py': ['"""Make src/generated/rates.ts from the tax office\'s list."""', 'import csv', '', 'def main(path):', '    # one row a country', '    with open(path) as f:', '        for row in csv.reader(f):',
+      "            print(f\"export const {row[0]} = {{ cents: {row[1]} }};\")", '', "if __name__ == '__main__':", "    main('rates.csv')", ''].join('\n'),
+    'scripts/deploy.sh': ['#!/bin/sh', '# Ship the shop: build, then copy it up.', 'set -e', 'npm run build', 'if [ -n "$TARGET" ]; then', '  rsync -a dist/ "$TARGET"', 'fi', ''].join('\n'),
+    '.github/workflows/ci.yml': ['name: ci', 'on: [push]', 'jobs:', '  test:', '    runs-on: ubuntu-latest', '    steps:', '      - uses: actions/checkout@v4', '      - run: npm test # every push', ''].join('\n'),
+    'src/emails/receipt.html': ['<!doctype html>', '<p class="hello">Thank you for your order.</p>', '<!-- the total, in the customer’s currency -->', '<p>Total: <b>{{ total }}</b></p>', ''].join('\n'),
+    [`docs/notes/readme${U(0x202e)}txt.exe`]: 'This file name reads backwards on purpose.\n',
+    'assets/invoice-logo.png': Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]),
+    'data/fixtures/large-accounts.json': large,
+    'src/generated/rates.ts': rates.join('\n') + '\n',
+    'src/legacy/latin1.txt': Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]),
+    'src/legacy/mixed.txt': 'one\r\ntwo\nthree\r\n',
+    [deep]: ['export const BATCH = 50;', 'export const PAUSE_MS = 200;', ''].join('\n'),
+  };
+  return {
+    name: 'storefront', branch: 'main', files, links: { 'config/keys': '../../../.ssh/config' },
+    agents: {
+      'Invoice export': s.agent.files,
+      'Price rounding': { 'src/cart.ts': files['src/cart.ts'].replace('return items.reduce((sum, item) => sum + item.price * item.quantity, 0);',
+        'const cents = items.reduce((sum, item) => sum + item.price * item.quantity, 0);\n  // whole cents, so the total never shows a fraction\n  return Math.round(cents);') },
+      'Help pages': { 'README.md': files['README.md'].replace("The shop's code: the cart, the checkout and the invoice export for accounts.",
+        'The code of the shop: its cart, its checkout, and the export of invoices for large accounts.\n\nAsk in #storefront when something is unclear.') },
+    },
+  };
+}
+
 /** Start the mock. Resolves to { port, close() }. */
 export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) {
   const clients = new Set();
@@ -797,20 +1060,86 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const mode = { answer: 'ok', auth: 'ok', holdMs: 0, down: false, steps: false, merge: 'ok', delay: null };
   const prefs = memoryPrefs();   // the person's choices, as Workbench keeps them across runs
   let name = 'demo';
-  let state = scenario(name);
-  let cw = connectFacts(name);   // Agents & keys: what Connect knows, in the connect scenarios (null elsewhere)
+  let state = worldOf(name);
+  let cw = factsOf(name);   // Agents & keys: what Connect knows, in the connect scenarios (null elsewhere)
   let confirmSeq = 0;
+  let modeChanges = 0;   // how often full permissions went on or off in this world (permissionsAnswer)
   const confirms = new Map();
   const send = (event, data) => { const f = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`; for (const c of clients) c.write(f); };
-  // a launch the person confirmed, as the engine does it: the reply names the new agent (focusId) before the stream
-  // brings it, about a third of a second later
+  // Work starts at once, as the engine's _startNow: no card. Each task's agent shows on the board about a third of a second
+  // later; the reply is the notice of what started, each task on one line ("Started a simulated Claude on “…”."; in a live
+  // world, "Started Claude on “…”."), it carries agentIds and no focusId (what the centre shows stays), and the notice is
+  // also sent on the stream, as command() posts it.
   let startSeq = 0;
-  const started = c => {
-    const id = 'n' + (++startSeq);
-    const task = /“(.+?)”/.exec(c?.sentence || '')?.[1] || 'the new task';
-    const a = view({ id, name: task.replace(/^./, x => x.toUpperCase()).split(' ').slice(0, 4).join(' '), task, state: 'working', now: 'Starting', ageMin: 0, sinceMin: 0, toolCalls: 0 }, Date.now());
-    setTimeout(() => { state.agents.push(a); countHelpers(state.agents); send('agents', [a]); }, 350);
-    return { reply: 'Started it. It will show on the board in a moment.', agentIds: [id], focusId: id };
+  let askedFor = null;   // "codex" alone asked what Codex should work on: the next words are its prompt, once
+  const PROGRAM = { claude: 'Claude', codex: 'Codex' };
+  const COUNT_SAID = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'];
+  /** Who starts on what, as the engine's startPhrase says it: "a simulated Claude on “…”", "three simulated Claude agents on “…”". */
+  const startPhrase = tasks => {
+    const byTask = new Map();
+    for (const t of tasks) byTask.set(t.task, [...(byTask.get(t.task) || []), t.harness || 'claude']);
+    const live = state.mode === 'live';
+    const who = hs => {
+      const counts = new Map();
+      for (const h of hs) counts.set(h, (counts.get(h) || 0) + 1);
+      return joinAnd([...counts].map(([h, n]) => (n === 1 ? `${live ? '' : 'a simulated '}${PROGRAM[h] || 'Claude'}` : `${COUNT_SAID[n] || n} ${live ? '' : 'simulated '}${PROGRAM[h] || 'Claude'} agents`)));
+    };
+    return joinAnd([...byTask].map(([task, hs]) => `${who(hs)} on “${clip(task, byTask.size > 1 ? 50 : 80)}”`));
+  };
+  const startNow = tasks => {
+    const ids = [];
+    // a world whose workbench.json has a setup command makes each new agent's copy first, as the engine does: it starts
+    // copying, and the first one to need the command opens the setup card (setupFor, below)
+    const copies = !!state.setupCommand;
+    for (const t of tasks) {
+      const id = 'n' + (++startSeq);
+      const harness = t.harness || 'claude';
+      const a = view({ id, name: nameFromTask(t.task) || 'New task', task: t.task, harness, state: copies ? 'starting' : 'working', now: copies ? COPYING : 'Starting', ageMin: 0, sinceMin: 0, toolCalls: 0 }, Date.now());
+      setTimeout(() => { state.agents.push(a); countHelpers(state.agents); send('agents', [a]); if (copies) setupFor(a); }, 350);
+      ids.push(id);
+    }
+    const reply = `Started ${startPhrase(tasks)}.`;
+    send('notice', { text: reply });
+    return { reply, agentIds: ids };
+  };
+  // More than one agent from one sentence asks first (the engine's _proposeStart): "Start three simulated Claude agents on
+  // “the login page”?" (in a live world, "Start three Claude agents on …"), with Start them and Cancel; its yes starts them.
+  const COUNTED = { two: 2, three: 3, four: 4, five: 5, 2: 2, 3: 3, 4: 4, 5: 5 };
+  const startCard = tasks => {
+    const sentence = `Start ${startPhrase(tasks)}`;
+    const detail = state.mode === 'live' ? 'Each one works in its own folder and spends on its own. A Claude agent can spend up to $2.00.' : 'This is the demo, so nothing is spent.';
+    return { kind: 'start', sentence: /\?”$/.test(sentence) ? sentence : `${sentence}?`, detail, yes: 'Start them', no: 'Cancel' };
+  };
+  // Agents' copies, as the engine does them: the first start to need the setup command opens the card (every page gets a
+  // snapshot with it), and every start meanwhile waits on it; once said yes to, a start runs it without asking.
+  let setupSeq = 0;
+  const runSetupIn = list => {
+    for (const a of list) a.now = 'Running the setup command in its copy';
+    send('agents', list);
+    setTimeout(() => { for (const a of list) a.now = `${COPIED} The setup command ran in it.`; send('agents', list); }, 500);
+  };
+  const setupFor = a => {
+    if (state.setupOk === state.setupCommand) { runSetupIn([a]); return; }
+    state.setupWaiting.push(a.id);
+    // its copy is made a moment later: while the card still waits, its line says it waits for the person
+    // (only in this world: another may have been opened meanwhile)
+    setTimeout(() => { if (state.agents.includes(a) && state.setupWaiting?.includes(a.id)) { a.now = SETUP_WAITING; send('agents', [a]); } }, 250);
+    if (state.setup) return;
+    state.setup = { id: 's' + (++setupSeq).toString(16).padStart(6, '0'), kind: 'setup', sentence: SETUP_SENTENCE, command: state.setupCommand, detail: SETUP_DETAIL, yes: 'Run it', no: 'Not now' };
+    send('snapshot', state);
+  };
+  /** Run it (go) or Not now, for every launch waiting on the card; every page gets a snapshot without it. */
+  const answerSetup = go => {
+    const waiting = state.agents.filter(a => state.setupWaiting.includes(a.id));
+    state.setupWaiting = [];
+    state.setup = null;
+    if (go) state.setupOk = state.setupCommand;
+    setTimeout(() => {
+      send('snapshot', state);
+      if (go) runSetupIn(waiting);
+      else { for (const a of waiting) a.now = `${COPIED} It starts without the setup command.`; send('agents', waiting); }
+    }, 60);
+    return { reply: go ? 'OK. Each agent’s copy runs it before the agent starts.' : `OK. The ${waiting.length > 1 ? 'agents start' : 'agent starts'} without it, and Workbench asks again next time.` };
   };
   const changed = list => send('agents', list);
 
@@ -904,15 +1233,68 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     gone: () => 'Its folder is gone, so there is nothing to merge.',
   };
   const PROBLEM = new Set(['conflict', 'blocked', 'moved', 'identity', 'detached', 'busy', 'ancestry', 'git']);
-  /** Settle a card: a launch starts, a forget forgets, a merge merges (or fails as mode.merge says), a throw-away throws away. */
+  /** Settle a card: a stop stops, a message is sent, a forget forgets, a merge merges (or fails as mode.merge says), a throw-away throws away. */
+  /**
+   * Full permissions on or off, as the engine's _permissions: 'full' is a card, 'ask' is at once, and withdraws every card
+   * that would turn them on. modeChanges counts the changes: a card made before the last one is refused (settle).
+   */
+  const permissionsAnswer = want => {
+    if (want === 'ask') {
+      for (const [id, c] of confirms) if (c.kind === 'permissions') confirms.delete(id);
+      if (state.permissions !== 'full') return { ok: true, reply: 'Agents already ask before risky steps.', permissions: 'ask' };
+      state.permissions = 'ask';
+      modeChanges++;
+      setTimeout(() => { send('snapshot', state); send('notice', { text: FULL_OFF }); }, 60);
+      return { ok: true, reply: FULL_OFF, permissions: 'ask' };
+    }
+    if (state.permissions === 'full') return { ok: true, reply: 'Full permissions are already on.', permissions: 'full' };
+    const n = state.agents.filter(a => a.ask && a.ask.type === 'permission').length;
+    const detail = n ? `${FULL_DETAIL} The ${n} question${n === 1 ? '' : 's'} waiting now ${n === 1 ? 'is' : 'are'} allowed too.` : FULL_DETAIL;
+    const card = { kind: 'permissions', sentence: 'Let agents do anything without asking?', detail, yes: 'Turn on full permissions', no: 'Keep asking', danger: true };
+    return { reply: card.sentence, confirm: newConfirm(card, { modeAt: modeChanges }) };
+  };
   const settle = (c, go) => {
+    if (c.kind === 'permissions') {
+      if (c.modeAt !== modeChanges) return { reply: 'That changed. Have another look.' };
+      if (!go) return { reply: 'OK, agents still ask before risky steps.' };
+      state.permissions = 'full';
+      modeChanges++;
+      // every permission question waiting is allowed, as an automatic approval, and the reply counts them
+      let n = 0;
+      for (const a of state.agents) {
+        if (a.ask?.type !== 'permission') continue;
+        Object.assign(a, { ask: null, state: 'working', stateSince: Date.now(), now: 'Carrying on', approvals: { ...a.approvals, auto: a.approvals.auto + 1 } });
+        n++;
+      }
+      countHelpers(state.agents);
+      const reply = n ? `Full permissions are on. ${n} waiting question${n === 1 ? ' was' : 's were'} allowed.` : FULL_ON;
+      setTimeout(() => { send('snapshot', state); send('notice', { text: reply }); }, 60);
+      return { reply, permissions: 'full' };
+    }
     if (c.kind === 'forget') {
       if (!go) return { reply: 'OK, I won’t forget it.' };
       state.agents = state.agents.filter(x => x.id !== c.forget);
       setTimeout(() => send('snapshot', state), 60);
       return { reply: 'Forgot it. Its folder and branch are still on this computer.' };
     }
-    if (c.kind !== 'merge' && c.kind !== 'discard') return go ? started(c) : { reply: 'OK, I won’t start it.' };
+    if (c.kind === 'stop') {
+      if (!go) return { reply: 'OK, I won’t stop it.' };
+      const a = state.agents.find(x => x.id === c.agentId);
+      if (!a) return { reply: 'I can’t find that agent.' };
+      Object.assign(a, { state: 'stopped', endedAt: Date.now(), stateSince: Date.now(), ask: null });
+      setTimeout(() => changed([a]), 60);
+      return { reply: `Stopped ${a.name}.`, focusId: a.id };
+    }
+    if (c.kind === 'say') {
+      if (!go) return { reply: 'OK, I won’t send it.' };
+      const a = state.agents.find(x => x.id === c.agentId);
+      return { reply: a ? `Sent to ${a.name}.` : 'I can’t find that agent.', ...(a ? { focusId: a.id } : {}) };
+    }
+    if (c.kind === 'start') {
+      if (!go) return { reply: 'OK, I won’t start them.' };
+      return startNow(c.tasks || []);
+    }
+    if (c.kind !== 'merge' && c.kind !== 'discard') return { reply: 'That request is no longer waiting. Ask again if you still want it.' };
     if (!go) return { reply: c.kind === 'merge' ? 'OK, I won’t merge it.' : 'OK, I won’t throw it away.' };
     const a = state.agents.find(x => x.id === c.agentId);
     if (!a) return { reply: 'I can’t find that agent.' };
@@ -942,6 +1324,128 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     state.repo = { ...state.repo, head: merge.slice(0, 7) };
     setTimeout(() => { send('agents', [a]); send('repo', state.repo); }, 60);
     return { reply: `Merged ${a.name} into ${into}.`, focusId: a.id };
+  };
+
+  // ---------------------------------------------------------------- the file view's routes (see above startMock)
+  let fw = null;   // this world's files, made the first time the page asks; a new scenario starts afresh
+  const filesWorld = () => {
+    if (fw) return fw;
+    const base = name === 'files' ? filesSample()
+      : (() => { const s = sampleProject(); return { name: s.name, branch: s.branch, files: s.files, links: {}, agents: { [s.agent.name]: s.agent.files } }; })();
+    const mirror = files => Object.fromEntries(Object.entries(files).map(([k, v]) => [k, Buffer.from(v)]));
+    fw = { base, you: { files: mirror(base.files), links: { ...base.links }, proj: null }, pristine: memoryProject(base.files), copies: new Map(), saved: false, mirror };
+    return fw;
+  };
+  const projOf = cp => cp.proj || (cp.proj = memoryProject(cp.files));
+  /** Which copy a request names, as the engine's _copyOf does: yours, or a root's (a helper's id means its agent's). */
+  const copyOf = where => {
+    const w = filesWorld();
+    const refusal = (reply, why = 'refused') => ({ refusal: { ok: false, reply, why } });
+    const named = state.repo ? state.repo.name : w.base.name;
+    if (where === 'you') return { in: 'you', name: named, branch: state.repo ? state.repo.branch : w.base.branch, copy: w.you };
+    if (typeof where !== 'string' || !where) return refusal('Say whose copy to show: yours, or an agent’s.');
+    const found = state.agents.find(a => a.id === where);
+    const v = found && found.parentId ? state.agents.find(a => a.id === found.rootId) || found : found;
+    if (!v) return refusal('I can’t find that agent.', 'gone');
+    if (v.work && v.work.thrownAway) return refusal(`${v.name}’s work was thrown away, so its copy is gone.`, 'gone');
+    if (v.work && v.work.folder === false) return refusal(`${v.name}’s folder is not on this computer any more.`, 'gone');
+    if (!w.copies.has(v.id)) w.copies.set(v.id, { files: w.mirror({ ...w.base.files, ...(w.base.agents[v.name] || {}) }), links: { ...w.base.links }, proj: null });
+    return { in: v.id, name: named, branch: (v.work && v.work.branch) || null, copy: w.copies.get(v.id), v };
+  };
+  /** The core's plain refusal as the engine gives it: its sentence, and the file's hash now when it changed. */
+  const plainOf = (err, fallback) => (err && err.plain && typeof err.message === 'string'
+    ? { ok: false, reply: err.message, why: err.why === 'changed' ? 'changed' : 'refused', ...(err.why === 'changed' && typeof err.hash === 'string' ? { hash: err.hash } : {}) }
+    : { ok: false, reply: fallback, why: 'refused' });
+  /** Why the person may not edit it (the engine's _notEditable), or null. */
+  const notEditable = got => {
+    const kinds = { binary: 'This is a binary file.', large: 'This file is too large to show here.', notutf8: 'This file is not UTF-8 text, so Workbench does not show it.',
+      link: `This is a link to ${got.link}.`, secret: 'This file holds keys, so Workbench shows only their last four characters and does not edit it.', missing: 'This file is not there any more.' };
+    if (kinds[got.kind]) return kinds[got.kind];
+    return got.eol === 'mixed' ? 'This file mixes line endings, so Workbench does not edit it.' : null;
+  };
+  /**
+   * The 'files' scenario: an agent's changes on the git screen are its copy's real ones, against your folder as it
+   * started (each path its record names, as its copy holds it now), so each opens where it really changed.
+   */
+  const ownChanges = root => {
+    const w = filesWorld();
+    if (!w.base.agents[root.name]) return null;
+    const c = copyOf(root.id);
+    if (c.refusal) return null;
+    const out = [];
+    for (const f of (root.files && root.files.list) || []) {
+      const now = projOf(c.copy).textOf(f.path);
+      const got = now == null ? null : realChange(f.path, w.pristine.textOf(f.path), now);
+      if (got) out.push(got);
+    }
+    return out;
+  };
+  const readIn = (c, rel) => {
+    if (Object.hasOwn(c.copy.links, rel)) { const t = c.copy.links[rel]; return { kind: 'link', link: t, hash: sha256(t), size: Buffer.byteLength(t), eol: 'none', bom: false }; }
+    return projOf(c.copy).readFile({ rel });
+  };
+  /** Write `text` over a file as the core does (its line endings and BOM kept), and keep its bytes for /ctl/files. */
+  const writeIn = async (c, rel, text, hash, force) => {
+    const proj = projOf(c.copy);
+    const was = await proj.readFile({ rel });
+    const saved = await proj.writeFile({ rel, text, hash, force });
+    const body = Buffer.from(was.eol === 'crlf' ? text.replace(/\n/g, '\r\n') : text, 'utf8');
+    c.copy.files[rel] = was.bom ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body]) : body;
+    if (sha256(c.copy.files[rel]) !== saved.hash) console.error('ui-mock: the bytes kept for', rel, 'are not the bytes written');
+    return saved;
+  };
+  const fileRoute = async (req, p, u, json, res) => {
+    const answer = (code, o) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store'); res.end(JSON.stringify(o)); };
+    const refuse = r => answer(r.why === 'gone' ? 404 : r.why === 'changed' ? 409 : 400, r);
+    const q = u.searchParams;
+    const allow = p === '/api/file' ? ['GET', 'POST'] : ['GET'];
+    if (!allow.includes(req.method)) { res.setHeader('Allow', allow.join(', ')); return answer(405, { error: 'That method is not allowed here.' }); }
+    if (req.method === 'GET') FILE_READS.push({ at: Date.now(), path: p, in: q.get('in'), file: q.get('path'), check: q.get('check'), q: q.get('q') });
+    if (mode.delay && mode.delay.file > 0) await new Promise(r => setTimeout(r, mode.delay.file));
+    if (mode.files === 'refuse') return refuse({ ok: false, reply: 'Workbench cannot show files right now.', why: 'refused' });
+    const c = copyOf(req.method === 'GET' ? q.get('in') : json && json.in);
+    if (c.refusal) return refuse(c.refusal);
+    if (p === '/api/files') {
+      const got = await projOf(c.copy).listFiles();
+      const all = [...new Set([...got.files, ...Object.keys(c.copy.links)])].sort();
+      const hidden = new Set(got.ignored || []);
+      const roots = c.v ? [c.v] : state.agents.filter(a => !a.parentId && !(a.work && (a.work.thrownAway || a.work.folder === false)));
+      const marks = new Map();
+      for (const v of roots) for (const f of (v.files && v.files.list) || []) { if (!marks.has(f.path)) marks.set(f.path, []); marks.get(f.path).push({ agentId: v.id, name: v.name, state: v.state }); }
+      return answer(200, { ok: true, in: c.in, name: c.name, branch: c.branch, files: all.map(path => ({ path, ...(marks.has(path) ? { changedBy: marks.get(path) } : {}), ...(hidden.has(path) ? { ignored: true } : {}) })) });
+    }
+    if (p === '/api/search') {
+      try {
+        const got = await projOf(c.copy).searchFiles({ query: q.get('q') });
+        return answer(200, { ok: true, in: c.in, results: got.results, ...(got.truncated ? { truncated: true } : {}) });
+      } catch (err) { return refuse(plainOf(err, 'Workbench could not search the files.')); }
+    }
+    if (req.method === 'GET') {
+      const rel = q.get('path');
+      let got;
+      try { checkPath(rel); got = await readIn(c, rel); } catch (err) { return refuse(plainOf(err, 'Workbench could not read that file.')); }
+      if (q.get('check') && got.hash && got.hash === q.get('check')) return answer(200, { ok: true, same: true });
+      const out = { ok: true, in: c.in, path: rel, ...got };
+      if (c.v && (got.kind === 'text' || got.kind === 'secret') && got.lines) {
+        const now = projOf(c.copy).textOf(rel);
+        if (now != null) out.changedLines = changedLinesBetween(filesWorld().pristine.textOf(rel), now);
+      }
+      const why = notEditable(got);
+      out.editable = !why;
+      if (why) out.why = why;
+      return answer(200, out);
+    }
+    // a save: at most 1 MB of text, then the core's checks (the hash it was read with, line endings, what it is)
+    const rel = json && json.path;
+    if (typeof (json && json.text) === 'string' && Buffer.byteLength(json.text) > 1024 * 1024) return answer(413, { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' });
+    try {
+      checkPath(rel);
+      if (Object.hasOwn(c.copy.links, rel)) return refuse({ ok: false, reply: `${rel} is a link, so Workbench does not write through it.`, why: 'refused' });
+      const saved = await writeIn(c, rel, json.text, json.hash, json.force === true);
+      const out = { ok: true, hash: saved.hash, size: saved.size };
+      if (state.mode !== 'live') { if (!filesWorld().saved) out.reply = DEMO_SAVED; filesWorld().saved = true; }
+      return answer(200, out);
+    } catch (err) { return refuse(plainOf(err, 'Workbench could not save that file.')); }
   };
 
   // ---------------------------------------------------------------- Agents & keys: the connect panel's routes
@@ -1167,7 +1671,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       const b = body ? JSON.parse(body) : {};
       res.setHeader('content-type', 'application/json');
       if (p === '/ctl/scenario') {
-        name = b.name; state = scenario(name); cw = connectFacts(name); confirms.clear();
+        name = b.name; state = worldOf(name); cw = factsOf(name); confirms.clear(); fw = null;
         if (b.push !== false) send('snapshot', state);
         res.end(JSON.stringify({ ok: true, agents: state.agents.length })); return;
       }
@@ -1181,8 +1685,26 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (p === '/ctl/drop') { for (const c of clients) c.destroy(); clients.clear(); res.end('{"ok":true}'); return; }
       if (p === '/ctl/log') { res.end(JSON.stringify(posted)); return; }
       if (p === '/ctl/reads') { res.end(JSON.stringify(GIT_READS)); return; }   // D1: the git screen's GETs
+      if (p === '/ctl/file-reads') { res.end(JSON.stringify(FILE_READS)); return; }   // the file view's GETs
+      if (p === '/ctl/files') {
+        // as an agent writes a file (POST { in, path, text }), and its bytes as they are on disk (GET ?in=&path=)
+        const c = copyOf(req.method === 'GET' ? u.searchParams.get('in') : b.in);
+        if (c.refusal) { res.statusCode = 404; res.end(JSON.stringify(c.refusal)); return; }
+        const rel = req.method === 'GET' ? u.searchParams.get('path') : b.path;
+        try {
+          if (req.method === 'POST') { const was = await projOf(c.copy).readFile({ rel }); const saved = await writeIn(c, rel, String(b.text), was.hash, false); res.end(JSON.stringify({ ok: true, ...saved })); return; }
+          const raw = c.copy.files[rel];
+          res.end(JSON.stringify(raw ? { ok: true, raw: raw.toString('utf8'), hash: sha256(raw), bom: raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf } : { ok: false })); return;
+        } catch (err) { res.statusCode = 400; res.end(JSON.stringify({ ok: false, reply: err.message })); return; }
+      }
       if (p === '/ctl/clear') { posted.length = 0; res.end('{"ok":true}'); return; }
-      if (p === '/ctl/prefs') { if (Object.keys(b).length) prefs.set(cleanPrefs({ ...prefs.get(), ...b })); res.end(JSON.stringify(prefs.get())); return; }
+      if (p === '/ctl/prefs') {
+        if ((b.permissions === 'full' || b.permissions === 'ask') && b.permissions !== state.permissions) { state.permissions = b.permissions; modeChanges++; }
+        const { permissions, ...choices } = b;
+        if (Object.keys(choices).length) prefs.set(cleanPrefs({ ...prefs.get(), ...choices }));
+        const { permissions: kept, ...now } = prefs.get();
+        res.end(JSON.stringify({ ...now, permissions: state.permissions })); return;
+      }
       res.statusCode = 404; res.end('{}'); return;
     }
     if (p.startsWith('/api/')) {
@@ -1197,10 +1719,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       // the person's choices, whatever mode.answer says, as the real server keeps them apart from the engine
       if (p === '/api/prefs') {
         res.setHeader('content-type', 'application/json');
-        if (req.method === 'GET') { res.end(JSON.stringify(prefs.get())); return; }
+        const page = ({ theme, detail, answered }) => ({ theme, detail, answered });   // never the permission mode
+        if (req.method === 'GET') { res.end(JSON.stringify(page(prefs.get()))); return; }
         let change;
         try { change = prefsChange(json); } catch (e) { res.statusCode = 400; res.end(JSON.stringify({ error: e.message })); return; }
-        res.end(JSON.stringify({ ok: true, ...prefs.set(change).prefs })); return;
+        res.end(JSON.stringify({ ok: true, ...page(prefs.set(change).prefs) })); return;
       }
       if (p === '/api/stream') {
         if (mode.down) { req.socket.destroy(); return; }
@@ -1211,6 +1734,8 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         clients.add(res); req.on('close', () => clients.delete(res));
         return;
       }
+      // the file view's four routes, whatever mode.answer says (mode.files and mode.delay.file are theirs)
+      if (p === '/api/files' || p === '/api/file' || p === '/api/search') return fileRoute(req, p, u, json, res);
       if (mode.answer === 'drop') { req.socket.destroy(); return; }
       if (mode.answer === '500') { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"error":"Something went wrong."}'); return; }
       // the engine does git work before it answers a merge or a throw-away: mode.delay makes those replies (and typed
@@ -1224,7 +1749,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (gm) {
         GIT_READS.push({ at: Date.now(), path: p });
         if (mode.answer === 'refuse') return reply({ ok: false, reply: p === '/api/git' ? 'Workbench could not read the history of your repository.' : 'Workbench could not read that agent’s changes.' });
-        return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1])));
+        return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1]), name === 'files' ? ownChanges : null));
       }
       const m = /^\/api\/agents\/([^/]+)\/(answer|say|stop|raise-limit)$/.exec(p);
       if (m) {
@@ -1242,7 +1767,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           return reply({ ok: true, reply: `${a.name} can spend $${limit.toFixed(2)} in all now, and it is continuing.` });
         }
         if (m[2] === 'answer') {
-          if (!a.ask && json && !json.askId && ['done_checked', 'done_claimed', 'checks_failed'].includes(a.state)) return reply({ ok: true, reply: `Good. ${a.name} stays as it is.` });
+          // finished work, as the engine's _answerDone: "Not now" says where its work stays, with no bare "OK." before it
+          if (!a.ask && json && !json.askId && ['done_checked', 'done_claimed', 'checks_failed'].includes(a.state)) {
+            if (NOT_NOW_RE.test(String(json.answer || '').trim())) return reply({ ok: true, reply: a.work?.branch ? `${a.name}’s work stays on its branch for now.` : `${a.name} stays as it is.` });
+            return reply({ ok: true, reply: `Good. ${a.name} stays as it is.` });
+          }
           if (!a.ask || !json || json.askId !== a.ask.id) return reply({ ok: false, reply: json && !json.askId && a.ask ? `Have a look at what ${a.name} is asking first.` : `${a.name} is not waiting for that any more.` });
           const was = a.ask, ans = String(json.answer || '');
           a.ask = null;
@@ -1287,7 +1816,16 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         const card = merge ? mergeCard(a) : discardCard(a);
         return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }) });
       }
+      if (p === '/api/permissions' && req.method === 'POST') {
+        const want = json?.mode;
+        if (want !== 'full' && want !== 'ask') { res.statusCode = 400; return reply({ error: 'Say whether agents should ask first or have full permissions.' }); }
+        if (mode.answer === 'refuse') return reply({ ok: false, reply: 'Workbench could not do that just now.' });
+        const out = permissionsAnswer(want);
+        if (!out.confirm) send('notice', { text: out.reply });
+        return reply(out);
+      }
       const cm = /^\/api\/confirm\/([^/]+)$/.exec(p);
+      if (cm && state.setup && decodeURIComponent(cm[1]) === state.setup.id) return reply(answerSetup(!!json && json.go === true));
       if (cm) {
         const c = confirms.get(decodeURIComponent(cm[1]));
         if (!c) return reply({ reply: 'That request is no longer waiting. Ask again if you still want it.' });
@@ -1295,29 +1833,150 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         return reply(settle(c, !!json && json.go === true));
       }
       if (p === '/api/command') {
+        // As src/core/commands.mjs and the engine read words, in short. Every prompt goes to an agent: words that are no
+        // command and no answer start one at once (startNow), exactly as typed; a card on screen stays where it is.
         const text = String(json?.text || '').trim();
+        // the setup card on screen: only its own words run the command, and its no is a no (src/core/commands.mjs, in
+        // short); a yes that is not enough ("yes", "sure", "okay", "yes, and then tell me") keeps it with its hint. Other
+        // words go on as anywhere: a prompt starts its agent at once, which waits on this same card, and the card stays.
+        if (state.setup && json?.confirmId === state.setup.id) {
+          if (/^(?:run it|run it first|run the setup command|do it|do that)(?:$|[\s,.!])/i.test(text)) return reply(answerSetup(true));
+          if (/^(?:not now|no|nope|cancel|skip it|never mind)(?:$|[\s,.!])/i.test(text)) return reply(answerSetup(false));
+          if (/^(?:yes|yeah|yep|sure|ok|okay|alright|go ahead|make it so)(?:$|[\s,.!])/i.test(text)) return reply({ reply: 'Say “run it” or “not now”.', confirm: { ...state.setup } });
+        }
         const shown = json?.confirmId ? confirms.get(json.confirmId) : null;
+        const forProgram = askedFor;
+        askedFor = null;
+        const prompt = () => {
+          const out = startNow([{ task: text, harness: forProgram }]);
+          return reply(shown ? { ...out, confirm: cardOf(shown) } : out);
+        };
+        const hint = verb => reply({ reply: `Say “do it” to ${verb}, or “cancel”.`, confirm: cardOf(shown) });
+        // A stop word and its target first, whatever follows (src/core/commands.mjs, stopFirst, in short): "stop it, it is
+        // deleting the wrong files" stops the agent in the centre, "stop everything, the build is broken" every agent at
+        // work. A card on screen stays where it is (the page sends no agent in the centre with one), and the line under the
+        // board says what stopped, as the engine's command() does.
+        const stopWords = /^(?:stop|kill|pause|halt)(?: (it|that|this one|the agent|everything|all agents|all of them|them))?(?=\s*[,.!;:]|\s+[-–—]\s|\s*\n|\s+(?:because|before|while|until|it|they)\b|\s*$)/i.exec(text);
+        const stopNow = () => {
+          const what = (stopWords[1] || '').toLowerCase();
+          let out;
+          if (['everything', 'all agents', 'all of them'].includes(what)) {
+            const roots = state.agents.filter(a => !a.parentId && AT_WORK.has(a.state));
+            for (const a of roots) Object.assign(a, { state: 'stopped', endedAt: Date.now(), stateSince: Date.now(), ask: null });
+            if (roots.length) setTimeout(() => changed(roots), 60);
+            out = { reply: !roots.length ? 'Nothing is running.' : roots.length === 1 ? `Stopped ${roots[0].name}.` : `Stopped all ${roots.length} agents.` };
+          } else {
+            // "it" is the agent in the centre; with none there (a card is, or nothing is), what a stop could act on: the
+            // card's own agent or helper when it works, else the one agent at work (src/core/commands.mjs, stopIt)
+            const centre = shown ? null : json?.focusId || null;
+            const own = shown?.agentId ? state.agents.find(x => x.id === shown.agentId && AT_WORK.has(x.state)) : null;
+            const working = state.agents.filter(x => !x.parentId && AT_WORK.has(x.state));
+            const a = what === 'them' ? null : centre ? state.agents.find(x => x.id === centre) : own || (working.length === 1 ? working[0] : null);
+            if (!a) out = { reply: 'I couldn’t tell which agent to stop.' };
+            else if (!AT_WORK.has(a.state)) out = { reply: `${a.name} is not running.`, focusId: a.id };
+            else {
+              Object.assign(a, { state: 'stopped', endedAt: Date.now(), stateSince: Date.now(), ask: null });
+              setTimeout(() => changed([a]), 60);
+              out = { reply: `Stopped ${a.name}.`, focusId: a.id };
+            }
+          }
+          send('notice', { text: out.reply });
+          return reply(shown ? { reply: out.reply, confirm: cardOf(shown) } : out);
+        };
+        // Words that begin with a card's yes or no answer it, whatever follows (src/core/commands.mjs, cardNoFirst and
+        // cardFirstReply, in short): "no, because the tests are red" is its no, "yes, and then tell me" or "do it, thanks"
+        // its yes; a yes with a condition ("yes, but …", "yes if …") or a question keeps the card, and so does a yes said
+        // alone where the card wants its own words ("yes", "sure, thanks a lot" to a throw-away), though one that goes on
+        // answers it ("yes, and then tell me"). A no first that asks ("don't you want to look first?") is no answer.
+        const firstNo = /^(?:no|nope|nah|cancel|don'?t|do not|not now|not yet)\b/i.test(text) && !/^(?:no problem|no worries)\b/i.test(text)
+          && !(/\?$/.test(text) && /^(?:don'?t|do not|not)\b/i.test(text));
+        const firstYes = /^(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b|(?:do it|go ahead)\b)/i.exec(text);
+        // a yes said alone, with nothing after it but thanks or please (src/core/commands.mjs, ALONE_FILL, in short)
+        const loneYes = /^(?:yes|yeah|yep|yup|sure|ok|okay|alright|go ahead|make it so)(?:[,.!]*\s*(?:please|thanks|thank you|whatever)(?: (?:a lot|so much|very much))?)?[.!]*$/i.test(text);
+        const firstYesKeeps = () => /\?$/.test(text) || /^\S+(?: it| ahead)?[,.!]?\s+(?:but|if|only|unless|except)\b/i.test(text);
+        // a yes taken back or put off right after it ("ok hold on", "yes, not yet", "sure, never mind", "okay, let me look
+        // first") is the card's no (src/core/commands.mjs, putsOff, in short)
+        const firstYesBack = () => !!firstYes && /^\S+(?: it| ahead)?[,.!]?\s+(?:no|nope|nah|wait|cancel|not now|not yet|never mind|forget it|hold on|hang on|one sec|one second|just a (?:sec|moment|minute)|give me a (?:sec|second|minute)|let me (?:think|check|look|see))\b/i.test(text);
+        // A program named alone ("codex", "the agent", "new agent", "ask claude") asks what it should work on, and the next
+        // words are its prompt; a card on screen stays, and the question is posted as a notice, as the engine's command() does
+        const alone = /^(?:start |ask )?(codex|claude|the agent|agent|new agent)[.!?]*$/i.exec(text);
+        const askAlone = () => {
+          const h = alone[1].toLowerCase() === 'codex' ? 'codex' : 'claude';
+          askedFor = h;
+          const question = `What should ${h === 'codex' ? 'Codex' : 'Claude Code'} work on?`;
+          if (!shown) return reply({ reply: question });
+          send('notice', { text: question });
+          return reply({ reply: question, confirm: cardOf(shown) });
+        };
+        if (shown && shown.kind === 'permissions') {
+          // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking",
+          // "turn it off" and its kin, or a no. A yes said alone is not enough, and a question answers nothing: the card
+          // stays. A yes that goes on ("yes, and then tell me") answers it.
+          if (/^(turn (it|them) on|turn on full permissions|do it|stop asking|full permissions|allow everything)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
+          if (/^(keep asking|no|cancel|never mind|ask first|ask me first|stop|stop it|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if (loneYes || /\?$/.test(text)) return hint('turn on full permissions');
+          if (firstNo || firstYesBack() || /^keep asking\b[,.!]/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if ((/^(?:turn (?:it|them) on|do it)\b[,.!]?\s/i.test(text) || firstYes) && !firstYesKeeps()) { confirms.delete(shown.id); return reply(settle(shown, true)); }
+          if (firstYes) return hint('turn on full permissions');
+          if (stopWords) return stopNow();
+          if (alone) return askAlone();
+          return prompt();
+        }
         if (shown) {
-          // a card's own words (src/core/commands.mjs): "merge it" is a yes to a merge; a throw-away needs its own words or
-          // "do it", and a bare "yes" is not enough; "forget it" cancels everywhere. Words not understood keep the card.
+          // a card's own words (src/core/commands.mjs): "merge it" is a yes to a merge; a throw-away needs its own words,
+          // "do it" or a yes that goes on, and a "yes" said alone is not enough; "stop it" to a stop card, "send it" to a
+          // message card; "forget it" cancels everywhere. A yes that is not enough, one asked, or another card's own yes keeps
+          // the card.
           const yes = shown.kind === 'discard' ? /^(throw it away|discard it|do it)$/i
             : shown.kind === 'merge' ? /^(yes|ok|do it|go ahead|sure|merge it|merge|land it)$/i
-            : shown.kind === 'start' ? /^(yes|ok|do it|go ahead|sure|start it|launch it)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
+            : shown.kind === 'stop' ? /^(yes|ok|do it|go ahead|sure|stop|stop it)$/i
+            : shown.kind === 'say' ? /^(yes|ok|do it|go ahead|sure|send it)$/i
+            : shown.kind === 'start' ? /^(yes|ok|do it|go ahead|sure|start|start them|start all of them|launch them)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
           if (yes.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
-          if (/^(no|cancel|never mind|stop|forget it|keep it|don.t)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
-          const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', start: 'start it' }[shown.kind] || 'go ahead';
-          if (/^(yes|yeah|yep|ok|okay|sure|go ahead|merge it|land it|start it)$/i.test(text) || !/^(merge|land|throw|discard|scrap|forget|start|what)\b/i.test(text)) {
-            return reply({ reply: `I did not catch that. Say “do it” to ${verb}, or “cancel”.`, confirm: cardOf(shown) });
-          }
+          if (/^(no|cancel|never mind|forget it|keep it|don.t|stop|stop it)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', stop: 'stop it', say: 'send it', start: 'start them' }[shown.kind] || 'go ahead';
+          if (/^(yes|yeah|yep|ok|okay|sure|go ahead|merge it|land it|start it|send it|stop it|allow it)[.!]*$/i.test(text) || /\?$/.test(text)) return hint(verb);
+          if (firstNo || firstYesBack() || (shown.kind === 'discard' && /^keep it\b[,.!]/i.test(text))) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          // the card's own words, then a break: "merge it, thanks", "throw it away, it is broken", "stop it, it is looping"
+          const own = { merge: /^(?:merge|land) it\b[,.!]\s/i, discard: /^(?:throw it away|discard it)\b[,.!]?\s/i, stop: /^stop(?: it)?[,.!]\s/i, say: /^send it\b[,.!]\s/i }[shown.kind];
+          if ((own && own.test(text)) || (firstYes && !firstYesKeeps() && (shown.kind !== 'discard' || !loneYes))) { confirms.delete(shown.id); return reply(settle(shown, true)); }
+          if (firstYes) return hint(verb);
+          if (stopWords) return stopNow();   // a stop stops, and the card stays
+          if (alone) return askAlone();      // a program named alone asks what it should work on, and the card stays
+          // more than one agent from one sentence brings its own card in place of this one (below)
+          const several = /^start (?:two|three|four|five|[2-5]|eight|8) /i.test(text);
+          if (!several && !/^(merge|land|throw|discard|scrap|forget|stop|tell|what needs me)\b/i.test(text)) return prompt();
           confirms.delete(shown.id);   // any other command withdraws the card on screen
         }
+        // "looks good" or "not now" that reach the engine with a finished agent in the centre (the git screen's input; the
+        // board presses the lid's own button): never a prompt (the engine's _lookedAt). Its finish is looked at (`looked`)
+        // only where the lid's button for those words would mark it so; a failed check, a merge that did not go through,
+        // and "looks good" on work that could be merged change nothing and name the lid's answers (_lidChoices)
+        const finished = !shown && json?.focusId ? state.agents.find(x => x.id === json.focusId && !x.parentId && ['done_checked', 'done_claimed', 'checks_failed'].includes(x.state)) : null;
+        if (finished && (LOOKS_GOOD_RE.test(text) || NOT_NOW_RE.test(text))) {
+          const notNow = NOT_NOW_RE.test(text), w = finished.work || null, into = state.repo?.branch || 'main';
+          const again = finished.state === 'done_claimed' && finished.checks?.state === 'running';   // checked again: no Merge
+          const mergeable = state.mode === 'live' && w?.branch && w.folder && !w.thrownAway && !w.merged && !again;
+          const choices = finished.earlier ? (notNow ? null : finished.canContinue ? 'Choose “Continue” or “Forget”.' : 'Choose “Forget”.')
+            : w?.thrownAway ? null
+            : w?.problem ? (w.problem.why === 'conflict' ? `Choose “Ask it to bring in ${w.problem.into || into}” or “Look later”.` : 'Choose “Try again” or “Not now”.')
+              : finished.state === 'checks_failed' ? 'Choose “Ask it to fix that” or “Look later”.'
+                : !notNow && mergeable ? `Choose “Merge into ${into}” or “Not now”.` : null;
+          const out = choices ? { reply: choices }
+            : { reply: notNow && w?.branch ? `${finished.name}’s work stays on its branch for now.` : notNow ? `${finished.name} stays as it is.` : `Good. ${finished.name} stays as it is.`, looked: finished.id };
+          send('notice', { text: out.reply });
+          return reply(out);
+        }
+        if (stopWords) return stopNow();
         if (/^(merge|land)\b|^bring its changes in\b/i.test(text) || /^(throw (it|its work|its changes) away|throw away|discard|scrap)\b/i.test(text)) {
           const merge = /^(merge|land|bring)/i.test(text);
           // the agent the words name ("merge search cleanup"), else the one on screen ("merge it"), as the parser does
           const named = text.replace(/^(merge|land|bring its changes in|throw (it|its work|its changes) away|throw away|discard|scrap)\b\s*/i, '').replace(/\s+into\s+\S+$/i, '').trim().toLowerCase();
-          const byName = named && !/^(it|its work|its changes|that|this)$/.test(named) ? state.agents.find(x => !x.parentId && x.name.toLowerCase() === named) : null;
-          const a = byName || rootOf(state.agents.find(x => x.id === json?.focusId));
-          if (!a) return reply({ reply: `I couldn’t tell which agent to ${merge ? 'merge' : 'throw away'}.` });
+          const pointed = !named || /^(it|its work|its changes|that|this|them|all of it|everything)$/.test(named);
+          const byName = !pointed ? state.agents.find(x => !x.parentId && x.name.toLowerCase() === named) : null;
+          if (!pointed && !byName) return prompt();   // "merge the feature branch": no agent's name, so a prompt
+          const a = byName || rootOf(state.agents.find(x => x.id === (shown?.agentId || json?.focusId)));
+          if (!a) return reply({ reply: 'Which one do you mean? Pick it on the board, then ask again.' });
           const no = merge ? mergeRefusal(a) : discardRefusal(a);
           if (no) return reply({ reply: no, focusId: a.id });
           const card = merge ? mergeCard(a) : discardCard(a);
@@ -1326,25 +1985,59 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         }
         if (/^forget\b/i.test(text)) {
           const a = state.agents.find(x => x.id === json?.focusId && x.earlier);
-          if (!a) return reply({ reply: 'I couldn’t tell which agent to forget.' });
-          const sentence = `Forget ${a.name}?`, detail = 'It will not show here again. Its folder and branch stay on this computer.';
+          if (!a) return prompt();
+          const sentence = `Forget ${a.name}?`, detail = 'It will not show here again. Its folder and branch are still on this computer.';
           return reply({ reply: sentence, confirm: newConfirm({ kind: 'forget', sentence, detail }, { forget: a.id }) });
         }
-        if (/^start\b/i.test(text) || STARTER_TASKS.includes(text)) {
-          const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
-          const eight = /eight|8/.test(text);
-          const sentence = eight
-            ? 'Start 8 agents: a simulated Claude on “fix the flaky checkout test”, a simulated Codex on “write tests for the parser”, a simulated Claude on “tidy up the invoice export”, a simulated Claude on “make the login page remember the last email”, a simulated Codex on “add a dark mode to the settings page”, a simulated Claude on “speed up the monthly report”, a simulated Claude on “translate the help pages into French” and a simulated Codex on “find and remove dead code in the search service”?'
-            : `Start a simulated Claude on “${text.replace(/^start (an agent|a helper|claude|codex)? ?(to |on )?/i, '').slice(0, 90)}”?`;
-          const detail = eight ? 'This is the demo: the agents are simulated and nothing is spent. Each one gets its own cloud machine, and each one can spend up to $2.' : 'This is the demo: the agents are simulated and nothing is spent. It runs on your laptop.';
-          confirms.set(id, { id, kind: 'start', sentence, detail });
-          return reply({ reply: sentence, confirm: { id, kind: 'start', sentence, detail } });
+        // a stop or a message whose words found the agent by its task, not its name, is asked first ("stop the sign-up
+        // one", "tell the sign-up one to use the new copy"), as the engine's _proposeIntent: "Stop Onboarding?"
+        const found = /^(?:stop the (.+?) one|tell the (.+?) one to (.+))$/i.exec(text);
+        if (found) {
+          const word = (found[1] || found[2]).toLowerCase();
+          const a = state.agents.find(x => !x.parentId && `${x.name} ${x.task || ''}`.toLowerCase().includes(word));
+          if (!a) return prompt();
+          const card = found[1]
+            ? { kind: 'stop', sentence: `Stop ${a.name}?`, detail: a.task ? `Its task: “${clip(a.task, 90)}”` : null }
+            : { kind: 'say', sentence: `Tell ${a.name} “${clip(found[3], 80)}”?`, detail: a.task ? `Its task: “${clip(a.task, 90)}”` : null };
+          return reply({ reply: card.sentence, confirm: newConfirm(card, { agentId: a.id }) });
         }
-        if (/what needs me/i.test(text)) {
+        // full permissions, said whole: on asks first with the card, off is at once
+        if (/^(full permissions|turn on full permissions|full permissions on|allow everything|stop asking|don'?t ask me|full access|enable full permissions)$/i.test(text)) {
+          const out = permissionsAnswer('full');
+          return reply(out.confirm ? out : { reply: out.reply });
+        }
+        if (/^(ask (me )?first|ask (me )?again|turn off full permissions|full permissions off|disable full permissions)$/i.test(text)) {
+          const out = permissionsAnswer('ask');
+          send('notice', { text: out.reply });
+          return reply({ reply: out.reply });
+        }
+        // "what needs me", also with a time, an urgency or a reason after it: always the status
+        if (/^what needs me( now| urgently| first| today| right now| most)?\??$/i.test(text)) {
           const need = state.agents.filter(a => ['needs_ok', 'question', 'maybe_stuck', 'checks_failed'].includes(a.state));
-          return reply({ reply: need.length ? `${need.length} thing${need.length === 1 ? '' : 's'} need${need.length === 1 ? 's' : ''} you.` : 'Nothing needs you.', focusId: need[0]?.id });
+          const out = { reply: need.length ? `${need.length} thing${need.length === 1 ? '' : 's'} need${need.length === 1 ? 's' : ''} you.` : 'Nothing needs you right now.', focusId: need[0]?.id };
+          send('notice', { text: out.reply });
+          return reply(out);
         }
-        return reply({ reply: 'I did not catch that. Say what to work on, like “the login page is broken”, or ask “what needs me”.' });
+        // an agent named alone asks what it should work on, and the next words are its prompt (askAlone, above)
+        if (alone) return askAlone();
+        // "start …": the words after it, at once; more than one agent from one sentence ("start three agents on the login
+        // page", or "start eight agents on the backlog", the eight the backlog holds) asks first, with the engine's card
+        if (/^start\b/i.test(text)) {
+          const eight = /eight|8/.test(text);
+          const many = /^start (two|three|four|five|[2-5]) (?:claude |codex )?agents (?:on|to) (.+)$/i.exec(text);
+          const tasks = eight
+            ? ['fix the flaky checkout test', 'write tests for the parser', 'tidy up the invoice export', 'make the login page remember the last email',
+              'add a dark mode to the settings page', 'speed up the monthly report', 'translate the help pages into French', 'find and remove dead code in the search service']
+              .map((task, i) => ({ task, harness: i % 3 === 1 ? 'codex' : 'claude' }))
+            : many ? Array.from({ length: COUNTED[many[1].toLowerCase()] }, () => ({ task: many[2], harness: /codex agents/i.test(text) ? 'codex' : forProgram || 'claude' }))
+              : [{ task: text.replace(/^start (an agent|a helper|claude|codex)? ?(to |on )?/i, '') || text, harness: /^start codex\b/i.test(text) ? 'codex' : forProgram }];
+          if (tasks.length > 1) {
+            const card = startCard(tasks);
+            return reply({ reply: card.sentence, confirm: newConfirm(card, { tasks }) });
+          }
+          return reply(startNow(tasks));
+        }
+        return prompt();
       }
       // Agents & keys: the connect panel's routes (404 outside the connect scenarios, as in the demo)
       if (p === '/api/connect' || p.startsWith('/api/connect/')) {
@@ -1367,7 +2060,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     if (file === path.join(ROOT, 'ui', 'index.html')) {
       // the page, with the person's choices on <html>, as the real server sends it
       res.writeHead(200, { 'content-type': TYPES['.html'], 'cache-control': 'no-store', ...SECURITY });
-      res.end(pageWithPrefs(fs.readFileSync(file, 'utf8'), prefs.get())); return;
+      res.end(pageWithPrefs(fs.readFileSync(file, 'utf8'), { ...prefs.get(), permissions: state.permissions })); return;
     }
     res.writeHead(200, { 'content-type': TYPES[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store', ...SECURITY });
     fs.createReadStream(file).pipe(res);
@@ -1377,7 +2070,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     if (!quiet) console.log('mock on', actual);
     resolve({
       port: actual,
-      setScenario(n) { name = n; state = scenario(n); cw = connectFacts(n); confirms.clear(); },
+      setScenario(n) { name = n; state = scenario(n); cw = connectFacts(n); confirms.clear(); fw = null; },
       close: () => new Promise(r => { clearInterval(stepTimer); for (const c of clients) c.destroy(); server.close(() => r()); }),
     });
   }));
