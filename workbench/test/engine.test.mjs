@@ -184,6 +184,7 @@ const FILLED = { copied: [{ path: '.env', kind: 'env' }, { path: 'apps/web/.env.
 const COPIES_NOTICE = 'Agents’ copies now get your .env files, keys included, and node_modules, so they can run the project. A .worktreeinclude file at the top of the repository chooses what is copied.';
 const SETUP_ASK = 'Run this setup command in each agent’s copy before it starts?';
 const SETUP_RAN = 'OK. Each agent’s copy runs it before the agent starts.';
+const SETUP_WAITING = 'Waiting for your answer about the setup command';
 
 /**
  * A live engine whose agents' copies are filled (stand-ins for fillWorkspace and envValues), with workbench.json's setup
@@ -229,8 +230,9 @@ test('a new agent’s copy is filled first, then its setup command runs, then it
   assert.equal(done.state, 'starting');
   const detail = 'Its copy has your .env, apps/web/.env.local and node_modules. The setup command ran in it.';
   assert.equal(done.now, detail, 'the start detail: the line its chip shows on hover');
-  assert.ok(t.logs.includes(`info Fix login redirect is starting. ${detail}`), t.logs.join('\n'));
-  assert.ok(t.logs.some(l => /^info The setup command ran in the copy of Fix login redirect\b.*added 12 packages/.test(l)), 'its output goes to the log');
+  // Warnings, as the launch's own lines are, so the log has them without --verbose (the Mac app passes none).
+  assert.ok(t.logs.includes(`warn Fix login redirect is starting. ${detail}`), t.logs.join('\n'));
+  assert.ok(t.logs.includes('warn The setup command ran in the copy of Fix login redirect (under a second). The end of what it printed: added 12 packages'), t.logs.join('\n'));
   assert.ok(t.notices.includes('Started Fix login redirect.'));
   await t.engine.shutdown();
 });
@@ -376,6 +378,7 @@ test('the setup card: asked the first time, Run it is kept for the repository an
   await new Promise(r => setTimeout(r, 20));
   assert.deepEqual(t.calls.order, ['fill'], 'it waits for the answer: no setup and no runner yet');
   assert.equal(t.store.list()[0].state, 'starting');
+  assert.equal(t.store.list()[0].now, SETUP_WAITING, 'its copy is made: it waits for the person, and says so');
   assert.deepEqual(await t.engine.confirm(card.id, true), { reply: SETUP_RAN });
   const v = await first;
   assert.deepEqual(t.calls.order, ['fill', 'setup', 'runner']);
@@ -488,6 +491,40 @@ test('an agent whose copy is being made ready is never asked whether it is stuck
   await t.engine.confirm(card.id, true);
   await a;
   await t.engine.shutdown();
+});
+
+test('while the setup card waits, a starting agent says so once its copy is made, and at once when there is no copy to make', async () => {
+  const t = copies({ setup: 'npm ci' });
+  const g = gate();
+  t.git.fillGate = g;
+  const a = t.engine.startAgent({ task: 'Fix the login redirect' });
+  const card = await setupCard(t);
+  const [v] = t.store.list();
+  assert.equal(t.store.get(v.id).now, 'Copying .env, apps/web/.env.local and node_modules into its copy', 'still copying');
+  g.open();
+  await until(() => t.store.get(v.id).now === SETUP_WAITING);
+  assert.deepEqual(t.calls.order, ['fill']);
+  await t.engine.confirm(card.id, false);
+  assert.equal((await a).now, 'Its copy has your .env, apps/web/.env.local and node_modules. It starts without the setup command.');
+  // Its setup card answered while it copied: it never says it waits.
+  t.git.fillGate = gate();
+  const b = t.engine.startAgent({ task: 'Fix the cart' });
+  const card2 = await setupCard(t);
+  await t.engine.confirm(card2.id, true);
+  const seen = [];
+  t.store.on('agents', ids => { for (const id of ids) if (t.store.get(id)?.name === 'Fix cart') seen.push(t.store.get(id).now); });
+  t.git.fillGate.open();
+  assert.equal((await b).now, 'Its copy has your .env, apps/web/.env.local and node_modules. The setup command ran in it.');
+  assert.ok(!seen.includes(SETUP_WAITING), seen.join(' / '));
+  await t.engine.shutdown();
+  // No copy to make (a workspace module without fillWorkspace): it waits for the person from the start.
+  const u = copies({ setup: 'npm ci', fill: null });
+  const c = u.engine.startAgent({ task: 'Fix the tax' });
+  const card3 = await setupCard(u);
+  await until(() => u.store.list()[0]?.now === SETUP_WAITING);
+  await u.engine.confirm(card3.id, true);
+  await c;
+  await u.engine.shutdown();
 });
 
 test('an agent stopped while its copy is made ready never starts; shutdown answers the setup card Not now, and starts nothing', async () => {

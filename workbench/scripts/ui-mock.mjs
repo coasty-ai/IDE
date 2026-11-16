@@ -854,14 +854,16 @@ function fullWorld(name, now) {
 //               launch the person confirms puts its agent on the board copying its files, and the setup card opens in
 //               the core; Run it runs it in each copy waiting (and later launches run it without asking), Not now
 //               starts them without it and asks again next time
-//   setup-card  the card already open, for a long command, with two agents waiting on it and one whose start detail
-//               says the setup command failed: the fit check's view
+//   setup-card  the card already open, for a long command, with two agents waiting on it (one still copying, one whose
+//               copy is made says it waits for the answer) and one whose start detail says the setup command failed: the
+//               fit check's view
 const SETUP_SCENARIOS = ['setup', 'setup-card'];
 SCENARIOS.push(...SETUP_SCENARIOS);
 const SETUP_SENTENCE = 'Run this setup command in each agent’s copy before it starts?';
 const SETUP_DETAIL = 'It comes from workbench.json, and runs before each new agent starts. Workbench asks again if it changes.';
 const COPYING = 'Copying .env, apps/web/.env.local and node_modules into its copy';
 const COPIED = 'Its copy has your .env, apps/web/.env.local and node_modules.';
+const SETUP_WAITING = 'Waiting for your answer about the setup command';
 function setupWorld(name, now) {
   const st = mergeWorld('merge', now);
   st.setupCommand = 'npm ci';
@@ -869,7 +871,7 @@ function setupWorld(name, now) {
   if (name === 'setup-card') {
     st.setupCommand = 'npm ci && npm run build --workspace=apps/web && npx prisma generate && cp .env.example .env.local && node scripts/seed-test-db.mjs --quiet --reset';
     const mk = (id, nm, task, o = {}) => view({ id, name: nm, task, state: 'starting', now: COPYING, ageMin: 0.3, sinceMin: 0.3, toolCalls: 0, work: workOf({ id, name: nm }), ...o }, now);
-    st.agents.push(mk('s1a2b3', 'Login redirect', 'Fix the login redirect loop'), mk('s4c5d6', 'Cart rounding', 'Fix the cart total rounding'),
+    st.agents.push(mk('s1a2b3', 'Login redirect', 'Fix the login redirect loop', { now: SETUP_WAITING }), mk('s4c5d6', 'Cart rounding', 'Fix the cart total rounding'),
       mk('s7e8f9', 'Search speed', 'Make the search page faster', { now: `${COPIED} The setup command failed (exit 1), so its copy may not run yet.` }));
     countHelpers(st.agents);
     st.setupWaiting = ['s1a2b3', 's4c5d6'];
@@ -922,6 +924,9 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const setupFor = a => {
     if (state.setupOk === state.setupCommand) { runSetupIn([a]); return; }
     state.setupWaiting.push(a.id);
+    // its copy is made a moment later: while the card still waits, its line says it waits for the person
+    // (only in this world: another may have been opened meanwhile)
+    setTimeout(() => { if (state.agents.includes(a) && state.setupWaiting?.includes(a.id)) { a.now = SETUP_WAITING; send('agents', [a]); } }, 250);
     if (state.setup) return;
     state.setup = { id: 's' + (++setupSeq).toString(16).padStart(6, '0'), kind: 'setup', sentence: SETUP_SENTENCE, command: state.setupCommand, detail: SETUP_DETAIL, yes: 'Run it', no: 'Not now' };
     send('snapshot', state);

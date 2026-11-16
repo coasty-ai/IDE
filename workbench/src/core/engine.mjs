@@ -116,6 +116,7 @@ const SETUP_RAN = 'OK. Each agent’s copy runs it before the agent starts.';
 const SETUP_NOT_KEPT = 'Workbench could not save that, so it asks again the next time it starts.';
 const SETUP_RUNNING = 'Running the setup command in its copy';
 const SETUP_SKIPPED = 'It starts without the setup command.';
+const SETUP_WAITING = 'Waiting for your answer about the setup command';
 const SETUP_EXPIRED = 'Nobody answered whether to run the setup command, so the agents waiting for it start without it.';
 const SETUP_TIMEOUT_SEC = 600;
 // The most values of copied env files the engine hides (the newest are kept).
@@ -2631,6 +2632,11 @@ export class Engine extends EventEmitter {
       said.push(...await this._fill(run, root, name));
       if (gone()) return false;
     }
+    // Its copy is made (or there was none to make), and the setup card still waits: it waits for the person, and its
+    // line says so, not "Copying …" for as long as the card is open.
+    if (answer?.asks && answer.waiting()) {
+      this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason: SETUP_WAITING }], { masked: true });
+    }
     if (answer) {
       if (await answer === 'run') {
         if (gone()) return false;
@@ -2645,7 +2651,9 @@ export class Engine extends EventEmitter {
     if (detail) {
       // Workbench's own words, made of file names: never masked (a copied value such as "production" is in ".env.production").
       this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason: detail }], { masked: true });
-      this.log.info(`${logText(name)} is starting. ${detail}`);
+      // A warning, as the launch's own lines are: the page shows it only until the agent's first step, and the log shows
+      // info lines only with --verbose, which the Mac app does not pass.
+      this.log.warn(`${logText(name)} is starting. ${detail}`);
     }
     return true;
   }
@@ -2720,7 +2728,9 @@ export class Engine extends EventEmitter {
     const printed = logTail(r?.tail);
     const end = printed ? ` The end of what it printed: ${printed}` : '';
     if (r?.ok) {
-      this.log.info(`The setup command ran in the copy of ${logText(name)} (${duration(Number(r.ms) || 0) || 'under a second'}).${end}`);
+      // A warning too (see _prepare): what it printed is in the log only.
+      const took = Number(r.ms) >= 500 ? duration(Number(r.ms)) : 'under a second';
+      this.log.warn(`The setup command ran in the copy of ${logText(name)} (${took}).${end}`);
       return 'The setup command ran in it.';
     }
     const how = r?.timedOut ? 'it took more than 10 minutes' : Number.isInteger(r?.exitCode) ? `exit ${r.exitCode}` : 'it could not start';
@@ -2771,6 +2781,8 @@ export class Engine extends EventEmitter {
       });
     });
     waits.asks = true; // it waits for the person
+    // Whether it still does: its card is open, and it was not stopped (_closeSetup and onAbort change both at once).
+    waits.waiting = () => this._setupAsks.has(d.id) && d.waiters.has(run.id);
     return waits;
   }
 
