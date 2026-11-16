@@ -842,7 +842,11 @@ export async function searchFiles({ root, query, max = MAX_SEARCH_RESULTS, timeo
   const top = realFolder(root);
   const limit = Number.isInteger(max) && max > 0 ? Math.min(max, MAX_SEARCH_RESULTS) : MAX_SEARCH_RESULTS;
   const icase = !/\p{Lu}/u.test(q);
-  const args = ['grep', '-n', '-I', '--fixed-strings', '--untracked', '--no-color', '-z', ...(icase ? ['-i'] : []), '-f', '-', '--', '.', ...NO_ENV];
+  // The repository's own settings (an agent can write them) could add a column to each record, or make --untracked
+  // fatal (submodule.recurse): settings given here outrank them. Options given here outrank the rest (grep.patternType,
+  // grep.lineNumber, color.grep).
+  const args = ['-c', 'grep.column=false', '-c', 'submodule.recurse=false',
+    'grep', '-n', '-I', '--fixed-strings', '--untracked', '--no-color', '-z', ...(icase ? ['-i'] : []), '-f', '-', '--', '.', ...NO_ENV];
   let out;
   let cut = false;
   try {

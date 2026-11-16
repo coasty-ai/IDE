@@ -1103,6 +1103,20 @@ test('search leaves out what the file view leaves out: env files, saves’ sibli
   assert.deepEqual(await searchFiles({ root, query: 'needle' }), { results: [{ path: 'a.txt', line: 1, text: 'needle' }] });
 });
 
+test('search and the list read the same, whatever the repository’s own git settings say (an agent can write them)', async () => {
+  const { root } = repo({ 'a.txt': 'one needle\n', 'src/b.js': 'needle(2)\n' });
+  put(root, { 'new.txt': 'a new needle\n' });
+  for (const [key, value] of [['grep.column', 'true'], ['submodule.recurse', 'true'], ['grep.patternType', 'perl'], ['grep.fullName', 'true'],
+    ['grep.lineNumber', 'false'], ['color.grep', 'always'], ['core.quotePath', 'true']]) git(root, 'config', key, value);
+  assert.deepEqual(await searchFiles({ root, query: 'needle' }), { results: [
+    { path: 'a.txt', line: 1, text: 'one needle' },
+    { path: 'new.txt', line: 1, text: 'a new needle' },
+    { path: 'src/b.js', line: 1, text: 'needle(2)' },
+  ] });
+  assert.deepEqual((await searchFiles({ root, query: 'needle(2' })).results.map(r => r.path), ['src/b.js'], 'still fixed strings');
+  assert.deepEqual(await listFiles({ root }), { files: ['a.txt', 'new.txt', 'src/b.js'] });
+});
+
 test('search cuts a long line to 400 characters around the match, and stops at the most results asked for', async () => {
   const long = `${'a'.repeat(1000)}NEEDLE${'b'.repeat(1000)}`;
   const many = Array.from({ length: 30 }, (_, i) => `needle ${i}`).join('\n') + '\n';
