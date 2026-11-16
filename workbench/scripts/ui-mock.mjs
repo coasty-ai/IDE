@@ -1426,7 +1426,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           // "turn it off" and its kin, or a no. A bare "yes" is not enough, and a question answers nothing: the card stays.
           if (/^(turn (it|them) on|turn on full permissions|do it|stop asking|full permissions|allow everything)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (/^(keep asking|no|cancel|never mind|ask first|ask me first|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
-          return reply({ reply: 'I did not catch that. Say “do it” to turn on full permissions, or “cancel”.', confirm: cardOf(shown) });
+          return reply({ reply: 'Say “do it” to turn on full permissions, or “cancel”.', confirm: cardOf(shown) });
         }
         if (shown) {
           // a card's own words (src/core/commands.mjs): "merge it" is a yes to a merge; a throw-away needs its own words or
@@ -1438,7 +1438,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if (/^(no|cancel|never mind|stop|forget it|keep it|don.t)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', start: 'start it' }[shown.kind] || 'go ahead';
           if (/^(yes|yeah|yep|ok|okay|sure|go ahead|merge it|land it|start it)$/i.test(text) || !/^(merge|land|throw|discard|scrap|forget|start|what)\b/i.test(text)) {
-            return reply({ reply: `I did not catch that. Say “do it” to ${verb}, or “cancel”.`, confirm: cardOf(shown) });
+            return reply({ reply: `Say “do it” to ${verb}, or “cancel”.`, confirm: cardOf(shown) });
           }
           confirms.delete(shown.id);   // any other command withdraws the card on screen
         }

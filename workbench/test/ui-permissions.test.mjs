@@ -3,7 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { permButtonView, permissionMode, launchNote } from '../ui/permissions.js';
+import { permButtonView, permissionMode } from '../ui/permissions.js';
+import * as permissions from '../ui/permissions.js';
 
 const read = (f) => readFileSync(new URL(`../ui/${f}`, import.meta.url), 'utf8');
 
@@ -23,12 +24,9 @@ test('the button is quiet while agents ask, and lit and pressed while full permi
   }
 });
 
-test('a launch card says, while full permissions are on, that it will not ask', () => {
-  assert.equal(launchNote('full'), 'Full permissions are on, so it will not ask before any step.');
-  assert.equal(launchNote('full', 1), 'Full permissions are on, so it will not ask before any step.');
-  assert.equal(launchNote('full', 3), 'Full permissions are on, so they will not ask before any step.');
-  assert.equal(launchNote('ask', 3), '');
-  assert.equal(launchNote(undefined), '');
+test('work starts with no card, so nothing is added to one while full permissions are on: the button shows the mode', () => {
+  assert.equal(permissions.launchNote, undefined);
+  assert.doesNotMatch(read('focus.js'), /permissions\.js|will not ask before any step/);
 });
 
 test('the band holds the button beside Agents & keys, with aria-pressed, hidden until the page is live', () => {

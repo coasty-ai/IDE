@@ -220,11 +220,11 @@ async function main() {
     } catch (err) { log('screenshot failed:', name, err.message); }
   };
 
-  const asked = await post('/api/command', { text: 'start an agent to ' + TASK });
-  if (!asked.body?.confirm) { console.error('No confirm came back:', JSON.stringify(asked.body)); eng.kill('SIGINT'); process.exit(1); }
-  const go = await post(`/api/confirm/${encodeURIComponent(asked.body.confirm.id)}`, { go: true });
+  // A typed task is never asked: the agent starts at once, and the reply carries it (the merge and throw-away below are
+  // still asked first, each with its card).
+  const go = await post('/api/command', { text: 'start an agent to ' + TASK });
   const rootId = go.body?.agentIds?.[0];
-  if (!rootId) { console.error('The agent did not start:', JSON.stringify(go.body)); eng.kill('SIGINT'); process.exit(1); }
+  if (go.body?.confirm || !rootId) { console.error('The agent did not start at once:', JSON.stringify(go.body)); eng.kill('SIGINT'); process.exit(1); }
   log('Started:', go.body.reply);
   const view = async () => (await agents()).find((a) => a.id === rootId) || null;
 
