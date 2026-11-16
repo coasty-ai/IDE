@@ -547,8 +547,11 @@ const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'], permi
 /**
  * A reply to the confirm card on screen: true (yes), false (no), 'asks' (a yes asked rather than said, such as
  * "is that right?": it answers nothing, so the card stays), 'keep' (a yes that is not enough for this card, such as
- * a bare "yes" to throwing work away: the card stays), 'permission' (a permission's own answer, "allow it", or a yes and
- * a no together: the card stays unless its first words answer it, see parse), or null (not a reply).
+ * a branch named on a merge card or "scrap it" to a throw-away: the card stays), 'plain' (a yes said alone that a card
+ * with no default answer does not take alone, such as a bare "yes" to throwing work away or to full permissions: the card
+ * stays, but words that begin with it and go on answer it, see cardFirstReply), 'permission' (a permission's own answer,
+ * "allow it", or a yes and a no together: the card stays unless its first words answer it, see parse), or null (not a
+ * reply).
  */
 function confirmReply(toks, kind, c) {
   // While "Stop Flaky test?" waits, "stop" and "stop it" mean yes; while "Tell Flaky test …?" waits, "send it" does.
@@ -571,7 +574,7 @@ function confirmReply(toks, kind, c) {
   }
   // Before the fillers go: "so" is one. Throwing work away and full permissions take their own words, so "make it so"
   // keeps those cards.
-  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : kind === 'discard' || kind === 'permissions' ? 'keep' : true;
+  if (toks.map(t => t.w).join(' ') === 'make it so') return yesAsked(toks) ? 'asks' : kind === 'discard' || kind === 'permissions' ? 'plain' : true;
   // "don't merge it", "do not throw it away": a no, though the card's own word is in it.
   const first = toks.map(t => t.w).filter(w => !SOFT_LEAD.has(w));
   const negated = first[0] === "don't" ? 1 : first[0] === 'do' && first[1] === 'not' ? 2 : first[0] === 'never' ? 1 : 0;
@@ -597,12 +600,12 @@ function confirmReply(toks, kind, c) {
     if (kind === 'discard') {
       const explicit = ws.some((w, i) => (w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || (own.includes(w) && w !== 'throw'))
         || (ws.includes('throw') && (ws.includes('away') || ws.includes('out')));
-      if (!explicit) return 'keep';
+      if (!explicit) return 'plain';
     }
     // Turning full permissions on takes its own words too: "turn it on", "turn on full permissions" or "do it".
     if (kind === 'permissions') {
       const explicit = ws.some((w, i) => w === 'do' && (ws[i + 1] === 'it' || ws[i + 1] === 'that')) || (ws.some(w => own.includes(w)) && ws.includes('on'));
-      if (!explicit) return 'keep';
+      if (!explicit) return 'plain';
     }
     return true;
   }
@@ -643,6 +646,12 @@ const CARD_CONDITION = new Set(['but', 'only', 'if', 'unless', 'except', 'provid
 const TAKE_BACK = new Set(['no', 'nope', 'nah', 'wait', 'cancel']);
 /** Words that may stand between a yes and what follows it: "yes, and then …", "yes, so …". */
 const CARD_GLUE = new Set(['and', 'then', 'so', 'also']);
+/**
+ * Words that leave a yes alone when they are all that follows it: thanks and please ("sure, thanks a lot", "okay, thank
+ * you so much"), the words a card's yes may come with (CONFIRM_YES_FILL), and with them other yes words and openers.
+ */
+const ALONE_FILL = new Set([...CONFIRM_YES_FILL, ...CARD_GLUE, 'a', 'lot', 'much', 'ty', 'cheers']);
+const leavesAlone = w => ALONE_FILL.has(w) || CONFIRM_YES.has(w) || SOFT_LEAD.has(w);
 
 /**
  * Words that begin with a plain no to the card on screen (CARD_FIRST_NO: "no, because the tests are red", "nope, not yet",
@@ -671,10 +680,12 @@ function cardWords(kind) {
  *   before this, so here it is null.
  * - A plain yes (CARD_FIRST_YES: "yes", "sure", "ok", "do it", "go ahead"), whatever follows: "yes add tests too", said
  *   with no comma, is a yes too. The first words are the longest the card takes as an answer by themselves, with no
- *   other card's no in them ("sure, no rush" is "sure"), so what the card refuses it still refuses: a bare yes to a
- *   throw-away, a branch named on a merge card ('keep'). A yes is a yes unless what follows asks something ("yes, and
- *   what does it change?": 'asks'), sets a condition no card can carry ("yes, but not into main", "yes if the tests pass":
- *   'keep'), or takes it back ("okay, no, do not do it", "yes no wait": false).
+ *   other card's no in them ("sure, no rush" is "sure"), so what the card refuses it still refuses: a branch named on a
+ *   merge card ('keep'). A card with no default answer (throw away, full permissions) takes no yes said alone ('plain'):
+ *   with nothing after it but thanks or please ("sure, thanks a lot": ALONE_FILL) it stays alone and the card stays
+ *   ('keep'), but a yes that goes on answers it as it answers every card ("yes, and then tell me"). A yes is a yes unless
+ *   what follows asks something ("yes, and what does it change?": 'asks'), sets a condition no card can carry ("yes, but
+ *   not into main", "yes if the tests pass": 'keep'), or takes it back ("okay, no, do not do it", "yes no wait": false).
  * - The card's own words ("merge it", "throw it away", "stop it", "keep it", "turn it on", cardWords), only when what
  *   follows is set off from them by a break, a dash or a joining word (CARD_JOIN): "merge it because the tests pass", but
  *   "stop onboarding" on a stop card stops Onboarding, and "merge onboarding" asks about Onboarding's merge.
@@ -704,7 +715,9 @@ function cardFirstReply(toks, kind, c) {
     const last = head[n - 1];
     const rest = toks.slice(k + n);
     if (!plain && !(last.tail || dashBetween(last, rest[0]) || CARD_JOIN.has(rest[0].w))) continue;
-    if (r !== true) return r;
+    // a plain yes that a card with no default answer does not take alone, and words after it that say more than thanks
+    const goesOn = r === 'plain' && plain > 0 && rest.some(t => !leavesAlone(t.w));
+    if (r !== true && !goesOn) return r === 'plain' ? 'keep' : r;
     if (asksSomething(rest)) return 'asks';
     const said = rest.filter(t => !CARD_GLUE.has(t.w)).map(t => t.w);
     if (said.slice(0, 2).some(w => CARD_CONDITION.has(w)) || rest.slice(0, 2).some(t => CARD_CONDITION.has(t.w))) return 'keep';
@@ -2718,7 +2731,7 @@ function parse(said, c, { free = true } = {}) {
     const kind = c.pendingConfirm.kind;
     let go = confirmReply(replyBase, kind, c);
     if (go === null || go === 'permission') go = cardNoFirst(replyBase) ?? cardFirstReply(replyBase, kind, c) ?? (go && 'keep');
-    if (go === 'asks' || go === 'keep') return { kind: 'unknown', text: said };
+    if (go === 'asks' || go === 'keep' || go === 'plain') return { kind: 'unknown', text: said };
     if (go !== null) return { kind: 'confirm', go };
   }
   // A finished agent's lid: "looks good" and the engine's other words for it, or "not now", said whole, answer its finish

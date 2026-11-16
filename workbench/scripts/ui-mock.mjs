@@ -1518,11 +1518,14 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         };
         // Words that begin with a card's yes or no answer it, whatever follows (src/core/commands.mjs, cardNoFirst and
         // cardFirstReply, in short): "no, because the tests are red" is its no, "yes, and then tell me" or "do it, thanks"
-        // its yes; a yes with a condition ("yes, but …", "yes if …") or a question keeps the card, and so does a bare yes
-        // where the card wants its own words. A no first that asks ("don't you want to look first?") is no answer.
+        // its yes; a yes with a condition ("yes, but …", "yes if …") or a question keeps the card, and so does a yes said
+        // alone where the card wants its own words ("yes", "sure, thanks a lot" to a throw-away), though one that goes on
+        // answers it ("yes, and then tell me"). A no first that asks ("don't you want to look first?") is no answer.
         const firstNo = /^(?:no|nope|nah|cancel|don'?t|do not|not now|not yet)\b/i.test(text) && !/^(?:no problem|no worries)\b/i.test(text)
           && !(/\?$/.test(text) && /^(?:don'?t|do not|not)\b/i.test(text));
         const firstYes = /^(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b|(?:do it|go ahead)\b)/i.exec(text);
+        // a yes said alone, with nothing after it but thanks or please (src/core/commands.mjs, ALONE_FILL, in short)
+        const loneYes = /^(?:yes|yeah|yep|yup|sure|ok|okay|alright|go ahead|make it so)(?:[,.!]*\s*(?:please|thanks|thank you)(?: (?:a lot|so much|very much))?)?[.!]*$/i.test(text);
         const firstYesKeeps = () => /\?$/.test(text) || /^\S+(?: it| ahead)?[,.!]?\s+(?:but|if|only|unless|except)\b/i.test(text);
         // A program named alone ("codex", "the agent", "new agent", "ask claude") asks what it should work on, and the next
         // words are its prompt; a card on screen stays, and the question is posted as a notice, as the engine's command() does
@@ -1537,21 +1540,23 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         };
         if (shown && shown.kind === 'permissions') {
           // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking",
-          // "turn it off" and its kin, or a no. A bare "yes" is not enough, and a question answers nothing: the card stays.
+          // "turn it off" and its kin, or a no. A yes said alone is not enough, and a question answers nothing: the card
+          // stays. A yes that goes on ("yes, and then tell me") answers it.
           if (/^(turn (it|them) on|turn on full permissions|do it|stop asking|full permissions|allow everything)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (/^(keep asking|no|cancel|never mind|ask first|ask me first|stop|stop it|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
-          if (/^(yes|yeah|yep|ok|okay|sure|go ahead|yes please|make it so)[.!]*$/i.test(text) || /\?$/.test(text)) return hint('turn on full permissions');
+          if (loneYes || /\?$/.test(text)) return hint('turn on full permissions');
           if (firstNo || /^keep asking\b[,.!]/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
-          if (/^(?:turn (?:it|them) on|do it)\b[,.!]?\s/i.test(text) && !firstYesKeeps()) { confirms.delete(shown.id); return reply(settle(shown, true)); }
+          if ((/^(?:turn (?:it|them) on|do it)\b[,.!]?\s/i.test(text) || firstYes) && !firstYesKeeps()) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (firstYes) return hint('turn on full permissions');
           if (stopWords) return stopNow();
           if (alone) return askAlone();
           return prompt();
         }
         if (shown) {
-          // a card's own words (src/core/commands.mjs): "merge it" is a yes to a merge; a throw-away needs its own words or
-          // "do it", and a bare "yes" is not enough; "stop it" to a stop card, "send it" to a message card; "forget it"
-          // cancels everywhere. A yes that is not enough, one asked, or another card's own yes keeps the card.
+          // a card's own words (src/core/commands.mjs): "merge it" is a yes to a merge; a throw-away needs its own words,
+          // "do it" or a yes that goes on, and a "yes" said alone is not enough; "stop it" to a stop card, "send it" to a
+          // message card; "forget it" cancels everywhere. A yes that is not enough, one asked, or another card's own yes keeps
+          // the card.
           const yes = shown.kind === 'discard' ? /^(throw it away|discard it|do it)$/i
             : shown.kind === 'merge' ? /^(yes|ok|do it|go ahead|sure|merge it|merge|land it)$/i
             : shown.kind === 'stop' ? /^(yes|ok|do it|go ahead|sure|stop|stop it)$/i
@@ -1564,7 +1569,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if (firstNo || (shown.kind === 'discard' && /^keep it\b[,.!]/i.test(text))) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           // the card's own words, then a break: "merge it, thanks", "throw it away, it is broken", "stop it, it is looping"
           const own = { merge: /^(?:merge|land) it\b[,.!]\s/i, discard: /^(?:throw it away|discard it)\b[,.!]?\s/i, stop: /^stop(?: it)?[,.!]\s/i, say: /^send it\b[,.!]\s/i }[shown.kind];
-          if ((own && own.test(text)) || (firstYes && !firstYesKeeps() && (shown.kind !== 'discard' || /^do it\b/i.test(text)))) { confirms.delete(shown.id); return reply(settle(shown, true)); }
+          if ((own && own.test(text)) || (firstYes && !firstYesKeeps() && (shown.kind !== 'discard' || !loneYes))) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (firstYes) return hint(verb);
           if (stopWords) return stopNow();   // a stop stops, and the card stays
           if (alone) return askAlone();      // a program named alone asks what it should work on, and the card stays

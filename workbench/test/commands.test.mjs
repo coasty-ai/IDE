@@ -2753,11 +2753,26 @@ test('on a card, words that begin with its yes or no word answer it, whatever fo
     ['turn it on, thanks', 'pendingPermissions', yesTo], ['keep asking, I want to see them', 'pendingPermissions', noTo],
     ['no, because I want to see them', 'pendingPermissions', noTo],
   ]);
+  // A card with no default answer (throw away, full permissions) takes no yes said alone, with nothing after it but thanks
+  // or please: the card stays, and says how to answer it. A yes that goes on answers it, as it answers every card.
+  for (const ctx of ['pendingDiscard', 'pendingDiscardOf', 'pendingDiscardOnPermission', 'dogPendingDiscard', 'pendingPermissions']) {
+    sweptRows([
+      ['yes, and then tell me', ctx, yesTo], ['yes and then tell me', ctx, yesTo], ['yeah, add tests too', ctx, yesTo], ['yes add tests too', ctx, yesTo],
+      ['ok, and tell me when it is done', ctx, yesTo], ['go ahead and tell me when it is done', ctx, yesTo], ['yep. The tests pass.', ctx, yesTo],
+      ['sure, no rush', ctx, yesTo], ["yes, don't forget the docs", ctx, yesTo], ['do it, thanks', ctx, yesTo],
+      ['yes', ctx, unknown('yes')], ['yes please', ctx, unknown('yes please')], ['sure, thanks', ctx, unknown('sure, thanks')],
+      ['sure, thanks a lot', ctx, unknown('sure, thanks a lot')], ['okay, thank you so much', ctx, unknown('okay, thank you so much')],
+      ['yes, thanks very much!', ctx, unknown('yes, thanks very much!')], ['go ahead', ctx, unknown('go ahead')], ['yes yes', ctx, unknown('yes yes')],
+      // what follows a yes may still ask, set a condition, or take the yes back, as on every card
+      ['yes, and what does it delete?', ctx, unknown('yes, and what does it delete?')], ['yes, but not yet', ctx, unknown('yes, but not yet')],
+      ['okay, no, do not do it', ctx, noTo], ['yes no wait', ctx, noTo],
+      ['no, because the tests are red', ctx, noTo], ['not now, later', ctx, noTo], ['cancel - wrong one', ctx, noTo],
+    ]);
+  }
   // what cards refuse they still refuse: a yes that is not enough for the card, a yes asked, a branch named; and a yes with
   // a condition, which no card can carry, keeps the card too. None of these starts anything.
   sweptRows([
-    ['yes, and then tell me', 'pendingDiscard', unknown('yes, and then tell me')], // a bare yes is not enough to throw work away
-    ['sure, thanks a lot', 'pendingPermissions', unknown('sure, thanks a lot')],
+    ['yes throw it', 'pendingDiscard', unknown('yes throw it')], ['sure, scrap it', 'pendingDiscard', unknown('sure, scrap it')],
     ['yes, is that right?', 'pendingMerge', unknown('yes, is that right?')],
     ['yes, and what does it change?', 'pendingMerge', unknown('yes, and what does it change?')],
     ['merge it into main, thanks', 'pendingMerge', unknown('merge it into main, thanks')],

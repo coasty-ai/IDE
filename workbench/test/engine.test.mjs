@@ -4820,3 +4820,26 @@ test('with a finished agent\'s merge card on screen, a stop of "it" with its rea
   assert.equal(t.calls.mergeWork.length, 0, 'nothing merged');
   await t.engine.shutdown();
 });
+
+test('on a throw-away or full permissions card, a yes that goes on answers it; a yes said alone, or with only thanks, keeps it', async (ctx) => {
+  const t = liveFolders(ctx, { prefs: prefsStore() });
+  t.engine.deps.commands = commands;
+  const cart = await doneAgent(t);
+  const away = await t.engine.proposeDiscard(cart.id);
+  assert.equal(away.confirm.kind, 'discard');
+  for (const text of ['yes', 'sure, thanks a lot']) {
+    assert.deepEqual(await t.engine.command(text, { confirmId: away.confirm.id }), { reply: 'Say “do it” to throw it away, or “cancel”.', confirm: away.confirm }, text);
+  }
+  assert.equal(t.calls.discardWork.length, 0, 'nothing thrown away yet');
+  assert.match((await t.engine.command('yes, and then tell me', { confirmId: away.confirm.id })).reply, /^Threw away Fix cart total’s work\./);
+  assert.equal(t.calls.discardWork.length, 1);
+  const perms = (await t.engine.permissions('full')).confirm;
+  for (const text of ['yes', 'sure, thanks a lot']) {
+    assert.deepEqual(await t.engine.command(text, { confirmId: perms.id }), { reply: 'Say “do it” to turn on full permissions, or “cancel”.', confirm: perms }, text);
+  }
+  assert.equal(t.engine.permissionMode, 'ask');
+  assert.equal((await t.engine.command('yes, and then tell me', { confirmId: perms.id })).reply, 'Full permissions are on. Agents no longer ask.');
+  assert.equal(t.engine.permissionMode, 'full');
+  assert.equal(t.claude.runners.length, 1, 'nothing started');
+  await t.engine.shutdown();
+});
