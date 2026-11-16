@@ -46,12 +46,16 @@ const WORKBENCH_SECRETS = new Set(['WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN']
 // The Claude adapter removes the same ones.
 const HOST_VARS = /^(VSCODE_.*|ELECTRON_RUN_AS_NODE|GIT_EDITOR|WORKBENCH_CLAUDE_BIN|WORKBENCH_CODEX_BIN)$/;
 
+/** A script node runs (see commandFor): its name alone is a path, which node reads from the folder it starts in. */
+export const isScriptName = bin => /\.(mjs|cjs|js)$/i.test(bin);
+
 /**
  * Where Codex is: `WORKBENCH_CODEX_BIN` (read at each call, so tests can point it at a fake), else `codex`, which, like
- * any bare name, is looked up on the PATH. An absolute path is taken as it is, and `~/` is the home folder. A relative
- * path is refused: Codex starts in the agent's folder, where the agent could put a program of its own at that path,
- * and the working folder of the moment is not the place either (the file view changes it for a moment). The CLI reads
- * one from the folder Workbench was started in, once, and puts the whole path in its place (bin/workbench.mjs).
+ * any bare name of a program, is looked up on the PATH. An absolute path is taken as it is, and `~/` is the home folder.
+ * A relative path is refused, and so is a script's name alone (node reads it as a path): Codex starts in the agent's
+ * folder, where the agent could put a program of its own at that path, and the working folder of the moment is not the
+ * place either (the file view changes it for a moment). The CLI reads such a path from the folder Workbench was
+ * started in, once, and puts the whole path in its place (placedCodexBin in bin/workbench.mjs).
  * @returns {{ path: string|null, reason?: string }}  `reason`, a plain sentence, when `path` is null
  */
 export function findCodex(env = process.env) {
@@ -60,7 +64,7 @@ export function findCodex(env = process.env) {
   if (!v) return { path: 'codex' };
   const home = e.HOME || (env === process.env ? os.homedir() : '');
   if ((v === '~' || v.startsWith('~/')) && home) v = path.join(home, v.slice(1));
-  if (!v.includes('/') || path.isAbsolute(v)) return { path: v };
+  if (path.isAbsolute(v) || (!v.includes('/') && !isScriptName(v))) return { path: v };
   return { path: null, reason: `Workbench cannot tell where ${e.WORKBENCH_CODEX_BIN} is: the path in WORKBENCH_CODEX_BIN must start with / or ~.` };
 }
 
@@ -171,7 +175,7 @@ export function resumeArgs({ threadId, text, model, gitDirs = [] }) {
 
 /** Node scripts (test doubles) run with this Node, so they need no exec bit or shebang. */
 function commandFor(bin, args) {
-  return /\.(mjs|cjs|js)$/i.test(bin) ? [process.execPath, [bin, ...args]] : [bin, args];
+  return isScriptName(bin) ? [process.execPath, [bin, ...args]] : [bin, args];
 }
 
 function spawnReason(err) {

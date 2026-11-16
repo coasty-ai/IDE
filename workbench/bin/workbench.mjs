@@ -339,14 +339,16 @@ function sentence(text) {
 }
 
 /**
- * WORKBENCH_CODEX_BIN as it is read from anywhere: a relative path (one with a "/" that does not start with "~") is
- * read from the folder Workbench was started in (`startedIn`), once, at start, and the whole path takes its place. The
- * Codex adapter and Agents & keys read the variable when they look, and refuse a relative path: Codex starts in an
- * agent's folder, where the agent could put a program of its own at that path. Without that folder (it was removed
- * before Workbench started), the path is left as it is, and so refused. Anything else is left as it is.
+ * WORKBENCH_CODEX_BIN as it is read from anywhere: a relative path (one with a "/" that does not start with "~", or a
+ * script's name alone, which node reads as a path) is read from the folder Workbench was started in (`startedIn`),
+ * once, at start, and the whole path takes its place. The Codex adapter and Agents & keys read the variable when they
+ * look, and refuse a relative path (findCodex): Codex starts in an agent's folder, where the agent could put a program
+ * of its own at that path. Without that folder (it was removed before Workbench started), the path is left as it is,
+ * and so refused. Anything else is left as it is: a bare name is looked up on the PATH.
  */
 export function placedCodexBin(value, startedIn) {
-  if (typeof value !== 'string' || !value.includes('/') || path.isAbsolute(value) || value === '~' || value.startsWith('~/')) return value;
+  if (typeof value !== 'string' || !value || path.isAbsolute(value) || value === '~' || value.startsWith('~/')) return value;
+  if (!value.includes('/') && !/\.(mjs|cjs|js)$/i.test(value)) return value;
   return typeof startedIn === 'string' && path.isAbsolute(startedIn) ? path.resolve(startedIn, value) : value;
 }
 

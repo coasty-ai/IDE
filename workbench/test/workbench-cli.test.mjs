@@ -466,6 +466,7 @@ test('a relative path in WORKBENCH_CODEX_BIN is read from the folder Workbench w
   assert.equal(placedCodexBin('./codex', '/where/it/started'), '/where/it/started/codex');
   assert.equal(placedCodexBin('/opt/codex', '/where/it/started'), '/opt/codex');
   assert.equal(placedCodexBin('codex', '/where/it/started'), 'codex', 'a bare name is looked up on the PATH');
+  assert.equal(placedCodexBin('codex.mjs', '/where/it/started'), '/where/it/started/codex.mjs', 'a script’s name is a path: node reads it from where it starts');
   assert.equal(placedCodexBin('~/bin/codex', '/where/it/started'), '~/bin/codex', 'the home folder is the adapter’s to read');
   assert.equal(placedCodexBin('tools/codex', null), 'tools/codex');
   assert.equal(placedCodexBin(undefined, '/where/it/started'), undefined);
