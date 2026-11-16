@@ -353,7 +353,8 @@ function show(r, { line = null, keep = null, fresh = null } = {}) {
     changed: new Set(Array.isArray(r.changedLines) ? r.changedLines.filter(n => Number.isInteger(n)) : []),
     rows, lang: langOf(r.path), states: [''], scanned: 0, maxCols: Math.max(maxCols, 20), html: new Map(), loading: false,
   };
-  st.note = null;
+  // "Reading export.ts…" goes; a note said in the line under the path (a save's, the demo's) stays its time
+  if (st.note && st.note.quiet) st.note = null;
   st.view = 'file';
   st.fresh = fresh ? { lines: new Set(fresh), until: performance.now() + 1700 } : { lines: new Set(line ? [line] : []), until: line ? performance.now() + 1700 : 0 };
   st.win.key = '';
@@ -612,7 +613,7 @@ function paintTitle() {
     const label = F.pathHtml(c.label);
     if (c.file || c.here) return `<b${c.cut ? ` title="${esc(F.shownPath(c.label))}"` : ''}>${label}</b>`;
     return `<button type="button" class="fv-crumb" data-dir="${esc(c.dir)}" data-key="crumb:${esc(c.dir)}"${editing ? ' aria-disabled="true"' : ''}>${label}</button>`;
-  }).join('<span class="fv-sep" aria-hidden="true">/</span>');
+  }).join(' <span class="fv-sep">/</span> ');
   const full = crumbs.map(c => F.shownPath(c.label)).join(' / ');
   const all = fit.length !== crumbs.length || fit.some(c => c.cut) ? `<span class="sr">${esc(full)}</span>` : '';
   if (el.title.dataset.html !== html + all) { el.title.innerHTML = `<span class="fv-crumbs"${all ? ' aria-hidden="true"' : ''}>${html}</span>${all}`; el.title.dataset.html = html + all; }
@@ -663,7 +664,7 @@ function whoseHtml(f) {
   const changed = f && f.changed ? f.changed.size : 0;
   const w = F.whoseLine({ where, agent: agent ? { id: agent.id, name: agent.name } : (where !== 'you' ? { id: where, name: 'the agent' } : null), changed: st.view === 'file' ? changed : 0,
     branch: st.list.branch ?? (S.meta && S.meta.repo ? S.meta.repo.branch : null), changedBy: st.view === 'file' && f ? (changedOf(f.path) || []).filter(a => a.agentId !== where) : [] });
-  const sep = '<span class="fv-dot" aria-hidden="true">·</span>';
+  const sep = ' <span class="fv-dot">·</span> ';
   let html = where !== 'you' ? markHtml(agent || { state: 'done_claimed' }) : '';
   html += `<span>${esc(visibleControls(w.lead))}</span>`;
   for (const r of w.rest) html += `${sep}<span>${esc(visibleControls(r))}</span>`;
@@ -859,6 +860,7 @@ function enterEdit() {
   if (!f || !f.editable || f.kind !== 'text' || st.edit) return;
   st.edit = { text0: f.text, indent: F.guessIndent(f.text), hash: f.hash };
   st.ask = null;
+  st.note = null;   // what the last save said is over: this is a new edit
   const top = el.code.scrollTop, left = el.code.scrollLeft, line = topLine();
   el.text.value = f.text;
   el.text.setAttribute('aria-label', `${F.shownPath(f.path)}, as text you can change`);
