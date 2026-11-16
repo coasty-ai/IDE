@@ -33,6 +33,9 @@ const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 't
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
 const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
 VIEWS.push(...GIT_VIEWS);
+// the file view: the sheet in the middle, in each look and at each size (the 'files' scenario of scripts/ui-mock.mjs)
+const FILE_VIEWS = ['files', 'files-edit'];
+VIEWS.push(...FILE_VIEWS);
 const args = process.argv.slice(2);
 const opt = k => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : null; };
 const only = (list, k) => (opt(k) ? list.filter(x => opt(k).split(',').includes(x)) : list);
@@ -81,10 +84,19 @@ const CHECK = String.raw`(() => {
     });
     const scroll = p.closest('[data-scroll]');
     // overlays are text layers of their own: they may cover the board's words, never their own (Agents & keys, #connect,
-    // covers the whole board while it is open)
-    const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail, #connect')?.id || 'board';
-    for (const r of rects) {
-      if (scroll) { const s = scroll.getBoundingClientRect(); if (r.bottom < s.top || r.top > s.bottom) continue; }
+    // and the file view, #fileSheet, cover the whole board while they are open)
+    const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail, #connect, #fileSheet')?.id || 'board';
+    for (let r of rects) {
+      // in a scroll box only what shows in it counts, above and below; and in the file view's code, to either side too
+      // (a long line of a file scrolls sideways there, and is not cut). Everywhere else nothing may run off sideways.
+      if (scroll) {
+        const s = scroll.getBoundingClientRect();
+        if (r.bottom < s.top || r.top > s.bottom) continue;
+        if (scroll.id === 'fvCode') {
+          if (r.right < s.left || r.left > s.right) continue;
+          r = { left: Math.max(r.left, s.left), right: Math.min(r.right, s.right), top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+        }
+      }
       texts.push({ r, p, n, layer });
       if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) { out.push('off-screen text: ' + label(p)); break; }
       let bad = null;
@@ -116,13 +128,13 @@ const CHECK = String.raw`(() => {
     if ((cx || ell) && e.scrollWidth > e.clientWidth + 1) out.push('clipped text: ' + label(e) + ' (' + e.scrollWidth + ' > ' + e.clientWidth + ')');
     else if (cy && e.scrollHeight > e.clientHeight + 1) out.push('clipped text: ' + label(e) + ' (' + e.scrollHeight + ' > ' + e.clientHeight + ' high)');
   }
-  // 3. nothing off-screen. Inside Agents & keys' scroll box (#connectBody, which holds buttons) only the part shown in the
-  //    box counts: what is scrolled out of it is not on screen
+  // 3. nothing off-screen. Inside a scroll box (Agents & keys' #connectBody, the git screen's diff, the file view's code
+  //    and list, which hold buttons) only the part shown in the box counts: what is scrolled out of it is not on screen
   for (const e of document.querySelectorAll('[data-box], button, .chip, .part, .hl, .mach, .more')) {
     if (sr(e) || !vis(e)) continue;
     let r = e.getBoundingClientRect();
     if (r.width < 0.5 && r.height < 0.5) continue;
-    const sb = e.parentElement && e.parentElement.closest('#connect [data-scroll]');
+    const sb = e.parentElement && e.parentElement.closest('[data-scroll]');
     if (sb) {
       const s = sb.getBoundingClientRect();
       r = { left: Math.max(r.left, s.left), top: Math.max(r.top, s.top), right: Math.min(r.right, s.right), bottom: Math.min(r.bottom, s.bottom) };
@@ -142,7 +154,7 @@ const CHECK = String.raw`(() => {
   const boxes = [];
   const add = (k, e, r) => boxes.push({ k, e, r: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } });
   for (const e of document.querySelectorAll('.chip')) if (vis(e)) { const r = e.getBoundingClientRect(); add('chip', e, { left: r.left - lead, top: r.top - lead, right: r.right + lead, bottom: r.bottom + lead }); }
-  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend, #connectBtn, #permBtn, #dram')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
+  for (const e of document.querySelectorAll('.part, .hl, .more, .mach, #tray, #brand, #mode, #repo, #conn, #spend, #connectBtn, #permBtn, #dram, #filesChip')) if (vis(e)) add(e.className.split(' ')[0] || e.id, e, e.getBoundingClientRect());
   for (const e of document.querySelectorAll('#said > span:not(.sr), #said > i')) if (vis(e)) for (const r of e.getClientRects()) add('said', e, r);
   for (const e of document.querySelectorAll('#wires .pad, #wires .you, #board .you')) add(e.classList.contains('pad') ? 'pad' : 'you', e, e.getBoundingClientRect());
   const pkg = document.querySelector('#board .pkg');
@@ -161,11 +173,11 @@ const CHECK = String.raw`(() => {
   //    Agents & keys has its button there). Agents & keys itself (#connect) is a modal dialog: it covers the board on
   //    purpose, with the board inert behind it, so it has only to be inside the window
   const top = [...document.querySelectorAll('#brand, #mode, #repo, #conn, #spend, #connectBtn, #permBtn')].filter(vis).map(e => [e, e.getBoundingClientRect()]);
-  for (const e of document.querySelectorAll('#card, #pop, #trayList, #look, #connect')) {
+  for (const e of document.querySelectorAll('#card, #pop, #trayList, #look, #connect, #fileSheet')) {
     if (!vis(e)) continue;
     const r = e.getBoundingClientRect();
     if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) out.push('off-screen: ' + label(e));
-    if (e.id === 'connect') continue;
+    if (e.id === 'connect' || e.id === 'fileSheet') continue;
     if (ov(r, core) > 1) out.push(e.id + ' covers the core');
     for (const [t, tr] of top) if (ov(r, tr) > 1) out.push(e.id + ' covers ' + label(t));
   }
@@ -184,7 +196,9 @@ const errors = [];
 b.on(m => {
   if (m.method === 'Runtime.exceptionThrown') errors.push('exception: ' + (m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text).slice(0, 300));
   if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') errors.push('console: ' + m.params.args.map(a => a.value || a.description).join(' ').slice(0, 300));
-  if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error' && !/status of 401/.test(m.params.entry.text)) errors.push('log: ' + m.params.entry.text.slice(0, 300) + ' ' + (m.params.entry.url || ''));
+  // a 401 (a stale key, on purpose) and a 409 from the file view's save (a file that changed on disk, on purpose) are expected
+  if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error' && !/status of 401/.test(m.params.entry.text)
+    && !(/status of 409/.test(m.params.entry.text) && /\/api\/file$/.test(m.params.entry.url || ''))) errors.push('log: ' + m.params.entry.text.slice(0, 300) + ' ' + (m.params.entry.url || ''));
 });
 // The git-tangles view serves its own histories as GET /api/git (Chrome holds the request and answers it); every other
 // request goes on to the mock.
@@ -286,6 +300,81 @@ async function gitView(v, s, d) {
       gitServed = null;
       await b.send('Fetch.disable');
     }
+  }
+}
+
+/**
+ * The file view's views, in the 'files' scenario of scripts/ui-mock.mjs, opened the way a person opens them (the files
+ * chip, the field, a crumb, the link to an agent's copy, Edit):
+ *   files       the top folder; a file in an agent's copy with its changed lines; the finder with files and lines found;
+ *               the env file shown masked, with why it is not edited; a path too long for the head; a binary file; the
+ *               file of 25,000 lines scrolled to its middle; the needs-you pill when something needs you, and the pill
+ *               beside why a file is not edited (an env file, mixed line endings, one over 1 MB), where the path must keep
+ *               to its own box (#fvTitle carries data-box, so text outside it is a failure)
+ *   files-edit  the editor; the question when Esc would leave an edit; the conflict line when the file changed on disk
+ */
+async function filesView(v, s, d) {
+  const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
+  const tag = `view ${v} ${s} ${d} ${t}`;
+  await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, delay: null, files: null }); await ctl('scenario', { name: 'files' }); await size(s);
+  await b.goto(`${base}/?t=k&still=1`, 1300); await setLook(t, d); await settle(100);
+  const shown = () => b.ev(`document.getElementById('fileSheet').open`);
+  const click = async (sel, ms = 500) => { const ok = await b.ev(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return false; e.click(); return true; })()`); await sleep(ms); await settle(80); return ok; };
+  const find = async (text, ms = 700) => { await b.ev(`(() => { const i = document.getElementById('fvFind'); i.focus(); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input')); return 1; })()`); await sleep(ms); await settle(60); };
+  const choose = async (path, ms = 700) => { await find(path); await b.ev(`(() => { const o = [...document.querySelectorAll('#fvList [role="option"]')].find(x => x.querySelector('.fv-nm')?.textContent === ${JSON.stringify(path.split('/').pop())}); o?.click(); return !!o; })()`); await sleep(ms); await settle(80); };
+  const title = () => b.ev(`document.getElementById('fvTitle').textContent`);
+  if (!(await click('#filesChip', 700)) || !(await shown())) { failures.push(`${tag}: the files chip did not open the file view`); return; }
+  if (v === 'files') {
+    await check(`${tag} (the top folder)`);
+    await choose('src/invoices/export.ts');
+    if (!/export\.ts$/.test(await title())) failures.push(`${tag}: export.ts did not open (${await title()})`);
+    await click('#fvWhose [data-fv="switch"]', 800);
+    const whose = await b.ev(`document.getElementById('fvWhose').textContent`);
+    if (!/In Invoice export’s copy/.test(whose) || !(await b.ev(`document.querySelectorAll('#fvRows .fv-row.chg').length`))) failures.push(`${tag}: Invoice export's copy did not show its changed lines (${whose})`);
+    await check(`${tag} (an agent's copy, its changed lines)`);
+    await find('inv', 1100);
+    if (!(await b.ev(`!!document.querySelector('#fvList .fv-hit')`))) failures.push(`${tag}: the finder found no lines in the files`);
+    await check(`${tag} (the finder: files, and lines in files)`);
+    await b.ev(`(() => { const i = document.getElementById('fvFind'); i.value = ''; i.dispatchEvent(new Event('input')); return 1; })()`); await sleep(200);
+    await click('#fvWhose [data-fv="switch"]', 700);
+    await choose('.env');
+    if (!/holds keys/.test(await b.ev(`document.getElementById('fvActs').textContent`))) failures.push(`${tag}: the env file did not say why it is not edited`);
+    await check(`${tag} (the env file, masked)`);
+    await choose('src/very/deeply/nested/folders/for/the/crumbs/to/give/way/invoice-export-batch-sender-for-large-accounts.ts');
+    await check(`${tag} (a path too long for the head)`);
+    await choose('assets/invoice-logo.png');
+    await check(`${tag} (a binary file)`);
+    await choose('src/generated/rates.ts', 1200);
+    await b.ev(`(() => { const c = document.getElementById('fvCode'); c.scrollTop = c.scrollHeight / 2; return 1; })()`); await sleep(400); await settle(80);
+    if (!(await b.ev(`document.querySelectorAll('#fvRows .fv-row').length < 200 && +document.querySelector('#fvRows .fv-row .no').textContent > 10000`))) failures.push(`${tag}: the long file did not draw a window of rows in its middle`);
+    await check(`${tag} (25,000 lines, scrolled to the middle)`);
+    const st = await (await fetch(base + '/ctl/state')).json();
+    const a = st.agents.find(x => x.id === 'f2');
+    await ctl('push', { event: 'agents', data: [{ ...a, state: 'needs_ok', ask: { id: 'fp1', type: 'permission', sentence: 'Price rounding wants to run a command', detail: 'npm run db:migrate', options: ['Allow', 'Deny'], createdAt: Date.now() } }] });
+    await sleep(500); await settle(80);
+    if (await b.ev(`document.getElementById('fvNeeds').hidden`)) failures.push(`${tag}: the needs-you pill did not show`);
+    await check(`${tag} (the needs-you pill)`);
+    // the pill beside why a file is not edited: the path keeps to its own box (#fvTitle is measured), never under them
+    for (const [path, why] of [['.env', /holds keys/], ['src/legacy/mixed.txt', /mixes line endings/], ['data/fixtures/large-accounts.json', /too large/]]) {
+      await choose(path);
+      if (!why.test(await b.ev(`document.getElementById('fvActs').textContent`))) failures.push(`${tag}: ${path} did not say why it is not edited`);
+      if (await b.ev(`document.getElementById('fvNeeds').hidden`)) failures.push(`${tag}: the needs-you pill went with ${path}`);
+      await check(`${tag} (the needs-you pill beside why ${path.split('/').pop()} is not edited)`);
+    }
+  } else if (v === 'files-edit') {
+    await choose('src/invoices/export.ts');
+    await click('#fvActs [data-fv="edit"]', 500);
+    if (await b.ev(`document.getElementById('fvEdit').hidden`)) failures.push(`${tag}: Edit did not open the editor`);
+    await check(`${tag} (the editor)`);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setRangeText('// a change\\n', 0, 0, 'end'); t.dispatchEvent(new Event('input')); return 1; })()`); await sleep(150);
+    await b.key('Escape'); await sleep(300); await settle(60);
+    if (!/not saved/.test(await b.ev(`document.getElementById('fvWhose').textContent`))) failures.push(`${tag}: Esc did not ask before leaving the edit`);
+    await check(`${tag} (leave the edit?)`);
+    await click('#fvWhose [data-fv="keep"]', 200);
+    await fetch(base + '/ctl/files', { method: 'POST', body: JSON.stringify({ in: 'you', path: 'src/invoices/export.ts', text: 'export const changedOnDisk = true;\n' }) });
+    await click('#fvActs [data-fv="save"]', 700);
+    if (!/changed on disk while you were editing/.test(await b.ev(`document.getElementById('fvWhose').textContent`))) failures.push(`${tag}: the conflict line did not show`);
+    await check(`${tag} (the conflict line)`);
   }
 }
 
@@ -396,6 +485,7 @@ try {
       if ((v === 'taint' || v === 'git-tangles') && sizes.length > 2 && !['960x900', '1440x789'].includes(s)) continue;
       if (v === 'wire' && sizes.length > 2 && !['960x900', '1024x700', '1280x680'].includes(s)) continue;   // where the room runs out
       if (GIT_VIEWS.includes(v)) { await gitView(v, s, d); continue; }   // D1
+      if (FILE_VIEWS.includes(v)) { await filesView(v, s, d); continue; }
       const t = quick ? 'green' : themes[(sizes.indexOf(s) + details.indexOf(d)) % themes.length];
       const tag = `view ${v} ${s} ${d} ${t}`;
       const load = async (sc, q = '') => { await ctl('mode', { answer: 'ok', auth: 'ok', holdMs: 0, down: false, merge: 'ok' }); await ctl('scenario', { name: sc }); await size(s); await b.goto(`${base}/?t=k&still=1${q}`, 1300); await setLook(t, d); await settle(100); };

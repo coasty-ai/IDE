@@ -64,9 +64,10 @@ export const gitShown = () => st.shown;
 
 /**
  * @param {object} c  { boardScreen, board, getG, measure, still, reduced, say, act, moved, render, command, onShow,
- *   listening, pick }. command(text, binding) sends words typed or spoken here, with the binding taken when they began;
- *   listening() is true while voice listens (Esc then throws the words away, so it is not the git screen's); pick(id)
- *   puts that agent in the lid as picking a chip does (a card on screen is withdrawn first).
+ *   listening, pick, openFile }. command(text, binding) sends words typed or spoken here, with the binding taken when
+ *   they began; listening() is true while voice listens (Esc then throws the words away, so it is not the git screen's);
+ *   pick(id) puts that agent in the lid as picking a chip does (a card on screen is withdrawn first); openFile({ agentId,
+ *   path, line, opener }) opens a file of an agent's copy in the file view (a path clicked in its diff).
  */
 export function setupGitScreen(c) {
   ctx = c;
@@ -836,6 +837,15 @@ function onDetailClick(e) {
   const b = e.target.closest('button');
   if (!b || b.disabled) return;
   if (b.dataset.gitAct === 'close') { closeDetail(); return; }
+  if (b.classList.contains('dopen')) {
+    // a file's path in the diff: that file in this agent's copy, at its first changed line (the file view checks again)
+    const d = st.detail, ch = st.changes;
+    const files = ch && ch.data && ch.data.diff && Array.isArray(ch.data.diff.files) ? ch.data.diff.files.filter(f => f && typeof f === 'object') : [];
+    const f = files[Number(b.dataset.fileIndex)];
+    if (!d || d.kind !== 'agent' || ch.agentId !== d.agentId || !f || typeof f.path !== 'string' || typeof ctx.openFile !== 'function') return;
+    ctx.openFile({ agentId: d.agentId, path: f.path, line: Math.max(1, Number(b.dataset.line) || 1), opener: b });
+    return;
+  }
   if (b.dataset.gitAct === 'agent') {
     // the agent's own row, the tip of its branch or its merge; when none is drawn, the selection stays where it was
     const row = rowOfAgent(b.dataset.agent);
@@ -1034,8 +1044,10 @@ function agentDetail(agentId, z) {
   else if (ch.error) body = `<p class="dq">${esc(ch.error)}</p>`;
   else if (ch.data && ch.data.ok === false) body = `<p class="dq">${esc(visibleControls(ch.data.reply || 'Workbench could not read its changes.'))}</p>`;
   else {
-    // made once per answer: a long diff is not rebuilt on every render
-    if (ch.htmlOf !== ch.data) { ch.html = diffHtml(diff || { files: [] }, { maxLines: 4000 }); ch.htmlOf = ch.data; }
+    // made once per answer: a long diff is not rebuilt on every render. While its copy is there, each file's path opens
+    // that file in the file view, at its first changed line
+    const open = typeof ctx.openFile === 'function' && !!(w.folder !== false && !w.thrownAway && (w.branch || a.branch));
+    if (ch.htmlOf !== ch.data || ch.htmlOpen !== open) { ch.html = diffHtml(diff || { files: [] }, { maxLines: 4000, open }); ch.htmlOf = ch.data; ch.htmlOpen = open; }
     body = ch.html;
   }
   h += `<div class="gdiff" data-scroll="1" tabindex="0" aria-label="${esc(name)}’s changes, in full">${body}</div>`;

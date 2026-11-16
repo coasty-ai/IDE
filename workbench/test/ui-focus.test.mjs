@@ -160,6 +160,21 @@ test('finished work that can be merged: Merge into main and Ask for a change; Re
   }
 });
 
+test('an agent checked again after a save into its copy: the lid says so, never "nothing checked it", and offers no Merge', { skip }, async () => {
+  const { lidView, S } = await load();
+  live(S);
+  for (const detail of ['calm', 'more']) for (const fit of [0, 3, 6]) {
+    const v = show(lidView, S, finished({ state: 'done_claimed', checks: { state: 'running', results: [] } }), { detail, fit });
+    assert.match(v.html, /<h1[^>]*>Invoice export is being checked again\.<\/h1>/, `${detail} fit ${fit}`);
+    assert.doesNotMatch(v.html, /nothing checked it|says it is done/, `${detail} fit ${fit}`);
+    assert.equal(labelled(v.html, 'Merge into main'), undefined, `${detail} fit ${fit}: no Merge while its checks run`);
+    assert.ok(labelled(v.html, 'Looks good') && labelled(v.html, 'Ask for a change'), `${detail} fit ${fit}: what can be said meanwhile`);
+    assert.ok(labelled(v.html, 'Review the changes'), `${detail} fit ${fit}: its work can still be looked at`);
+  }
+  // the meta line, where there is room for it, says why
+  assert.match(show(lidView, S, finished({ state: 'done_claimed', says: null, checks: { state: 'running', results: [] } }), { detail: 'more' }).html, /Its work changed, so its checks run again\./);
+});
+
 test('"Review the changes" shows in calm too, and at every fit step', { skip }, async () => {
   const { lidView, S } = await load();
   live(S);

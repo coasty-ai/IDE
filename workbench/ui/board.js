@@ -28,7 +28,7 @@ function svgEl(tag, attrs, parent) {
 
 export class Board {
   /**
-   * @param {object} o  { boardSvg, wires, parts, core, dram, machines, tray, said, card, hooks, still, reduced }
+   * @param {object} o  { boardSvg, wires, parts, core, dram, files, machines, tray, said, card, hooks, still, reduced }
    *   hooks: { enter(id), leave(id), pick(id), more(rootId), machine(id, el), tray(el), home() }
    *   home(): a chip that held the keyboard is leaving the board; put the keyboard somewhere that stays (the lid's sentence)
    */
@@ -66,8 +66,9 @@ export class Board {
   // ------------------------------------------------------------------ the static board
   paintBoard(G) {
     const P = G.P, b = G.board, c = G.core, W = G.W, H = G.H;
-    const dr = G.dram;
-    const sig = [W, H, P.name, c.x, c.y, c.h, G.dense, G.nodes.map(n => `${n.id}${n.side}${n.rowIdx}`).join(','), dr ? [dr.x, dr.y, dr.w, dr.wire.x, !!dr.label].join(',') : ''].join('|');
+    const dr = G.dram, fl = G.flash;
+    const sig = [W, H, P.name, c.x, c.y, c.h, G.dense, G.nodes.map(n => `${n.id}${n.side}${n.rowIdx}`).join(','), dr ? [dr.x, dr.y, dr.w, dr.wire.x, !!dr.label].join(',') : '',
+      fl ? [fl.x, fl.y, fl.w].join(',') : ''].join('|');
     if (sig === this.boardSig) return;
     this.boardSig = sig;
     let s = `<defs>
@@ -101,6 +102,7 @@ export class Board {
     }
     s += '</g>';
     if (dr) s += this.dramSvg(G);
+    if (fl) s += this.flashSvg(G);
     // the core: a package with balls (or leads) on all four sides, pin 1, its courtyard and the designator YOU
     s += `<rect class="b-shadow" x="${c.x}" y="${c.y + 3}" width="${c.w}" height="${c.h}" rx="9" fill="#000" filter="url(#blur6)" opacity=".5"/>`;
     s += `<rect class="pkg" x="${c.x}" y="${c.y}" width="${c.w}" height="${c.h}" rx="8"/>`;
@@ -156,6 +158,36 @@ export class Board {
     const e = this.dram, d = G.dram;
     if (!e || !d) return;
     Object.assign(e.style, { left: d.x + 'px', top: d.y + 'px', width: d.w + 'px', height: d.h + 'px', fontSize: d.git + 'px' });
+  }
+
+  /**
+   * The files chip (U3) beside the DRAM: its bus of 4 traces up to the core's bottom edge, a small flash package with
+   * chunkier pins along both long edges and a dot at pin 1, and the designator U3 under it. The #filesChip button lies
+   * over the package and carries the word files; hovering or focusing it warms this copper (app.css).
+   */
+  flashSvg(G) {
+    const f = G.flash;
+    const top = r1(f.y - f.pin), bot = r1(f.y + f.h);
+    let s = '<g class="flash-cu">';
+    for (const x of f.bus) s += `<path class="flash-bus" d="M${x} ${f.busTop}V${top}"/>`;
+    s += '</g>';
+    s += `<rect class="b-shadow" x="${f.x}" y="${r1(f.y + 2)}" width="${f.w}" height="${f.h}" rx="2.5" fill="#000" filter="url(#blur6)" opacity=".45"/>`;
+    s += '<g class="flash-pins">';
+    for (const x of f.pins) s += `<rect x="${r1(x - 1.3)}" y="${top}" width="2.6" height="${f.pin}" rx=".6"/><rect x="${r1(x - 1.3)}" y="${bot}" width="2.6" height="${f.pin}" rx=".6"/>`;
+    s += '</g>';
+    s += `<rect class="flash-body" x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}" rx="2"/>`;
+    s += `<path class="dram-shine" d="M${r1(f.x + 1.5)} ${r1(f.y + 1)}H${r1(f.x + f.w - 1.5)}"/>`;
+    s += `<circle class="dram-dot" cx="${r1(f.x + 5)}" cy="${r1(bot - 4.5)}" r="1.5"/>`;
+    s += `<text class="dram-u2" x="${f.label.x}" y="${f.label.y}" font-size="${f.label.size}">U3</text>`;
+    return s;
+  }
+
+  /** The #filesChip button over the files chip (the word files, hover, focus and the click that opens the file view). */
+  placeFlash(G) {
+    const e = this.files, f = G.flash;
+    if (!e) return;
+    e.hidden = !f;
+    if (f) Object.assign(e.style, { left: f.x + 'px', top: f.y + 'px', width: f.w + 'px', height: f.h + 'px', fontSize: f.files + 'px' });
   }
 
   // ------------------------------------------------------------------ chips and helpers
@@ -461,6 +493,7 @@ export class Board {
     this.paintWires(G, o.hoverRoot);
     this.placeCore(G);
     this.placeDram(G);
+    this.placeFlash(G);
     this.placeSaid(G);
     this.paintMachines(G, o.machines || [], o.litMachine);
     this.paintTray(G, o.tray);

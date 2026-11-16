@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { layoutBoard, sizeClass, frame, boardProblems, boardBoxes, placeCard, maxDenseRows, wrapWords, clipTo, overlapArea, SIZES,
-  dramSegments, saidLineH, saidTextLines, SAID_HINT, saidMinLines, bottomRanks, clipToLines } from '../ui/layout.js';
+  dramSegments, flashSegments, saidLineH, saidTextLines, SAID_HINT, saidMinLines, bottomRanks, clipToLines } from '../ui/layout.js';
 import { Lanes, denseLanes } from '../ui/lanes.js';
 import { boardModel, boardAndTray } from '../ui/boardmodel.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
@@ -208,6 +208,49 @@ test('the DRAM sits centred under the core, joined to its bottom edge by a bus o
     assert.equal(wire[1][1], G.board.b, `${tag}: to the board's bottom edge`);
     assert.ok(d.pins.includes(d.wire.x) && d.wire.x > G.cx && d.wire.x < d.x + d.w, `${tag}: from a pin near its right end`);
   });
+});
+
+test('the files chip (U3) sits beside the DRAM, on its right, with a bus of 4 traces of its own up to the core', () => {
+  each((name, W, H, detail, lidNeed) => {
+    const { G } = board(name, W, H, detail, { lidNeed });
+    const f = G.flash, d = G.dram, c = G.core, tag = `${name} ${W}x${H} ${detail} ${lidNeed}`;
+    if (!f) return;
+    assert.ok(f.x >= d.x + d.w + G.P.flash.gap - 0.6, `${tag}: right of the DRAM, a gap between`);
+    assert.ok(f.w >= G.P.flash.min - 0.01 && f.w <= G.P.flash.w + 0.01, `${tag}: as wide as it may be (${f.w})`);
+    assert.ok(Math.abs(f.y + f.h / 2 - (d.y + d.h / 2)) < 0.6, `${tag}: level with the DRAM`);
+    assert.ok(d.w >= G.P.dram.min - 0.01, `${tag}: the DRAM keeps its least width beside it (${d.w})`);
+    assert.equal(f.bus.length, 4, `${tag}: four traces`);
+    for (const [p, q] of flashSegments(G)) {
+      assert.equal(p[1], c.b, `${tag}: from the core's bottom edge`);
+      assert.equal(q[1], f.y - f.pin, `${tag}: to a pin on its top edge`);
+      assert.ok(p[0] > f.x && p[0] < f.x + f.w, `${tag}: within its width`);
+    }
+    // clear of the lanes that leave the core's bottom edge on the right
+    const rightPins = G.nodes.filter(n => n.lane.kind === 'down' && n.side === 'R').map(n => n.lane.pts[0][0]);
+    for (const x of rightPins) assert.ok(f.x + f.w <= x - G.P.padR - 8 + 0.6, `${tag}: clear of a corner lane at ${x}`);
+    for (const p of boardProblems(G)) assert.ok(!/flash|U3|files/.test(p), `${tag}: ${p}`);
+  });
+});
+
+test('the files chip is on every ordinary board, at every size, and never comes and goes as the lid changes size', () => {
+  for (const name of ['demo', 'live', 'merge', 'idle', 'zero', 'helper', 'long', 'files']) {
+    for (const [W, H] of WINDOWS) for (const detail of DETAILS) {
+      const shapes = [120, 220, 400, 900].map(lidNeed => board(name, W, H, detail, { lidNeed }).G).map(G => G.flash && [G.flash.x, G.flash.w, G.dram.w].join(','));
+      assert.ok(shapes[0], `${name} ${W}x${H} ${detail}: the files chip is there`);
+      assert.deepEqual(new Set(shapes).size, 1, `${name} ${W}x${H} ${detail}: the same place for every lid (${shapes.join(' | ')})`);
+    }
+  }
+});
+
+test('the checks catch a files chip that is in the way: a chip on its package, its bus on a lane', () => {
+  const { G } = board('demo', 1440, 900, 'calm');
+  assert.ok(G.flash);
+  assert.deepEqual(boardProblems(G), []);
+  const box = boardBoxes(G).find(b => b.k === 'flash');
+  assert.ok(box && boardBoxes(G).some(b => b.k === 'flash-label' && b.id === 'U3'));
+  const chip = G.nodes[0];
+  chip.chip.x = box.x + 2; chip.chip.y = box.y + 2;
+  assert.ok(boardProblems(G).some(p => /flash/.test(p)), boardProblems(G).join('; '));
 });
 
 test('the core\'s tallest shrinks by the DRAM\'s room: the DRAM and two lines under it always fit above the edge connector', () => {

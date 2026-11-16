@@ -839,12 +839,37 @@ function* grepRecords(buf, cut) {
 }
 
 /**
+ * Whether the view would show the file at `rel`, so a line found in it can be opened: not when it holds more than
+ * MAX_FILE_BYTES, looked at as readFile looks (standing in its folder, the file itself never followed), and not when the
+ * rules refuse its path. A file gone meanwhile, or one that is no regular file, is left to readFile to describe.
+ */
+function viewShows(top, rel) {
+  let at;
+  try {
+    at = locate(top, rel, 'open');
+  } catch {
+    return false;
+  }
+  if (at.missing) return true;
+  try {
+    return standingIn(at, rel, 'open', () => {
+      const st = fs.lstatSync(at.name);
+      return !(st.isFile() && st.size > MAX_FILE_BYTES);
+    });
+  } catch {
+    return true;
+  }
+}
+
+/**
  * The lines that hold `query`, in the project's files: `git grep -n -I --fixed-strings --untracked --no-color -z`, with
  * `-i` when the words have no capital letter. The words go to git on its stdin (`-f -`), never on its command line,
  * which other programs on the computer can read: a person may search for a key. Tracked files and new files no ignore
  * rule hides are searched, as they are in the folder; binary files are not (`-I`), nor is anything through a link.
  * Results follow the list's rules (a name that is not UTF-8, one the path rules refuse, a save's sibling: left out),
  * and env files are left out (git never reads them, and they are checked again by name): their values would show.
+ * So are files over 1 MB, which the view does not show (one look at each file found, before the results are counted,
+ * so a large file full of matches never crowds out the files after it).
  * When git takes longer than `timeoutMs`, or says more than 8 MB, it is stopped: the results it gave whole are kept,
  * and the answer is `truncated`.
  * @param {{ root: string, query: string, max?: number, timeoutMs?: number }} o query: 2 to 200 characters on one line;
@@ -875,10 +900,13 @@ export async function searchFiles({ root, query, max = MAX_SEARCH_RESULTS, timeo
   }
   const results = [];
   let truncated = cut;
+  const shows = new Map(); // path -> whether the view shows that file (looked at once a path)
   for (const r of grepRecords(out, cut)) {
     const name = utf8OrNull(r.path);
     const line = Number(r.line.toString('latin1'));
     if (name === null || isSaveFile(name) || isEnvFile(name) || pathProblem(name, 'open') || !Number.isInteger(line) || line < 1) continue;
+    if (!shows.has(name)) shows.set(name, viewShows(top, name));
+    if (!shows.get(name)) continue;
     if (results.length >= limit) {
       truncated = true;
       break;
@@ -1091,7 +1119,7 @@ export function memoryProject(files = {}) {
       const results = [];
       for (const rel of [...held.keys()].sort()) {
         const bytes = held.get(rel);
-        if (isEnvFile(rel) || bytes.includes(0)) continue; // as on disk: no env file, no binary file
+        if (isEnvFile(rel) || bytes.includes(0) || bytes.length > MAX_FILE_BYTES) continue; // as on disk: no env file, no binary file, nothing over 1 MB
         const lines = linesOf(LENIENT.decode(bytes));
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i].replace(/\r$/, '');

@@ -58,6 +58,20 @@ export const PAIRS = [
   ['k-need', 'exact', 'the needs-you mark by the keys warning', 3],
   ...['mask-1', 'mask-2', 'mask-3'].map(bg => ['t-ok', bg, 'the Agents & keys light when an agent is ready', 3]),
   ...['mask-1', 'mask-2', 'mask-3'].map(bg => ['focus', bg, 'a focus ring on the board', 3]),
+  // the file view: the code and its colours on the page, on a changed line, on a line briefly marked, and selected; the
+  // line numbers; a hidden character's mark; the gold bar of a changed line (and the caret, and the page's keyboard line);
+  // the finder's rows, the row chosen, and the marks beside them; the lid's focus ring on the page
+  ...['fv-page', 'fv-chg', 'fv-fresh'].flatMap(bg => [
+    ['lid-ink', bg, `code on the file view (${bg})`], ['fv-no', bg, `line numbers (${bg})`], ['fv-vc', bg, `a hidden character shown in a file (${bg})`],
+    ...['fv-k', 'fv-s', 'fv-n', 'fv-c', 'fv-h'].map(k => [k, bg, `${k}: the file view's gentle colours (${bg})`]),
+  ]),
+  ['lid-ink', 'fv-sel', 'code that is selected'],
+  ...['fv-page', 'fv-chg'].map(bg => ['fv-bar', bg, `the gold bar of a changed line, and the caret (${bg})`, 3]),
+  ...['fv-page', 'fv-on'].flatMap(bg => [['lid-ink', bg, `a file in the finder (${bg})`], ['lid-ink-2', bg, `a line found, a group's name (${bg})`], ['lid-ink-3', bg, `a folder after a file's name, "and 4 more in export.ts" (${bg})`],
+    ...['k-need', 'k-stuck', 'k-ok', 'k-work', 'k-word', 'k-fail'].map(k => [k, bg, `${k} mark beside a file (${bg})`, 3])]),
+  ['lid-focus', 'fv-page', 'a focus ring on the file view’s page', 3],
+  // "Saved" in the sheet's head, which sits at the top of its surface (lid-1)
+  ['fv-ok', 'lid-1', '"Saved" in the file view’s head'],
 ];
 
 const hex = h => { h = h.replace('#', ''); if (h.length === 3) h = [...h].map(c => c + c).join(''); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16) / 255); };

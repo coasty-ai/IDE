@@ -76,6 +76,27 @@ export function looksLikeSecret(text) {
   return NOT_SECRET;
 }
 
+/**
+ * The start of a known shape: its prefix at the start of a word and three characters of the key after it. Where the
+ * prefix also begins ordinary names (sk-learn, npm_package_version, ASIAN), a digit or a capital must come after it too.
+ */
+const KEY_START = new RegExp(`${START}(?:`
+  + '(?:sk-(?:ant|proj|svcacct|admin)-|(?:sk|rk)_(?:live|test)_|whsec_|gh[opsur]_|github_pat_|xox[abeoprs]-|xapp-|glpat-|AIza|eyJ)[A-Za-z0-9_-]{3}'
+  + '|AKIA[A-Z0-9]{3}'
+  + '|(?:sk-|npm_)(?=[A-Za-z0-9_-]*[0-9A-Z])[A-Za-z0-9_-]{3}'
+  + '|ASIA(?=[A-Z0-9]*[0-9])[A-Z0-9]{3})');
+
+/**
+ * Whether `text` holds the start of a key of a known shape, typed a letter at a time: looksLikeSecret knows a key only
+ * once enough of it is there, and a field that searches as the person types would send every start of it before then.
+ * A prefix alone, or with two characters after it, is not one ("what is a ghp_ token?").
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function startsLikeSecret(text) {
+  return typeof text === 'string' && text.length >= 6 && KEY_START.test(text);
+}
+
 /** A word that reads as random: what a generated key looks like, and what names, paths and commit ids do not. */
 function randomWord(word) {
   if (HEX_RE.test(word)) {

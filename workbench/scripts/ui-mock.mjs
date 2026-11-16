@@ -28,6 +28,9 @@
 // answer "refuse" refuses it.
 // Agents & keys: the connect panel's routes, /api/connect*, in the 'connect-*' scenarios (see connectFacts below); mode
 // gains connect: { terminal, github, githubAgents, fail, gh, browser } and delay.connect.
+// The file view: GET /api/files, /api/file and /api/search and POST /api/file in every scenario, from the core's own
+// memoryProject (see "the file view" above startMock); mode gains files ('refuse') and delay.file; POST /ctl/files writes a
+// file as an agent would, GET /ctl/files reads its bytes, GET /ctl/file-reads lists the page's GETs of those routes.
 // Full permissions: POST /api/permissions { mode }, answered as the engine does (the card for 'full', which only its yes
 // turns on, counting what it allowed; 'ask' at once, withdrawing every such card; a card from before the last change of
 // mode is refused, "That changed. Have another look."), the snapshot's `permissions`, the page sent with data-permissions
@@ -40,6 +43,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { presetById } from '../src/shared/keypresets.mjs';
 import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../src/core/prefs.mjs';
+import { memoryProject, sampleProject, changedLinesBetween, checkPath } from '../src/core/files.mjs';
+import crypto from 'node:crypto';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -139,6 +144,7 @@ export function scenario(name, now = Date.now()) {
   if (name === 'limit') return limitWorld(now);
   if (TRAY_SCENARIOS.includes(name)) return trayWorld(name, now);
   if (CONNECT_SCENARIOS.includes(name)) return connectWorld(name, now);
+  if (name === 'files') return filesBoard(now);
   if (name === 'demo' || name === 'helper' || name === 'longq' || name === 'busy' || name === 'idle') {
     raw = demo();
     if (name === 'helper' || name === 'longq' || name === 'idle') backToWork(by(raw, '399e17'), 'Running checkout tests');
@@ -459,8 +465,16 @@ function gitGraphOf(state, now = Date.now()) {
   return { ok: true, repo: { ...repo, head: repo.head || head.slice(0, 7) }, commits, more: false, agents };
 }
 
-/** A unified diff of one file, made up from its counts: a hunk of believable lines. */
+/**
+ * A unified diff of one file, made up from its counts: a hunk of believable lines. A new file's hunk is all added
+ * lines from line 1 (@@ -0,0 +1,N @@), as git writes it, so its path on the git screen opens it at line 1.
+ */
 function filePatch(f, i) {
+  if (f.status === 'added') {
+    const n = Math.max(1, Math.min(f.adds || 1, 40));
+    const lines = Array.from({ length: n }, (_, k) => `+${k ? `export const batch${k} = ${k * 50};` : '// sends invoices a batch at a time'}`);
+    return `diff --git a/${f.path} b/${f.path}\nnew file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null\n+++ b/${f.path}\n@@ -0,0 +1${n === 1 ? '' : `,${n}`} @@\n${lines.join('\n')}\n`;
+  }
   const ctx = ['', 'export function total(items) {', '  return items.reduce((sum, item) => sum + item.price, 0);', '}'];
   const adds = Math.min(f.adds, 40), dels = Math.min(f.dels, 20);
   const lines = [];
@@ -470,6 +484,42 @@ function filePatch(f, i) {
   lines.push(' ' + ctx[3]);
   const head = f.status === 'added' ? 'new file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null' : f.status === 'deleted' ? 'deleted file mode 100644\nindex 4f3e2d1..0000000\n--- a/' + f.path : 'index 1a2b3c4..5d6e7f8 100644\n--- a/' + f.path;
   return `diff --git a/${f.path} b/${f.path}\n${head}\n+++ ${f.status === 'deleted' ? '/dev/null' : 'b/' + f.path}\n@@ -${10 + i},${dels + 3} +${10 + i},${adds + 3} @@ export function total(items) {\n${lines.join('\n')}\n`;
+}
+
+/**
+ * A file's real change as git would write it, from its text before (null: a new file) and after: { path, status, adds,
+ * dels, patch }, hunks with three lines around each change, or null when nothing changed. For the 'files' scenario,
+ * whose agents' copies hold real text, so each path on the git screen opens where it changed.
+ */
+function realChange(path, before, after) {
+  const lines = t => { const r = String(t).split('\n'); if (r.length > 1 && r[r.length - 1] === '') r.pop(); return t === '' ? [] : r; };
+  const a = before == null ? [] : lines(before), b = lines(after);
+  const n = a.length, m = b.length, ops = [];
+  if (n * m > 4e6) return null;   // the samples are small; a large file is not diffed here
+  const L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push([' ', a[i]]); i++; j++; } else if (L[i + 1][j] >= L[i][j + 1]) ops.push(['-', a[i++]]); else ops.push(['+', b[j++]]);
+  }
+  while (i < n) ops.push(['-', a[i++]]);
+  while (j < m) ops.push(['+', b[j++]]);
+  const changed = ops.map((o, k) => (o[0] === ' ' ? -1 : k)).filter(k => k >= 0);
+  if (!changed.length) return null;
+  const oldAt = [], newAt = [];
+  for (let k = 0, o = 1, w = 1; k < ops.length; k++) { oldAt.push(o); newAt.push(w); if (ops[k][0] !== '+') o++; if (ops[k][0] !== '-') w++; }
+  const groups = [];
+  for (const k of changed) {
+    const last = groups[groups.length - 1];
+    if (last && k - 3 <= last[1]) last[1] = Math.min(ops.length, k + 4); else groups.push([Math.max(0, k - 3), Math.min(ops.length, k + 4)]);
+  }
+  const hunks = groups.map(([s, e]) => {
+    const part = ops.slice(s, e), oldN = part.filter(x => x[0] !== '+').length, newN = part.filter(x => x[0] !== '-').length;
+    return `@@ -${oldN ? oldAt[s] : oldAt[s] - 1},${oldN} +${newN ? newAt[s] : newAt[s] - 1},${newN} @@\n${part.map(([t, l]) => t + l).join('\n')}`;
+  });
+  const head = before == null ? 'new file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null' : `index 1a2b3c4..5d6e7f8 100644\n--- a/${path}`;
+  return { path, status: before == null ? 'added' : 'modified', adds: ops.filter(x => x[0] === '+').length, dels: ops.filter(x => x[0] === '-').length,
+    patch: `diff --git a/${path} b/${path}\n${head}\n+++ b/${path}\n${hunks.join('\n')}\n` };
 }
 
 /** The stress diff, for "Invoice export" in any scenario. */
@@ -489,17 +539,22 @@ function stressFiles() {
   ];
 }
 
-/** GET /api/agents/:id/changes, as engine.changes() answers it. */
-function changesOf(state, agentId) {
+/**
+ * GET /api/agents/:id/changes, as engine.changes() answers it. `own(root)`, when given, is that agent's real change, as
+ * its copy holds it (the 'files' scenario): then no made-up hunks and no stress diff.
+ */
+function changesOf(state, agentId, own = null) {
   const a = state.agents.find(x => x.id === agentId);
   if (!a) return { ok: false, reply: 'There is no such agent.' };
   const root = a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a;
   const work = root.work || (state.mode === 'demo' ? workOf(root) : null);
   if (!work || !work.branch || work.folder === false) return { ok: false, reply: `${root.name}’s folder is gone, so there is nothing to show.` };
-  let files = ((root.files && root.files.list) || []).map((f, i) => ({ path: f.path, status: f.adds && !f.dels && /test|docs|new/.test(f.path) ? 'added' : 'modified', adds: f.adds, dels: f.dels }));
+  let files = ((root.files && root.files.list) || []).map((f, i) => ({ path: f.path, status: f.adds && !f.dels && /test|docs|new|batch|migrations/.test(f.path) ? 'added' : 'modified', adds: f.adds, dels: f.dels }));
   files = files.map((f, i) => ({ ...f, patch: filePatch(f, i), cut: f.adds > 40 ? true : undefined }));
   let left = [];
-  if (root.name === 'Invoice export') { files = [...stressFiles(), ...files]; left = [{ path: '.env.local', why: 'ignored' }, { path: 'vendor/payments-sdk', why: 'nested-repo' }]; }
+  const real = own ? own(root) : null;
+  if (real) files = real;
+  else if (root.name === 'Invoice export') { files = [...stressFiles(), ...files]; left = [{ path: '.env.local', why: 'ignored' }, { path: 'vendor/payments-sdk', why: 'nested-repo' }]; }
   const active = ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(root.state);
   return { ok: true, agentId: root.id, name: root.name, branch: work.branch, into: state.repo ? state.repo.branch : 'main', live: active,
     diff: { workId: `${gitId(root.id + ':head')}:${gitId(root.id + ':tree')}`, since: gitId(root.id + ':since'), head: gitId(root.id + ':head'), files, left, omitted: 0 } };
@@ -889,6 +944,99 @@ function worldOf(name) {
 /** Agents & keys' facts for a world: full-live has connect-github's. */
 const factsOf = name => connectFacts(name === 'full-live' ? 'connect-github' : name);
 
+// ---------------------------------------------------------------- the file view (GET /api/files, /api/file, /api/search; POST /api/file)
+// As the engine answers them (src/core/engine.mjs: files, file, search, saveFile), from the core's own memoryProject
+// (src/core/files.mjs), which the engine's demo uses too. Every scenario has files: the demo's sample project
+// ('storefront'), with Invoice export's changes in its copy; the 'files' scenario has a richer one:
+//   files   live, on main, nothing needing you: Invoice export done and checked with work not merged yet (its copy
+//           changes export.ts and query.ts and adds batch.ts, a migration and a test, which carry changedLines), Price
+//           rounding at work in its copy (it changed src/cart.ts), and Help pages saying it is done (it changed README.md).
+//           Their counts, and their diffs on the git screen, are their copies' real changes (realChange), so each path there
+//           opens where it changed, a new file at line 1. The project holds a
+//           CRLF file (src/invoices/sample.csv), a file with hidden characters (src/cart.ts, a zero-width space) and a path
+//           with one (docs/notes/readme<U+202E>txt.exe), an env file shown masked (.env), a binary (assets/invoice-logo.png),
+//           one over 1 MB (data/fixtures/large-accounts.json), one of 25,000 lines just under 1 MB (src/generated/rates.ts), a
+//           link (config/keys), one not UTF-8, one with mixed line endings, a CSS file with a BOM, tabs (src/server/main.go)
+//           and a deep path.
+// POST /ctl/files { in, path, text } writes a file as an agent would (its line endings kept): a file that changes on disk
+// while it is shown, or while it is edited (a conflict). GET /ctl/files?in=&path= reads its bytes ({ raw, hash, bom }).
+// GET /ctl/file-reads lists the page's GETs of the file routes. mode.delay.file slows every file answer (ms);
+// mode.files 'refuse' refuses them.
+const FILE_READS = [];
+const sha256 = b => crypto.createHash('sha256').update(b).digest('hex');
+const DEMO_SAVED = 'This is the demo, so your change is kept only until Workbench closes.';
+const FILES_REPO = { name: 'storefront', root: '/Users/someone/code/storefront', head: 'a1b2c3d', branch: 'main', dirty: 0, identity: true };
+
+/** What each agent of the 'files' scenario changed in its copy, as git would count it: { name: [realChange, …] }. */
+let SAMPLE_WORK = null;
+function sampleWork() {
+  if (SAMPLE_WORK) return SAMPLE_WORK;
+  const s = filesSample();
+  SAMPLE_WORK = Object.fromEntries(Object.entries(s.agents).map(([name, files]) => [name, Object.entries(files)
+    .map(([path, text]) => realChange(path, typeof s.files[path] === 'string' ? s.files[path] : null, text)).filter(Boolean)]));
+  return SAMPLE_WORK;
+}
+
+/** The 'files' board: calm, live, on main; nothing needs you, so a question pushed later lights the sheet's pill. */
+function filesBoard(now) {
+  const work = (a, o) => workOf(a, o);
+  // each agent's files and counts are its copy's real changes, so the board, the git screen and the file view agree
+  const counted = name => filesOf(sampleWork()[name].map(c => ({ path: c.path, adds: c.adds, dels: c.dels })));
+  const raw = [
+    { id: 'f1', name: 'Invoice export', state: 'done_checked', machineId: 'laptop', endedMin: 4, says: 'Invoices now go out in small batches, so large accounts can export without timing out.',
+      files: counted('Invoice export'), checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 41000 }] } },
+    { id: 'f2', name: 'Price rounding', state: 'working', machineId: 'laptop', now: 'Editing cart.ts', files: counted('Price rounding') },
+    { id: 'f3', name: 'Help pages', state: 'done_claimed', machineId: 'laptop', endedMin: 12, harness: 'codex', says: 'I rewrote the README in plain language.',
+      files: counted('Help pages'), checks: { state: 'none', results: [] } },
+  ];
+  for (const a of raw) a.work = work(a);
+  const st = world(raw, now);
+  st.mode = 'live';
+  st.repo = { ...FILES_REPO };
+  st.machines = [{ ...LAPTOP, agents: 1, note: '1 agent' }];
+  return st;
+}
+SCENARIOS.push('files');
+
+/** The 'files' scenario's project: yours, each agent's changes, and the links in it. */
+function filesSample() {
+  const s = sampleProject();
+  const U = n => String.fromCodePoint(n);
+  const rates = ['// Rates for every country and currency, as the tax office lists them. Made by tools/rates.py: do not edit.', ''];
+  for (let i = 1; rates.length < 25000; i++) rates.push(`export const R${String(i).padStart(5, '0')} = ${(i * 37) % 100000}; // ${i % 7 ? 'cents' : 'whole'}`);
+  const large = '{\n  "accounts": [\n' + Array.from({ length: 20000 }, (_, i) => `    { "id": "acct_${i}", "invoices": ${i % 900}, "total": "${(i * 3.7).toFixed(2)}" }`).join(',\n') + '\n  ]\n}\n';
+  const deep = 'src/very/deeply/nested/folders/for/the/crumbs/to/give/way/invoice-export-batch-sender-for-large-accounts.ts';
+  const files = {
+    ...s.files,
+    'README.md': ['# Storefront', '', "The shop's code: the cart, the checkout and the invoice export for accounts.", '', '## Run it', '', 'Run `npm test` before you merge.', ''].join('\n'),
+    'src/server/main.go': ['package main', '', 'import (', '\t"fmt"', '\t"net/http"', ')', '', '// main serves the shop on port 3000.', 'func main() {', '\thttp.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {',
+      '\t\tfmt.Fprintln(w, "storefront")', '\t})', '\thttp.ListenAndServe(":3000", nil)', '}', ''].join('\n'),
+    'src/styles/cart.css': '\ufeff' + ['/* The cart, on every screen size */', '.cart { display: grid; gap: 12px; color: #1f1d1a; }', '@media (max-width: 520px) {', '  .cart { gap: 8px; }', '}', ''].join('\n'),
+    'tools/rates.py': ['"""Make src/generated/rates.ts from the tax office\'s list."""', 'import csv', '', 'def main(path):', '    # one row a country', '    with open(path) as f:', '        for row in csv.reader(f):',
+      "            print(f\"export const {row[0]} = {{ cents: {row[1]} }};\")", '', "if __name__ == '__main__':", "    main('rates.csv')", ''].join('\n'),
+    'scripts/deploy.sh': ['#!/bin/sh', '# Ship the shop: build, then copy it up.', 'set -e', 'npm run build', 'if [ -n "$TARGET" ]; then', '  rsync -a dist/ "$TARGET"', 'fi', ''].join('\n'),
+    '.github/workflows/ci.yml': ['name: ci', 'on: [push]', 'jobs:', '  test:', '    runs-on: ubuntu-latest', '    steps:', '      - uses: actions/checkout@v4', '      - run: npm test # every push', ''].join('\n'),
+    'src/emails/receipt.html': ['<!doctype html>', '<p class="hello">Thank you for your order.</p>', '<!-- the total, in the customer’s currency -->', '<p>Total: <b>{{ total }}</b></p>', ''].join('\n'),
+    [`docs/notes/readme${U(0x202e)}txt.exe`]: 'This file name reads backwards on purpose.\n',
+    'assets/invoice-logo.png': Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]),
+    'data/fixtures/large-accounts.json': large,
+    'src/generated/rates.ts': rates.join('\n') + '\n',
+    'src/legacy/latin1.txt': Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]),
+    'src/legacy/mixed.txt': 'one\r\ntwo\nthree\r\n',
+    [deep]: ['export const BATCH = 50;', 'export const PAUSE_MS = 200;', ''].join('\n'),
+  };
+  return {
+    name: 'storefront', branch: 'main', files, links: { 'config/keys': '../../../.ssh/config' },
+    agents: {
+      'Invoice export': s.agent.files,
+      'Price rounding': { 'src/cart.ts': files['src/cart.ts'].replace('return items.reduce((sum, item) => sum + item.price * item.quantity, 0);',
+        'const cents = items.reduce((sum, item) => sum + item.price * item.quantity, 0);\n  // whole cents, so the total never shows a fraction\n  return Math.round(cents);') },
+      'Help pages': { 'README.md': files['README.md'].replace("The shop's code: the cart, the checkout and the invoice export for accounts.",
+        'The code of the shop: its cart, its checkout, and the export of invoices for large accounts.\n\nAsk in #storefront when something is unclear.') },
+    },
+  };
+}
+
 /** Start the mock. Resolves to { port, close() }. */
 export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) {
   const clients = new Set();
@@ -1110,6 +1258,128 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     state.repo = { ...state.repo, head: merge.slice(0, 7) };
     setTimeout(() => { send('agents', [a]); send('repo', state.repo); }, 60);
     return { reply: `Merged ${a.name} into ${into}.`, focusId: a.id };
+  };
+
+  // ---------------------------------------------------------------- the file view's routes (see above startMock)
+  let fw = null;   // this world's files, made the first time the page asks; a new scenario starts afresh
+  const filesWorld = () => {
+    if (fw) return fw;
+    const base = name === 'files' ? filesSample()
+      : (() => { const s = sampleProject(); return { name: s.name, branch: s.branch, files: s.files, links: {}, agents: { [s.agent.name]: s.agent.files } }; })();
+    const mirror = files => Object.fromEntries(Object.entries(files).map(([k, v]) => [k, Buffer.from(v)]));
+    fw = { base, you: { files: mirror(base.files), links: { ...base.links }, proj: null }, pristine: memoryProject(base.files), copies: new Map(), saved: false, mirror };
+    return fw;
+  };
+  const projOf = cp => cp.proj || (cp.proj = memoryProject(cp.files));
+  /** Which copy a request names, as the engine's _copyOf does: yours, or a root's (a helper's id means its agent's). */
+  const copyOf = where => {
+    const w = filesWorld();
+    const refusal = (reply, why = 'refused') => ({ refusal: { ok: false, reply, why } });
+    const named = state.repo ? state.repo.name : w.base.name;
+    if (where === 'you') return { in: 'you', name: named, branch: state.repo ? state.repo.branch : w.base.branch, copy: w.you };
+    if (typeof where !== 'string' || !where) return refusal('Say whose copy to show: yours, or an agent’s.');
+    const found = state.agents.find(a => a.id === where);
+    const v = found && found.parentId ? state.agents.find(a => a.id === found.rootId) || found : found;
+    if (!v) return refusal('I can’t find that agent.', 'gone');
+    if (v.work && v.work.thrownAway) return refusal(`${v.name}’s work was thrown away, so its copy is gone.`, 'gone');
+    if (v.work && v.work.folder === false) return refusal(`${v.name}’s folder is not on this computer any more.`, 'gone');
+    if (!w.copies.has(v.id)) w.copies.set(v.id, { files: w.mirror({ ...w.base.files, ...(w.base.agents[v.name] || {}) }), links: { ...w.base.links }, proj: null });
+    return { in: v.id, name: named, branch: (v.work && v.work.branch) || null, copy: w.copies.get(v.id), v };
+  };
+  /** The core's plain refusal as the engine gives it: its sentence, and the file's hash now when it changed. */
+  const plainOf = (err, fallback) => (err && err.plain && typeof err.message === 'string'
+    ? { ok: false, reply: err.message, why: err.why === 'changed' ? 'changed' : 'refused', ...(err.why === 'changed' && typeof err.hash === 'string' ? { hash: err.hash } : {}) }
+    : { ok: false, reply: fallback, why: 'refused' });
+  /** Why the person may not edit it (the engine's _notEditable), or null. */
+  const notEditable = got => {
+    const kinds = { binary: 'This is a binary file.', large: 'This file is too large to show here.', notutf8: 'This file is not UTF-8 text, so Workbench does not show it.',
+      link: `This is a link to ${got.link}.`, secret: 'This file holds keys, so Workbench shows only their last four characters and does not edit it.', missing: 'This file is not there any more.' };
+    if (kinds[got.kind]) return kinds[got.kind];
+    return got.eol === 'mixed' ? 'This file mixes line endings, so Workbench does not edit it.' : null;
+  };
+  /**
+   * The 'files' scenario: an agent's changes on the git screen are its copy's real ones, against your folder as it
+   * started (each path its record names, as its copy holds it now), so each opens where it really changed.
+   */
+  const ownChanges = root => {
+    const w = filesWorld();
+    if (!w.base.agents[root.name]) return null;
+    const c = copyOf(root.id);
+    if (c.refusal) return null;
+    const out = [];
+    for (const f of (root.files && root.files.list) || []) {
+      const now = projOf(c.copy).textOf(f.path);
+      const got = now == null ? null : realChange(f.path, w.pristine.textOf(f.path), now);
+      if (got) out.push(got);
+    }
+    return out;
+  };
+  const readIn = (c, rel) => {
+    if (Object.hasOwn(c.copy.links, rel)) { const t = c.copy.links[rel]; return { kind: 'link', link: t, hash: sha256(t), size: Buffer.byteLength(t), eol: 'none', bom: false }; }
+    return projOf(c.copy).readFile({ rel });
+  };
+  /** Write `text` over a file as the core does (its line endings and BOM kept), and keep its bytes for /ctl/files. */
+  const writeIn = async (c, rel, text, hash, force) => {
+    const proj = projOf(c.copy);
+    const was = await proj.readFile({ rel });
+    const saved = await proj.writeFile({ rel, text, hash, force });
+    const body = Buffer.from(was.eol === 'crlf' ? text.replace(/\n/g, '\r\n') : text, 'utf8');
+    c.copy.files[rel] = was.bom ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body]) : body;
+    if (sha256(c.copy.files[rel]) !== saved.hash) console.error('ui-mock: the bytes kept for', rel, 'are not the bytes written');
+    return saved;
+  };
+  const fileRoute = async (req, p, u, json, res) => {
+    const answer = (code, o) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store'); res.end(JSON.stringify(o)); };
+    const refuse = r => answer(r.why === 'gone' ? 404 : r.why === 'changed' ? 409 : 400, r);
+    const q = u.searchParams;
+    const allow = p === '/api/file' ? ['GET', 'POST'] : ['GET'];
+    if (!allow.includes(req.method)) { res.setHeader('Allow', allow.join(', ')); return answer(405, { error: 'That method is not allowed here.' }); }
+    if (req.method === 'GET') FILE_READS.push({ at: Date.now(), path: p, in: q.get('in'), file: q.get('path'), check: q.get('check'), q: q.get('q') });
+    if (mode.delay && mode.delay.file > 0) await new Promise(r => setTimeout(r, mode.delay.file));
+    if (mode.files === 'refuse') return refuse({ ok: false, reply: 'Workbench cannot show files right now.', why: 'refused' });
+    const c = copyOf(req.method === 'GET' ? q.get('in') : json && json.in);
+    if (c.refusal) return refuse(c.refusal);
+    if (p === '/api/files') {
+      const got = await projOf(c.copy).listFiles();
+      const all = [...new Set([...got.files, ...Object.keys(c.copy.links)])].sort();
+      const hidden = new Set(got.ignored || []);
+      const roots = c.v ? [c.v] : state.agents.filter(a => !a.parentId && !(a.work && (a.work.thrownAway || a.work.folder === false)));
+      const marks = new Map();
+      for (const v of roots) for (const f of (v.files && v.files.list) || []) { if (!marks.has(f.path)) marks.set(f.path, []); marks.get(f.path).push({ agentId: v.id, name: v.name, state: v.state }); }
+      return answer(200, { ok: true, in: c.in, name: c.name, branch: c.branch, files: all.map(path => ({ path, ...(marks.has(path) ? { changedBy: marks.get(path) } : {}), ...(hidden.has(path) ? { ignored: true } : {}) })) });
+    }
+    if (p === '/api/search') {
+      try {
+        const got = await projOf(c.copy).searchFiles({ query: q.get('q') });
+        return answer(200, { ok: true, in: c.in, results: got.results, ...(got.truncated ? { truncated: true } : {}) });
+      } catch (err) { return refuse(plainOf(err, 'Workbench could not search the files.')); }
+    }
+    if (req.method === 'GET') {
+      const rel = q.get('path');
+      let got;
+      try { checkPath(rel); got = await readIn(c, rel); } catch (err) { return refuse(plainOf(err, 'Workbench could not read that file.')); }
+      if (q.get('check') && got.hash && got.hash === q.get('check')) return answer(200, { ok: true, same: true });
+      const out = { ok: true, in: c.in, path: rel, ...got };
+      if (c.v && (got.kind === 'text' || got.kind === 'secret') && got.lines) {
+        const now = projOf(c.copy).textOf(rel);
+        if (now != null) out.changedLines = changedLinesBetween(filesWorld().pristine.textOf(rel), now);
+      }
+      const why = notEditable(got);
+      out.editable = !why;
+      if (why) out.why = why;
+      return answer(200, out);
+    }
+    // a save: at most 1 MB of text, then the core's checks (the hash it was read with, line endings, what it is)
+    const rel = json && json.path;
+    if (typeof (json && json.text) === 'string' && Buffer.byteLength(json.text) > 1024 * 1024) return answer(413, { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' });
+    try {
+      checkPath(rel);
+      if (Object.hasOwn(c.copy.links, rel)) return refuse({ ok: false, reply: `${rel} is a link, so Workbench does not write through it.`, why: 'refused' });
+      const saved = await writeIn(c, rel, json.text, json.hash, json.force === true);
+      const out = { ok: true, hash: saved.hash, size: saved.size };
+      if (state.mode !== 'live') { if (!filesWorld().saved) out.reply = DEMO_SAVED; filesWorld().saved = true; }
+      return answer(200, out);
+    } catch (err) { return refuse(plainOf(err, 'Workbench could not save that file.')); }
   };
 
   // ---------------------------------------------------------------- Agents & keys: the connect panel's routes
@@ -1335,7 +1605,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       const b = body ? JSON.parse(body) : {};
       res.setHeader('content-type', 'application/json');
       if (p === '/ctl/scenario') {
-        name = b.name; state = worldOf(name); cw = factsOf(name); confirms.clear();
+        name = b.name; state = worldOf(name); cw = factsOf(name); confirms.clear(); fw = null;
         if (b.push !== false) send('snapshot', state);
         res.end(JSON.stringify({ ok: true, agents: state.agents.length })); return;
       }
@@ -1349,6 +1619,18 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (p === '/ctl/drop') { for (const c of clients) c.destroy(); clients.clear(); res.end('{"ok":true}'); return; }
       if (p === '/ctl/log') { res.end(JSON.stringify(posted)); return; }
       if (p === '/ctl/reads') { res.end(JSON.stringify(GIT_READS)); return; }   // D1: the git screen's GETs
+      if (p === '/ctl/file-reads') { res.end(JSON.stringify(FILE_READS)); return; }   // the file view's GETs
+      if (p === '/ctl/files') {
+        // as an agent writes a file (POST { in, path, text }), and its bytes as they are on disk (GET ?in=&path=)
+        const c = copyOf(req.method === 'GET' ? u.searchParams.get('in') : b.in);
+        if (c.refusal) { res.statusCode = 404; res.end(JSON.stringify(c.refusal)); return; }
+        const rel = req.method === 'GET' ? u.searchParams.get('path') : b.path;
+        try {
+          if (req.method === 'POST') { const was = await projOf(c.copy).readFile({ rel }); const saved = await writeIn(c, rel, String(b.text), was.hash, false); res.end(JSON.stringify({ ok: true, ...saved })); return; }
+          const raw = c.copy.files[rel];
+          res.end(JSON.stringify(raw ? { ok: true, raw: raw.toString('utf8'), hash: sha256(raw), bom: raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf } : { ok: false })); return;
+        } catch (err) { res.statusCode = 400; res.end(JSON.stringify({ ok: false, reply: err.message })); return; }
+      }
       if (p === '/ctl/clear') { posted.length = 0; res.end('{"ok":true}'); return; }
       if (p === '/ctl/prefs') {
         if ((b.permissions === 'full' || b.permissions === 'ask') && b.permissions !== state.permissions) { state.permissions = b.permissions; modeChanges++; }
@@ -1386,6 +1668,8 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         clients.add(res); req.on('close', () => clients.delete(res));
         return;
       }
+      // the file view's four routes, whatever mode.answer says (mode.files and mode.delay.file are theirs)
+      if (p === '/api/files' || p === '/api/file' || p === '/api/search') return fileRoute(req, p, u, json, res);
       if (mode.answer === 'drop') { req.socket.destroy(); return; }
       if (mode.answer === '500') { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"error":"Something went wrong."}'); return; }
       // the engine does git work before it answers a merge or a throw-away: mode.delay makes those replies (and typed
@@ -1399,7 +1683,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (gm) {
         GIT_READS.push({ at: Date.now(), path: p });
         if (mode.answer === 'refuse') return reply({ ok: false, reply: p === '/api/git' ? 'Workbench could not read the history of your repository.' : 'Workbench could not read that agent’s changes.' });
-        return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1])));
+        return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1]), name === 'files' ? ownChanges : null));
       }
       const m = /^\/api\/agents\/([^/]+)\/(answer|say|stop|raise-limit)$/.exec(p);
       if (m) {
@@ -1586,7 +1870,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     if (!quiet) console.log('mock on', actual);
     resolve({
       port: actual,
-      setScenario(n) { name = n; state = scenario(n); cw = connectFacts(n); confirms.clear(); },
+      setScenario(n) { name = n; state = scenario(n); cw = connectFacts(n); confirms.clear(); fw = null; },
       close: () => new Promise(r => { clearInterval(stepTimer); for (const c of clients) c.destroy(); server.close(() => r()); }),
     });
   }));

@@ -117,7 +117,7 @@ test('a hunk whose function line holds a line or paragraph separator, or a carri
 test('the git screen\'s files hold no raw hidden characters themselves', () => {
   for (const f of ['../ui/diffview.js', './ui-diffview.test.mjs', '../ui/gitgraph.js', '../ui/gitscreen.js', '../ui/layout.js', '../ui/board.js', '../ui/app.js',
     '../ui/index.html', '../ui/app.css', './ui-gitgraph.test.mjs', './ui-layout.test.mjs', '../scripts/ui-mock.mjs', '../scripts/ui-fit-check.mjs',
-    '../ui/words.js', './ui-words.test.mjs', '../ui/focus.js', './ui-focus.test.mjs', '../scripts/ui-contrast.mjs']) {
+    '../ui/words.js', './ui-words.test.mjs', '../ui/focus.js', './ui-focus.test.mjs', '../scripts/ui-contrast.mjs', '../ui/fileview.js', '../ui/api.js']) {
     // read in context, with line breaks and tabs (a file's own layout) left out: an emoji keeps its one selector
     const src = readFileSync(new URL(f, import.meta.url), 'utf8').replace(/[\n\t]/g, ' ');
     const raw = hiddenParts(src).filter(p => p.hidden).map(p => hex(p.text));
@@ -222,4 +222,49 @@ test('a link that became a file shows the new file’s lines', async () => {
   const facts = patchFacts(patch);
   assert.equal(facts.became, 'file');
   assert.equal(fileWords({ status: 'modified', adds: 2, dels: 1, patch }, facts), 'the link became a file, +2');
+});
+
+test('a piece of a line keeps its tab stops where the line put them (visibleHtmlAt), so a coloured line lines up', async () => {
+  const { visibleHtmlAt } = await import('../ui/diffview.js');
+  // "ab" then a tab: the tab takes the line to column 4, wherever the piece with the tab begins
+  const a = visibleHtmlAt('ab', 0);
+  assert.deepEqual(a, { html: 'ab', col: 2 });
+  const b = visibleHtmlAt('\tc', a.col);
+  assert.equal(b.html.replace(/<[^>]+>/g, ''), '⇥ c', 'the tab fills to the next stop of 4 from column 2');
+  assert.equal(b.col, 5);
+  assert.equal(visibleHtml('ab\tc'), a.html + b.html, 'the same as the whole line at once');
+  // a hidden character counts as the columns of what is shown for it
+  const z = visibleHtmlAt(`x${U(0x200b)}`, 3);
+  assert.equal(z.col, 3 + 1 + '⟦U+200B⟧'.length);
+  assert.match(z.html, /<span class="vc" title="Hidden here: a zero-width space\.">⟦U\+200B⟧<\/span>/);
+  assert.deepEqual(visibleHtmlAt('', 7), { html: '', col: 7 });
+});
+
+test('the first line a file’s change added or changed, for opening it there (firstChangedLine)', async () => {
+  const { firstChangedLine } = await import('../ui/diffview.js');
+  assert.equal(firstChangedLine(patch('a.js', '@@ -10,4 +10,5 @@ fn\n keep\n keep\n+new\n keep\n')), 12);
+  assert.equal(firstChangedLine(patch('a.js', '@@ -1,3 +1,3 @@\n-old\n+new\n same\n')), 1);
+  // only lines taken away: where they were, in the file as it is now
+  assert.equal(firstChangedLine(patch('a.js', '@@ -20,3 +20,2 @@\n keep\n-gone\n keep\n')), 21);
+  // the second hunk counts from its own start
+  assert.equal(firstChangedLine(patch('a.js', '@@ -3,2 +3,2 @@\n a\n b\n@@ -40,2 +40,3 @@\n c\n+d\n e\n')), 41);
+  assert.equal(firstChangedLine(patch('n.js', '@@ -0,0 +1,2 @@\n+a\n+b\n', 'new file mode 100644')), 1);
+  assert.equal(firstChangedLine(null), 1);
+  assert.equal(firstChangedLine(''), 1);
+});
+
+test('the git screen can open a file from its header: a button with the file’s place, only when asked, and never for a deleted file', () => {
+  const files = [
+    { path: 'src/a.js', status: 'modified', adds: 1, dels: 0, patch: patch('src/a.js', '@@ -4,2 +4,3 @@\n x\n+y\n z\n') },
+    { path: 'gone.js', status: 'deleted', adds: 0, dels: 1, patch: patch('gone.js', '@@ -1 +0,0 @@\n-a\n') },
+    { path: `logo${RLO}.png`, status: 'added', adds: 0, dels: 0, binary: true, patch: null },
+  ];
+  const plain = diffHtml({ files });
+  assert.doesNotMatch(plain, /<button/, 'not without being asked');
+  const html = diffHtml({ files }, { open: true });
+  assert.match(html, /<h3 class="dh"><button type="button" class="dp dopen" data-file-index="0" data-line="5" data-key="open:0" title="Open src\/a\.js at line 5">src\/a\.js<\/button> <span class="dn">\+1 −0<\/span><\/h3>/);
+  assert.match(html, /<span class="dp">gone\.js<\/span>/, 'a deleted file is not in the copy any more');
+  assert.match(html, /data-file-index="2" data-line="1"/);
+  assert.doesNotMatch(html, new RegExp(RLO), 'a path in a title shows its hidden characters too');
+  assert.match(html, /title="Open logo⟦U\+202E⟧\.png at line 1">logo<span class="vc"/);
 });

@@ -90,8 +90,14 @@ export function canReview(a) {
  */
 export function mergeApplies(a, { ACTIVE, meta }) {
   const repo = meta && meta.repo;
-  return !!(meta && meta.mode === 'live' && canReview(a) && !ACTIVE.has(a.state) && repo && repo.branch && repo.identity !== false && unmergedWork(a));
+  return !!(meta && meta.mode === 'live' && canReview(a) && !ACTIVE.has(a.state) && !checkedAgain(a) && repo && repo.branch && repo.identity !== false && unmergedWork(a));
 }
+
+/**
+ * Is this agent being checked again? A save into the copy of an agent that said it is done makes the engine record its
+ * work and run its checks again (done_claimed with its checks running), and it refuses a merge until they end.
+ */
+export const checkedAgain = a => !!(a && a.state === 'done_claimed' && a.checks && a.checks.state === 'running');
 
 /**
  * Can its work be thrown away now? Live mode, a root whose work was not thrown away, with its branch or its folder still
@@ -111,7 +117,7 @@ const NO_IDENTITY = 'Git does not know your name and email yet, so Workbench can
  */
 export function gitReason(a, { ACTIVE, meta }) {
   const repo = meta && meta.repo;
-  if (!meta || meta.mode !== 'live' || !repo || !canReview(a) || ACTIVE.has(a.state) || !unmergedWork(a)) return null;
+  if (!meta || meta.mode !== 'live' || !repo || !canReview(a) || ACTIVE.has(a.state) || checkedAgain(a) || !unmergedWork(a)) return null;
   if (!repo.branch) return DETACHED;
   if (repo.identity === false) return NO_IDENTITY;
   return null;

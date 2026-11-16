@@ -679,6 +679,10 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitDetail .df { margin: 0 0 4px; }
 #gitDetail .dh { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; margin: 12px 0 5px; font-size: 12px; font-weight: 600; }
 #gitDetail .dp { min-width: 0; overflow-wrap: anywhere; }
+/* a file's path, while its copy is there: it opens the file in the file view, at its first changed line */
+#gitDetail .dp.dopen { padding: 0 2px; margin: 0 -2px; border: 0; border-radius: 3px; background: none; color: var(--card-ink); font: inherit; text-align: left; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--card-rule); transition: text-decoration-color .15s ease; }
+#gitDetail .dp.dopen:hover { text-decoration-color: var(--card-ink-2); }
 #gitDetail .dn { font-weight: 400; color: var(--card-sub); white-space: nowrap; }
 #gitDetail .dlines { border: 1px solid var(--card-rule); border-radius: 4px; }
 #gitDetail .dl { display: grid; grid-template-columns: 1.6em minmax(0, 1fr); }
@@ -707,6 +711,227 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #core.idle .meta.git { color: var(--idle-ink-2); }
 /* the card: where its work is, on the Now line's second row */
 #card .wk { display: block; margin-top: 2px; font-weight: 400; color: var(--card-sub); }
+
+/* =====================================================================================================================
+   The file view: the files chip (U3) beside the DRAM, and the sheet, the core's lid grown into the middle of the board.
+   ===================================================================================================================== */
+/* the sheet's own colours: the page the code sits on (flat, so the line numbers can stay put as long lines scroll
+   sideways), a changed line's tint and gold bar, a line briefly marked, a chosen row, the gentle syntax colours, a
+   hidden character's mark, and "Saved" in the head (words, so a deeper green than the done mark's). All on the lid's
+   light surfaces, in each look, and checked by scripts/ui-contrast.mjs. */
+:root, :root[data-theme="green"] {
+  --fv-page: #efeee9; --fv-chg: #e2e8d9; --fv-bar: #a0731c; --fv-fresh: #f3e3b6; --fv-on: #e1dfd6; --fv-sel: #e8d9ae; --fv-no: #5d6159;
+  --fv-k: #2a57c2; --fv-s: #11734a; --fv-n: #8a4e00; --fv-c: #5f635b; --fv-h: #1f4aa8; --fv-vc: #a5390b; --fv-ok: #11734a;
+}
+:root[data-theme="black-gold"] {
+  --fv-page: #fbf8f1; --fv-chg: #ebeedd; --fv-bar: #8c6e2f; --fv-fresh: #f5e6bd; --fv-on: #efe8da; --fv-sel: #efdfb5; --fv-no: #6b655a;
+  --fv-k: #2a57c2; --fv-s: #11734a; --fv-n: #8a4e00; --fv-c: #5d574c; --fv-h: #1f4aa8; --fv-vc: #a5390b; --fv-ok: #11734a;
+}
+:root[data-theme="ivory"] {
+  --fv-page: #fffefa; --fv-chg: #ecf3e5; --fv-bar: #9c6835; --fv-fresh: #faecc6; --fv-on: #f4efe4; --fv-sel: #f3e5bf; --fv-no: #6a655c;
+  --fv-k: #2a57c2; --fv-s: #11734a; --fv-n: #8a5000; --fv-c: #615c53; --fv-h: #1f4aa8; --fv-vc: #a5390b; --fv-ok: #11734a;
+}
+
+/* ---------- the files chip: a small flash package (SVG), its bus, and the #filesChip button over it ---------- */
+.flash-cu path { fill: none; stroke: var(--copper); stroke-width: 1.2; stroke-linecap: round; transition: stroke .3s ease; }
+.flash-pins rect { fill: var(--tin); opacity: .9; }
+.flash-body { fill: url(#dramBody); stroke: var(--chip-line); stroke-width: 1; transition: stroke .3s ease; }
+:root[data-theme="ivory"] .flash-body { fill: var(--chip-1); stroke-width: 1.3; }
+#filesChip { position: absolute; z-index: 1; display: grid; place-items: center; margin: 0; padding: 0; border: 0; border-radius: 2px; background: none;
+  color: var(--chip-ink-2); font-weight: 700; transition: color .3s ease; }
+#filesChip .fl { letter-spacing: .1em; padding-left: .1em; line-height: 1; }
+#filesChip:hover, #filesChip:focus-visible { color: var(--chip-ink); }
+#filesChip:focus-visible { outline: 2px solid var(--focus); outline-offset: 5px; }
+#filesChip:focus:not(:focus-visible) { outline: none; }
+#filesChip.dim { opacity: .38; transition: opacity 1.2s ease; }
+body:has(#filesChip:hover, #filesChip:focus-visible) .flash-cu path { stroke: var(--copper-warm); }
+body:has(#filesChip:hover, #filesChip:focus-visible) .flash-body { stroke: var(--hover-line); }
+@media (prefers-reduced-motion: reduce) { #filesChip, .flash-cu path, .flash-body { transition: none; } }
+
+/* ---------- while the sheet shows: the board (or the git screen) dims behind it, and its lit lines stay lit ---------- */
+#board, #main, #top, #gitScreen > * { transition: opacity .3s var(--ease); }
+/* only the copper that dims eases: a lit line's glow keeps changing at once, as board.js draws it */
+#wires > :not(.lit):not(.glow):not(.pin):not(.pad):not(.padn) { transition: opacity .3s var(--ease), stroke .3s ease; }
+:root[data-files] #board, :root[data-files] #main, :root[data-files] #top, :root[data-files] #gitScreen > * { opacity: .34; }
+:root[data-files] #wires > :not(.lit):not(.glow):not(.pin):not(.pad):not(.padn) { opacity: .3; }
+:root[data-theme="ivory"][data-files] #board, :root[data-theme="ivory"][data-files] #main, :root[data-theme="ivory"][data-files] #top,
+:root[data-theme="ivory"][data-files] #gitScreen > * { opacity: .45; }
+
+/* ---------- the sheet: a modal dialog in the top layer, the lid's surface and corner cut, a shadow that lands with it ---------- */
+#fileSheet { position: fixed; inset: auto; margin: 0; padding: 0; border: 0; max-width: none; max-height: none; overflow: visible; background: none; color: var(--lid-ink);
+  color-scheme: light; font-size: var(--fv-whose, 12.5px); line-height: 1.4; font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
+#fileSheet[open] { display: block; }
+#fileSheet::backdrop { background: transparent; }
+#fileSheet .fv-shade { position: absolute; inset: 0; border-radius: var(--lid-radius); pointer-events: none;
+  box-shadow: 0 34px 90px -20px rgba(0, 0, 0, .62), 0 10px 26px rgba(0, 0, 0, .34); }
+/* ivory's dark outline is the shade's, outside the growing clip, so the edge lands with the shadow instead of popping in
+   when the clip reaches the sheet's own edge */
+:root[data-theme="ivory"] #fileSheet .fv-shade { box-shadow: 0 0 0 1.3px #2b2823, 0 30px 70px -26px rgba(60, 40, 10, .34), 0 2px 0 rgba(43, 40, 35, .05); }
+#fileSheet .fv-sheet { position: absolute; inset: 0; display: flex; flex-direction: column; padding: var(--fv-pt) 0 var(--fv-pb); border-radius: var(--lid-radius);
+  clip-path: polygon(var(--lid-cut) 0, 100% 0, 100% 100%, 0 100%, 0 var(--lid-cut));
+  background: repeating-linear-gradient(90deg, rgba(255, 255, 255, 0) 0 2px, rgba(255, 255, 255, .13) 2px 3px), linear-gradient(180deg, var(--lid-1) 0%, var(--lid-2) 52%, var(--lid-3) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .85), inset 0 0 0 1px rgba(60, 58, 48, .30); }
+:root[data-theme="black-gold"] #fileSheet .fv-sheet { background: radial-gradient(130% 100% at 50% 0%, var(--lid-1) 0%, var(--lid-2) 52%, var(--lid-3) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .85), inset 0 0 0 1px #c4b89d; }
+:root[data-theme="black-gold"] #fileSheet .fv-sheet::after { content: ""; position: absolute; inset: 8px; border: 1.25px solid rgba(190, 150, 74, .7); border-radius: 4px; pointer-events: none; }
+:root[data-theme="ivory"] #fileSheet .fv-sheet { background: var(--lid-1); box-shadow: none; }
+#fileSheet .fv-sheet > * { position: relative; z-index: 1; }
+
+/* its head: the path you can click, the needs-you pill, Edit (or Save and Cancel, or why not), and ✕ */
+#fileSheet .fv-head { flex: none; display: flex; align-items: center; gap: 14px; min-height: 34px; padding: 0 calc(var(--fv-px) - 8px) 0 var(--fv-px); }
+/* the path takes what the pill, the actions and ✕ leave (flex-basis 0), and is fitted to that room (paintTitle), so it
+   never runs under them */
+#fvTitle { flex: 1 1 0; min-width: 0; margin: 0; font-size: var(--fv-path); font-weight: 400; line-height: 1.3; color: var(--lid-ink-3); white-space: nowrap; }
+#fvTitle:focus { outline: none; }
+#fvTitle .fv-crumbs { display: inline-flex; align-items: baseline; flex-wrap: nowrap; max-width: 100%; }
+#fvTitle b { font-size: var(--fv-name); font-weight: 700; color: var(--lid-ink); letter-spacing: -.2px; }
+#fvTitle .fv-sep { margin: 0 .42em; color: var(--lid-ink-3); }
+#fvTitle .fv-gap { color: var(--lid-ink-3); }
+#fileSheet .fv-crumb { padding: 1px 2px; margin: -1px -2px; border: 0; border-radius: 3px; background: none; color: var(--lid-ink-2); font: inherit;
+  text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--lid-rule); transition: color .15s ease, text-decoration-color .15s ease; }
+#fileSheet .fv-crumb:hover { color: var(--lid-ink); text-decoration-color: var(--lid-ink-2); }
+#fileSheet .fv-crumb[aria-disabled="true"] { text-decoration: none; cursor: default; color: var(--lid-ink-3); }
+#fileSheet .fv-acts { flex: 0 1 auto; display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; max-width: 64%; }
+/* with the needs-you pill beside it, why a file is not edited leaves the path its room (it wraps into two even lines) */
+#fileSheet .fv-head:has(> #fvNeeds:not([hidden])) .fv-acts { max-width: 40%; }
+#fileSheet .fv-acts:empty { display: none; }
+/* why a file is not edited, where Edit would be: one line where there is room, else two even lines */
+#fileSheet .fv-why { color: var(--lid-ink-3); text-align: right; overflow-wrap: anywhere; line-height: 1.35; text-wrap: balance; }
+#fileSheet .fv-saved { color: var(--fv-ok); font-weight: 600; white-space: nowrap; animation: fv-saved 2.6s ease both; }
+@keyframes fv-saved { 0% { opacity: 0; } 12%, 70% { opacity: 1; } 100% { opacity: 0; } }
+#fileSheet .fv-x { flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--lid-ink-2); font-size: 15px; line-height: 1; }
+#fileSheet .fv-x:hover { background: rgba(60, 58, 48, .10); color: var(--lid-ink); }
+#fileSheet .fv-needs { flex: none; display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border: 1px solid var(--k-need); border-radius: 4px; background: none;
+  color: var(--lid-ink); font-weight: 600; white-space: nowrap; }
+:root[data-theme="ivory"] #fileSheet .fv-needs { border-radius: 99px; }
+#fileSheet .fv-needs:hover { background: rgba(60, 58, 48, .07); }
+
+/* the lid's buttons, a size smaller: an outline layer and a fill layer, cut at the corners (pills in ivory) */
+#fileSheet .fv-btn { position: relative; isolation: isolate; min-width: 72px; min-height: 30px; padding: 3px 15px; border: 0; background: none; font-size: calc(var(--fv-path) - .5px);
+  font-weight: 600; line-height: 1.25; color: var(--btn-ink); white-space: nowrap; transition: opacity .2s ease; }
+#fileSheet .fv-btn::before, #fileSheet .fv-btn::after { content: ""; position: absolute; inset: 0; z-index: -1; border-radius: var(--btn-radius);
+  clip-path: polygon(var(--btn-cut) 0, calc(100% - var(--btn-cut)) 0, 100% var(--btn-cut), 100% calc(100% - var(--btn-cut)), calc(100% - var(--btn-cut)) 100%, var(--btn-cut) 100%, 0 calc(100% - var(--btn-cut)), 0 var(--btn-cut)); }
+#fileSheet .fv-btn::before { background: var(--btn-line); }
+#fileSheet .fv-btn::after { inset: 1.25px; background: linear-gradient(180deg, var(--btn-1), var(--btn-2)); }
+#fileSheet .fv-btn.pri { color: var(--btn-pri-ink); }
+#fileSheet .fv-btn.pri::before { background: var(--btn-pri); }
+#fileSheet .fv-btn.pri::after { display: none; }
+#fileSheet .fv-btn:hover::before { background: var(--btn-hover-line); }
+#fileSheet .fv-btn.pri:hover::before { background: var(--btn-pri-hover); }
+#fileSheet .fv-btn:active:not([aria-disabled="true"]) { transform: translateY(1px); }
+#fileSheet .fv-btn[aria-disabled="true"] { opacity: .55; cursor: default; }
+#fileSheet .fv-btn.small { min-width: 0; min-height: 26px; padding: 2px 11px; font-size: var(--fv-whose); }
+
+/* whose copy it is, in one quiet line (or what asks first, or a note) */
+#fileSheet .fv-whose { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 3px 8px; min-height: 26px; margin: 6px 0 12px; padding: 0 var(--fv-px);
+  font-size: var(--fv-whose); color: var(--lid-ink-2); }
+#fileSheet .fv-whose svg.g, #fileSheet .fv-needs svg.g, #fileSheet .fv-mk svg.g { width: 10px; height: 10px; flex: none; }
+#fileSheet .fv-dot { color: var(--lid-ink-3); }
+#fileSheet .fv-link { padding: 1px 2px; margin: -1px -2px; border: 0; border-radius: 3px; background: none; color: var(--lid-ink-2); font: inherit;
+  text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--lid-rule); }
+#fileSheet .fv-link:hover { color: var(--lid-ink); text-decoration-color: var(--lid-ink-2); }
+#fileSheet .fv-said { color: var(--lid-ink-2); overflow-wrap: anywhere; }
+#fileSheet .fv-ask { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; color: var(--lid-ink); font-weight: 600; }
+#fileSheet .fv-ask > span { overflow-wrap: anywhere; }
+#fileSheet .fv-ask .fv-btn { font-weight: 600; }
+#fileSheet .k-need { color: var(--k-need); } #fileSheet .k-stuck { color: var(--k-stuck); } #fileSheet .k-ok { color: var(--k-ok); }
+#fileSheet .k-work { color: var(--k-work); } #fileSheet .k-word { color: var(--k-word); } #fileSheet .k-fail { color: var(--k-fail); }
+
+/* the page: the code, a folder, or what the field finds, between two hairlines, flat so its line numbers stay put */
+#fileSheet .fv-body { position: relative; flex: 1 1 auto; min-height: 60px; margin: 0 1px; background: var(--fv-page); border-top: 1px solid var(--lid-rule); border-bottom: 1px solid var(--lid-rule); }
+:root[data-theme="ivory"] #fileSheet .fv-body { margin: 0 1.5px; border-color: #e4dbcc; }
+/* in black-gold the sheet's gold frame is the page's sides: two hairlines run between it, as in the other looks */
+:root[data-theme="black-gold"] #fileSheet .fv-body { margin: 0 9.25px; border-color: #e3d8c2; }
+#fileSheet .fv-code, #fileSheet .fv-edit, #fileSheet .fv-list { position: absolute; inset: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--lid-rule) transparent; }
+#fileSheet .fv-code:focus, #fileSheet .fv-list:focus { outline: none; }
+/* the keyboard on the page: a gold line along its top edge, and its hairlines darker (never a frame over the code). The
+   line is drawn over the rows (a changed row's tint and the line numbers' column are opaque), so it stays as they scroll */
+#fileSheet .fv-body:has(.fv-code:focus-visible, .fv-ta:focus) { border-color: var(--lid-ink-3); }
+#fileSheet .fv-body::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; z-index: 2; background: var(--fv-bar); opacity: 0; pointer-events: none; }
+#fileSheet .fv-body:has(.fv-code:focus-visible, .fv-ta:focus)::after { opacity: 1; }
+#fileSheet .fv-code.fv-wait { opacity: 0; }
+/* the same file on its way from the other copy: what shows stays, dimmed only once it takes a while */
+#fileSheet .fv-code.fv-dim { opacity: .5; transition: opacity .2s ease; }
+#fileSheet .fv-sizer { position: relative; min-width: 100%; }
+#fileSheet .fv-rows { position: absolute; left: 0; min-width: 100%; font: 400 var(--fv-code)/var(--fv-lh) "JetBrains Mono", ui-monospace, monospace; color: var(--lid-ink);
+  font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
+#fileSheet .fv-row { display: flex; height: var(--fv-lh); white-space: pre; }
+#fileSheet .fv-row .no { position: sticky; left: 0; z-index: 1; flex: none; width: var(--fv-gut); padding-right: 14px; text-align: right; color: var(--fv-no); background: var(--fv-page);
+  user-select: none; font-variant-numeric: tabular-nums; }
+#fileSheet .fv-row .tx { padding-left: 14px; padding-right: 28px; }
+#fileSheet .fv-row.chg { background: var(--fv-chg); }
+#fileSheet .fv-row.chg .no { background: var(--fv-chg); box-shadow: inset 3px 0 0 var(--fv-bar); }
+/* a line marked for a moment: a gold tint that fades (a still tint, for the moment, without motion) */
+#fileSheet .fv-row.fresh, #fileSheet .fv-row.fresh .no { background-color: var(--fv-fresh); animation: fv-fresh 1.7s ease-out both; }
+@keyframes fv-fresh { 0%, 30% { background-color: var(--fv-fresh); } 100% { background-color: var(--fv-page); } }
+#fileSheet .fv-row.chg.fresh, #fileSheet .fv-row.chg.fresh .no { animation-name: fv-fresh-chg; }
+@keyframes fv-fresh-chg { 0%, 30% { background-color: var(--fv-fresh); } 100% { background-color: var(--fv-chg); } }
+#fileSheet .fv-rows ::selection, #fileSheet .fv-ta::selection { background: var(--fv-sel); color: var(--lid-ink); }
+#fileSheet .hk { color: var(--fv-k); } #fileSheet .hs { color: var(--fv-s); } #fileSheet .hn { color: var(--fv-n); }
+#fileSheet .hc { color: var(--fv-c); font-style: italic; } #fileSheet .hh { color: var(--fv-h); font-weight: 700; }
+#fileSheet .vc { padding: 0 1px; border: 1px solid var(--fv-vc); border-radius: 3px; color: var(--fv-vc); font-weight: 600; font-style: normal; }
+#fileSheet .vc.tab { padding: 0; border: 0; color: var(--fv-no); font-weight: 400; }
+
+/* the editor: a plain text box in the same type, with the line numbers beside it, scrolling as one */
+#fileSheet .fv-edit { overflow-x: hidden; }
+#fileSheet .fv-esizer { position: relative; min-height: 100%; }
+#fileSheet .fv-enums { position: absolute; left: 0; width: var(--fv-gut); display: flex; flex-direction: column; font: 400 var(--fv-code)/var(--fv-lh) "JetBrains Mono", ui-monospace, monospace;
+  font-feature-settings: "liga" 0, "calt" 0; color: var(--fv-no); font-variant-numeric: tabular-nums; user-select: none; }
+#fileSheet .fv-enums span { display: block; height: var(--fv-lh); padding-right: 14px; text-align: right; }
+#fileSheet .fv-ta { position: absolute; left: var(--fv-gut); right: 0; top: 0; bottom: 0; width: calc(100% - var(--fv-gut)); margin: 0; padding: 8px 28px 18px 14px; border: 0; outline: 0;
+  resize: none; overflow-x: auto; overflow-y: hidden; white-space: pre; overflow-wrap: normal; tab-size: 4; background: transparent; color: var(--lid-ink);
+  caret-color: var(--fv-bar); font: 400 var(--fv-code)/var(--fv-lh) "JetBrains Mono", ui-monospace, monospace; font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
+
+/* a folder, or what the field finds: a calm list, the row chosen marked */
+#fileSheet .fv-list { padding: 8px 0 12px; background: var(--fv-page); }
+/* the finder over the editor: the edit stays at its place, unseen, and the keyboard does not reach it */
+#fileSheet .fv-edit.fv-under { visibility: hidden; }
+#fileSheet .fv-group { margin: 10px var(--fv-px) 4px; font-size: calc(var(--fv-whose) - .5px); font-weight: 700; letter-spacing: .3px; color: var(--lid-ink-2); }
+#fileSheet .fv-group:first-child { margin-top: 2px; }
+#fileSheet .fv-opt { display: flex; align-items: baseline; gap: 10px; min-height: calc(var(--fv-lh) + 8px); padding: 4px var(--fv-px) 4px calc(var(--fv-px) - 18px);
+  font: 400 var(--fv-code)/var(--fv-lh) "JetBrains Mono", ui-monospace, monospace; font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0;
+  color: var(--lid-ink); cursor: pointer; white-space: nowrap; }
+#fileSheet .fv-opt.on { background: var(--fv-on); }
+/* the letters matched, and the words found: bold, nothing more, so a long list stays calm */
+#fileSheet .fv-opt b { font-weight: 700; color: var(--lid-ink); }
+/* "and 4 more in export.ts": quiet, where a line found would be; choosing it shows them */
+#fileSheet .fv-opt.fv-more { color: var(--lid-ink-3); }
+#fileSheet .fv-mk { flex: none; display: inline-flex; align-items: center; justify-content: flex-end; gap: 2px; width: 12px; align-self: center; }
+#fileSheet .fv-nm { flex: none; }
+#fileSheet .fv-slash { color: var(--lid-ink-3); }
+#fileSheet .fv-folder .fv-nm { font-weight: 600; }
+#fileSheet .fv-dir, #fileSheet .fv-loc i { color: var(--lid-ink-3); font-style: normal; }
+#fileSheet .fv-loc { flex: none; color: var(--lid-ink-2); }
+#fileSheet .fv-line { color: var(--lid-ink); }
+#fileSheet .fv-empty { margin: 10px var(--fv-px); color: var(--lid-ink-3); white-space: normal; overflow-wrap: anywhere; }
+
+/* in place of the code, for a file with no text to show: what it is, quietly */
+#fileSheet .fv-note { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; text-align: center; color: var(--lid-ink-3); }
+#fileSheet .fv-note .fv-big { font-size: var(--fv-name); font-weight: 600; color: var(--lid-ink-2); overflow-wrap: anywhere; }
+
+/* the field at the bottom, where the lid's input sits: "find a file" */
+#fileSheet .fv-bar { flex: none; position: relative; display: flex; align-items: center; gap: 8px; height: calc(var(--l-inh, 36px) + 4px); margin: 12px var(--fv-px) 0; padding: 0 12px 0 14px;
+  border-radius: 4px; background: var(--field); box-shadow: inset 0 1px 2px rgba(40, 35, 20, .28), inset 0 0 0 1px rgba(110, 106, 92, .38); }
+:root[data-theme="ivory"] #fileSheet .fv-bar { box-shadow: inset 0 0 0 1px #e4dbcc; border-radius: 8px; }
+#fileSheet .fv-bar:focus-within { box-shadow: inset 0 1px 2px rgba(40, 35, 20, .28), inset 0 0 0 1.5px var(--lid-focus); }
+:root[data-theme="ivory"] #fileSheet .fv-bar:focus-within { box-shadow: inset 0 0 0 1.5px var(--lid-focus); }
+#fvFind { flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; padding: 0; background: transparent; color: var(--field-ink); font: inherit; font-size: var(--l-input, 13px); }
+#fileSheet .fv-bar .ph { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); font-size: var(--l-input, 13px); color: var(--field-ph); pointer-events: none; white-space: nowrap; }
+#fileSheet .fv-bar.typed .ph { display: none; }
+#fvKey { flex: none; font: inherit; font-size: calc(var(--l-input, 13px) * .88); color: var(--field-ph); border: 1px solid var(--kbd-line); border-bottom-width: 2px; border-radius: 3px; padding: 0 5px; }
+#fileSheet .fv-bar.typed #fvKey { visibility: hidden; }
+
+/* the lid's focus ring, on the lid's surface and on the field */
+#fileSheet button:focus-visible, #fvTitle:focus-visible { outline: 2px solid var(--lid-focus); outline-offset: 2px; }
+#fileSheet .fv-crumb:focus:not(:focus-visible), #fileSheet .fv-link:focus:not(:focus-visible) { outline: none; }
+/* with reduced motion the sheet fades in (140 ms) and out (120 ms), and what is behind it dims and comes back with it:
+   a fade, not movement. These outrank the page's own reduced-motion rules (no transition on the screens), and still=1
+   still has nothing move at all. */
+@media (prefers-reduced-motion: reduce) {
+  body:not(.still) #board, body:not(.still) #main, body:not(.still) #top, body:not(.still) #gitScreen > *,
+  body:not(.still) #wires > :not(.lit):not(.glow):not(.pin):not(.pad):not(.padn) { transition: opacity .14s ease !important; }
+  #fileSheet .fv-row.fresh, #fileSheet .fv-row.fresh .no, #fileSheet .fv-saved { animation: none; }
+}
 
 /* =====================================================================================================================
    Agents & keys: the button in the top band, and the connect panel, a dialog with the lid's surface over the board.
