@@ -2767,8 +2767,26 @@ test('on a card, words that begin with its yes or no word answer it, whatever fo
       ['yes, and what does it delete?', ctx, unknown('yes, and what does it delete?')], ['yes, but not yet', ctx, unknown('yes, but not yet')],
       ['okay, no, do not do it', ctx, noTo], ['yes no wait', ctx, noTo],
       ['no, because the tests are red', ctx, noTo], ['not now, later', ctx, noTo], ['cancel - wrong one', ctx, noTo],
+      // a shrug is a yes said alone
+      ['okay whatever', ctx, unknown('okay whatever')],
+      // Pinned on purpose, as on a merge card (below): the first words decide, so an opener that is also a yes, or a yes
+      // before a stop of everything, is this card's yes, and the rest starts and stops nothing.
+      ['ok so the login page is broken', ctx, yesTo], ['yes, stop everything', ctx, yesTo], ['go ahead, stop everything', ctx, yesTo],
     ]);
   }
+  // On every card, words right after a yes that take it back or put it off make it the card's no: nothing is merged, thrown
+  // away, stopped or started. "let me know" puts nothing off.
+  for (const ctx of ['pendingMerge', 'boardCard', 'pendingStop', 'pendingSay', 'pendingDiscard', 'pendingPermissions', 'pendingStart']) {
+    sweptRows([
+      ['ok hold on', ctx, noTo], ['yes, hang on a sec', ctx, noTo], ['ok one sec', ctx, noTo], ['okay hmm let me think', ctx, noTo],
+      ['sure, never mind', ctx, noTo], ['okay, let me look first', ctx, noTo], ['yes, give me a minute', ctx, noTo], ['yes, well, hold on', ctx, noTo],
+      ['yeah, just a moment', ctx, noTo], ['yes, wait', ctx, noTo], ['sure, forget it', ctx, noTo], ['yes, not yet', ctx, noTo],
+      ['ok, not now', ctx, noTo], ['yes, on second thought, no', ctx, noTo], ['yes, in a minute', ctx, noTo],
+      ['yes, let me know when it is done', ctx, yesTo], ['yes, and hold the release until the tests pass', ctx, yesTo],
+      ['yes, the tests finish in a minute', ctx, yesTo],
+    ]);
+  }
+  sweptRows([['merge it, hold on', 'pendingMerge', noTo], ['throw it away, one sec', 'pendingDiscard', noTo], ['okay whatever', 'pendingMerge', yesTo]]);
   // what cards refuse they still refuse: a yes that is not enough for the card, a yes asked, a branch named; and a yes with
   // a condition, which no card can carry, keeps the card too. None of these starts anything.
   sweptRows([

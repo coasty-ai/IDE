@@ -644,14 +644,40 @@ const CARD_JOIN = new Set(['and', 'because', 'cause', 'cuz', 'since', 'so', 'the
 const CARD_CONDITION = new Set(['but', 'only', 'if', 'unless', 'except', 'provided', 'though', 'although']);
 /** Words that take a yes back when they come right after it: "okay, no, do not do it", "yes no wait". */
 const TAKE_BACK = new Set(['no', 'nope', 'nah', 'wait', 'cancel']);
+/** A short time, asked for right after a yes: "one sec", "a moment", "just a minute", "give me a second". */
+const SHORT_TIME = new Set(['sec', 'secs', 'second', 'seconds', 'moment', 'minute', 'minutes', 'min', 'mo', 'tick']);
+/** The words that ask for a short time before it: "one sec", "just a moment", "give me a minute", "in a second". */
+const TIME_ASK = new Set(['one', 'a', 'just', 'give', 'me', 'gimme', 'half', 'in']);
+/** What a person does before they answer, after "let me": "okay, let me look first", "sure, let me think". */
+const LOOK_FIRST = new Set(['think', 'check', 'look', 'see', 'read', 'review', 'verify', 'decide', 'consider', 'test', 'try']);
 /** Words that may stand between a yes and what follows it: "yes, and then …", "yes, so …". */
 const CARD_GLUE = new Set(['and', 'then', 'so', 'also']);
 /**
  * Words that leave a yes alone when they are all that follows it: thanks and please ("sure, thanks a lot", "okay, thank
- * you so much"), the words a card's yes may come with (CONFIRM_YES_FILL), and with them other yes words and openers.
+ * you so much"), a shrug ("okay whatever"), the words a card's yes may come with (CONFIRM_YES_FILL), and with them other
+ * yes words and openers.
  */
-const ALONE_FILL = new Set([...CONFIRM_YES_FILL, ...CARD_GLUE, 'a', 'lot', 'much', 'ty', 'cheers']);
+const ALONE_FILL = new Set([...CONFIRM_YES_FILL, ...CARD_GLUE, 'a', 'lot', 'much', 'ty', 'cheers', 'whatever']);
 const leavesAlone = w => ALONE_FILL.has(w) || CONFIRM_YES.has(w) || SOFT_LEAD.has(w);
+
+/**
+ * Whether the words right after a yes (no "no" first: cardFirstReply reads that) take it back or put it off, so the yes
+ * is the card's no, as "yes, wait" is: a word of TAKE_BACK, "not now" or "not yet", a never-mind ("sure, never mind"),
+ * "on second thought", "hold on", "hold it" or "hang on" ("ok hold on"), a short time asked for ("ok one sec", "yes, give me
+ * a minute"), or "let me" and what is done before an answer ("okay, let me look first", "sure, let me think"). Openers
+ * before them count for nothing ("yes, well, hold on"). "let me know when it is done", "no rush" and "don't forget the
+ * docs" put nothing off.
+ */
+function putsOff(said) {
+  const ws = said.slice(Math.max(0, said.findIndex(w => !SOFT_LEAD.has(w))));
+  const [a, b, c] = ws;
+  if (TAKE_BACK.has(a) || (a === 'not' && (b === 'now' || b === 'yet')) || startsWithSeq(ws, NEVER_MIND)) return true;
+  if ((a === 'second' && /^thoughts?$/.test(b ?? '')) || (a === 'on' && b === 'second' && /^thoughts?$/.test(c ?? ''))) return true;
+  if ((a === 'hold' && ['on', 'it', 'up'].includes(b)) || (a === 'hang' && b === 'on')) return true;
+  const t = ws.findIndex(w => SHORT_TIME.has(w));
+  if (t > 0 && t <= 3 && ws.slice(0, t).every(w => TIME_ASK.has(w))) return true;
+  return a === 'let' && b === 'me' && LOOK_FIRST.has(c);
+}
 
 /**
  * Words that begin with a plain no to the card on screen (CARD_FIRST_NO: "no, because the tests are red", "nope, not yet",
@@ -685,7 +711,8 @@ function cardWords(kind) {
  *   with nothing after it but thanks or please ("sure, thanks a lot": ALONE_FILL) it stays alone and the card stays
  *   ('keep'), but a yes that goes on answers it as it answers every card ("yes, and then tell me"). A yes is a yes unless
  *   what follows asks something ("yes, and what does it change?": 'asks'), sets a condition no card can carry ("yes, but
- *   not into main", "yes if the tests pass": 'keep'), or takes it back ("okay, no, do not do it", "yes no wait": false).
+ *   not into main", "yes if the tests pass": 'keep'), or takes it back or puts it off ("okay, no, do not do it", "yes no
+ *   wait", "ok hold on", "sure, never mind", "okay, let me look first": false, putsOff).
  * - The card's own words ("merge it", "throw it away", "stop it", "keep it", "turn it on", cardWords), only when what
  *   follows is set off from them by a break, a dash or a joining word (CARD_JOIN): "merge it because the tests pass", but
  *   "stop onboarding" on a stop card stops Onboarding, and "merge onboarding" asks about Onboarding's merge.
@@ -721,11 +748,14 @@ function cardFirstReply(toks, kind, c) {
     if (asksSomething(rest)) return 'asks';
     const said = rest.filter(t => !CARD_GLUE.has(t.w)).map(t => t.w);
     if (said.slice(0, 2).some(w => CARD_CONDITION.has(w)) || rest.slice(0, 2).some(t => CARD_CONDITION.has(t.w))) return 'keep';
-    // "no" takes it back alone, or before another no ("no wait", "no, don't", "no do not"); "no rush" and "no need to" do not
+    // "no" takes it back alone, or before another no ("no wait", "no, don't", "no do not"); "no rush" and "no need to" do not.
+    // Other words take it back or put it off by themselves ("wait", "hold on", "let me look first": putsOff), read after
+    // the first words and after the yes word itself, which the first words may run past ("ok one sec" is "okay one", "sec").
     const no = rest.find(t => t.w === 'no');
+    const putOff = words => putsOff(words.filter(t => !CARD_GLUE.has(t.w)).map(t => t.w));
     const back = said[0] === 'no'
       ? said.length === 1 || no.tail || TAKE_BACK.has(said[1]) || said[1] === "don't" || (said[1] === 'do' && said[2] === 'not')
-      : TAKE_BACK.has(said[0]);
+      : putOff(rest) || (plain > 0 && putOff(toks.slice(k + plain)));
     return !back;
   }
   return null;

@@ -1525,8 +1525,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           && !(/\?$/.test(text) && /^(?:don'?t|do not|not)\b/i.test(text));
         const firstYes = /^(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b|(?:do it|go ahead)\b)/i.exec(text);
         // a yes said alone, with nothing after it but thanks or please (src/core/commands.mjs, ALONE_FILL, in short)
-        const loneYes = /^(?:yes|yeah|yep|yup|sure|ok|okay|alright|go ahead|make it so)(?:[,.!]*\s*(?:please|thanks|thank you)(?: (?:a lot|so much|very much))?)?[.!]*$/i.test(text);
+        const loneYes = /^(?:yes|yeah|yep|yup|sure|ok|okay|alright|go ahead|make it so)(?:[,.!]*\s*(?:please|thanks|thank you|whatever)(?: (?:a lot|so much|very much))?)?[.!]*$/i.test(text);
         const firstYesKeeps = () => /\?$/.test(text) || /^\S+(?: it| ahead)?[,.!]?\s+(?:but|if|only|unless|except)\b/i.test(text);
+        // a yes taken back or put off right after it ("ok hold on", "yes, not yet", "sure, never mind", "okay, let me look
+        // first") is the card's no (src/core/commands.mjs, putsOff, in short)
+        const firstYesBack = () => !!firstYes && /^\S+(?: it| ahead)?[,.!]?\s+(?:no|nope|nah|wait|cancel|not now|not yet|never mind|forget it|hold on|hang on|one sec|one second|just a (?:sec|moment|minute)|give me a (?:sec|second|minute)|let me (?:think|check|look|see))\b/i.test(text);
         // A program named alone ("codex", "the agent", "new agent", "ask claude") asks what it should work on, and the next
         // words are its prompt; a card on screen stays, and the question is posted as a notice, as the engine's command() does
         const alone = /^(?:start |ask )?(codex|claude|the agent|agent|new agent)[.!?]*$/i.exec(text);
@@ -1545,7 +1548,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if (/^(turn (it|them) on|turn on full permissions|do it|stop asking|full permissions|allow everything)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (/^(keep asking|no|cancel|never mind|ask first|ask me first|stop|stop it|(turn|switch|leave|keep) ((it|them) )?off)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           if (loneYes || /\?$/.test(text)) return hint('turn on full permissions');
-          if (firstNo || /^keep asking\b[,.!]/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if (firstNo || firstYesBack() || /^keep asking\b[,.!]/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           if ((/^(?:turn (?:it|them) on|do it)\b[,.!]?\s/i.test(text) || firstYes) && !firstYesKeeps()) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (firstYes) return hint('turn on full permissions');
           if (stopWords) return stopNow();
@@ -1566,7 +1569,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if (/^(no|cancel|never mind|forget it|keep it|don.t|stop|stop it)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', stop: 'stop it', say: 'send it', start: 'start them' }[shown.kind] || 'go ahead';
           if (/^(yes|yeah|yep|ok|okay|sure|go ahead|merge it|land it|start it|send it|stop it|allow it)[.!]*$/i.test(text) || /\?$/.test(text)) return hint(verb);
-          if (firstNo || (shown.kind === 'discard' && /^keep it\b[,.!]/i.test(text))) { confirms.delete(shown.id); return reply(settle(shown, false)); }
+          if (firstNo || firstYesBack() || (shown.kind === 'discard' && /^keep it\b[,.!]/i.test(text))) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           // the card's own words, then a break: "merge it, thanks", "throw it away, it is broken", "stop it, it is looping"
           const own = { merge: /^(?:merge|land) it\b[,.!]\s/i, discard: /^(?:throw it away|discard it)\b[,.!]?\s/i, stop: /^stop(?: it)?[,.!]\s/i, say: /^send it\b[,.!]\s/i }[shown.kind];
           if ((own && own.test(text)) || (firstYes && !firstYesKeeps() && (shown.kind !== 'discard' || !loneYes))) { confirms.delete(shown.id); return reply(settle(shown, true)); }

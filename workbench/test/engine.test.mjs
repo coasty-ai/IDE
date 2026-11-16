@@ -4830,8 +4830,11 @@ test('on a throw-away or full permissions card, a yes that goes on answers it; a
   for (const text of ['yes', 'sure, thanks a lot']) {
     assert.deepEqual(await t.engine.command(text, { confirmId: away.confirm.id }), { reply: 'Say “do it” to throw it away, or “cancel”.', confirm: away.confirm }, text);
   }
+  // a yes put off at once is the card's no
+  assert.deepEqual(await t.engine.command('ok hold on', { confirmId: away.confirm.id }), { reply: 'OK, I won’t throw it away.' });
   assert.equal(t.calls.discardWork.length, 0, 'nothing thrown away yet');
-  assert.match((await t.engine.command('yes, and then tell me', { confirmId: away.confirm.id })).reply, /^Threw away Fix cart total’s work\./);
+  const again = await t.engine.proposeDiscard(cart.id);
+  assert.match((await t.engine.command('yes, and then tell me', { confirmId: again.confirm.id })).reply, /^Threw away Fix cart total’s work\./);
   assert.equal(t.calls.discardWork.length, 1);
   const perms = (await t.engine.permissions('full')).confirm;
   for (const text of ['yes', 'sure, thanks a lot']) {
