@@ -1462,7 +1462,7 @@ test('say: to a helper goes through its root', async () => {
 
 // ------------------------------------------------------------------ commands and confirms
 
-test('command: a start intent starts its agents at once: no launch card, and a quiet notice of what started', async () => {
+test('command: a start of one agent starts it at once: no launch card, and a quiet notice of what started; several from one sentence ask first', async () => {
   const t = live();
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the flaky checkout test', harness: 'claude', machine: null }] };
   const out = await t.engine.command('start an agent to fix the flaky checkout test', { focusId: null });
@@ -1479,18 +1479,70 @@ test('command: a start intent starts its agents at once: no launch card, and a q
   // identity: null, as start() has not read it yet (Workbench cannot tell); true or false once it has.
   assert.deepEqual(ctx.repo, { name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2, identity: null });
 
-  // a task that names no agent goes to the default one; several start together, each named in the notice
+  // a task that names no agent goes to the default one
   t.deps.commands.intent = { kind: 'task', task: 'fix the login redirect' };
   assert.equal((await t.engine.command('fix the login redirect')).reply, 'Started Claude on “fix the login redirect”.');
+  assert.deepEqual([...t.engine.confirms.values()], [], 'no card was made');
+  // more than one agent from one sentence multiplies what is spent: a card asks first, and its yes starts them all, each
+  // named in the notice
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'write tests for the parser', harness: 'codex' }, { task: 'fix the parser', harness: 'claude' }] };
   const two = await t.engine.command('have codex write tests for the parser and claude fix it');
-  assert.equal(two.reply, 'Started Codex on “write tests for the parser” and Claude on “fix the parser”.');
-  assert.equal(two.agentIds.length, 2);
+  assert.equal(two.confirm.kind, 'start');
+  assert.equal(two.confirm.sentence, 'Start Codex on “write tests for the parser” and Claude on “fix the parser”?');
+  assert.equal(two.reply, two.confirm.sentence);
+  assert.equal(t.codex.runners.length, 0, 'nothing started yet');
+  const yes = await t.engine.confirm(two.confirm.id, true);
+  assert.equal(yes.reply, 'Started Codex on “write tests for the parser” and Claude on “fix the parser”.');
+  assert.equal(yes.agentIds.length, 2);
   assert.deepEqual(t.codex.runners.map(r => r.opts.task), ['write tests for the parser']);
   t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'tidy the readme', harness: 'claude' }, { task: 'tidy the readme', harness: 'claude' }] };
-  assert.equal((await t.engine.command('start two agents to tidy the readme')).reply, 'Started two Claude agents on “tidy the readme”.');
+  const same = await t.engine.command('start two agents to tidy the readme');
+  assert.equal(same.confirm.sentence, 'Start two Claude agents on “tidy the readme”?');
+  assert.equal((await t.engine.confirm(same.confirm.id, true)).reply, 'Started two Claude agents on “tidy the readme”.');
   assert.equal(t.store.list().filter(v => !v.parentId).length, 6);
-  assert.deepEqual([...t.engine.confirms.values()], [], 'no card was made');
+  await t.engine.shutdown();
+});
+
+test('starting more than one agent from one sentence asks first, with a card; its yes starts them, its no starts nothing', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const card = await t.engine.command('start three agents on the login page');
+  assert.deepEqual({ ...card.confirm, id: null }, { id: null, kind: 'start', sentence: 'Start three Claude agents on “the login page”?',
+    detail: 'Each one works in its own folder and spends on its own. A Claude agent can spend up to $2.00.', yes: 'Start them', no: 'Cancel' });
+  assert.equal(t.claude.runners.length, 0, 'nothing started');
+  assert.ok(!t.notices.includes(card.reply), 'a card is not announced under the board');
+  // its no starts nothing
+  assert.equal((await t.engine.command('no, just one', { confirmId: card.confirm.id })).reply, 'OK, I won’t start them.');
+  assert.equal(t.claude.runners.length, 0);
+  // a card that waits keeps a prompt's card rule: one agent's work starts at once, and the card stays
+  const again = await t.engine.command('have two agents fix the flaky test');
+  assert.equal(again.confirm.sentence, 'Start two Claude agents on “fix the flaky test”?');
+  const one = await t.engine.command('fix the docs', { confirmId: again.confirm.id });
+  assert.deepEqual(one.confirm, again.confirm);
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['fix the docs']);
+  // its own words start them: "start them", "do it", "yes, all of them"
+  const yes = await t.engine.command('start them', { confirmId: again.confirm.id });
+  assert.equal(yes.reply, 'Started two Claude agents on “fix the flaky test”.');
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), ['fix the docs', 'fix the flaky test', 'fix the flaky test']);
+  // and a hint names its verb
+  const third = await t.engine.command('start claude and codex on the parser');
+  assert.equal(third.confirm.sentence, 'Start Claude and Codex on “the parser”?');
+  assert.deepEqual(await t.engine.command('yes start it is that right', { confirmId: third.confirm.id }), { reply: 'Say “do it” to start them, or “cancel”.', confirm: third.confirm });
+  // a start card without its tasks starts nothing
+  t.engine.confirms.set('0123456789ab', { id: '0123456789ab', kind: 'start', sentence: 'Start?', detail: null, createdAt: Date.now() });
+  assert.deepEqual(await t.engine.confirm('0123456789ab', true), { reply: 'That request is no longer waiting. Ask again if you still want it.' });
+  assert.equal(t.claude.runners.length, 3);
+  await t.engine.shutdown();
+});
+
+test('starting several agents with none ready, or naming one that cannot run, says so with no card, as a start of one does', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  t.engine.harnessInfo.codex = { ok: false, reason: 'Codex was not found on this computer.' };
+  const out = await t.engine.command('start claude and codex on the parser');
+  assert.equal(out.confirm, undefined);
+  assert.match(out.reply, /^Codex is not available on this computer\./);
+  assert.equal(t.claude.runners.length + t.codex.runners.length, 0);
   await t.engine.shutdown();
 });
 
@@ -1727,8 +1779,11 @@ test('demo: cloud launches each get their own machine, waking one if needed', as
     { task: 'fix the checkout bug', harness: 'codex', machine: 'cloud' },
     { task: 'write the release notes', harness: 'claude', machine: 'cloud' },
   ] };
-  const go = await t.engine.command('start Claude and Codex on the checkout bug, each on its own cloud machine');
-  assert.equal(go.confirm, undefined, 'they start at once');
+  const card = await t.engine.command('start Claude and Codex on the checkout bug, each on its own cloud machine');
+  // more than one agent from one sentence asks first, in the demo too, where nothing is spent
+  assert.equal(card.confirm.sentence, 'Start a simulated Claude and a simulated Codex on “fix the checkout bug” and a simulated Claude on “write the release notes”?');
+  assert.equal(card.confirm.detail, 'This is the demo, so nothing is spent.');
+  const go = await t.engine.confirm(card.confirm.id, true);
   assert.equal(go.reply, 'Started a simulated Claude and a simulated Codex on “fix the checkout bug” and a simulated Claude on “write the release notes”.');
   const machines = go.agentIds.map(id => t.store.get(id).machineId);
   assert.deepEqual(machines, ['cloud-1', 'cloud-3', 'cloud-2'], 'awake idle machines first, then a sleeping one');

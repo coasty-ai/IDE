@@ -885,19 +885,39 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   let startSeq = 0;
   let askedFor = null;   // "codex" alone asked what Codex should work on: the next words are its prompt, once
   const PROGRAM = { claude: 'Claude', codex: 'Codex' };
+  const COUNT_SAID = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'];
+  /** Who starts on what, as the engine's startPhrase says it: "a simulated Claude on “…”", "three simulated Claude agents on “…”". */
+  const startPhrase = tasks => {
+    const byTask = new Map();
+    for (const t of tasks) byTask.set(t.task, [...(byTask.get(t.task) || []), t.harness || 'claude']);
+    const live = state.mode === 'live';
+    const who = hs => {
+      const counts = new Map();
+      for (const h of hs) counts.set(h, (counts.get(h) || 0) + 1);
+      return joinAnd([...counts].map(([h, n]) => (n === 1 ? `${live ? '' : 'a simulated '}${PROGRAM[h] || 'Claude'}` : `${COUNT_SAID[n] || n} ${live ? '' : 'simulated '}${PROGRAM[h] || 'Claude'} agents`)));
+    };
+    return joinAnd([...byTask].map(([task, hs]) => `${who(hs)} on “${clip(task, byTask.size > 1 ? 50 : 80)}”`));
+  };
   const startNow = tasks => {
-    const ids = [], parts = [];
+    const ids = [];
     for (const t of tasks) {
       const id = 'n' + (++startSeq);
       const harness = t.harness || 'claude';
       const a = view({ id, name: nameFromTask(t.task) || 'New task', task: t.task, harness, state: 'working', now: 'Starting', ageMin: 0, sinceMin: 0, toolCalls: 0 }, Date.now());
       setTimeout(() => { state.agents.push(a); countHelpers(state.agents); send('agents', [a]); }, 350);
       ids.push(id);
-      parts.push(`${state.mode === 'live' ? '' : 'a simulated '}${PROGRAM[harness] || 'Claude'} on “${clip(t.task, tasks.length > 1 ? 50 : 80)}”`);
     }
-    const reply = `Started ${joinAnd(parts)}.`;
+    const reply = `Started ${startPhrase(tasks)}.`;
     send('notice', { text: reply });
     return { reply, agentIds: ids };
+  };
+  // More than one agent from one sentence asks first (the engine's _proposeStart): "Start three simulated Claude agents on
+  // “the login page”?" (in a live world, "Start three Claude agents on …"), with Start them and Cancel; its yes starts them.
+  const COUNTED = { two: 2, three: 3, four: 4, five: 5, 2: 2, 3: 3, 4: 4, 5: 5 };
+  const startCard = tasks => {
+    const sentence = `Start ${startPhrase(tasks)}`;
+    const detail = state.mode === 'live' ? 'Each one works in its own folder and spends on its own. A Claude agent can spend up to $2.00.' : 'This is the demo, so nothing is spent.';
+    return { kind: 'start', sentence: /\?”$/.test(sentence) ? sentence : `${sentence}?`, detail, yes: 'Start them', no: 'Cancel' };
   };
   const changed = list => send('agents', list);
 
@@ -1047,6 +1067,10 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (!go) return { reply: 'OK, I won’t send it.' };
       const a = state.agents.find(x => x.id === c.agentId);
       return { reply: a ? `Sent to ${a.name}.` : 'I can’t find that agent.', ...(a ? { focusId: a.id } : {}) };
+    }
+    if (c.kind === 'start') {
+      if (!go) return { reply: 'OK, I won’t start them.' };
+      return startNow(c.tasks || []);
     }
     if (c.kind !== 'merge' && c.kind !== 'discard') return { reply: 'That request is no longer waiting. Ask again if you still want it.' };
     if (!go) return { reply: c.kind === 'merge' ? 'OK, I won’t merge it.' : 'OK, I won’t throw it away.' };
@@ -1514,10 +1538,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           const yes = shown.kind === 'discard' ? /^(throw it away|discard it|do it)$/i
             : shown.kind === 'merge' ? /^(yes|ok|do it|go ahead|sure|merge it|merge|land it)$/i
             : shown.kind === 'stop' ? /^(yes|ok|do it|go ahead|sure|stop|stop it)$/i
-            : shown.kind === 'say' ? /^(yes|ok|do it|go ahead|sure|send it)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
+            : shown.kind === 'say' ? /^(yes|ok|do it|go ahead|sure|send it)$/i
+            : shown.kind === 'start' ? /^(yes|ok|do it|go ahead|sure|start|start them|start all of them|launch them)$/i : /^(yes|ok|do it|go ahead|sure)$/i;
           if (yes.test(text)) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (/^(no|cancel|never mind|forget it|keep it|don.t|stop|stop it)$/i.test(text)) { confirms.delete(shown.id); return reply(settle(shown, false)); }
-          const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', stop: 'stop it', say: 'send it' }[shown.kind] || 'go ahead';
+          const verb = { merge: 'merge it', discard: 'throw it away', forget: 'forget it', stop: 'stop it', say: 'send it', start: 'start them' }[shown.kind] || 'go ahead';
           if (/^(yes|yeah|yep|ok|okay|sure|go ahead|merge it|land it|start it|send it|stop it|allow it)[.!]*$/i.test(text) || /\?$/.test(text)) return hint(verb);
           if (firstNo || (shown.kind === 'discard' && /^keep it\b[,.!]/i.test(text))) { confirms.delete(shown.id); return reply(settle(shown, false)); }
           // the card's own words, then a break: "merge it, thanks", "throw it away, it is broken", "stop it, it is looping"
@@ -1525,7 +1550,9 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if ((own && own.test(text)) || (firstYes && !firstYesKeeps() && (shown.kind !== 'discard' || /^do it\b/i.test(text)))) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (firstYes) return hint(verb);
           if (stopWords) return stopNow();   // a stop stops, and the card stays
-          if (!/^(merge|land|throw|discard|scrap|forget|stop|tell|what needs me)\b/i.test(text)) return prompt();
+          // more than one agent from one sentence brings its own card in place of this one (below)
+          const several = /^start (?:two|three|four|five|[2-5]|eight|8) /i.test(text);
+          if (!several && !/^(merge|land|throw|discard|scrap|forget|stop|tell|what needs me)\b/i.test(text)) return prompt();
           confirms.delete(shown.id);   // any other command withdraws the card on screen
         }
         if (stopWords) return stopNow();
@@ -1586,14 +1613,21 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           askedFor = h;
           return reply({ reply: `What should ${h === 'codex' ? 'Codex' : 'Claude Code'} work on?` });
         }
-        // "start …": the words after it, at once; "start eight agents on the backlog" starts the eight the backlog holds
+        // "start …": the words after it, at once; more than one agent from one sentence ("start three agents on the login
+        // page", or "start eight agents on the backlog", the eight the backlog holds) asks first, with the engine's card
         if (/^start\b/i.test(text)) {
           const eight = /eight|8/.test(text);
+          const many = /^start (two|three|four|five|[2-5]) (?:claude |codex )?agents (?:on|to) (.+)$/i.exec(text);
           const tasks = eight
             ? ['fix the flaky checkout test', 'write tests for the parser', 'tidy up the invoice export', 'make the login page remember the last email',
               'add a dark mode to the settings page', 'speed up the monthly report', 'translate the help pages into French', 'find and remove dead code in the search service']
               .map((task, i) => ({ task, harness: i % 3 === 1 ? 'codex' : 'claude' }))
-            : [{ task: text.replace(/^start (an agent|a helper|claude|codex)? ?(to |on )?/i, '') || text, harness: /^start codex\b/i.test(text) ? 'codex' : forProgram }];
+            : many ? Array.from({ length: COUNTED[many[1].toLowerCase()] }, () => ({ task: many[2], harness: /codex agents/i.test(text) ? 'codex' : forProgram || 'claude' }))
+              : [{ task: text.replace(/^start (an agent|a helper|claude|codex)? ?(to |on )?/i, '') || text, harness: /^start codex\b/i.test(text) ? 'codex' : forProgram }];
+          if (tasks.length > 1) {
+            const card = startCard(tasks);
+            return reply({ reply: card.sentence, confirm: newConfirm(card, { tasks }) });
+          }
           return reply(startNow(tasks));
         }
         return prompt();

@@ -279,6 +279,26 @@ try {
         && st.agents.length === agents && p.length === 4 && /^c/.test(p[1].body.confirmId || '') && /^c/.test(p[3].body.confirmId || ''),
       JSON.stringify({ card1, no, after1, card2, yes, after2, agents: [agents, st.agents.length], sent: p.map(x => x.body) }));
   });
+  // More than one agent from one sentence multiplies what is spent: a card asks first, and its yes starts them all.
+  await run('starting more than one agent from one sentence asks first, with a card; its yes starts them all', async () => {
+    await open('prompt');
+    await sleep(800);
+    const agents = (await ctl('state')).agents.length;
+    await realClick('#say'); await sleep(150);
+    await b.type('start three agents on the login page'); await b.key('Enter');
+    await sleep(900);
+    const card = await h1(), mid = (await ctl('state')).agents.length;
+    const buttons = await b.ev(`[...(${page()}?.querySelectorAll('[data-act="confirm"]') || [])].map(x => x.textContent).join(',')`);
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.type('do it'); await b.key('Enter');
+    await sleep(1300);
+    const words = await saidAll(), after = (await ctl('state')).agents.length;
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check('starting more than one agent from one sentence asks first, with a card; its yes starts them all',
+      card === 'Start three simulated Claude agents on “the login page”?' && buttons === 'Start them,Cancel' && mid === agents
+        && words === 'Started three simulated Claude agents on “the login page”.' && after === agents + 3 && p.length === 2 && /^c/.test(p[1].body.confirmId || ''),
+      JSON.stringify({ card, buttons, agents: [agents, mid, after], words, sent: p.map(x => x.body) }));
+  });
   await run('words too long to send in one go stay in the box, and nothing is sent', async () => {
     await open('prompt');
     await sleep(700);

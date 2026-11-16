@@ -191,8 +191,23 @@ const COUNT_WORD = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven',
  * spaces). `started`: [{ harness, task }], in the order they started.
  */
 function startedSentence(started, demo) {
+  return `Started ${startPhrase(started, demo)}.`;
+}
+
+/**
+ * The question of the card that asks before more than one agent starts from one sentence, in the notice's words: "Start
+ * three Claude agents on “the login page”?", "Start Codex on “write tests” and Claude on “fix the parser”?" ("simulated"
+ * in the demo). A quoted task that is a question already ends the sentence.
+ */
+function startQuestion(tasks, demo) {
+  const s = `Start ${startPhrase(tasks, demo)}`;
+  return /\?”$/.test(s) ? s : `${s}?`;
+}
+
+/** Who starts on what: "Claude on “fix the login”", "two Claude agents on “…”", "Codex on “…” and Claude on “…”". */
+function startPhrase(starts, demo) {
   const byTask = new Map();
-  for (const s of started) byTask.set(s.task, [...(byTask.get(s.task) || []), s.harness]);
+  for (const s of starts) byTask.set(s.task, [...(byTask.get(s.task) || []), s.harness]);
   const sim = demo ? 'simulated ' : '';
   const who = (hs) => {
     const counts = new Map();
@@ -203,7 +218,7 @@ function startedSentence(started, demo) {
     }));
   };
   const width = byTask.size > 1 ? 50 : 80;
-  return `Started ${joinAnd([...byTask].map(([task, hs]) => `${who(hs)} on “${clip(task, width)}”`))}.`;
+  return joinAnd([...byTask].map(([task, hs]) => `${who(hs)} on “${clip(task, width)}”`));
 }
 
 /**
@@ -275,8 +290,20 @@ function confirmVerb(c) {
     case 'discard': return 'throw it away';
     case 'permissions': return 'turn on full permissions';
     case 'stop': return `stop ${c.agentIds?.length > 1 ? 'them' : 'it'}`;
+    case 'start': return 'start them';
     default: return 'go ahead';
   }
+}
+
+/**
+ * The work of a start, as the engine takes it: each task's words trimmed (none empty), its agent only when it is one the
+ * engine knows (else null: the default agent's), its machine, and at most eight.
+ */
+function startList(tasks) {
+  return (Array.isArray(tasks) ? tasks : [])
+    .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
+    .filter(t => t.task)
+    .slice(0, 8);
 }
 
 /** "2.1.322" -> [2, 1, 322]; null when it does not start like a version. */
@@ -3735,12 +3762,16 @@ export class Engine extends EventEmitter {
   async _runIntent(intent, { focusId = null, askId = null, shown = null, said = '' } = {}) {
     const get = (id) => (id ? this.store.get(id) : null);
     switch (intent.kind) {
-      case 'start':
-        // A start is never asked: its agents start at once. "start an agent" with no task comes as { kind: 'start',
-        // tasks: [], task: null, harness }: the reply asks what to work on, naming the agent the words named ("start
-        // codex"), or says why that one cannot start.
-        return this._startNow(Array.isArray(intent.tasks) ? intent.tasks
-          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : [], intent.harness);
+      case 'start': {
+        // One agent starts at once, never asked. More than one from one sentence ("start three agents on …", "claude and
+        // codex on …") multiplies what is spent, so a card asks first (_proposeStart). "start an agent" with no task comes
+        // as { kind: 'start', tasks: [], task: null, harness }: the reply asks what to work on, naming the agent the words
+        // named ("start codex"), or says why that one cannot start.
+        const tasks = Array.isArray(intent.tasks) ? intent.tasks
+          : intent.task ? [{ task: intent.task, harness: intent.harness, machine: intent.machine }] : [];
+        if (startList(tasks).length > 1) return this._proposeStart(startList(tasks));
+        return this._startNow(tasks, intent.harness);
+      }
       case 'task':
         return this._startNow([{ task: intent.task, harness: intent.harness, machine: intent.machine }]);
       case 'help': {
@@ -3960,10 +3991,7 @@ export class Engine extends EventEmitter {
    * names no agent to put in the centre: what is there stays.
    */
   async _startNow(tasks, named = null) {
-    const list = (Array.isArray(tasks) ? tasks : [])
-      .map(t => ({ task: String(t?.task ?? '').trim(), harness: HARNESS_NAMES[t?.harness] ? t.harness : null, machine: t?.machine || null }))
-      .filter(t => t.task)
-      .slice(0, 8);
+    const list = startList(tasks);
     let def; // looked up once, and only when a task names no agent
     const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
     if (!list.length) {
@@ -4014,6 +4042,24 @@ export class Engine extends EventEmitter {
     parts.push(...problems);
     this.log.warn(`Of the work asked for, ${started.length} of ${list.length} started.${problems.length ? ` ${problems.join(' ')}` : ''}`);
     return { reply: parts.join(' '), agentIds: started.map(s => s.v.id), ...(openConnect ? { openConnect: true } : {}) };
+  }
+
+  /**
+   * More than one agent from one sentence ("start three agents on the login page", "start claude and codex on the
+   * parser"): asked first, with a card, since each one spends on its own. What would refuse the start refuses it now,
+   * with no card: no agent ready, or one named that cannot run here. The card names the agents that would start (the
+   * default one for work that names none), in the words of the notice of a start ("Start three Claude agents on “the login
+   * page”?"); its yes starts them (_startNow checks everything again), its no starts nothing. `list`: startList's tasks.
+   */
+  _proposeStart(list) {
+    let def;
+    const fallback = () => (def === undefined ? (def = this._defaultHarness()) : def);
+    const tasks = list.map(t => ({ ...t, harness: t.harness || fallback() }));
+    if (tasks.some(t => !t.harness)) return { reply: NO_AGENT, openConnect: true };
+    for (const t of tasks) if (!this._canRun(t.harness)) return this._cannotRunReply(t.harness);
+    const limit = tasks.some(t => t.harness === 'claude') ? ` A Claude agent can spend up to ${money(this.defaultBudgetUsd)}.` : '';
+    const detail = this.mode === 'demo' ? 'This is the demo, so nothing is spent.' : `Each one works in its own folder and spends on its own.${limit}`;
+    return this._newConfirm({ kind: 'start', tasks, sentence: startQuestion(tasks, this.mode === 'demo'), detail, yes: 'Start them', no: 'Cancel' });
   }
 
   /**
@@ -4077,8 +4123,19 @@ export class Engine extends EventEmitter {
         if (c.modeAt !== this._modeChanges) return { reply: MODE_CHANGED };
         if (!go) return { reply: 'OK, agents still ask before risky steps.' };
         return this._fullOn();
+      case 'start': {
+        // More than one agent from one sentence, asked first (_proposeStart). Only a card that holds them starts them:
+        // a start card without its tasks is none.
+        const tasks = startList(c.tasks);
+        if (tasks.length < 2) {
+          this.log.warn('A start card without the work it asked about was answered; nothing was done.');
+          return { reply: GONE };
+        }
+        if (!go) return { reply: 'OK, I won’t start them.' };
+        return this._startNow(tasks);
+      }
       default:
-        // Starting work is never asked (_startNow), so no card starts anything: a kind nobody knows does nothing.
+        // One agent starts at once (_startNow), and only a start card starts more: a kind nobody knows does nothing.
         this.log.warn(`A confirm card of an unknown kind (${String(c.kind)}) was answered; nothing was done.`);
         return { reply: GONE };
     }

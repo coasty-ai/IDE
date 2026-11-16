@@ -2704,6 +2704,28 @@ test('on a card, words that begin with its yes or no word answer it, whatever fo
   ]);
 });
 
+test('more than one agent from one sentence is a start of that many (the engine asks first, with a card); the card takes "start them"', () => {
+  const three = t => start([t], [t], [t]);
+  sweptRows([
+    ['start three agents on the login page', 'none', three('the login page')],
+    ['have two agents fix the flaky test', 'none', start(['fix the flaky test'], ['fix the flaky test'])],
+    ['two agents fix the login page', 'none', start(['fix the login page'], ['fix the login page'])],
+    ['get three agents to review the parser', 'none', three('review the parser')],
+    ['have 2 codex agents write tests', 'none', start(['write tests', 'codex'], ['write tests', 'codex'])],
+    // one agent starts at once; words that only count agents say no work
+    ['have an agent fix the login', 'none', said('have an agent fix the login')],
+    ['two agents are stuck', 'none', said('two agents are stuck')],
+    ['add an agents page to the dashboard', 'none', said('add an agents page to the dashboard')],
+  ]);
+  sweptRows([
+    ['start them', 'pendingStart', yesTo], ['start all three', 'pendingStart', yesTo], ['yes, all of them', 'pendingStart', yesTo],
+    ['launch them', 'pendingStart', yesTo], ['do it', 'pendingStart', yesTo], ['start both', 'pendingStart', yesTo],
+    ['no, just one', 'pendingStart', noTo], ['cancel', 'pendingStart', noTo],
+    // another card's yes, or one asked, keeps it
+    ['send it', 'pendingStart', unknown('send it')], ['start them?', 'pendingStart', unknown('start them?')],
+  ]);
+});
+
 test('on a card, words that begin with its yes or no word never start work, whatever follows them', () => {
   const heads = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'do it', 'go ahead', 'no', 'nope', 'cancel', "don't", 'not now'];
   const tails = [', and then tell me', ', because the tests are red', ', thanks', ' and add tests too', ', fix the login page first',

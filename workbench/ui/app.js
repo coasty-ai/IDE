@@ -1101,7 +1101,7 @@ function modeIs(mode) {
 
 function onSnapshot(snap) {
   // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board.
-  // meta.permissions: whether full permissions are on, for the band's button (no card starts work, so none speaks of them).
+  // meta.permissions: whether full permissions are on, for the band's button (no card speaks of them).
   const was = S.meta.permissions;
   S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap),
     permissions: was };

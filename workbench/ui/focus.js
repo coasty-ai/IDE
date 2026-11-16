@@ -167,8 +167,8 @@ export function lidView(f, o = {}) {
 
   if (f.confirm) {
     // An engine card: a stop or message whose words named no agent, which the person typed or said, or a card a button or
-    // words asked for (forget, merge, throw away, full permissions). Work starts at once, with no card. Its own words for
-    // yes and no; a dangerous one has no default answer.
+    // words asked for (forget, merge, throw away, full permissions, more than one agent from one sentence). One agent's work
+    // starts at once, with no card. Its own words for yes and no; a dangerous one has no default answer.
     const c = f.confirm;
     const words = CARD_COUNT[c.kind] || 'You said';
     // its words name branches, paths and tasks: anything that could hide or turn text is shown

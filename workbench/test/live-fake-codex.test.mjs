@@ -115,7 +115,7 @@ const CONFIG = {
 };
 
 async function launch(w, text) {
-  // a start is never asked: the agents start at once, and the reply says so and carries them
+  // a start of one agent is never asked: it starts at once, and the reply says so and carries it
   const go = await w.post('/api/command', { text });
   assert.equal(go.status, 200, JSON.stringify(go.body));
   assert.equal(go.body.confirm, undefined, `no card was expected, got ${JSON.stringify(go.body)}`);
@@ -225,9 +225,16 @@ test('stopping Codex, or Workbench, mid-turn ends its process and the commands i
   await until('everything to be gone', () => !alive(c2.pid) && !alive(c2.grandchild), { timeoutMs: 3000 });
 });
 
-test('"start Claude and Codex on …" gives two agents, one of each', async (t) => {
+test('"start Claude and Codex on …" asks first, and its yes gives two agents, one of each', async (t) => {
   const w = await setup(t);
-  const { reply, ids } = await launch(w, 'start Claude and Codex on the checkout bug');
+  // more than one agent from one sentence asks first, with a card
+  const card = await w.post('/api/command', { text: 'start Claude and Codex on the checkout bug' });
+  assert.equal(card.status, 200, JSON.stringify(card.body));
+  assert.equal(card.body.confirm?.sentence, 'Start Claude and Codex on “the checkout bug”?');
+  assert.equal(w.calls().length, 0, 'nothing started yet');
+  const go = await w.post(`/api/confirm/${card.body.confirm.id}`, { go: true });
+  assert.equal(go.status, 200, JSON.stringify(go.body));
+  const { reply, agentIds: ids } = go.body;
   assert.equal(ids.length, 2);
   assert.equal(reply, 'Started Claude and Codex on “the checkout bug”.');
   const all = await until('both agents', async () => { const a = await w.agents(); return a.length === 2 && a.every((x) => x.state.startsWith('done')) ? a : null; });

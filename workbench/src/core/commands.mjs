@@ -536,7 +536,9 @@ const START_YES = new Set(['start', 'launch']);
 const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw'], permissions: ['turn', 'switch'] };
 /** Words that may come with a card's own yes: "bring it in", "throw it away", "merge its changes", "turn it on". */
 const CARD_YES_FILL = { merge: ['in', 'its', 'work', 'changes', 'branch'], discard: ['away', 'out', 'its', 'work', 'changes', 'branch'],
-  permissions: ['on', 'full', 'permissions', 'permission'] };
+  permissions: ['on', 'full', 'permissions', 'permission'],
+  // "start all three", "yes, both of them", "launch the two agents": the agents a start card asks about
+  start: ['all', 'both', 'of', 'them', 'agents', 'two', 'three', 'four', 'five', '2', '3', '4', '5'] };
 /** A card's own no: the throw-away card's "Keep it" button, and the full permissions card's "Keep asking", said. */
 const CARD_NO = { discard: ['keep'], permissions: ['keep'] };
 const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'], permissions: ['asking', 'off', 'me'] };
@@ -2080,16 +2082,19 @@ function matchStart(core, c) {
   let strongVerb = v > 0;
   if (!v) v = startsWithSeq(ws, START_WEAK);
   let noun = parseNoun(ws, v);
+  // A number of agents, then what they should do: "have two agents fix the flaky test", "two agents fix the login page".
+  // The number says the words are about agents (never a noun's modifier), so they start that many, which asks first.
+  const counted = noun.count > 1 && noun.named && WORK_VERBS.has(ws[noun.end]);
   if (!v) {
     // No verb, but a launchable noun and a clear join: "codex, write tests", "new agent to fix the login".
     if (!noun.named || !launchNoun(ws) || noun.definite) return null;
     // A new agent and nothing more: "new agent", "another codex agent". Work comes next, so ask for it.
     if (noun.end === ws.length) return ws.some(w => NEW_WORDS.has(w)) ? { intent: NO_TASK_START(noTaskHarness(noun, [], c)), strong: true } : null;
     const joined = core[noun.end - 1] && core[noun.end - 1].tail;
-    if (!joined && !['to', 'on', 'for', 'that'].includes(ws[noun.end])) return null;
+    if (!joined && !['to', 'on', 'for', 'that'].includes(ws[noun.end]) && !counted) return null;
   } else if (!strongVerb && !noun.named) {
     return null;
-  } else if (!strongVerb && !noun.harnesses.length && noun.end < ws.length && !LAUNCH_JOIN.has(ws[noun.end]) && ws[noun.end] !== 'working') {
+  } else if (!strongVerb && !noun.harnesses.length && noun.end < ws.length && !LAUNCH_JOIN.has(ws[noun.end]) && ws[noun.end] !== 'working' && !counted) {
     return null; // a word for agents used as a noun's modifier: "add an agents page to the dashboard"
   }
   if (noun.hasNoun && noun.definite && !noun.harnesses.length) return null; // "start the agent" refers to one that exists
@@ -2971,8 +2976,9 @@ function describeStart(tasks, c) {
 
 /**
  * A plain sentence describing an intent, for a confirm card: "Stop Flaky test?", "Tell Onboarding “use the new copy”?".
- * The engine asks first only for a stop or a message whose words did not name the agent; work starts at once, so the
- * sentence for a start ("Start Claude on “fix the flaky checkout test”?") is for other callers.
+ * The engine asks for it for a stop or a message whose words did not name the agent. One agent's work starts at once,
+ * and the engine words its own card for more than one, so the sentence for a start ("Start Claude on “fix the flaky
+ * checkout test”?") is for other callers.
  */
 export function describeIntent(intent, ctx) {
   const c = context(ctx);
