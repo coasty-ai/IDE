@@ -122,6 +122,43 @@ test('the path’s crumbs: the repository, each folder you can open, and the fil
   assert.ok(tiny.reduce((s, c) => s + w(c.label, !!c.file), 0) + 14 * (tiny.length - 1) <= 200);
 });
 
+test('a path with no room for the top folder keeps the file’s whole name after "…", and cuts it only when even that does not fit', () => {
+  const w = (t, bold) => Array.from(t).length * (bold ? 9 : 8);
+  const shown = list => list.map(c => (c.gap ? '…' : c.label));
+  const width = list => list.reduce((s, c) => s + w(c.label, !!(c.file || c.here)), 0) + 14 * (list.length - 1);
+  const crumbs = F.crumbsOf('storefront', 'src/invoices/export.ts');
+  // "storefront / … / export.ts" takes 197; "… / export.ts" 103
+  assert.deepEqual(shown(F.fitCrumbs(crumbs, { widthOf: w, sep: 14, maxW: 150 })), ['…', 'export.ts']);
+  assert.deepEqual(shown(F.fitCrumbs(crumbs, { widthOf: w, sep: 14, maxW: 197 })), ['storefront', '…', 'export.ts'], 'the top folder while it fits');
+  // a file at the top: "storefront / .env" takes 130, "… / .env" 58
+  assert.deepEqual(shown(F.fitCrumbs(F.crumbsOf('storefront', '.env'), { widthOf: w, sep: 14, maxW: 100 })), ['…', '.env']);
+  // too narrow for even that: the name is cut in its middle, after the gap, and fits
+  const cut = F.fitCrumbs(crumbs, { widthOf: w, sep: 14, maxW: 70 });
+  assert.equal(cut.length, 2);
+  assert.ok(cut[0].gap && cut[1].cut && cut[1].label.includes('…'), JSON.stringify(cut));
+  assert.ok(width(cut) <= 70, `${width(cut)}`);
+  // a folder shown, not a file: its own name, bold, is what is kept
+  assert.deepEqual(shown(F.fitCrumbs(F.crumbsOf('storefront', 'src/invoices', { folder: true }), { widthOf: w, sep: 14, maxW: 110 })), ['…', 'invoices']);
+});
+
+test('the line at the top of a scroll, and the scroll that puts it there again, to the pixel', () => {
+  const lh = 21, pad = 8;
+  for (const top of [0, 3, 8, 9, 29, 113, 251987, 251979]) {
+    const back = F.scrollForLine(F.lineAtScroll(top, lh, pad), lh, pad);
+    assert.ok(Math.abs(back - top) < 1e-6, `${top} → ${F.lineAtScroll(top, lh, pad)} → ${back}`);
+  }
+  assert.equal(F.lineAtScroll(8, lh, pad), 1, 'line 1 at the top, under the page’s own space');
+  assert.equal(Math.floor(F.lineAtScroll(8 + 21 * 11999, lh, pad)), 12000);
+  assert.equal(Math.floor(F.lineAtScroll(8 + 21 * 11999 + 20, lh, pad)), 12000, 'a line part-way out is still the line at the top');
+  assert.equal(F.scrollForLine(12000, lh, pad), 8 + 21 * 11999);
+  assert.equal(F.scrollForLine(1, lh, pad), 8);
+  assert.equal(F.scrollForLine(-3, lh, pad), 0, 'never above the top');
+  // read again ten times, the place never moves
+  let top = 251987;
+  for (let i = 0; i < 10; i++) top = F.scrollForLine(F.lineAtScroll(top, lh, pad), lh, pad);
+  assert.ok(Math.abs(top - 251987) < 1e-6, `${top}`);
+});
+
 test('Tab inserts the file’s own indentation: a tab, or its usual number of spaces', () => {
   assert.equal(F.guessIndent('a\n\tb\n\t\tc\n\td\n'), '\t');
   assert.equal(F.guessIndent('function a() {\n  if (x) {\n    y();\n  }\n}\n'), '  ');
@@ -193,6 +230,30 @@ test('search results: the open file’s first, at most 30, and the words found i
   assert.deepEqual(F.cutAround('short', [[0, 2]], 40), { text: 'short', ranges: [[0, 2]] });
   assert.equal(F.markedHtml(`a<b>${RLO}c`, [[1, 4]]), 'a<b>&lt;b&gt;</b><span class="vc" title="Hidden here: a right-to-left override.">⟦U+202E⟧</span>c');
   assert.equal(F.hitRanges([1, 2, 3, 7, 9, 10]).join(';'), '1,4;7,8;9,11');
+});
+
+test('lines found: three a file, then one row for the rest of it, which shows them all when asked; the open file’s all first', () => {
+  const of = (path, lines) => lines.map(line => ({ path, line, text: 'x' }));
+  const r = [...of('a.ts', [1, 2, 3, 4, 5]), ...of('b.ts', [7]), ...of('c.ts', [1, 2, 3, 4])];
+  const rows = list => list.map(x => (x.kind === 'more' ? `+${x.count}${x.atLeast ? '+' : ''} ${x.path}` : `${x.path}:${x.line}`));
+  assert.deepEqual(rows(F.searchRows(r)), ['a.ts:1', 'a.ts:2', 'a.ts:3', '+2 a.ts', 'b.ts:7', 'c.ts:1', 'c.ts:2', 'c.ts:3', '+1 c.ts']);
+  assert.ok(F.searchRows(r).every(x => x.kind === 'hit' || x.kind === 'more'));
+  assert.deepEqual(rows(F.searchRows(r, { open: 'c.ts' })), ['c.ts:1', 'c.ts:2', 'c.ts:3', 'c.ts:4', 'a.ts:1', 'a.ts:2', 'a.ts:3', '+2 a.ts', 'b.ts:7'],
+    'the open file’s lines first, all of them');
+  assert.deepEqual(rows(F.searchRows(r, { all: new Set(['a.ts']) })), ['a.ts:1', 'a.ts:2', 'a.ts:3', 'a.ts:4', 'a.ts:5', 'b.ts:7', 'c.ts:1', 'c.ts:2', 'c.ts:3', '+1 c.ts'],
+    'a file asked for whole shows every line found in it');
+  // when the answer was cut, the last file in it may hold more than were counted
+  assert.deepEqual(rows(F.searchRows(r, { truncated: true })).slice(-1), ['+1+ c.ts']);
+  assert.deepEqual(rows(F.searchRows(r, { truncated: true })).filter(x => x.startsWith('+')), ['+2 a.ts', '+1+ c.ts'], 'only the last file’s count is a floor');
+  // at most 30 lines in all; a file asked for whole is not held to it
+  const many = Array.from({ length: 40 }, (_, i) => of(`f${String(i).padStart(2, '0')}.ts`, [1, 2, 3, 4])).flat();
+  assert.equal(F.searchRows(many).filter(x => x.kind === 'hit').length, 30);
+  const big = of('big.ts', Array.from({ length: 50 }, (_, i) => i + 1));
+  const open = F.searchRows(big, { open: 'big.ts' });
+  assert.deepEqual(rows(open).slice(-2), ['big.ts:30', '+20 big.ts'], 'the open file’s lines too stop at 30, the rest in one row');
+  assert.equal(F.searchRows(big, { open: 'big.ts', all: new Set(['big.ts']) }).length, 50);
+  assert.deepEqual(F.searchRows([]), []);
+  assert.deepEqual(F.searchRows(null), []);
 });
 
 test('a folder too long for its row keeps its end, the folders nearest the file, with "…" where it was cut', () => {

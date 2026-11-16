@@ -175,7 +175,8 @@ export function crumbsOf(name, path, { folder = false } = {}) {
 
 /**
  * The crumbs in the room there is: whole when they fit; else the folders in the middle give way (one gap, "…") from the
- * top down, keeping the copy's name, the file's own folder and the file; then the file's own name is cut in its middle.
+ * top down, keeping the copy's name, the file's own folder and the file; then the copy's name gives way too ("… /
+ * export.ts"); then the file's own name is cut in its middle.
  * @param {{ label: string }[]} crumbs  from crumbsOf
  * @param {{ widthOf: (text: string, bold: boolean) => number, sep: number, maxW: number }} o
  */
@@ -193,6 +194,9 @@ export function fitCrumbs(crumbs, { widthOf, sep, maxW }) {
   }
   let shown = crumbs.length > 2 ? [first, gap, last] : [first, last];
   if (middle.length === 1 && crumbs.length > 2 && width([first, gap, middle[0], last]) <= maxW) return [first, gap, middle[0], last];
+  if (width(shown) <= maxW) return shown;
+  // no room for the copy's name either: the file's whole name after the gap, which the title holds in full
+  if (crumbs.length > 1) shown = [gap, last];
   if (width(shown) <= maxW) return shown;
   // the file's own name, cut in its middle to the room left
   const room = maxW - width(shown.slice(0, -1)) - sep;
@@ -241,6 +245,15 @@ export function rowWindow({ top, height, lineH, total, overscan = 30, chunk = 20
   const last = Math.min(total, Math.ceil((visLast + overscan) / chunk) * chunk);
   return { first, last: Math.max(first, last) };
 }
+
+/**
+ * The line at the top of a scroll (1-based), with the part of it scrolled past as a fraction: rows of `lineH` start
+ * `padTop` below the top of the page. scrollForLine is its inverse, to the pixel, so a file read again (or the same file
+ * in the other copy) comes back exactly where it was, however often.
+ */
+export const lineAtScroll = (scrollTop, lineH, padTop = 0) => (scrollTop - padTop) / lineH + 1;
+/** The scroll that puts `line` (a fraction too) at the top of the page: never above its top. */
+export const scrollForLine = (line, lineH, padTop = 0) => Math.max(0, (line - 1) * lineH + padTop);
 
 /** Does the window drawn still cover the rows that show, with a few to spare? Then nothing needs drawing again. */
 export function windowCovers(win, { top, height, lineH, total, margin = 10 }) {
@@ -309,6 +322,31 @@ export function orderSearch(results, openPath, max = 30) {
   const all = (results || []).filter(r => r && typeof r.path === 'string');
   const mine = all.filter(r => r.path === openPath).sort((x, y) => x.line - y.line);
   return [...mine, ...all.filter(r => r.path !== openPath)].slice(0, max);
+}
+
+/**
+ * The lines found, as the finder lists them: the open file's first (by line), then the rest as they came, at most `max`
+ * lines in all. Each file but the open one shows its first `perFile` lines; the rest of a file's lines are one row,
+ * { kind: 'more', path, count, atLeast }, until the person asks for them all (`all`, the paths asked for, which `max`
+ * does not hold). `atLeast`: the answer was cut (`truncated`) and this is the last file in it, which may hold more.
+ * @returns {({ kind: 'hit', path: string, line: number, text: string } | { kind: 'more', path: string, count: number, atLeast: boolean })[]}
+ */
+export function searchRows(results, { open = null, max = 30, perFile = 3, all = null, truncated = false } = {}) {
+  const list = (results || []).filter(r => r && typeof r.path === 'string');
+  const last = list.length ? list[list.length - 1].path : null;
+  const groups = new Map();
+  for (const r of orderSearch(list, open, Infinity)) { const g = groups.get(r.path); if (g) g.push(r); else groups.set(r.path, [r]); }
+  const out = [];
+  let room = max;
+  for (const [path, rows] of groups) {
+    const whole = !!(all && all.has(path));
+    if (!whole && room <= 0) continue;
+    const n = whole ? rows.length : Math.min(rows.length, room, path === open ? Infinity : perFile);
+    for (const r of rows.slice(0, n)) out.push({ kind: 'hit', ...r });
+    if (!whole) room -= n;
+    if (n < rows.length) out.push({ kind: 'more', path, count: rows.length - n, atLeast: truncated && path === last });
+  }
+  return out;
 }
 
 /** Where `query` is in `text`: [start, end) pairs, side by side, in any case unless the query has a capital. */

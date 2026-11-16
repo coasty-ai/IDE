@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { looksLikeSecret } from '../src/shared/secretshape.mjs';
+import { looksLikeSecret, startsLikeSecret } from '../src/shared/secretshape.mjs';
 
 const join = (...parts) => parts.join('');
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -154,6 +154,49 @@ test('words joined by dashes are checked in a time that grows with their length,
   // A password in a link after such a run is still found.
   const pw = join('hun', 'ter', '2Qx', '9z');
   assert.equal(looksLikeSecret(join(text, ' https://deploy:', pw, '@git.example.com/acme/shop.git')).secret, true);
+});
+
+test('the start of a key, typed a letter at a time, is known three characters after its prefix', () => {
+  // [key, the length of its prefix]: every start of it from the prefix and three more characters on is a key's start
+  const lower = join('gh', 'p_', 'abcdef', randomish(30, 'P'));   // a key whose random part begins in lower case
+  const typed = [
+    [shapes.github, 4], [shapes.githubOauth, 4], [shapes.githubServer, 4], [lower, 4], [shapes.githubFine, 11], [shapes.anthropic, 7],
+    [shapes.openaiProject, 8], [shapes.stripe, 8], [shapes.stripeRestricted, 8], [join('wh', 'sec_', randomish(32, 'Q')), 6],
+    [shapes.slack, 5], [join('xa', 'pp-', '1-', randomish(30, 'R')), 5], [join('gl', 'pat-', randomish(20, 'S')), 6],
+    [join('AI', 'za', randomish(35, 'T', `${ALNUM}_-`)), 4], [shapes.aws, 4], [shapes.jwt, 3],
+  ];
+  for (const [key, p] of typed) {
+    for (let n = p + 3; n <= key.length; n++) assert.equal(startsLikeSecret(key.slice(0, n)), true, `${key.slice(0, p)}… at ${n}`);
+    assert.equal(startsLikeSecret(key.slice(0, p)), false, `${key.slice(0, p)} alone`);
+    assert.equal(startsLikeSecret(`find ${key.slice(0, p + 3)}`), true, 'after other words too');
+  }
+  // prefixes that also begin ordinary names: from the first digit or capital after them on
+  const npm = join('np', 'm_', 'abc', '7', randomish(32, 'U'));
+  assert.equal(startsLikeSecret(npm.slice(0, 7)), false, 'npm_abc');
+  for (let n = 8; n <= npm.length; n++) assert.equal(startsLikeSecret(npm.slice(0, n)), true, `npm_ at ${n}`);
+  const sk = join('sk', '-', 'abQ', randomish(40, 'V'));
+  assert.equal(startsLikeSecret(sk.slice(0, 5)), false, 'sk-ab');
+  for (let n = 6; n <= sk.length; n++) assert.equal(startsLikeSecret(sk.slice(0, n)), true, `sk- at ${n}`);
+  for (let n = 7; n <= shapes.awsSession.length; n++) {
+    const s = shapes.awsSession.slice(0, n);
+    assert.equal(startsLikeSecret(s), /[0-9]/.test(s.slice(4)), `ASIA… at ${n}`);
+  }
+});
+
+test('names and words that only begin like a key are not a key’s start', () => {
+  for (const text of ['npm_package_version', 'process.env.npm_config_cache', 'npm_lifecycle_event', 'sk-learn', 'use sk-learn for the model',
+    'the branch sk-improve-error-handling', 'ASIAN', 'ASIAPAC', 'AKIA_ROLE', 'ghp_', 'what is a ghp_ token?', 'sk_live_', 'xoxb-', 'eyJ', 'AKIA',
+    'mask_live_abc123', 'task-sk-abc123', 'the risk_test_abc suite', 'useFakeTimers', 'resumeToken2', 'Total', '']) {
+    assert.equal(startsLikeSecret(text), false, text);
+  }
+  for (const x of [undefined, null, 42, {}, ['ghp_abcdef']]) assert.equal(startsLikeSecret(x), false);
+});
+
+test('a key’s start is looked for in good time, in a long paste too', () => {
+  const text = `${'word '.repeat(40_000)}${'sk-'.repeat(20_000)}${'a-'.repeat(60_000)}`;
+  const started = Date.now();
+  assert.equal(startsLikeSecret(text), false);
+  assert.ok(Date.now() - started < 500, 'checked in under half a second');
 });
 
 test('secretshape.mjs is pure: the page loads it as it is', () => {
