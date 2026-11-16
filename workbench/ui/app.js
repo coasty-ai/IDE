@@ -25,7 +25,7 @@ import { buttonRow } from './words.js';
 import { visibleControls } from './words.js'; // say(): what is said shows hidden characters as the lid does
 import { spentAmountWords } from './numbers.js';
 // D1: the git screen below the board, reached by the DRAM (gitscreen.js draws it; this file switches screens)
-import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitTick, gitHold, gitTake, gitRelease, gitListening, gitHome } from './gitscreen.js';
+import { setupGitScreen, openGit, closeGit, gitShown, gitRender, gitSay, gitEscape, gitTick, gitHold, gitTake, gitRelease, gitListening, gitHome, gitPutBack } from './gitscreen.js';
 import { gitScreenWords } from './gitgraph.js';
 import { visibleText } from './diffview.js';
 import { clipToLines } from './layout.js';
@@ -1362,12 +1362,13 @@ const gitAct = b => actOn(b);
  * gitscreen.js): the card in the detail by its id, or the agent whose detail is open, or nothing. A card the reply brings
  * shows in that agent's detail only when the card itself names that agent (its agentId); any other card is shown where it
  * can be answered: in the lid, back on the board. A card that was on screen and that the words were not sent to is
- * still waiting in the engine: it is withdrawn, so none waits unseen.
+ * still waiting in the engine: it is withdrawn, so none waits unseen. Words that could not be sent (too long: the page
+ * checks first; Workbench not answering; a failed request) go back in the git screen's input, as the board's box does.
  */
 async function gitCommand(text, b = {}) {
   text = String(text || '').trim();
   if (!text) return;
-  // as on the board: a key is never sent (the git screen's input is already empty)
+  // as on the board: a key is never sent, and never put back (the git screen's input is already empty)
   if (refuseKey(text, false)) return;
   touch();
   const words = gitScreenWords(text);
@@ -1376,7 +1377,7 @@ async function gitCommand(text, b = {}) {
   const pc = pageCommand(text);
   if (pc && (pc.kind === 'theme' || pc.kind === 'detail')) { applyPref(pc.kind, pc[pc.kind]); return; }
   if (pc && pc.kind === 'next') { say('“Next” steps through what needs you, on the board. Say “back” to go there.', 6000); return; }
-  if (cannotSend(linkNow())) { say('Workbench is not answering, so that was not sent.'); return; }
+  if (cannotSend(linkNow())) { gitPutBack(text); say('Workbench is not answering, so that was not sent.'); return; }
   // as submit() does: a card is answered only by the id it had when the person began
   const shown = S.confirm && b.confirmId && b.confirmId === S.confirm.id ? S.confirm : null;
   const focusId = shown ? null : (b.agentId || null);
@@ -1398,7 +1399,11 @@ async function gitCommand(text, b = {}) {
     moved();
     // Agents & keys opens over the git screen too
     if (res.openConnect === true) showConnect(null, res.reply);
-  } catch (err) { say(err.message); }
+  } catch (err) {
+    // nothing was sent, or it failed: the words go back in the input, unless the person has typed something new there
+    gitPutBack(text);
+    say(err.message);
+  }
   render();
 }
 

@@ -20,6 +20,7 @@ import { markOfAgent } from './look.js';
 import * as model from './model.js';
 import { api } from './api.js';
 import { agoText } from './boardmodel.js';
+import { sayKey } from './saybox.js';
 
 const { S, STATES } = model;
 const $ = id => document.getElementById(id);
@@ -86,14 +87,17 @@ export function setupGitScreen(c) {
     closeGit({ toLid: true });
     ctx.render();
   });
-  // Typed words go with what the screen showed when the person began (the first key), as the core's input does
-  el.bar.addEventListener('submit', e => {
-    e.preventDefault();
+  // Typed words go with what the screen showed when the person began (the first key), as the core's input does. The input
+  // is a box one line high that keeps a paste's lines, as the board's box does: Enter sends (saybox.js sayKey), and
+  // Shift+Enter adds a line. Words that could not be sent come back (gitPutBack).
+  const send = () => {
     const t = el.say.value, b = st.bound || bindingNow();
     st.bound = null;
     el.say.value = ''; el.bar.classList.remove('typed');
     ctx.command(t, b);
-  });
+  };
+  el.bar.addEventListener('submit', e => { e.preventDefault(); send(); });
+  el.say.addEventListener('keydown', e => { if (sayKey(e) === 'send') { e.preventDefault(); send(); } });
   el.say.addEventListener('input', () => {
     el.bar.classList.toggle('typed', !!el.say.value);
     if (el.say.value && !st.bound) st.bound = bindingNow();
@@ -785,6 +789,15 @@ export function gitTake() {
 }
 /** A voice session on the git screen ended with nothing heard: its binding goes (typed words keep theirs). */
 export function gitRelease() { if (el && !el.say.value) st.bound = null; }
+/**
+ * Words typed or spoken here that could not be sent (too long, Workbench not answering, a failed request) go back in the
+ * input, line breaks and all, unless the person has typed something new there meanwhile, as the board's box does.
+ */
+export function gitPutBack(text) {
+  if (!el || el.say.value || !text) return;
+  el.say.value = text;
+  el.bar.classList.add('typed');
+}
 /** The band shows that voice listens (the wave and the words heard take the input's place). */
 export function gitListening(on) { if (el) el.bar.classList.toggle('listening', !!on); }
 

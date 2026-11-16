@@ -577,7 +577,10 @@ body:has(#dram:hover, #dram:focus-visible) .dram-body { stroke: var(--hover-line
 #gitBar { position: relative; display: flex; align-items: center; width: clamp(150px, 20vw, 260px); height: 30px; padding: 0 10px; border-radius: 4px;
   background: var(--card-1); box-shadow: inset 0 0 0 1px var(--card-line); }
 :root[data-theme="ivory"] #gitBar { border-radius: 8px; }
-#gitSay { width: 100%; border: 0; outline: 0; padding: 0; background: transparent; color: var(--card-ink); font: inherit; }
+/* one line high, as the input it was, but a textarea: a paste keeps its lines (the line with the caret shows, and the text
+   scrolls sideways to it), and Enter sends (gitscreen.js) */
+#gitSay { display: block; width: 100%; height: 1.4em; border: 0; outline: 0; padding: 0; background: transparent; color: var(--card-ink); font: inherit;
+  line-height: 1.4; resize: none; overflow: hidden; white-space: pre; overflow-wrap: normal; }
 #gitBar .ph { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--card-sub); pointer-events: none; white-space: nowrap; }
 #gitBar.typed .ph, #gitBar:focus-within .ph { display: none; }
 #gitBar:focus-within { box-shadow: inset 0 0 0 2px var(--card-focus); }

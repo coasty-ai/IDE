@@ -291,12 +291,11 @@ try {
     await b.key('Enter'); await sleep(900);
     const p = (await posts()).filter(x => x.path === '/api/command');
     const words = await saidAll(), after = [await value(), await lines()];
-    const git = await b.ev(`document.getElementById('gitSay').tagName`);
     const want = 'fix the login\nit fails on Safari\nTypeError: total is undefined\n  at render (cart.js:12)';
     check('the input grows with its text: Enter sends, Shift+Enter adds a line, a paste keeps its lines',
       typed === 'fix the login\nit fails on Safari' && two === 2 && early === 0 && pasted === want && four === 4 && p.length === 1 && p[0].body.text === want
-        && /^Started a simulated Claude on “fix the login it fails on Safari TypeError: total is undefined[^\n”]*”\.$/.test(words) && after[0] === '' && after[1] === 1 && git === 'INPUT',
-      JSON.stringify({ typed, two, early, pasted, four, sent: p.map(x => x.body.text), words, after, git }));
+        && /^Started a simulated Claude on “fix the login it fails on Safari TypeError: total is undefined[^\n”]*”\.$/.test(words) && after[0] === '' && after[1] === 1,
+      JSON.stringify({ typed, two, early, pasted, four, sent: p.map(x => x.body.text), words, after }));
   });
   await run('a failed answer keeps the core held on what the person answered, and its button can be tried again', async () => {
     await open('race', { mode: { answer: '500' } });
@@ -1672,6 +1671,53 @@ try {
     const p = (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
     check(GS + '"<name> needs you" takes that item to the lid even while a card waits, and withdraws the card',
       there === 'board' && /Release prep/.test(shown) && !/Merge Invoice export/.test(shown) && p.length === 1 && p[0].body.go === false, `${there}, lid "${shown}", ${JSON.stringify(p.map(x => [x.path, x.body]))}`);
+  });
+
+  await run(GS + 'its input keeps a paste’s lines, and words that could not be sent stay in it: too long, a failed request, no answer', async () => {
+    await open('merge', { still: true });
+    await sleep(900);
+    await click('#dram'); await sleep(900);
+    const gitSaid = () => b.ev(`(() => { const s = document.getElementById('gitSaid'); return s.querySelector('.sr')?.textContent || s.textContent; })()`);
+    const value = () => b.ev(`document.getElementById('gitSay').value`);
+    const setValue = v => b.ev(`(() => { const i = document.getElementById('gitSay'); i.focus(); i.value = ${JSON.stringify(v)}; i.dispatchEvent(new Event('input', { bubbles: true })); return 1; })()`);
+    const shape = await b.ev(`(() => { const i = document.getElementById('gitSay'); return [i.tagName, Math.round(i.clientHeight / parseFloat(getComputedStyle(i).lineHeight))]; })()`);
+    // a real paste, through the clipboard, as the board's check makes one
+    const paste = 'this fails:\n```js\nfunction total(cart) {\n  return cart.sum();\n}\n```';
+    await b.send('Browser.grantPermissions', { origin: base, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
+    await b.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await b.ev(`navigator.clipboard.writeText(${JSON.stringify(paste)})`);
+    await b.ev(`document.getElementById('gitSay').focus(), 1`);
+    await b.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86, modifiers: 4, commands: ['paste'] });
+    await b.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86, modifiers: 4 });
+    await sleep(200);
+    const pasted = await value();
+    await b.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+    await clearLog();
+    await b.key('Enter'); await sleep(900);
+    const sent = (await posts()).filter(x => x.path === '/api/command').map(x => x.body.text);
+    const emptied = await value();
+    // too long: nothing is sent, and the words stay
+    await clearLog();
+    await setValue('x'.repeat(70 * 1024));
+    await b.key('Enter'); await sleep(700);
+    const long = { sent: (await posts()).filter(x => x.path === '/api/command').length, kept: (await value()).length, said: await gitSaid() };
+    await setValue('');
+    // a request that fails, and one that gets no answer: the words come back
+    const failed = [];
+    for (const answer of ['500', 'drop']) {
+      await ctl('mode', { answer });
+      await setValue('fix the docs');
+      await b.key('Enter'); await sleep(900);
+      failed.push({ answer, kept: await value(), said: await gitSaid() });
+      await ctl('mode', { answer: 'ok' });
+      await setValue('');
+    }
+    check(GS + 'its input keeps a paste’s lines, and words that could not be sent stay in it: too long, a failed request, no answer',
+      shape[0] === 'TEXTAREA' && shape[1] === 1 && pasted === paste && sent.length === 1 && sent[0] === paste && emptied === ''
+        && long.sent === 0 && long.kept === 70 * 1024 && long.said === 'That is too long to send in one go. The limit is 64 KB.'
+        && failed[0].kept === 'fix the docs' && failed[0].said === 'Something went wrong.'
+        && failed[1].kept === 'fix the docs' && failed[1].said === 'Workbench isn’t answering. Is it still running?',
+      JSON.stringify({ shape, pasted, sent, emptied, long, failed }));
   });
 
   await run(GS + 'a card from typed words goes in a detail only when it is that agent’s, never by a name inside another', async () => {

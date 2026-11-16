@@ -95,12 +95,21 @@ test('boxHeight: at least one line, at most a few and the room the lid leaves', 
   assert.deepEqual(boxHeight({ need: 10, line: 18 }), { height: 18, extra: 0, scroll: false });
 });
 
-test('the page uses a textarea for the board\'s input, one line to begin with, and the git screen keeps its one-line input', () => {
+test('the page uses a textarea for the board\'s input, one line to begin with, and for the git screen\'s, one line high, that keeps a paste\'s lines', () => {
   const html = readFileSync(new URL('../ui/index.html', import.meta.url), 'utf8');
   assert.match(html, /<textarea id="say" rows="1"[^>]*aria-label="Type what you want, or hold the space bar to talk"/);
-  assert.match(html, /<input id="gitSay"/);
+  assert.match(html, /<textarea id="gitSay" rows="1" wrap="off"[^>]*aria-label="Type what you want\. It goes to Workbench, about the agent shown here\."/);
+  assert.doesNotMatch(html, /<input id="gitSay"/, 'an input would make a paste one line');
   const app = readFileSync(new URL('../ui/app.js', import.meta.url), 'utf8');
   assert.match(app, /setupSayBox\(/, 'app.js wires the box');
+  // the git screen's Enter is the board's: it sends, and Shift+Enter or an input method's Enter does not (sayKey)
+  const git = readFileSync(new URL('../ui/gitscreen.js', import.meta.url), 'utf8');
+  assert.match(git, /import \{ sayKey \} from '\.\/saybox\.js';/);
+  assert.match(git, /el\.say\.addEventListener\('keydown', e => \{ if \(sayKey\(e\) === 'send'\) \{ e\.preventDefault\(\); send\(\); \} \}\);/);
+  // one line high, never resized by hand, and its lines not wrapped into more
+  const css = readFileSync(new URL('../ui/app.css', import.meta.url), 'utf8');
+  const rule = /#gitSay \{([^}]*)\}/.exec(css)?.[1] || '';
+  for (const part of ['height: 1.4em', 'line-height: 1.4', 'resize: none', 'overflow: hidden', 'white-space: pre']) assert.ok(rule.includes(part), part);
 });
 
 test('the input bar shows its focus ring in every look: the ivory look\'s own border does not hide it', () => {
