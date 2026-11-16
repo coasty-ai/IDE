@@ -2667,6 +2667,8 @@ Object.assign(SWEPT, {
   itDiscardCardOwn: world([cartTotal, docsUpdate, loginRedirect], { id: 'c33', kind: 'discard', agentId: 'w00009' }),
   itPermissionsCard: world([cartTotal, loginRedirect], { id: 'c34', kind: 'permissions' }),
   itStartCard: world([loginRedirect], { id: 'c35', kind: 'start' }),
+  // a stop card of a helper at work (its words found the helper by its task): "it" is that helper, not its whole agent
+  itHelperStopCard: world([loginRedirect, loginHelper, docsUpdate], { id: 'c36', kind: 'stop', agentIds: ['w00009-11111111'] }),
   // nothing in the centre
   itNothing: world([cartTotal, loginRedirect]),
   itNothingTwo: world([loginRedirect, docsUpdate]),
@@ -2696,6 +2698,9 @@ test('a stop\'s "it" with no agent in the centre (a card, or nothing) is the car
     ['stop', 'itNothing', stopOf('w00009')], ['stop it', 'itNothing', stopOf('w00009')], ['stop', 'itNothingTwo', stopOf()],
     // "them" is still not clear
     ['stop them, they are looping', 'itMergeCard', stopOf()],
+    // on a stop card of a helper, "it" is that helper; "stop it" with its reason is the card's own yes, as before
+    ['kill it\nwrong branch', 'itHelperStopCard', stopOf('w00009-11111111')], ['pause it - I need to check', 'itHelperStopCard', stopOf('w00009-11111111')],
+    ['stop it, it is looping', 'itHelperStopCard', { kind: 'confirm', go: true }],
     // a program named first: the agent "it" means only when it runs that program
     ['claude, stop it, it is looping', 'itMergeCard', stopOf('w00009')], ['codex, stop it, it is looping', 'itMergeCard', stopOf()],
     ['claude stop', 'itNothing', stopOf('w00009')], ['codex stop', 'itNothing', stopOf()],

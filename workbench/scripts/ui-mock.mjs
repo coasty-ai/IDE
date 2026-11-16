@@ -1500,9 +1500,9 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
             out = { reply: !roots.length ? 'Nothing is running.' : roots.length === 1 ? `Stopped ${roots[0].name}.` : `Stopped all ${roots.length} agents.` };
           } else {
             // "it" is the agent in the centre; with none there (a card is, or nothing is), what a stop could act on: the
-            // card's own agent when it works, else the one agent at work (src/core/commands.mjs, stopIt)
+            // card's own agent or helper when it works, else the one agent at work (src/core/commands.mjs, stopIt)
             const centre = shown ? null : json?.focusId || null;
-            const own = shown?.agentId ? state.agents.find(x => x.id === shown.agentId && !x.parentId && AT_WORK.has(x.state)) : null;
+            const own = shown?.agentId ? state.agents.find(x => x.id === shown.agentId && AT_WORK.has(x.state)) : null;
             const working = state.agents.filter(x => !x.parentId && AT_WORK.has(x.state));
             const a = what === 'them' ? null : centre ? state.agents.find(x => x.id === centre) : own || (working.length === 1 ? working[0] : null);
             if (!a) out = { reply: 'I couldn’t tell which agent to stop.' };

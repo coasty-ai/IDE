@@ -1213,17 +1213,16 @@ const atWork = a => !!a && isRoot(a) && ACTIVE.has(a.state);
 /**
  * The agent a stop's "it" means ("stop it", "stop the agent", "this one", a stop word alone with its reason after it,
  * "shut it down", "stop its work"): the agent in the centre. With none there (a card is in the centre, for the page sends
- * no agent with one, or nothing is), a stop can only be about work: the card's own agent when it is at work (a throw-away
- * card of an agent that still works), else the one agent at work (a merge card is about finished work, so "stop it, it is
- * deleting the wrong files" there is about the agent that works). With more than one at work and none of them the card's,
- * null: which one is not clear, and the engine says so.
+ * no agent with one, or nothing is), a stop can only be about work: the card's own agent or helper when it is at work (a
+ * throw-away card of an agent that still works, a stop card of a helper), else the one agent at work (a merge card is
+ * about finished work, so "stop it, it is deleting the wrong files" there is about the agent that works). With more than
+ * one at work and none of them the card's, null: which one is not clear, and the engine says so.
  */
 function stopIt(c) {
   if (c.focusId) return c.focusId;
   const id = cardAgentId(liveCard(c));
   const own = id ? c.agents.find(a => a.id === id) : null;
-  const root = own ? rootOf(own, c) : null;
-  if (atWork(root)) return root.id;
+  if (own && ACTIVE.has(own.state)) return own.id;
   const working = c.agents.filter(atWork);
   return working.length === 1 ? working[0].id : null;
 }
