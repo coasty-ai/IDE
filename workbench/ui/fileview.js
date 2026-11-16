@@ -75,7 +75,8 @@ export function setupFiles(c) {
   });
   el.title.addEventListener('click', e => {
     const b = e.target.closest('button[data-dir]');
-    if (!b) return;
+    // while editing, the path is only words: the editor is left by Save, Cancel or Esc
+    if (!b || b.getAttribute('aria-disabled') === 'true') return;
     const dir = b.dataset.dir;
     guard(() => showFolder(dir, { focusField: true }));
   });
@@ -363,6 +364,7 @@ function show(r, { line = null, keep = null, fresh = null } = {}) {
   markFor(fresh || (line ? [line] : []));
   st.win.key = '';
   paint();
+  drawRows(true);   // the page takes this file's height first, so the place below is never cut short
   // the place: a line asked for (a third of the way down), the line that was at the top, or the top
   const lh = st.geo.lh;
   if (line) el.code.scrollTop = Math.max(0, (line - 1) * lh + CODE_PAD.top - el.code.clientHeight / 3);
@@ -598,8 +600,11 @@ function listItems() {
 function choose(i) {
   const it = st.find.items[i];
   if (!it) return;
+  if (it.kind === 'line') { jumpTo(it.line); return; }   // inside the editor too, where it moves the caret
+  // anything else leaves an edit, asking first when something changed
+  if (editChanged()) { askLeave(() => choose(i)); return; }
+  if (st.edit) leaveEdit({ ask: false, focus: false });
   if (it.kind === 'folder') { showFolder(it.path, { focusField: true }); return; }
-  if (it.kind === 'line') { jumpTo(it.line); return; }
   const line = it.kind === 'hit' ? it.line : null;
   el.find.value = ''; st.find.q = ''; st.find.mode = 'find';
   if (st.file && st.file.path === it.path && st.file.in === st.where && st.file.rows) {
