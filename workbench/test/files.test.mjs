@@ -1187,6 +1187,27 @@ test('search leaves out what the file view leaves out: env files, saves’ sibli
   assert.deepEqual(await searchFiles({ root, query: 'needle' }), { results: [{ path: 'a.txt', line: 1, text: 'needle' }] });
 });
 
+test('search leaves out a file over 1 MB, which the view does not show, before it counts the most results', async () => {
+  // a JSON fixture of 1 MB and more, a line found on almost every line of it: none of them could be opened at its line
+  const line = '{ "invoice": 1 },\n';
+  const big = line.repeat(Math.ceil((MAX_FILE_BYTES + 1) / line.length));
+  const justFits = Buffer.concat([Buffer.from('invoice\n'), Buffer.alloc(MAX_FILE_BYTES - 8, 0x61)]);
+  const { root } = repo({ 'a.txt': 'an invoice\n', 'data/big.json': big, 'fits.txt': justFits, 'z.txt': 'the last invoice\n' });
+  put(root, { 'new-big.json': big });
+  assert.deepEqual(await searchFiles({ root, query: 'invoice' }), { results: [
+    { path: 'a.txt', line: 1, text: 'an invoice' },
+    { path: 'fits.txt', line: 1, text: 'invoice' },
+    { path: 'z.txt', line: 1, text: 'the last invoice' },
+  ] });
+  // the big file alone holds far more lines than the most asked for: the files after it are still found
+  assert.deepEqual(await searchFiles({ root, query: 'invoice', max: 3 }), { results: [
+    { path: 'a.txt', line: 1, text: 'an invoice' }, { path: 'fits.txt', line: 1, text: 'invoice' }, { path: 'z.txt', line: 1, text: 'the last invoice' },
+  ] });
+  // a project in memory leaves it out the same way
+  const p = memoryProject({ 'a.txt': 'an invoice\n', 'data/big.json': big, 'z.txt': 'the last invoice\n' });
+  assert.deepEqual((await p.searchFiles({ query: 'invoice', max: 2 })).results.map(r => r.path), ['a.txt', 'z.txt']);
+});
+
 test('search and the list read the same, whatever the repository’s own git settings say (an agent can write them)', async () => {
   const { root } = repo({ 'a.txt': 'one needle\n', 'src/b.js': 'needle(2)\n' });
   put(root, { 'new.txt': 'a new needle\n' });
