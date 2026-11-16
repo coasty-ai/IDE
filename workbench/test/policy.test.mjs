@@ -1486,6 +1486,8 @@ test('with full permissions on, every step the policy would ask about runs witho
     bash('cat ~/.ssh/id_ed25519'), bash('node -e "console.log(1)"'), bash('git apply fix.patch'),
     () => monitor({ command: `tail -f ${outside}/dir/secret.txt` }), monitor({ ws: 'wss://example.com/feed' }),
     { tool: 'SendMessage', input: { to: 'uds:/tmp/other.sock', message: 'hi' } }, { tool: 'SendMessage', input: { to: 'someone', message: 'hi' }, recipients: ['main'] },
+    // a find that only lists, with a pattern that leaves hidden files out, as an Explore helper's first command often is
+    bash("find . -type f -not -path '*/\\.*' | sort"), bash("find src -name '*.js' | head -20"), bash('find . -not -path \\*/.\\* -type f | wc -l'),
   ];
   // the same steps ask without it
   check(rows, 'ask');
@@ -1553,6 +1555,8 @@ test('with full permissions on, a command or another tool’s step that names Cl
     bash("rm -rf '.cla''ude'"), bash('rm -rf .cl\\aude'), bash('rm -rf .{claude,git}'), bash('echo "x" | tee ".claude/settings.json"'),
     // wildcards that could match them: a dot pattern, and * as zsh matches it with GLOB_DOTS, which the person may have set
     bash('rm -rf .c*'), bash('rm -rf .??aude'), bash('rm -rf *'), bash('chmod -R 777 ./*'),
+    // a find whose pattern could match them and that deletes or runs something on what it finds
+    bash("find . -name '.c*' -delete"), bash("find . -path '*/.cl*' -exec rm {} +"),
     // inside another command, and in the background
     bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), monitor({ command: 'rm -rf .claude' }),
     // after a << that is no heredoc (a here-string, a shift, a comment), on a line of its own

@@ -1,7 +1,7 @@
 // One real acceptance run of Workbench with Claude Code. IT SPENDS REAL MONEY: at most $0.50 (the --budget it
 // passes) on the account Claude Code is logged in to, with the haiku model.
 //
-//   node scripts/accept-real.mjs <throwaway git repo> [screenshots folder] [--keep] [--claude <path>]
+//   node scripts/accept-real.mjs <throwaway git repo> [screenshots folder] [--keep] [--claude <path>] [--full]
 //
 // The repository needs a branch checked out and a committed workbench.json with a check and a rule, for example:
 //   { "checks": [{ "name": "tests", "run": "node test.mjs" }], "rules": [{ "say": "Do not change greet.js", "paths": ["greet.js"] }]
@@ -22,12 +22,17 @@
 // Workbench's --verbose log).
 // Claude Code is found the way Workbench finds it: --claude, WORKBENCH_CLAUDE_BIN, `claude` on the PATH, then the
 // VS Code extension. It refuses to run inside a Workbench agent, as Workbench itself does.
+// With --full it runs with Full permissions on: it turns them on through their card, as the page's button does, and gives
+// the agent one more step that names Claude Code's own settings (`touch .claude/workbench-check-<run>.txt`). Then the
+// touch of the marker runs without asking, only that step asks ("Full permissions do not cover steps that name Claude
+// Code's own settings.") and is refused, and the merge and the throw-away still ask first. Full permissions are turned off
+// again before Workbench stops, and the run checks that ~/.workbench/prefs.json is not left on them.
 // Dry run without spending (FAKE_CLAUDE_ROOT_BASH may hold anything: this script puts its own `touch` there):
 //   WORKBENCH_CLAUDE_BIN=test/helpers/claude-fake.mjs FAKE_CLAUDE_FIXTURE=claude-subagent-run.jsonl
 //   FAKE_CLAUDE_HOOKS=1 FAKE_CLAUDE_ROOT_BASH=1 node scripts/accept-real.mjs <repo>
 import { spawn, execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, rmdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, rmdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -144,14 +149,16 @@ async function main() {
     process.exit(2);
   }
 
-  const USAGE = 'Usage: node scripts/accept-real.mjs <throwaway git repo> [screenshots folder] [--keep] [--claude <path>]';
+  const USAGE = 'Usage: node scripts/accept-real.mjs <throwaway git repo> [screenshots folder] [--keep] [--claude <path>] [--full]';
   const argv = process.argv.slice(2);
   let keep = false;
+  let full = false;
   let claudePath = null;
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--keep') keep = true;
+    else if (a === '--full') full = true;
     else if (a === '--claude') {
       const v = argv[i + 1];
       claudePath = v != null && !v.startsWith('--') ? v : ''; // a missing path is a usage error, never the next option
@@ -172,8 +179,11 @@ async function main() {
   const MARKER = `agent-was-here-${RUN}.txt`; // its own name for each run: an earlier run's merge already holds the last one
   const MORE = `more-work-${RUN}.txt`; // written into the agent's folder after the merge, so the throw-away has work to keep
   const BUDGET = 0.5;
+  const SETTINGS = `.claude/workbench-check-${RUN}.txt`; // --full: a step that names Claude Code's own settings
   const TASK = 'Use the Agent tool to launch one Explore helper that lists the files in this repository and says what greet.js does. '
-    + `When it has finished, run the shell command \`touch ${MARKER}\` with Bash. Then finish with one short sentence.`;
+    + `When it has finished, run the shell command \`touch ${MARKER}\` with Bash. `
+    + (full ? `Then run the shell command \`mkdir -p .claude && touch ${SETTINGS}\` with Bash; if it is refused, do not try it another way. ` : '')
+    + 'Then finish with one short sentence.';
 
   const t0 = Date.now();
   const log = (...a) => console.log(`${((Date.now() - t0) / 1000).toFixed(1).padStart(6)}s`, ...a);
@@ -220,16 +230,36 @@ async function main() {
     } catch (err) { log('screenshot failed:', name, err.message); }
   };
 
+  // --full: Full permissions on through their card, as the band's button does; turned off again before Workbench stops.
+  let fullOn = false;
+  const fullOff = async () => {
+    if (!fullOn) return null;
+    fullOn = false;
+    return post('/api/permissions', { mode: 'ask' }).catch(() => null);
+  };
+  if (full) {
+    const asked = await post('/api/permissions', { mode: 'full' });
+    const pc = asked.body?.confirm || null;
+    check('Full permissions ask first, with their card', pc?.kind === 'permissions', pc ? pc.sentence : JSON.stringify(asked.body));
+    if (pc) {
+      const yes = await post(`/api/confirm/${encodeURIComponent(pc.id)}`, { go: true });
+      fullOn = (await get('/api/state')).body?.permissions === 'full';
+      check('their yes turns them on', fullOn && /^Full permissions are on\./.test(yes.body?.reply || ''), yes.body?.reply || JSON.stringify(yes.body));
+    }
+    if (!fullOn) { console.error('Full permissions did not turn on.'); eng.kill('SIGINT'); process.exit(1); }
+  }
+
   // A typed task is never asked: the agent starts at once, and the reply carries it (the merge and throw-away below are
   // still asked first, each with its card).
   const go = await post('/api/command', { text: 'start an agent to ' + TASK });
   const rootId = go.body?.agentIds?.[0];
-  if (go.body?.confirm || !rootId) { console.error('The agent did not start at once:', JSON.stringify(go.body)); eng.kill('SIGINT'); process.exit(1); }
+  if (go.body?.confirm || !rootId) { console.error('The agent did not start at once:', JSON.stringify(go.body)); await fullOff(); eng.kill('SIGINT'); process.exit(1); }
   log('Started:', go.body.reply);
   const view = async () => (await agents()).find((a) => a.id === rootId) || null;
 
   const answered = new Set();
   let sawHelper = false, shotHelper = false, touchHeld = false, touchAbsentWhileHeld = false, refused = 0;
+  let settingsAsked = false, settingsWhy = '', helperAsked = false; // --full
   let sessionId = null, workspace = null, branch = null, last = '', final = null, merged = null;
   while (Date.now() - t0 < 300_000) {
     await sleep(1000);
@@ -257,7 +287,12 @@ async function main() {
           touchAbsentWhileHeld = !!workspace && !existsSync(path.join(workspace, MARKER));
           shot('real-needs-ok', '&pin=' + a.id);
           answer = 'Allow';
+        } else if (full && !a.parentId && detail.includes(SETTINGS)) {
+          settingsAsked = true;
+          settingsWhy = String(a.ask.why || '');
+          answer = 'Deny';
         } else if (a.parentId && helperAskMayRun(a.ask)) {
+          helperAsked = true;
           answer = 'Allow';
         } else { answer = 'Deny'; refused++; }
       } else if (a.ask.type === 'question') {
@@ -280,8 +315,17 @@ async function main() {
   if (!final) log('The agent did not finish within 5 minutes.');
   else log('FINAL', final.state, '| says:', final.says, '| files:', JSON.stringify(final.files && { changed: final.files.changed, list: final.files.list?.map((f) => f.path) }), '| checks:', JSON.stringify(final.checks), '| rules:', JSON.stringify(final.rules), '| approvals:', JSON.stringify(final.approvals), '| cost: $' + final.usage?.costUsd);
   check('a helper appeared in the tree', sawHelper);
-  check(`\`touch ${MARKER}\` waited for an OK`, touchHeld && touchAbsentWhileHeld, touchHeld ? (touchAbsentWhileHeld ? 'and had not run' : 'but the file already existed') : 'never asked');
-  check('Allow released it', touchHeld && workspace && existsSync(path.join(workspace, MARKER)));
+  if (full) {
+    check(`with full permissions on, \`touch ${MARKER}\` ran without asking`, !touchHeld && !!workspace && existsSync(path.join(workspace, MARKER)), touchHeld ? 'it asked' : '');
+    check('no helper needed an answer either', !helperAsked);
+    check('the step that names Claude Code’s own settings still asked, saying full permissions do not cover it', settingsAsked
+      && /Full permissions do not cover steps that name Claude Code['’]s own settings\.$/.test(settingsWhy), settingsAsked ? settingsWhy : 'never asked');
+    check('Deny kept it from running', !!workspace && !existsSync(path.join(workspace, SETTINGS)));
+    check('its steps were counted as automatic approvals', (final?.approvals?.auto ?? 0) >= 1 && (final?.approvals?.byYou ?? 0) === 0, JSON.stringify(final?.approvals));
+  } else {
+    check(`\`touch ${MARKER}\` waited for an OK`, touchHeld && touchAbsentWhileHeld, touchHeld ? (touchAbsentWhileHeld ? 'and had not run' : 'but the file already existed') : 'never asked');
+    check('Allow released it', touchHeld && workspace && existsSync(path.join(workspace, MARKER)));
+  }
   check('the agent ended done and checked', final?.state === 'done_checked', final?.state || 'not finished');
   check('the receipt shows exactly that one new file', final?.files?.changed === 1 && final.files.list?.[0]?.path === MARKER, JSON.stringify(final?.files?.list?.map((f) => f.path)));
   check('the rule was kept', final?.rules && Array.isArray(final.rules.broken) && final.rules.broken.length === 0, JSON.stringify(final?.rules));
@@ -350,6 +394,12 @@ async function main() {
     }
   }
 
+  if (full) {
+    console.log('');
+    const off = await fullOff();
+    check('Full permissions turn off again', off?.body?.reply === 'Agents ask again before risky steps.' && (await get('/api/state')).body?.permissions === 'ask', off?.body?.reply || JSON.stringify(off?.body));
+  }
+
   console.log('');
   const running = sessionId ? processesWith(sessionId) : [];
   log('Claude Code processes for this agent before stopping:', running.length ? running.join(' ') : 'none');
@@ -359,6 +409,11 @@ async function main() {
   const left = sessionId ? processesWith(sessionId) : ['(no session id was seen)'];
   check('Workbench stopped cleanly', exit && exit.code === 0, JSON.stringify(exit));
   check('no Claude Code process was left running', left.length === 0, left.join(' '));
+  if (full) {
+    let kept = null;
+    try { kept = JSON.parse(readFileSync(path.join(homedir(), '.workbench', 'prefs.json'), 'utf8')).permissions ?? null; } catch { kept = null; }
+    check('your saved choice is not left on full permissions', kept !== 'full', String(kept));
+  }
 
   if (!keep) {
     // Whatever the steps above left: the folder, the branch this run made, and the hidden copy. Never the merge.

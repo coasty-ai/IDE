@@ -445,8 +445,15 @@ const withHome = text => String(text).replace(/^\$(HOME|\{HOME\})(?=\/|$)/, os.h
 
 /** Whether any word of one part names Claude Code's settings: as written, wherever it leads, or by what it matches. */
 function partNamesClaude(c, bases, base) {
-  for (const raw of c.words) {
+  // A find that only lists: the words after its pattern options are patterns find matches names against, not places it
+  // acts on, so only a name written out counts there ("find . -not -path '*/.*'" leaves hidden files out). A find that
+  // deletes, writes or runs something on what it finds counts them all.
+  const listsOnly = c.prog === 'find' && !c.words.some(w => FIND_BAD.has(w));
+  for (let i = 0; i < c.words.length; i++) {
+    const raw = c.words[i];
+    const pattern = listsOnly && i > 0 && FIND_PATTERNS.has(c.words[i - 1]);
     for (const form of braceForms(withHome(raw))) {
+      if (pattern) { if (textNamesClaude(form, { wildcards: false })) return true; continue; }
       if (textNamesClaude(form)) return true;
       if (!base) continue;
       for (const piece of new Set([form, ...form.split(/[=:,]/)])) {
@@ -484,20 +491,51 @@ function globNamesClaude(piece, b, base) {
   return names;
 }
 
+/** The pattern options of find: the word after each is a pattern find matches names against. */
+const FIND_PATTERNS = new Set(['-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '-lname', '-ilname']);
+
+/**
+ * Text with the wildcards the shell never expands made plain: those inside quotes, and those after a backslash. A name
+ * written out stays as it is, quoted or not.
+ */
+function plainWildcards(text) {
+  let out = '';
+  let q = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) {
+      if (ch === q) q = null;
+      else if (ch === '\\' && q === '"' && i + 1 < text.length) { out += ch + text[++i]; continue; }
+      else if (ch === '*' || ch === '?' || ch === '[') { out += '_'; continue; }
+      out += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') q = ch;
+    else if (ch === '\\' && i + 1 < text.length) {
+      const n = text[++i];
+      out += n === '*' || n === '?' || n === '[' ? '_' : ch + n;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 /**
  * Whether text names Claude Code's settings by name: a piece of it between spaces, the shell's punctuation, slashes, =,
  * : and commas, that the disk takes for .claude or .mcp.json (foldName), after the shell's quotes and backslashes are
- * taken away and its braces expanded; or a wildcard piece that starts with a dot and could match one of them.
+ * taken away and its braces expanded; or, unless `wildcards` is false, a wildcard piece the shell would expand (not in
+ * quotes, not after a backslash) that starts with a dot and could match one of them.
  */
-function textNamesClaude(text) {
-  const t = String(text ?? '').replace(/[\\'"]/g, '');
+function textNamesClaude(text, { wildcards = true } = {}) {
+  const t = plainWildcards(String(text ?? '')).replace(/[\\'"]/g, '');
   for (const word of t.split(/[ \t\n\r;&|<>()`$]+/)) {
     for (const form of braceForms(word)) {
       for (const seg of form.split(/[/=:,{}]+/)) {
         if (!seg) continue;
         const f = foldName(seg);
         if (f === '.claude' || f === '.mcp.json') return true;
-        if (/[*?[]/.test(seg) && dotPatternMatchesClaude(seg)) return true;
+        if (wildcards && /[*?[]/.test(seg) && dotPatternMatchesClaude(seg)) return true;
       }
     }
   }
