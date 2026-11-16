@@ -3230,8 +3230,14 @@ export class Engine extends EventEmitter {
       held = this._rechecks.get(id) || { id, workspace: c.ws, config: this._loadConfig(c.ws), harness: v.harness, receipt: null, deciding: false, checksDone: null, saves: 0 };
       this._rechecks.set(id, held);
     }
-    if (v.state === STATE.DONE_CHECKED || v.state === STATE.CHECKS_FAILED) {
-      this._apply([{ kind: EV.STATE, agentId: id, state: STATE.DONE_CLAIMED, reason: null }]);
+    // What its checks found is about content that is gone: its state and its results go together, at once.
+    const drop = [];
+    if (v.state === STATE.DONE_CHECKED || v.state === STATE.CHECKS_FAILED) drop.push({ kind: EV.STATE, agentId: id, state: STATE.DONE_CLAIMED, reason: null });
+    if (v.checks && v.checks.state !== 'none') drop.push({ kind: EV.CHECKS, agentId: id, checks: { state: 'none', results: [] } });
+    if (drop.length) {
+      this._apply(drop);
+      // An earlier agent's record says so at once too: stopped before its checks end, it must not come back checked.
+      if (!run && c.rec) this._keepEarlier(id, c.ws);
     }
     const seq = run ? run.turnSeq : 0;
     // Not run.stopped: closing a finished agent's idle process (a merge, Stop) marks it stopped, and its copy is checked all the same.
@@ -3246,11 +3252,14 @@ export class Engine extends EventEmitter {
     // A newer receipt (a save that came just now started one) decides instead: this one's outcome is already old.
     if (!got || held.receipt) return;
     this._apply([{ kind: EV.STATE, agentId: id, state: doneState(got.checksState), reason: got.reason }]);
-    if (!run && c.rec) {
-      this._replaceEarlier(id, c.ws); // the next start knows what its checks found
-      try { this.history?.schedule(); } catch (err) { this.log.warn('Could not save the history:', err); }
-    }
+    if (!run && c.rec) this._keepEarlier(id, c.ws); // the next start knows what its checks found
     this._lookAgainIfSaved(id, held, got.saves);
+  }
+
+  /** An earlier agent's record is built again from its view as it is now, and the history is written (soon). */
+  _keepEarlier(id, workspace) {
+    this._replaceEarlier(id, workspace);
+    try { this.history?.schedule(); } catch (err) { this.log.warn('Could not save the history:', err); }
   }
 
   /**

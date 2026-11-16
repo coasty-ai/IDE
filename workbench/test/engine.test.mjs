@@ -4549,12 +4549,16 @@ test('the file view: a working agent’s copy is saved and left to it; a copy be
   await t.engine.shutdown();
 });
 
-test('the file view: a save into an earlier agent’s copy runs its checks again too, and the next start knows what they found', async (ctx) => {
+/**
+ * Live engines over one repository folder, with the real history (under `dir`) and the real file view: what one keeps,
+ * the next one started restores, as an earlier agent. Agents' folders are real, and are kept at shutdown.
+ */
+function earlierWorlds(ctx) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-engine-earlier-')));
   ctx.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const repoRoot = path.join(dir, 'repo');
   fs.mkdirSync(repoRoot);
-  const world = () => {
+  return () => {
     const store = new Store();
     const claude = fakeAdapter('claude');
     const { deps, calls } = fakeDeps({ checks: CHECKS, folders: path.join(dir, 'wt') });
@@ -4563,10 +4567,14 @@ test('the file view: a save into an earlier agent’s copy runs its checks again
     deps.workspace.removeWorkspace = async (o) => { calls.removeWorkspace.push(o); return { removed: false, kept: true }; };
     const engine = new Engine({
       store, mode: 'live', repo: { root: repoRoot, name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 0 }, hook: HOOK, adapters: { claude, codex: fakeAdapter('codex') },
-      machines: new FakeMachines(), deps, options: { tickMs: 10_000_000, historyDir: path.join(dir, 'history'), historyDebounceMs: 5, exitGraceMs: 20 },
+      machines: new FakeMachines(), deps, options: { tickMs: 10_000_000, historyDir: path.join(dir, 'history'), historyDebounceMs: 5, exitGraceMs: 20, stopTimeoutMs: 2000 },
     });
     return { store, engine, claude, deps, calls };
   };
+}
+
+/** In a first engine of `world`, an agent done and checked, with a file in its folder; then that engine stops. */
+async function checkedEarlier(world) {
   const first = world();
   await first.engine.start();
   const a = await started(first, { task: 'Fix the cart total' });
@@ -4576,7 +4584,12 @@ test('the file view: a save into an earlier agent’s copy runs its checks again
   await until(() => first.store.get(a.id).state === 'done_checked');
   fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
   await first.engine.shutdown();
+  return a;
+}
 
+test('the file view: a save into an earlier agent’s copy runs its checks again too, and the next start knows what they found', async (ctx) => {
+  const world = earlierWorlds(ctx);
+  const a = await checkedEarlier(world);
   const next = world();
   await next.engine.start();
   assert.deepEqual([next.store.get(a.id).earlier, next.store.get(a.id).state], [true, 'done_checked']);
@@ -4597,6 +4610,29 @@ test('the file view: a save into an earlier agent’s copy runs its checks again
   const third = world();
   await third.engine.start();
   assert.deepEqual([third.store.get(a.id).state, third.store.get(a.id).stateReason], ['checks_failed', 'The check “unit tests” did not pass.']);
+  await third.engine.shutdown();
+});
+
+test('the file view: an earlier agent’s copy saved, then Workbench stopped before its checks ended: the next start does not say checked', async (ctx) => {
+  const world = earlierWorlds(ctx);
+  const a = await checkedEarlier(world);
+  const next = world();
+  await next.engine.start();
+  // Its checks start and hold, until they are stopped.
+  next.deps.receipt.runChecks = (o) => new Promise((resolve) => {
+    next.calls.runChecks.push(o);
+    o.signal.addEventListener('abort', () => resolve({ state: 'failed', results: [{ name: 'unit tests', ok: false, ms: 0, tail: 'Not run.' }] }), { once: true });
+  });
+  const f = await next.engine.file(a.id, 'cart.js');
+  assert.equal((await next.engine.saveFile(a.id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+  assert.deepEqual([next.store.get(a.id).state, next.store.get(a.id).checks], ['done_claimed', { state: 'none', results: [] }], 'its old results go with its old state');
+  await until(() => next.calls.runChecks.length === 1);
+  await next.engine.shutdown();
+  assert.equal(next.calls.runChecks[0].signal.aborted, true, 'shutdown stopped its checks');
+  const third = world();
+  await third.engine.start();
+  assert.equal(third.store.get(a.id).state, 'done_claimed');
+  assert.notEqual(third.store.get(a.id).checks?.state, 'passed');
   await third.engine.shutdown();
 });
 
