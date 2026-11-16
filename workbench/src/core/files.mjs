@@ -673,6 +673,17 @@ const DEPENDENCY_FOLDERS = new Set(['node_modules', 'bower_components', 'jspm_pa
   '__pypackages__', 'site-packages', 'pods', 'carthage', '.bundle', '.yarn', '.pnpm-store', '.gradle', 'elm-stuff']);
 /** The most of git's list of hidden files that the list reads, for the env files in it. */
 const HIDDEN_LIST_BYTES = 16 * 1024 * 1024;
+/** How long the list may look inside the folders an ignore rule names, for the env files in them, in milliseconds. */
+export const HIDDEN_LOOK_MS = 1500;
+/** One look inside them takes at most this many folders, and this many bytes of pathspecs: they go on git's command line. */
+const FOLDERS_PER_LOOK = 100;
+const PATHSPEC_BYTES_PER_LOOK = 64 * 1024;
+/** The env files' names as glob patterns (the case is git's `icase`'s to ignore): see isDotEnv. */
+const ENV_GLOBS = ['.env', '.env.*', '.envrc'];
+/** The dependency folders inside a folder it looks into, left out by git as it walks, so it never reads them. */
+const NO_DEPENDENCIES = [...DEPENDENCY_FOLDERS].map(d => `:(exclude,glob,icase)**/${d}/**`);
+/** A name as a glob pattern matches only itself: git's glob characters and its escape character are escaped. */
+const globEscape = s => s.replace(/[*?[\]\\]/g, '\\$&');
 
 /** An env file the list shows though an ignore rule hides it: named .env, .env.<anything> or .envrc, in any case. */
 function isDotEnv(rel) {
@@ -684,39 +695,89 @@ const inDependencies = rel => rel.split('/').slice(0, -1).some(part => DEPENDENC
 
 /**
  * What git lists of the files its ignore rules hide, for the env files among them: { stdout, cut }. A folder that an
- * ignore rule names is listed as the folder, and git does not look inside it. Never rejects: without these the list is
- * still right, only shorter.
+ * ignore rule names is listed as the folder ("config/local/"), and git does not look inside it, so the env files inside
+ * each such folder are then asked for by name (envFilesInside). Never rejects: without these the list is still right,
+ * only shorter.
  */
-async function hiddenFiles(cwd) {
+async function hiddenFiles(cwd, lookMs = HIDDEN_LOOK_MS) {
+  let listed;
   try {
     const r = await git(['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'],
       { cwd, encoding: 'buffer', maxBuffer: HIDDEN_LIST_BYTES });
-    return { stdout: r.stdout, cut: false };
+    listed = r.stdout;
   } catch (e) {
     const tooMuch = !!e && (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || e.killed === true);
-    return tooMuch && Buffer.isBuffer(e.stdout) ? { stdout: e.stdout, cut: true } : { stdout: Buffer.alloc(0), cut: false };
+    if (!tooMuch || !Buffer.isBuffer(e.stdout)) return { stdout: Buffer.alloc(0), cut: false };
+    listed = e.stdout.subarray(0, e.stdout.lastIndexOf(0) + 1); // the names it gave whole
   }
+  const inside = await envFilesInside(cwd, [...nulFields(listed)], lookMs);
+  return { stdout: Buffer.concat([listed, ...inside]), cut: false };
+}
+
+/**
+ * The env files (by their names' patterns, in any case) inside the folders an ignore rule names as a whole, at any
+ * depth: git's own answers, each ending in NUL. Only the outermost folders git listed are looked into (it lists a folder
+ * that holds only hidden things beside the hidden folders in it), and never a dependency folder, one inside a dependency
+ * folder, or the dependency folders inside a folder looked into (a build's own node_modules). A name that is not UTF-8,
+ * or that the path rules refuse, is not looked into. Each look is `git ls-files --others --ignored --exclude-standard`
+ * with a glob pathspec per folder and name (the folder's name escaped, so it matches only itself), for at most 100
+ * folders at once, all within `lookMs`: a look that is not done in time is stopped, and what earlier ones found is kept.
+ */
+async function envFilesInside(cwd, fields, lookMs) {
+  const folders = [];
+  for (const raw of fields) {
+    const name = utf8OrNull(raw);
+    // A folder's name keeps its "/", so inDependencies judges the folder itself as well as the ones above it.
+    if (name === null || !name.endsWith('/') || inDependencies(name) || pathProblem(name.slice(0, -1), 'open')) continue;
+    folders.push(name);
+  }
+  const outermost = folders.filter(f => !folders.some(o => o !== f && f.startsWith(o)));
+  const found = [];
+  const until = Date.now() + lookMs;
+  for (let i = 0; i < outermost.length;) {
+    const specs = [];
+    let bytes = 0;
+    for (let n = 0; i < outermost.length && n < FOLDERS_PER_LOOK; n++, i++) {
+      const mine = ENV_GLOBS.map(g => `:(glob,icase)${globEscape(outermost[i])}**/${g}`);
+      const size = mine.reduce((sum, x) => sum + Buffer.byteLength(x) + 1, 0);
+      if (n && bytes + size > PATHSPEC_BYTES_PER_LOOK) break;
+      specs.push(...mine);
+      bytes += size;
+    }
+    const left = until - Date.now();
+    if (left <= 0) break;
+    try {
+      const r = await git(['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...specs, ...NO_DEPENDENCIES],
+        { cwd, encoding: 'buffer', timeout: left, maxBuffer: HIDDEN_LIST_BYTES });
+      found.push(r.stdout);
+    } catch {
+      // Stopped for taking too long, or git could not: these folders go without, and the time left goes to the next.
+    }
+  }
+  return found;
 }
 
 /**
  * The project's files: what `git ls-files -z --cached --others --exclude-standard` lists, run as its two halves so that
  * tracked files come first when the list is cut: every tracked file (one in a conflict once), then every new file no
  * ignore rule hides. Between them come the env files an ignore rule hides (named .env, .env.<anything> or .envrc, in
- * any case), outside dependency folders (node_modules, vendor and the like), so a person can see that a copy has its
- * .env; they are named in `ignored` too. Left out: a repository inside the folder (git names it "folder/"), a name that
- * is not UTF-8 (the page could not ask for it by name), a name the path rules refuse, and the sibling of a save (see
- * isSaveFile). When the new files are more than git() reads at once, or git is stopped for taking too long listing them
- * (an un-ignored node_modules in an agent's copy, say), the names it gave whole are kept and the list is cut there: what
- * git did not give is not known. The tracked files are not cut that way: without them all, the list is refused.
- * @param {{ root: string, max?: number }} o max: at most this many, and never more than 50,000 (MAX_LIST_FILES)
+ * any case), outside dependency folders (node_modules, vendor and the like), inside folders an ignore rule names as a
+ * whole too (envFilesInside), so a person can see that a copy has its .env; they are named in `ignored` too. Left out:
+ * a repository inside the folder (git names it "folder/"), a name that is not UTF-8 (the page could not ask for it by
+ * name), a name the path rules refuse, and the sibling of a save (see isSaveFile). When the new files are more than
+ * git() reads at once, or git is stopped for taking too long listing them (an un-ignored node_modules in an agent's
+ * copy, say), the names it gave whole are kept and the list is cut there: what git did not give is not known. The
+ * tracked files are not cut that way: without them all, the list is refused.
+ * @param {{ root: string, max?: number, hiddenTimeoutMs?: number }} o max: at most this many, and never more than
+ *   50,000 (MAX_LIST_FILES); hiddenTimeoutMs: how long it may look inside the folders an ignore rule names (1.5 s)
  * @returns {Promise<{ files: string[], ignored?: string[], truncated?: true }>} paths from root with "/", ordered by
  *   path; ignored: the hidden env files among them, ordered by path, when there are any; truncated when there were
  *   more, or may have been. Rejects with a plain error when git cannot list them.
  */
-export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
+export async function listFiles({ root, max = MAX_LIST_FILES, hiddenTimeoutMs = HIDDEN_LOOK_MS } = {}) {
   const top = realFolder(root);
   const limit = Number.isInteger(max) && max >= 0 ? Math.min(max, MAX_LIST_FILES) : MAX_LIST_FILES;
-  const hidden = hiddenFiles(top);
+  const hidden = hiddenFiles(top, Number.isFinite(hiddenTimeoutMs) && hiddenTimeoutMs > 0 ? hiddenTimeoutMs : HIDDEN_LOOK_MS);
   let halves;
   try {
     halves = await Promise.all([

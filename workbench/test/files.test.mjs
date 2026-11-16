@@ -1054,12 +1054,13 @@ test('the list adds the env files a .gitignore hides, outside dependency folders
     '.env': 'KEY=1\n', '.envrc': 'export KEY=2\n', 'apps/web/.env.local': 'KEY=3\n', 'apps/web/.ENV.production': 'KEY=4\n',
     'fresh/.env': 'KEY=5\n', // a new folder that holds nothing else
     'node_modules/pkg/.env': 'KEY=6\n', 'vendor/lib/.env': 'KEY=7\n', 'apps/web/node_modules/x/.env.test': 'KEY=8\n', // dependencies
-    'prod.env': 'KEY=9\n', 'debug.log': 'not an env file\n', 'config/local/.env': 'KEY=10\n',
+    'prod.env': 'KEY=9\n', 'debug.log': 'not an env file\n',
+    'config/local/.env': 'KEY=10\n', // in a folder an ignore rule names as a whole
   });
   const got = await listFiles({ root });
-  assert.deepEqual(got.ignored, ['.env', '.envrc', 'apps/web/.ENV.production', 'apps/web/.env.local', 'fresh/.env']);
+  assert.deepEqual(got.ignored, ['.env', '.envrc', 'apps/web/.ENV.production', 'apps/web/.env.local', 'config/local/.env', 'fresh/.env']);
   assert.deepEqual(got.files, ['.env', '.env.example', '.envrc', '.gitignore', 'a.txt', 'apps/web/.ENV.production', 'apps/web/.env.local',
-    'apps/web/page.js', 'fresh/.env', 'prod.env']);
+    'apps/web/page.js', 'config/local/.env', 'fresh/.env', 'prod.env']);
   assert.equal(got.truncated, undefined);
   // They open as env files do: each value masked, never edited.
   const env = await readFile({ root, rel: 'apps/web/.env.local' });
@@ -1067,6 +1068,54 @@ test('the list adds the env files a .gitignore hides, outside dependency folders
   // With none hidden, the answer is as it was.
   const { root: plain } = repo({ 'a.txt': 'a\n' });
   assert.deepEqual(await listFiles({ root: plain }), { files: ['a.txt'] });
+});
+
+test('the list looks inside each folder an ignore rule names for its env files, at any depth, but not in dependencies inside it', async () => {
+  // `\[odd]\*dir/` names the folder `[odd]*dir` itself; `odddir`, which the same letters unescaped would name, is not
+  // hidden, and its env file is not looked for.
+  const { root } = repo({ '.gitignore': 'secrets/\nbuild/\n\\[odd]\\*dir/\nnode_modules/\nlocal-*/\n', 'a.txt': 'a\n' });
+  put(root, {
+    'secrets/.env': 'KEY=1\n', 'secrets/deploy/prod/.env.production': 'KEY=2\n', 'secrets/notes.txt': 'not an env file\n',
+    'build/out/.envrc': 'export KEY=3\n', 'build/node_modules/x/.env': 'KEY=4\n', 'build/vendor/y/.env.local': 'KEY=5\n', // a build's own dependencies
+    '[odd]*dir/.env': 'KEY=6\n', // a name git's patterns would read as a pattern
+    'odddir/.env.sample': 'KEY=\n', // what that pattern would match, read as one: a new file no rule hides
+    'local-a/.env': 'KEY=7\n', 'local-b/.ENV.TEST': 'KEY=8\n', // two folders, each named by one rule
+    'node_modules/pkg/deep/.env': 'KEY=9\n',
+  });
+  const got = await listFiles({ root });
+  assert.deepEqual(got.ignored, ['[odd]*dir/.env', 'build/out/.envrc', 'local-a/.env', 'local-b/.ENV.TEST', 'secrets/.env', 'secrets/deploy/prod/.env.production']);
+  assert.deepEqual(got.files, ['.gitignore', '[odd]*dir/.env', 'a.txt', 'build/out/.envrc', 'local-a/.env', 'local-b/.ENV.TEST', 'odddir/.env.sample',
+    'secrets/.env', 'secrets/deploy/prod/.env.production']);
+  const env = await readFile({ root, rel: 'secrets/deploy/prod/.env.production' });
+  assert.deepEqual([env.kind, env.text], ['secret', 'KEY=••••\n']);
+});
+
+test('a look inside the ignored folders that takes too long is let go: the list comes in time, without what it would have found', async (t) => {
+  const { root } = repo({ '.gitignore': '.env\nsecrets/\n', 'a.txt': 'a\n' });
+  put(root, { '.env': 'KEY=1\n', 'secrets/.env': 'KEY=2\n' });
+  // A stand-in for git that never answers a look inside the folders (ls-files with --ignored, without --directory), and
+  // hands everything else to the real git.
+  const realGit = process.env.PATH.split(path.delimiter).map(d => path.join(d, 'git')).find(p => fs.existsSync(p));
+  const bin = path.join(T, `bin-${++made}`);
+  fs.mkdirSync(bin);
+  const looked = path.join(bin, 'looked');
+  fs.writeFileSync(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    'ignored=; directory=',
+    'for a in "$@"; do',
+    '  [ "$a" = "--ignored" ] && ignored=1',
+    '  [ "$a" = "--directory" ] && directory=1',
+    'done',
+    `if [ -n "$ignored" ] && [ -z "$directory" ]; then : > '${looked}'; exec sleep 30; fi`,
+    `exec '${realGit}' "$@"`,
+  ].join('\n') + '\n', { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${PATH}`;
+  t.after(() => { process.env.PATH = PATH; });
+  const began = Date.now();
+  assert.deepEqual(await listFiles({ root, hiddenTimeoutMs: 300 }), { files: ['.env', '.gitignore', 'a.txt'], ignored: ['.env'] });
+  assert.ok(Date.now() - began < 10_000, 'it did not wait for git');
+  assert.ok(fs.existsSync(looked), 'it looked inside secrets/, and let the look go');
 });
 
 // ------------------------------------------------------------------ search
