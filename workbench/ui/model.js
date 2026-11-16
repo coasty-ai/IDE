@@ -66,7 +66,7 @@ export function helpersOf(root) {
 export const helpersAtWork = a => Q.helpersAtWork(childrenOf(a.id), ACTIVE);
 
 /**
- * What the core shows, in this order: a launch question on screen; the agent the person picked or stepped to (with its
+ * What the core shows, in this order: an engine card on screen; the agent the person picked or stepped to (with its
  * place in a queue, when it is in one); the most urgent thing that needs the person; finished work not yet looked at;
  * otherwise nothing.
  */

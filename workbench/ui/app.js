@@ -190,7 +190,7 @@ function shownFocus() {
   letGo = false;
   if (!lidFocus || own || !engaged() || keyOf(want) === lidKey) return { f: want, also: false };
   const held = lidFocus;
-  // something else waits behind what is held: an agent that needs the person, or a launch question
+  // something else waits behind what is held: an agent that needs the person, or an engine card
   const also = x => !!(want.confirm || (want.agent && want.agent.id !== x && STATES.NEEDS_YOU.has(want.agent.state)));
   if (held.confirm) return S.confirm && S.confirm.id === held.confirm.id ? { f: { confirm: S.confirm }, also: also(null) } : { f: want, also: false };
   if (held.empty) return { f: want, also: false };
@@ -614,7 +614,7 @@ async function actOn(b) {
       // Merge (also "Merge anyway" and "Try again") and Throw it away never act by themselves: the engine answers with a
       // card in its own words, bound by id, and the person answers that. Its outcome then shows on this agent.
       busy(b);
-      // A card already on screen (a launch question in the lid while the git screen's detail is used, another agent's
+      // A card already on screen (a card in the lid while the git screen's detail is used, another agent's
       // card) is withdrawn first, as picking a chip does, so none waits unseen. If that does not go through, it stays,
       // nothing is asked, and this button can be tried again.
       const old = S.confirm;
@@ -847,12 +847,12 @@ const voice = setupVoice({
   },
 });
 
-// A launch question the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot start it.
+// A card the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot answer it.
 function dropConfirm() {
   const c = S.confirm;
   if (!c) return;
   S.confirm = null;
-  // if the withdrawal does not go through, the card stays: no launch question waits unseen
+  // if the withdrawal does not go through, the card stays: no card waits unseen
   api.confirm(c.id, false).then(r => say(r.reply || ''), err => { if (!S.confirm) S.confirm = c; say(err.message); render(); });
 }
 
@@ -1101,7 +1101,7 @@ function modeIs(mode) {
 
 function onSnapshot(snap) {
   // meta.connect (which agents can start work), when this engine has Agents & keys; null keeps today's board.
-  // meta.permissions: whether full permissions are on, for the band's button and the launch card.
+  // meta.permissions: whether full permissions are on, for the band's button (no card starts work, so none speaks of them).
   const was = S.meta.permissions;
   S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap),
     permissions: was };

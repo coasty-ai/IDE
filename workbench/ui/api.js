@@ -55,7 +55,7 @@ async function call(method, path, body) {
 export const api = {
   state: () => call('GET', '/api/state'),
   /**
-   * What the person typed or said. focusId: what the core showed; confirmId: the launch question on screen, if any;
+   * What the person typed or said. focusId: what the core showed; confirmId: the card on screen (a stop, a message, a merge…), if any;
    * askId: the ask on screen when they started typing or talking, so the engine applies the words only to that ask.
    */
   command: (text, { focusId = null, confirmId = null, askId = null } = {}) =>
