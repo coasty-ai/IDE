@@ -96,10 +96,15 @@ function heredocEnd(cmd, k, heredoc) {
   }
 }
 
-/** A redirection's own fd number ("2>", "10<") starts it, when the number is a word of its own so far: where it starts. */
+/**
+ * A redirection's own fd number ("2>", "10<") starts it, when the number is a word of its own so far: where it starts. Only
+ * the end of the text is read, so a part with many redirections is read in a time that grows with its length alone.
+ */
 function fdStart(text) {
-  const m = /(?:^|[ \t])(\d+)$/.exec(text);
-  return text.length - (m ? m[1].length : 0);
+  const m = /\d+$/.exec(text.slice(-16));
+  if (!m) return text.length;
+  const at = text.length - m[0].length;
+  return at === 0 || text[at - 1] === ' ' || text[at - 1] === '\t' ? at : text.length;
 }
 
 /** A heredoc's operator goes into the part as a redirection of its own, whose word is its end line, not a file. */
@@ -133,6 +138,142 @@ function takeRedirect(cmd, k, cur) {
  */
 export const FILLED = '\u0000';
 
+/**
+ * The caps of expandBraces: the forms one word may make, how deep its braces may nest, and how many characters the text may
+ * grow by. Past any of them, the text is too much to read.
+ */
+const BRACE_FORMS = 256;
+const BRACE_DEPTH = 32;
+const BRACE_ROOM = 65536;
+/** What ends a word to the shell, outside quotes, for expandBraces. */
+const BRACE_ENDS = ' \t\n\r;&|<>()';
+
+/**
+ * Text with its braces expanded as the shell expands them, before anything else: an unquoted `{a,b}` in a word, nested ones
+ * too, makes the word several, side by side, each as written (`mv .claude{,-old}` is `mv .claude .claude-old`, and
+ * `rm -rf .{claude,git}` is `rm -rf .claude .git`). A brace or a comma in quotes, after a backslash or in `${…}` stays as it
+ * is, and so do `{}` and a pair with no comma of its own (`{a{b,c}}` is `{ab} {ac}`). The floor's reading (simpleCommands,
+ * read whole) expands each part's text, which holds no heredoc's text. null past the caps (BRACE_FORMS forms in one word,
+ * braces BRACE_DEPTH deep, BRACE_ROOM more characters): too much to read. The time it takes grows with the text's length.
+ */
+export function expandBraces(text) {
+  const s = String(text ?? '');
+  if (!s.includes('{')) return s;
+  let out = '';
+  let grown = 0;
+  for (let k = 0; k < s.length;) {
+    if (BRACE_ENDS.includes(s[k])) { out += s[k++]; continue; }
+    const w = braceWord(s, k);
+    k = w.end;
+    if (!w.open) { out += s.slice(w.start, w.end); continue; }
+    const forms = braceForms(w.units);
+    if (forms === null) return null;
+    const joined = forms.join(' ');
+    grown += joined.length - (w.end - w.start);
+    if (grown > BRACE_ROOM) return null;
+    out += joined;
+  }
+  return out;
+}
+
+/** Where a quote that opens at s[k - 1] closes (the index of its closing mark, or the last index when nothing closes it). */
+function quoteEnd(s, k, mark, escapes) {
+  for (let j = k; j < s.length; j++) {
+    if (escapes && s[j] === '\\') { j++; continue; }
+    if (s[j] === mark) return j;
+  }
+  return s.length - 1;
+}
+
+/** Where a `${` that opens at s[k - 2] closes: its own `}`, quotes and `${…}` inside it counted. */
+function paramClose(s, k) {
+  let depth = 1;
+  for (let j = k; j < s.length; j++) {
+    const ch = s[j];
+    if (ch === '\\') { j++; continue; }
+    if (ch === "'") { j = quoteEnd(s, j + 1, "'", false); continue; }
+    if (ch === '"') { j = quoteEnd(s, j + 1, '"', true); continue; }
+    if (ch === '$' && s[j + 1] === '{') { depth++; j++; continue; }
+    if (ch === '}' && --depth === 0) return j;
+  }
+  return s.length - 1;
+}
+
+/**
+ * One word of the text from `from`, as pieces (`units`): `{`, `}` and `,` the shell reads as braces and commas (`ch`), and the
+ * text between them as written (quotes, backslashes and `${…}` whole). `open`: it has a brace the shell reads.
+ */
+function braceWord(s, from) {
+  const units = [];
+  let lit = '';
+  let open = false;
+  let k = from;
+  for (; k < s.length; k++) {
+    const ch = s[k];
+    if (BRACE_ENDS.includes(ch)) break;
+    let to = k;
+    if (ch === '\\') to = k + 1;
+    else if (ch === "'") to = quoteEnd(s, k + 1, "'", false);
+    else if (ch === '"') to = quoteEnd(s, k + 1, '"', true);
+    else if (ch === '$' && s[k + 1] === "'") to = quoteEnd(s, k + 2, "'", true);
+    else if (ch === '$' && s[k + 1] === '"') to = quoteEnd(s, k + 2, '"', true);
+    else if (ch === '$' && s[k + 1] === '{') to = paramClose(s, k + 2);
+    else if (ch === '{' || ch === '}' || ch === ',') {
+      if (lit) units.push({ raw: lit });
+      lit = '';
+      units.push({ raw: ch, ch });
+      if (ch === '{') open = true;
+      continue;
+    }
+    lit += s.slice(k, to + 1);
+    k = to;
+  }
+  if (lit) units.push({ raw: lit });
+  return { units, start: from, end: Math.min(k, s.length), open };
+}
+
+/**
+ * The forms one word's pieces make (braceWord), or null past BRACE_FORMS forms or BRACE_DEPTH: each `{` is matched with its
+ * `}` and owns the commas between them at its own level; a pair with a comma is a choice, anything else stays as written.
+ */
+function braceForms(units) {
+  const close = new Map();
+  const commas = new Map();
+  const stack = [];
+  for (let i = 0; i < units.length; i++) {
+    const ch = units[i].ch;
+    if (ch === '{') { if (stack.push(i) > BRACE_DEPTH) return null; }
+    else if (ch === '}' && stack.length) close.set(stack.pop(), i);
+    else if (ch === ',' && stack.length) {
+      const o = stack.at(-1);
+      if (!commas.has(o)) commas.set(o, []);
+      commas.get(o).push(i);
+    }
+  }
+  const expand = (from, to) => {
+    let forms = [''];
+    let lit = '';
+    for (let i = from; i < to; i++) {
+      const u = units[i];
+      if (u.ch !== '{' || !close.has(i) || !commas.has(i)) { lit += u.raw; continue; }
+      const cuts = [i, ...commas.get(i).filter(c => c < close.get(i)), close.get(i)];
+      const alts = [];
+      for (let a = 0; a + 1 < cuts.length; a++) {
+        const sub = expand(cuts[a] + 1, cuts[a + 1]);
+        if (sub === null) return null;
+        alts.push(...sub);
+        if (alts.length > BRACE_FORMS) return null;
+      }
+      if (forms.length * alts.length > BRACE_FORMS) return null;
+      forms = forms.flatMap(f => alts.map(x => f + lit + x));
+      lit = '';
+      i = close.get(i);
+    }
+    return lit ? forms.map(f => f + lit) : forms;
+  };
+  return expand(0, units.length);
+}
+
 /** Keywords after which a command still starts: a `{` or a `(` there opens a group or a subshell. */
 const COMMAND_START = /^\s*(?:(?:then|do|else|elif|if|while|until|!|time|coproc)\s+)*$/;
 /** Keywords whose parentheses hold a list or a pattern, not a subshell or a word's group: `case x in (a) …`, zsh's `for f (a b) …`. */
@@ -149,34 +290,43 @@ const LIST_KEYWORD = /^\s*(?:case|for|foreach|select)\s/;
  * `{}` is a word (`find … -exec cp {} … \;`). A brace of its own opens or ends a group where a command starts (a group, a
  * function's body), and ends the command's words after them too, as zsh reads its short forms (`repeat 2 { rm x }`,
  * `{ cp a b }`); bash, and zsh after other words (`echo { a`), read it as one more word, so when words follow it, all the
- * words, read so, are a part of their own too (`nested`). A `#` that starts a word starts a comment, to the end of its line. Quotes, backslashes, heredocs and redirections are read as
- * shellParts reads them. Each part also says whether the shell runs it itself (`nested` false) or a subshell does (inside
- * `( )`, `$( )`, `` ` ` ``, `<( )` or `>( )`), and what ended it (`sep`: ';', '&&', '||', '|', '&', a new line, ')' at a
- * subshell's end, '{' or '}', or '').
- * @returns {{ text: string, writes: boolean, redir: object[], nested: boolean, sep: string }[]}
+ * words, read so, are one part of their own too (`shadow`, `nested`), once the command ends. A `#` that starts a word starts a
+ * comment, to the end of its line. Quotes, backslashes, heredocs and redirections are read as shellParts reads them. Each
+ * part also says whether the shell runs it itself (`nested` false) or a subshell does (inside `( )`, `$( )`, `` ` ` ``, `<( )`
+ * or `>( )`), which shell runs it (`frame`: a number for each subshell and output, whose `ups[frame]` is the one it was
+ * started from; the line's own commands run in `top`), and what ended it (`sep`: ';', '&&', '||', '|', '&', a new line, ')'
+ * at a subshell's end, '{' or '}', or '').
+ * @returns {{ text: string, writes: boolean, redir: object[], nested: boolean, frame: number, sep: string, shadow?: true }[]}
  */
-function lineParts(cmd) {
+function lineParts(cmd, ups = [-1], top = 0) {
   const parts = [];
   // what is open: a subshell ('paren'), another command's output ('sub', 'tick'), a ${…} ('param') or a pattern group ('group')
   const frames = [];
   let nested = 0; // how many subshells and outputs the current part is in
-  const fresh = () => ({ text: '', writes: false, redir: [], nested: nested > 0, sep: '' });
+  let frame = top; // the shell the current part runs in
+  const fresh = () => ({ text: '', writes: false, redir: [], nested: nested > 0, frame, sep: '' });
   let cur = fresh();
   let q = null; // the open quote, ' or "
   let heredoc = null;
-  const end = (sep) => {
-    if (cur.text.trim()) {
+  const end = (sep, brace = false) => {
+    const words = !!cur.text.trim();
+    if (words) {
       cur.sep = sep;
       parts.push(cur);
-      // after a "}" of its own in the middle of a command: bash's reading, all its words one command, as a part the shell does not run itself
-      if (cur.shadow) parts.push({ text: `${cur.shadow} ${cur.text}`, writes: cur.writes, redir: [], nested: true, sep });
+    }
+    // after a brace of its own in the middle of a command: bash's reading, all its words one command, as a part the shell
+    // does not run itself, once the command really ends (each brace of its own only adds to it), when words came after it
+    if (cur.bash && !brace && (words || cur.after)) {
+      parts.push({ text: `${cur.bash} ${cur.text}`, writes: cur.writes, redir: [], nested: true, frame: cur.frame, sep, shadow: true });
     }
     cur = fresh();
   };
   const starts = () => COMMAND_START.test(cur.text);
+  // a shell of its own: a subshell, or the one that runs another command's output
+  const inner = () => { const id = ups.length; ups.push(frame); frame = id; nested++; };
   // another command's output: a hole in this word, which goes on after it; the commands inside are parts of their own
-  const open = (kind) => { cur.text += FILLED; frames.push({ kind, q, saved: cur }); q = null; nested++; cur = fresh(); };
-  const close = () => { const f = frames.pop(); end(''); nested--; cur = f.saved; q = f.q; };
+  const open = (kind) => { cur.text += FILLED; frames.push({ kind, q, saved: cur, frame }); q = null; inner(); cur = fresh(); };
+  const close = () => { const f = frames.pop(); end(''); nested--; frame = f.frame; cur = f.saved; q = f.q; };
   // a word of its own: a blank, the start or the end, or the shell's punctuation on each side
   const alone = k => /^[\s;&|()]?$/.test(cmd[k - 1] ?? '') && /^[\s;&|()]?$/.test(cmd[k + 1] ?? '');
   for (let k = 0; k < cmd.length; k++) {
@@ -201,7 +351,7 @@ function lineParts(cmd) {
     // a case pattern's "(" and zsh's "for x (a b) …" list end the words before them, and the command after them starts afresh
     if ((ch === '(' || ch === ')') && LIST_KEYWORD.test(cur.text)) { end(''); continue; }
     if (ch === '(') {
-      if (starts()) { end(''); frames.push({ kind: 'paren' }); nested++; cur = fresh(); continue; }
+      if (starts()) { end(''); frames.push({ kind: 'paren', frame }); inner(); cur = fresh(); continue; }
       const fn = /^\(\s*\)/.exec(cmd.slice(k));
       if (fn && /^\s*(?:function\s+)?[^\s;&|()<>]+\s*$/.test(cur.text)) { cur.text = ''; k += fn[0].length - 1; continue; } // NAME(): its body follows
       frames.push({ kind: 'group' });
@@ -211,7 +361,7 @@ function lineParts(cmd) {
     if (ch === ')') {
       const f = frames.at(-1);
       if (f?.kind === 'sub') { close(); continue; }
-      if (f?.kind === 'paren') { end(')'); frames.pop(); nested--; cur = fresh(); continue; }
+      if (f?.kind === 'paren') { end(')'); frames.pop(); nested--; frame = f.frame; cur = fresh(); continue; }
       end(')'); // a case pattern's end
       continue;
     }
@@ -227,9 +377,11 @@ function lineParts(cmd) {
     if ((ch === '{' || ch === '}') && alone(k)) {
       // zsh opens and ends a group at a brace of its own after a command's words too ("repeat 2 { rm x }", "{ cp a.txt b }");
       // bash, and zsh after other words ("echo { a"), take it for one more word of the command: that reading is kept too
-      const shadow = `${cur.shadow ? `${cur.shadow} ` : ''}${cur.text}${ch}`;
-      end(ch);
-      cur.shadow = shadow;
+      const shadow = `${cur.bash ? `${cur.bash} ` : ''}${cur.text}${ch}`;
+      const after = !!cur.bash && (cur.after || !!cur.text.trim());
+      end(ch, true);
+      cur.bash = shadow;
+      cur.after = after;
       continue;
     }
     if (ch === '#' && /^[\s;&|()]?$/.test(cmd[k - 1] ?? '')) { // a comment, to the end of its line
@@ -244,18 +396,23 @@ function lineParts(cmd) {
     cur.text += ch;
   }
   // what is left open at the end: the commands inside end there, and the words around them go on
-  while (frames.length) { const f = frames.pop(); if (f.saved) { end(''); cur = f.saved; q = f.q; } }
+  while (frames.length) {
+    const f = frames.pop();
+    if (f.frame !== undefined) { if (f.saved) end(''); nested--; frame = f.frame; }
+    if (f.saved) { cur = f.saved; q = f.q; }
+  }
   end('');
   return parts;
 }
 
 /**
  * The word a redirection names, from `from` in a part's text: its quotes and backslashes taken away as shellWords does,
- * up to a blank or the next redirection. `end` is where it ends in the text.
+ * up to a blank or the next redirection. `end` is where it ends in the text, and `raw` the word as written.
  */
 function redirectWord(text, from) {
   let k = from;
   while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++;
+  const start = k;
   let w = '';
   let q = null;
   for (; k < text.length; k++) {
@@ -271,21 +428,21 @@ function redirectWord(text, from) {
     else if (ch === '\\' && k + 1 < text.length) w += text[++k];
     else w += ch;
   }
-  return { word: w, end: k };
+  return { word: w, end: k, raw: text.slice(start, k) };
 }
 
 /**
- * A part's redirections, `{ op, kind, target }` each (kind: 'write', 'quiet' for /dev/null and the like, 'read', 'dup',
- * 'string' for <<<, 'heredoc'), and its text without them, so its words are the command's own (`echo x>.claude/a` is
- * `echo x`, writing `.claude/a`).
+ * A part's redirections, `{ op, kind, target, raw }` each (kind: 'write', 'quiet' for /dev/null and the like, 'read', 'dup',
+ * 'string' for <<<, 'heredoc'; `raw`: the target as written), and its text without them, so its words are the command's own
+ * (`echo x>.claude/a` is `echo x`, writing `.claude/a`).
  */
 function partRedirects(part) {
   const redirects = [];
   let bare = '';
   let at = 0;
   for (const r of part.redir) {
-    const w = r.kind === 'heredoc' ? { word: '', end: r.end } : redirectWord(part.text, r.end);
-    redirects.push({ op: part.text.slice(r.start, r.end), kind: r.kind, target: w.word });
+    const w = r.kind === 'heredoc' ? { word: '', end: r.end, raw: '' } : redirectWord(part.text, r.end);
+    redirects.push({ op: part.text.slice(r.start, r.end), kind: r.kind, target: w.word, raw: w.raw });
     bare += part.text.slice(at, r.start) + ' ';
     at = w.end;
   }
@@ -431,22 +588,36 @@ function simpleCommand(words, writes, whole = false) {
  * part); a shell given its command inline runs it in a shell of its own (its commands are `nested`), and eval runs its
  * commands in this shell (`kids` on the eval part, `inEval` on each).
  */
-function simpleCommands(command, depth = 0, whole = false) {
+function simpleCommands(command, depth = 0, whole = false, ups = [-1], top = 0) {
   const out = [];
-  for (const part of (whole ? lineParts : shellParts)(String(command || ''))) {
-    const words = shellWords(part.text);
-    const c = simpleCommand(words, part.writes, whole);
+  for (const part of (whole ? lineParts(String(command || ''), ups, top) : shellParts(String(command || '')))) {
     // where the part redirects to, and the command without its redirections (null when that leaves no program)
-    const { redirects, bare } = partRedirects(part);
+    let { redirects, bare } = partRedirects(part);
+    let text = part.text;
+    let unread = false;
+    if (whole) {
+      // read whole, each word's braces are expanded first, as the shell expands them; past expandBraces' caps, the part
+      // is read as it is written, marked `unread`
+      const read = t => { const x = expandBraces(t); if (x === null) unread = true; return x ?? t; };
+      text = read(text);
+      bare = read(bare);
+      redirects = redirects.flatMap(r => {
+        if (!r.raw.includes('{')) return [r];
+        const forms = shellWords(read(r.raw));
+        return forms.length ? forms.map(target => ({ ...r, target })) : [r];
+      });
+    }
+    const words = shellWords(text);
+    const c = simpleCommand(words, part.writes, whole);
     const own = { redirects, bare: simpleCommand(shellWords(bare), part.writes, whole) };
-    if (whole) Object.assign(own, { nested: part.nested, sep: part.sep });
+    if (whole) Object.assign(own, { nested: part.nested, sep: part.sep, frame: part.frame, ...(part.shadow === true ? { shadow: true } : {}), ...(unread ? { unread } : {}) });
     if (!c) {
       if (words.length) out.push({ empty: true, prog: '', script: false, args: [], writes: part.writes, sub: '', subArgs: [], gitOpts: false, words, at: words.length, ...own });
       continue;
     }
     Object.assign(c, own);
     out.push(c);
-    if (whole) { out.push(...wholeKids(c, depth)); continue; }
+    if (whole) { out.push(...wholeKids(c, depth, ups)); continue; }
     const inner = inlineOf(c);
     if (inner !== null) c.inline = true;
     if (depth > 2) continue;
@@ -468,31 +639,40 @@ function inlineOf(c) {
 
 /**
  * The commands one part runs besides itself, read whole: those of a shell given its command inline, in a shell of its own
- * (`nested`); those of eval, in this shell (`kids` on the eval part, `inEval` on each); and those find runs (findRuns).
+ * (`nested`, in a frame of their own); those of eval, in this shell (`kids` on the eval part, `inEval` on each, in the frame
+ * `evalFrame`, which stands for the eval part); and those find runs (findRuns). Past three shells inside each other, the
+ * part is marked `unread`: what the innermost runs is not read.
  */
-function wholeKids(c, depth) {
+function wholeKids(c, depth, ups) {
   const out = [];
   const inner = inlineOf(c);
   if (inner !== null) c.inline = true;
-  if (depth > 2) return out;
+  if (depth > 2) {
+    if (inner !== null || (c.prog === 'find' && c.args.some(a => /^-(?:exec|execdir|ok|okdir)$/.test(a)))) c.unread = true;
+    return out;
+  }
   if (inner !== null) {
-    const kids = simpleCommands(inner, depth + 1, true);
+    const frame = ups.length;
+    ups.push(c.frame ?? 0);
+    const kids = simpleCommands(inner, depth + 1, true, ups, frame);
     if (c.prog === 'eval') {
       c.kids = kids.filter(kid => !kid.inEval);
+      c.evalFrame = frame;
       for (const kid of kids) { kid.inEval = true; kid.nested = kid.nested || c.nested; }
     } else for (const kid of kids) kid.nested = true;
     if (c.finder) for (const kid of kids) kid.finder ??= c.finder; // find puts what it finds at "{}" in the shell's command too
     out.push(...kids);
   }
-  if (c.prog === 'find') for (const run of findRuns(c)) out.push(run, ...wholeKids(run, depth + 1));
+  if (c.prog === 'find') for (const run of findRuns(c, ups)) out.push(run, ...wholeKids(run, depth + 1, ups));
   return out;
 }
 
 /**
  * The commands a find part runs, read whole: each -exec, -execdir, -ok and -okdir, up to its ";" or the "+" after "{}" (or a
- * "+" that ends the words), each `nested`, with `finder`: the find part, whose "{}" each stands for what find finds.
+ * "+" that ends the words), each `nested`, in a frame of its own, with `finder`: the find part, whose "{}" each stands for
+ * what find finds.
  */
-function findRuns(c) {
+function findRuns(c, ups) {
   const out = [];
   for (let e = 0; e < c.args.length; e++) {
     if (!/^-(?:exec|execdir|ok|okdir)$/.test(c.args[e])) continue;
@@ -500,7 +680,11 @@ function findRuns(c) {
     while (stop < c.args.length && c.args[stop] !== ';' && !(c.args[stop] === '+' && c.args[stop - 1] === '{}')) stop++;
     if (stop >= c.args.length && c.args.at(-1) === '+') stop = c.args.length - 1;
     const run = simpleCommand(c.args.slice(e + 1, stop), false, true);
-    if (run) out.push(Object.assign(run, { redirects: [], nested: true, sep: '', finder: c }));
+    if (run) {
+      const frame = ups.length;
+      ups.push(c.frame ?? 0);
+      out.push(Object.assign(run, { redirects: [], nested: true, sep: '', finder: c, frame }));
+    }
     e = stop;
   }
   return out;
@@ -794,6 +978,8 @@ const ACTIONS = [
 ];
 
 const WRITES = ACTIONS.findIndex(([does]) => does === 'write to a file');
+/** The most parts a command may have for commandAction to name what it does: past them, plainer words. */
+const ACTION_PARTS = 256;
 
 /**
  * Commands with nothing to tell the person that do not change what the commands after them mean. (`cd` is
@@ -815,6 +1001,7 @@ const NOOPS = new Set(['cd', 'pushd', 'popd', 'echo', 'printf', 'true', 'false',
 export function commandAction(command, vouch) {
   let cmds;
   try { cmds = simpleCommands(command); } catch { return null; } // words are a courtesy; never break narration
+  if (cmds.length > ACTION_PARTS) return null; // too many parts to name in a few words, and to read each time
   if (cmds.some(c => DOWNLOADERS.has(c.prog)) && cmds.some(c => RUNS_CODE.has(c.prog))) return { does: FROM_INTERNET[0], doing: FROM_INTERNET[1], routine: false };
   let main = -1; // the most important entry that is not routine
   let routine = -1; // the most important routine entry
@@ -860,7 +1047,20 @@ export function commandAction(command, vouch) {
  * output is a hole (FILLED) in its word.
  */
 export function shellCommands(command, { whole = false } = {}) {
-  try { return simpleCommands(command, 0, whole === true); } catch { return []; }
+  if (whole !== true) {
+    try { return simpleCommands(command, 0, false); } catch { return []; }
+  }
+  // read whole: `ups` says which shell each frame was started from; a line that could not be read at all is `unread`
+  const ups = [-1];
+  let out;
+  try {
+    out = simpleCommands(command, 0, true, ups, 0);
+  } catch {
+    out = [];
+    out.unread = true;
+  }
+  out.ups = ups;
+  return out;
 }
 
 /** A script name worth reading out: no spaces or slashes, so it is the name and nothing else. */

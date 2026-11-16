@@ -1814,6 +1814,116 @@ test('with full permissions on, a tool of another service is judged by the place
   ]);
 });
 
+// ---------------------------------------------------------------------------------------------
+// Bounded: every decide answers in well under a tenth of a second, whatever the command holds, and past a cap it says it
+// could not tell, never something that is not true
+
+const TOO_MUCH = 'Full permissions are on, but this command is too long or too involved for Workbench to tell where it writes, so it did not allow it.';
+/** Reasons that say a step reaches Claude Code's own settings: never given where nothing names them. */
+const SETTINGS_REASONS = [FLOOR_REASON, CD_CLAUDE, CODE_CLAUDE, TOOL_CLAUDE, CD_UNCLEAR_REASON];
+/** A decide may take this long here; on this Mac each takes a few tens of milliseconds at most. */
+const LIMIT_MS = 250;
+
+/** A folder of many packages and folders, link chains longer than anything follows them, and a folder of many files, made once. */
+let bigDir = null;
+function big() {
+  if (bigDir) return bigDir;
+  bigDir = T + '/big';
+  for (const d of ['/.claude', '/links/target', '/many']) fs.mkdirSync(bigDir + d, { recursive: true });
+  for (let i = 0; i < 200; i++) fs.mkdirSync(`${bigDir}/pkg${i}`);
+  for (let i = 0; i < 60; i++) { fs.mkdirSync(`${bigDir}/d${i}`); fs.mkdirSync(`${bigDir}/e${i}`); }
+  // l0 -> l1 -> … -> l39 -> target: more links in a row than the system follows; m0 -> … -> m19 -> nothing: more than the policy follows
+  for (let i = 0; i < 40; i++) fs.symlinkSync(i < 39 ? `l${i + 1}` : 'target', `${bigDir}/links/l${i}`);
+  for (let i = 0; i < 20; i++) fs.symlinkSync(i < 19 ? `m${i + 1}` : 'nothing-here', `${bigDir}/links/m${i}`);
+  for (let i = 0; i < 400; i++) fs.writeFileSync(`${bigDir}/many/f${i}.txt`, '');
+  return bigDir;
+}
+const rep = (n, f, sep = ' && ') => Array.from({ length: n }, (_, i) => f(i)).join(sep);
+const upTo64k = unit => { let s = ''; for (let i = 0; s.length < 65536; i++) s += unit(i); return s; };
+
+test('every decide is bounded: many cd steps, || chains, 64 KB lines, many braces and deep links answer in well under a tenth of a second', () => {
+  const b = big();
+  const json = upTo64k(i => `{"id":${i},"name":"item${i}"},\n`);
+  // each line, and what full permissions decide for it: what they can read is judged, and past a cap they say they could not tell
+  const lines = [
+    [rep(200, i => `cd pkg${i} && npm test && cd ..`), FULL],
+    [rep(200, i => `cd pkg${i} && npm test > out.txt && cd ..`), FULL],
+    [rep(20, i => `cd d${i}`), FULL],
+    [rep(60, i => `cd d${i} || cd e${i}`) + ' && npm test', TOO_MUCH],
+    [rep(8, i => `cd d${i} || cd e${i}`) + ' && npm test', TOO_MUCH],
+    [upTo64k(i => `echo ${i} && `) + 'true', TOO_MUCH],
+    [upTo64k(i => `cd d${i % 60}; `) + 'ls', TOO_MUCH],
+    [upTo64k(() => 'echo a } ') + 'b', TOO_MUCH],
+    ["cat > data.json <<'EOF'\n" + json + 'EOF', FULL],
+    ['ls ' + upTo64k(i => `a${i} `), FULL],
+    ['echo "' + upTo64k(() => '{a,b},') + '" > notes.md', FULL],
+    ['echo ' + rep(300, i => `x{a,b}${i}`, ' '), FULL],
+    ['rm -f ' + rep(300, i => `x{a,b}${i}`, ' '), FULL],
+    ['echo ' + rep(300, () => '{a,b}', ''), TOO_MUCH],
+    ['echo x > links/l0/out.txt', WRITE_UNCLEAR],
+    [rep(30, i => `echo x > links/l${i}/out${i}.txt`, '; '), WRITE_UNCLEAR],
+    ['echo x > links/m0', WRITE_UNCLEAR],
+    ['rm -f many/*.txt many/f*', FULL],
+    [rep(50, () => 'echo x > many/f*', '; '), FULL],
+  ];
+  const wrong = [];
+  for (const [command, want] of lines) {
+    for (const full of [true, false]) {
+      const t0 = performance.now();
+      const d = decide({ tool: 'Bash', input: { command }, cwd: b, full });
+      const ms = performance.now() - t0;
+      const label = `${JSON.stringify(command.slice(0, 60))}… (${command.length} characters, full ${full})`;
+      if (ms >= LIMIT_MS) wrong.push(`${label}: ${Math.round(ms)} ms`);
+      if (full && d.reason !== want) wrong.push(`${label}: ${d.decision}: ${d.reason}`);
+      if (full && SETTINGS_REASONS.includes(d.reason)) wrong.push(`${label}: a reason that is not true`);
+    }
+  }
+  assert.equal(wrong.length, 0, wrong.join('\n'));
+});
+
+test('past a cap, full permissions say they could not tell, never that a step reaches Claude Code’s own settings', () => {
+  // eight "cd a || cd b" pairs make more ways than are followed: once refused as moving the shell into the settings
+  refusedWith([bash(rep(8, i => `cd d${i} || cd e${i}`) + ' && ls'), bash(rep(40, i => `pushd d${i % 60}`)),
+    bash(rep(1500, i => `cd d${i % 60}`, '; ')), bash('echo ' + '{a,b}'.repeat(9))], TOO_MUCH, row => decide({ cwd: big(), ...row, full: true }));
+  // shells inside shells inside shells: what the innermost runs is not read
+  refusedWith([bash(`sh -c "sh -c \\"sh -c 'sh -c ls'\\""`)], TOO_MUCH);
+  // without full permissions, a line too long to check every part of asks, and says why
+  const d = decide({ cwd: big(), ...bash('ls ' + upTo64k(i => `a${i} `)) });
+  assert.deepEqual([d.decision, d.reason], ['ask', 'This step has more in it than Workbench can check, so it needs your OK.']);
+});
+
+test('with full permissions on, a heredoc’s text and words in quotes keep their braces: a heredoc is judged by where it writes', () => {
+  const objects = n => '[' + Array.from({ length: n }, (_, i) => `{"id":${i},"name":"item${i}"}`).join(',') + ']';
+  allowedInFull([
+    bash(`cat > data.json <<'EOF'\n${objects(7)}\nEOF`), bash(`cat > data.json <<'EOF'\n${objects(40)}\nEOF`),
+    bash("cat > data.json <<'EOF'\n" + rep(200, i => `  {"id":${i},"name":"item${i}"},`, '\n') + '\nEOF'),
+    bash("cat > f.js <<'EOF'\n" + rep(70, () => 'function f(a,b){return {a,b};}', '\n') + '\nEOF'),
+    bash(`curl -d '${objects(9)}' https://example.com`), bash(`echo "${objects(9)}" > notes.json`), bash("touch '{.claude,x}'"),
+    bash(`python3 - <<'EOF'\nimport json\nprint(json.dumps(${objects(12)}))\nEOF`),
+  ]);
+  // where it writes still counts, and so does a brace the shell expands
+  refusedWith([bash(`cat > .claude/data.json <<'EOF'\n${objects(9)}\nEOF`), bash(`cat > .mcp.json <<EOF\n{"a":1,"b":2}\nEOF`),
+    bash('echo x > .{claude,git}/x'), bash("sh -c 'mv .claude{,-old}'"), bash('bash -c "rm -rf .{claude,git}"'), bash("eval 'mv .mcp.json{,.bak}'"),
+    bash('echo "$(rm -rf .{claude,git})"')], FLOOR_REASON);
+  // a shell given code on its input expands its braces: in a heredoc's text, and in the words another command hands it
+  refusedWith([bash("echo 'rm -rf .{claude,git}' | sh"), bash("bash <<'EOF'\nrm -rf .{claude,git}\nEOF"),
+    { tool: 'mcp__shell__run_command', input: { command: 'rm -rf .{claude,git}' } }], CODE_CLAUDE);
+});
+
+test('with full permissions on, each command is read from the folder the shell is in when it runs', () => {
+  allowedInFull([
+    // a cd in a subshell, another command's output, the background or a pipe's command before its last stays there
+    bash('(cd .claude && ls); rm settings.json'), bash('echo "$(cd .claude && pwd)"; rm settings.json'), bash('cd .claude & rm settings.json'),
+    bash('cd .claude | cat; rm settings.json'), bash('cd .claude; cd ..; rm settings.json'), bash('cd src && touch new.js && cd .. && rm old.txt'),
+    bash(rep(40, i => `cd pkg${i} && npm test > out.txt && cd ..`)),
+  ], row => decide({ cwd: big(), ...row, full: true }));
+  refusedWith([bash('cd .claude; rm settings.json; cd ..'), bash('(cd .claude && rm settings.json)'), bash('pushd .claude && rm settings.json && popd'),
+    bash("eval 'cd .claude' && rm settings.json && cd .."),
+    // a loop or a function may run a command again, from wherever a later one left the shell
+    bash('for x in 1 2; do rm settings.json; cd .claude; done; cd ..'), bash('f() { rm settings.json; }; cd .claude; f; cd ..'),
+    bash('while true; do touch x.json; cd .claude; done')], FLOOR_REASON, row => decide({ cwd: big(), ...row, full: true }));
+});
+
 test('without full permissions, nothing the policy says changes', () => {
   const rows = [bash('rm -rf build'), bash('echo {} > .claude/settings.json'), { tool: 'Write', input: { file_path: '.claude/settings.json' } },
     { tool: 'WebFetch', input: { url: 'https://example.com' } }, bash('ls'), { tool: 'Agent', input: { isolation: 'worktree' } }];
