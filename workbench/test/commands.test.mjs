@@ -2141,6 +2141,21 @@ test('an agent named alone asks what it should work on; the engine names it, and
   ]);
 });
 
+test('words said again once the agent they started has ended are a prompt again; while it is at work they are its status', () => {
+  for (const [name, said] of [['Thanks', 'thanks'], ['Hi', 'hi'], ['Help', 'help'], ['Hello', 'hello'], ['Cool', 'cool'], ['Thank you', 'thank you']]) {
+    for (const state of ['done_claimed', 'done_checked', 'checks_failed', 'stopped', 'failed']) {
+      const ended = [{ id: 'q1', name, task: said, state, kind: 'agent' }];
+      for (const focusId of [null, 'q1']) {
+        assert.deepEqual(parseCommand(said, { agents: ended, machines, harnesses, focusId }), task(said), `${said} [${state}, focus ${focusId}]`);
+      }
+    }
+  }
+  for (const [name, said] of [['Thanks', 'thanks'], ['Help', 'help']]) {
+    const busy = [{ id: 'q1', name, task: said, state: 'working', kind: 'agent' }];
+    assert.deepEqual(parseCommand(said, { agents: busy, machines, harnesses, focusId: null }), { kind: 'status', agentId: 'q1' }, said);
+  }
+});
+
 test('on a card, words that answer it answer it; anything else is a prompt, and the card stays (the engine keeps it)', () => {
   for (const ctx of ['pending', 'pendingStop', 'pendingMerge', 'pendingDiscard', 'pendingPermissions', 'boardCard', 'boardStopCard']) {
     sweptRows([

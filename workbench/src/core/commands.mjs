@@ -2190,12 +2190,16 @@ function helpersWait(c) {
   return c.agents.filter(a => a.id !== c.focus.id && (a.parentId === c.focus.id || a.rootId === c.focus.id) && hasAsk(a)).length > 1;
 }
 
-/** The words of an agent's task that say something: retyping them is the same work again. */
+/**
+ * The words of an agent's task that say something: retyping them is the same work again. A task of words that say
+ * nothing by themselves ("thanks", "hi", "thank you", a prompt like any other) is the same work when all its words are
+ * said again.
+ */
 function sameWork(core, a) {
-  const task = lex(String(a.task || '')).map(t => t.w).filter(w => !NOTHING_WORDS.has(w));
-  if (!task.length) return false;
+  const all = lex(String(a.task || '')).map(t => t.w);
+  const meant = all.some(w => !NOTHING_WORDS.has(w)) ? all.filter(w => !NOTHING_WORDS.has(w)) : all;
   const said = new Set(core.map(t => t.w));
-  return task.every(w => said.has(w));
+  return meant.length > 0 && meant.every(w => said.has(w));
 }
 
 /**
