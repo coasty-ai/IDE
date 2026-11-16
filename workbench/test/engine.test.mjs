@@ -4789,3 +4789,34 @@ test('words that begin with a card\'s yes or no answer it, whatever follows, and
   assert.equal(t.claude.runners.length, 2, 'nothing started');
   await t.engine.shutdown();
 });
+
+test('with a finished agent\'s merge card on screen, a stop of "it" with its reason after it stops the one agent at work, and the card stays', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.engine.deps.commands = commands;
+  const cart = await doneAgent(t);
+  const card = await t.engine.proposeMerge(cart.id);
+  assert.equal(card.confirm.kind, 'merge');
+  // as the page sends words while a card is shown: the card's id, and no agent in the centre
+  for (const text of ['stop it, it is deleting the wrong files', 'kill it\nwrong branch', 'pause it - I need to check',
+    'stop the agent because it is looping', 'stop\nit is deleting the wrong files']) {
+    const a = await started(t); // Fix login redirect, the one agent at work
+    const before = t.notices.length;
+    const out = await t.engine.command(text, { focusId: null, confirmId: card.confirm.id, askId: null });
+    assert.deepEqual(out, { reply: 'Stopped Fix login redirect.', confirm: card.confirm }, text);
+    assert.deepEqual(t.notices.slice(before), [out.reply], `${text}: what stopped is said under the board, as the card stays`);
+    assert.equal(t.store.get(a.id).state, 'stopped', text);
+    assert.equal(a.runner.stopCalls, 1, text);
+  }
+  // two at work: which one is not clear, nothing stops, and the card still stays
+  const one = await started(t);
+  const two = await started(t, { task: 'Update the docs' });
+  assert.deepEqual(await t.engine.command('stop it, it is deleting the wrong files', { confirmId: card.confirm.id }),
+    { reply: 'I couldn’t tell which agent to stop.', confirm: card.confirm });
+  assert.deepEqual([one.runner.stopCalls, two.runner.stopCalls], [0, 0]);
+  assert.ok([one, two].every(x => t.store.get(x.id).state !== 'stopped'), 'both still work');
+  // the card still takes its own words, and nothing started
+  assert.equal((await t.engine.command('cancel', { confirmId: card.confirm.id })).reply, 'OK, I won’t merge it.');
+  assert.equal(t.claude.runners.length, 8, 'the finished agent, the five stopped and the two at work: nothing started');
+  assert.equal(t.calls.mergeWork.length, 0, 'nothing merged');
+  await t.engine.shutdown();
+});

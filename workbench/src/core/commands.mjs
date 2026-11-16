@@ -35,7 +35,7 @@
 // 'start', tasks: [], task: null, harness }, with harness the one agent the words named (else null), and the engine
 // asks what that agent should work on.
 import { clip } from '../shared/format.mjs';
-import { ENDED, LOOK, DONE } from '../shared/states.mjs';
+import { ENDED, LOOK, DONE, ACTIVE } from '../shared/states.mjs';
 import { FILLER } from '../shared/filler.mjs';
 import { LOOKS_GOOD_RE, NOT_NOW_RE } from '../shared/answers.mjs';
 
@@ -900,7 +900,8 @@ function dashBetween(a, b) {
 const ALL_END = new Set([...STOP_ALL_WORDS, 'agents', 'them', 'helpers', 'jobs', 'tasks', 'things', 'stuff']);
 
 /**
- * The target of a stop word, and how it may end:
+ * The target of a stop word, and how it may end ("it" and the other words for the agent in the centre are what stopIt
+ * says they mean):
  * - `open`: "it", "them", which no word can go on from, so anything but "from" (what to prevent) may follow;
  * - `clause`: "the agent", "this one", "everything", "all agents", which a break, a word of reason or time, a pronoun, or
  *   the first word of another noun ends ("stop all agents the build is broken");
@@ -916,12 +917,12 @@ function stopTarget(toks, c, cancel) {
   const ws = toks.map(t => t.w);
   const s = ws.join(' ');
   const last = ws[ws.length - 1];
-  const focus = { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] };
-  if (s === 'it' || s === 'him' || s === 'her') return { intent: focus, strong: !!c.focusId, level: 'open' };
+  const it = level => ({ ...stopOfIt(c), level });
+  if (s === 'it' || s === 'him' || s === 'her') return it('open');
   if (s === 'them' || s === 'they') return { intent: { kind: 'stop', agentIds: [] }, strong: false, level: 'open' };
-  if (s === 'that' || s === 'this') return cancel ? null : { intent: focus, strong: !!c.focusId, level: 'tight' };
+  if (s === 'that' || s === 'this') return cancel ? null : it('tight');
   if (s === 'all' || s === 'every') return { intent: { kind: 'stop_all' }, strong: true, level: 'tight' };
-  if (PRONOUN_REFS.has(s)) return { intent: focus, strong: !!c.focusId, level: 'clause' };
+  if (PRONOUN_REFS.has(s)) return it('clause');
   if (ALL_END.has(last) && matchStopAll(['stop', ...ws])) return { intent: { kind: 'stop_all' }, strong: true, level: 'clause' };
   if (launchPhrase(ws)) return null; // "stop an agent to fix the login" says what a new agent should do
   // a name ends with a word of it, or with a word for an agent ("the onboarding agent"), never with a little word that
@@ -969,11 +970,12 @@ function stopFirst(core, c) {
     if (!target) continue;
     let k = 1 + n;
     for (let m = 1; m && k < core.length && !core[k - 1].tail; k += m) m = startsWithSeq(core.slice(k).map(t => t.w), STOP_SOON);
+    const found = { intent: target.intent, strong: target.strong, it: !!target.it };
     if (k >= core.length) {
-      if (k > 1 + n) return { intent: target.intent, strong: target.strong }; // "stop everything for now"
+      if (k > 1 + n) return found; // "stop everything for now"
       continue; // the target is all that is said: as before
     }
-    if (endsTarget(core, k, target.level)) return { intent: target.intent, strong: target.strong };
+    if (endsTarget(core, k, target.level)) return found;
   }
   return null;
 }
@@ -985,7 +987,7 @@ function matchStop(core, c, base = core) {
   if (around) {
     const what = around[1] || around[2];
     if (what === 'everything' || what === 'them all' || what === 'all of them') return { intent: { kind: 'stop_all' }, strong: true };
-    return { intent: { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] }, strong: !!c.focusId };
+    return stopOfIt(c);
   }
   const v = startsWithSeq(ws, STOP_VERBS);
   if (!v) return null;
@@ -1019,16 +1021,16 @@ function matchStop(core, c, base = core) {
     if (!(rest.length === 1 && rest[0].w === 'that')) rest = [];
   }
   if (!rest.length) {
-    // A bare "stop" means the focused agent. A bare "cancel" or "end" is too vague to stop anything.
+    // A bare "stop" means what "it" does (stopIt). A bare "cancel" or "end" is too vague to stop anything.
     if (!['stop', 'pause', 'halt', 'kill', 'abort', 'terminate'].includes(ws[0])) return null;
-    return { intent: { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] }, strong: !!c.focusId };
+    return stopOfIt(c);
   }
   const refWords = rest.map(t => t.w).join(' ');
   if (ws[0] === 'cancel' && (refWords === 'that' || refWords === 'this')) return null; // "cancel that" is a never-mind, not about an agent
   // "stop them": which ones is not clear, so the engine says so; never one agent picked by its spelling
   if (refWords === 'them' || refWords === 'they') return { intent: { kind: 'stop', agentIds: [] }, strong: false };
-  // "stop its work", "stop the work": the agent in the centre, as "stop it"
-  if (GENERIC_WORK.test(refWords)) return { intent: { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] }, strong: !!c.focusId };
+  // "stop its work", "stop the work": what "it" means, as "stop it"
+  if (GENERIC_WORK.test(refWords)) return stopOfIt(c);
   // "stop the tests from failing", "stop the flaky test from timing out": what to prevent, which is work; but "stop the
   // onboarding agent from running" is a stop
   const from = rest.findIndex((t, i) => i > 0 && i < rest.length - 1 && t.w === 'from');
@@ -1041,9 +1043,11 @@ function matchStop(core, c, base = core) {
   // Words that match nothing beside the agent's words say what to do, not which agent:
   // "stop the flaky test from timing out" is work, the prompt for a new agent like other work.
   if (r.ids.length && !r.full) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
+  // "stop this one", "stop that agent", "stop that": what "it" means
+  if (r.pronoun || (!r.ids.length && PRONOUN_REFS.has(refWords))) return stopOfIt(c);
   // No agent matches (and it is no "it" or "that"): a work request that starts with a stop verb, so the whole sentence
   // is the prompt for a new agent: "Started Claude on “stop the flaky test from timing out”."
-  if (!r.ids.length && !PRONOUN_REFS.has(refWords)) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
+  if (!r.ids.length) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
   const intent = { kind: 'stop', agentIds: r.ids };
   if (r.ids.length && !r.named) intent.sure = false; // found, but not by its name: the engine asks first
   return { intent, strong: r.named };
@@ -1136,6 +1140,13 @@ function focusRoot(c) {
 /** A card on screen that still waits (not one that ran out). */
 const liveCard = c => (c.pendingConfirm && !c.pendingConfirm.gone ? c.pendingConfirm : null);
 
+/** The one agent a card is about: a merge or throw-away card names it, a stop or message card may. Else null. */
+function cardAgentId(card) {
+  if (!card) return null;
+  return typeof card.agentId === 'string' && card.agentId ? card.agentId
+    : Array.isArray(card.agentIds) && card.agentIds.length === 1 && typeof card.agentIds[0] === 'string' ? card.agentIds[0] : null;
+}
+
 /**
  * The root that words pointing at work mean ("it", "all of it", "everything it did"). With a card on screen, "it" is
  * the card: its one agent (a merge or throw-away card names it, a stop card may), else none. Otherwise the agent in the
@@ -1147,11 +1158,37 @@ function pointedRoot(c) {
     const f = focusRoot(c);
     if (f || !card) return f;
   }
-  const id = typeof card.agentId === 'string' && card.agentId ? card.agentId
-    : Array.isArray(card.agentIds) && card.agentIds.length === 1 && typeof card.agentIds[0] === 'string' ? card.agentIds[0] : null;
+  const id = cardAgentId(card);
   if (!id) return null;
   const a = c.agents.find(x => x.id === id);
   return a ? (rootOf(a, c)?.id ?? null) : id;
+}
+
+/** A root agent at work: one a stop acts on. */
+const atWork = a => !!a && isRoot(a) && ACTIVE.has(a.state);
+
+/**
+ * The agent a stop's "it" means ("stop it", "stop the agent", "this one", a stop word alone with its reason after it,
+ * "shut it down", "stop its work"): the agent in the centre. With none there (a card is in the centre, for the page sends
+ * no agent with one, or nothing is), a stop can only be about work: the card's own agent when it is at work (a throw-away
+ * card of an agent that still works), else the one agent at work (a merge card is about finished work, so "stop it, it is
+ * deleting the wrong files" there is about the agent that works). With more than one at work and none of them the card's,
+ * null: which one is not clear, and the engine says so.
+ */
+function stopIt(c) {
+  if (c.focusId) return c.focusId;
+  const id = cardAgentId(liveCard(c));
+  const own = id ? c.agents.find(a => a.id === id) : null;
+  const root = own ? rootOf(own, c) : null;
+  if (atWork(root)) return root.id;
+  const working = c.agents.filter(atWork);
+  return working.length === 1 ? working[0].id : null;
+}
+
+/** A stop of what "it" means (stopIt). `it` says so, for a program named before the words (vocativeRest). */
+function stopOfIt(c) {
+  const id = stopIt(c);
+  return { intent: { kind: 'stop', agentIds: id ? [id] : [] }, strong: !!id, it: true };
 }
 
 /** The words are nothing but an agent's whole name ("diff viewer", "merge command"): a name, not a command. */
@@ -2887,7 +2924,8 @@ function addressedRest(base) {
 /**
  * An agent's name, then a command: the command. After "claude," or "codex:" any command but work (which is a launch
  * for that agent: matchStart); with no comma, a stop ("claude stop", "claude stop it"). A stop meant for the agent in
- * the centre stops it only when it is that agent ("codex, stop" with a Claude agent in the centre names none).
+ * the centre, or for the one "it" means with none there (stopIt), stops it only when it is that agent ("codex, stop" with
+ * a Claude agent in the centre, or at work, names none).
  */
 function vocativeRest(core, c) {
   const ws = core.map(t => t.w);
@@ -2899,8 +2937,8 @@ function vocativeRest(core, c) {
   // "claude, stop asking" is work for Claude, as before: full permissions take their words only whole
   if (!r || ['start', 'task', 'unknown', 'permissions'].includes(r.intent.kind)) return null;
   if (!core[h.len - 1].tail && r.intent.kind !== 'stop' && r.intent.kind !== 'stop_all') return null;
-  if (r.intent.kind === 'stop' && r.intent.agentIds?.length === 1 && r.intent.agentIds[0] === c.focusId) {
-    const f = c.focus;
+  if (r.intent.kind === 'stop' && r.intent.agentIds?.length === 1 && (r.it || r.intent.agentIds[0] === c.focusId)) {
+    const f = c.agents.find(a => a.id === r.intent.agentIds[0]);
     if (f && typeof f.harness === 'string' && f.harness !== h.harness) return { intent: { kind: 'stop', agentIds: [] }, strong: false };
   }
   return r;

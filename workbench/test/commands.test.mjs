@@ -2556,8 +2556,8 @@ test('a stop word with an agent target first stops that target, whatever follows
     ['stop the agent because it is looping', 'onboarding', stopOf('7a8b9c')],
     ['stop all agents, the build is broken', 'onboarding', stopAll],
     ['stop everything it is deleting files', 'onboarding', stopAll],
-    // with no agent in the centre, which one is not clear (the engine says so): never a prompt, and never an agent picked by
-    // a word of the reason ("check" is no part of Checkout fix's name)
+    // with no agent in the centre and more than one at work, which one is not clear (the engine says so): never a prompt,
+    // and never an agent picked by a word of the reason ("check" is no part of Checkout fix's name)
     ['stop it, it is deleting the wrong files', 'none', stopOf()],
     ['kill it\nwrong branch', 'none', stopOf()],
     ['pause it - I need to check', 'none', stopOf()],
@@ -2634,20 +2634,74 @@ test('a stop word whose words go on past any target is read as before: work, a n
 });
 
 test('on a card a stop of an agent still stops it (the engine keeps the card); the page sends no agent in the centre with a card', () => {
-  for (const [ctx, name, id] of [['pendingMerge', 'onboarding', '7a8b9c'], ['pendingDiscard', 'onboarding', '7a8b9c'],
-    ['pendingPermissions', 'onboarding', '7a8b9c'], ['boardCard', 'search cleanup', 'w00001']]) {
+  // [card, a name on the board, its agent, what "it" means there: the one agent at work, or none when more than one is]
+  for (const [ctx, name, id, it] of [['pendingMerge', 'onboarding', '7a8b9c', []], ['pendingDiscard', 'onboarding', '7a8b9c', []],
+    ['pendingPermissions', 'onboarding', '7a8b9c', []], ['boardCard', 'search cleanup', 'w00001', ['w00001']]]) {
     sweptRows([
       [`stop ${name}, it is looping`, ctx, stopOf(id)],
       [`stop ${name}`, ctx, stopOf(id)],
       ['stop everything, the build is broken', ctx, stopAll],
       ['stop all agents', ctx, stopAll],
-      // "it" on a card is no agent at work: which one is not clear, and nothing starts
-      ['stop it, it is deleting the wrong files', ctx, stopOf()],
+      // "it" on a card: the one agent at work; with five at work, which one is not clear, and nothing starts
+      ['stop it, it is deleting the wrong files', ctx, stopOf(...it)],
       // a stop word alone, or with "it", is still the card's no
       ['stop', ctx, { kind: 'confirm', go: false }],
       ['stop it', ctx, { kind: 'confirm', go: false }],
     ]);
   }
+});
+
+// A stop's "it" with no agent in the centre (a card is there, or nothing is): what a stop could act on.
+const cartTotal = { id: 'd00009', name: 'Fix cart total', task: 'Fix the cart total', state: 'done_claimed', kind: 'agent', harness: 'claude' };
+const loginRedirect = { id: 'w00009', name: 'Fix login redirect', task: 'Fix the login redirect', state: 'working', kind: 'agent', harness: 'claude' };
+const docsUpdate = { id: 'w00010', name: 'Update docs', task: 'Update the docs', state: 'working', kind: 'agent', harness: 'codex' };
+const asking = { id: 'q00011', name: 'Tidy readme', task: 'Tidy the readme', state: 'question', kind: 'agent',
+  ask: { id: 'ask-t', type: 'question', sentence: 'Should I keep the old badges?', options: [] } };
+const loginHelper = { id: 'w00009-11111111', name: 'Read the router', task: 'Read the router code', state: 'working', kind: 'helper', parentId: 'w00009', rootId: 'w00009' };
+const world = (agentList, pendingConfirm) => ({ agents: agentList, machines, harnesses, focusId: null, ...(pendingConfirm ? { pendingConfirm } : {}) });
+Object.assign(SWEPT, {
+  // the checker's world: a finished agent's merge card on screen, and one agent at work
+  itMergeCard: world([cartTotal, loginRedirect], { id: 'c31', kind: 'merge', agentId: 'd00009' }),
+  itMergeCardTwo: world([cartTotal, loginRedirect, docsUpdate], { id: 'c32', kind: 'merge', agentId: 'd00009' }),
+  // a throw-away card of an agent that still works, beside another at work: the card's own agent
+  itDiscardCardOwn: world([cartTotal, docsUpdate, loginRedirect], { id: 'c33', kind: 'discard', agentId: 'w00009' }),
+  itPermissionsCard: world([cartTotal, loginRedirect], { id: 'c34', kind: 'permissions' }),
+  itStartCard: world([loginRedirect], { id: 'c35', kind: 'start' }),
+  // nothing in the centre
+  itNothing: world([cartTotal, loginRedirect]),
+  itNothingTwo: world([loginRedirect, docsUpdate]),
+  itNothingHelper: world([cartTotal, loginRedirect, loginHelper]),
+  itNothingAsking: world([loginRedirect, asking]),
+});
+
+test('a stop\'s "it" with no agent in the centre (a card, or nothing) is the card\'s own agent at work, else the one agent at work; with more than one, which one is not clear', () => {
+  const phrases = ['stop it, it is deleting the wrong files', 'kill it\nwrong branch', 'pause it - I need to check', 'stop the agent because it is looping',
+    'stop\nit is deleting the wrong files'];
+  const rows = [];
+  for (const [ctx, it] of [['itMergeCard', ['w00009']], ['itMergeCardTwo', []], ['itDiscardCardOwn', ['w00009']], ['itPermissionsCard', ['w00009']],
+    ['itStartCard', ['w00009']], ['itNothing', ['w00009']], ['itNothingTwo', []], ['itNothingHelper', ['w00009']], ['itNothingAsking', []]]) {
+    for (const text of phrases) rows.push([text, ctx, stopOf(...it)]);
+    // the other words for "it", and the stop said the other way round ("stop its work" to a throw-away card is its no, as before)
+    for (const text of ['stop this one, it is looping', 'stop its work', 'shut it down', 'make it stop', 'okay, stop it']) {
+      rows.push([text, ctx, text === 'stop its work' && ctx === 'itDiscardCardOwn' ? { kind: 'confirm', go: false } : stopOf(...it)]);
+    }
+  }
+  sweptRows([
+    ...rows,
+    // everything is everything, and a name is that agent, as before
+    ['stop all agents, the build is broken', 'itMergeCard', stopAll], ['stop everything it is deleting files', 'itMergeCardTwo', stopAll],
+    ['stop update docs, it is looping', 'itMergeCardTwo', stopOf('w00010')],
+    // a stop word alone, or with "it", is still a card's no; with nothing on screen it stops the one at work
+    ['stop', 'itMergeCard', { kind: 'confirm', go: false }], ['stop it', 'itMergeCard', { kind: 'confirm', go: false }],
+    ['stop', 'itNothing', stopOf('w00009')], ['stop it', 'itNothing', stopOf('w00009')], ['stop', 'itNothingTwo', stopOf()],
+    // "them" is still not clear
+    ['stop them, they are looping', 'itMergeCard', stopOf()],
+    // a program named first: the agent "it" means only when it runs that program
+    ['claude, stop it, it is looping', 'itMergeCard', stopOf('w00009')], ['codex, stop it, it is looping', 'itMergeCard', stopOf()],
+    ['claude stop', 'itNothing', stopOf('w00009')], ['codex stop', 'itNothing', stopOf()],
+    // a want about it is asked first, as before
+    ['I want to stop it', 'itNothing', { kind: 'stop', agentIds: ['w00009'], sure: false }],
+  ]);
 });
 
 test('a stop word with an agent target first never starts work, whatever follows it, in any context', () => {
@@ -2727,14 +2781,15 @@ test('on a card, words that begin with its yes or no word answer it, whatever fo
   // Pinned on purpose, where a reading could merge work: the first words decide. A yes first is the card's yes, whatever
   // follows it, a stop of everything too ("yes, stop everything" merges, and stops nothing); "go ahead" set off by a comma
   // is that yes. Past an opener that is also a yes ("okay", "go ahead and"), one of Workbench's own commands is that
-  // command: "okay, stop it" stops (with a card, no agent is in the centre: which one is not clear) and "go ahead and stop
-  // everything" stops everything, the card staying; with no command after it, the opener is the yes ("ok so the login
-  // page is broken" merges, and the rest starts nothing).
+  // command: "okay, stop it" stops (with a card, no agent is in the centre: the one at work, and with five at work, which
+  // one is not clear) and "go ahead and stop everything" stops everything, the card staying; with no command after it, the
+  // opener is the yes ("ok so the login page is broken" merges, and the rest starts nothing).
   sweptRows([
     ['ok so the login page is broken', 'pendingMerge', yesTo],
     ['yes, stop everything', 'pendingMerge', yesTo],
     ['go ahead, stop everything', 'pendingMerge', yesTo],
     ['okay, stop it', 'pendingMerge', stopOf()],
+    ['okay, stop it', 'boardCard', stopOf('w00001')],
     ['go ahead and stop everything', 'pendingMerge', stopAll],
     ['okay, what needs me?', 'pendingMerge', { kind: 'status', needsMe: true }],
   ]);
