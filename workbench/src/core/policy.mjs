@@ -151,6 +151,8 @@ const R = Object.freeze({
   full: 'Full permissions are on.',
   fullClaude: "This would change Claude Code's own settings, which agents may not change, even with full permissions on.",
   fullUnchecked: "Whether this would change Claude Code's own settings could not be checked, so it was refused.",
+  fullEditUnclear: 'Full permissions are on, but Workbench could not tell where this edit lands, so it did not allow it.',
+  fullLinked: 'This file is also linked from another place on disk, so Workbench did not allow it.',
 });
 
 /**
@@ -329,22 +331,40 @@ function judgeMonitor(input, ctx) {
 
 /**
  * Full permissions: a step the policy would ask about runs without asking, with the reason "Full permissions are on.",
- * unless it would change Claude Code's own settings (changesClaude): that is refused, as edits there always are. What
+ * unless it would change Claude Code's own settings (changesClaude): that is refused, as edits there always are; and an
+ * edit runs only where Workbench can tell where it lands, to a file no other place on disk shares (editFloor). What
  * the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's settings, helpers
  * that would work elsewhere) is refused as before. A check that fails, or does not finish within its cap (PAST_CAP),
  * refuses: it never allows by mistake, and never says the step reaches those settings.
  */
 function withFull(tool, input, ctx, verdict) {
   if (verdict.decision !== 'ask') return verdict;
-  let floor;
+  let refused;
   try {
-    floor = phase(() => changesClaude(tool, input, ctx));
+    refused = phase(() => (changesClaude(tool, input, ctx) ? deny(R.fullClaude, 'claude') : EDIT_TOOLS.has(tool) ? editFloor(tool, input, ctx) : null));
   } catch {
     return deny(R.fullUnchecked);
   }
-  if (floor) return deny(R.fullClaude, 'claude');
+  if (refused) return refused;
   const out = allow(R.full, verdict.where);
   return verdict.say ? { ...out, say: verdict.say } : out;
+}
+
+/**
+ * An edit that full permissions would let through, refused when Workbench cannot tell where it lands (no path, blank space
+ * around it, an agent's folder that cannot be checked, a path the system cannot resolve: ~user, a step back out of a
+ * folder that is not there, links that lead to each other or more than 8 in a row, a file taken for a folder), or when it
+ * would change a file that is also linked from another place on disk (a hard link, which could be one of Claude Code's own
+ * settings under another name, wherever the file is). null when it may run.
+ */
+function editFloor(tool, input, ctx) {
+  const target = tool === 'NotebookEdit' ? (input.notebook_path ?? input.file_path) : (input.file_path ?? input.notebook_path);
+  const base = realFolder(ctx.cwd);
+  if (!base || typeof target !== 'string' || !target.trim() || padded(target)) return deny(R.fullEditUnclear);
+  const r = throughLinks(resolveReal(target, base), base);
+  if (!r.ok) return deny(R.fullEditUnclear);
+  if (r.exists && linkedFile(r.real)) return deny(R.fullLinked, 'linked');
+  return null;
 }
 
 /** Reasons that only say where a command reads: such a part changes nothing there. */
