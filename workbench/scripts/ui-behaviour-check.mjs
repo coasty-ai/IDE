@@ -933,6 +933,38 @@ try {
       `"${shown}" → chips ${chips}, tray "${tray}"; after Look later: chips ${chips2}, tray "${tray2}"`);
   });
 
+  await run(DT + 'a merge that did not go through keeps its agent on the board, set aside or not, until "Dismiss" lets it go: the tray says "not merged"', async () => {
+    // Invoice export, let go with "Not now", is picked in the tray and merged; the merge conflicts
+    await open('done-waits', { mode: { merge: 'conflict' } });
+    await sleep(900);
+    await clickIn('[data-act="looksgood"]'); await sleep(1300);
+    const tray0 = await trayNow();
+    await click('#tray'); await sleep(300);
+    await b.ev(`document.querySelector('#trayList .row[data-agent="w1"]').click(), 1`); await sleep(900);
+    await clickIn('[data-act="merge"]'); await sleep(900);
+    await clickIn('[data-act="confirm"][data-go="1"]'); await sleep(1500);
+    const chips1 = await chipsNow(), lid1 = await lidNow(), quiet = await b.ev(`[...(${page()}?.querySelectorAll('.links button') || [])].map(x => x.textContent).join(',')`);
+    // "Look later": set aside, it stays at the board's edge
+    await clickIn('[data-act="later"]'); await sleep(1300);
+    const chips2 = await chipsNow(), lid2 = await lidNow();
+    // picked on the board, "Dismiss": off the board, into the tray, and its row says its work is not merged
+    await click('.chip[data-id="w1"]'); await sleep(900);
+    const lid3 = await lidNow();
+    await clickIn('[data-act="reviewed"]'); await sleep(1300);
+    const chips4 = await chipsNow(), tray4 = await trayNow(), lid4 = await lidNow();
+    await click('#tray'); await sleep(300);
+    const row = await b.ev(`document.querySelector('#trayList .row[data-agent="w1"]')?.textContent.trim() || ''`);
+    // a reload keeps it there, and it is neither asked about again nor offered as set aside
+    await b.goto(`${base}/?t=k`, 1600);
+    const reChips = await chipsNow(), reTray = await trayNow(), reLid = await lidNow();
+    check(DT + 'a merge that did not go through keeps its agent on the board, set aside or not, until "Dismiss" lets it go: the tray says "not merged"',
+      tray0 === '1 not merged' && chips1 === 'w1~' && /Invoice export’s work does not merge cleanly into main\./.test(lid1) && quiet === 'Review the changes,Dismiss'
+      && chips2 === 'w1~' && /^1 set aside/.test(lid2) && /does not merge cleanly/.test(lid3)
+      && chips4 === '' && tray4 === '1 not merged' && /^All clear/.test(lid4) && row === 'Invoice export · not merged'
+      && reChips === '' && reTray === '1 not merged' && /^All clear/.test(reLid),
+      `tray "${tray0}"; merged from the tray: chips ${chips1}, lid "${lid1}" [${quiet}]; Look later: chips ${chips2}, lid "${lid2}"; picked "${lid3}"; Dismiss: chips "${chips4}", tray "${tray4}", lid "${lid4}", row "${row}"; reload: chips "${reChips}", tray "${reTray}", lid "${reLid}"`);
+  });
+
   await run(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent', async () => {
     const typeIt = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); };
     const sent = async () => (await posts()).filter(x => x.path === '/api/command' || /\/answer$/.test(x.path)).map(x => [x.path, x.body]);

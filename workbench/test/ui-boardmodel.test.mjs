@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { boardModel, splitBoard, boardAndTray, trayWords, doneWords } from '../ui/boardmodel.js';
 import { Lanes, ROWS } from '../ui/lanes.js';
-import { finishKey, readMarks, keepMarks } from '../ui/queue.js';
+import { finishKey, problemKey, readMarks, keepMarks } from '../ui/queue.js';
 import { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY } from '../src/shared/states.mjs';
 
 const STATES = { LOOK, NEEDS_YOU, DONE, ENDED, PRIORITY };
@@ -373,6 +373,22 @@ test('picked from the tray, a merge that does not go through brings it back to t
   // the problem clears (Try again went through): merged with nothing new, it is finished with again
   const merged = { ...p, work: W({ merged: { ...MERGED, at: T + MIN } }), files: files(0) };
   assert.deepEqual(boardAndTray(model([merged, agent('B', 'working')], { reviewed }).roots, lanes, { laptop }).trayIds.done, ['A']);
+});
+
+test('a merge that did not go through, dismissed, waits in the tray saying "not merged", whatever state its agent is in', () => {
+  const lanes = new Lanes(null);
+  const problem = { why: 'conflict', sentence: 'It does not merge cleanly into main.', paths: ['src/a.js'], at: T };
+  for (const [st, f] of [['done_checked', files(3)], ['done_claimed', null], ['stopped', null], ['failed', files(2)]]) {
+    const p = agent('A', st, { endedAt: T - MIN, work: W({ problem }), files: f });
+    let b = boardAndTray(model([p, agent('B', 'working')]).roots, lanes, { laptop });
+    assert.deepEqual(ids(b.roots), ['A', 'B'], st + ': on the board until it is dismissed');
+    // "Dismiss" on the problem's lid, as model.js marks it
+    const reviewed = new Set([finishKey(p), problemKey(p)]);
+    b = boardAndTray(model([p, agent('B', 'working')], { reviewed }).roots, lanes, { laptop });
+    assert.deepEqual([ids(b.roots), b.trayIds.done], [['B'], ['A']], st);
+    assert.equal(doneWords(p, LOOK), 'not merged', st + ': never words that read like work that is in');
+    assert.equal(b.tray.text, '1 not merged', st);
+  }
 });
 
 test('an agent in the tray that is continued, told something or asked for a change comes back to the board, on a lane, at work', () => {

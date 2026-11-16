@@ -287,6 +287,9 @@ export function lidView(f, o = {}) {
         acts = big('Try again', { act: 'merge', ...st, work: wk, into }, true) + big('Not now', { act: 'later', ...st, work: wk });
       }
       if (reviewable) links.push(reviewLink());
+      // "Look later" and "Not now" set it aside, on the board; "Dismiss" lets it go to the done tray ("not merged"), as it
+      // lets a stopped or failed agent go. Never a failed check's: that is fixed, merged, thrown away or set aside.
+      if (a.state !== 'checks_failed') links.push(quiet('Dismiss', { act: 'reviewed', ...st, work: wk }));
       leaves = true;
       break;
     }

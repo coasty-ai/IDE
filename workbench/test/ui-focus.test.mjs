@@ -377,6 +377,29 @@ test('your own changes in the way: Try again proposes the merge again, and Not n
   assert.match(one.html, /<h1[^>]*>Invoice export started from a commit that is no longer in main, so merging it would bring in other work\.<\/h1>/);
 });
 
+test('a merge that did not go through can be let go: a quiet "Dismiss" under the answers, bound to that work; never for a failed check', { skip }, async () => {
+  const { lidView, S, workKey } = await load();
+  live(S);
+  const kinds = [['conflict', 'Invoice export’s work does not merge cleanly into main.'], ['blocked', 'Your own changes are in the way: a.js. Commit or put them aside, then merge again.'],
+    ['moved', 'main changed since you looked. Have another look.']];
+  for (const [why, sentence] of kinds) for (const st of ['done_checked', 'done_claimed', 'stopped', 'failed']) for (const fit of [0, 6]) {
+    const a = finished({ state: st, work: problem(why, sentence, ['a.js']), files: st === 'stopped' || st === 'failed' ? null : FILES(3) });
+    const v = show(lidView, S, a, { fit }), tag = `${why} ${st} fit ${fit}`;
+    const d = labelled(v.html, 'Dismiss');
+    assert.ok(d, `${tag}: Dismiss`);
+    assert.deepEqual([d.cls, d.act, d.agent, d.state, d.work], ['quiet', 'reviewed', 'W1', st, workKey(a)], tag);
+    assert.equal(allButtons(v.html).filter(b => b.cls.startsWith('big')).length, 2, `${tag}: still two answers`);
+    assert.match(v.html, /<div class="links">.*>Review the changes<.*>Dismiss<\/button><\/div>/s, `${tag}: in the row of links, after Review the changes`);
+    // picked from the tray, it has its own way to go, so no "Close" is added
+    assert.equal(labelled(show(lidView, S, a, { fit }, { agent: a, picked: true, queued: 0 }).html, 'Close'), undefined, tag);
+  }
+  // a failed check whose "Merge anyway" did not go through: a failed check is fixed, merged, thrown away or set aside
+  const cf = finished({ state: 'checks_failed', work: problem('conflict', 'x', ['a.js']), checks: { state: 'failed', results: [{ name: 'tests', ok: false }] } });
+  const v = show(lidView, S, cf);
+  assert.equal(labelled(v.html, 'Dismiss'), undefined);
+  assert.equal(labelled(v.html, 'Look later').act, 'later');
+});
+
 test('thrown away: "<Name>’s work was thrown away." and Dismiss', { skip }, async () => {
   const { lidView, S } = await load();
   live(S);

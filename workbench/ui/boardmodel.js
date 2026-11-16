@@ -61,14 +61,18 @@ export function boardModel(agents, ctx) {
   return { roots, queue, byId };
 }
 
-/** A root that finished its work (done, or a failed check) with work not merged yet: not settled, and changed files. */
-const notMergedYet = a => !!a && !a.parentId && !a.earlier && (a.state === 'done_checked' || a.state === 'done_claimed' || a.state === 'checks_failed')
-  && !workSettled(a) && unmergedWork(a);
+/**
+ * A root whose work is not merged yet: it finished its work (done, or a failed check), not settled, with changed files;
+ * or, in any state, a merge of it did not go through (work.problem: the person dismissed it to get here).
+ */
+const notMergedYet = a => !!a && !a.parentId && !a.earlier && (!!(a.work && a.work.problem)
+  || ((a.state === 'done_checked' || a.state === 'done_claimed' || a.state === 'checks_failed') && !workSettled(a) && unmergedWork(a)));
 
 /**
  * What a row in the done tray's "Done" section says after the agent's name: where its work went ("merged", "thrown
- * away"), that it is not merged yet ("not merged", or "checks failed" for a failed check), or how it ended ("stopped",
- * "done and checked"). Unmerged work then reads differently from work that is in, so it is not forgotten.
+ * away"), that it is not merged yet ("not merged", also for a merge that did not go through whatever state its agent is
+ * in, or "checks failed" for a failed check), or how it ended ("stopped", "done and checked"). Unmerged work then reads
+ * differently from work that is in, so it is not forgotten.
  * @param {object} a  an AgentView
  */
 export function doneWords(a, LOOK) {

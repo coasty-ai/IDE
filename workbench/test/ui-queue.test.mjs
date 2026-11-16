@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { finishKey, needsPerson, needsQueue, reviewQueue, setAsideList, stepFrom, helpersByNeed, helpersAtWork, finishedWith, finishedSinceSettled, readMarks, keepMarks } from '../ui/queue.js';
+import { finishKey, problemKey, needsPerson, needsQueue, reviewQueue, setAsideList, stepFrom, helpersByNeed, helpersAtWork, finishedWith, finishedSinceSettled, readMarks, keepMarks } from '../ui/queue.js';
 import { unmergedWork, workSettled, workKey, canReview, mergeApplies, discardApplies, gitReason } from '../ui/queue.js';
 import { NEEDS_YOU, PRIORITY, ENDED, ACTIVE } from '../src/shared/states.mjs';
 
@@ -223,6 +223,41 @@ test('finished with: never while its work has a problem (a merge that did not go
   const cf = { ...p, state: 'checks_failed' };
   assert.equal(needsPerson(cf, { NEEDS_YOU }), true);
   assert.deepEqual(reviewQueue([cf], { reviewed: new Set() }), []);
+});
+
+test('finished with: a merge that did not go through leaves the board once the person dismisses that problem, and a later one is news again', () => {
+  const p = done({ work: work({ problem: { why: 'conflict', sentence: 'Invoice export’s work does not merge cleanly into main.', paths: ['src/a.js'], at: 600 } }) });
+  const k = finishKey(p), pk = problemKey(p);
+  assert.ok(pk && pk !== k && pk.startsWith(k), `the problem's own mark: "${pk}"`);
+  // "Dismiss" on its lid marks the finish and the problem: it leaves, is not to look at, and is not listed as set aside
+  const dismissed = new Set([k, pk]);
+  assert.equal(finishedWith(p, marks({ reviewed: dismissed })), true);
+  assert.equal(finishedWith(p, marks({ reviewed: new Set([pk]) })), true);
+  assert.deepEqual(reviewQueue([p], { reviewed: dismissed }), []);
+  // set aside first ("Look later"), then dismissed: it goes, whichever came first, and the empty lid does not offer it
+  assert.equal(finishedWith(p, marks({ reviewed: dismissed, later: new Set([k]) })), true);
+  assert.deepEqual(setAsideList([p], { later: new Set([k]), reviewed: dismissed }), []);
+  assert.deepEqual(setAsideList([p], { later: new Set([k]), reviewed: new Set([k]) }).map(x => x.id), ['W'], 'a look from before the problem is no dismissal');
+  // a later problem (merged again from the tray, and that failed too) is news again: back to the board, to look at
+  for (const later of [{ ...p.work.problem, at: 900 }, { ...p.work.problem, why: 'blocked' }]) {
+    const again = { ...p, work: work({ problem: later }) };
+    assert.equal(finishedWith(again, marks({ reviewed: dismissed })), false, later.why + later.at);
+    assert.deepEqual(reviewQueue([again], { reviewed: dismissed }).map(x => x.id), ['W']);
+  }
+  // the problem clears with no new finish ("Try again" found nothing left to merge): the finish's own mark holds
+  assert.equal(finishedWith({ ...p, work: work() }, marks({ reviewed: dismissed })), true);
+  // a stopped or failed one alike
+  for (const st of ['done_claimed', 'failed', 'stopped']) {
+    const s = { ...p, state: st, files: st === 'done_claimed' ? files(3) : null };
+    assert.equal(finishedWith(s, marks({ reviewed: new Set([finishKey(s), problemKey(s)]) })), true, st);
+  }
+  // a failed check is never dismissed: it needs the person until it is set aside, and then stays at the board's edge
+  const cf = { ...p, state: 'checks_failed' };
+  assert.equal(finishedWith(cf, marks({ reviewed: new Set([k, problemKey(cf)]) })), false);
+  assert.equal(finishedWith(cf, marks({ reviewed: new Set([k, problemKey(cf)]), later: new Set([k]) })), false);
+  // no problem, no such mark; a helper has none
+  assert.equal(problemKey(done()), null);
+  assert.equal(problemKey(ag('h', 'finished', { parentId: 'W', endedAt: 5, work: p.work })), null);
 });
 
 test('finished with: settled work that finished again since waits to be looked at, so what it said is seen', () => {

@@ -5,6 +5,19 @@
 /** One finish of one agent: a mark ("looked at", "set aside") made on it does not outlive that finish. */
 export const finishKey = a => `${a.id}@${a.endedAt ?? a.stateSince ?? 0}`;
 
+/**
+ * One merge that did not go through, on one finish: the mark "Dismiss" makes on its lid, beside the finish's own. It
+ * names the problem as the work's signature does (workKey: why and when), so a look from before the problem does not
+ * count for it, and a later problem is news again. null for a root whose work has no problem, and for a helper.
+ */
+export function problemKey(a) {
+  const p = a && !a.parentId && a.work && a.work.problem;
+  return p ? `${finishKey(a)}|p${p.why || ''}${p.at || ''}` : null;
+}
+
+/** The person let this merge that did not go through go ("Dismiss" on its lid). */
+const problemLetGo = (a, reviewed) => { const k = problemKey(a); return !!(k && reviewed && reviewed.has(k)); };
+
 // ---------------------------------------------------------------- an agent's work (AgentView.work)
 // work: { branch, from, folder, merged: { into, merge, at, files, adds, dels } | null,
 //         problem: { why, sentence, paths, into, at } | null, thrownAway: { at, saved } | null } | null (helpers, no git)
@@ -133,7 +146,8 @@ const TO_LOOK_AT = new Set(['done_checked', 'done_claimed', 'failed']);
  * on a merge that did not go through), and not one whose work is settled (merged with nothing new, or thrown away) since
  * it finished: one that finished again after that waits to be looked at like any finish (finishedSinceSettled). A
  * merge that did not go through is news of its own: a look from before it does not count, so a root at rest with one is
- * to be looked at until it clears or the person sets it aside (one with a failed check needs the person already).
+ * to be looked at until it clears, or the person sets it aside or dismisses it (problemKey); one with a failed check
+ * needs the person already.
  */
 export function reviewQueue(agents, { reviewed, later }) {
   return [...agents].filter(a => toLookAt(a, { reviewed, later }))
@@ -144,17 +158,19 @@ function toLookAt(a, { reviewed, later }) {
   if (!a || a.parentId || a.earlier || !AT_REST.has(a.state)) return false;
   const k = finishKey(a);
   if (later && later.has(k)) return false;
-  if (a.work && a.work.problem) return a.state !== 'checks_failed';
+  if (a.work && a.work.problem) return a.state !== 'checks_failed' && !problemLetGo(a, reviewed);
   return TO_LOOK_AT.has(a.state) && !(reviewed && reviewed.has(k)) && !settledSeen(a, { reviewed });
 }
 
 /**
  * What the person set aside, still unchanged: a failed check, or a finished root whose merge did not go through. Not one
- * whose work has since settled (merged, or thrown away): that one is finished with, and waits in the done tray.
+ * whose work has since settled (merged, or thrown away), nor a merge that did not go through which the person has since
+ * dismissed: those are finished with, and wait in the done tray.
  */
-export function setAsideList(agents, { later }) {
+export function setAsideList(agents, { later, reviewed }) {
   if (!later) return [];
-  return [...agents].filter(a => (a.state === 'checks_failed' || (!a.parentId && !a.earlier && AT_REST.has(a.state))) && later.has(finishKey(a)) && !settledSeen(a));
+  return [...agents].filter(a => (a.state === 'checks_failed' || (!a.parentId && !a.earlier && AT_REST.has(a.state))) && later.has(finishKey(a)) && !settledSeen(a)
+    && !problemLetGo(a, reviewed));
 }
 
 /**
@@ -163,16 +179,18 @@ export function setAsideList(agents, { later }) {
  * says (merged with nothing new since, or thrown away), and it has not finished since (finishedSinceSettled: a merged
  * agent asked for a change that brought nothing new stays until its reply is seen); or they looked at this finish ("Looks
  * good", "Not now" on work that could be merged, "Dismiss": the page's `reviewed` marks). Set aside ("Look later", "Not
- * now" on a merge that did not go through) is not finished, and neither is a root whose merge did not go through
+ * now" on a merge that did not go through) is not finished. Nor is a root whose merge did not go through
  * (`work.problem`), whatever was said before it: it stays on the board until that clears (a merge that goes through, a
- * message it takes, a new turn, or its work thrown away). Helpers go with their agent, and agents from an earlier run
- * wait in the tray by their own rule, so neither is this rule's.
+ * message it takes, a new turn, or its work thrown away) or the person dismisses it ("Dismiss" on its lid: problemKey),
+ * set aside or not. A failed check is never dismissed: it needs the person until it is set aside, and then stays at the
+ * board's edge. Helpers go with their agent, and agents from an earlier run wait in the tray by their own rule, so
+ * neither is this rule's.
  * @param {object} a  an AgentView
  * @param {{ NEEDS_YOU: Set<string>, reviewed?: Set<string>, later?: Set<string> }} ctx
  */
 export function finishedWith(a, { NEEDS_YOU, reviewed, later }) {
   if (!a || a.parentId || a.earlier || !AT_REST.has(a.state) || needsPerson(a, { NEEDS_YOU, later })) return false;
-  if (a.work && a.work.problem) return false;
+  if (a.work && a.work.problem) return a.state !== 'checks_failed' && problemLetGo(a, reviewed);
   if (settledSeen(a, { reviewed })) return true;
   const k = finishKey(a);
   return !!(reviewed && reviewed.has(k)) && !(later && later.has(k));
