@@ -4072,15 +4072,25 @@ test('full permissions with the real policy: what would ask runs as an automatic
   assert.deepEqual(t.store.get(id).approvals, { auto: 3, byYou: 0, denied: 2 });
   assert.equal(t.store.get(id).ask, null, 'nothing asked');
   // a command that names Claude Code's own settings waits for the person, with the reason it asks for without full
-  // permissions and why they do not cover it
+  // permissions and why they do not cover it; its question says only that the agent wants to run a command, never what
+  // the command does with them
+  const name = t.store.get(id).name;
   const named = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf .claude' } });
   await until(() => t.store.get(id).ask);
   assert.equal(t.store.get(id).state, 'needs_ok');
+  assert.equal(t.store.get(id).ask.sentence, `${name} wants to run a command`);
   assert.equal(t.store.get(id).ask.why, "This command is not on the list of safe commands. Full permissions do not cover steps that name Claude Code's own settings.");
   assert.equal(t.store.get(id).ask.detail, 'rm -rf .claude');
   await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
   assert.equal((await named).hookSpecificOutput.permissionDecision, 'deny');
   assert.equal(seen.length, 6, 'judged once, as full permissions judge it');
+  // one that writes .gitignore, not a file in those settings, is asked about in the same words
+  const ignore = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: "echo '.claude/' >> .gitignore" } });
+  await until(() => t.store.get(id).ask);
+  assert.deepEqual([t.store.get(id).ask.sentence, t.store.get(id).ask.why, t.store.get(id).ask.detail], [`${name} wants to run a command`,
+    "The command chains, redirects or substitutes other commands. Full permissions do not cover steps that name Claude Code's own settings.", "echo '.claude/' >> .gitignore"]);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await ignore).hookSpecificOutput.permissionDecision, 'deny');
   await t.engine.shutdown();
 });
 

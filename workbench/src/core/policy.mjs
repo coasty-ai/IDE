@@ -11,7 +11,7 @@
 // The floor is refused: what is refused anyway (above), an edit whose path names Claude Code's own settings, and an edit
 // whose landing place cannot be told or whose file is also linked from another place. A command, or another tool's step,
 // that names those settings is judged as without full permissions: it asks, with the reason it would ask for and why
-// full permissions do not cover it.
+// full permissions do not cover it, in words that say only what kind of step it is.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -177,7 +177,8 @@ const WHERE = Object.freeze({
 const USES = Object.freeze({ outside: 'usesOutside', git: 'usesGit', claude: 'usesClaude', linked: 'usesLinked' });
 
 // A verdict: the decision and its reason, plus optionally where (a WHERE key), what an ask does in plain words
-// when the policy knows better than the command's everyday reading (does), or a whole sentence (say).
+// when the policy knows better than the command's everyday reading (does), a whole sentence (say), or that its words
+// say only what kind of step it is (kindOnly: a step full permissions do not cover, notCovered).
 const allow = (reason, where) => ({ decision: 'allow', reason, where });
 const ask = (reason, where, does) => ({ decision: 'ask', reason, where, does });
 const deny = (reason, where) => ({ decision: 'deny', reason, where });
@@ -341,9 +342,10 @@ function judgeMonitor(input, ctx) {
  * disk (editFloor); a check of an edit that fails, or does not finish within its cap (PAST_CAP), refuses too. A command,
  * or a tool of another service or one the policy does not know, that names those settings (stepNamesClaude) is judged as
  * it is without full permissions: it asks, with its own reason and one more sentence, and so does one the check could not
- * finish for. Such an ask never says what the step does with them: its words are those it has without full permissions.
- * What the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's settings, helpers
- * that would work elsewhere) is refused as before. Reads, web pages, messages and helpers change no file, and run.
+ * finish for (notCovered). Such an ask never says what the step does, nor where it reaches: its words say only what kind
+ * of step it is. What the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's
+ * settings, helpers that would work elsewhere) is refused as before. Reads, web pages, messages and helpers change no
+ * file, and run.
  */
 function withFull(tool, input, ctx, verdict) {
   if (verdict.decision !== 'ask') return verdict;
@@ -360,13 +362,21 @@ function withFull(tool, input, ctx, verdict) {
     try {
       named = phase(() => stepNamesClaude(tool, input, ctx));
     } catch {
-      return { ...verdict, reason: `${verdict.reason} ${R.fullUnsure}` };
+      return notCovered(verdict, R.fullUnsure);
     }
-    if (named) return { ...verdict, reason: `${verdict.reason} ${R.fullNamed}` };
+    if (named) return notCovered(verdict, R.fullNamed);
   }
   const out = allow(R.full, verdict.where);
   return verdict.say ? { ...out, say: verdict.say } : out;
 }
+
+/**
+ * A step full permissions do not cover: asked about with the reason it has without them, and why they do not cover it.
+ * Its words say only what kind of step it is (`kindOnly`, see sentenceFor): a command's everyday words, and the place
+ * they add ("in Claude Code's own settings"), are a reading of what it does, and naming those settings says nothing of
+ * what it would do with them (echo '.claude/' >> .gitignore writes .gitignore).
+ */
+const notCovered = (verdict, why) => ({ ...ask(`${verdict.reason} ${why}`), kindOnly: true });
 
 /**
  * An edit that full permissions would let through, refused when Workbench cannot tell where it lands (no path, blank space
@@ -576,10 +586,13 @@ const suffix = where => (typeof where === 'string' && Object.hasOwn(WHERE, where
  * word ("read a file", "run the tests") is used only when the policy itself, judging each part of the command
  * alone, would allow it or asks only because of where it reaches. Otherwise the sentence names the riskier
  * part, the option that made it ask ("write to a file", "delete files", "run another program"), or says
- * "run a command"; the exact command is always the detail. Never the agent's own description.
+ * "run a command"; the exact command is always the detail. Never the agent's own description. A step full
+ * permissions do not cover (notCovered) says only what kind of step it is: "run a command" for a command, and the
+ * tool's own words for another ("run a command in the background and watch what it prints", "use fs (write_file)").
  */
 function sentenceFor(tool, input, verdict, plain, ctx) {
   if (verdict.say) return verdict.say;
+  if (verdict.kindOnly) return tool === 'Bash' ? 'wants to ' + RUN : plain;
   const command = tool === 'Bash' || (tool === 'Monitor' && input.ws === undefined) ? input.command : undefined;
   if (verdict.decision === 'allow' || typeof command !== 'string' || !command.trim()) return plain + suffix(verdict.where);
   const base = realFolder(ctx.cwd);

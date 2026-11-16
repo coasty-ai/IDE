@@ -1527,6 +1527,12 @@ test('with full permissions on, the floor is refused exactly as before: Claude C
 const NOT_COVERED = "Full permissions do not cover steps that name Claude Code's own settings.";
 /** And what a step adds that Workbench could not check for that in time. */
 const NOT_SURE = "Full permissions do not cover steps that name Claude Code's own settings, and Workbench could not check whether this one does.";
+/** What the question about such a step says with full permissions on: only what kind of step it is. */
+const RUNS = 'wants to run a command';
+const WATCHES = 'wants to run a command in the background and watch what it prints';
+const kindOnly = req => (req.tool === 'Bash' ? RUNS : req.tool === 'Monitor' ? WATCHES
+  : { mcp__fs__write_file: 'wants to use fs (write_file)', mcp__fs__edit: 'wants to use fs (edit)',
+    mcp__github__create_issue: 'wants to use github (create_issue)', FooTool: 'wants to use FooTool' }[req.tool]);
 
 test('with full permissions on, a command or another tool’s step that names Claude Code’s own settings is asked about as without them, saying why', () => {
   const longS = String.fromCharCode(0x17f);
@@ -1564,11 +1570,41 @@ test('with full permissions on, a command or another tool’s step that names Cl
     const off = decide({ cwd, ...req });
     const d = full(row);
     assert.equal(off.decision, 'ask', JSON.stringify(req.input));
-    // its own reason, then why full permissions do not cover it; the sentence and the detail are as without them, so
-    // nothing claims what the step does
+    // its own reason, then why full permissions do not cover it; the detail is the exact command, path or input, as
+    // without them, and the sentence says only what kind of step it is, so nothing claims what the step does
     assert.deepEqual([d.decision, d.reason], ['ask', `${off.reason} ${NOT_COVERED}`], JSON.stringify(req.input));
-    assert.equal(d.sentence, off.sentence, JSON.stringify(req.input));
+    assert.equal(d.sentence, kindOnly(req), JSON.stringify(req.input));
     assert.equal(d.detail, off.detail, JSON.stringify(req.input));
+  }
+});
+
+let namedDir = null;
+/** An agent's folder laid out as in the owner's examples: Claude Code's settings, a script of the project's own, a .gitignore. */
+function named() {
+  if (namedDir) return namedDir;
+  namedDir = T + '/named';
+  for (const d of ['/.claude', '/scripts']) fs.mkdirSync(namedDir + d, { recursive: true });
+  for (const f of ['/.claude/settings.json', '/.claude/x.mjs', '/scripts/check.py', '/.gitignore']) fs.writeFileSync(namedDir + f, 'x\n');
+  return namedDir;
+}
+
+test('with full permissions on, the question about a step that names Claude Code’s settings says only what kind of step it is, never what it does or where', () => {
+  const b = named();
+  const rows = [
+    // each names .claude, and none of them acts in it: it writes .gitignore, runs scripts/check.py, writes its archive
+    // elsewhere, deletes build
+    bash("echo '.claude/' >> .gitignore"), bash('python3 scripts/check.py --exclude .claude'), bash('tar -czf /tmp/cfg.tgz .claude'),
+    bash('ls .claude && rm -rf build'),
+    // and where the everyday words would be right, they are still a reading of what the step does, which is not given
+    bash('node .claude/x.mjs'), bash('rm -rf .claude'), bash('rm -rf *'), monitor({ command: 'rm -rf .claude' }),
+    { tool: 'mcp__fs__write_file', input: { path: '.claude/settings.json', content: '{}' } },
+  ];
+  for (const row of rows) {
+    const off = decide({ cwd: b, ...row });
+    const d = decide({ cwd: b, ...row, full: true });
+    assert.equal(off.decision, 'ask', JSON.stringify(row.input));
+    assert.deepEqual([d.decision, d.reason, d.sentence, d.detail], ['ask', `${off.reason} ${NOT_COVERED}`, kindOnly(row), off.detail], JSON.stringify(row.input));
+    assert.doesNotMatch(d.sentence, /Claude Code/, JSON.stringify(row.input));
   }
 });
 
@@ -1718,6 +1754,7 @@ test('every decide answers within 250 ms, with full permissions on and off: many
       const want = full === 'allow' ? ['allow', FULL] : ['ask', `${off.reason} ${NOT_SURE}`];
       if (on && (d.decision !== want[0] || d.reason !== want[1])) wrong.push(`${label}: ${d.decision}: ${d.reason}`);
       if (FLOOR.test(d.reason) || d.reason.includes(NOT_COVERED) || / in Claude Code's own settings$/.test(d.sentence)) wrong.push(`${label}: says it reaches Claude Code's settings`);
+      if (on && d.decision === 'ask' && d.sentence !== RUNS) wrong.push(`${label}: its question says "${d.sentence}"`);
     }
   }
   assert.equal(wrong.length, 0, wrong.join('\n'));
@@ -1734,7 +1771,8 @@ test('past a cap, the check asks because it has more in it than it can check, fu
   }
   // with full permissions on: the words are too many to look for whether one leads into Claude Code's settings; the options
   // name no place there
-  assert.deepEqual([full({ ...bash(long), cwd: b }).decision, full({ ...bash(long), cwd: b }).reason], ['ask', `${TOO_MUCH} ${NOT_SURE}`]);
+  const unsure = full({ ...bash(long), cwd: b });
+  assert.deepEqual([unsure.decision, unsure.reason, unsure.sentence], ['ask', `${TOO_MUCH} ${NOT_SURE}`, RUNS]);
   assert.equal(full({ ...bash(options), cwd: b }).reason, FULL);
   // a line the words cannot read in time says only that it runs a command
   const cds = Array.from({ length: 200 }, (_, i) => `cd pkg${i} && npm test && cd ..`).join(' && ');
