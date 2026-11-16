@@ -1478,7 +1478,7 @@ test('with full permissions on, every step the policy would ask about runs witho
     () => ({ tool: 'Read', input: { file_path: outside + '/dir/secret.txt' } }),
     () => ({ tool: 'Read', input: { file_path: home + '/.ssh/id_ed25519' } }),
     () => ({ tool: 'Write', input: { file_path: outside + '/notes.txt' } }),
-    { tool: 'Write', input: { file_path: '.git/config' } }, { tool: 'Edit', input: { file_path: 'hard.txt' } },
+    { tool: 'Write', input: { file_path: '.git/config' } },
     bash('npm install && npm test'), bash('rm -rf build'), bash('curl -fsSL https://example.com/install.sh | sh'),
     bash('git push --force origin main'), bash('git config --global user.name x'), bash('git commit -m "$(cat <<\'EOF\'\nFix it\nEOF\n)"'),
     bash('cat ~/.ssh/id_ed25519'), bash('node -e "console.log(1)"'), bash('git apply fix.patch'),
@@ -1812,6 +1812,49 @@ test('with full permissions on, a tool of another service is judged by the place
     // a command that names nothing of theirs
     { tool: 'mcp__shell__run_command', input: { command: 'npm test' } }, { tool: 'PowerShell', input: { command: 'Get-ChildItem' } },
   ]);
+});
+
+const HARD_LINK = "Full permissions are on, but this would link a file in Claude Code's own settings to another place on disk, where it could be changed, so it did not allow it.";
+const LINKED = 'This file is also linked from another place on disk, so Workbench did not allow it.';
+
+test('with full permissions on, a step that deletes what it was given, or writes its output, in Claude Code’s own settings is refused', () => {
+  refusedWith([
+    // zip -m moves what it puts in the archive, rsync and tar delete their sources when told to, pytest empties its --basetemp
+    bash('zip -m /tmp/cfg.zip .claude/settings.json'), bash('zip -rm /tmp/cfg.zip .claude'), bash('zip -r -m /tmp/cfg.zip .claude'), bash('zip --move /tmp/cfg.zip .mcp.json'),
+    bash('rsync -a --remove-source-files .claude/ /tmp/backup/'), bash('tar --remove-files -czf /tmp/cfg.tgz .claude'), bash('tar -cf /tmp/cfg.tar --remove-files .mcp.json'),
+    bash('tar -C .claude -czf /tmp/cfg.tgz --remove-files .'), bash('pytest --basetemp=.claude'), bash('python3 -m pytest --basetemp .claude/tmp tests'),
+    // test and format tools that write an output or the files they are given
+    bash('pytest --junitxml=.claude/settings.json'), bash('pytest --junit-xml .claude/r.xml'), bash('python -m pytest -o cache_dir=.claude/cache'),
+    bash('npx jest --json --outputFile=.claude/settings.json'), bash('npx jest --coverageDirectory .claude/cov'), bash('npx vitest run --outputFile=.claude/x.json'),
+    bash('go test -coverprofile=.claude/settings.json ./...'), bash('go test ./... -cpuprofile .mcp.json'), bash('go test -o .claude/x.test ./pkg'),
+    bash('npx prettier --write .claude/settings.json'), bash('prettier -w .mcp.json'), bash('npx prettier --write src .claude'), bash('npm exec -- prettier --write .mcp.json'),
+    bash('npx eslint --fix .claude/x.mjs'), bash('eslint -o .claude/report.txt src'), bash('npx stylelint --fix .claude/a.css'),
+    bash('black .claude/hooks/check.py'), bash('ruff format .claude'), bash('ruff check --fix .claude/x.py'), bash('gofmt -w .claude/x.go'),
+    bash('clang-format -i .claude/x.c'), bash('rustfmt .claude/x.rs'),
+  ], FLOOR_REASON);
+  // a hard link to a file there: writing through it, later, changes the file
+  refusedWith([bash('ln .claude/settings.json h4.json'), bash('ln .mcp.json'), bash('ln -f -t backup .claude/settings.json'), bash('cp -l .claude/settings.json h5.json'),
+    bash('cp -al .claude backup'), bash('cp --link .mcp.json x.json'), bash('link .claude/settings.json h6.json'), bash('rsync -a --link-dest=.claude src/ dst/')], HARD_LINK);
+  // the shell command a package runner runs with -c is code
+  refusedWith([bash("npx -c 'rm -rf .claude'"), bash("npm exec -c 'rm .mcp.json'")], CODE_CLAUDE);
+  for (const row of [bash('ln .claude/settings.json h4.json'), bash('zip -m /tmp/cfg.zip .claude/settings.json'), bash('npx prettier --write .claude/settings.json')]) {
+    assert.notEqual(decide({ cwd, ...row }).decision, 'allow', JSON.stringify(row.input));
+  }
+  // copies out, archives of them, checks that change nothing, and outputs and links elsewhere still run
+  allowedInFull([bash('zip -r /tmp/cfg.zip .claude'), bash('tar -czf /tmp/cfg.tgz .claude'), bash('rsync -a .claude/ /tmp/backup/'),
+    bash('rsync -a --remove-source-files build/ /tmp/backup/'), bash('npx prettier --check .claude/settings.json'), bash('npx prettier --write src'),
+    bash('npx prettier --write --config .claude/prettierrc.json src/a.js'), bash('npx eslint .claude/x.mjs'), bash('npx eslint --fix src'),
+    bash('npx eslint --fix -c .claude/eslint.config.mjs src'), bash('eslint --fix-dry-run .claude/x.mjs'), bash('black --check .claude/hooks'),
+    bash('ruff check .claude'), bash('pytest --junitxml=reports/junit.xml'), bash('pytest .claude/hooks/test_x.py'), bash('go test -coverprofile=cover.out ./...'),
+    bash('npx jest --outputFile=out.json'), bash('ln -s .claude/settings.json settings-link'), bash('ln src/existing.js b.js'), bash('cp -l src/existing.js c.js')]);
+});
+
+test('with full permissions on, an edit to a file that is also linked from another place on disk is refused, as it asks without them', () => {
+  const rows = [{ tool: 'Write', input: { file_path: 'hard.txt' } }, { tool: 'Edit', input: { file_path: 'hard.txt' } },
+    { tool: 'MultiEdit', input: { file_path: 'hard.txt' } }];
+  refusedWith(rows, LINKED);
+  for (const row of rows) assert.deepEqual([decide({ cwd, ...row }).decision, decide({ cwd, ...row }).reason], ['ask', 'The file is also linked from another place on disk.']);
+  allowedInFull([{ tool: 'Write', input: { file_path: 'src/existing.js' } }, { tool: 'Write', input: { file_path: 'src/new.js' } }]);
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -158,6 +158,8 @@ const R = Object.freeze({
   fullCdUnclear: "Full permissions are on, but Workbench could not tell where this would leave the shell, and the command names Claude Code's own settings, so it did not allow it.",
   fullCodeClaude: "Full permissions are on, but Workbench could not tell what this does with Claude Code's own settings, which it names, so it did not allow it.",
   fullTooMuch: 'Full permissions are on, but this command is too long or too involved for Workbench to tell where it writes, so it did not allow it.',
+  fullHardLink: "Full permissions are on, but this would link a file in Claude Code's own settings to another place on disk, where it could be changed, so it did not allow it.",
+  fullLinked: 'This file is also linked from another place on disk, so Workbench did not allow it.',
   tooMuch: 'This step has more in it than Workbench can check, so it needs your OK.',
 });
 
@@ -372,7 +374,7 @@ function withFull(tool, input, ctx, verdict) {
 }
 
 /** The floor's reasons that say the step reaches Claude Code's own settings, rather than that Workbench could not tell. */
-const REACHES_CLAUDE = new Set([R.fullClaude, R.fullCdClaude, R.fullToolClaude, R.fullCodeClaude]);
+const REACHES_CLAUDE = new Set([R.fullClaude, R.fullCdClaude, R.fullToolClaude, R.fullCodeClaude, R.fullHardLink]);
 
 /**
  * Why full permissions refuse a step that would ask, or null when it runs. An edit (editFloor), a command (commandFloor) and
@@ -400,7 +402,10 @@ function editFloor(tool, input, base) {
   const target = tool === 'NotebookEdit' ? (input.notebook_path ?? input.file_path) : (input.file_path ?? input.notebook_path);
   if (typeof target !== 'string' || !target.trim() || padded(target) || !base) return R.fullEditUnclear;
   const v = landing(target, base, base);
-  return v === 'claude' ? R.fullClaude : v === 'unclear' ? R.fullEditUnclear : null;
+  if (v !== 'clear') return v === 'claude' ? R.fullClaude : R.fullEditUnclear;
+  // a file that is also linked from another place on disk (a hard link) could be one of their files under another name
+  const r = throughLinks(resolveReal(target, base), base);
+  return r.ok && r.exists && linkedFile(r.real) ? R.fullLinked : null;
 }
 
 /** Whether a real path is in Claude Code's own settings: in the agent's folder (placeOf), or anywhere else (claudeSetting). */
@@ -484,11 +489,13 @@ function commandFloor(command, base) {
       const key = `${folderIds.get(folders)}\n${targetKey(t)}`;
       if (!judged.has(key)) judged.set(key, targetLanding(t, folders, base));
       const v = judged.get(key);
-      if (v === 'claude') return R.fullClaude;
+      if (v === 'claude') return t.link ? R.fullHardLink : R.fullClaude;
       if (v === 'unclear') unclear = true;
       if (v === 'carried') carried = true;
     }
     if (codeNamesClaude(c, command, parts) || builtProgram(c)) code = true;
+    const call = c.bare ? packageCall(c.bare) : null;
+    if (call !== null && namesExpanded(call)) code = true;
   }
   if (!code && feedsNames(parts) && (named || textNamesClaude(command))) code = true;
   const left = walked ? leftIn(walked.end, base) : null;
@@ -509,8 +516,8 @@ const FLOOR_PARTS = 2048;
 /** The folder states of a part that no walk placed: the agent's own folder (a null dir is read from there). */
 const HOME_STATE = Object.freeze([Object.freeze({ dir: null, prev: null, stack: [] })]);
 
-/** What makes two places a command writes the same: the word, whether what is inside counts, the name given inside, git's -C words. */
-const targetKey = t => [t.word, t.deep ? 1 : 0, t.into ?? '', ...(t.chain ?? [])].join('\0');
+/** What makes two places a command writes the same: the word, whether what is inside counts, a hard link, the name given inside, git's -C words. */
+const targetKey = t => [t.word, t.deep ? 1 : 0, t.link ? 1 : 0, t.into ?? '', ...(t.chain ?? [])].join('\0');
 
 /** A command's places, each once. */
 function uniqueTargets(targets) {
@@ -1007,9 +1014,14 @@ function programTargets(prog, args) {
       return each([...operands, ...optValues(opts, 'o', 'output')]);
     }
     case 'zip': {
-      // the archive it writes: its first word, or -O's
+      // the archive it writes: its first word, or -O's; with -m (--move), what it puts in the archive is deleted, with what is inside it
       const { operands, opts } = argsOf(args, 'bntOP', ['temp-path', 'suffixes', 'output-file', 'password']);
-      return each([operands[0], optValue(opts, 'O', 'output-file')].filter(w => w !== undefined));
+      const moves = optionWords(args).some(a => (!a.startsWith('--') && shortHas(a, 'm')) || longIs(a, ['move']));
+      return [...each([operands[0], optValue(opts, 'O', 'output-file')].filter(w => w !== undefined)), ...(moves ? each(operands.slice(1), { deep: true }) : [])];
+    }
+    case 'link': { // link FILE NAME: a second name for FILE
+      const { operands } = argsOf(args);
+      return [...(operands[0] !== undefined ? [{ word: operands[0], link: true }] : []), ...each(operands.slice(1, 2))];
     }
     case 'curl': return optionTargets(args, 'AbcCdDeEFHKmoPQrtTuUwxXyYz', 'oDc',
       ['output', 'output-dir', 'dump-header', 'cookie-jar', 'trace', 'trace-ascii', 'stderr', 'libcurl', 'etag-save', 'hsts', 'alt-svc']);
@@ -1023,9 +1035,143 @@ function programTargets(prog, args) {
     case 'uniq': { const files = uniqFiles(args); return files.length > 1 ? [{ word: files[1] }] : []; }
     case 'find': return findTargets(args);
     case 'git': return gitTargets(args);
-    case 'node': case 'npm': case 'pnpm': case 'yarn': case 'npx': return reporterTargets(args);
-    default: return [];
+    case 'node': return reporterTargets(args);
+    case 'npm': case 'pnpm': case 'yarn': case 'npx': case 'pnpx': case 'bunx': case 'bun': {
+      const tool = packageTool(prog, args);
+      return [...reporterTargets(args), ...(tool ? programTargets(tool.prog, tool.args) : [])];
+    }
+    case 'pytest': case 'py.test': return pytestTargets(args);
+    case 'python': case 'python3': case 'python2': return args[0] === '-m' && args[1] === 'pytest' ? pytestTargets(args.slice(2)) : [];
+    case 'go': return args[0] === 'test' ? goTestTargets(args.slice(1)) : [];
+    case 'jest': case 'vitest': return jestTargets(args);
+    default: return Object.hasOwn(TOOL_WRITES, prog) ? toolTargets(TOOL_WRITES[prog], prog === 'ruff' ? args.slice(1) : args, prog === 'ruff' ? args[0] : null) : [];
   }
+}
+
+/**
+ * The tool a package runner runs, past its own options: npx, pnpx, bunx and `bun x`, `npm exec` (and `npm x`), `pnpm exec`,
+ * `pnpm dlx`, `yarn exec` and `yarn dlx`, and yarn given a tool's own name (`yarn prettier --write …`). null for anything else.
+ */
+function packageTool(prog, args) {
+  let rest = null;
+  if (prog === 'npx' || prog === 'pnpx' || prog === 'bunx') rest = args;
+  else if ((prog === 'npm' && /^(?:exec|x)$/.test(args[0] ?? '')) || ((prog === 'pnpm' || prog === 'yarn') && /^(?:exec|dlx)$/.test(args[0] ?? ''))
+    || (prog === 'bun' && args[0] === 'x')) rest = args.slice(1);
+  else if (prog === 'yarn' && (Object.hasOwn(TOOL_WRITES, args[0] ?? '') || args[0] === 'jest' || args[0] === 'vitest')) rest = args;
+  if (!rest) return null;
+  let k = 0;
+  while (k < rest.length && rest[k].startsWith('-')) {
+    if (rest[k] === '--') { k++; break; }
+    k += /^(?:-p|--package|-c|--call)$/.test(rest[k]) ? 2 : 1;
+  }
+  return k < rest.length ? { prog: rest[k].replace(/^.*\//, '').replace(/@[^/]*$/, ''), args: rest.slice(k + 1) } : null;
+}
+
+/** The shell command npx, `npm exec` and their kin run with -c (--call): code, which the floor reads as code (or null). */
+function packageCall(p) {
+  const rest = p.prog === 'npm' && /^(?:exec|x)$/.test(p.args[0] ?? '') ? p.args.slice(1) : ['npx', 'pnpx', 'bunx'].includes(p.prog) ? p.args : null;
+  if (!rest) return null;
+  for (let k = 0; k < rest.length && rest[k].startsWith('-') && rest[k] !== '--'; k++) {
+    const m = /^(?:-c|--call)(?:=(.*))?$/s.exec(rest[k]);
+    if (m) return m[1] ?? rest[k + 1] ?? null;
+    if (/^(?:-p|--package)$/.test(rest[k])) k++;
+  }
+  return null;
+}
+
+/**
+ * The value of each of a tool's options named here (`--name=value`, `--name value`, a short letter's `-xvalue` or `-x value`),
+ * with what it is: `{ word, deep? }` from `names` (long names) and `short` (letters), maps to `{}` or `{ deep: true }`.
+ */
+function optionPlaces(args, names, short = {}) {
+  const out = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === '--') break;
+    let m = /^--([^=]+)(?:=(.*))?$/s.exec(a);
+    if (m && Object.hasOwn(names, m[1])) { const v = m[2] ?? args[++k]; if (v !== undefined) out.push({ word: v, ...names[m[1]] }); continue; }
+    m = /^-([A-Za-z])(.*)$/s.exec(a);
+    if (m && Object.hasOwn(short, m[1])) { const v = m[2] || args[++k]; if (v !== undefined) out.push({ word: v, ...short[m[1]] }); }
+  }
+  return out;
+}
+
+/**
+ * pytest (and python -m pytest): the folder --basetemp empties and fills, the reports it writes (--junitxml, --junit-xml,
+ * --result-log, --report-log, pytest-html's --html, pytest-cov's --cov-report TYPE:PATH), the cache folder -o cache_dir=…
+ * names, and the cache it keeps in --rootdir.
+ */
+function pytestTargets(args) {
+  const out = optionPlaces(args, { basetemp: { deep: true }, junitxml: {}, 'junit-xml': {}, 'result-log': {}, 'report-log': {}, html: {} });
+  for (const t of optionPlaces(args, { 'cov-report': {} })) { const at = t.word.indexOf(':'); if (at > 0) out.push({ word: t.word.slice(at + 1) }); }
+  for (const t of optionPlaces(args, { 'override-ini': {} }, { o: {} })) { const m = /^cache_dir=(.*)$/s.exec(t.word); if (m) out.push({ word: m[1], deep: true }); }
+  for (const t of optionPlaces(args, { rootdir: {} })) out.push({ word: `${t.word.replace(/\/+$/, '')}/.pytest_cache`, deep: true });
+  return out;
+}
+
+/** jest and vitest: the file --outputFile writes (vitest's --outputFile.<reporter> too), and the coverage and cache folders. */
+function jestTargets(args) {
+  const out = optionPlaces(args, { outputFile: {}, 'output-file': {}, coverageDirectory: { deep: true }, 'coverage-directory': { deep: true },
+    cacheDirectory: { deep: true }, 'cache-directory': { deep: true }, 'coverage.reportsDirectory': { deep: true } });
+  for (const a of args) { const m = /^--outputFile\.[^=]+=(.*)$/s.exec(a); if (m) out.push({ word: m[1] }); }
+  return out;
+}
+
+/** go test: the profiles and trace it writes, the folder -outputdir puts them in, and the test binary -o writes (one dash or two). */
+function goTestTargets(args) {
+  const out = [];
+  for (let k = 0; k < args.length; k++) {
+    const m = /^--?(?:test\.)?(coverprofile|cpuprofile|memprofile|blockprofile|mutexprofile|trace|outputdir|o)(?:=(.*))?$/s.exec(args[k]);
+    if (!m) continue;
+    const v = m[2] ?? args[++k];
+    if (v !== undefined) out.push({ word: v, ...(m[1] === 'outputdir' ? { deep: true } : {}) });
+  }
+  return out;
+}
+
+/** The options of a formatter's or linter's own words that take a value (so a config file is never taken for one it rewrites). */
+const PRETTIER_VALUES = ['arrow-parens', 'cursor-offset', 'embedded-language-formatting', 'end-of-line', 'experimental-operator-position',
+  'html-whitespace-sensitivity', 'object-wrap', 'parser', 'plugin', 'plugin-search-dir', 'print-width', 'prose-wrap', 'quote-props', 'range-end',
+  'range-start', 'tab-width', 'trailing-comma', 'config', 'config-precedence', 'ignore-path', 'log-level', 'loglevel', 'stdin-filepath', 'cache-location',
+  'cache-strategy', 'find-config-path', 'file-info'];
+const ESLINT_VALUES = ['config', 'env', 'ext', 'global', 'parser', 'parser-options', 'resolve-plugins-relative-to', 'rulesdir', 'plugin', 'rule',
+  'ignore-path', 'ignore-pattern', 'format', 'output-file', 'max-warnings', 'cache-location', 'cache-file', 'cache-strategy',
+  'report-unused-disable-directives-severity', 'report-unused-inline-configs', 'stdin-filename', 'flag', 'concurrency', 'fix-type', 'print-config'];
+const STYLELINT_VALUES = ['config', 'config-basedir', 'custom-syntax', 'ignore-path', 'ignore-pattern', 'formatter', 'custom-formatter', 'output-file',
+  'cache-location', 'cache-strategy', 'max-warnings', 'stdin-filename'];
+const BLACK_VALUES = ['line-length', 'target-version', 'include', 'exclude', 'extend-exclude', 'force-exclude', 'stdin-filename', 'workers', 'config',
+  'python-cell-magics', 'required-version', 'code', 'enable-unstable-feature', 'line-ranges'];
+const RUFF_VALUES = ['config', 'select', 'extend-select', 'ignore', 'extend-ignore', 'per-file-ignores', 'extend-per-file-ignores', 'fixable',
+  'extend-fixable', 'unfixable', 'exclude', 'extend-exclude', 'target-version', 'line-length', 'output-format', 'output-file', 'cache-dir',
+  'stdin-filename', 'dummy-variable-rgx', 'range'];
+
+/**
+ * Formatters and linters that rewrite the files they are given when told to (`fix`, a test of their option words; ruff by its
+ * subcommand too), and the places their options name for an output (`out`: long names, `short` letters). The files they are
+ * given count as written, a folder by its name only: what it holds is judged as the agent's own folder is.
+ */
+const TOOL_WRITES = Object.freeze({
+  prettier: { values: { short: '', long: PRETTIER_VALUES, flags: ['cache'] }, fix: w => w.some(a => a === '-w' || a === '--write'), out: { 'cache-location': {} } },
+  eslint: { values: { short: 'cfo', long: ESLINT_VALUES, flags: ['cache', 'fix'] }, fix: w => w.includes('--fix'),
+    out: { 'output-file': {}, 'cache-location': {}, 'cache-file': {} }, short: { o: {} } },
+  stylelint: { values: { short: 'cfio', long: STYLELINT_VALUES, flags: ['cache', 'fix'] }, fix: w => w.includes('--fix'),
+    out: { 'output-file': {}, 'cache-location': {} }, short: { o: {} } },
+  black: { values: { short: 'ltWc', long: BLACK_VALUES }, fix: w => !w.some(a => a === '--check' || a === '--diff'), out: {} },
+  ruff: { values: { short: 'o', long: RUFF_VALUES, flags: ['fix'] },
+    fix: (w, sub) => (sub === 'format' && !w.some(a => a === '--check' || a === '--diff')) || (sub === 'check' && w.some(a => a === '--fix' || a === '--fix-only')),
+    out: { 'output-file': {}, 'cache-dir': { deep: true } }, short: { o: {} } },
+  gofmt: { values: { short: 'r', long: [] }, fix: w => w.some(a => /^-[a-z]*w/.test(a)), out: {} },
+  goimports: { values: { short: '', long: [] }, fix: w => w.some(a => /^-[a-z]*w/.test(a)), out: {} },
+  'clang-format': { values: { short: '', long: [] }, fix: w => w.some(a => a === '-i' || a === '--i'), out: {} },
+  rustfmt: { values: { short: '', long: ['edition', 'config-path', 'config', 'emit', 'color', 'print-config', 'style-edition'] },
+    fix: w => !w.some(a => a === '--check' || /^--emit(?:=|$)/.test(a)), out: {} },
+});
+
+/** What a tool of TOOL_WRITES writes: the files it is given when told to rewrite them, and its options' outputs. */
+function toolTargets(spec, args, sub = null) {
+  const out = optionPlaces(args, spec.out, spec.short ?? {});
+  if (!spec.fix(optionWords(args), sub)) return out;
+  return [...out, ...gitArgs(args, spec.values).operands.filter(w => w !== '-').map(word => ({ word }))];
 }
 
 /** cp, ln, install, ditto, rsync and scp: the destination, and the name each source gets inside it when it is a folder. */
@@ -1041,9 +1187,20 @@ function copyTargets(prog, args) {
   if (dir !== undefined) [dest, sources] = [dir, operands];
   else if (prog === 'ln' && operands.length === 1) [dest, sources] = ['.', operands]; // a link in this folder, named as what it links to
   else [dest, sources] = [operands.at(-1), operands.slice(0, -1)];
+  const words = optionWords(args);
+  // a hard link (ln without -s, cp -l): a second name for each source, through which it can be changed; rsync's --link-dest
+  // makes them to the files of its folder. rsync --remove-source-files deletes the files it sent.
+  const recursive = words.some(a => shortHas(a, 'rRa') || longIs(a, ['recursive', 'archive']));
+  if ((prog === 'ln' && !words.some(a => shortHas(a, 's') || longIs(a, ['symbolic']))) || (prog === 'cp' && words.some(a => shortHas(a, 'l') || longIs(a, ['link'])))) {
+    for (const s of sources) out.push({ word: s, link: true, deep: prog === 'cp' && recursive });
+  }
+  if (prog === 'rsync') {
+    out.push(...optValues(opts, null, 'link-dest').map(word => ({ word, link: true, deep: true })));
+    if (words.some(a => longIs(a, ['remove-source-files', 'remove-sent-files']))) for (const s of sources) if (!remote(s)) out.push({ word: s, deep: true });
+  }
   if (dest === undefined || remote(dest)) return out;
   // rsync --delete removes what the source does not have, everywhere inside its destination
-  out.push({ word: dest, deep: prog === 'rsync' && optionWords(args).some(a => /^--del/.test(a)) });
+  out.push({ word: dest, deep: prog === 'rsync' && words.some(a => /^--del/.test(a)) });
   for (const s of sources) out.push({ word: dest, into: path.basename(s.replace(/^[^/]*:/, '')) });
   return out;
 }
@@ -1132,6 +1289,10 @@ function tarTargets(args) {
   const out = optValues(opts, 'g', 'listed-incremental').map(word => ({ word }));
   const file = optValue(opts, 'f', 'file');
   if (create && file !== undefined && file !== '-') out.push({ word: file });
+  if (create && words.some(a => longIs(a, ['remove-files']))) { // GNU tar deletes what it puts in the archive, read from its -C folder
+    const dirs = optValues(opts, 'C', 'directory');
+    for (const m of operands) for (const d of dirs.length ? dirs : ['.']) out.push({ word: d === '.' ? m : `${d.replace(/\/+$/, '')}/${m}`, deep: true });
+  }
   if (extract) {
     const dirs = optValues(opts, 'C', 'directory');
     out.push(...dirs.map(word => ({ word })));
