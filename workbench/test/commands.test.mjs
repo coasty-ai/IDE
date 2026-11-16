@@ -2229,6 +2229,24 @@ test('an agent named alone asks what it should work on; the engine names it, and
     ['the agent', 'none', noTask()], ['the agent', 'oneAtWork', noTask()], ['start the agent', 'oneAtWork', noTask()], ['start an agent', 'none', noTask()],
     ['codex', 'question', answer('codex')], // a question takes it as its answer
   ]);
+  // with a card on screen, a program named alone is still a start with no work (the engine keeps the card, and asks)
+  for (const ctx of ['pendingMerge', 'pendingStop', 'pendingDiscard', 'pendingPermissions', 'pendingStart', 'boardCard']) {
+    sweptRows([
+      ['codex', ctx, noTask('codex')], ['claude', ctx, noTask('claude')], ['the agent', ctx, noTask()], ['new agent', ctx, noTask()],
+      ['ask claude', ctx, noTask('claude')],
+    ]);
+  }
+});
+
+test('at a permission, "try again" and words like it that say no work keep the permission\'s hint; work still starts an agent', () => {
+  for (const text of ['try again', 'try it again', 'run it again', 'try once more', 'please try again', 'try again later', 'retry', 'go again', 'check it again']) {
+    assert.deepEqual(parseCommand(text, CTX.permission), unknown(text), text);
+  }
+  sweptRows([
+    ['fix the login page', 'permission', said('fix the login page')],
+    ['run the tests again', 'permission', said('run the tests again')],
+    ['try again', 'none', said('try again')], // with nothing on screen, a prompt as before
+  ]);
 });
 
 test('words said again are a prompt again, whatever became of the agent they started: starting, at work or ended', () => {

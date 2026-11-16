@@ -299,6 +299,23 @@ try {
         && words === 'Started three simulated Claude agents on “the login page”.' && after === agents + 3 && p.length === 2 && /^c/.test(p[1].body.confirmId || ''),
       JSON.stringify({ card, buttons, agents: [agents, mid, after], words, sent: p.map(x => x.body) }));
   });
+  // A program named alone keeps a card on screen: it asks what that program should work on, and its next words start it.
+  await run('a program named alone keeps a card on screen, asks what it should work on, and its next words start it', async () => {
+    await open('demo');
+    await sleep(800);
+    const ask = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); await sleep(900); };
+    await ask('stop the sign-up one');
+    const card = await h1();
+    await ask('codex');
+    const kept1 = await h1(), q = await saidAll();
+    await ask('fix the login page');
+    const kept2 = await h1(), words = await saidAll();
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check('a program named alone keeps a card on screen, asks what it should work on, and its next words start it',
+      card === 'Stop Onboarding?' && kept1 === card && q === 'What should Codex work on?' && kept2 === card && words === 'Started a simulated Codex on “fix the login page”.'
+        && p.length === 3 && p.slice(1).every(x => /^c/.test(x.body.confirmId || '')),
+      JSON.stringify({ card, kept1, q, kept2, words, sent: p.map(x => x.body) }));
+  });
   await run('words too long to send in one go stay in the box, and nothing is sent', async () => {
     await open('prompt');
     await sleep(700);

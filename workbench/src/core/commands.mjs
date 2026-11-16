@@ -2272,7 +2272,10 @@ function matchTask(core, c) {
   let words = core;
   if (core.length > 2 && core[0].w === 'work' && core[1].w === 'on') words = core.slice(2);
   else if (core.length < 2 || !WORK_VERBS.has(core[0].w)) return null;
-  if (emptyTask(words === core ? core.slice(1) : words)) return null; // "fix it", "do that", "work on it"
+  // "fix it", "do that", "work on it", "try again", "run it again": the words after the verb say no work by themselves
+  // (NOTHING_WORDS), so they are no work request; at a permission they keep its hint, and elsewhere they are the prompt
+  const what = words === core ? core.slice(1) : words;
+  if (emptyTask(what) || contentCount(what) === 0) return null;
   // "merge everything", "merge its work", "bring it all in": Workbench's own verb for an agent's work, pointing at an agent;
   // where that is no command now (a request waits), it is no work either
   const after = stripTrailing(core.slice(1), WORK_TAIL).map(t => t.w).filter(w => w !== 'in').join(' ');
@@ -2372,7 +2375,7 @@ const NOTHING_WORDS = new Set([
   'lovely', 'love', 'thanks', 'thank', 'ty', 'cheers', 'please', 'sorry', 'lol', 'haha', 'wow', 'whoa', 'yay', 'oops', 'ugh',
   'argh', 'hell', 'heck', 'damn', 'crap', 'right', 'correct', 'exactly', 'indeed', 'true', 'agreed', 'agree', 'sounds',
   'looks', 'seems', 'lgtm', 'got', 'see', 'understood', 'understand', 'noted', 'makes', 'sense', 'mean', 'means', 'mind',
-  'never', 'worries', 'bye', 'goodbye', 'later', 'again', 'now', 'today', 'still', 'already', 'yet', 'well', 'hi', 'hello',
+  'never', 'worries', 'bye', 'goodbye', 'later', 'again', 'once', 'now', 'today', 'still', 'already', 'yet', 'well', 'hi', 'hello',
   'hey', 'next', 'long', 'longer', 'let', 'think', 'thinking', 'give', 'minute', 'minutes', 'sec', 'second', 'seconds',
   'moment', 'hang', 'happen', 'happens', 'happened', 'happening', 'changing', 'taking', 'forever', 'testing', 'two', 'three',
   'four', 'five', 'agent', 'agents', 'helper', 'helpers', 'task', 'tasks', 'job', 'jobs', 'thing', 'things', 'stuff',

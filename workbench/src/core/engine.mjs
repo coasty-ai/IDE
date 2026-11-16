@@ -3692,14 +3692,16 @@ export class Engine extends EventEmitter {
           ? { reply: GONE }
           : { reply: `Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
       } else {
-        // Any other command withdraws the card on screen, without a notice: the page lets go of it. Three do not, and the
+        // Any other command withdraws the card on screen, without a notice: the page lets go of it. Four do not, and the
         // reply carries the card, as for words not caught, so the page keeps it too. A look at an agent's changes is
         // read-only, so the card keeps waiting ("show me the changes" before saying yes to a merge). A prompt starts its
         // agent at once, and the card stays where it is: it was not answered. A stop stops what it names, and the card
-        // stays too ("stop everything, the build is broken" while a merge card waits).
+        // stays too ("stop everything, the build is broken" while a merge card waits). A program named alone ("codex", "the
+        // agent", "ask claude") asks what it should work on, and the card stays for its own answer.
         const prompt = intent.kind === 'task' || (intent.kind === 'start' && Array.isArray(intent.tasks) && intent.tasks.length > 0);
         const stopping = intent.kind === 'stop' || intent.kind === 'stop_all';
-        const keep = (intent.kind === 'changes' || prompt || stopping) && shown && !shown.gone;
+        const asking = intent.kind === 'start' && !prompt && !intent.task;
+        const keep = (intent.kind === 'changes' || prompt || stopping || asking) && shown && !shown.gone;
         if (shown && !shown.gone && intent.kind !== 'confirm' && !keep) this.confirms.delete(shown.id);
         try {
           // With a card on screen, no ask was: the centre shows one thing at a time.
@@ -3713,9 +3715,9 @@ export class Engine extends EventEmitter {
           // the words asked first with a card of their own ("stop the stuck one"): that card takes the centre
           this.confirms.delete(kept.id);
         } else if (kept) {
-          // what a prompt started, or a stop stopped, is said under the board all the same: the card in the centre does
-          // not say it, and the centre stays on the card
-          if ((prompt || stopping) && out.reply) this._notice(out.reply, null);
+          // what a prompt started, a stop stopped, or the question of what a program named alone should work on, is said
+          // under the board all the same: the card in the centre does not say it, and the centre stays on the card
+          if ((prompt || stopping || asking) && out.reply) this._notice(out.reply, null);
           if (stopping) delete out.focusId;
           out = { ...out, confirm: this._card(kept) };
         }

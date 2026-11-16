@@ -1519,6 +1519,17 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           && !(/\?$/.test(text) && /^(?:don'?t|do not|not)\b/i.test(text));
         const firstYes = /^(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b|(?:do it|go ahead)\b)/i.exec(text);
         const firstYesKeeps = () => /\?$/.test(text) || /^\S+(?: it| ahead)?[,.!]?\s+(?:but|if|only|unless|except)\b/i.test(text);
+        // A program named alone ("codex", "the agent", "new agent", "ask claude") asks what it should work on, and the next
+        // words are its prompt; a card on screen stays, and the question is posted as a notice, as the engine's command() does
+        const alone = /^(?:start |ask )?(codex|claude|the agent|agent|new agent)[.!?]*$/i.exec(text);
+        const askAlone = () => {
+          const h = alone[1].toLowerCase() === 'codex' ? 'codex' : 'claude';
+          askedFor = h;
+          const question = `What should ${h === 'codex' ? 'Codex' : 'Claude Code'} work on?`;
+          if (!shown) return reply({ reply: question });
+          send('notice', { text: question });
+          return reply({ reply: question, confirm: cardOf(shown) });
+        };
         if (shown && shown.kind === 'permissions') {
           // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking",
           // "turn it off" and its kin, or a no. A bare "yes" is not enough, and a question answers nothing: the card stays.
@@ -1529,6 +1540,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if (/^(?:turn (?:it|them) on|do it)\b[,.!]?\s/i.test(text) && !firstYesKeeps()) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (firstYes) return hint('turn on full permissions');
           if (stopWords) return stopNow();
+          if (alone) return askAlone();
           return prompt();
         }
         if (shown) {
@@ -1550,6 +1562,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if ((own && own.test(text)) || (firstYes && !firstYesKeeps() && (shown.kind !== 'discard' || /^do it\b/i.test(text)))) { confirms.delete(shown.id); return reply(settle(shown, true)); }
           if (firstYes) return hint(verb);
           if (stopWords) return stopNow();   // a stop stops, and the card stays
+          if (alone) return askAlone();      // a program named alone asks what it should work on, and the card stays
           // more than one agent from one sentence brings its own card in place of this one (below)
           const several = /^start (?:two|three|four|five|[2-5]|eight|8) /i.test(text);
           if (!several && !/^(merge|land|throw|discard|scrap|forget|stop|tell|what needs me)\b/i.test(text)) return prompt();
@@ -1615,13 +1628,8 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           send('notice', { text: out.reply });
           return reply(out);
         }
-        // an agent named alone asks what it should work on, and the next words are its prompt
-        const alone = /^(?:start )?(codex|claude|the agent|agent)[.!?]*$/i.exec(text);
-        if (alone) {
-          const h = alone[1].toLowerCase() === 'codex' ? 'codex' : 'claude';
-          askedFor = h;
-          return reply({ reply: `What should ${h === 'codex' ? 'Codex' : 'Claude Code'} work on?` });
-        }
+        // an agent named alone asks what it should work on, and the next words are its prompt (askAlone, above)
+        if (alone) return askAlone();
         // "start …": the words after it, at once; more than one agent from one sentence ("start three agents on the login
         // page", or "start eight agents on the backlog", the eight the backlog holds) asks first, with the engine's card
         if (/^start\b/i.test(text)) {

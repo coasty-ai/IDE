@@ -4729,6 +4729,46 @@ test('a stop with its reason after it stops that agent and starts nothing; with 
   await t.engine.shutdown();
 });
 
+test('a program named alone keeps a card on screen: it asks what that program should work on, and the next words are its prompt', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const readme = await started(t, { task: 'Tidy the readme' });
+  const card = await t.engine.command('stop the readme one');
+  for (const [text, who] of [['codex', 'Codex'], ['claude', 'Claude Code'], ['the agent', 'Claude Code'], ['new agent', 'Claude Code'], ['ask claude', 'Claude Code'], ['start codex', 'Codex']]) {
+    const before = t.notices.length;
+    const out = await t.engine.command(text, { confirmId: card.confirm.id });
+    assert.deepEqual(out, { reply: `What should ${who} work on?`, confirm: card.confirm }, text);
+    assert.deepEqual(t.notices.slice(before), [out.reply], `${text}: the question is said under the board, as the card stays`);
+  }
+  // the next words are that program's prompt, and the card still stays
+  await t.engine.command('codex', { confirmId: card.confirm.id });
+  const go = await t.engine.command('fix the login page', { confirmId: card.confirm.id });
+  assert.equal(go.reply, 'Started Codex on “fix the login page”.');
+  assert.deepEqual(go.confirm, card.confirm);
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), ['fix the login page']);
+  // and it still takes its own words
+  assert.equal((await t.engine.command('yes', { confirmId: card.confirm.id })).reply, 'Stopped Tidy readme.');
+  assert.equal(t.store.get(readme.id).state, 'stopped');
+  await t.engine.shutdown();
+});
+
+test('at a permission, "try again" keeps the permission\'s hint and starts nothing, as other words that say no work do', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } });
+  await until(() => t.store.get(id).ask);
+  const askId = t.store.get(id).ask.id;
+  for (const text of ['try again', 'please try it again', 'run it again', 'retry']) {
+    assert.deepEqual(await t.engine.command(text, { focusId: id, askId }), { reply: 'Fix login redirect is waiting for your OK. Say “yes” or “no” to it first.' }, text);
+  }
+  assert.equal(t.claude.runners.length, 1, 'nothing started');
+  assert.equal(await settled(pending), false, 'the request still waits');
+  await t.engine.answer(id, { askId, answer: 'Deny' });
+  await pending;
+  await t.engine.shutdown();
+});
+
 test('words that begin with a card\'s yes or no answer it, whatever follows, and what follows starts nothing', async () => {
   const t = live();
   t.engine.deps.commands = commands;
