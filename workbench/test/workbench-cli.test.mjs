@@ -460,6 +460,20 @@ test('full permissions kept from an earlier run are read at start and said in th
   assert.ok(!off.out.includes(LINE), off.out);
 });
 
+test('the file view is there in both modes: the demo shows its sample project, and a repository its own files', async (t) => {
+  const w = setup(t);
+  const ask = (at, p) => fetch(`${at.origin}${p}`, { headers: { 'X-Workbench-Token': at.token } }).then(r => r.json());
+  const demo = await running(t, ['--demo', '--no-open', '--port', '0'], w.env);
+  const sample = await ask(demo, 'api/files?in=you');
+  assert.deepEqual([sample.ok, sample.name, sample.branch], [true, 'storefront', 'main']);
+  assert.ok(sample.files.some(f => f.path === 'src/invoices/export.ts'), JSON.stringify(sample));
+  assert.equal(await demo.stop(), 0, demo.out());
+  const live = await running(t, ['--repo', w.repo, '--no-open', '--port', '0'], w.env);
+  assert.deepEqual(await ask(live, 'api/files?in=you'), { ok: true, in: 'you', name: 'repo', branch: 'main', files: [{ path: 'README.md' }] });
+  assert.deepEqual((await ask(live, 'api/file?in=you&path=README.md')).text, '# test\n');
+  assert.equal(await live.stop(), 0, live.out());
+});
+
 test('--app: one line the Mac app reads, no browser, and Workbench stops when the app closes its standard input', async (t) => {
   const w = setup(t);
   const proc = spawn(process.execPath, [BIN, '--demo', '--app', '--port', '0'], { env: w.env, stdio: ['pipe', 'pipe', 'pipe'] });

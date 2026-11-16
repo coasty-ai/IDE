@@ -13,6 +13,9 @@ import { Connect } from '../src/core/connect.mjs';
 import { KeyStore } from '../src/core/keys.mjs';
 import { createPrefs, memoryPrefs, prefsFile } from '../src/core/prefs.mjs';
 import { EV } from '../src/shared/events.mjs';
+import { Engine } from '../src/core/engine.mjs';
+import * as filesMod from '../src/core/files.mjs';
+import { FakeSim, FakeMachines } from './helpers/engine-fakes.mjs';
 
 const ROOT = path.join(os.tmpdir(), `wb-http-${process.pid}-${crypto.randomBytes(3).toString('hex')}`);
 const TOKEN = crypto.randomBytes(32).toString('hex');
@@ -64,6 +67,25 @@ class FakeEngine extends EventEmitter {
   async proposeDiscard(id, o) {
     this.calls.push(['proposeDiscard', id, o]);
     return { reply: 'Throw away Fix login’s work?', confirm: { id: '0a1b2c3d4e60', sentence: 'Throw away Fix login’s work?', detail: 'Its folder and its branch are deleted.', kind: 'discard', yes: 'Throw it away', no: 'Keep it', danger: true } };
+  }
+  // The file view. A test may set `fileAnswer` to answer in its place (a refusal, say).
+  async files(where) {
+    this.calls.push(['files', where]);
+    return this.fileAnswer?.('files') ?? { ok: true, in: where, name: 'shop', branch: 'main', files: [{ path: 'src/a.js', changedBy: [{ agentId: 'abc123', name: 'Fix login', state: 'done_checked' }] }, { path: '.env', ignored: true }] };
+  }
+  async file(where, rel, o) {
+    this.calls.push(['file', where, rel, o]);
+    if (this.fileAnswer) return this.fileAnswer('file');
+    if (o?.check === 'ab'.repeat(32)) return { ok: true, same: true };
+    return { ok: true, in: where, path: rel, kind: 'text', text: 'let a = 1;\n', hash: 'ab'.repeat(32), size: 11, lines: 1, eol: 'lf', bom: false, changedLines: [1], editable: true };
+  }
+  async search(where, q) {
+    this.calls.push(['search', where, q]);
+    return this.fileAnswer?.('search') ?? { ok: true, in: where, results: [{ path: 'src/a.js', line: 1, text: 'let a = 1;' }] };
+  }
+  async saveFile(where, rel, o) {
+    this.calls.push(['saveFile', where, rel, { ...o, text: typeof o?.text === 'string' && o.text.length > 64 ? `${o.text.length} characters` : o?.text }]);
+    return this.fileAnswer?.('saveFile') ?? { ok: true, hash: 'cd'.repeat(32), size: 12 };
   }
   hookPreToolUse(agentId, payload, { signal } = {}) {
     this.calls.push(['hook', agentId, payload]);
@@ -681,6 +703,143 @@ test('unknown routes, wrong methods, bad ids and engine errors get plain JSON er
   const crash = await post('/api/agents', { task: 'explode' });
   assert.equal(crash.status, 500);
   assert.equal(crash.json.error, 'Something went wrong in the workbench. The details are in its log.');
+});
+
+// ------------------------------------------------------------------ the file view
+
+test('the file view’s routes call the engine with what the page sent, and answer as it does', async () => {
+  engine.calls.length = 0;
+  engine.fileAnswer = null;
+  const get = p => request({ path: p, headers: auth() });
+  const list = await get('/api/files?in=you');
+  assert.equal(list.status, 200);
+  assert.equal(list.headers['cache-control'], 'no-store');
+  assert.deepEqual(list.json, { ok: true, in: 'you', name: 'shop', branch: 'main', files: [{ path: 'src/a.js', changedBy: [{ agentId: 'abc123', name: 'Fix login', state: 'done_checked' }] }, { path: '.env', ignored: true }] });
+  const one = await get(`/api/file?in=abc123&path=${encodeURIComponent('src/a b.js')}`);
+  assert.equal(one.status, 200);
+  assert.deepEqual(one.json, { ok: true, in: 'abc123', path: 'src/a b.js', kind: 'text', text: 'let a = 1;\n', hash: 'ab'.repeat(32), size: 11, lines: 1, eol: 'lf', bom: false, changedLines: [1], editable: true });
+  assert.deepEqual((await get(`/api/file?in=abc123&path=src%2Fa.js&check=${'ab'.repeat(32)}`)).json, { ok: true, same: true });
+  assert.deepEqual((await get('/api/search?in=you&q=let%20a')).json, { ok: true, in: 'you', results: [{ path: 'src/a.js', line: 1, text: 'let a = 1;' }] });
+  const saved = await post('/api/file', { in: 'abc123', path: 'src/a.js', text: 'let a = 2;\n', hash: 'ab'.repeat(32), force: true });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.json, { ok: true, hash: 'cd'.repeat(32), size: 12 });
+  // What is missing or not a string reaches the engine as it is, to refuse in its own words; force is only ever true.
+  await get('/api/files');
+  await get('/api/file?in=you');
+  await get('/api/search?in=you');
+  await post('/api/file', { in: 'you', path: 'a.js', text: 'x', hash: 'ab'.repeat(32), force: 'yes' });
+  await post('/api/file', { in: ['you'], path: 42, text: { x: 1 } });
+  assert.deepEqual(engine.calls, [
+    ['files', 'you'],
+    ['file', 'abc123', 'src/a b.js', { check: null }],
+    ['file', 'abc123', 'src/a.js', { check: 'ab'.repeat(32) }],
+    ['search', 'you', 'let a'],
+    ['saveFile', 'abc123', 'src/a.js', { text: 'let a = 2;\n', hash: 'ab'.repeat(32), force: true }],
+    ['files', null],
+    ['file', 'you', null, { check: null }],
+    ['search', 'you', null],
+    ['saveFile', 'you', 'a.js', { text: 'x', hash: 'ab'.repeat(32), force: false }],
+    ['saveFile', ['you'], 42, { text: { x: 1 }, hash: undefined, force: false }],
+  ]);
+});
+
+test('the file view’s routes: the page’s key, GET by address or header, POST from this page as JSON, and the engine’s refusals as 4xx codes', async () => {
+  engine.calls.length = 0;
+  engine.fileAnswer = null;
+  for (const p of ['/api/files?in=you', '/api/file?in=you&path=a.js', '/api/search?in=you&q=ab']) {
+    assert.equal((await request({ path: p })).status, 401, p);
+    assert.equal((await request({ path: p, headers: { 'X-Workbench-Token': hookTokenFor('abc123') } })).status, 401, `${p}: an agent’s own token opens nothing here`);
+    assert.equal((await request({ path: `${p}&t=${TOKEN}` })).status, 200, `${p}: GET takes the key in its address`);
+  }
+  const body = { in: 'you', path: 'a.js', text: 'x\n', hash: 'ab'.repeat(32) };
+  assert.equal((await request({ method: 'POST', path: '/api/file', body, headers: { 'Content-Type': 'application/json' } })).status, 401);
+  assert.equal((await request({ method: 'POST', path: `/api/file?t=${TOKEN}`, body, headers: { 'Content-Type': 'application/json' } })).status, 401, 'the query token is for GET routes only');
+  assert.equal((await post('/api/file', body, { 'X-Workbench-Token': hookTokenFor('abc123') })).status, 401);
+  assert.equal((await post('/api/file', body, { Origin: 'http://evil.example' })).status, 403);
+  assert.equal((await request({ method: 'POST', path: '/api/file', body: JSON.stringify(body), headers: auth({ 'Content-Type': 'text/plain' }) })).status, 415);
+  assert.deepEqual(engine.calls.filter(c => c[0] === 'saveFile'), [], 'none of these reached the engine');
+  for (const [method, p, allow] of [['POST', '/api/files', 'GET'], ['POST', '/api/search', 'GET'], ['PUT', '/api/file', 'GET, POST'], ['DELETE', '/api/file', 'GET, POST']]) {
+    const r = await request({ method, path: p, body: {}, headers: auth({ 'Content-Type': 'application/json' }) });
+    assert.equal(r.status, 405, `${method} ${p}`);
+    assert.equal(r.headers.allow, allow, p);
+  }
+  // The engine's refusals: a copy that is not there is a 404, a file that changed a 409 with its hash now, the rest 400.
+  const answers = {
+    gone: { ok: false, reply: 'I can’t find that agent.', why: 'gone' },
+    changed: { ok: false, reply: 'a.js changed on disk since it was opened, so nothing was written.', why: 'changed', hash: 'ef'.repeat(32) },
+    refused: { ok: false, reply: '“../a.js” is not the name of a file inside the project.', why: 'refused' },
+  };
+  for (const [why, status] of [['gone', 404], ['changed', 409], ['refused', 400]]) {
+    engine.fileAnswer = () => answers[why];
+    for (const r of [await request({ path: '/api/files?in=x', headers: auth() }), await request({ path: '/api/file?in=x&path=a.js', headers: auth() }),
+      await request({ path: '/api/search?in=x&q=ab', headers: auth() }), await post('/api/file', body)]) {
+      assert.equal(r.status, status, why);
+      assert.equal(r.headers['cache-control'], 'no-store');
+      assert.deepEqual(r.json, answers[why]);
+    }
+  }
+  // Something the engine did not expect: the person reads only that it went wrong.
+  engine.fileAnswer = () => { throw new TypeError('Cannot read properties of undefined (reading \'path\')'); };
+  const crash = await request({ path: '/api/files?in=you', headers: auth() });
+  assert.equal(crash.status, 500);
+  assert.deepEqual(crash.json, { error: 'Something went wrong in the workbench. The details are in its log.' });
+  engine.fileAnswer = null;
+});
+
+test('POST /api/file alone takes a body of up to 3 MB, with at most 1 MB of text; every other route keeps its limit', async () => {
+  engine.calls.length = 0;
+  engine.fileAnswer = null;
+  // About 2.4 MB of JSON for 400 KB of text: control characters are written six bytes each.
+  const text = '\u0001'.repeat(400_000);
+  const big = await post('/api/file', { in: 'you', path: 'a.txt', text, hash: 'ab'.repeat(32) });
+  assert.ok(Buffer.byteLength(JSON.stringify({ text })) > 2 * 1024 * 1024);
+  assert.equal(big.status, 200, big.text);
+  assert.deepEqual(engine.calls.at(-1), ['saveFile', 'you', 'a.txt', { text: '400000 characters', hash: 'ab'.repeat(32), force: false }]);
+  // Over 3 MB (here 3.6 MB): refused, and the engine never sees it.
+  const calls = engine.calls.length;
+  const tooBig = await post('/api/file', { in: 'you', path: 'a.txt', text: '\u0001'.repeat(600_000), hash: 'ab'.repeat(32) });
+  assert.equal(tooBig.status, 413);
+  assert.equal(tooBig.json.error, 'The request is too large. The limit is 3 MB.');
+  // More than 1 MB of text, written as UTF-8.
+  const long = await post('/api/file', { in: 'you', path: 'a.txt', text: 'é'.repeat(524_289), hash: 'ab'.repeat(32) });
+  assert.equal(long.status, 413);
+  assert.deepEqual(long.json, { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' });
+  assert.equal(engine.calls.length, calls, 'the engine saw neither');
+  // The other routes keep theirs: 64 KB, and 16 KB on Agents & keys (see their own tests).
+  for (const p of ['/api/command', '/api/agents/abc123/say', '/api/prefs']) {
+    const r = await post(p, { text: 'x'.repeat(600 * 1024) });
+    assert.equal(r.status, 413, p);
+    assert.equal(r.json.error, 'The request is too large. The limit is 64 KB.', p);
+  }
+  assert.equal(engine.calls.length, calls, 'none of them reached the engine');
+});
+
+test('the file view’s routes with the real engine and the demo’s sample project', async (t) => {
+  const s = new Store();
+  const e = new Engine({ store: s, mode: 'demo', adapters: { sim: new FakeSim() }, machines: new FakeMachines({ demo: true }), deps: { files: filesMod }, options: { tickMs: 10_000_000, simTickMs: 10_000_000 } });
+  const srv = createServer({ engine: e, store: s, token: TOKEN, port: 0, rootDir: ROOT });
+  const { url } = await srv.listen();
+  t.after(async () => { await srv.close(); await e.shutdown(); });
+  const call = async (p, init = {}) => {
+    const r = await fetch(new URL(p, url), { ...init, headers: { 'X-Workbench-Token': TOKEN, ...(init.body ? { 'Content-Type': 'application/json' } : {}) } });
+    return { status: r.status, json: await r.json() };
+  };
+  const list = await call('/api/files?in=you');
+  assert.equal(list.status, 200);
+  assert.equal(list.json.name, 'storefront');
+  assert.ok(list.json.files.some(f => f.path === 'src/invoices/sample.csv'));
+  const csv = await call('/api/file?in=you&path=src/invoices/sample.csv');
+  assert.deepEqual([csv.json.kind, csv.json.eol, csv.json.editable], ['text', 'crlf', true]);
+  const saved = await call('/api/file', { method: 'POST', body: JSON.stringify({ in: 'you', path: 'src/invoices/sample.csv', text: `${csv.json.text}INV-1004,2026-10-12,10.00\n`, hash: csv.json.hash }) });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.json.reply, 'This is the demo, so your change is kept only until Workbench closes.');
+  assert.equal((await call(`/api/file?in=you&path=src/invoices/sample.csv&check=${saved.json.hash}`)).json.same, true);
+  const stale = await call('/api/file', { method: 'POST', body: JSON.stringify({ in: 'you', path: 'src/invoices/sample.csv', text: 'x\n', hash: csv.json.hash }) });
+  assert.equal(stale.status, 409);
+  assert.deepEqual([stale.json.why, stale.json.hash], ['changed', saved.json.hash]);
+  assert.deepEqual(await call('/api/files?in=nobody'), { status: 404, json: { ok: false, reply: 'I can’t find that agent.', why: 'gone' } });
+  assert.deepEqual(await call('/api/search?in=you&q=x'), { status: 400, json: { ok: false, reply: 'Type at least two characters to search for.', why: 'refused' } });
+  assert.deepEqual((await call('/api/search?in=you&q=INV-1004')).json.results, [{ path: 'src/invoices/sample.csv', line: 5, text: 'INV-1004,2026-10-12,10.00' }]);
 });
 
 // ------------------------------------------------------------------ the held hook
