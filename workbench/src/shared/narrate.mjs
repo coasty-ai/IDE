@@ -134,7 +134,7 @@ function takeRedirect(cmd, k, cur) {
 export const FILLED = '\u0000';
 
 /** Keywords after which a command still starts: a `{` or a `(` there opens a group or a subshell. */
-const COMMAND_START = /^\s*(?:(?:then|do|else|elif|if|while|until|!|time)\s+)*$/;
+const COMMAND_START = /^\s*(?:(?:then|do|else|elif|if|while|until|!|time|coproc)\s+)*$/;
 /** Keywords whose parentheses hold a list or a pattern, not a subshell or a word's group: `case x in (a) …`, zsh's `for f (a b) …`. */
 const LIST_KEYWORD = /^\s*(?:case|for|foreach|select)\s/;
 
@@ -146,10 +146,10 @@ const LIST_KEYWORD = /^\s*(?:case|for|foreach|select)\s/;
  * subshell only where a command starts; after a command's first word it opens a pattern group or an array, part of the word
  * up to its `)` (zsh's `rm -rf (.claude|x)`), after a function's name it is the `()` of its definition, and after case,
  * for, foreach and select it holds a pattern or a list, after which a command starts (`case x in (a) …`, `for f (a b) …`).
- * `{` splits only as a word of its own where a command starts (a group, or a function's body); elsewhere, `{}` included,
- * it is a word (`find … -exec cp {} … \;`). A `}` of its own ends a command, as zsh reads it anywhere (`{ cp a b }`); bash
- * reads it as one more word, so when words follow it, all the words, read so, are a part of their own too (`nested`). A `#`
- * that starts a word starts a comment, to the end of its line. Quotes, backslashes, heredocs and redirections are read as
+ * `{}` is a word (`find … -exec cp {} … \;`). A brace of its own opens or ends a group where a command starts (a group, a
+ * function's body), and ends the command's words after them too, as zsh reads its short forms (`repeat 2 { rm x }`,
+ * `{ cp a b }`); bash, and zsh after other words (`echo { a`), read it as one more word, so when words follow it, all the
+ * words, read so, are a part of their own too (`nested`). A `#` that starts a word starts a comment, to the end of its line. Quotes, backslashes, heredocs and redirections are read as
  * shellParts reads them. Each part also says whether the shell runs it itself (`nested` false) or a subshell does (inside
  * `( )`, `$( )`, `` ` ` ``, `<( )` or `>( )`), and what ended it (`sep`: ';', '&&', '||', '|', '&', a new line, ')' at a
  * subshell's end, '{' or '}', or '').
@@ -224,11 +224,12 @@ function lineParts(cmd) {
       end(ch);
       continue;
     }
-    if (ch === '}' && alone(k)) {
-      // zsh ends a group at a "}" of its own anywhere ("{ cp a.txt b }"); bash takes it for one more word of the command
-      const before = cur.text;
-      end('}');
-      cur.shadow = `${before}}`;
+    if ((ch === '{' || ch === '}') && alone(k)) {
+      // zsh opens and ends a group at a brace of its own after a command's words too ("repeat 2 { rm x }", "{ cp a.txt b }");
+      // bash, and zsh after other words ("echo { a"), take it for one more word of the command: that reading is kept too
+      const shadow = `${cur.shadow ? `${cur.shadow} ` : ''}${cur.text}${ch}`;
+      end(ch);
+      cur.shadow = shadow;
       continue;
     }
     if (ch === '#' && /^[\s;&|()]?$/.test(cmd[k - 1] ?? '')) { // a comment, to the end of its line
@@ -366,8 +367,8 @@ function pastOptions(words, k, spec) {
   return k;
 }
 
-/** Read whole, these run the command after them too: sudo and doas, and zsh's noglob, nocorrect and repeat N. */
-const WHOLE_WRAPPERS = new Set([...WRAPPERS, 'sudo', 'doas', 'noglob', 'nocorrect', 'repeat']);
+/** Read whole, these run the command after them too: sudo and doas, coproc, and zsh's noglob, nocorrect and repeat N. */
+const WHOLE_WRAPPERS = new Set([...WRAPPERS, 'sudo', 'doas', 'coproc', 'noglob', 'nocorrect', 'repeat']);
 
 /** env's -S (--split-string): its value is split into the words of the command it runs, in its place. Where they go on. */
 function splitEnv(words, k) {

@@ -225,11 +225,15 @@ test('shellCommands read whole, for the floor: another command’s output leaves
   assert.deepEqual(ev.map(c => [c.prog, !!c.nested, !!c.inEval]), [['eval', false, false], ['cd', false, true]]);
   assert.equal(ev[0].kids[0], ev[1]);
   assert.deepEqual(whole("sh -c 'cd .claude && ls'").map(c => [c.prog, !!c.nested]), [['sh', false], ['cd', true], ['ls', true]]);
-  // "{" is a word but where a command starts, "{}" always; a "}" of its own ends a command as zsh reads it, and bash's reading,
-  // where it is one more word, is kept as a nested part when words follow it; "(" after a command's first word is zsh's pattern group
-  assert.deepEqual(shape('echo { a }'), [['echo', ['{', 'a'], false, '}']]);
+  // "{}" is a word; a brace of its own ends a command as zsh can read it, and bash's reading, where it is one more word, is kept
+  // as a nested part when words follow it; "(" after a command's first word is zsh's pattern group
+  assert.deepEqual(shape('echo { a }'), [['echo', [], false, '{'], ['a', [], false, '}'], ['echo', ['{', 'a'], true, '}']]);
   assert.deepEqual(shape('{ cp a.txt .mcp.json }'), [['cp', ['a.txt', '.mcp.json'], false, '}']]);
   assert.deepEqual(shape('rm -rf } .claude'), [['rm', ['-rf'], false, '}'], ['.claude', [], false, ''], ['rm', ['-rf', '}', '.claude'], true, '']]);
+  // zsh's short forms open a group at a "{" of their own after a command's words; bash's reading of it as a word is kept too
+  assert.deepEqual(shape('if [[ -d x ]] { rm -rf .claude }').map(c => c.slice(0, 3)),
+    [['[[', ['-d', 'x', ']]'], false], ['rm', ['-rf', '.claude'], false], ['[[', ['-d', 'x', ']]', '{', 'rm', '-rf', '.claude'], true]]);
+  assert.deepEqual(shape('co' + 'proc { rm -rf .claude; }').map(c => c.slice(0, 2)), [['rm', ['-rf', '.claude']]]);
   assert.deepEqual(shape('rm -rf (.claude|x)'), [['rm', ['-rf', '(.claude|x)'], false, '']]);
   // a case pattern's "(" and zsh's "for x (a b)" list start the command after them afresh
   assert.deepEqual(shape('case x in (a) rm -rf .claude;; esac').map(c => c[0]), ['case', 'a', 'rm', 'esac']);

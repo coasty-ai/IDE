@@ -1664,6 +1664,9 @@ test('with full permissions on, a place written out is refused whatever another 
     bash("env -S 'rm -rf .claude'"), bash('noglob rm -rf .claude'), bash('nocorrect rm -rf .claude'), bash('repeat 2 rm -rf .claude'),
     bash('echo ${X:-$(rm -rf .claude)}'), bash('echo "${X:-$(rm -rf .claude)}"'), bash('{ cp a.txt .mcp.json }'), bash('rm -rf } .claude'),
     bash('cp a.txt .mcp.json # copy it in'),
+    // zsh's short forms, whose "{" opens a group after a command's words, and coproc
+    bash('if [[ -d x ]] { rm -rf .claude }'), bash('repeat 2 { rm -rf .claude }'), bash('while true { rm -rf .claude; break }'),
+    bash('coproc { rm -rf .claude; }'), bash('coproc (rm -rf .claude)'), bash('coproc rm -rf .claude'),
   ];
   refusedWith(rows, FLOOR_REASON);
   for (const row of rows) assert.notEqual(decide({ cwd, ...row }).decision, 'allow', JSON.stringify(row.input)); // none runs without asking when they are off
@@ -1767,8 +1770,11 @@ test('with full permissions on, code that names Claude Code’s own settings whe
     bash('(cd .claude && ls)'), bash('pushd .claude && ls && popd'), bash('cd .claude/.. && ls'), bash('cd .claude; ls; cd -'), bash('pushd .claude; ls; popd'),
     bash('cd .claude/hooks && ls && cd ../..'), bash("sh -c 'cd .claude && ls'"), bash('cd .claude && ls &'), bash('x=$(cd .claude && pwd); echo "$x"'),
     bash('cd .claude | cat'), bash('cd .claude && ls && cd -'), bash('if (cd .claude); then ls; fi'),
-    // a folder held in a variable, in a line that does not name them, is not known: it runs
-    bash('cd "$REPO" && git status'), bash('cd "$(git rev-parse --show-toplevel)" && npm test')]);
+    // a folder held in a variable is not known: it runs, unless they are named where they could reach it (before it, or in it)
+    bash('cd "$REPO" && git status'), bash('cd "$(git rev-parse --show-toplevel)" && npm test'),
+    bash('cd "$(git rev-parse --show-toplevel)" && cat .claude/settings.json'), bash('cd "$REPO" && cp .claude/settings.json /tmp/b.json'),
+    // what comes after a # that starts a word is a comment, which the shell never runs
+    bash('echo hi # ; rm -rf .claude')]);
 });
 
 test('with full permissions on, a tool of another service is judged by the places it is given, not by what its text mentions', () => {

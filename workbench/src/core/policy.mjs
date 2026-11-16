@@ -513,13 +513,20 @@ const CARRIED = Symbol('held in a value the shell fills in');
 function shellLeftIn(parts, base) {
   const key = s => [s.dir, s.prev, ...s.stack].map(d => (typeof d === 'symbol' ? d.description : String(d))).join('\n');
   const uniq = list => [...new Map(list.map(s => [key(s), s])).values()];
+  // whether the settings are named where they could reach a part's words: in the parts before it, its own output's included
+  const reached = new Map();
+  let seen = false;
+  for (const c of parts) {
+    reached.set(c, seen);
+    if (!seen && textNamesClaude((c.words ?? []).join(' '))) seen = true;
+  }
   const walk = (list, start) => {
     let states = start;
     let listStart = start;
     let cond = '';
     for (const c of list) {
       if (c.sep === '|') continue; // before the last command of a pipe: a subshell of its own
-      const next = c.kids ? walk(c.kids.filter(kid => !kid.nested), states) : uniq(states.flatMap(s => moveDir(s, c, base)));
+      const next = c.kids ? walk(c.kids.filter(kid => !kid.nested), states) : uniq(states.flatMap(s => moveDir(s, c, reached.get(c))));
       if (next === null) return null;
       states = cond === '||' ? uniq([...states, ...next]) : next;
       if (states.length > 64) return null;
@@ -543,8 +550,9 @@ function shellLeftIn(parts, base) {
  * Where one command leaves the shell, from one state `{ dir, prev, stack }` (dir null: not known): a list of states, one for
  * each way it can go. cd (none: home; "-": where it was), pushd (none: swap; +N or -N: any folder on the stack) and popd
  * (+N or -N: any folder on the stack; none on the stack: it stays). Each cd is taken to succeed, as the line is read.
+ * `reached`: whether Claude Code's settings are named where they could reach this command's words (dirOf).
  */
-function moveDir(s, c, base) {
+function moveDir(s, c, reached) {
   const p = c.bare === undefined ? c : c.bare;
   if (!p || !['cd', 'pushd', 'popd'].includes(p.prog)) return [s];
   let k = 0;
@@ -569,7 +577,7 @@ function moveDir(s, c, base) {
   }
   if (p.prog === 'cd' && ops.length > 1) return [to(null)]; // zsh's cd OLD NEW: a folder not known
   if (p.prog === 'cd' && ops[0] === '-') return [to(s.prev)];
-  const dir = dirOf(ops.length ? ops[0] : '~', s.dir);
+  const dir = dirOf(ops.length ? ops[0] : '~', s.dir, reached);
   return [p.prog === 'pushd' ? to(dir, [...s.stack, s.dir]) : to(dir)];
 }
 
@@ -577,12 +585,13 @@ function moveDir(s, c, base) {
  * The folder a cd to `word` leads to from folder `from`, as the shell's cd reads it: the path, with each ".." taking away the
  * folder before it (links are followed when it is judged), a folder the line makes first included. IN_CLAUDE for a path that
  * cannot be resolved but names Claude Code's settings (~user/.claude, "$X/.claude"); CARRIED for a variable or another
- * command's output, and for a relative path from such a folder; null when it cannot be known otherwise (~user, a relative
- * path from a folder not known).
+ * command's output when the settings are named where they could reach it (`reached`: `X=.claude; cd "$X"`, `cd "$(echo
+ * .claude)"`), and for a relative path from such a folder; null when it cannot be known otherwise (`cd "$REPO"` in a line
+ * that names them only after it, ~user, a relative path from a folder not known).
  */
-function dirOf(word, from) {
+function dirOf(word, from, reached) {
   let w = withHome(word);
-  if (filled(w)) return textNamesClaude(w) ? IN_CLAUDE : CARRIED;
+  if (filled(w)) return textNamesClaude(w) ? IN_CLAUDE : reached ? CARRIED : null;
   if (w === '~' || w.startsWith('~/')) w = os.homedir() + w.slice(1);
   else if (w.startsWith('~')) return textNamesClaude(w) ? IN_CLAUDE : null;
   if (!w.startsWith('/')) {
