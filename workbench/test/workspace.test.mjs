@@ -538,14 +538,12 @@ test('removeWorkspace with onlyIfUnchanged removes an untouched workspace and it
 });
 
 test('removeWorkspace with onlyIfUnchanged takes away a folder whose only extra files are the ones Workbench copied in, and keeps anything else', async () => {
-  const t = await fillRepo(
-    { '.gitignore': '.env\nnode_modules/\n.vercel/\nbuild.log\n', 'a.txt': 'a\n' },
-    { '.env': 'K=value\n', 'node_modules/pkg/index.js': 'x\n', '.vercel/.env.development.local': 'V=1\n' },
-  );
+  const t = await fillRepo({ '.gitignore': '.env\nnode_modules/\n.vercel/\nbuild.log\n', 'a.txt': 'a\n' });
   const base = git(t.ws, 'rev-parse', 'HEAD');
-  const filled = await fillWorkspace({ repoRoot: t.root, path: t.ws, copy: cpStandIn() });
-  const copied = filled.copied.map(c => c.path);
-  for (const p of ['.env', 'node_modules', '.vercel/.env.development.local']) assert.ok(copied.includes(p), `${p} was copied: ${copied}`);
+  // What fillWorkspace would have copied in, put there directly: whether node_modules can be copied depends on the disk
+  // (no clones on ext4), and the copying has tests of its own.
+  put(t.ws, { '.env': 'K=value\n', 'node_modules/pkg/index.js': 'x\n', '.vercel/.env.development.local': 'V=1\n' });
+  const copied = ['.env', 'node_modules', '.vercel/.env.development.local'];
   const tidy = (more = {}) => removeWorkspace({ repoRoot: t.root, path: t.ws, base, onlyIfUnchanged: true, deleteBranch: true, ...more });
   // Without the list of what was copied, the copies may be work, as before.
   assert.deepEqual(await tidy(), { removed: false, kept: true });
