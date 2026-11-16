@@ -7,9 +7,11 @@
 // make them safe: changes to Claude Code's own settings (.claude folders, .mcp.json) and helpers
 // that would work outside the agent's folder.
 //
-// With full permissions on (decide's `full`), the person is not asked at all: every step that would ask runs, except
-// the floor, which is refused. The floor is what is refused anyway (above), and any step that would ask and names
-// Claude Code's own settings as more than something to read (withFull).
+// With full permissions on (decide's `full`), every step that would ask runs without asking, but two kinds (withFull).
+// The floor is refused: what is refused anyway (above), an edit whose path names Claude Code's own settings, and an edit
+// whose landing place cannot be told or whose file is also linked from another place. A command, or another tool's step,
+// that names those settings is judged as without full permissions: it asks, with the reason it would ask for and why
+// full permissions do not cover it.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -152,6 +154,8 @@ const R = Object.freeze({
   fullClaude: "This would change Claude Code's own settings, which agents may not change, even with full permissions on.",
   fullUnchecked: "Whether this would change Claude Code's own settings could not be checked, so it was refused.",
   fullEditUnclear: 'Full permissions are on, but Workbench could not tell where this edit lands, so it did not allow it.',
+  fullNamed: "Full permissions do not cover steps that name Claude Code's own settings.",
+  fullUnsure: "Full permissions do not cover steps that name Claude Code's own settings, and Workbench could not check whether this one does.",
   fullLinked: 'This file is also linked from another place on disk, so Workbench did not allow it.',
 });
 
@@ -191,8 +195,9 @@ const RUN = 'run a command';
  * against a wildcard 1 for every 2500 steps, expanding one word's braces 1 for every 2048 characters it holds, at each
  * level, and a path whose answer is already known 0.1: what the disk said, and where each path sits, is kept for the rest
  * of the decide (`known`). A word of short options longer than OPTION_WORD is too much to check at once. Past a cap, the
- * phase stops (PAST_CAP), and nothing it found is used: the check asks (R.tooMuch), full permissions refuse as unchecked
- * (R.fullUnchecked), and the words fall back to plainer ones.
+ * phase stops (PAST_CAP), and nothing it found is used: the check asks (R.tooMuch); full permissions refuse an edit as
+ * unchecked (R.fullUnchecked), and ask about another step as without them, saying they could not check it (R.fullUnsure);
+ * and the words fall back to plainer ones.
  */
 const COST_LIMIT = 1500;
 const WORDS_LIMIT = 500;
@@ -331,21 +336,34 @@ function judgeMonitor(input, ctx) {
 
 /**
  * Full permissions: a step the policy would ask about runs without asking, with the reason "Full permissions are on.",
- * unless it would change Claude Code's own settings (changesClaude): that is refused, as edits there always are; and an
- * edit runs only where Workbench can tell where it lands, to a file no other place on disk shares (editFloor). What
- * the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's settings, helpers
- * that would work elsewhere) is refused as before. A check that fails, or does not finish within its cap (PAST_CAP),
- * refuses: it never allows by mistake, and never says the step reaches those settings.
+ * but two kinds. An edit whose path names Claude Code's own settings is refused, as edits there always are
+ * (editNamesClaude), and so is one whose landing place cannot be told or whose file is also linked from another place on
+ * disk (editFloor); a check of an edit that fails, or does not finish within its cap (PAST_CAP), refuses too. A command,
+ * or a tool of another service or one the policy does not know, that names those settings (stepNamesClaude) is judged as
+ * it is without full permissions: it asks, with its own reason and one more sentence, and so does one the check could not
+ * finish for. Such an ask never says what the step does with them: its words are those it has without full permissions.
+ * What the policy allows or refuses anyway stays exactly as it is: the floor (edits to Claude Code's settings, helpers
+ * that would work elsewhere) is refused as before. Reads, web pages, messages and helpers change no file, and run.
  */
 function withFull(tool, input, ctx, verdict) {
   if (verdict.decision !== 'ask') return verdict;
-  let refused;
-  try {
-    refused = phase(() => (changesClaude(tool, input, ctx) ? deny(R.fullClaude, 'claude') : EDIT_TOOLS.has(tool) ? editFloor(tool, input, ctx) : null));
-  } catch {
-    return deny(R.fullUnchecked);
+  if (EDIT_TOOLS.has(tool)) {
+    let refused;
+    try {
+      refused = phase(() => (editNamesClaude(input, ctx) ? deny(R.fullClaude, 'claude') : editFloor(tool, input, ctx)));
+    } catch {
+      return deny(R.fullUnchecked);
+    }
+    if (refused) return refused;
+  } else if (!Object.hasOwn(READ_TOOLS, tool) && !HELPER_TOOLS.has(tool) && !['WebFetch', 'WebSearch', 'SendMessage'].includes(tool)) {
+    let named;
+    try {
+      named = phase(() => stepNamesClaude(tool, input, ctx));
+    } catch {
+      return { ...verdict, reason: `${verdict.reason} ${R.fullUnsure}` };
+    }
+    if (named) return { ...verdict, reason: `${verdict.reason} ${R.fullNamed}` };
   }
-  if (refused) return refused;
   const out = allow(R.full, verdict.where);
   return verdict.say ? { ...out, say: verdict.say } : out;
 }
@@ -367,47 +385,40 @@ function editFloor(tool, input, ctx) {
   return null;
 }
 
-/** Reasons that only say where a command reads: such a part changes nothing there. */
-const READ_WHERE = new Set([R.readOutside, R.readLinks, R.readList, R.globOutside, R.gitSettingsOutside]);
 /** Programs that run what they are given on their input or take their words from it, so any text in the line may count. */
 const RUNS_INPUT = new Set(['xargs', 'parallel', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'eval', 'source', '.',
   'python', 'python2', 'python3', 'node', 'perl', 'ruby', 'php', 'deno', 'bun', 'osascript', 'awk', 'gawk', 'pwsh', 'lua', 'tclsh', 'Rscript']);
 
-/**
- * Whether a step that would ask names Claude Code's own settings as more than something to read: an edit whose path
- * names them, as written or wherever it leads; a command with a part that names them and does more than read
- * (commandChangesClaude); a tool of another service, or one the policy does not know, with any text that names them.
- * Reads, web pages, messages and helpers change no file. Best effort: code a step runs can still write anywhere the
- * person can (ARCHITECTURE.md, "Permission policy").
- */
-function changesClaude(tool, input, ctx) {
+/** Whether an edit's path names Claude Code's own settings, as written or wherever it leads (links followed). */
+function editNamesClaude(input, ctx) {
   const base = realFolder(ctx.cwd);
-  if (EDIT_TOOLS.has(tool)) {
-    return [input.file_path, input.notebook_path].some(p => typeof p === 'string' && (textNamesClaude(p) || (!!base && placeNamesClaude(p.trim(), base, base))));
-  }
-  if (tool === 'Bash' || tool === 'Monitor') return typeof input.command === 'string' && commandChangesClaude(input.command, base, ctx);
-  if (Object.hasOwn(READ_TOOLS, tool) || HELPER_TOOLS.has(tool) || ['WebFetch', 'WebSearch', 'SendMessage'].includes(tool)) return false;
+  return [input.file_path, input.notebook_path].some(p => typeof p === 'string' && (textNamesClaude(p) || (!!base && placeNamesClaude(p.trim(), base, base))));
+}
+
+/**
+ * Whether a step that is not an edit names Claude Code's own settings: a command (Bash, a Monitor's command) whose line
+ * names them (commandNamesClaude), or a tool of another service, or one the policy does not know, with any text in its
+ * input that names them. It says nothing of what the step would do with them. Best effort: code a step runs, and a name
+ * built when the line runs, can still reach them without naming them (ARCHITECTURE.md, "Permission policy").
+ */
+function stepNamesClaude(tool, input, ctx) {
+  if (tool === 'Bash' || tool === 'Monitor') return typeof input.command === 'string' && commandNamesClaude(input.command, realFolder(ctx.cwd));
   return stringsIn(input).some(textNamesClaude);
 }
 
 /**
- * A command line that names Claude Code's settings as more than something to read: a part that names them (by its words,
- * links followed, and by what a wildcard matches, read from every folder the line cd's into) and that the policy, judging
- * it alone, would not allow or would ask about only because it reads outside the folder. A part with a redirection, a
- * variable set before it, or a value the shell fills in never only reads. When the line names them where no part shows
- * it (inside a brace, as in .{claude,git}), or when a part runs what it is given (xargs, a shell, an interpreter: the
- * names can reach it through a pipe or a heredoc), any mention refuses it.
+ * Whether a command line names Claude Code's own settings: its text does (textNamesClaude), but for a heredoc's text,
+ * which is data unless a part runs what it is given (xargs, a shell, an interpreter: the names can reach it through a
+ * pipe or a heredoc); or one of its parts does, by a word as written, by where a word or one of its values leads, links
+ * followed, or by what a wildcard matches the loose way, read from the agent's folder and from every folder the line
+ * cd's or pushd's into.
  */
-function commandChangesClaude(command, base, ctx) {
+function commandNamesClaude(command, base) {
   const parts = partsOf(command);
   const runsInput = parts.some(c => RUNS_INPUT.has(c.prog) || c.words.slice(0, c.at ?? 0).includes('xargs'));
-  const named = textNamesClaude(runsInput ? command : withoutHeredocs(command));
-  if (!parts.length) return named;
-  if (named && runsInput) return true;
+  if (textNamesClaude(runsInput ? command : withoutHeredocs(command))) return true;
   const bases = base ? cdBases(parts, base) : [];
-  const naming = parts.filter(c => partNamesClaude(c, bases, base));
-  if (named && !naming.length) return true;
-  return naming.some(c => !readsOnly(c, base, ctx));
+  return parts.some(c => partNamesClaude(c, bases, base));
 }
 
 /** The folders a line's relative words are read from: the agent's own, and each existing folder it cd's or pushd's into. */
@@ -536,33 +547,6 @@ function withoutHeredocs(command) {
       line = next + 1;
     }
   }
-}
-
-/**
- * Whether one part of a command only reads: the policy, judging that part alone, would allow it, or asks only because
- * what it reads is outside the folder. A part with a value the shell fills in or an escape, a variable set before it,
- * env or xargs before it, or a redirection other than to the terminal or /dev/null, never only reads; nor does a part
- * that only sets variables, or a shell given its command inline.
- */
-function readsOnly(c, base, ctx) {
-  if (!base || c.empty || c.inline) return false;
-  if (c.words.some(w => /[$`\\]/.test(w) || CONTROL.test(w))) return false;
-  if (c.words.slice(0, c.at).some(w => /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(w) || w === 'env' || w === 'xargs')) return false;
-  const rest = [];
-  for (let k = c.at; k < c.words.length; k++) {
-    const w = c.words[k];
-    if (QUIET_REDIRECT.test(w)) continue;
-    if (REDIRECT_ALONE.test(w) && QUIET_TARGET.test(c.words[k + 1] ?? '')) { k++; continue; }
-    if (/[<>]/.test(w)) return false;
-    rest.push(w);
-  }
-  if (!rest.length) return false;
-  const words = rest.map(text => {
-    const glob = /[*?[^#]/.test(text);
-    return { text, glob, globLead: glob && /^[-*?[^#]/.test(text), pattern: text, equals: /^=.|[=:]=./.test(text) };
-  });
-  const v = judgeExpanded(words, base, ctx);
-  return v.decision === 'allow' || READ_WHERE.has(v.reason);
 }
 
 /** Every string in a tool's input, a few levels down (at most 200): what a tool of another service could act on. */

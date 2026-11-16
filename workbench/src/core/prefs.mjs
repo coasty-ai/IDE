@@ -16,7 +16,7 @@ import crypto from 'node:crypto';
 /** The looks, detail levels and permission modes, as ui/prefs.js lists them (test/prefs.test.mjs keeps them the same). */
 export const THEMES = Object.freeze(['green', 'black-gold', 'ivory']);
 export const DETAILS = Object.freeze(['calm', 'more']);
-/** ask: agents ask before risky steps (the default); full: they run every step without asking, but the floor. */
+/** ask: agents ask before risky steps (the default); full: they run every step without asking, but the floor and steps that name Claude Code's own settings. */
 export const PERMISSIONS = Object.freeze(['ask', 'full']);
 export const DEFAULT_PREFS = Object.freeze({ theme: 'green', detail: 'calm', answered: false, permissions: 'ask' });
 

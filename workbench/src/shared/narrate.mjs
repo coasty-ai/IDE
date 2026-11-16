@@ -546,7 +546,8 @@ export function commandAction(command, vouch) {
  * The simple commands of a command line, each with all its words (`words`), where the program is among them
  * (`at`), the program's name (`prog`), the words after it (`args`), whether the program is named by a path to a
  * script (`script`), and whether the part sends its output into a file (`writes`). For the permission policy's
- * wording only: the policy never decides anything from this reading.
+ * wording, and for whether a command names Claude Code's own settings with full permissions on: the policy's other
+ * decisions never come from this reading.
  */
 export function shellCommands(command) {
   try { return simpleCommands(command); } catch { return []; }

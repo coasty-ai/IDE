@@ -228,8 +228,9 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
   };
   const workId = () => `${git.agentHead}:tree${git.seq}`;
   // The policy's contract in short. With full permissions on (`full: true`), what would ask is allowed, with the reason
-  // "Full permissions are on.", except the tool `Settings`, which stands for a step that would change Claude Code's own
-  // settings: it asks without full permissions, and is refused with them.
+  // "Full permissions are on.", except the tool `Settings`, which stands for an edit of Claude Code's own settings: it asks
+  // without full permissions, and is refused with them; and `SettingsCommand`, which stands for a command that names
+  // those settings: it asks either way, with full permissions on saying why they do not cover it.
   const policy = {
     decide(req) {
       calls.decide.push(req);
@@ -237,9 +238,10 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
       let d;
       if (tool === 'Read' || tool === 'Grep') d = { decision: 'allow', reason: 'Reading is fine.', sentence: 'wants to read a file', detail: input.file_path || '' };
       else if (tool === 'Forbidden') d = { decision: 'deny', reason: 'Never.', sentence: 'wants to do something forbidden', detail: '' };
-      else if (tool === 'Bash') d = { decision: 'ask', reason: 'Needs a person.', sentence: 'wants to run a command', detail: String(input.command || '') };
+      else if (tool === 'Bash' || tool === 'SettingsCommand') d = { decision: 'ask', reason: 'Needs a person.', sentence: 'wants to run a command', detail: String(input.command || '') };
       else d = { decision: 'ask', reason: 'Unknown tool.', sentence: `wants to use ${tool}`, detail: '' };
       if (req.full !== true || d.decision !== 'ask') return d;
+      if (tool === 'SettingsCommand') return { ...d, reason: `${d.reason} Full permissions do not cover steps that name Claude Code's own settings.` };
       return tool === 'Settings'
         ? { ...d, decision: 'deny', reason: "This would change Claude Code's own settings, which agents may not change, even with full permissions on." }
         : { ...d, decision: 'allow', reason: 'Full permissions are on.' };

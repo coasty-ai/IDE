@@ -1523,14 +1523,19 @@ test('with full permissions on, the floor is refused exactly as before: Claude C
   }
 });
 
-test('with full permissions on, a command or tool that names Claude Code’s own settings and does more than read them is refused, never asked', () => {
+/** What a step that names Claude Code's own settings adds to the reason it asks for, with full permissions on. */
+const NOT_COVERED = "Full permissions do not cover steps that name Claude Code's own settings.";
+/** And what a step adds that Workbench could not check for that in time. */
+const NOT_SURE = "Full permissions do not cover steps that name Claude Code's own settings, and Workbench could not check whether this one does.";
+
+test('with full permissions on, a command or another tool’s step that names Claude Code’s own settings is asked about as without them, saying why', () => {
   const longS = String.fromCharCode(0x17f);
   const joiner = String.fromCharCode(0x200c);
-  const refused = [
-    // the commands the policy asks about today that write there
+  const rows = [
+    // commands that write there
     bash('echo {} > .claude/settings.json'), bash('cat > .claude/settings.json <<EOF\n{}\nEOF'), bash('rm -rf .claude'), bash('mv .claude .claude-old'),
     bash('rm -rf .CLAUDE'), bash(`rm .mcp.j${longS}on`), bash(`rm .clau${joiner}de/settings.json`), bash("sed -i '' s/a/b/ .mcp.json"),
-    () => bash(`cp ${outside}/evil.mjs .claude/settings.json`), // the place outside does not hide the place it writes
+    () => bash(`cp ${outside}/evil.mjs .claude/settings.json`), // the place outside does not hide the place it names
     bash('git checkout -- .claude/settings.json'), bash('git restore .claude/settings.json'), bash('git checkout main -- .claude'),
     bash('node --test --test-reporter=spec --test-reporter-destination=.claude/settings.json'), bash('node .claude/x.mjs'),
     bash('cd .claude && rm settings.json'), bash('cd .claude'), bash('mkdir -p sub/.claude && touch sub/.claude/settings.json'),
@@ -1540,37 +1545,52 @@ test('with full permissions on, a command or tool that names Claude Code’s own
     bash('rm -rf ~/.claude'), bash('echo x >> $HOME/.claude/settings.json'), () => bash(`echo x > ${outside}/.mcp.json`),
     // written so the shell puts the name together
     bash("rm -rf '.cla''ude'"), bash('rm -rf .cl\\aude'), bash('rm -rf .{claude,git}'), bash('echo "x" | tee ".claude/settings.json"'),
-    // wildcards that match it: a dot pattern, and * as zsh matches it with GLOB_DOTS, which the person may have set
+    // wildcards that could match them: a dot pattern, and * as zsh matches it with GLOB_DOTS, which the person may have set
     bash('rm -rf .c*'), bash('rm -rf .??aude'), bash('rm -rf *'), bash('chmod -R 777 ./*'),
     // inside another command, and in the background
     bash('sh -c "rm -rf .claude"'), bash('echo $(rm -rf .claude)'), monitor({ command: 'rm -rf .claude' }),
-    // a tool of another service that names it
+    // reading them where the policy asks without full permissions, and mentioning them: the step names them all the same
+    bash('cat .claude/settings.json | head -5'), bash('grep -r hooks .claude | wc -l'), () => bash(`cat ${outside}/dir/secret.txt .mcp.json`),
+    bash('ls -la ~/.claude && echo done'), bash('git log -- .claude/settings.json | head'), bash("echo '.claude/' >> .gitignore"),
+    bash('gh pr create --body "Explains the .claude folder"'),
+    // tools of other services that name them
     { tool: 'mcp__fs__write_file', input: { path: '.claude/settings.json', content: '{}' } },
     { tool: 'mcp__fs__edit', input: { edits: [{ file: 'sub/.mcp.json' }] } },
-    // a path the policy cannot resolve still names it
-    { tool: 'Write', input: { file_path: '~nobody/.claude/settings.json' } }, { tool: 'Write', input: { file_path: 'missing/../.claude/settings.json' } },
+    { tool: 'mcp__github__create_issue', input: { owner: 'acme', repo: 'shop', title: 'Explain the .claude folder' } },
+    { tool: 'FooTool', input: { target: '~/.claude/settings.json' } },
   ];
-  for (const row of refused) {
+  for (const row of rows) {
     const req = typeof row === 'function' ? row() : row;
+    const off = decide({ cwd, ...req });
     const d = full(row);
-    assert.equal(d.decision, 'deny', JSON.stringify(req.input));
-    assert.match(d.reason, FLOOR, JSON.stringify(req.input));
-    // without full permissions, none of these runs without asking either
-    assert.notEqual(decide({ cwd, ...req }).decision, 'allow', JSON.stringify(req.input));
+    assert.equal(off.decision, 'ask', JSON.stringify(req.input));
+    // its own reason, then why full permissions do not cover it; the sentence and the detail are as without them, so
+    // nothing claims what the step does
+    assert.deepEqual([d.decision, d.reason], ['ask', `${off.reason} ${NOT_COVERED}`], JSON.stringify(req.input));
+    assert.equal(d.sentence, off.sentence, JSON.stringify(req.input));
+    assert.equal(d.detail, off.detail, JSON.stringify(req.input));
   }
 });
 
-test('with full permissions on, reading Claude Code’s settings, and names that only look like them, run', () => {
+test('with full permissions on, a command that names Claude Code’s settings and runs or is refused without them runs or is refused the same', () => {
+  // reading them in the agent's own folder runs without asking anyway; an edit of them is refused anyway
+  const rows = [bash('cat .claude/settings.json'), bash('ls -la .claude'), bash('grep -rn hooks .claude'), { tool: 'Write', input: { file_path: '.claude/settings.json' } }];
+  for (const row of rows) assert.deepEqual(full(row), decide({ cwd, ...row }), JSON.stringify(row.input));
+  assert.deepEqual(rows.map(r => full(r).decision), ['allow', 'allow', 'allow', 'deny']);
+});
+
+test('with full permissions on, names that only look like Claude Code’s settings, and reads with the file tools, run', () => {
   const rows = [
-    bash('cat .claude/settings.json | head -5'), bash('grep -r hooks .claude | wc -l'), bash('cat ~/.claude/settings.json'),
-    bash('ls -la ~/.claude && echo done'), bash('git log -- .claude/settings.json | head'),
     () => ({ tool: 'Read', input: { file_path: home + '/.claude/settings.json' } }),
     bash('rm -rf .claude-notes'), bash('rm CLAUDE.md && echo gone'), bash('rm docs/mcp.json.bak; ls'), bash('rm -rf build/*'), bash('rm *.log'),
     bash('rm -rf node_modules'), { tool: 'Write', input: { file_path: '.claude-notes/a.md' } }, { tool: 'mcp__docs__search', input: { query: 'claude code settings' } },
   ];
   for (const row of rows) {
     const req = typeof row === 'function' ? row() : row;
-    assert.equal(full(row).decision, 'allow', JSON.stringify(req.input));
+    const off = decide({ cwd, ...req });
+    // what asks without full permissions runs with them; what runs anyway keeps its own reason
+    if (off.decision === 'allow') assert.deepEqual(full(row), off, JSON.stringify(req.input));
+    else assert.deepEqual([full(row).decision, full(row).reason], ['allow', FULL], JSON.stringify(req.input));
   }
 });
 
@@ -1677,7 +1697,6 @@ function fastest(f) {
   return best;
 }
 const TOO_MUCH = 'This step has more in it than Workbench can check, so it needs your OK.';
-const UNCHECKED = "Whether this would change Claude Code's own settings could not be checked, so it was refused.";
 
 let slowDir = null;
 /** The agent's folder the slow lines are checked in (test/helpers/slow-lines.mjs), made once. */
@@ -1689,18 +1708,22 @@ function slow() {
 test('every decide answers within 250 ms, with full permissions on and off: many cd steps, wildcards over 5,000 files, 64 KB lines, braces, deep links', () => {
   const wrong = [];
   for (const { label, command, full } of slowLines()) {
+    let off = null;
     for (const on of [false, true]) {
       const { ms, value: d } = fastest(() => decide({ tool: 'Bash', input: { command }, cwd: slow(), full: on }));
       if (ms >= LIMIT_MS) wrong.push(`${label}, full permissions ${on ? 'on' : 'off'}: ${Math.round(ms)} ms`);
-      // with them on: allowed when checked in time, refused as unchecked when not, and never as reaching Claude Code's settings
-      if (on && d.reason !== (full === 'allow' ? FULL : UNCHECKED)) wrong.push(`${label}: ${d.decision}: ${d.reason}`);
-      if (FLOOR.test(d.reason) || / in Claude Code's own settings$/.test(d.sentence)) wrong.push(`${label}: says it reaches Claude Code's settings`);
+      if (!on) off = d;
+      // with them on: allowed when checked in time; asked about as without them when not, saying only that Workbench could
+      // not check whether it names Claude Code's settings
+      const want = full === 'allow' ? ['allow', FULL] : ['ask', `${off.reason} ${NOT_SURE}`];
+      if (on && (d.decision !== want[0] || d.reason !== want[1])) wrong.push(`${label}: ${d.decision}: ${d.reason}`);
+      if (FLOOR.test(d.reason) || d.reason.includes(NOT_COVERED) || / in Claude Code's own settings$/.test(d.sentence)) wrong.push(`${label}: says it reaches Claude Code's settings`);
     }
   }
   assert.equal(wrong.length, 0, wrong.join('\n'));
 });
 
-test('past a cap, the check asks because it has more in it than it can check, and the words are plainer', () => {
+test('past a cap, the check asks because it has more in it than it can check, full permissions do not cover it, and the words are plainer', () => {
   const b = slow();
   // 12,000 words to look for on the disk, and a word of 2,000 short options, each of whose tails could name a place
   const long = 'ls ' + Array.from({ length: 12000 }, (_, i) => `a${i}`).join(' ');
@@ -1711,7 +1734,7 @@ test('past a cap, the check asks because it has more in it than it can check, an
   }
   // with full permissions on: the words are too many to look for whether one leads into Claude Code's settings; the options
   // name no place there
-  assert.deepEqual([full({ ...bash(long), cwd: b }).decision, full({ ...bash(long), cwd: b }).reason], ['deny', UNCHECKED]);
+  assert.deepEqual([full({ ...bash(long), cwd: b }).decision, full({ ...bash(long), cwd: b }).reason], ['ask', `${TOO_MUCH} ${NOT_SURE}`]);
   assert.equal(full({ ...bash(options), cwd: b }).reason, FULL);
   // a line the words cannot read in time says only that it runs a command
   const cds = Array.from({ length: 200 }, (_, i) => `cd pkg${i} && npm test && cd ..`).join(' && ');

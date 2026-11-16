@@ -3895,8 +3895,8 @@ function prefsStore(start = {}) {
     set(change) { saved.push(change); now = { ...now, ...change }; return { ok: true, prefs: { ...now } }; },
   };
 }
-const FULL_DETAIL = 'Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. It stays on until you turn it off.';
-const FULL_ON = 'Full permissions are on. Agents no longer ask.';
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
 const FULL_OFF = 'Agents ask again before risky steps.';
 const FULL_REASON = 'Full permissions are on.';
 const pause = (ms = 10) => new Promise(r => setTimeout(r, ms));
@@ -4057,7 +4057,7 @@ test('full permissions: when they cannot be kept for the next start, they still 
   await throwing.engine.shutdown();
 });
 
-test('full permissions with the real policy: what would ask runs as an automatic approval; the floor is still refused', async (ctx) => {
+test('full permissions with the real policy: what would ask runs as an automatic approval, the floor is still refused, and a step that names Claude Code’s settings asks', async (ctx) => {
   const t = liveFolders(ctx, { prefs: prefsStore({ permissions: 'full' }) });
   const seen = [];
   t.engine.deps.policy = { decide: (req) => { seen.push(req); return policyMod.decide(req); } };
@@ -4068,10 +4068,38 @@ test('full permissions with the real policy: what would ask runs as an automatic
   assert.equal((await hook('Read', { file_path: 'README.md' })).permissionDecisionReason, "Looking at files inside the agent's own folder is always allowed.");
   assert.deepEqual(await hook('Write', { file_path: '.claude/settings.json', content: '{}' }), { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Files in a .claude folder change how Claude Code itself runs, so agents may not change them.' });
   assert.deepEqual(await hook('Agent', { description: 'x', prompt: 'y', isolation: 'worktree' }), { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: "Helpers must work in this agent's own folder, not in a separate copy or on another computer. Start the helper again without isolation." });
-  assert.equal((await hook('Bash', { command: 'rm -rf .claude' })).permissionDecision, 'deny');
   assert.ok(seen.every(r => r.full === true));
-  assert.deepEqual(t.store.get(id).approvals, { auto: 3, byYou: 0, denied: 3 });
+  assert.deepEqual(t.store.get(id).approvals, { auto: 3, byYou: 0, denied: 2 });
   assert.equal(t.store.get(id).ask, null, 'nothing asked');
+  // a command that names Claude Code's own settings waits for the person, with the reason it asks for without full
+  // permissions and why they do not cover it
+  const named = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf .claude' } });
+  await until(() => t.store.get(id).ask);
+  assert.equal(t.store.get(id).state, 'needs_ok');
+  assert.equal(t.store.get(id).ask.why, "This command is not on the list of safe commands. Full permissions do not cover steps that name Claude Code's own settings.");
+  assert.equal(t.store.get(id).ask.detail, 'rm -rf .claude');
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await named).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(seen.length, 6, 'judged once, as full permissions judge it');
+  await t.engine.shutdown();
+});
+
+test('full permissions: a step they do not cover asks while they are on, and stays waiting at the yes to their card', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  const { id } = await started(t);
+  // the stand-in policy's SettingsCommand names Claude Code's settings: it asks with full permissions on too
+  const p = t.engine.hookPreToolUse(id, { tool_name: 'SettingsCommand', tool_input: { command: 'rm -rf .claude' } });
+  await until(() => t.store.get(id).ask);
+  assert.equal(t.store.get(id).ask.why, "Needs a person. Full permissions do not cover steps that name Claude Code's own settings.");
+  assert.equal(await settled(p), false, 'it waits for the person');
+  // turned off and on again, their yes leaves it waiting, and counts nothing
+  await t.engine.permissions('ask');
+  const card = (await t.engine.permissions('full')).confirm;
+  assert.equal(card.detail, FULL_DETAIL, 'not counted among the questions they allow');
+  assert.equal((await t.engine.confirm(card.id, true)).reply, FULL_ON);
+  assert.equal(await settled(p), false);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Allow' });
+  assert.equal((await p).hookSpecificOutput.permissionDecision, 'allow');
   await t.engine.shutdown();
 });
 

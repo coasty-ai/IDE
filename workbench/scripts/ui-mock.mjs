@@ -798,8 +798,8 @@ function connectWorld(name, now) {
 // Every other world starts with them off. The card's words, and what is said when they go on and off, are the engine's.
 const FULL_SCENARIOS = ['full', 'full-live'];
 SCENARIOS.push(...FULL_SCENARIOS);
-const FULL_DETAIL = 'Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. It stays on until you turn it off.';
-const FULL_ON = 'Full permissions are on. Agents no longer ask.';
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
 const FULL_OFF = 'Agents ask again before risky steps.';
 function fullWorld(name, now) {
   const st = name === 'full-live' ? connectWorld('connect-github', now) : scenario('demo', now);
