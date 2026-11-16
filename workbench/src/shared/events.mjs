@@ -5,7 +5,8 @@
 /** Event kinds. Every event is { kind, agentId?, ts, ...fields }. */
 export const EV = Object.freeze({
   CREATED: 'agent.created',       // { agentId, parentId|null, name, fullName?, task, harness, kind, helperType?, model?, machineId, budgetUsd?, workspace? }
-  STATE: 'agent.state',           // { agentId, state, reason?, atLimit? }  atLimit: a Claude Code root failed at its spending limit
+  STATE: 'agent.state',           // { agentId, state, reason?, atLimit?, again? }  atLimit: a Claude Code root failed at its spending limit;
+                                  //   again: true, an ended agent ended again (a recheck after a save): a new finish (endedAt, stateSince) though its state stays
   ACTIVITY: 'agent.activity',     // { agentId, sentence, toolKind, toolUseId?, phase: 'start'|'end', ok? }
   THINKING: 'agent.thinking',     // { agentId, on: boolean }
   USAGE: 'agent.usage',           // { agentId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd?, unreportedUsd?, contextTokens?, contextWindow?, mode: 'set'|'add' }

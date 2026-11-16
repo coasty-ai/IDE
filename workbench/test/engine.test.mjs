@@ -4495,6 +4495,28 @@ test('the file view: a save into the copy of an agent whose run has ended record
   await t.engine.shutdown();
 });
 
+test('the file view: a save into the copy of an agent that is done, with no checks to run, gives it a new finish all the same, as the end of a turn would', async (ctx) => {
+  const t = liveFolders(ctx); // no checks declared: its recheck records what changed, and it is done again
+  t.deps.files = filesMod;
+  const a = await doneAgent(t);
+  const was = t.store.get(a.id);
+  assert.equal(was.state, 'done_claimed');
+  const finished = was.endedAt;
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
+  const f = await t.engine.file(a.id, 'cart.js');
+  await pause(5); // so a new finish has a new time
+  const diffs = t.calls.diffStats.length;
+  assert.equal((await t.engine.saveFile(a.id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+  await until(() => t.calls.diffStats.length === diffs + 1 && t.store.get(a.id).endedAt !== finished);
+  const v = t.store.get(a.id);
+  assert.equal(v.state, 'done_claimed');
+  assert.ok(v.endedAt > finished, 'its finish moved, so a look the person gave the old one does not hide this one');
+  assert.equal(v.stateSince, v.endedAt);
+  assert.equal(v.says, 'I fixed the cart total.', 'its own words stay');
+  assert.equal(t.calls.runChecks.length, 0);
+  await t.engine.shutdown();
+});
+
 test('the file view: a save while a receipt is being built makes it look again; a save after a merge is checked all the same', async (ctx) => {
   const turnEnd = gate();
   const t = liveFolders(ctx, { deps: { checks: CHECKS, checksGates: [turnEnd] } });

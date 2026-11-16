@@ -270,6 +270,12 @@ export class Store extends EventEmitter {
         this._setState(v, ev.state, ev.reason ?? null, ev.ts, batch, index, changed);
         // The turn that reached the limit says so; a process that then exits with an error leaves it so (see _setState).
         if (ev.state === STATE.FAILED && ev.atLimit === true) v.atLimit = true;
+        // It ended again (the engine's recheck after a save): a new finish, though its state may be the same, so a look
+        // the person gave the last one does not hide this one. Nothing else of a change of state happens.
+        if (ev.again === true && ENDED.has(v.state)) {
+          v.endedAt = ev.ts;
+          v.stateSince = ev.ts;
+        }
         break;
       }
 

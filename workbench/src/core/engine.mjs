@@ -3254,7 +3254,8 @@ export class Engine extends EventEmitter {
     }
     // A newer receipt (a save that came just now started one) decides instead: this one's outcome is already old.
     if (!got || held.receipt) return;
-    this._apply([{ kind: EV.STATE, agentId: id, state: doneState(got.checksState), reason: got.reason }]);
+    // A new finish, as the end of a turn gives, though the state may be the one it had (done, with no checks to run).
+    this._apply([{ kind: EV.STATE, agentId: id, state: doneState(got.checksState), reason: got.reason, again: true }]);
     if (!run && c.rec) this._keepEarlier(id, c.ws); // the next start knows what its checks found
     this._lookAgainIfSaved(id, held, got.saves);
   }

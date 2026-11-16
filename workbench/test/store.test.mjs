@@ -301,6 +301,30 @@ test('a process that ends after its agent finished leaves the finish as it was: 
   assert.equal(s.get('r3').endedAt, T0 + 3500);
 });
 
+test('agent.state with again: an ended agent that ended again (a recheck after a save) has a new finish, though its state stays', () => {
+  const { s, emitted } = recording();
+  s.apply([created('r1'), state('r1', 'working', T0 + 1000), state('r1', 'done_claimed', T0 + 5000, { reason: null })]);
+  s.apply({ kind: EV.FILES, ts: T0 + 6000, agentId: 'r1', files: { changed: 1, adds: 1, dels: 0, list: [{ path: 'a.js', adds: 1, dels: 0 }] } });
+  // the same state again moves nothing by itself
+  s.apply(state('r1', 'done_claimed', T0 + 7000));
+  assert.deepEqual([s.get('r1').endedAt, s.get('r1').stateSince], [T0 + 5000, T0 + 5000]);
+  // with again: a new finish, and nothing else of a change of state (its files, says and ask stay)
+  const before = emitted.length;
+  s.apply(state('r1', 'done_claimed', T0 + 9000, { again: true, reason: 'Still done.' }));
+  const v = s.get('r1');
+  assert.deepEqual([v.state, v.endedAt, v.stateSince, v.stateReason], ['done_claimed', T0 + 9000, T0 + 9000, 'Still done.']);
+  assert.equal(v.files.changed, 1, 'its receipt stays');
+  assert.ok(emitted.length > before, 'the page hears of it');
+  // when its state changes as well, the finish is that change's, as without it
+  s.apply(state('r1', 'done_checked', T0 + 11000, { again: true }));
+  assert.deepEqual([s.get('r1').endedAt, s.get('r1').stateSince], [T0 + 11000, T0 + 11000]);
+  // only true counts, and only for a state that ends a run
+  s.apply(state('r1', 'done_checked', T0 + 12000, { again: 'yes' }));
+  assert.equal(s.get('r1').endedAt, T0 + 11000);
+  s.apply([created('r2'), state('r2', 'working', T0 + 1000), state('r2', 'working', T0 + 4000, { again: true })]);
+  assert.deepEqual([s.get('r2').endedAt, s.get('r2').stateSince], [null, T0 + 1000]);
+});
+
 test('plan, says, files, checks, rules, model, session, approvals and ended', () => {
   const { s } = recording();
   s.apply(created('r1'));
