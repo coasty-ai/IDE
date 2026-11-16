@@ -2598,7 +2598,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       'node_modules/x/index.js': 'x\n',
       'node_modules/x/.env.example': 'X=1\n', // a package's own, which .env* matches too, as in git
     }, { forced: ['secrets/README.md'] });
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cpStandIn().copy });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy });
     // data/ is one entry in git's list of what it ignores, and file by file in what .worktreeinclude matches. src/sub/
     // holds only matching files: git 2.39 names it whole in both lists (and the file in it too), so it is copied as one;
     // a git that names only the file gives the file.
@@ -2615,7 +2615,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     // With node_modules/ listed too, it is one entry, whole.
     fs.appendFileSync(t.p('.worktreeinclude'), 'node_modules/\n');
     const ws2 = await t.agent();
-    const r2 = await fillWorkspace({ repoRoot: t.root, path: ws2, platform: 'darwin', copy: cpStandIn().copy });
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: ws2, platform: 'darwin', clones: true, copy: cpStandIn().copy });
     assert.deepEqual(pathsOf(r2.copied).filter(p => p.startsWith('node_modules')), ['node_modules']);
     assert.equal(readText(path.join(ws2, 'node_modules/x/index.js')), 'x\n');
   });
@@ -2624,7 +2624,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     const t = await fillRepo({ '.gitignore': '.env\nnode_modules/\n', '.worktreeinclude': '' },
       { '.env': 'E=1\n', 'node_modules/x/index.js': 'x\n', 'include.txt': '.env\n' });
     const cp = cpStandIn();
-    const fill = () => fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    const fill = () => fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy });
     for (const text of ['', '# nothing yet\n\n']) {
       fs.writeFileSync(t.p('.worktreeinclude'), text);
       const r = await fill();
@@ -2647,7 +2647,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       'envs/README.txt': 'not listed below\n', // so that only envs/py311/ matches, never envs/ as a whole
       'tools/.env/pyvenv.cfg': 'home = /usr/bin\n',
     });
-    const fill = ws => fillWorkspace({ repoRoot: t.root, path: ws, platform: 'darwin', copy: cpStandIn().copy });
+    const fill = ws => fillWorkspace({ repoRoot: t.root, path: ws, platform: 'darwin', clones: true, copy: cpStandIn().copy });
     const r = await fill(t.ws);
     assert.deepEqual(r.copied, [{ path: '.env', kind: 'env', cloned: true }]);
     assert.deepEqual(r.skipped, []);
@@ -2702,7 +2702,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     // In the agent's folder: a .env and a node_modules of its own (a post-checkout hook may make them).
     put(t.ws, { '.env': 'AGENT=1\n', 'node_modules/keep.txt': 'kept\n' });
     const cp = cpStandIn();
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy });
     assert.deepEqual(r.copied, [{ path: '.env.local', kind: 'env', cloned: true }]);
     assert.deepEqual(r.skipped, ['.env', '.env.shared', 'conf/.env', 'node_modules'].map(p => ({ path: p, why: 'exists' })));
     assert.deepEqual(cp.calls.map(c => c.args.at(-1)), [t.w('.env.local')]);
@@ -2748,7 +2748,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
   test('on a Mac each entry is cloned by /bin/cp -c -R -p, given as an argument array, within five minutes', async () => {
     const t = await fillRepo(...SMALL);
     const cp = cpStandIn();
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy });
     assert.deepEqual(r.copied.map(e => [e.path, e.cloned]), [['.env', true], ['node_modules', true], ['packages/a/node_modules', true]]);
     const calls = [...cp.calls].sort((a, b) => (a.args.at(-1) < b.args.at(-1) ? -1 : 1));
     assert.deepEqual(calls.map(c => [c.file, c.args]),
@@ -2756,26 +2756,31 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     for (const c of calls) assert.ok(c.timeout > 0 && c.timeout <= 5 * 60_000, String(c.timeout));
   });
 
-  test('on a Mac, where cp -c cannot clone (another volume), a file is copied plainly and a folder is left out', async () => {
+  test('on a Mac whose disk makes no clones (another volume, or HFS+), cp -c is never tried: a file is copied plainly and a folder is left out', async () => {
+    // On HFS+ cp -c makes a full copy without a word, so the disks are looked at first, never cp's words.
     const t = await fillRepo(...SMALL);
-    const cp = cpStandIn(({ args, dst }) => {
-      if (args[0] !== '-c') return;
-      if (path.basename(dst) === 'node_modules') {
-        // cp makes the folders, then fails once for every file: more words than execFile keeps, so it is stopped.
-        fs.mkdirSync(path.join(dst, 'x'), { recursive: true });
-        const said = `cp: ${dst}/x/index.js: clonefile failed: Cross-device link\n`.repeat(3000);
-        throw Object.assign(new RangeError('stderr maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', stderr: said });
-      }
-      throw cpError(`cp: ${dst}: clonefile failed: Cross-device link\n`);
-    });
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    const cp = cpStandIn();
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: false, copy: cp.copy });
     assert.deepEqual(r.copied, [{ path: '.env', kind: 'env', cloned: false }]);
     assert.deepEqual(r.skipped, [{ path: 'node_modules', why: 'noclone' }, { path: 'packages/a/node_modules', why: 'noclone' }]);
-    assert.ok(cp.calls.some(c => c.file === '/bin/cp' && c.args.join('\n') === ['-R', '-p', t.p('.env'), t.w('.env')].join('\n')), 'a plain copy');
-    assert.ok(!cp.calls.some(c => c.args[0] !== '-c' && c.args.at(-1).endsWith('node_modules')), 'a folder is never copied in full');
+    assert.deepEqual(cp.calls.map(c => [c.file, c.args]), [['/bin/cp', ['-R', '-p', t.p('.env'), t.w('.env')]]], 'one plain copy, and no clone tried');
     assert.equal(readText(t.w('.env')), 'E=1\n');
+    for (const f of ['node_modules', 'packages/a/node_modules']) assert.equal(present(t.w(f)), false, f);
+  });
+
+  test('on a Mac that makes clones, a cp -c that fails is that entry’s failure only, whatever it says: a file that vanished is not a disk without clones', async () => {
+    const t = await fillRepo(SMALL[0], { ...SMALL[1], 'packages/b/node_modules/z/index.js': 'z\n', 'packages/b/package.json': '{}\n' });
+    const cp = cpStandIn(({ args, dst }) => {
+      if (dst !== t.w('node_modules')) return;
+      // npm install replacing a package while cp clones it: cp's words then hold "clonefile failed" too.
+      fs.mkdirSync(path.join(dst, 'x'), { recursive: true });
+      throw cpError(`cp: ${dst}/x/index.js: clonefile failed: No such file or directory\ncp: ${dst}/x/index.js: No such file or directory\n`);
+    });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy });
+    assert.deepEqual(r.copied.map(e => [e.path, e.cloned]), [['.env', true], ['packages/a/node_modules', true], ['packages/b/node_modules', true]]);
+    assert.deepEqual(r.skipped, [{ path: 'node_modules', why: 'failed' }]);
+    assert.ok(cp.calls.every(c => c.args[0] === '-c'), 'never a plain copy after it');
     assert.equal(present(t.w('node_modules')), false, 'the half-made copy is gone');
-    assert.equal(present(t.w('packages/a/node_modules')), false);
   });
 
   test('on a Mac, the clones are really made: every file, links as links, modes kept', { skip: process.platform !== 'darwin' && 'cp -c is the Mac’s' }, async () => {
@@ -2818,6 +2823,28 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     assert.equal(readText(path.join(ws2, 'packages/a/node_modules/y/index.js')), 'y\n');
   });
 
+  test('on Linux only the words of a disk without clones mean one: any other failure of --reflink=always is that entry’s own', async () => {
+    const t = await fillRepo(SMALL[0], { ...SMALL[1], 'packages/b/node_modules/z/index.js': 'z\n', 'packages/b/package.json': '{}\n' });
+    const cp = cpStandIn(({ args, src, dst }) => {
+      if (dst !== t.w('node_modules')) return;
+      fs.mkdirSync(dst);
+      throw cpError(`cp: failed to clone '${dst}/x/index.js' from '${src}/x/index.js': No space left on device\n`);
+    });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'linux', copy: cp.copy });
+    assert.deepEqual(r.copied.map(e => [e.path, e.cloned]), [['.env', false], ['packages/a/node_modules', true], ['packages/b/node_modules', true]]);
+    assert.deepEqual(r.skipped, [{ path: 'node_modules', why: 'failed' }]);
+    assert.equal(present(t.w('node_modules')), false);
+    // Each of the words GNU cp says when no clone can be made at all means that disk: left out.
+    for (const said of ['Operation not supported', 'Invalid cross-device link', 'Inappropriate ioctl for device']) {
+      const ws = await t.agent();
+      const none = cpStandIn(({ args, src, dst }) => {
+        if (args.includes('--reflink=always')) throw cpError(`cp: failed to clone '${dst}/x/index.js' from '${src}/x/index.js': ${said}\n`);
+      });
+      const r2 = await fillWorkspace({ repoRoot: t.root, path: ws, platform: 'linux', copy: none.copy });
+      assert.deepEqual(r2.skipped.map(s => s.why), ['noclone', 'noclone', 'noclone'], said);
+    }
+  });
+
   test('what .worktreeinclude chooses inside a folder of installed packages, or a store of them, also needs a clone (Linux, ext4)', async () => {
     const t = await fillRepo({
       '.gitignore': 'node_modules/\n.env\n.pnpm-store/\n/vendor/\n',
@@ -2834,22 +2861,26 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     assert.deepEqual(r.skipped, ['.pnpm-store', 'node_modules/next', 'vendor'].map(p => ({ path: p, why: 'noclone' })));
     assert.ok(!ext4.calls.some(c => c.args.includes('--reflink=auto') && c.args.at(-1) !== t.w('.env')), 'never a full copy of a package');
     for (const f of ['node_modules', '.pnpm-store', 'vendor']) assert.equal(present(t.w(f)), false, f);
+    // The same on a Mac whose disk makes no clones: no cp at all for them.
+    const mac = cpStandIn();
+    const ws2 = await t.agent();
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: ws2, platform: 'darwin', clones: false, copy: mac.copy });
+    assert.deepEqual(r2.skipped, r.skipped);
+    assert.deepEqual(mac.calls.map(c => c.args.at(-1)), [path.join(ws2, '.env')]);
   });
 
   test('only a folder of installed packages or a virtualenv needs a clone; where none can be made, any other listed folder is copied plainly', async () => {
     const t = await fillRepo({ '.gitignore': '.env\nnode_modules/\n.venv/\n/secrets/\n', '.worktreeinclude': '.env\nnode_modules/\n.venv/\nsecrets/\n' }, {
       '.env': 'E=1\n', 'node_modules/x/index.js': 'x\n', '.venv/pyvenv.cfg': 'home = /usr/bin\n', 'secrets/key.pem': 'key\n', 'secrets/more/b.pem': 'b\n',
     });
-    // A Mac whose cp -c cannot clone (the folder is on another volume), and a Linux disk with no clones (ext4).
-    const mac = cpStandIn(({ args, dst }) => {
-      if (args[0] === '-c') throw cpError(`cp: ${dst}: clonefile failed: Cross-device link\n`);
-    });
+    // A Mac whose disk makes no clones (the folder is on another volume), and a Linux disk with none (ext4).
+    const mac = cpStandIn();
     const ext4 = cpStandIn(({ args, src, dst }) => {
       if (args.includes('--reflink=always')) throw cpError(`cp: failed to clone '${dst}' from '${src}': Operation not supported\n`);
     });
     for (const [platform, cp, plain] of [['darwin', mac, ['-R', '-p']], ['linux', ext4, ['-a', '--reflink=auto']]]) {
       const ws = await t.agent();
-      const r = await fillWorkspace({ repoRoot: t.root, path: ws, platform, copy: cp.copy });
+      const r = await fillWorkspace({ repoRoot: t.root, path: ws, platform, clones: platform === 'darwin' ? false : undefined, copy: cp.copy });
       assert.deepEqual(r.copied, ['.env', 'secrets'].map(p => ({ path: p, kind: 'listed', cloned: false })), platform);
       assert.deepEqual(r.skipped, [{ path: '.venv', why: 'noclone' }, { path: 'node_modules', why: 'noclone' }], platform);
       assert.ok(cp.calls.some(c => c.args.join('\n') === [...plain, t.p('secrets'), path.join(ws, 'secrets')].join('\n')), platform);
@@ -2874,7 +2905,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       if (args.at(-1).endsWith('.envrc')) throw new Error('cp could not be started'); // thrown at once, not a rejection
       return cp.copy(file, args, o);
     };
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy });
     assert.deepEqual(pathsOf(r.copied), ['.env', 'node_modules', 'src/.env']);
     assert.deepEqual(r.skipped, ['.env.local', '.envrc', 'packages/a/node_modules'].map(p => ({ path: p, why: 'failed' })));
     for (const f of ['.env.local', '.envrc', 'packages/a/node_modules']) assert.equal(present(t.w(f)), false, f);
@@ -2886,10 +2917,10 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     const t = await fillRepo({ '.gitignore': '.env\n' }, { '.env': 'E=1\n' });
     const cp = cpStandIn();
     const broken = async () => { throw Object.assign(new Error('Command failed'), { code: 128, stderr: 'fatal: not a git repository' }); };
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy, run: broken });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy, run: broken });
     assert.deepEqual([r.copied, r.skipped], [[], [{ path: '.', why: 'failed' }]]);
     fs.writeFileSync(t.p('.worktreeinclude'), `.env\n${'#'.repeat(300 * 1024)}\n`); // far too big for a list of patterns
-    const r2 = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cp.copy });
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cp.copy });
     assert.deepEqual([r2.copied, r2.skipped], [[], [{ path: '.worktreeinclude', why: 'failed' }]]);
     assert.equal(cp.calls.length, 0);
     assert.equal(present(t.w('.env')), false);
@@ -2905,7 +2936,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       searches.push(args);
       return Promise.reject(Object.assign(new Error('Command failed'), { code: null, killed: true, signal: 'SIGTERM', stderr: '' }));
     };
-    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', copy: cpStandIn().copy, run });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy, run });
     assert.equal(searches.length, 1);
     assert.deepEqual(r.copied.map(e => [e.path, e.kind]), [['.env', 'env'], ['node_modules', 'deps']]);
     assert.deepEqual(r.skipped, [{ path: 'secrets', why: 'failed' }, { path: 'target', why: 'failed' }]);

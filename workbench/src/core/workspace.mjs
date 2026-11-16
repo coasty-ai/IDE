@@ -368,8 +368,12 @@ const CP_AT_ONCE = 8;
  * for a node_modules: cp is then stopped, and its first lines still say why.
  */
 const CP_MAX_BUFFER = 256 * 1024;
-/** cp's words when it cannot make a clone: macOS's `cp -c` to another volume, GNU's `--reflink=always` where there are none. */
-const NO_CLONE = /clonefile failed|failed to clone/;
+/**
+ * GNU cp's words when `--reflink=always` cannot make a clone on this disk at all: one without clones (ext4), or another
+ * disk. Any other failure ("No such file or directory", "No space left on device") is that entry's own. A Mac's cp is
+ * never read for this: whether it can clone is known before it runs (see fillWorkspace).
+ */
+const NO_CLONE = /failed to clone .*: (?:Operation not supported|Invalid cross-device link|Inappropriate ioctl for device)$/m;
 const INCLUDE_MAX_BYTES = 256 * 1024;
 /** Env files by name: .env, .env.<anything> (.env.local, .env.development.local) and direnv's .envrc. */
 const ENV_NAMES = ['.env', '.env.*', '.envrc'];
@@ -395,8 +399,9 @@ const VCS_FOLDERS = new Set(['.git', '.hg', '.svn', '.bzr', '.jj', '.sl', '_darc
  * How: one cp per entry, at most CP_AT_ONCE at once, each within CP_TIMEOUT_MS and the time left of `timeoutMs`, and
  * none started with less than CP_START_MS left. A folder of installed packages (node_modules) or of version control,
  * a virtualenv, or a folder inside one of those, is copied only as a clone, and left out where none can be made;
- * anything else is copied plainly then. On a Mac `/bin/cp -c -R -p` clones (APFS), and cannot to another volume.
- * Elsewhere GNU cp: `-a --reflink=always` for those folders (ext4 makes no clones), `-a --reflink=auto` for the rest.
+ * anything else is copied plainly then. On a Mac `/bin/cp -c -R -p` clones, and that is decided before any cp: the
+ * entry and the workspace on one volume, of the startup disk's kind (APFS); otherwise `/bin/cp -R -p`. Elsewhere GNU
+ * cp: `-a --reflink=always` for those folders (ext4 makes no clones, which cp says), `-a --reflink=auto` for the rest.
  * Never with Node: on a Mac, fs.copyFile makes a full copy even when asked to clone, and fs.cp makes relative links
  * absolute unless told not to. A folder made on the way gets the mode of the person's folder it stands for.
  *
@@ -406,16 +411,18 @@ const VCS_FOLDERS = new Set(['.git', '.hg', '.svn', '.bzr', '.jj', '.sl', '_darc
  * .worktreeinclude cannot be read, [{ path: '.worktreeinclude', why: 'failed' }]; a folder git ignores as a whole
  * that could not be searched for env files is named with why 'failed', and the rest is copied all the same.
  * @param {{ repoRoot: string, path: string, platform?: string, run?: typeof git,
- *   copy?: (file: string, args: string[], o: { timeout: number }) => Promise<unknown>, timeoutMs?: number }} opts
+ *   copy?: (file: string, args: string[], o: { timeout: number }) => Promise<unknown>, timeoutMs?: number,
+ *   clones?: boolean }} opts
  *   repoRoot: the top folder of the person's checkout (prepareRepo's root); path: the workspace (createWorkspace's);
  *   platform: 'darwin' for the Mac's cp, anything else for GNU cp; run and copy: stand-ins for git() and cp (tests);
- *   timeoutMs: the whole fill's limit (10 minutes unless given)
+ *   timeoutMs: the whole fill's limit (10 minutes unless given); clones: whether the disk makes clones, as tests
+ *   say it (a Mac looks, and elsewhere cp says, unless given)
  * @returns {Promise<{ copied: { path: string, kind: 'env'|'deps'|'listed', cloned: boolean }[],
  *   skipped: { path: string, why: 'exists'|'link-outside'|'noclone'|'failed'|'venv' }[], ms: number }>}
  *   paths relative to the repository (a folder's without its "/"), each list in path order; cloned: made with clones
- *   (`cp -c` on a Mac, `--reflink=always` elsewhere), which take almost no disk
+ *   (`cp -c` on a Mac, where the disk makes them, `--reflink=always` elsewhere), which take almost no disk
  */
-export async function fillWorkspace({ repoRoot, path: wsPath, platform = process.platform, run = git, copy = runCp, timeoutMs = FILL_TIMEOUT_MS } = {}) {
+export async function fillWorkspace({ repoRoot, path: wsPath, platform = process.platform, run = git, copy = runCp, timeoutMs = FILL_TIMEOUT_MS, clones } = {}) {
   const started = Date.now();
   const root = realRoot(repoRoot);
   if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath) || !isFolder(wsPath)) throw plainError('No workspace folder was given.');
@@ -454,7 +461,14 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
   const program = mac || fs.existsSync('/bin/cp') ? '/bin/cp' : 'cp';
   const cpWith = typeof copy === 'function' ? copy : runCp;
   const dep = dependencyFolders(root);
-  let noClones = false; // a clone failed for want of clones: the two disks are the same for every entry
+  // Where a clone can be made. A Mac's cp -c makes a full copy without a word where the disk has no clones (HFS+), and
+  // says "clonefile failed" for other reasons too (a file that vanished), so a Mac decides before any cp: the entry
+  // and the agent's folder on one volume, of the startup disk's kind (APFS). Elsewhere cp says it (NO_CLONE), and then
+  // no clone is tried again: the two disks are the same for every entry. `clones` (tests) is the answer given.
+  const wsDev = fs.statSync(ws).dev;
+  const apfs = mac && typeof clones !== 'boolean' && likeStartupDisk(ws);
+  let noClones = false;
+  const canClone = st => (typeof clones === 'boolean' ? clones : mac ? apfs && st.dev === wsDev : !noClones);
   const made = new Map(); // folders made on the way in the workspace -> the person's folder each stands for
 
   /** One cp within the time left: { ok }, or { ok: false, noClone } with its half-made copy removed. */
@@ -466,7 +480,7 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
       return { ok: true };
     } catch (e) {
       await fs.promises.rm(dst, { recursive: true, force: true }).catch(() => {}); // nothing was there before
-      return { ok: false, noClone: NO_CLONE.test(String((e && e.stderr) || '')) };
+      return { ok: false, noClone: !mac && NO_CLONE.test(String((e && e.stderr) || '')) };
     }
   };
 
@@ -485,32 +499,26 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
       return null; // gone since git listed it: nothing to copy
     }
     if (st.isSymbolicLink() && !linkStaysInside(root, src)) return 'link-outside';
-    const inTheWay = foldersFor(ws, parts, made, root);
-    if (inTheWay) return inTheWay;
-    if (!nothingAt(dst)) return 'exists';
     const folder = st.isDirectory();
     // A folder of installed packages or of version control, or a virtualenv, or one inside them (node_modules/next),
     // only as a clone: a full copy of a node_modules is too slow and too big to make unasked. Anything else is copied
     // plainly where clones cannot be made.
     const cloneOnly = folder && (kind === 'deps' || dep.is(rel) || dep.above(rel));
+    const clone = canClone(st);
+    if (cloneOnly && !clone) return 'noclone';
+    const inTheWay = foldersFor(ws, parts, made, root);
+    if (inTheWay) return inTheWay;
+    if (!nothingAt(dst)) return 'exists';
     let cloned;
     if (mac) {
       // A clone takes almost no disk, and seconds for a node_modules.
-      const r = noClones ? { ok: false, noClone: true } : await cp(['-c', '-R', '-p', src, dst], dst);
-      if (r.ok) {
-        cloned = true;
-      } else {
-        if (!r.noClone) return 'failed';
-        noClones = true;
-        if (cloneOnly) return 'noclone';
-        if (!(await cp(['-R', '-p', src, dst], dst)).ok) return 'failed';
-        cloned = false;
-      }
+      if (!(await cp(clone ? ['-c', '-R', '-p', src, dst] : ['-R', '-p', src, dst], dst)).ok) return 'failed';
+      cloned = clone;
     } else if (!cloneOnly) {
       if (!(await cp(['-a', '--reflink=auto', src, dst], dst)).ok) return 'failed'; // a clone or a copy: cp knows
       cloned = false;
     } else {
-      const r = noClones ? { ok: false, noClone: true } : await cp(['-a', '--reflink=always', src, dst], dst);
+      const r = await cp(['-a', '--reflink=always', src, dst], dst);
       if (!r.ok) {
         if (!r.noClone) return 'failed';
         noClones = true;
@@ -714,6 +722,19 @@ const globEscape = s => s.replace(/[*?[\]\\]/g, '\\$&');
 
 /** Whether `p` is `top` or inside it. */
 const within = (top, p) => p === top || p.startsWith(top + path.sep);
+
+/**
+ * Whether the folder `p` is on a disk of the same kind as the startup disk: APFS, which makes clones, on every macOS
+ * that Node 22 runs on (macOS 11 and later start only from APFS). The numbers statfs gives for a kind of disk differ
+ * from one Mac to another, so they are compared, never written down. False when either cannot be read.
+ */
+function likeStartupDisk(p) {
+  try {
+    return fs.statfsSync(p).type === fs.statfsSync('/').type;
+  } catch {
+    return false;
+  }
+}
 
 /** Whether `p` is a real folder (lstat): not a link to one. */
 function isRealFolder(p) {
