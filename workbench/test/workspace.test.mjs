@@ -3325,10 +3325,11 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     assert.deepEqual(pathsOf(r.copied), ['.env', 'apps/web/.env.local', 'node_modules', 'secrets/.env']);
     const env = await envValues({ path: t.ws, copied: r.copied });
     assert.equal(env.files, 3, 'the three env files; node_modules is not looked into');
-    for (const v of ['postgres://u:pw-abc123@localhost/db', 'sk-live-0123456789', 'single-quoted-value', 'spaced-out-value', 'production',
+    for (const v of ['postgres://u:pw-abc123@localhost/db', 'sk-live-0123456789', 'single-quoted-value', 'spaced-out-value',
       '-----BEGIN KEY-----', 'line-two-of-the-key', '-----END KEY-----', 'first-line\nsecond-line', 'first-line\\nsecond-line', 'second-line',
       'abc#defghijkl', 'web-token-value-99', 'in-secrets-folder']) assert.ok(env.values.includes(v), JSON.stringify(v));
-    for (const v of ['1234567', 'package-secret-1', '# a comment line, never a value', 'DATABASE_URL', '']) assert.ok(!env.values.includes(v), JSON.stringify(v));
+    // "production" is a plain word, which cannot be a secret (see the next test)
+    for (const v of ['1234567', 'production', 'package-secret-1', '# a comment line, never a value', 'DATABASE_URL', '']) assert.ok(!env.values.includes(v), JSON.stringify(v));
     assert.ok(env.values.every(v => typeof v === 'string' && v.length >= 8));
     assert.equal(new Set(env.values).size, env.values.length, 'each once');
     assert.ok(Object.isFrozen(env.values));
@@ -3354,6 +3355,40 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     assert.deepEqual([odd.files, odd.values], [0, []]);
     assert.deepEqual(await envValues({ path: 'relative', copied: r.copied }), { values: [], files: 0 });
     assert.deepEqual(await envValues({}), { values: [], files: 0 });
+  });
+
+  test('envValues leaves out the values that cannot be secrets, which people and agents write too, unless the name or the shape says secret', async () => {
+    const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(T, 'env-plain-')));
+    // made up here, from parts: a webhook's address holds its secret in its path, which looksLikeSecret does not search
+    const hook = ['https://hooks.slack.com/services', 'T0A1B2C3D', 'B0E4F5G6H', ['x7Kq', 'W2mZ', 'p9Lr', 'T4vN', 'b8Yc', 'J3sD'].join('')].join('/');
+    const awsId = ['AKIA', 'QWERTYUIOPASDFGH'].join(''); // letters only, but a key's shape
+    const plain = {
+      NODE_ENV: 'production', DB_HOST: 'localhost', DB_NAME: 'database', CHAT_ROLE: 'assistant', COUNTRY: 'Australia', BIG: '12345678',
+      PHONE: '+15551234567', HOST_IP: '127.0.0.1', LISTEN: 'localhost:3000', DB_ADDR: '127.0.0.1:5432', NET: '10.0.0.0/16',
+      V6: '2001:db8::1', V6_PORT: '[2001:db8::1]:8080', SMTP_HOST: 'smtp.example.com', APP_URL: 'http://localhost:3000',
+      API_BASE: 'https://api.example.com/v1/users/', CACHE_URL: 'redis://cache:6379', DOCS: 'https://example.com/docs/index.html',
+    };
+    const secret = {
+      // the name says secret: hidden whatever the value looks like
+      DB_PASSWORD: 'sunshine', ADMIN_PW: 'letmeinplease', JWT_SECRET: 'supersecret', STRIPE_KEY: 'abcdefghij', LOGIN_PIN: '87654321',
+      NEXTAUTH_URL: 'http://localhost:3000/auth', TEAM_WEBHOOK: 'https://example.com/hooks/deploy',
+      // the shape says secret, or may hide one
+      ACCESS_ID: awsId, SLACK_HOOK: hook, TRACK_URL: 'https://example.com/t?id=abcdef123', AT_URL: 'https://example.com/a#token-abc',
+      DATABASE_URL: ['postgres://app', 'pw-x81mQ@db.internal/app'].join(':'), ENCODED: 'https://example.com/a%20b/c',
+      // any other shape is hidden, even when it is no secret
+      REGION: 'us-east-1', MODEL: 'claude-haiku-4-5', CACHE: 'redis:6379', USER_LOGIN: 'alice:4321', IDP_BASE: 'https://example.com/oauth2/x',
+      PHRASE: 'correct horse battery', MIXED_HOST: 'Db.Example.com',
+    };
+    // quoted where dotenv would cut a bare value at the #
+    const lines = Object.entries({ ...plain, ...secret }).map(([k, v]) => `${k}=${v.includes('#') ? JSON.stringify(v) : v}`);
+    fs.writeFileSync(path.join(dir, '.env'), `${lines.join('\n')}\nexport QUOTED="development"\nMULTI="first-line-of-it\nproduction"\n`);
+    const env = await envValues({ path: dir, copied: [{ path: '.env', kind: 'env' }] });
+    assert.equal(env.files, 1);
+    for (const [k, v] of Object.entries(plain)) assert.ok(!env.values.includes(v), `${k}=${v} is not hidden`);
+    for (const [k, v] of Object.entries(secret)) assert.ok(env.values.includes(v), `${k}=${v} is hidden`);
+    assert.ok(!env.values.includes('development'), 'quoted, it is the same word');
+    // each line of a value of several lines is judged by itself, unless the value as a whole says secret
+    assert.ok(env.values.includes('first-line-of-it\nproduction') && env.values.includes('first-line-of-it') && !env.values.includes('production'));
   });
 
   test('envValuesIn reads again, in an agent’s folder, the env files a fill would choose there: its copies, for an agent continued in a later run', async () => {

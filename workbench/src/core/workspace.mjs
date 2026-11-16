@@ -11,9 +11,11 @@
 import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { clip } from '../shared/format.mjs';
+import { looksLikeSecret } from '../shared/secretshape.mjs';
 
 const GIT_TIMEOUT_MS = 30_000;
 const WORKTREE_TIMEOUT_MS = 120_000;
@@ -707,30 +709,77 @@ const ENV_DEPTH_MAX = 8;
  * value quoted with ', " or ` (and then it may go on over several lines) or bare, up to a #. Comments and blank lines
  * match nothing.
  */
-const ENV_LINE = /^\s*(?:export\s+)?[\w.-]+(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?$/mg;
+const ENV_LINE = /^\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?$/mg;
+/**
+ * A variable whose name says it holds a secret: its value is hidden whatever it looks like (DB_PASSWORD=sunshine,
+ * NEXTAUTH_URL=http://localhost:3000/auth).
+ */
+const ENV_SECRET_NAME = /KEY|TOKEN|SECRET|PASS|PWD|AUTH|CRED|PRIVATE|SALT|DSN|WEBHOOK|(?:^|[_.-])(?:PW|PIN)(?:[_.-]|$)/i;
+// The shapes of a value that cannot be a secret (see plainEnvValue).
+const PLAIN_WORD = /^[A-Za-z]+$/;
+const PLAIN_NUMBER = /^[+-]?\d+(?:\.\d+)?$/;
+const HOST_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const HOST_NAME = new RegExp(`^(?:${HOST_LABEL}\\.)+[a-z]{2,63}$`); // db.internal, smtp.example.com
+const HOST_ONE = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/; // cache, as the host of redis://cache:6379
+// A web address with no user or password (no @ at all), no query and no fragment: its host, and its path.
+const PLAIN_LINK = /^[a-z][a-z0-9+.-]{0,30}:\/\/([^/?#@\s]+)(\/[^?#@\s]*)?$/i;
+const PLAIN_SEGMENT = /^(?:[a-z]+(?:[-_.][a-z]+)*|v?\d{1,4})?$/; // users, index.html, v1, 2024 (or nothing, as after a last /)
 
 /**
- * The values a dotenv text holds, in each form a program may print one: as dotenv gives it ("\n" in double quotes is a
- * line break), as the file has it, each of its lines when it has several, and a bare value with what follows a # on
- * its line (dotenv cuts it there, the file does not).
+ * Each assignment a dotenv text holds: its variable's `name`, and its value in each form a program may print it
+ * (`values`): as dotenv gives it ("\n" in double quotes is a line break), as the file has it, each of its lines when it
+ * has several, and a bare value with what follows a # on its line (dotenv cuts it there, the file does not).
+ * @returns {{ name: string, values: string[] }[]}
  */
-function dotenvValues(text) {
+function dotenvEntries(text) {
   const out = [];
   for (const m of String(text).replace(/\r\n?/g, '\n').matchAll(ENV_LINE)) {
-    const raw = (m[1] || '').trim();
+    const raw = (m[2] || '').trim();
     if (!raw) continue;
+    const forms = [];
     const q = raw[0];
     if ((q === '"' || q === "'" || q === '`') && raw.endsWith(q) && raw.length >= 2) {
       const inner = raw.slice(1, -1);
-      out.push(inner);
-      if (q === '"') out.push(inner.replace(/\\n/g, '\n').replace(/\\r/g, '\r'));
+      forms.push(inner);
+      if (q === '"') forms.push(inner.replace(/\\n/g, '\n').replace(/\\r/g, '\r'));
     } else {
-      out.push(raw);
+      forms.push(raw);
     }
     const rest = /=\s*([^\n]*)$/.exec(m[0]) || /:\s+([^\n]*)$/.exec(m[0]);
-    if (rest && rest[1].trim() && !/^['"`]/.test(rest[1].trim())) out.push(rest[1].trim());
+    if (rest && rest[1].trim() && !/^['"`]/.test(rest[1].trim())) forms.push(rest[1].trim());
+    out.push({ name: m[1], values: forms.flatMap(v => [v, ...(v.includes('\n') ? v.split('\n').map(l => l.trim()) : [])]) });
   }
-  return out.flatMap(v => [v, ...(v.includes('\n') ? v.split('\n').map(l => l.trim()) : [])]);
+  return out;
+}
+
+/**
+ * A host, with or without a port, that is no secret: localhost, an IP address (in brackets for IPv6 with a port), or a
+ * lower-case name with a dot (db.internal). `one`: in a web address, where nothing else can stand there, a name of one
+ * part too (cache); a bare alice:4321 may be a name and a PIN.
+ */
+function plainHost(s, one = false) {
+  const v6 = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(s);
+  if (v6) return net.isIPv6(v6[1]);
+  if (net.isIP(s)) return true; // an IPv6 address's colons are no port
+  const m = /^([^:]+)(?::\d{1,5})?$/.exec(s);
+  if (!m) return false;
+  return m[1] === 'localhost' || net.isIPv4(m[1]) || HOST_NAME.test(m[1]) || (one && HOST_ONE.test(m[1]));
+}
+
+/**
+ * Whether a value from an env file cannot be a secret, so the engine does not hide it: copied .env files hold plain
+ * words too ("production", "localhost"), which people and agents write, and hiding them would put "••••" in their words.
+ * Letters only; a number; a host (127.0.0.1:5432, localhost:3000, smtp.example.com), or a network (10.0.0.0/16); or a
+ * web address with no user or password, no query and no fragment, whose path is lower-case words and short numbers
+ * (http://localhost:3000/api/v1). A webhook's address is none of these: its secret is in its path. Anything else may be
+ * a secret, and is hidden (us-east-1 too). The name, or a key's shape, can still say secret (see envValues).
+ */
+function plainEnvValue(v) {
+  if (PLAIN_WORD.test(v) || PLAIN_NUMBER.test(v) || plainHost(v)) return true;
+  const net4 = /^([^/]+)\/\d{1,3}$/.exec(v);
+  if (net4 && net.isIP(net4[1])) return true;
+  const link = PLAIN_LINK.exec(v);
+  return !!link && plainHost(link[1], true) && (link[2] || '').split('/').every(s => PLAIN_SEGMENT.test(s));
 }
 
 /**
@@ -740,6 +789,8 @@ function dotenvValues(text) {
  * .env.<anything> or .envrc: an entry itself, or one inside a folder .worktreeinclude chose (looked into to a depth of
  * 8, never into folders of installed packages, of version control or a virtualenv, nor into a repository). Nothing is
  * read through a link, outside the workspace, nor from a file over 256 KB; at most 200 files and 1000 values.
+ * A form of a value that cannot be a secret (plainEnvValue: "production", localhost:3000) is left out, unless the
+ * variable's name says secret (ENV_SECRET_NAME: DB_PASSWORD) or one of its forms has a key's shape (looksLikeSecret).
  * The values are never logged. Never rejects: what cannot be read gives nothing.
  * @param {{ path: string, copied: { path: string, kind: string }[] }} opts
  * @returns {Promise<{ values: readonly string[], files: number }>}
@@ -769,7 +820,11 @@ export async function envValues({ path: wsPath, copied } = {}) {
       if (!st.isFile() || st.size > ENV_FILE_MAX_BYTES) return;
       const text = (await fh.readFile()).toString('utf8');
       files += 1;
-      for (const v of dotenvValues(text)) add(v);
+      for (const { name, values: forms } of dotenvEntries(text)) {
+        // Every form is kept when the name or one form says secret; otherwise the forms that cannot be one are left out.
+        const secret = ENV_SECRET_NAME.test(name) || forms.some(f => looksLikeSecret(f).secret === true);
+        for (const v of forms) if (secret || !plainEnvValue(v)) add(v);
+      }
     } catch {
       // gone, or not readable: nothing to hide
     } finally {

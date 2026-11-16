@@ -327,6 +327,37 @@ test('values in copied env files are hidden in what the agent prints, on the pag
   await t.engine.shutdown();
 });
 
+test('a copied value never hides the person’s own words: the task, the name, the replies and the merge commit keep "production"', async (ctx) => {
+  // envValues leaves out a plain word, but hands over one whose name says secret (PASSWORD=production): the fake hands
+  // it over, as that one. What agents print hides it; what the person typed, and what is made of it, does not.
+  const url = ['postgres://app', 'pw-x81mQ@db.internal/app'].join(':');
+  const t = liveFolders(ctx, { deps: { fill: { copied: [{ path: '.env', kind: 'env' }], skipped: [] } } });
+  t.git.env = { values: ['production', url], files: 1 };
+  // Launched before the value was known (its own copy brings it): its merge comes after.
+  const a = await doneAgent(t, { task: 'fix the production build' }, `I fixed the build, which reads ${url} now.`);
+  // Launched once the value is known, through the launch card.
+  t.deps.commands.intent = { kind: 'task', task: 'deploy to production' };
+  const out = await t.engine.command('deploy to production');
+  assert.equal(out.confirm.sentence, 'Start Claude Code on “deploy to production”?');
+  const yes = await t.engine.confirm(out.confirm.id, true);
+  assert.equal(yes.reply, 'Started Deploy to production.');
+  const b = t.store.get(yes.agentIds[0]);
+  assert.deepEqual([b.name, b.task], ['Deploy to production', 'deploy to production'], 'as the board and the history keep it');
+  await until(() => t.claude.runners.length === 2 && t.claude.runners[1].started);
+  assert.deepEqual(t.claude.runners[1].opts.task, 'deploy to production', 'the agent gets its task as it was typed');
+  assert.equal((await t.engine.say(b.id, 'use the production database')).reply, 'Sent to Deploy to production.');
+  // What the agent prints is still hidden.
+  t.claude.runners[1].emit({ kind: EV.SAYS, text: `NODE_ENV is production, and the database is ${url}.` });
+  assert.equal(t.store.get(b.id).says, 'NODE_ENV is ••••, and the database is •••• /app.');
+  // The merge commit: its subject and name are the person's words; its body is the agent's, hidden as it printed it.
+  const merge = await t.engine.proposeMerge(a.id);
+  assert.equal(merge.confirm.sentence, 'Merge Fix production build into main?');
+  assert.equal((await t.engine.confirm(merge.confirm.id, true)).reply, 'Merged Fix production build into main.');
+  assert.deepEqual(t.calls.mergeWork.at(-1).message, { subject: 'Fix the production build', body: 'I fixed the build, which reads •••• /app now.', name: 'Fix production build' });
+  assert.ok(!JSON.stringify(t.store.list()).includes(url), 'never the value itself');
+  await t.engine.shutdown();
+});
+
 test('the setup card: asked the first time, Run it is kept for the repository and that command; Not now starts without it and asks again; a changed command asks again', async (ctx) => {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-setup-prefs-')));
   ctx.after(() => fs.rmSync(home, { recursive: true, force: true }));

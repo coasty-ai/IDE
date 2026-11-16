@@ -2534,11 +2534,13 @@ export class Engine extends EventEmitter {
       prep: null, // while its copy is made ready (live): the AbortController that stops its setup command
     };
     this.runs.set(id, run);
+    // The task and the name are the person's own words: only their stored keys are hidden in them, never a value of a
+    // copied env file, which may be a word they use ("production"). The rest of the batch holds no text to hide.
     this._apply([
-      { kind: EV.CREATED, agentId: id, parentId: null, name: agentName, task: text, harness: h, model: mdl, machineId: mach, budgetUsd: budget, workspace: workspace?.path ?? null },
+      { kind: EV.CREATED, agentId: id, parentId: null, name: this._maskStored(agentName), task: this._maskStored(text), harness: h, model: mdl, machineId: mach, budgetUsd: budget, workspace: workspace?.path ?? null },
       ...(workspace ? [{ kind: EV.WORK, agentId: id, work: { branch: workspace.branch, from: workspace.from, folder: true, merged: null, problem: null, thrownAway: null } }] : []),
       { kind: EV.STATE, agentId: id, state: STATE.STARTING, reason: null },
-    ]);
+    ], { masked: true });
     const opts = {
       agentId: id,
       name: agentName,
@@ -3483,14 +3485,17 @@ export class Engine extends EventEmitter {
     const again = this._mergeRefusal(v, { state: c.state, ownJob: true });
     if (again) return { reply: again.reply, focusId: id };
     // The commit outlives the page: its words go through the mask too, for text kept from before a key was stored.
-    // Masked before they are cut (a key the cut splits no longer matches), and again after.
+    // Masked before they are cut (a key the cut splits no longer matches), and again after. The subject and the name are
+    // made of the person's own words (the task, and its name): only stored keys are hidden in them, never a value of a
+    // copied env file ("production"), as when they were typed. The body is the agent's words: the whole mask.
     const m = this._mask || ((s) => s);
+    const typed = (s) => this._maskStored(s);
     let res;
     try {
       res = await this.deps.workspace.mergeWork({
         repoRoot: this.repoInfo.root, path: ws.path, branch: ws.branch, since: sinceOf(ws),
         expect: { workId: c.expect.workId, into: c.expect.into, intoHead: c.expect.intoHead },
-        message: { subject: m(commitSubject(m(v.task), `Work by ${m(v.name)}`)), body: m(commitBody(m(v.says))), name: m(v.name) },
+        message: { subject: typed(commitSubject(typed(v.task), `Work by ${typed(v.name)}`)), body: m(commitBody(m(v.says))), name: typed(v.name) },
         agentId: v.id, harness: v.harness,
       });
     } catch (err) {
