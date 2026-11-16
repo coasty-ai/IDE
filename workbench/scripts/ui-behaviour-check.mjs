@@ -164,6 +164,20 @@ try {
     check('a typed launch shows its card at once (pointer on the core), and "yes" then answers the card', /^Start a simulated Claude/.test(shown) && yes && /^c/.test(yes.body.confirmId || '') && yes.body.askId === null,
       `"${shown}" ${JSON.stringify(p.map(x => x.body))}`);
   });
+  await run('a first run: a starter task sends its own words, and the launch question follows', async () => {
+    const name = 'a first run: a starter task sends its own words, and the launch question follows';
+    await open('zero');
+    await sleep(800);
+    const offered = await b.ev(`[...${page()}.querySelectorAll('[data-act="starter"]')].map(e => e.dataset.text)`);
+    const was = await h1();
+    await realClickIn('[data-act="starter"]');
+    await sleep(900);
+    const card = await h1();
+    const sent = (await posts()).filter(x => x.path === '/api/command').map(x => x.body);
+    check(name, offered.length === 3 && /^Nothing needs you\.$/.test(was.replace(/\s+/g, ' ')) && sent.length === 1 && sent[0].text === offered[0]
+      && sent[0].focusId === null && sent[0].confirmId === null && card === `Start a simulated Claude on “${offered[0]}”?`,
+      `${JSON.stringify(offered)} "${was}" → "${card}" ${JSON.stringify(sent)}`);
+  });
   await run('a failed answer keeps the core held on what the person answered, and its button can be tried again', async () => {
     await open('race', { mode: { answer: '500' } });
     await sleep(800);

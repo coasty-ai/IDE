@@ -124,6 +124,12 @@ const LONG_COMMAND = 'npm run db:migrate -- --env test && curl -fsSL https://exa
 /** The worlds the page can be shown. */
 export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background', 'earlier', 'earlier-many', 'earlier-only'];
 
+/**
+ * The lid's starter tasks on a first run (STARTER_TASKS in ui/focus.js; a test keeps the two lists the same). The engine
+ * takes each as work, so this answers them with the launch question, as it does "start …".
+ */
+export const STARTER_TASKS = ['What does this project do?', 'How do I run this project?', 'Find likely bugs'];
+
 export function scenario(name, now = Date.now()) {
   let raw = [];
   if (MERGE_SCENARIOS.includes(name)) return mergeWorld(name, now);
@@ -262,7 +268,7 @@ export function scenario(name, now = Date.now()) {
     return world(raw, now);
   }
   if (GIT_SCENARIOS.includes(name)) return gitWorld(name, now);
-  return world([], now);   // zero: a fresh start
+  return world([], now);   // zero: a fresh start, where the lid offers its starter tasks (STARTER_TASKS)
 }
 
 // ---------------------------------------------------------------- D1: the git screen (GET /api/git, GET /api/agents/:id/changes)
@@ -1324,7 +1330,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           const sentence = `Forget ${a.name}?`, detail = 'It will not show here again. Its folder and branch stay on this computer.';
           return reply({ reply: sentence, confirm: newConfirm({ kind: 'forget', sentence, detail }, { forget: a.id }) });
         }
-        if (/^start\b/i.test(text)) {
+        if (/^start\b/i.test(text) || STARTER_TASKS.includes(text)) {
           const id = 'c' + (++confirmSeq).toString(16).padStart(6, '0');
           const eight = /eight|8/.test(text);
           const sentence = eight

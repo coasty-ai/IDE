@@ -92,6 +92,8 @@ test('the lid: "Connect a coding agent to start." with Connect, in place of "Not
   const v = lidView({ empty: true, aside: [], connect: meta }, { detail: 'calm' });
   assert.equal(v.key, 'connect');
   assert.equal(focusKey({ empty: true, connect: meta }), 'connect');
+  // an agent has worked here, so the empty lid is the plain one (with none, it offers the starter tasks: ui-focus.test.mjs)
+  S.agents.set('X', { id: 'X', name: 'Checkout fix', state: 'working' });
   assert.equal(focusKey({ empty: true }), 'empty', 'without it, the key is as before');
   assert.equal(v.idle, false, 'it needs the person: the lit lid');
   assert.match(v.html, /<h1[^>]*>Connect a coding agent to start\.<\/h1>/);
@@ -112,6 +114,7 @@ test('the lid: "Connect a coding agent to start." with Connect, in place of "Not
   const empty = lidView({ empty: true, aside: [] }, { detail: 'calm' });
   assert.equal(empty.key, 'empty');
   assert.match(empty.html, /Nothing needs you\./);
+  S.agents.clear();
 });
 
 // ---------------------------------------------------------------- agents: every state, its sentence, light and buttons
