@@ -4097,6 +4097,31 @@ test('full permissions in words: the real parser asks first for "stop asking", a
   await t.engine.shutdown();
 });
 
+test('full permissions in words: a thanks before them still acts, a question never does, and their card takes its own words beside an agent of that name', async () => {
+  const t = live({ prefs: prefsStore() });
+  t.engine.deps.commands = commands;
+  const card = await t.engine.command('thank you, stop asking');
+  assert.equal(card.confirm.kind, 'permissions');
+  assert.equal((await t.engine.command('thanks, stop asking', { confirmId: card.confirm.id })).reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  // asked, the mark typed apart or not, they change nothing
+  for (const q of ['ask first ?', 'ask first?']) {
+    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal(t.engine.permissionMode, 'full', q);
+  }
+  assert.equal((await t.engine.command('thanks, ask first')).reply, FULL_OFF);
+  assert.equal(t.engine.permissionMode, 'ask');
+  // an agent called Stop asking: the words alone reach it, and at the card they are still the card's yes
+  const { id } = await started(t, { task: 'Stop asking' });
+  assert.equal(t.store.get(id).name, 'Stop asking');
+  assert.equal((await t.engine.command('stop asking')).confirm, undefined);
+  assert.equal(t.engine.permissionMode, 'ask');
+  const again = await t.engine.command('turn on full permissions');
+  assert.equal((await t.engine.command('stop asking', { confirmId: again.confirm.id })).reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  await t.engine.shutdown();
+});
+
 test('full permissions: the launch, the spending limit and Codex are as before', async () => {
   const t = live({ prefs: prefsStore({ permissions: 'full' }) });
   t.engine.deps.commands = commands;

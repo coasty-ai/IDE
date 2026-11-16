@@ -1986,4 +1986,43 @@ test('full permissions: words that are exactly the name of an agent on the board
   // with no such agent, the same words are the mode
   assert.deepEqual(parseCommand('Full permissions', CTX.none), { kind: 'permissions', mode: 'full' });
   assert.deepEqual(parseCommand('Ask first', CTX.none), { kind: 'permissions', mode: 'ask' });
+  // past a reaction, a name is still the agent's
+  assert.deepEqual(parseCommand('thanks, stop asking', { agents: [...agents, planted[3]], machines, harnesses, focusId: null }), { kind: 'status', agentId: 'p00004' });
+  // at their card, the card's own words answer it, even when an agent has that name: the card asked exactly that
+  for (const board of boards) {
+    const card = { agents: board, machines, harnesses, focusId: null, pendingConfirm: { id: 'c20', kind: 'permissions' } };
+    for (const [said, go] of [['stop asking', true], ['Full permissions', true], ['allow everything', true], ['Ask first', false]]) {
+      assert.deepEqual(parseCommand(said, card), { kind: 'confirm', go }, `${said} (${board.length})`);
+    }
+  }
+});
+
+test('full permissions: a thanks or a reaction before the words still counts; a question, however it is typed, never does', () => {
+  for (const ctx of [CTX.none, CTX.onboarding]) {
+    for (const s of ['thanks, ask first', 'thank you, stop asking', 'great, stop asking', 'yes, stop asking', 'nah, ask first', 'ok thanks, stop asking',
+      'cool, turn off full permissions', 'thanks! full permissions please', 'oh nice, stop asking now']) {
+      const r = parseCommand(s, ctx);
+      assert.equal(r.kind, 'permissions', `${s} -> ${JSON.stringify(r)}`);
+      assert.equal(r.mode, /ask first|turn off/.test(s) ? 'ask' : 'full', s);
+    }
+    // past the reaction, an opener that changes who acts still makes them something else
+    for (const s of ['great, we should ask first', 'thanks, I need to ask first', 'yes, help me stop asking', "thanks, let's ask first", 'ok, you should stop asking']) {
+      assert.notEqual(parseCommand(s, ctx).kind, 'permissions', s);
+    }
+    // a question mark with a space before it, or after a reaction, still asks
+    for (const s of ['ask first ?', 'full permissions off ?', 'stop asking ?!', 'thanks, ask first?', 'Full permissions ?']) {
+      assert.notEqual(parseCommand(s, ctx).kind, 'permissions', s);
+    }
+  }
+  // a reaction before them at a permission counts as with nothing waiting; while a question waits, they are its answer
+  assert.deepEqual(parseCommand('thanks, ask first', CTX.permission), { kind: 'permissions', mode: 'ask' });
+  assert.equal(parseCommand('thanks, ask first', CTX.question).kind, 'answer');
+  // at their card: a thanks or a yes before their words is their answer; a no before them keeps asking; asked, they settle nothing
+  for (const ctx of [CTX.pendingPermissions, CTX.pendingPermissionsOnPermission]) {
+    for (const s of ['thanks, stop asking', 'thank you, stop asking', 'yes, stop asking', 'great, full permissions', 'sure, allow everything']) {
+      assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: true }, s);
+    }
+    for (const s of ['thanks, ask first', 'nah, ask first', 'no, stop asking', 'wait, stop asking']) assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: false }, s);
+    for (const s of ['stop asking ?', 'full permissions ?', 'turn it on ?', 'thanks, stop asking?']) assert.equal(parseCommand(s, ctx).kind, 'unknown', s);
+  }
 });

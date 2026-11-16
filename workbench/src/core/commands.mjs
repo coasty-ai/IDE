@@ -481,12 +481,16 @@ function confirmReply(toks, kind, c) {
   const isNo = w => (CONFIRM_NO.has(w) && !own.includes(w)) || ownNo.includes(w);
   // The full permissions card: the words that ask for them say yes to it ("stop asking"), and the words that turn them
   // off say no: "ask first", "keep asking", and "turn it off", "switch it off" or "leave it off", which keep them off.
-  // Those words with a question mark ask about the card rather than answer it: it stays. An agent's whole name is no answer.
+  // A thanks or a yes may come before them ("thanks, stop asking"); a no before them is a no ("no, turn it off", "no, stop
+  // asking"). Those words with a question mark ask about the card rather than answer it: it stays. They are the card's own
+  // words, so they answer it even when an agent has that name: the card asked exactly that.
   if (kind === 'permissions') {
-    const bare = stripTrailing(stripPolite(stripSoft(toks), MODE_POLITE));
-    const mode = namesAgent(toks, c) ? null : permissionsMode(bare);
-    const off = /^(?:(?:no|nope|nah) )?(?:keep asking(?: me)?|(?:turn|switch|leave|keep) (?:(?:it|them) )?off)$/.test(bare.map(t => t.w).join(' '));
-    if (mode || off) return endsAsking(toks) ? 'asks' : mode === 'full';
+    const bare = stripTrailing(stripPolite(stripSoft(stripReactions(stripSoft(toks), CONFIRM_NO)), MODE_POLITE));
+    const ws = bare.map(t => t.w);
+    const lead = ws.length > 1 && ['no', 'nope', 'nah'].includes(ws[0]) ? 1 : 0;
+    const mode = permissionsMode(bare.slice(lead));
+    const off = /^(?:keep asking(?: me)?|(?:turn|switch|leave|keep) (?:(?:it|them) )?off)$/.test(ws.slice(lead).join(' '));
+    if (mode || off) return endsWithQuestion(toks) ? 'asks' : mode === 'full' && !lead;
   }
   // Before the fillers go: "so" is one. Throwing work away and full permissions take their own words, so "make it so"
   // keeps those cards.
@@ -552,12 +556,22 @@ const QUESTION_START = new Set(['what', 'why', 'how', 'which', 'who', 'whom', 'w
   'were', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'shall', 'may', 'might', 'must', 'has', 'have']);
 
 /**
+ * Whether the words end with a question mark: the last word's own, or one typed apart after it, at the end of what was said
+ * ("ask first ?", "yes ?"), where the tokens leave it out.
+ */
+function endsWithQuestion(toks) {
+  const t = toks[toks.length - 1];
+  if (!t) return false;
+  return /[?？]["'”’)]*$/.test(t.raw) || /^[\s"'”’)]*[?？][\s?？!！"'”’)]*$/.test(t.src.slice(t.end));
+}
+
+/**
  * Words that ask something rather than answer: they end with "?", or start like a question ("what does it delete",
  * "should I allow it", "do I need to approve this"; "do it" is not one).
  */
 function asksSomething(toks) {
   if (!toks.length) return false;
-  if (/\?["'”’)]*$/.test(toks[toks.length - 1].raw)) return true;
+  if (endsWithQuestion(toks)) return true;
   const ws = stripSoft(toks).map(t => t.w);
   return QUESTION_START.has(ws[0]) || (ws[0] === 'do' && ['i', 'we', 'you', 'they'].includes(ws[1]));
 }
@@ -1767,9 +1781,6 @@ function permissionsMode(core) {
  */
 const MODE_POLITE = [['please'], ['kindly'], ['just'], ['can', 'you'], ['could', 'you'], ['would', 'you'], ['will', 'you']];
 
-/** Whether the words end with a question mark: then they ask, and act on nothing. */
-const endsAsking = toks => toks.length > 0 && /[?？]["'”’)]*$/.test(toks[toks.length - 1].raw);
-
 /**
  * Whether the words are exactly an agent's name, as the person would say it: the name read as their words are (case and
  * punctuation aside), word for word, a plural ending aside ("full permission" for an agent called Full permissions).
@@ -1786,11 +1797,12 @@ function namesAgent(toks, c) {
  * 'full', 'ask' or null: what the person's words, whole, ask of full permissions. Soft openers ("okay", "um"), the polite
  * words of MODE_POLITE ("please", "can you") and trailing ones ("please", "thanks", "now") may go with them. An opener that
  * changes who acts ("I need to ask first", "we should stop asking", "help me stop asking") makes them something else, and
- * so does a question mark at the end ("ask first?"). Words that are exactly the name of an agent on the board ("Ask first",
+ * so does a question mark at the end ("ask first?", "ask first ?"). A reaction before them ("thanks, ask first") is taken away
+ * by the caller, in the pass past a reaction (parse, step 3). Words that are exactly the name of an agent on the board ("Ask first",
  * "Full permissions") are that agent's.
  */
 function modeWords(toks, c) {
-  if (!toks.length || endsAsking(toks) || namesAgent(toks, c)) return null;
+  if (!toks.length || endsWithQuestion(toks) || namesAgent(toks, c)) return null;
   return permissionsMode(stripTrailing(stripPolite(stripSoft(toks), MODE_POLITE)));
 }
 
@@ -1948,14 +1960,19 @@ const REACTION_SEQ = [['hold', 'on'], ['hang', 'on'], ['one', 'sec'], ['one', 's
   ['thanks', 'a', 'lot'], ['good', 'morning'], ['good', 'afternoon'], ['good', 'evening'], ['not', 'good'], ['not', 'great'],
   ['love', 'it'], ['looks', 'good'], ['looks', 'great'], ['sounds', 'good'], ['hey', 'there'], ['hi', 'there'], ['hello', 'there']];
 
-/** Past the reactions at the start ("looks good, merge it" is "merge it"); at least one word is kept. */
-function stripReactions(toks) {
+/**
+ * Past the reactions at the start ("looks good, merge it" is "merge it"); at least one word is kept. A word in `keep` stays,
+ * with what follows it ("no, stop asking" keeps its "no").
+ */
+function stripReactions(toks, keep = null) {
   let k = 0;
+  const kept = w => !!keep && keep.has(w);
   for (let moved = true; moved && k < toks.length - 1;) {
     moved = false;
-    const n = startsWithSeq(toks.slice(k).map(t => t.w), REACTION_SEQ);
-    if (n && k + n < toks.length) { k += n; moved = true; continue; }
-    if (REACTION.has(toks[k].w)) { k++; moved = true; }
+    const ws = toks.slice(k).map(t => t.w);
+    const n = startsWithSeq(ws, REACTION_SEQ);
+    if (n && k + n < toks.length && !ws.slice(0, n).some(kept)) { k += n; moved = true; continue; }
+    if (REACTION.has(toks[k].w) && !kept(toks[k].w)) { k++; moved = true; }
   }
   return toks.slice(k);
 }
@@ -2235,7 +2252,9 @@ function parse(said, c, { free = true } = {}) {
   if (voc) found = voc;
   if (!found) found = matchCommand(core, c, base);
   if (!found && reacted.length < core.length) {
-    const r = matchCommand(reacted, c, base);
+    // full permissions' words past the reaction, as the person said them: "thanks, ask first" counts, "great, we should ask
+    // first" does not (only polite words go with them, never an opener that changes who acts)
+    const r = matchCommand(reacted, c, base, stripReactions(stripSoft(base)));
     if (r && r.intent.kind !== 'unknown' && (!waiting || r.intent.kind === 'stop_all')) found = r;
     // a sure stop past a reaction: of another agent, it is no answer to this one ("ugh, stop onboarding");
     // of the stuck agent itself, it is its own "Stop it" ("yes stop", "wait wait wait stop")
@@ -2381,7 +2400,11 @@ function vocativeRest(core, c) {
   return r;
 }
 
-function matchCommand(core, c, base = core) {
+/**
+ * The commands the words match. `modeBase`: the words full permissions' own are read from, when not all of `base` (past a
+ * reaction: "thanks, ask first").
+ */
+function matchCommand(core, c, base = core, modeBase = base) {
   if (!core.length) return null;
   const ws = core.map(t => t.w);
   if (matchStopAll(ws)) return { intent: { kind: 'stop_all' }, strong: true };
@@ -2390,7 +2413,7 @@ function matchCommand(core, c, base = core) {
   // cleanup change" and "show search cleanup's changes" were status questions, and still are when they name no agent.
   return matchHelp(core, base, c)
     || matchConnect(core)
-    || matchPermissions(base, c)
+    || matchPermissions(modeBase, c)
     || matchMachines(core, c)
     || matchStop(core, c)
     || matchForget(core, c)
