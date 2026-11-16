@@ -258,6 +258,27 @@ try {
         && p.length === 3 && /^c/.test(p[2].body.confirmId || '') && p[2].body.focusId === null,
       JSON.stringify({ words1, stopped, card, kept, words2, sent: p.map(x => x.body) }));
   });
+  // A card's yes or no first answers it, whatever follows, and what follows starts nothing.
+  await run('words that begin with a card\'s yes or no answer it, whatever follows, and start nothing', async () => {
+    await open('demo');
+    await sleep(800);
+    const agents = (await ctl('state')).agents.length;
+    const ask = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); await sleep(900); };
+    await ask('stop the sign-up one');
+    const card1 = await h1();
+    await ask('no, because the tests are red');
+    const no = await saidAll(), after1 = await h1();
+    await ask('stop the sign-up one');
+    const card2 = await h1();
+    await ask('yes, and then tell me what it did');
+    const yes = await saidAll(), after2 = await h1();
+    const st = await ctl('state');
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check('words that begin with a card\'s yes or no answer it, whatever follows, and start nothing',
+      card1 === 'Stop Onboarding?' && no === 'OK, I won’t stop it.' && after1 !== card1 && card2 === card1 && yes === 'Stopped Onboarding.' && after2 !== card2
+        && st.agents.length === agents && p.length === 4 && /^c/.test(p[1].body.confirmId || '') && /^c/.test(p[3].body.confirmId || ''),
+      JSON.stringify({ card1, no, after1, card2, yes, after2, agents: [agents, st.agents.length], sent: p.map(x => x.body) }));
+  });
   await run('words too long to send in one go stay in the box, and nothing is sent', async () => {
     await open('prompt');
     await sleep(700);

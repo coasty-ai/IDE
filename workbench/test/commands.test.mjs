@@ -1698,7 +1698,7 @@ test('never-minds take back, praise praises, and an answer is never turned aroun
     ['nice work on the parser', 'none', task('nice work on the parser')],
     ['good work on the docs', 'none', task('good work on the docs')],
     ['great work on the login fix', 'Wdone', task('great work on the login fix')],
-    ['yes, add tests too', 'pending', task('yes, add tests too')], // the prompt, and the card stays (the engine keeps it)
+    ['yes, add tests too', 'pending', { kind: 'confirm', go: true }], // the card's yes first: it answers the card, and the rest starts nothing
     ['yes, stop it', 'stopQ', answer('yes, stop it')], // the answer to "Should I stop it?", not a stop of the one asking
     ['否', 'optionsQ', answer('否', 'd4e5f6', 'ask-o')], // never the first option because both lose their letters
     ['好的', 'empty', task('好的')], ['谢谢', 'empty', task('谢谢')], ['muchas gracias', 'empty', task('muchas gracias')],
@@ -2643,6 +2643,80 @@ test('a stop word with an agent target first never starts work, whatever follows
     for (const text of texts) {
       const got = parseCommand(text, ctx);
       if (got.kind === 'task' || (got.kind === 'start' && got.tasks?.length)) failures.push(`${JSON.stringify(text)} [${name}] -> ${JSON.stringify(got)}`);
+    }
+  }
+  assert.deepEqual(failures, []);
+});
+
+const yesTo = { kind: 'confirm', go: true };
+const noTo = { kind: 'confirm', go: false };
+
+test('on a card, words that begin with its yes or no word answer it, whatever follows; the rest starts nothing', () => {
+  for (const ctx of ['pending', 'pendingStop', 'pendingMerge', 'pendingSay', 'pendingForget', 'boardCard', 'boardStopCard', 'pendingMergeOnPermission']) {
+    sweptRows([
+      ['yes, and then tell me', ctx, yesTo], ['yes and then tell me', ctx, yesTo], ['yeah, add tests too', ctx, yesTo],
+      ['yes, add tests too', ctx, yesTo], ['sure, thanks a lot', ctx, yesTo], ['ok, and tell me when it is done', ctx, yesTo],
+      ['go ahead and tell me when it is done', ctx, yesTo], ['do it, thanks', ctx, yesTo], ['yep. The tests pass.', ctx, yesTo],
+      ['yes add tests too', ctx, yesTo], // spoken, with no comma: the yes is first, and what follows starts nothing
+      ['sure, no rush', ctx, yesTo], ["yes, don't forget the docs", ctx, yesTo],
+      ['no, because the tests are red', ctx, noTo], ['no because the tests are red', ctx, noTo], ['nope, not yet', ctx, noTo],
+      ['cancel, I changed my mind', ctx, noTo], ["don't, the tests are red", ctx, noTo], ['not now, the tests are red', ctx, noTo],
+      ['no, fix the login page first', ctx, noTo], ['no use the staging database', ctx, noTo],
+      // a yes taken back is a no
+      ['okay, no, do not do it', ctx, noTo], ['yes no wait', ctx, noTo],
+    ]);
+  }
+  // a card's own words, then a break or a word that joins what follows to them
+  sweptRows([
+    ['merge it, thanks', 'pendingMerge', yesTo], ['merge it because the tests pass', 'boardCard', yesTo], ['land it, it is ready', 'pendingMerge', yesTo],
+    ['throw it away, it is broken', 'pendingDiscard', yesTo], ['discard it because the tests fail', 'pendingDiscard', yesTo],
+    ['do it, it is broken', 'pendingDiscard', yesTo], ['keep it, I want to look first', 'pendingDiscard', noTo],
+    ['no, because the tests are red', 'pendingDiscard', noTo],
+    ['stop it, it is looping', 'pendingStop', yesTo], ['stop, it is looping', 'boardStopCard', yesTo], ['stop it because it is looping', 'boardStopCard', yesTo],
+    ['send it, thanks', 'pendingSay', yesTo],
+    ['turn it on, thanks', 'pendingPermissions', yesTo], ['keep asking, I want to see them', 'pendingPermissions', noTo],
+    ['no, because I want to see them', 'pendingPermissions', noTo],
+  ]);
+  // what cards refuse they still refuse: a yes that is not enough for the card, a yes asked, a branch named; and a yes with
+  // a condition, which no card can carry, keeps the card too. None of these starts anything.
+  sweptRows([
+    ['yes, and then tell me', 'pendingDiscard', unknown('yes, and then tell me')], // a bare yes is not enough to throw work away
+    ['sure, thanks a lot', 'pendingPermissions', unknown('sure, thanks a lot')],
+    ['yes, is that right?', 'pendingMerge', unknown('yes, is that right?')],
+    ['yes, and what does it change?', 'pendingMerge', unknown('yes, and what does it change?')],
+    ['merge it into main, thanks', 'pendingMerge', unknown('merge it into main, thanks')],
+    ['yes, but not into main', 'pendingMerge', unknown('yes, but not into main')],
+    ['sure, but only the tests folder', 'boardCard', unknown('sure, but only the tests folder')],
+    ['yes if the tests pass', 'pendingMerge', unknown('yes if the tests pass')],
+    ["don't you want to look first?", 'pendingMerge', unknown("don't you want to look first?")], // a question, not a no
+    ['no, why would I merge that?', 'pendingMerge', noTo], // a clear no, then why
+    ["no, don't do it", 'pendingMerge', noTo], ["no, don't do it", 'pendingDiscard', noTo],
+  ]);
+  // words that do not begin with such a word are as before: a prompt, and the card stays; a card's own word before another
+  // agent's name is a command for that agent (a stop of it, or a card of its own), never this card's answer
+  sweptRows([
+    ['the tests are red, so no', 'pendingMerge', said('the tests are red, so no')],
+    ['add tests too', 'pendingMerge', said('add tests too')],
+    ['stop onboarding', 'pendingStop', stopOf('7a8b9c')],
+    ['stop onboarding, it is looping', 'pendingStop', stopOf('7a8b9c')],
+    ['merge onboarding', 'pendingMerge', merge('7a8b9c')],
+    ['no problem', 'pendingMerge', yesTo], // a yes, said with a "no"
+  ]);
+});
+
+test('on a card, words that begin with its yes or no word never start work, whatever follows them', () => {
+  const heads = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'do it', 'go ahead', 'no', 'nope', 'cancel', "don't", 'not now'];
+  const tails = [', and then tell me', ', because the tests are red', ', thanks', ' and add tests too', ', fix the login page first',
+    '. The build is broken.', ' but not into main', ' add tests too', '\nthe login page is broken'];
+  const failures = [];
+  for (const [name, ctx] of Object.entries(ALL_CONTEXTS())) {
+    if (!ctx.pendingConfirm || ctx.pendingConfirm.gone) continue;
+    for (const head of heads) {
+      for (const tail of tails) {
+        const text = head + tail;
+        const got = parseCommand(text, ctx);
+        if (got.kind === 'task' || (got.kind === 'start' && got.tasks?.length)) failures.push(`${JSON.stringify(text)} [${name}] -> ${JSON.stringify(got)}`);
+      }
     }
   }
   assert.deepEqual(failures, []);

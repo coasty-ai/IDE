@@ -544,7 +544,8 @@ const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'], permi
 /**
  * A reply to the confirm card on screen: true (yes), false (no), 'asks' (a yes asked rather than said, such as
  * "is that right?": it answers nothing, so the card stays), 'keep' (a yes that is not enough for this card, such as
- * a bare "yes" to throwing work away: the card stays), or null (not a reply).
+ * a bare "yes" to throwing work away: the card stays), 'permission' (a permission's own answer, "allow it", or a yes and
+ * a no together: the card stays unless its first words answer it, see parse), or null (not a reply).
  */
 function confirmReply(toks, kind, c) {
   // While "Stop Flaky test?" waits, "stop" and "stop it" mean yes; while "Tell Flaky test …?" waits, "send it" does.
@@ -610,14 +611,109 @@ function confirmReply(toks, kind, c) {
   // its no, and never new work: the card stays, and says how to answer it.
   if (kind === 'discard' && ws.some(w => w === 'scrap' || w === 'trash')
     && ws.every(w => isYes(w) || isNo(w) || w === 'scrap' || w === 'trash' || CONFIRM_YES_FILL.has(w) || CONFIRM_NO_FILL.has(w) || ownFill.includes(w))) return 'keep';
-  // A permission's own answer ("allow it", "approve", "deny that"): not this card's, and never new work either.
+  // A permission's own answer ("allow it", "approve", "deny that"): not this card's, and never new work either. So is a
+  // yes and a no together ("no, don't do it"), which a no first then answers (cardNoFirst, cardFirstReply).
   const pr = permissionReply(words);
-  if (pr && (pr.kind === 'allow' || pr.kind === 'asks' || (pr.kind === 'deny' && !pr.text))) return 'keep';
+  if (pr && (pr.kind === 'allow' || pr.kind === 'asks' || (pr.kind === 'deny' && !pr.text))) return 'permission';
   return null;
 }
 
 /** The yes words of one card kind or another that another card does not take: they keep that card (confirmReply). */
 const CARD_VERBS = new Set(['start', 'launch', 'send']);
+
+// A card's own yes or no first -----------------------------------------------------------------------
+//
+// Every prompt starts a paid agent at once, so a reply to the card on screen must never become one: words that begin
+// with a yes or a no answer the card, whatever follows ("yes, and then tell me", "no, because the tests are red", "do it,
+// thanks"), and what follows starts nothing.
+
+/** Yes words a reply to a card may begin with, whatever follows. Longer ones first. */
+const CARD_FIRST_YES = [['go', 'for', 'it'], ['go', 'ahead'], ['do', 'it'], ['do', 'that'], ['yes'], ['yeah'], ['yep'], ['yup'], ['ya'],
+  ['yah'], ['yea'], ['sure'], ['okay'], ['alright'], ['absolutely'], ['definitely'], ['certainly'], ['affirmative'], ['lgtm']];
+/** No words a reply to a card may begin with, whatever follows. Longer ones first. */
+const CARD_FIRST_NO = [['do', 'not'], ['not', 'now'], ['not', 'yet'], ['no'], ['nope'], ['nah'], ['nay'], ['negative'], ['cancel'], ["don't"]];
+/** Words that join what follows to a card's own words: "merge it because the tests pass", "throw it away and tell me". */
+const CARD_JOIN = new Set(['and', 'because', 'cause', 'cuz', 'since', 'so', 'then', 'thanks', 'thank', 'please', 'but', 'though', 'as']);
+/** A condition after a yes ("yes, but not into main", "yes if the tests pass"): no card can carry it, so the card stays. */
+const CARD_CONDITION = new Set(['but', 'only', 'if', 'unless', 'except', 'provided', 'though', 'although']);
+/** Words that take a yes back when they come right after it: "okay, no, do not do it", "yes no wait". */
+const TAKE_BACK = new Set(['no', 'nope', 'nah', 'wait', 'cancel']);
+/** Words that may stand between a yes and what follows it: "yes, and then …", "yes, so …". */
+const CARD_GLUE = new Set(['and', 'then', 'so', 'also']);
+
+/**
+ * Words that begin with a plain no to the card on screen (CARD_FIRST_NO: "no, because the tests are red", "nope, not yet",
+ * "don't, it is broken", "cancel, I changed my mind"): false, a no whatever follows, before the whole reply is read (so
+ * "no, don't do it" is never read as a mix of a yes and a no). Null for anything else: "no problem" is a yes, and a
+ * question that begins with "don't" or "not" ("don't you want to look first?") asks; a clear "no, why …?" is still a no.
+ */
+function cardNoFirst(toks) {
+  const ws = toks.slice(replyStart(toks)).map(t => t.w);
+  if (!startsWithSeq(ws, CARD_FIRST_NO) || /^(?:no problem|no worries|not a problem)$/.test(ws.join(' '))) return null;
+  if (endsAsking(toks) && !['no', 'nope', 'nah', 'nay', 'cancel'].includes(ws[0])) return null;
+  return false;
+}
+
+/** A card's own words, said first: "merge" for a merge card, "throw" and "keep" for a throw-away card, "start" for a launch. */
+function cardWords(kind) {
+  const of = table => (typeof kind === 'string' && Object.hasOwn(table, kind) ? table[kind] : []);
+  return [...of(CARD_YES), ...of(CARD_NO), ...(kind == null || kind === 'start' ? START_YES : [])];
+}
+
+/**
+ * A reply to the card on screen that begins with the card's yes or no and goes on (parse tries confirmReply on the whole
+ * reply first): the answer for those first words, whatever follows (true, false, 'keep' or 'asks'), or null when the
+ * words begin with no such word.
+ * - A plain no (CARD_FIRST_NO: "no", "nope", "cancel", "don't", "not now") is a no, whatever follows: cardNoFirst reads it,
+ *   before this, so here it is null.
+ * - A plain yes (CARD_FIRST_YES: "yes", "sure", "ok", "do it", "go ahead"), whatever follows: "yes add tests too", said
+ *   with no comma, is a yes too. The first words are the longest the card takes as an answer by themselves, with no
+ *   other card's no in them ("sure, no rush" is "sure"), so what the card refuses it still refuses: a bare yes to a
+ *   throw-away, a branch named on a merge card ('keep'). A yes is a yes unless what follows asks something ("yes, and
+ *   what does it change?": 'asks'), sets a condition no card can carry ("yes, but not into main", "yes if the tests pass":
+ *   'keep'), or takes it back ("okay, no, do not do it", "yes no wait": false).
+ * - The card's own words ("merge it", "throw it away", "stop it", "keep it", "turn it on", cardWords), only when what
+ *   follows is set off from them by a break, a dash or a joining word (CARD_JOIN): "merge it because the tests pass", but
+ *   "stop onboarding" on a stop card stops Onboarding, and "merge onboarding" asks about Onboarding's merge.
+ * Past an opener that is also a yes ("okay", "alright", "go ahead and"), one of Workbench's own commands is that command,
+ * as anywhere: "okay so connect github", "go ahead and stop everything", "okay, merge onboarding".
+ */
+function cardFirstReply(toks, kind, c) {
+  const k = replyStart(toks);
+  const ws = toks.slice(k).map(t => t.w);
+  if (ws.length < 2) return null;
+  if (/^(?:no problem|no worries|not a problem)$/.test(ws.join(' '))) return true;
+  const front = stripPolite(stripSoft(toks));
+  if (front.length && front.length < toks.length) {
+    const cmd = matchCommand(stripTrailing(front), c, front)?.intent;
+    if (cmd && cmd.kind !== 'task' && cmd.kind !== 'unknown' && !(cmd.kind === 'start' && cmd.tasks?.length)) return null;
+  }
+  if (startsWithSeq(ws, CARD_FIRST_NO)) return null; // a no first is cardNoFirst's: a question that begins with "don't" asks
+  const plain = startsWithSeq(ws, CARD_FIRST_YES);
+  const own = cardWords(kind);
+  if (!plain && !own.includes(ws[0])) return null;
+  const otherNo = w => CONFIRM_NO.has(w) && !own.includes(w);
+  for (let n = Math.min(ws.length - 1, 6); n >= Math.max(plain, 1); n--) {
+    const head = toks.slice(k, k + n);
+    if (head.slice(1).some(t => otherNo(t.w))) continue;
+    const r = confirmReply(head, kind, c);
+    if (r === null || r === 'permission') continue;
+    const last = head[n - 1];
+    const rest = toks.slice(k + n);
+    if (!plain && !(last.tail || dashBetween(last, rest[0]) || CARD_JOIN.has(rest[0].w))) continue;
+    if (r !== true) return r;
+    if (asksSomething(rest)) return 'asks';
+    const said = rest.filter(t => !CARD_GLUE.has(t.w)).map(t => t.w);
+    if (said.slice(0, 2).some(w => CARD_CONDITION.has(w)) || rest.slice(0, 2).some(t => CARD_CONDITION.has(t.w))) return 'keep';
+    // "no" takes it back alone, or before another no ("no wait", "no, don't", "no do not"); "no rush" and "no need to" do not
+    const no = rest.find(t => t.w === 'no');
+    const back = said[0] === 'no'
+      ? said.length === 1 || no.tail || TAKE_BACK.has(said[1]) || said[1] === "don't" || (said[1] === 'do' && said[2] === 'not')
+      : TAKE_BACK.has(said[0]);
+    return !back;
+  }
+  return null;
+}
 
 // A clear yes or no at the start of a longer reply. "go", "do", "okay" and "fine" are not here: they also begin
 // commands and work requests ("go to search cleanup", "okay fix the login"), which are tried first.
@@ -2571,8 +2667,11 @@ function parse(said, c, { free = true } = {}) {
   // 1. A confirm on screen is waiting for "yes" or "cancel" (only the one the page shows: see the engine).
   // "is that right?" asks about the card rather than answering it: it settles nothing, and the card stays. So does a
   // yes that is not enough for that card (a bare "yes" to throwing work away): it never falls through to a prompt.
+  // Words that begin with the card's yes or no answer it, whatever follows them (cardFirstReply).
   if (c.pendingConfirm) {
-    const go = confirmReply(replyBase, c.pendingConfirm.kind, c);
+    const kind = c.pendingConfirm.kind;
+    let go = confirmReply(replyBase, kind, c);
+    if (go === null || go === 'permission') go = cardNoFirst(replyBase) ?? cardFirstReply(replyBase, kind, c) ?? (go && 'keep');
     if (go === 'asks' || go === 'keep') return { kind: 'unknown', text: said };
     if (go !== null) return { kind: 'confirm', go };
   }
@@ -2655,8 +2754,8 @@ function parse(said, c, { free = true } = {}) {
   // 4. The answer to the question or stuck ask on screen: the whole reply, as typed.
   if (waiting) return answerIntent(addressedRest(base) || base, holder, ask);
   // A work request with no start verb ("fix the login redirect"): the prompt, or a start for the program or machine it
-  // names. Past a reaction only after a break, and with nothing on screen to answer: "yes, add tests too" on a card is
-  // no new work. With a permission waiting it is work all the same, as it was.
+  // names. Past a reaction only after a break, and with nothing on screen to answer ("yes, add tests too" on a card is the
+  // card's yes, step 1). With a permission waiting it is work all the same, as it was.
   const calm = !card && !permission;
   const work = matchTask(core, c) || (brk && calm ? matchTask(reacted, c) : null);
   if (work) return work.kind === 'task' ? prompt : work;

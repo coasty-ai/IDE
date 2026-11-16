@@ -4653,3 +4653,24 @@ test('a stop with its reason after it stops that agent and starts nothing; with 
   assert.equal(t.claude.runners.length, 3, 'nothing started');
   await t.engine.shutdown();
 });
+
+test('words that begin with a card\'s yes or no answer it, whatever follows, and what follows starts nothing', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id } = await started(t);
+  const readme = await started(t, { task: 'Tidy the readme' });
+  const card = await t.engine.command('stop the readme one');
+  assert.equal((await t.engine.command('no, because the tests are red', { confirmId: card.confirm.id })).reply, 'OK, I won’t stop it.');
+  assert.notEqual(t.store.get(readme.id).state, 'stopped');
+  const again = await t.engine.command('stop the readme one');
+  assert.equal((await t.engine.command('yes, and then tell me what it did', { confirmId: again.confirm.id })).reply, 'Stopped Tidy readme.');
+  assert.equal(t.store.get(readme.id).state, 'stopped');
+  // a yes with a condition no card can carry keeps the card, and starts nothing; its plain yes still answers it
+  const third = await t.engine.command('stop the redirect one');
+  const cond = await t.engine.command('yes, but only after the tests pass', { confirmId: third.confirm.id });
+  assert.deepEqual(cond, { reply: 'Say “do it” to stop it, or “cancel”.', confirm: third.confirm });
+  assert.equal((await t.engine.command('do it, thanks', { confirmId: third.confirm.id })).reply, 'Stopped Fix login redirect.');
+  assert.equal(t.store.get(id).state, 'stopped');
+  assert.equal(t.claude.runners.length, 2, 'nothing started');
+  await t.engine.shutdown();
+});
