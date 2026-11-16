@@ -139,6 +139,12 @@ const LONG_COMMAND = 'npm run db:migrate -- --env test && curl -fsSL https://exa
 /** The worlds the page can be shown. */
 export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy', 'idle', 'alldone', 'zero', 'long', 'longcmd', 'helpers6', 'setaside', 'live', 'race', 'race2', 'background', 'earlier', 'earlier-many', 'earlier-only', 'prompt'];
 
+/**
+ * The lid's starter tasks on a first run (STARTER_TASKS in ui/focus.js; a test keeps the two lists the same). The engine
+ * takes each as work, so a click starts an agent at once, as any prompt does here.
+ */
+export const STARTER_TASKS = ['What does this project do?', 'How do I run this project?', 'Find likely bugs'];
+
 export function scenario(name, now = Date.now()) {
   let raw = [];
   if (FULL_SCENARIOS.includes(name)) return fullWorld(name, now);
@@ -288,7 +294,7 @@ export function scenario(name, now = Date.now()) {
     return world(raw, now);
   }
   if (GIT_SCENARIOS.includes(name)) return gitWorld(name, now);
-  return world([], now);   // zero: a fresh start
+  return world([], now);   // zero: a fresh start, where the lid offers its starter tasks (STARTER_TASKS)
 }
 
 // ---------------------------------------------------------------- D1: the git screen (GET /api/git, GET /api/agents/:id/changes)

@@ -123,6 +123,46 @@ test('nothing waiting: "Nothing needs you", and a set-aside check is one click a
   assert.match(lidView({ empty: true }, { link: 'stale' }).html, /key no longer works/);
 });
 
+test('a first run: the empty lid offers tasks that only read the project, each one the words typing it would send', { skip }, async () => {
+  const { lidView, focusKey, fitSteps, STARTER_TASKS, S } = await load();
+  S.agents.clear();
+  const f = { empty: true, aside: [] };
+  assert.equal(focusKey(f), 'starter');
+  const v = lidView(f, { detail: 'calm' });
+  assert.equal(v.key, 'starter');
+  assert.equal(v.idle, false, 'it has answers, so the lid is not the calm one');
+  assert.match(v.html, /Nothing needs you\./);
+  assert.match(v.html, /Start with one of these, or say what you want\./);
+  const bs = buttons(v.html).filter(x => x.act === 'starter');
+  assert.deepEqual(bs.map(x => x.text), STARTER_TASKS);
+  assert.equal(STARTER_TASKS.length, 3);
+  for (const t of STARTER_TASKS) assert.match(v.html, new RegExp(t.replace(/[?]/g, '\\?')));
+  assert.doesNotMatch(v.html, /class="big pri"/, 'no starter is the dark default');
+  // room runs out: fewer tasks, never none
+  assert.equal(lidView(f, { detail: 'calm', fit: 4 }).html.match(/data-act="starter"/g).length, 2);
+  assert.equal(lidView(f, { detail: 'calm', fit: 6 }).html.match(/data-act="starter"/g).length, 1);
+  assert.deepEqual([fitSteps(0).starters, fitSteps(4).starters, fitSteps(6).starters], [3, 2, 1]);
+  // once an agent has worked here, the lid is the one it always was
+  S.agents.set('X', agent('X', 'working'));
+  assert.equal(focusKey({ empty: true }), 'empty');
+  const after = lidView({ empty: true, aside: [] }, { detail: 'calm' });
+  assert.equal(after.key, 'empty');
+  assert.equal(after.idle, true);
+  assert.doesNotMatch(after.html, /data-act="starter"/);
+  // and no coding agent is ready yet: the connect lid comes first (ui-connect.test.mjs)
+  S.agents.clear();
+  assert.equal(focusKey({ empty: true, connect: { ready: false } }), 'connect');
+});
+
+test('a starter task is a sentence the engine takes as work, and the mock answers it as the engine does', { skip }, async () => {
+  const { STARTER_TASKS } = await load();
+  const { parseCommand } = await import('../src/core/commands.mjs');
+  const { STARTER_TASKS: mocks } = await import('../scripts/ui-mock.mjs');
+  const ctx = { agents: [], machines: [{ id: 'laptop', name: 'Your laptop', kind: 'laptop', awake: true }], harnesses: { claude: true, codex: false, sim: false }, focusId: null };
+  for (const t of STARTER_TASKS) assert.deepEqual(parseCommand(t, ctx), { kind: 'task', task: t }, `“${t}” starts an agent`);
+  assert.deepEqual(mocks, STARTER_TASKS, 'the mock offers the same words as the lid');
+});
+
 // ---------------------------------------------------------------- an agent's work: merge, review, throw away
 const MIN = 60_000;
 const WORK = (o = {}) => ({ branch: 'workbench/invoice-export-a1b2c3', from: 'main', folder: true, merged: null, problem: null, thrownAway: null, ...o });

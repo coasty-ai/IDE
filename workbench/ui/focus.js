@@ -88,13 +88,22 @@ function workLid(a) {
 const WORK_COUNT = { thrown: 'thrown away', problem: 'not merged', merged: 'merged' };
 
 /**
+ * A first run: nothing needs the person, a coding agent is ready, and no agent has worked in this repository yet (none
+ * is running, and none came back from history). The lid then offers these tasks, which only read the project. A click
+ * sends the same words typing them would (app.js), so an agent starts on it at once, as any prompt does: each is a sentence
+ * the engine takes as work (src/core/commands.mjs).
+ */
+export const STARTER_TASKS = ['What does this project do?', 'How do I run this project?', 'Find likely bugs'];
+const starterTasks = f => (f.empty && !f.connect && !S.agents.size ? STARTER_TASKS : []);
+
+/**
  * The lid's key: what it shows (the confirm card, nothing, or an agent in a state with an ask) and, for an agent's work,
  * where that went (merged, a problem, thrown away). A new key swaps the page and arms the click guard; the same key is
  * patched in place. app.js uses this too, so the two never disagree.
  */
 export function focusKey(f) {
   if (f.confirm) return 'confirm:' + f.confirm.id;
-  if (f.empty) return f.connect ? 'connect' : 'empty';
+  if (f.empty) return f.connect ? 'connect' : starterTasks(f).length ? 'starter' : 'empty';
   const a = f.agent, wk = workKey(a);
   return `${a.id}|${a.state}|${a.ask ? a.ask.id : ''}${wk ? '|' + wk : ''}`;
 }
@@ -114,6 +123,7 @@ function metaLine(a, extraHtml, more) {
  *   4    a text over 200 characters is cut, with "Read all of it";
  *   5    secondary links go, the answer buttons tighten and the command sits closer; a permission still shows about 160
  *        characters of its command and the whole of its reason (security over calm);
+ *   4    the first run's starter tasks become two;                 6  one;
  *   6    the last resort: long texts 140, the command 72, the reason 60 (all of both under "See all of it").
  * An agent's work keeps its words at every step: "Review the changes" and the other links about its work, the paths a
  * merge named (3 of them, 2 at the last step), why git cannot merge it (its first sentence at the last step), and what a
@@ -124,6 +134,7 @@ export function fitSteps(fit) {
     hDown: Math.min(3, fit), meta: fit >= 3 ? 0 : fit >= 2 ? 1 : 2, longCut: fit >= 6 ? 140 : fit >= 4 ? 190 : Infinity,
     cmd: fit >= 6 ? 72 : 160, why: fit >= 6 ? 60 : Infinity, extras: fit < 5, tight: fit >= 5, close: fit >= 5,
     paths: fit >= 6 ? 2 : 3, pathMax: fit >= 6 ? 32 : 48, last: fit >= 6,
+    starters: fit >= 6 ? 1 : fit >= 4 ? 2 : 3,
   };
 }
 
@@ -229,6 +240,17 @@ export function lidView(f, o = {}) {
       };
     }
     const count = aside.length ? `${aside.length} set aside` : 'All clear';
+    // A first run: up to three tasks that only read the project, fewer as the lid runs out of room. They are the only
+    // answers here, so none is the dark default: the person reads all three.
+    const starters = starterTasks(f).slice(0, fs.starters);
+    if (starters.length) {
+      const sub2 = 'Start with one of these, or say what you want.';
+      return {
+        key: 'starter', idle: false, count, say: `${count}. Nothing needs you. ${sub2}`, bind: {},
+        html: page(countLine('ok', 'ok', count), h1('Nothing needs you.'),
+          { msg: fs.meta ? metaP(esc(sub2)) : '', acts: starters.map(t => big(t, { act: 'starter', text: t })).join(''), after: asideBtn }),
+      };
+    }
     return {
       key: 'empty', idle: true, count, say: `${count}. Nothing needs you.`, bind: {},
       html: page(countLine('ok', 'ok', count), h1('Nothing needs you.'), { msg: fs.meta ? metaP(esc(sub)) : '', after: asideBtn }),

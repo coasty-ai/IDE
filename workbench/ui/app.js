@@ -493,7 +493,7 @@ function renderCard(quiet = false) {
 
 // ---------------------------------------------------------------- answering what the core shows
 const changed = () => { say('That changed. Have another look.', 5000); render(); };
-const GUARDED = new Set(['answer', 'looksgood', 'fix', 'raise', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick', 'forget', 'merge', 'discard', 'review']);
+const GUARDED = new Set(['answer', 'looksgood', 'fix', 'raise', 'stop', 'reviewed', 'later', 'confirm', 'reply', 'parent', 'pick', 'forget', 'merge', 'discard', 'review', 'starter']);
 const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 /**
  * The engine says where to look next (the asker after a refused answer, a stopped agent, a new one): follow it. An agent
@@ -548,6 +548,9 @@ async function actOn(b, o = {}) {
   if (act === 'pick') { S.focusId = b.dataset.agent; moved(); render(); return; }
   // "Connect a coding agent to start.": Connect opens Agents & keys, and sends nothing
   if (act === 'connect') { showConnect(b); return; }
+  // A starter task on a first run's empty board: the same as typing those words, so an agent starts on it at once,
+  // as any prompt does.
+  if (act === 'starter') { moved(); submit(b.dataset.text || ''); return; }
   if (act === 'confirm') {
     const id = b.dataset.confirm;
     const c = cardShown(id);
