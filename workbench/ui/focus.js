@@ -67,7 +67,8 @@ const branchLabel = b => visibleControls(cutMiddle(b, 16));
 const branchTitle = (words, b) => (Array.from(String(b)).length > 16 ? ` title="${esc(words + visibleControls(b))}"` : '');
 
 /** The count line of an engine card follows what it is about. */
-const CARD_COUNT = { merge: 'Before it merges', discard: 'Before it is thrown away', forget: 'Before it is forgotten', permissions: 'Before agents stop asking' };
+const CARD_COUNT = { merge: 'Before it merges', discard: 'Before it is thrown away', forget: 'Before it is forgotten', permissions: 'Before agents stop asking',
+  setup: 'Before agents start' };
 /** Why an agent at its spending limit stopped, in the engine's words (its reason for Claude Code's error_max_budget_usd). */
 const LIMIT_REASON = 'It reached its spending limit.';
 
@@ -165,6 +166,27 @@ export function lidView(f, o = {}) {
   }
   if (o.link === 'connecting') {
     return { key: 'link:connecting', idle: true, count: '', say: '', bind: {}, html: o.late ? page('', metaP('Connecting…'), {}) : '' };
+  }
+
+  if (f.confirm && f.confirm.kind === 'setup') {
+    // The setup card: the repository's setup command, which each new agent's copy runs before it starts once the person
+    // says Run it. Security over calm, as for a permission: the exact command at every fit step, cut in the middle (its
+    // tail kept) with "See all of it" when it is long, never dropped. Launches wait on it, so Run it is the default.
+    const c = f.confirm;
+    const words = CARD_COUNT.setup;
+    const sentence = visibleControls(c.sentence || ''), detail = c.detail ? visibleControls(c.detail) : '';
+    const full = visibleControls(String(c.command || ''));
+    const cm = clipMiddle(full, fs.cmd);
+    const toggle = cm.clipped ? quiet(open.exact ? 'Show less' : 'See all of it', { act: 'exact' }, ` aria-expanded="${!!open.exact}"`) : '';
+    const code = open.exact && cm.clipped
+      ? `<code class="all" tabindex="0" data-scroll="1" aria-label="The setup command, in full">${esc(full)}</code>`
+      : `<code>${esc(cm.text)}</code>`;
+    const msg = `<div class="exact${fs.close ? ' close' : ''}">${code}${toggle}</div>${detail && fs.meta ? metaP(esc(detail)) : ''}`;
+    return {
+      key: focusKey(f), idle: false, count: words, say: `${words}: ${sentence} It will run: ${full}. ${detail}`.trim(), bind: { confirmId: c.id },
+      html: page(countLine('ask', 'work', words), h1(sentence),
+        { msg, acts: big(c.yes || 'Run it', { act: 'confirm', confirm: c.id, go: '1' }, true) + big(c.no || 'Not now', { act: 'confirm', confirm: c.id, go: '0' }) }),
+    };
   }
 
   if (f.confirm) {
@@ -478,7 +500,9 @@ export function lidView(f, o = {}) {
     default: { // working, starting
       sentence = `${nm} is working.`;
       const now = prose(a.thinking && (!a.now || a.now === 'Thinking') ? 'Thinking' : (a.now || 'Starting'));
-      msg += fs.meta === 2 && more ? metaP(`${esc(clipShown(now, 70))} · ${metaLine(a, '', true)}`) : metaP(esc(clipShown(now, 70)));
+      // a starting agent's line is its start detail (what its copy has, the setup command), said once: whole
+      const room = a.state === 'starting' ? 200 : 70;
+      msg += fs.meta === 2 && more ? metaP(`${esc(clipShown(now, room))} · ${metaLine(a, '', true)}`) : metaP(esc(clipShown(now, room)));
       acts = big('Tell it something', { act: 'reply', ...st, mode: 'say' }, true) + big('Stop it', { act: 'stop', ...st });
       if (more && fs.extras && !a.parentId && a.usage) { const sw = spentWords(a.usage, money, a.harness); after = metaP(esc(/^not reported/.test(sw) ? `cost ${sw}` : `${sw} so far${a.budgetUsd != null ? ` of ${money(a.budgetUsd)}` : ''}`)); }
     }

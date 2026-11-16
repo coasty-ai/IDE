@@ -12,9 +12,12 @@ export const S = {
   meta: { mode: null, repo: null, harnesses: {}, defaultBudgetUsd: null, spendTodayUsd: null, permissions: 'ask' },
   loaded: false,         // a snapshot has arrived
   focusId: null,         // set when the person picks an agent or steps the queue; null = follow the queue
-  // an engine card on screen: { id, sentence, detail, kind: 'start'|'stop'|'say'|'forget'|'merge'|'discard'|'permissions',
-  // yes?, no?, danger?, agents? }, plus agentId (the page's own note) when a lid button for that agent asked for it
+  // an engine card on screen: { id, sentence, detail, kind: 'start'|'stop'|'say'|'forget'|'merge'|'discard'|'permissions'|'setup',
+  // yes?, no?, danger?, agents?, command? }, plus agentId (the page's own note) when a lid button for that agent asked for it
   confirm: null,
+  // the setup card the engine waits on (the snapshot's `setup`: { id, kind: 'setup', sentence, command, detail, yes, no }):
+  // launches wait for its answer, so it stays in the core, after a card on screen, until it is answered
+  setup: null,
   hoverId: null,         // chip or helper under the pointer or keyboard
   pinId: null,           // card pinned by a click
   reply: null,           // { agentId, mode: 'answer'|'say', askId }
@@ -75,12 +78,13 @@ export function helpersOf(root) {
 export const helpersAtWork = a => Q.helpersAtWork(childrenOf(a.id), ACTIVE);
 
 /**
- * What the core shows, in this order: a launch question on screen; the agent the person picked or stepped to (with its
- * place in a queue, when it is in one); the most urgent thing that needs the person; finished work not yet looked at;
- * otherwise nothing.
+ * What the core shows, in this order: a launch question on screen; the setup card launches wait on; the agent the person
+ * picked or stepped to (with its place in a queue, when it is in one); the most urgent thing that needs the person;
+ * finished work not yet looked at; otherwise nothing.
  */
 export function currentFocus() {
   if (S.confirm) return { confirm: S.confirm };
+  if (S.setup) return { confirm: S.setup };
   const q = needsQueue();
   if (S.focusId && S.agents.has(S.focusId)) {
     const a = S.agents.get(S.focusId);

@@ -3,7 +3,8 @@
 // landing on an answer, failed answers that can be retried, "Look later", stepping with "next", typed words bound to the
 // ask on screen, launch questions answered by id and withdrawn when dropped, the look and detail words, the stale key,
 // rest (no motion while waiting), reduced motion, space to talk, the keyboard rules, merging, the spending limit, the git
-// screen, Agents & keys, and Full permissions (the band's button, its card, the launch card's words, the typed words).
+// screen, Agents & keys, Full permissions (the band's button, its card, the launch card's words, the typed words), and the
+// setup card a launch waits on (Run it, Not now, typed words, a page opened meanwhile).
 // Prints PASS or FAIL per point, then every request the page sent, with its body (a key's values shown as "••••").
 // Not part of npm test (it needs Chrome). No dependencies.
 //   node scripts/ui-behaviour-check.mjs [--only name] [--log]
@@ -2086,6 +2087,70 @@ try {
       out.push(`${theme}: ${here} (${Math.round(p.right)}→${Math.round(c.left)}, ${JSON.stringify(colours)})`);
     }
     check(FP + 'the button sits in the top band just left of Agents & keys, lit amber in every look', ok, out.join('; '));
+  });
+
+  // ---------------------------------------------------------------- agents' copies: the setup card a launch waits on
+  const SC = 'setup card: ';
+  const SETUP_LID = 'Before agents start / Run this setup command in each agent’s copy before it starts?';
+  const confirmPosts = async () => (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
+  const codeNow = () => b.ev(`${page()}?.querySelector('.exact code')?.textContent || ''`);
+  const cardIdOf = go => b.ev(`${page()}?.querySelector('[data-act="confirm"][data-go="${go}"]')?.dataset.confirm || ''`);
+  const launch = async task => {
+    await typeIn(`start an agent to ${task}`);
+    await sleep(1100);
+    const lid = await lidNow();
+    await clickIn('[data-act="confirm"][data-go="1"]');
+    await sleep(1500);
+    return lid;
+  };
+
+  await run(SC + 'Do it on a launch, then the setup card comes in the middle by itself, and Run it runs it in that agent’s copy', async () => {
+    await open('setup');
+    await sleep(900);
+    const asked = await launch('fix the login redirect');
+    const card = await lidNow(), row = await acts(), code = await codeNow(), id = await cardIdOf(1);
+    await clickIn('[data-act="confirm"][data-go="1"]');
+    await sleep(1300);
+    const after = await lidNow(), words = await said(), p = await confirmPosts();
+    const a = (await ctl('state')).agents.find(x => x.name === 'Fix the login redirect');
+    check(SC + 'Do it on a launch, then the setup card comes in the middle by itself, and Run it runs it in that agent’s copy',
+      asked === 'You said / Start a simulated Claude on “fix the login redirect”?' && card === SETUP_LID && row === 'Run it*,Not now' && code === 'npm ci'
+      && /^s/.test(id) && p.length === 2 && p[1].path === `/api/confirm/${id}` && p[1].body.go === true
+      && words.includes('OK. Each agent’s copy runs it before the agent starts.') && after !== SETUP_LID && !!a && /The setup command ran in it\.$/.test(a.now),
+      `"${asked}" → "${card}" [${row}] "${code}" ${id}; then "${after}" said "${words}"; ${JSON.stringify(p.map(x => [x.path, x.body]))}; now "${a?.now}"`);
+  });
+
+  await run(SC + 'Not now starts the agent without the command, and the next launch asks again', async () => {
+    await open('setup');
+    await sleep(900);
+    await launch('fix the cart total');
+    const first = await cardIdOf(0);
+    await clickIn('[data-act="confirm"][data-go="0"]');
+    await sleep(1200);
+    const words = await said();
+    const a = (await ctl('state')).agents.find(x => x.name === 'Fix the cart total');
+    await launch('fix the tax rounding');
+    const again = await lidNow(), second = await cardIdOf(1);
+    const p = (await confirmPosts()).map(x => [x.path.replace(/^\/api\/confirm\//, ''), x.body.go]).filter(x => x[0].startsWith('s'));
+    check(SC + 'Not now starts the agent without the command, and the next launch asks again',
+      /^s/.test(first) && words.includes('OK. The agent starts without it, and Workbench asks again next time.') && !!a && /It starts without the setup command\.$/.test(a.now)
+      && again === SETUP_LID && /^s/.test(second) && second !== first && JSON.stringify(p) === JSON.stringify([[first, false]]),
+      `${first} said "${words}"; now "${a?.now}"; again "${again}" ${second}; ${JSON.stringify(p)}`);
+  });
+
+  await run(SC + 'a page opened while launches wait shows the card, its whole command, and "run it" typed answers it', async () => {
+    await open('setup-card');
+    await sleep(1000);
+    const card = await lidNow(), code = await codeNow();
+    await typeIn('run it');
+    await sleep(1100);
+    const after = await lidNow(), words = await said();
+    const p = (await posts()).filter(x => x.path === '/api/command');
+    check(SC + 'a page opened while launches wait shows the card, its whole command, and "run it" typed answers it',
+      card === SETUP_LID && /^npm ci && .* node scripts\/seed-test-db\.mjs --quiet --reset$/.test(code)
+      && p.length === 1 && p[0].body.text === 'run it' && p[0].body.confirmId === 's00a001'
+      && words.includes('OK. Each agent’s copy runs it before the agent starts.') && after !== SETUP_LID,
+      `"${card}" "${code}"; then "${after}" said "${words}"; ${JSON.stringify(p.map(x => x.body))}`);
   });
 
   if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);

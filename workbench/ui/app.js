@@ -538,8 +538,8 @@ async function actOn(b, o = {}) {
   if (act === 'connect') { showConnect(b); return; }
   if (act === 'confirm') {
     const id = b.dataset.confirm;
-    const c = S.confirm;
-    if (!c || c.id !== id) { changed(); return; }
+    const c = cardShown(id);
+    if (!c) { changed(); return; }
     const go = b.dataset.go === '1';
     busy(b);
     // the outcome of a merge or a throw-away shows on that agent: the engine's reply names it (focusId), or the page
@@ -548,6 +548,8 @@ async function actOn(b, o = {}) {
     try {
       const r = await api.confirm(id, go);
       if (S.confirm && S.confirm.id === id) S.confirm = null;
+      // the setup card goes at once (the stream's snapshot says so too)
+      if (S.setup && S.setup.id === id) S.setup = null;
       // the yes to full permissions: the band's button lights at once (the stream's snapshot says so too)
       if (r) modeIs(r.permissions);
       say(r.reply || '', lasting(r));
@@ -786,12 +788,12 @@ async function submit(text) {
       if (S.focusId === r.agentId) S.focusId = null;
       if (res.openConnect === true) showConnect(null, res.reply);
     } else {
-      const shown = S.confirm && b.confirmId === S.confirm.id ? S.confirm : null;
+      const shown = cardShown(b.confirmId);
       const res = await api.command(text, { focusId: shown ? null : (b.agentId || null), confirmId: shown ? shown.id : (b.confirmId || null), askId: shown ? null : (b.askId || null) });
       // the card shown, back again (words not understood, or a look at the work it is about): it stays, still bound to
-      // the agent it was drawn for
-      if (res.confirm) S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
-      else if (shown && S.confirm === shown) S.confirm = null;
+      // the agent it was drawn for. The setup card stays where it is (S.setup, from the stream) until it is answered.
+      if (res.confirm && res.confirm.kind !== 'setup') S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
+      else if (!res.confirm && shown && S.confirm === shown) S.confirm = null;
       lookAt(res.focusId);
       // the reply to the person's own words: a new launch question, or the agent it names, shows at once
       if (res.confirm || res.focusId || shown) moved();
@@ -833,6 +835,21 @@ const voice = setupVoice({
     render();
   },
 });
+
+/** The card with this id the core may show: the card on screen, or the setup card launches wait on; else null. */
+function cardShown(id) {
+  return [S.confirm, S.setup].find(c => c && typeof id === 'string' && c.id === id) || null;
+}
+
+/**
+ * The setup card a snapshot carries (launches wait on it), with only the fields the core draws; null when there is none.
+ * It is not dropped like a launch question (Esc, picking a chip): it stays until it is answered.
+ */
+function setupCardOf(c) {
+  if (!c || typeof c !== 'object' || c.kind !== 'setup' || typeof c.id !== 'string' || !ID_RE.test(c.id) || typeof c.sentence !== 'string' || typeof c.command !== 'string') return null;
+  return { id: c.id, kind: 'setup', sentence: c.sentence, command: c.command, detail: typeof c.detail === 'string' ? c.detail : null,
+    yes: typeof c.yes === 'string' && c.yes ? c.yes : 'Run it', no: typeof c.no === 'string' && c.no ? c.no : 'Not now' };
+}
 
 // A launch question the page drops on its own (Esc, or picking a chip) is withdrawn, so a later "yes" cannot start it.
 function dropConfirm() {
@@ -1095,6 +1112,8 @@ function onSnapshot(snap) {
   S.meta = { mode: snap.mode, repo: snap.repo, harnesses: snap.harnesses || {}, defaultBudgetUsd: snap.defaultBudgetUsd, spendTodayUsd: snap.spendTodayUsd, connect: connectMeta(snap),
     permissions: was };
   modeIs(snapMode(snap, was));
+  // the setup card launches wait on, here or answered in another tab
+  S.setup = setupCardOf(snap.setup);
   const fresh = new Map((snap.agents || []).map(a => [a.id, a]));
   for (const id of [...S.agents.keys()]) if (!fresh.has(id)) S.agents.delete(id);
   upsert(snap.agents || []);

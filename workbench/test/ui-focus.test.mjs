@@ -631,6 +631,74 @@ test('everything an agent controls reaches the lid with its hidden characters sh
   assert.match(changed.html, /<li>src\/payments\/refund⟦U\+202E⟧cod\.exe <span>\+2 −1<\/span><\/li>/);
 });
 
+// ---------------------------------------------------------------- the setup card (agents' copies)
+const SETUP = { id: 'c7', kind: 'setup', sentence: 'Run this setup command in each agent’s copy before it starts?', command: 'npm ci',
+  detail: 'It comes from workbench.json, and runs before each new agent starts. Workbench asks again if it changes.', yes: 'Run it', no: 'Not now' };
+
+test('the setup card: the question, the exact command at every fit step, and Run it and Not now bound to the card', { skip }, async () => {
+  const { lidView } = await load();
+  const v = lidView({ confirm: SETUP }, {});
+  assert.equal(v.count, 'Before agents start');
+  assert.equal(v.key, 'confirm:c7');
+  assert.deepEqual(v.bind, { confirmId: 'c7' });
+  assert.match(v.html, /<h1[^>]*>Run this setup command in each agent’s copy before it starts\?<\/h1>/);
+  assert.ok(v.html.includes('<div class="exact"><code>npm ci</code></div>'), v.html);
+  assert.ok(v.html.includes(`<p class="meta">${SETUP.detail}</p>`));
+  assert.deepEqual(allButtons(v.html).map(b => [b.label, b.cls, b.act, b.confirm, b.go]),
+    [['Run it', 'big pri', 'confirm', 'c7', '1'], ['Not now', 'big', 'confirm', 'c7', '0']]);
+  assert.equal(v.say, `Before agents start: ${SETUP.sentence} It will run: npm ci. ${SETUP.detail}`);
+  // the command is never cut without the way to see all of it: what the person says yes to is what runs
+  const long = { ...SETUP, command: `npm ci && npm run build -- --workspace=apps/web && ${'cp .env.example .env.local && '.repeat(6)}npx prisma generate` };
+  for (let fit = 0; fit <= 6; fit++) {
+    const w = lidView({ confirm: long }, { fit });
+    const shown = ((w.html.match(/<code>([^<]*)<\/code>/) || [])[1] || '').replaceAll('&amp;', '&');
+    if (shown === long.command) continue;
+    assert.ok(shown.includes('…'), `fit ${fit}: cut in the middle`);
+    assert.ok(shown.endsWith('npx prisma generate'), `fit ${fit}: its tail stays`);
+    assert.equal(labelled(w.html, 'See all of it')?.act, 'exact', `fit ${fit}`);
+    const all = lidView({ confirm: long }, { fit, open: { exact: true } });
+    assert.ok(all.html.includes(`${long.command.replaceAll('&', '&amp;')}</code>`), `fit ${fit}: all of it, opened`);
+  }
+  // what could hide or turn text in it shows as a mark
+  const odd = lidView({ confirm: { ...SETUP, command: `npm ci${String.fromCharCode(0x202e)} && rm -rf ~` } }, {});
+  assert.match(odd.html, /npm ci⟦U\+202E⟧ &amp;&amp; rm -rf ~/);
+});
+
+test('the setup card waits in the core: after a card the person asked for, before what they pick and before what needs them', { skip }, async () => {
+  const { currentFocus, S } = await load();
+  const was = { confirm: S.confirm, setup: S.setup, focusId: S.focusId };
+  try {
+    S.agents.clear();
+    S.agents.set('A1', agent('A1', 'needs_ok', { ask: { id: 'k1', type: 'permission', sentence: 'Checkout fix wants to run a command', detail: 'npm test', createdAt: NOW } }));
+    S.agents.set('A2', agent('A2', 'working', { name: 'Search cleanup' }));
+    S.confirm = null; S.focusId = null; S.setup = SETUP;
+    assert.equal(currentFocus().confirm, SETUP);
+    S.focusId = 'A2';
+    assert.equal(currentFocus().confirm, SETUP, 'agents wait on it: it stays until it is answered');
+    const launch = { id: 'c8', kind: 'start', sentence: 'Start Claude Code on “fix it”?', detail: null };
+    S.confirm = launch;
+    assert.equal(currentFocus().confirm, launch, 'a card on screen first');
+    S.confirm = null; S.setup = null;
+    assert.equal(currentFocus().agent.id, 'A2');
+  } finally {
+    Object.assign(S, was);
+  }
+});
+
+test('a starting agent’s start detail shows whole on its card and in the core: what its copy has, and what came of the setup command', { skip }, async () => {
+  const { lidView, S } = await load();
+  const { cardHtml } = await import('../ui/card.js');
+  const detail = 'Its copy has your .env, apps/web/.env.local and node_modules. The setup command failed (exit 1), so its copy may not run yet.';
+  const a = agent('S1', 'starting', { now: detail, name: 'Login fix' });
+  S.agents.clear(); S.agents.set('S1', a);
+  for (const d of ['calm', 'more']) assert.ok(cardHtml(a, { detail: d, now: NOW, one: false }).includes(`<span class="now">${detail}</span>`), d);
+  assert.ok(lidView({ agent: a, picked: true }, {}).html.includes(detail), 'picked, in the core too');
+  // a working agent's line stays short, as before
+  const w = agent('W2', 'working', { now: detail });
+  S.agents.set('W2', w);
+  assert.ok(!cardHtml(w, { detail: 'calm', now: NOW, one: false }).includes(`<span class="now">${detail}</span>`));
+});
+
 // ---------------------------------------------------------------- full permissions
 test('the full permissions card: its own count line and words, no answer drawn as the default, and its warning at every fit step but the last', { skip }, async () => {
   const { lidView } = await load();

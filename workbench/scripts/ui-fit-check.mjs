@@ -5,7 +5,8 @@
 // elsewhere ([data-clip-ok]). Agents & keys is an overlay and a text layer of its own: its button sits in the top band in
 // the 'connect-*' scenarios, and its panel (#connect), which opens by itself in 'connect-none', is checked at every size,
 // detail level and look there. The Full permissions button sits in the top band on every live page, lit in the 'full'
-// scenarios ('full-live' has both buttons, the widest the band gets), and its card is the 'perm-card' view.
+// scenarios ('full-live' has both buttons, the widest the band gets), and its card is the 'perm-card' view. The setup card
+// a launch waits on, with a long command, and the card of an agent whose start detail is long, are the 'setup-card' view.
 // Not part of npm test (it needs Chrome). No dependencies.
 //
 //   node scripts/ui-fit-check.mjs [--size 1280x680] [--scenario demo] [--theme ivory] [--detail more] [--view card] [--quick] [--verbose]
@@ -25,7 +26,9 @@ const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 't
   // a crowded board with a long done tray: the edge connector's sections keep clear of the DRAM's wire
   'wire',
   // full permissions: the card the band's button brings, and a launch card's added sentence while they are on
-  'perm-card', 'perm-launch'];
+  'perm-card', 'perm-launch',
+  // agents' copies: the setup card launches wait on (a long command), and a starting agent's long start detail on its card
+  'setup-card'];
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
 const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
@@ -528,6 +531,19 @@ try {
         if (!/Start 8 agents/.test(all)) failures.push(`${tag}: the launch question did not show`);
         else if (Number(fit) < 3 && !/so they will not ask before any step/.test(all)) failures.push(`${tag}: the launch card did not say that they will not ask`);
         await check(tag);
+      } else if (v === 'setup-card') {
+        // the setup card launches wait on, from the snapshot: its question, its whole command (or its tail with "See all
+        // of it"), Run it and Not now; then, pinned, the card of an agent whose start detail is long
+        await load('setup-card');
+        const h1 = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
+        const code = await b.ev(`document.querySelector('#pages .page:not(.old) .exact code')?.textContent || ''`);
+        if (h1 !== 'Run this setup command in each agent’s copy before it starts?') failures.push(`${tag}: the setup card did not show (${h1.slice(0, 40)})`);
+        else if (!/--quiet --reset$/.test(code)) failures.push(`${tag}: the end of the setup command is not shown (${code.slice(-40)})`);
+        await check(tag);
+        await load('setup-card', '&pin=s7e8f9');
+        const detail = await b.ev(`document.querySelector('#card .now')?.textContent || ''`);
+        if (!/The setup command failed \(exit 1\), so its copy may not run yet\.$/.test(detail)) failures.push(`${tag}: the start detail is not whole on its card (${detail.slice(-40)})`);
+        await check(tag + ' (a start detail)');
       } else if (v === 'stale') {
         await ctl('scenario', { name: 'demo' }); await size(s); await b.goto(`${base}/?t=bad&still=1`, 1300); await setLook(t, d); await settle(100);
         const l = await check(tag);

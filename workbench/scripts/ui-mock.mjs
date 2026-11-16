@@ -32,6 +32,8 @@
 // turns on, counting what it allowed; 'ask' at once, withdrawing every such card; a card from before the last change of
 // mode is refused, "That changed. Have another look."), the snapshot's `permissions`, the page sent with data-permissions
 // on <html>, and the words for them in POST /api/command. See the 'full' scenarios.
+// Agents' copies: the setup card a launch waits on (the snapshot's `setup`, sent to every page), answered through
+// POST /api/confirm/:id or the words "run it" and "not now", as the engine does. See the 'setup' scenarios.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -132,6 +134,7 @@ export const SCENARIOS = ['demo', 'helper', 'longq', 'many', 'many-asks', 'busy'
 export function scenario(name, now = Date.now()) {
   let raw = [];
   if (FULL_SCENARIOS.includes(name)) return fullWorld(name, now);
+  if (SETUP_SCENARIOS.includes(name)) return setupWorld(name, now);
   if (MERGE_SCENARIOS.includes(name)) return mergeWorld(name, now);
   if (name === 'limit') return limitWorld(now);
   if (TRAY_SCENARIOS.includes(name)) return trayWorld(name, now);
@@ -846,6 +849,35 @@ function fullWorld(name, now) {
   st.permissions = 'full';
   return st;
 }
+// ---------------------------------------------------------------- agents' copies: the setup card
+//   setup       a live repository whose workbench.json holds a setup command (npm ci) nobody has said Run it to yet: a
+//               launch the person confirms puts its agent on the board copying its files, and the setup card opens in
+//               the core; Run it runs it in each copy waiting (and later launches run it without asking), Not now
+//               starts them without it and asks again next time
+//   setup-card  the card already open, for a long command, with two agents waiting on it and one whose start detail
+//               says the setup command failed: the fit check's view
+const SETUP_SCENARIOS = ['setup', 'setup-card'];
+SCENARIOS.push(...SETUP_SCENARIOS);
+const SETUP_SENTENCE = 'Run this setup command in each agent’s copy before it starts?';
+const SETUP_DETAIL = 'It comes from workbench.json, and runs before each new agent starts. Workbench asks again if it changes.';
+const COPYING = 'Copying .env, apps/web/.env.local and node_modules into its copy';
+const COPIED = 'Its copy has your .env, apps/web/.env.local and node_modules.';
+function setupWorld(name, now) {
+  const st = mergeWorld('merge', now);
+  st.setupCommand = 'npm ci';
+  st.setupWaiting = [];
+  if (name === 'setup-card') {
+    st.setupCommand = 'npm ci && npm run build --workspace=apps/web && npx prisma generate && cp .env.example .env.local && node scripts/seed-test-db.mjs --quiet --reset';
+    const mk = (id, nm, task, o = {}) => view({ id, name: nm, task, state: 'starting', now: COPYING, ageMin: 0.3, sinceMin: 0.3, toolCalls: 0, work: workOf({ id, name: nm }), ...o }, now);
+    st.agents.push(mk('s1a2b3', 'Login redirect', 'Fix the login redirect loop'), mk('s4c5d6', 'Cart rounding', 'Fix the cart total rounding'),
+      mk('s7e8f9', 'Search speed', 'Make the search page faster', { now: `${COPIED} The setup command failed (exit 1), so its copy may not run yet.` }));
+    countHelpers(st.agents);
+    st.setupWaiting = ['s1a2b3', 's4c5d6'];
+    st.setup = { id: 's00a001', kind: 'setup', sentence: SETUP_SENTENCE, command: st.setupCommand, detail: SETUP_DETAIL, yes: 'Run it', no: 'Not now' };
+  }
+  return st;
+}
+
 /** A world as a scenario gives it, with full permissions off unless the scenario turns them on. */
 function worldOf(name) {
   const st = scenario(name);
@@ -874,9 +906,38 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
   const started = c => {
     const id = 'n' + (++startSeq);
     const task = /“(.+?)”/.exec(c?.sentence || '')?.[1] || 'the new task';
-    const a = view({ id, name: task.replace(/^./, x => x.toUpperCase()).split(' ').slice(0, 4).join(' '), task, state: 'working', now: 'Starting', ageMin: 0, sinceMin: 0, toolCalls: 0 }, Date.now());
-    setTimeout(() => { state.agents.push(a); countHelpers(state.agents); send('agents', [a]); }, 350);
-    return { reply: 'Started it. It will show on the board in a moment.', agentIds: [id], focusId: id };
+    const copies = !!state.setupCommand;
+    const a = view({ id, name: task.replace(/^./, x => x.toUpperCase()).split(' ').slice(0, 4).join(' '), task, state: copies ? 'starting' : 'working', now: copies ? COPYING : 'Starting', ageMin: 0, sinceMin: 0, toolCalls: 0 }, Date.now());
+    setTimeout(() => { state.agents.push(a); countHelpers(state.agents); send('agents', [a]); if (copies) setupFor(a); }, 350);
+    return { reply: copies ? `Started ${a.name}.` : 'Started it. It will show on the board in a moment.', agentIds: [id], focusId: id };
+  };
+  // Agents' copies, as the engine does them: the first launch to need the setup command opens the card (every page gets a
+  // snapshot with it), and every launch meanwhile waits on it; once said yes to, a launch runs it without asking.
+  let setupSeq = 0;
+  const runSetupIn = list => {
+    for (const a of list) a.now = 'Running the setup command in its copy';
+    send('agents', list);
+    setTimeout(() => { for (const a of list) a.now = `${COPIED} The setup command ran in it.`; send('agents', list); }, 500);
+  };
+  const setupFor = a => {
+    if (state.setupOk === state.setupCommand) { runSetupIn([a]); return; }
+    state.setupWaiting.push(a.id);
+    if (state.setup) return;
+    state.setup = { id: 's' + (++setupSeq).toString(16).padStart(6, '0'), kind: 'setup', sentence: SETUP_SENTENCE, command: state.setupCommand, detail: SETUP_DETAIL, yes: 'Run it', no: 'Not now' };
+    send('snapshot', state);
+  };
+  /** Run it (go) or Not now, for every launch waiting on the card; every page gets a snapshot without it. */
+  const answerSetup = go => {
+    const waiting = state.agents.filter(a => state.setupWaiting.includes(a.id));
+    state.setupWaiting = [];
+    state.setup = null;
+    if (go) state.setupOk = state.setupCommand;
+    setTimeout(() => {
+      send('snapshot', state);
+      if (go) runSetupIn(waiting);
+      else { for (const a of waiting) a.now = `${COPIED} It starts without the setup command.`; send('agents', waiting); }
+    }, 60);
+    return { reply: go ? 'OK. Each agent’s copy runs it before the agent starts.' : `OK. The ${waiting.length > 1 ? 'agents start' : 'agent starts'} without it, and Workbench asks again next time.` };
   };
   const changed = list => send('agents', list);
 
@@ -1405,6 +1466,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         return reply(out);
       }
       const cm = /^\/api\/confirm\/([^/]+)$/.exec(p);
+      if (cm && state.setup && decodeURIComponent(cm[1]) === state.setup.id) return reply(answerSetup(!!json && json.go === true));
       if (cm) {
         const c = confirms.get(decodeURIComponent(cm[1]));
         if (!c) return reply({ reply: 'That request is no longer waiting. Ask again if you still want it.' });
@@ -1413,6 +1475,12 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       }
       if (p === '/api/command') {
         const text = String(json?.text || '').trim();
+        // the setup card on screen: its own words (src/core/commands.mjs), and a near miss keeps it; other words leave it
+        if (state.setup && json?.confirmId === state.setup.id) {
+          if (/^(run it|yes|ok|okay|do it|go ahead|sure)$/i.test(text)) return reply(answerSetup(true));
+          if (/^(not now|no|cancel|skip it|never mind)$/i.test(text)) return reply(answerSetup(false));
+          if (!/^(what|status|stop|merge|throw|start)\b/i.test(text)) return reply({ reply: 'I did not catch that. Say “run it” or “not now”.', confirm: { ...state.setup } });
+        }
         const shown = json?.confirmId ? confirms.get(json.confirmId) : null;
         if (shown && shown.kind === 'permissions') {
           // its own words (src/core/commands.mjs): "turn it on", "do it" or the words that ask for them; "keep asking",

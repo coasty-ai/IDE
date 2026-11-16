@@ -48,7 +48,8 @@ function nowLine(a, now) {
     const what = a.thinking && (!a.now || a.now === 'Thinking') ? 'Thinking' : (a.now || 'Working');
     // whole minutes only: the card does not tick every second
     const quietFor = now - (a.lastEventAt || a.stateSince);
-    return `<span class="now">${vis(clip(what, 70))}</span>${quietFor >= 60000 ? ` <em>· quiet for ${esc(duration(quietFor))}</em>` : ''}`;
+    // a starting agent's line is its start detail (what its copy has, the setup command): said once, so said whole
+    return `<span class="now">${vis(clip(what, a.state === 'starting' ? 200 : 70))}</span>${quietFor >= 60000 ? ` <em>· quiet for ${esc(duration(quietFor))}</em>` : ''}`;
   }
   if (a.state === 'waiting_helpers') {
     // what it waits for, in the engine's words ("Waiting for a background command"), never a count of helper views
