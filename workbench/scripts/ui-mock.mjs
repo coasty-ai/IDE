@@ -1949,8 +1949,10 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
         const finished = !shown && json?.focusId ? state.agents.find(x => x.id === json.focusId && !x.parentId && ['done_checked', 'done_claimed', 'checks_failed'].includes(x.state)) : null;
         if (finished && (LOOKS_GOOD_RE.test(text) || NOT_NOW_RE.test(text))) {
           const notNow = NOT_NOW_RE.test(text), w = finished.work || null, into = state.repo?.branch || 'main';
-          const mergeable = state.mode === 'live' && w?.branch && w.folder && !w.thrownAway && !w.merged;
-          const choices = w?.thrownAway ? null
+          const again = finished.state === 'done_claimed' && finished.checks?.state === 'running';   // checked again: no Merge
+          const mergeable = state.mode === 'live' && w?.branch && w.folder && !w.thrownAway && !w.merged && !again;
+          const choices = finished.earlier ? (notNow ? null : finished.canContinue ? 'Choose “Continue” or “Forget”.' : 'Choose “Forget”.')
+            : w?.thrownAway ? null
             : w?.problem ? (w.problem.why === 'conflict' ? `Choose “Ask it to bring in ${w.problem.into || into}” or “Look later”.` : 'Choose “Try again” or “Not now”.')
               : finished.state === 'checks_failed' ? 'Choose “Ask it to fix that” or “Look later”.'
                 : !notNow && mergeable ? `Choose “Merge into ${into}” or “Not now”.` : null;

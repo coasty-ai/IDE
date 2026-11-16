@@ -2407,6 +2407,26 @@ try {
       `${first} said "${words}"; now "${a?.now}"; again "${again}" ${second}; ${JSON.stringify(p)}`);
   });
 
+  await run(SC + 'a prompt typed on the git screen starts its agent there; the band lights "Before agents start", which takes you to the setup card in the lid', async () => {
+    await open('setup');
+    await sleep(900);
+    await click('#dram'); await sleep(1100);
+    const onGit = await b.ev(`document.documentElement.dataset.screen === 'git'`);
+    await b.ev(`document.getElementById('gitSay').focus(), 1`);
+    await b.type('fix the login redirect'); await b.key('Enter');
+    await sleep(1700);
+    const band = await b.ev(`(() => { const n = document.getElementById('gitNeeds'); return { hidden: n.hidden, text: n.textContent.trim(), aria: n.getAttribute('aria-label') || '' }; })()`);
+    const still = await b.ev(`document.documentElement.dataset.screen === 'git'`);
+    const heard = await b.ev(`document.getElementById('gitAnnounce')?.textContent || ''`);
+    const sent = (await posts()).filter(x => x.path === '/api/command').map(x => x.body.text);
+    await click('#gitNeeds'); await sleep(1300);
+    const back = await b.ev(`document.documentElement.dataset.screen !== 'git'`), lid = await lidNow();
+    check(SC + 'a prompt typed on the git screen starts its agent there; the band lights "Before agents start", which takes you to the setup card in the lid',
+      onGit && still && !band.hidden && band.text === 'Before agents start' && /setup command/.test(band.aria) && /setup command/.test(heard)
+      && JSON.stringify(sent) === '["fix the login redirect"]' && back && lid === SETUP_LID,
+      `git ${onGit} → still ${still}; band ${JSON.stringify(band)}; heard "${heard}"; ${JSON.stringify(sent)}; back ${back}, lid "${lid}"`);
+  });
+
   await run(SC + 'a yes said to it, alone or going on, keeps it with its hint and starts nothing; a prompt typed at it starts its agent, which waits on the same card', async () => {
     await open('setup');
     await sleep(900);

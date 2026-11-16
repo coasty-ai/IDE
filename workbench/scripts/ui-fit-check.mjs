@@ -321,6 +321,10 @@ async function gitView(v, s, d) {
       await open(sc); await check(`${tag} (${sc})`);
       await scrollEnd('#gitGraph'); await check(`${tag} (${sc}, scrolled to the end)`);
     }
+    // while launches wait on the setup card, the band lights "Before agents start" in place of "<Name> needs you"
+    await open('setup-card');
+    if (await b.ev(`document.getElementById('gitNeeds').hidden || document.getElementById('gitNeeds').textContent.trim() !== 'Before agents start'`)) failures.push(`${tag}: the band did not light "Before agents start" while the setup card waits`);
+    await check(`${tag} (setup-card, the band lit for the setup card)`);
   } else if (v === 'git-detail') {
     await open('git');
     await pick('#gitGraph .gr[data-id="work:g1"]');

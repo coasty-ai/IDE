@@ -81,6 +81,8 @@ export function setupGitScreen(c) {
   el.back.addEventListener('click', () => closeGit());
   el.wireEnd.addEventListener('click', () => closeGit());
   el.needs.addEventListener('click', () => {
+    // the setup card launches wait on: the lid shows it first (it comes from the stream), so back to the board
+    if (el.needs.dataset.setup && S.setup && S.setup.id === el.needs.dataset.setup) { closeGit({ toLid: true }); ctx.render(); return; }
     const id = el.needs.dataset.agent;
     if (!id || !S.agents.has(id)) { paintBand(); return; }
     // "<Name> needs you" puts that item in the lid, as picking its chip does: a card on screen is withdrawn first
@@ -413,10 +415,22 @@ function paintBand(z = sizes()) {
   if (el.state.dataset.html !== stateHtml) { el.state.innerHTML = stateHtml; el.state.dataset.html = stateHtml; }
   el.state.hidden = !stateHtml;
   el.state.style.fontSize = P.silkSub + 'px';
-  // what needs you: the first in the queue, lit; it takes you back to the board with that item in the lid
+  // what needs you, lit; it takes you back to the board with that in the lid. The setup card that launches wait on comes
+  // first, as the lid shows it before anything picked: a prompt typed here starts its agent at once, and the card that
+  // agent's copy waits on opens in the lid, behind this screen. Else the first in the queue.
   const q = model.needsQueue();
-  const first = q[0] || null;
-  if (first) {
+  const setup = S.setup && typeof S.setup.id === 'string' ? S.setup : null;
+  const first = setup ? null : q[0] || null;
+  if (setup) {
+    const label = 'Before agents start';
+    if (el.needs.dataset.label !== label) {
+      el.needs.dataset.label = label;
+      el.needs.innerHTML = `<svg class="g" viewBox="0 0 12 12" aria-hidden="true"><use href="#g-need"/></svg><span>${esc(label)}</span>`;
+      el.needs.setAttribute('aria-label', 'Before agents start, Workbench asks whether to run the setup command in each agent’s copy. Back to the board, to answer it.');
+    }
+    el.needs.dataset.setup = setup.id;
+    el.needs.dataset.agent = '';
+  } else if (first) {
     const nm = visibleText(first.name || 'An agent');
     const label = `${cutMiddle(nm, 24)} needs you`;
     if (el.needs.dataset.label !== label + q.length) {
@@ -425,9 +439,10 @@ function paintBand(z = sizes()) {
       el.needs.setAttribute('aria-label', `${nm} needs you${q.length > 1 ? `, and ${q.length - 1} more` : ''}. Back to the board, to answer it.`);
     }
     el.needs.dataset.agent = first.id;
+    el.needs.dataset.setup = '';
   }
-  el.needs.hidden = !first;
-  tellNeeds(q);
+  el.needs.hidden = !first && !setup;
+  tellNeeds(q, setup);
   el.needs.style.fontSize = P.silkSub + 'px';
   el.back.style.fontSize = P.silkSub + 'px';
   el.say.style.fontSize = P.silkSub + 'px';
@@ -443,13 +458,14 @@ function paintBand(z = sizes()) {
  * (the lid's own live region is on the board, hidden while this screen shows). What needs you as the screen opens is
  * not news; a new head of the queue is, and so is one more behind it.
  */
-function tellNeeds(q) {
+function tellNeeds(q, setup = null) {
   const first = q[0] || null;
-  const now = { head: first ? `${first.id}|${first.ask ? first.ask.id : first.state}` : '', n: q.length };
+  const now = { head: setup ? `setup|${setup.id}` : first ? `${first.id}|${first.ask ? first.ask.id : first.state}` : '', n: q.length };
   const was = st.needKey;
   st.needKey = now;
-  if (!st.shown || st.moving || !was || !first) return;
-  if (now.head !== was.head) announce(`${visibleText(first.name || 'An agent')} needs you. The button at the top goes back to the board, to answer it.`);
+  if (!st.shown || st.moving || !was || (!first && !setup)) return;
+  if (now.head !== was.head && setup) announce('Before agents start, Workbench asks whether to run the setup command. The button at the top goes back to the board, to answer it.');
+  else if (now.head !== was.head) announce(`${visibleText(first.name || 'An agent')} needs you. The button at the top goes back to the board, to answer it.`);
   else if (now.n > was.n) announce('Another one needs you. The button at the top goes back to the board.');
 }
 

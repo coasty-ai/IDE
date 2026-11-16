@@ -3273,6 +3273,20 @@ test('"looks good" said at a finished agent\'s lid starts nothing, and marks it 
   for (const said of ['looks good', 'not now']) assert.deepEqual(await t.engine.command(said, { focusId: a.id }), { reply: 'Choose “Ask it to bring in main” or “Look later”.' }, said);
   v.work = { ...v.work, problem: { why: 'blocked', sentence: 'Your own changes are in the way.', paths: [], into: 'main', at: 1 } };
   assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: 'Choose “Try again” or “Not now”.' });
+  // being checked again after a save into its copy: its lid offers no Merge, so its "Looks good" stands for both
+  v.work = { ...v.work, problem: null };
+  v.state = 'done_claimed';
+  v.checks = { state: 'running', results: [] };
+  assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: `Good. ${a.v.name} stays as it is.`, looked: a.id });
+  v.checks = { state: 'none', results: [] };
+  // from an earlier run, its lid is Continue or Forget: "looks good" names them, and "not now" is its Close
+  v.earlier = true;
+  v.canContinue = true;
+  assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: 'Choose “Continue” or “Forget”.' });
+  v.canContinue = false;
+  assert.deepEqual(await t.engine.command('lgtm', { focusId: a.id }), { reply: 'Choose “Forget”.' });
+  assert.deepEqual(await t.engine.command('not now', { focusId: a.id }), { reply: `${a.v.name}’s work stays on its branch for now.`, looked: a.id });
+  v.earlier = false;
   // thrown away: its "Dismiss" stands for both
   v.work = { ...v.work, problem: null, thrownAway: { at: 1, saved: null } };
   assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: `Good. ${a.v.name} stays as it is.`, looked: a.id });

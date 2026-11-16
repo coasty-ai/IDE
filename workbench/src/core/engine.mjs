@@ -2054,6 +2054,8 @@ export class Engine extends EventEmitter {
   _lidChoices(v, good) {
     const w = v.work || null;
     const into = this._repoView()?.branch || null;
+    // an earlier run's agent: its lid is Continue (when it can) or Forget, and its Close stands for "not now"
+    if (v.earlier) return good ? (v.canContinue ? 'Choose “Continue” or “Forget”.' : 'Choose “Forget”.') : null;
     if (w?.thrownAway || (w?.merged && workSettled(v))) return null;
     if (w?.problem && typeof w.problem === 'object') {
       const target = (typeof w.problem.into === 'string' && w.problem.into) || into || w.from || null;
@@ -2065,14 +2067,16 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * Whether the lid offers Merge for this root, by the page's rule (ui/queue.js mergeApplies): live mode, at rest, its
-   * folder and branch there and not thrown away, work not merged yet, and the person on a branch, with a name and email
-   * git is not known to lack.
+   * Whether the lid offers Merge for this root, by the page's rule (ui/queue.js mergeApplies): live mode, at rest and not
+   * being checked again after a save into its copy (done_claimed with its checks running: checkedAgain), its folder and
+   * branch there and not thrown away, work not merged yet, and the person on a branch, with a name and email git is not
+   * known to lack.
    */
   _mergeOffered(v) {
     const w = v && !v.parentId ? v.work : null;
     const repo = this._repoView();
-    return this.mode === 'live' && !!w && !!w.branch && !!w.folder && !w.thrownAway && !ACTIVE.has(v.state)
+    const again = v?.state === STATE.DONE_CLAIMED && v.checks?.state === 'running';
+    return this.mode === 'live' && !!w && !!w.branch && !!w.folder && !w.thrownAway && !ACTIVE.has(v.state) && !again
       && !!repo?.branch && repo.identity !== false && unmergedWork(v);
   }
 
