@@ -847,7 +847,7 @@ What the file view lists, reads and saves, in the person's repository or an agen
 
 - `files`: paths from `root` with `/`, ordered by path. They come from `git ls-files -z --cached --others --exclude-standard`, run as its two halves (`--cached`, then `--others --exclude-standard`) so that tracked files come first when the list is cut. That is every tracked file (one in a conflict once), then every new file no ignore rule hides.
 - `truncated: true` when there were more than `max` (never more than 50,000, `MAX_LIST_FILES`).
-- When a half is more than `git()` reads at once (64 MB of names, as an agent's copy with a `node_modules` no rule hides can give), or git is stopped for taking too long, the names it gave whole are kept, the list is cut there, and it is `truncated`. A cut list of tracked files gets no new files after it.
+- When the new files are more than `git()` reads at once (64 MB of names, as an agent's copy with a `node_modules` no rule hides can give), or git is stopped for taking too long listing them, the names it gave whole are kept, the list is cut there, and it is `truncated`. The tracked files are not cut that way: when git cannot give them all, the list is refused (below).
 - Left out: a repository inside the folder (git names it `folder/`), a name that is not UTF-8 (the page could not ask for it by name), a name the path rules refuse, and a save's sibling (`isSaveFile(rel)`: the last part is `.<name>.workbench-save-<16 hex>`). Names are read as bytes.
 - When git fails otherwise: "Git could not list the files in <root>.", or git's trouble ("Git is not installed, or it is not on the PATH.", "Git took too long and was stopped.", "Git gave back more than Workbench can read at once.").
 

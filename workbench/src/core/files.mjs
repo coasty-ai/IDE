@@ -636,12 +636,13 @@ function* nulFields(buf, cut = false) {
 }
 
 /**
- * One half of the list, as git gives it: { stdout, cut }. When git says more than git() reads at once (64 MB), or is
- * stopped for taking too long, what it said up to then is kept, and `cut` is true.
+ * The new files no ignore rule hides, as git lists them: { stdout, cut }. When git says more than git() reads at once
+ * (64 MB), or is stopped for taking too long, what it said up to then is kept, and `cut` is true.
  */
-async function listHalf(args, cwd) {
+async function newFiles(cwd) {
   try {
-    return { stdout: (await git(args, { cwd, encoding: 'buffer' })).stdout, cut: false };
+    const r = await git(['ls-files', '-z', '--others', '--exclude-standard'], { cwd, encoding: 'buffer' });
+    return { stdout: r.stdout, cut: false };
   } catch (e) {
     const tooMuch = !!e && (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || e.killed === true);
     if (tooMuch && Buffer.isBuffer(e.stdout)) return { stdout: e.stdout, cut: true };
@@ -662,8 +663,9 @@ const utf8OrNull = bytes => {
  * tracked files come first when the list is cut: every tracked file (one in a conflict once), then every new file no
  * ignore rule hides. Left out: a repository inside the folder (git names it "folder/"), a name that is not UTF-8 (the
  * page could not ask for it by name), a name the path rules refuse, and the sibling of a save (see isSaveFile). When
- * a half is more than git() reads at once, or git is stopped for taking too long, the names it gave whole are kept,
- * and the list is cut there (an un-ignored node_modules in an agent's copy, say): what git did not give is not known.
+ * the new files are more than git() reads at once, or git is stopped for taking too long listing them (an un-ignored
+ * node_modules in an agent's copy, say), the names it gave whole are kept and the list is cut there: what git did not
+ * give is not known. The tracked files are not cut that way: without them all, the list is refused.
  * @param {{ root: string, max?: number }} o max: at most this many, and never more than 50,000 (MAX_LIST_FILES)
  * @returns {Promise<{ files: string[], truncated?: true }>} paths from root with "/", ordered by path; truncated when
  *   there were more, or may have been. Rejects with a plain error when git cannot list them.
@@ -674,8 +676,8 @@ export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
   let halves;
   try {
     halves = await Promise.all([
-      listHalf(['ls-files', '-z', '--cached'], top),
-      listHalf(['ls-files', '-z', '--others', '--exclude-standard'], top),
+      git(['ls-files', '-z', '--cached'], { cwd: top, encoding: 'buffer' }).then(r => ({ stdout: r.stdout, cut: false })),
+      newFiles(top),
     ]);
   } catch (e) {
     throw gitTrouble(e) || plainError(`Git could not list the files in ${top}.`, { cause: e });
@@ -694,7 +696,7 @@ export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
       seen.add(name);
       files.push(name);
     }
-    if (cut) truncated = true; // tracked files come first: none of the new ones after a cut list of tracked ones
+    if (cut) truncated = true;
     if (truncated) break;
   }
   files.sort();

@@ -834,6 +834,23 @@ test('a long file name still gets a temporary name that fits', async () => {
   assert.deepEqual(leftovers(root), []);
 });
 
+test('a path asked for in another case or Unicode form reaches the file as it is on disk, and a save keeps its name', async () => {
+  const folder = 'Café'; // decomposed, as some programs write names
+  const { root } = repo({ [`${folder}/Notes.txt`]: 'one\n' });
+  const real = path.join(root, folder);
+  let saved = 0;
+  for (const rel of [`${folder}/Notes.txt`, 'Café/Notes.txt', 'café/NOTES.TXT', 'CAFÉ/notes.txt']) {
+    if (!fs.existsSync(path.join(root, rel))) continue; // a file system that tells cases and forms apart: no such file
+    const got = await readFile({ root, rel });
+    assert.equal(got.kind, 'text', rel);
+    const text = `${got.text}${++saved}\n`;
+    await writeFile({ root, rel, text, hash: got.hash });
+    assert.deepEqual(fs.readdirSync(real), ['Notes.txt'], `${JSON.stringify(rel)}: the file keeps its name, and nothing is left`);
+    assert.equal(fs.readFileSync(path.join(real, 'Notes.txt'), 'utf8'), text);
+  }
+  assert.ok(saved >= 1);
+});
+
 test('a save cut short leaves its sibling: the list leaves it out, and a later save in that folder removes it once it is old', async () => {
   for (const yes of ['.a.txt.workbench-save-0123456789abcdef', 'src/.b.js.workbench-save-00112233445566ff', '.x.workbench-save-ffffffffffffffff']) {
     assert.equal(isSaveFile(yes), true, yes);
@@ -905,11 +922,13 @@ test('a file in a conflict is listed once', async () => {
 test('when git’s list of new files is more than Workbench reads at once, the list is cut, not refused', async (t) => {
   const { root } = repo({ 'a.txt': 'a\n', 'src/b.js': 'b\n' });
   // A stand-in for git that answers `ls-files --others` with more than 64 MB of names (an agent's copy with a
-  // node_modules no rule hides, say) and hands everything else to the real git.
+  // node_modules no rule hides, say), `ls-files --cached` too while a marker file is there, and hands everything else
+  // to the real git.
   const realGit = process.env.PATH.split(path.delimiter).map(d => path.join(d, 'git')).find(p => fs.existsSync(p));
   const bin = path.join(T, `bin-${++made}`);
   fs.mkdirSync(bin);
   const names = path.join(bin, 'names');
+  const floodTracked = path.join(bin, 'flood-tracked');
   const name = n => `new/${String(n).padStart(7, '0')}-${'n'.repeat(1388)}`; // 1400 bytes with its NUL
   const count = 50_000; // 70 MB
   fs.writeFileSync(names, Array.from({ length: count }, (_, n) => `${name(n)}\0`).join(''));
@@ -917,6 +936,7 @@ test('when git’s list of new files is more than Workbench reads at once, the l
     '#!/bin/sh',
     'for a in "$@"; do',
     `  if [ "$a" = "--others" ]; then exec cat '${names}'; fi`,
+    `  if [ "$a" = "--cached" ] && [ -e '${floodTracked}' ]; then exec cat '${names}'; fi`,
     'done',
     `exec '${realGit}' "$@"`,
   ].join('\n') + '\n', { mode: 0o755 });
@@ -932,6 +952,9 @@ test('when git’s list of new files is more than Workbench reads at once, the l
   assert.ok(fresh.length > 1000 && fresh.length < count, `${fresh.length} new files`);
   assert.ok(fresh.every((f, k) => f === name(k)), 'only names that came whole, in order');
   assert.deepEqual(await listFiles({ root, max: 3 }), { files: ['a.txt', name(0), 'src/b.js'], truncated: true });
+  // The tracked files are the list's start: when git cannot give them whole, the list is refused, not shown cut.
+  fs.writeFileSync(floodTracked, '');
+  await refused(listFiles({ root }), /^Git gave back more than Workbench can read at once\.$/);
 });
 
 // ------------------------------------------------------------------ changed lines
