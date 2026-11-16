@@ -44,7 +44,8 @@ const SHOTS = [
   { name: 'git-black-gold', scenario: 'git-many', theme: 'black-gold', click: ['#dram', '#gitGraph .gr[data-id="work:m5"]'] },
   { name: 'git-ivory', scenario: 'git', theme: 'ivory', detail: 'more', click: ['#dram', '#gitGraph .gr:not(.work)'] },
   // the file view, reached by the files chip and its field (`steps`: 'chip', 'find:<text>' then 'enter', a selector
-  // clicked, 'type:<text>' into the editor, 'disk:<path>' for a change an agent writes, 'wait:<ms>')
+  // clicked, 'type:<text>' into the editor, 'disk:<path>' for a change an agent writes, 'needs:<agent id>' for a
+  // question from that agent, which lights the sheet's pill, 'wait:<ms>')
   { name: 'files-sheet', scenario: 'files', steps: ['chip', 'find:export.ts', 'enter', '#fvWhose [data-fv="switch"]'] },
   { name: 'files-finder', scenario: 'files', steps: ['chip', 'find:invoice', 'wait:700'] },
   { name: 'files-editor', scenario: 'files', steps: ['chip', 'find:export.ts', 'enter', '#fvWhose [data-fv="switch"]', '#fvActs [data-fv="edit"]', 'type:// read a page at a time\n'] },
@@ -52,6 +53,8 @@ const SHOTS = [
   { name: 'files-folder', scenario: 'files', detail: 'more', steps: ['chip', 'find:export.ts', 'enter', '#fvTitle [data-dir="src"]'] },
   { name: 'files-black-gold', scenario: 'files', theme: 'black-gold', steps: ['chip', 'find:export.ts', 'enter', '#fvWhose [data-fv="switch"]'] },
   { name: 'files-ivory', scenario: 'files', theme: 'ivory', steps: ['chip', 'find:cart.ts', 'enter'] },
+  { name: 'files-needs-you', scenario: 'files', steps: ['chip', 'needs:f2', 'find:.env', 'enter'] },
+  { name: 'files-finder-over-editor', scenario: 'files', theme: 'black-gold', steps: ['chip', 'find:export.ts', 'enter', '#fvActs [data-fv="edit"]', 'type:// a note\n', 'find:que', 'wait:400'] },
 ];
 
 const mock = await startMock({ quiet: true });
@@ -69,6 +72,13 @@ async function step(x) {
     const r = await (await fetch(`${base}/api/file?in=you&path=${encodeURIComponent(arg)}`, { headers: { 'X-Workbench-Token': 'k' } })).json();
     await fetch(`${base}/ctl/files`, { method: 'POST', body: JSON.stringify({ in: 'you', path: arg, text: `// a change on disk\n${r.text}` }) });
     await sleep(200); return;
+  }
+  if (op === 'needs') {
+    const st = await (await fetch(`${base}/ctl/state`)).json();
+    const a = st.agents.find(x => x.id === arg);
+    const ask = { id: `shot-${arg}`, type: 'permission', sentence: `${a.name} wants to run a command`, detail: 'npm run db:migrate', options: ['Allow', 'Deny'], createdAt: Date.now() };
+    await fetch(`${base}/ctl/push`, { method: 'POST', body: JSON.stringify({ event: 'agents', data: [{ ...a, state: 'needs_ok', ask }] }) });
+    await sleep(600); return;
   }
   if (op === 'wait') { await sleep(Number(arg)); return; }
   await b.ev(`(document.querySelector(${JSON.stringify(x)})?.click(), 1)`); await sleep(900);

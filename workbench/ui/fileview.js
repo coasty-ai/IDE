@@ -18,7 +18,7 @@ import { sizeClass } from './layout.js';
 
 const $ = id => document.getElementById(id);
 const POLL_MS = 2000;
-const GROW_MS = 300, SHRINK_MS = 250;
+const GROW_MS = 300, SHRINK_MS = 220;
 const EASE_OUT = 'cubic-bezier(.2,.7,.2,1)', EASE_IN_OUT = 'cubic-bezier(.4,0,.2,1)';
 // type and spacing for each size class: the code's size and line height, the sheet's padding
 const SHEET = {
@@ -31,8 +31,12 @@ const KINDS_WITHOUT_TEXT = new Set(['binary', 'large', 'notutf8', 'link', 'missi
 /** What leaving the editor asks first for, when the person only leaves the editor (and stays on the file). */
 const STAY = () => {};
 const KEY_NOTE = 'That looks like a key, so it was not searched for. Keys go in Agents & keys, where they are kept safe.';
+/** After a key the field caught, how long what still arrives is kept out too (the rest of it, typed or auto-typed), in ms. */
+const KEY_HOLD_MS = 1500;
 /** The most rows a folder draws; the rest are found by typing. */
 const FOLDER_ROWS = 1000;
+/** The same file in the other copy: how long what shows stays as it is before it dims, while the other copy's answer comes. */
+const SWITCH_DIM_MS = 150;
 
 let ctx = null, el = null;
 const st = {
@@ -43,7 +47,7 @@ const st = {
   file: null, seq: 0, loadingPath: null, note: null,
   edit: null, ask: null, saving: false,
   recent: [],
-  find: { q: '', active: 0, items: [], mode: 'find', search: { q: '', seq: 0, results: null, error: null, truncated: false, timer: 0 } },
+  find: { q: '', active: 0, items: [], mode: 'find', keyAt: 0, search: { q: '', seq: 0, results: null, error: null, truncated: false, timer: 0, all: new Set() } },
   poll: 0, polling: false,
   fresh: { lines: new Set(), until: 0 },
   win: { first: -1, last: -1, key: '' },
@@ -54,9 +58,10 @@ const st = {
 export const filesShown = () => st.open;
 
 /**
- * @param {object} c { getG, measure, still, reduced, onShow(shown), toLid(id), looksLikeSecret(text), home(), isMac }
- *   onShow(true) closes the board's menus and card and stops voice; toLid(id) puts that agent in the lid (from the
- *   needs-you pill); home() is where the keyboard goes when what opened the sheet is gone.
+ * @param {object} c { getG, measure, still, reduced, onShow(shown), toLid(id), looksLikeSecret(text), startsLikeSecret(text),
+ *   home(), isMac } onShow(true) closes the board's menus and card and stops voice; toLid(id) puts that agent in the lid
+ *   (from the needs-you pill); home() is where the keyboard goes when what opened the sheet is gone; the two key checks
+ *   are src/shared/secretshape.mjs's (a whole key, and the start of one typed a letter at a time).
  */
 export function setupFiles(c) {
   ctx = c;
@@ -80,14 +85,18 @@ export function setupFiles(c) {
     const dir = b.dataset.dir;
     guard(() => showFolder(dir, { focusField: true }));
   });
-  el.acts.addEventListener('click', e => {
+  // a button that waits (Edit and the link while the other copy's answer comes, Save while saving) does nothing
+  const press = e => {
     const b = e.target.closest('button[data-fv]');
-    if (b) act(b.dataset.fv, b);
-  });
-  el.whose.addEventListener('click', e => {
-    const b = e.target.closest('button[data-fv]');
-    if (b) act(b.dataset.fv, b);
-  });
+    if (b && b.getAttribute('aria-disabled') !== 'true') act(b.dataset.fv, b);
+  };
+  el.acts.addEventListener('click', press);
+  el.whose.addEventListener('click', press);
+  // the path is fitted to the room its box has, which the pill, the actions and the window's size change
+  if (typeof ResizeObserver === 'function') {
+    let roomW = 0;
+    new ResizeObserver(() => { const w = el.title.clientWidth; if (w !== roomW) { roomW = w; if (st.open && st.geo) paintTitle(); } }).observe(el.title);
+  }
   el.list.addEventListener('mousemove', e => {
     const o = e.target.closest('[role="option"]');
     if (o && +o.dataset.i !== st.find.active) { st.find.active = +o.dataset.i; markActive(); }
@@ -125,6 +134,8 @@ export function setupFiles(c) {
  */
 export function openFiles({ opener = null, where = null, path = null, line = null, mode = 'browse', origin = null } = {}) {
   if (!ctx) return;
+  // asked for again while it goes (⌘P just after Esc): it comes back from where it got to, and stays
+  if (st.open && st.moving === 'out') comeBack();
   const first = !st.open;
   if (first) {
     const ae = document.activeElement;
@@ -154,10 +165,30 @@ export function openFiles({ opener = null, where = null, path = null, line = nul
     return;
   }
   if (first) {
-    if (st.file && st.file.in === st.where && st.file.rows) { st.view = 'file'; paint(); drawRows(true); focusCode(); pollSoon(); }
+    if (st.file && st.file.in === st.where && st.file.rows) { backToFile(); focusCode(); pollSoon(); }
     else if (st.file) openFile(st.file.path, { focus: 'code' });
     else { showFolder(st.dir || '', { focusField: true }); }
   }
+}
+
+/**
+ * The sheet was going and is asked for again: each part plays back from where it got to (its words, its shadow, its
+ * edge, or the short fade), the board dims again, and it stays.
+ */
+function comeBack() {
+  const anims = st.anims;
+  st.moving = 'back';
+  st.restore = null;
+  el.html.dataset.files = 'open';
+  for (const a of anims) { try { a.reverse(); } catch { a.cancel(); } }
+  const done = () => {
+    if (st.moving !== 'back') return;
+    for (const a of anims) a.cancel();
+    if (st.anims === anims) st.anims = [];
+    st.moving = null;
+  };
+  Promise.all(anims.map(a => a.finished)).then(done, done);
+  startPoll();
 }
 
 /** Close the sheet: it shrinks back into what it grew from, and the keyboard goes back to what opened it. */
@@ -183,9 +214,11 @@ function finishClose() {
   st.restore = null;
   ctx.onShow(false);
   if (toLid) { ctx.toLid(id); return; }
-  let to = st.opener && st.opener.isConnected && !st.opener.closest('[inert]') ? st.opener : null;
-  if (!to && st.openerKey) to = document.querySelector(`[data-key="${CSS.escape(st.openerKey)}"]`);
-  focusOn(to && !to.closest('[inert]') ? to : ctx.home());
+  // what opened it, if it still shows (a menu the sheet closed, or a card it withdrew, does not): else home
+  const shows = e => !!e && e.isConnected && !e.closest('[inert], [hidden]') && e.getClientRects().length > 0;
+  let to = shows(st.opener) ? st.opener : null;
+  if (!to && st.openerKey) { const again = document.querySelector(`[data-key="${CSS.escape(st.openerKey)}"]`); if (shows(again)) to = again; }
+  focusOn(to || ctx.home());
   st.opener = null; st.openerKey = null;
 }
 
@@ -259,18 +292,28 @@ function grow(origin) {
   a.finished.then(done, done);
 }
 
-/** Back into what it grew from: its words go first, then it narrows into the lid (or the path) and is gone. */
+/**
+ * Back into what it grew from, at once: its words fade in the first 90 ms as it narrows into the lid (or the path), and
+ * it is gone in 220 ms, the board coming up behind it. Under reduced motion it fades out in 120 ms; with still=1 or a
+ * hidden tab it is simply gone.
+ */
 function shrink() {
   for (const a of st.anims) a.cancel();
   st.anims = [];
-  if (ctx.still() || ctx.reduced() || document.hidden) { finishClose(); return; }
+  if (ctx.still() || document.hidden) { finishClose(); return; }
   st.moving = 'out';
-  const box = el.dialog.getBoundingClientRect(), to = originRect(st.origin);
-  for (const k of el.sheet.children) st.anims.push(k.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 110, easing: 'ease-in', fill: 'forwards' }));
-  st.anims.push(el.shade.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120, easing: 'ease-in', fill: 'forwards' }));
-  const a = el.sheet.animate([{ clipPath: clipFor(box, box), opacity: 1 }, { opacity: 1, offset: 0.7 }, { clipPath: clipFor(to, box), opacity: 0 }], { duration: SHRINK_MS, delay: 60, easing: EASE_IN_OUT, fill: 'forwards' });
-  st.anims.push(a);
   const done = () => { if (st.moving === 'out') finishClose(); };
+  if (ctx.reduced()) {
+    const fade = el.dialog.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120, easing: 'ease-in', fill: 'forwards' });
+    st.anims.push(fade);
+    fade.finished.then(done, done);
+    return;
+  }
+  const box = el.dialog.getBoundingClientRect(), to = originRect(st.origin);
+  for (const k of el.sheet.children) st.anims.push(k.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 90, easing: 'ease-in', fill: 'forwards' }));
+  st.anims.push(el.shade.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 110, easing: 'ease-in', fill: 'forwards' }));
+  const a = el.sheet.animate([{ clipPath: clipFor(box, box), opacity: 1 }, { opacity: 1, offset: 0.7 }, { clipPath: clipFor(to, box), opacity: 0 }], { duration: SHRINK_MS, easing: EASE_IN_OUT, fill: 'forwards' });
+  st.anims.push(a);
   a.finished.then(done, done);
 }
 
@@ -315,13 +358,21 @@ const changedOf = path => (st.list.files || []).find(f => f.path === path)?.chan
 /**
  * Open a file of the copy shown. The sheet shows it at once (the code fades in when it arrives); `line` is shown a third
  * of the way down and briefly marked; `keep` keeps the line at the top where it was (switching copies, reading again).
+ * The same file in the other copy (show yours, show its copy) keeps what shows, its whose line and its place until the
+ * other copy's answer comes, with Edit waiting; it dims only when that takes a while, and the answer takes its place
+ * without a fade: the gold bars coming or going are the change. An answer that comes after the person went to the
+ * finder or a folder waits there, with its place, until they come back (backToFile).
  */
 function openFile(path, { line = null, keep = null, focus = null } = {}) {
   const where = st.where, seq = ++st.seq;
   st.view = 'file';
   st.loadingPath = path;
   st.edit = null; st.ask = null; st.note = null;
-  if (!st.file || st.file.path !== path || st.file.in !== where) {
+  undim(false);
+  const was = st.file;
+  const switching = !!(was && was.path === path && was.in !== where && Array.isArray(was.rows) && !KINDS_WITHOUT_TEXT.has(was.kind) && was.kind !== 'refused');
+  if (switching) { was.pending = where; dimSoon(seq); }
+  else if (!was || was.path !== path || was.in !== where) {
     st.file = { in: where, path, kind: null, loading: true };
     el.code.classList.add('fv-wait');
   }
@@ -333,21 +384,38 @@ function openFile(path, { line = null, keep = null, focus = null } = {}) {
     clearTimeout(slow);
     if (seq !== st.seq) return;
     st.loadingPath = null;
+    undim();
     if (!r.ok) { st.file = { in: where, path, kind: 'refused', reply: visibleControls(r.reply), why: r.why }; st.note = null; paint(); return; }
-    show(r, { line, keep });
-    if (focus === 'code') focusCode();
+    const away = st.view !== 'file';
+    show(r, { line, keep, away });
+    if (focus === 'code' && !away) focusCode();
     say(`${F.shownPath(F.nameAndDir(path).name)}${r.lines ? `, ${r.lines} line${r.lines === 1 ? '' : 's'}` : ''}.`);
   }, err => {
     clearTimeout(slow);
     if (seq !== st.seq) return;
     st.loadingPath = null;
+    undim(false);
     st.file = { in: where, path, kind: 'refused', reply: visibleControls(err.message) };
     paint();
   });
 }
 
+/** The code shown while the other copy's answer is on its way: dimmed to half once it takes a while (150 ms). */
+let dimTimer = 0;
+function dimSoon(seq) {
+  clearTimeout(dimTimer);
+  dimTimer = setTimeout(() => { if (seq === st.seq && st.file && st.file.pending) el.code.classList.add('fv-dim'); }, SWITCH_DIM_MS);
+}
+/** Back to full strength: as the answer arrives (a short fade up), or at once when something else takes its place. */
+function undim(fade = true) {
+  clearTimeout(dimTimer);
+  if (!el.code.classList.contains('fv-dim')) return;
+  el.code.classList.remove('fv-dim');
+  if (fade && !ctx.still() && !ctx.reduced() && !document.hidden) el.code.animate([{ opacity: 0.5 }, { opacity: 1 }], { duration: 180, easing: 'ease-out' });
+}
+
 /** An answer of GET /api/file, shown: its rows, colours read in idle slices, its changed lines, at the place asked for. */
-function show(r, { line = null, keep = null, fresh = null } = {}) {
+function show(r, { line = null, keep = null, fresh = null, away = false } = {}) {
   const text = typeof r.text === 'string' ? r.text : null;
   const rows = text != null ? F.splitLines(text) : [];
   let maxCols = 0;
@@ -360,19 +428,41 @@ function show(r, { line = null, keep = null, fresh = null } = {}) {
   };
   // "Reading export.ts…" goes; a note said in the line under the path (a save's, the demo's) stays its time
   if (st.note && st.note.quiet) st.note = null;
+  // the person went to the finder or a folder while it was on its way: it waits there, with its place, until they come back
+  if (away) { st.file.place = { line, keep, fresh }; paint(); scanSoon(); return; }
   st.view = 'file';
   markFor(fresh || (line ? [line] : []));
   st.win.key = '';
   paint();
   drawRows(true);   // the page takes this file's height first, so the place below is never cut short
-  // the place: a line asked for (a third of the way down), the line that was at the top, or the top
-  const lh = st.geo.lh;
-  if (line) el.code.scrollTop = Math.max(0, (line - 1) * lh + CODE_PAD.top - el.code.clientHeight / 3);
-  else if (keep != null) el.code.scrollTop = Math.max(0, (keep - 1) * lh);
-  else el.code.scrollTop = 0;
-  if (!line && keep == null) el.code.scrollLeft = 0;
+  placeAt({ line, keep });
   drawRows(true);
   scanSoon();
+  arrive();
+}
+
+/** The place: a line asked for (a third of the way down), the line that was at the top (to the pixel), or the top. */
+function placeAt({ line = null, keep = null } = {}) {
+  const lh = st.geo.lh;
+  if (line) el.code.scrollTop = Math.max(0, (line - 1) * lh + CODE_PAD.top - el.code.clientHeight / 3);
+  else if (keep != null) el.code.scrollTop = F.scrollForLine(keep, lh, CODE_PAD.top);   // topLine()'s inverse
+  else el.code.scrollTop = 0;
+  if (!line && keep == null) el.code.scrollLeft = 0;
+}
+
+/**
+ * Back to the file (from the finder or a folder). One whose answer came while the person was away comes in now, at the
+ * place it asked for, its line or new lines marked, fading in.
+ */
+function backToFile() {
+  const f = st.file, p = f && f.place;
+  if (p) { f.place = null; el.code.classList.add('fv-wait'); markFor(p.fresh || (p.line ? [p.line] : [])); st.win.key = ''; }
+  st.view = 'file';
+  paint();
+  drawRows(true);
+  if (!p) return;
+  placeAt(p);
+  drawRows(true);
   arrive();
 }
 
@@ -384,11 +474,14 @@ function arrive() {
   el.code.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 220, easing: 'ease-out' });
 }
 
-/** The line at the top of the code now (1-based), to keep the place when the file is read again or the copy changes. */
+/**
+ * The line at the top of the code (or the editor) now, 1-based, with the part of it scrolled past as a fraction: the
+ * place a file read again, or the same file in the other copy, comes back to (placeAt), to the pixel.
+ */
 function topLine() {
   if (!st.geo) return 1;
   const box = st.edit ? el.edit : el.code;
-  return Math.max(1, Math.floor(Math.max(0, box.scrollTop - CODE_PAD.top) / st.geo.lh) + 1);
+  return F.lineAtScroll(box.scrollTop, st.geo.lh, CODE_PAD.top);
 }
 
 // ---------------------------------------------------------------- drawing rows
@@ -507,9 +600,13 @@ function showFolder(dir, { focusField: toField = false } = {}) {
 let findFrame = 0;
 function onFindInput() {
   let q = el.find.value;
+  const now = performance.now();
+  // the rest of a key the field caught, still arriving (typed, or typed by a password manager): kept out as well, until
+  // nothing has come for a moment and a half
+  if (st.find.keyAt && now - st.find.keyAt < KEY_HOLD_MS) { if (q) { el.find.value = ''; st.find.keyAt = now; } return; }
   // a key typed or pasted here is never searched for, said back or kept: the field empties, as the board's input does
   st.find.keyNote = false;
-  if (q.length >= 16 && ctx.looksLikeSecret && ctx.looksLikeSecret(q)) { el.find.value = ''; q = ''; st.find.keyNote = true; say(KEY_NOTE); }
+  if (q.length >= 16 && ctx.looksLikeSecret && ctx.looksLikeSecret(q)) { el.find.value = ''; q = ''; st.find.keyNote = true; st.find.keyAt = now; say(KEY_NOTE); }
   st.find.q = q;
   if (q && st.view !== 'find') { st.back = backOf(); st.view = 'find'; }
   st.find.active = 0;
@@ -549,12 +646,17 @@ function onFindKey(e) {
   }
 }
 
-/** Words to find in the files, after two characters, a moment after the last key; never something that looks like a key. */
+/**
+ * Words to find in the files, after two characters, a moment after the last key; never something that looks like a key,
+ * nor the start of one typed a letter at a time (startsLikeSecret): the whole key is known only once it is all there,
+ * and the words of a search go in its address. New words show each file's first lines again (`all` is emptied).
+ */
 function searchSoon(q) {
   const s = st.find.search;
   clearTimeout(s.timer);
+  s.all = new Set();
   const words = q.trim().length >= 2 && !F.lineJump(q) ? q : '';
-  if (!words) { Object.assign(s, { q: '', results: null, error: null, truncated: false }); return; }
+  if (!words || (ctx.startsLikeSecret && ctx.startsLikeSecret(words))) { Object.assign(s, { q: '', results: null, error: null, truncated: false }); return; }
   if (ctx.looksLikeSecret && ctx.looksLikeSecret(words)) { Object.assign(s, { q: words, results: [], error: 'That looks like a key, so Workbench did not search for it.', truncated: false }); return; }
   s.timer = setTimeout(() => {
     const seq = ++s.seq, where = st.where;
@@ -592,7 +694,9 @@ function listItems() {
   const jump = F.lineJump(q);
   if (jump && st.file && st.file.rows && st.file.rows.length) items.push({ kind: 'line', line: Math.min(jump, st.file.rows.length), path: st.file.path });
   const found = F.findFiles(candidates(files, q), q, { max: 12 }).map(r => ({ kind: 'file', path: r.path, hits: r.hits, changedBy: r.file.changedBy, group: 'Files' }));
-  const s = st.find.search, hits = s.q && s.results ? F.orderSearch(s.results, st.file ? st.file.path : null, 30).map(r => ({ kind: 'hit', ...r, group: 'In files' })) : [];
+  // lines found: three a file (the open file's all first), the rest of a file one row that shows them when chosen
+  const s = st.find.search;
+  const hits = s.q && s.results ? F.searchRows(s.results, { open: st.file ? st.file.path : null, max: 30, perFile: 3, all: s.all, truncated: s.truncated }).map(r => ({ ...r, group: 'In files' })) : [];
   if (st.find.mode === 'search') items.push(...hits, ...found); else items.push(...found, ...hits);
   return items;
 }
@@ -601,6 +705,8 @@ function choose(i) {
   const it = st.find.items[i];
   if (!it) return;
   if (it.kind === 'line') { jumpTo(it.line); return; }   // inside the editor too, where it moves the caret
+  // "and 4 more in export.ts": its lines take the row's place, the first of them chosen
+  if (it.kind === 'more') { st.find.search.all.add(it.path); paint(); markActive(true); return; }
   // anything else leaves an edit, asking first when something changed
   if (editChanged()) { askLeave(() => choose(i)); return; }
   if (st.edit) leaveEdit({ ask: false, focus: false });
@@ -608,7 +714,7 @@ function choose(i) {
   const line = it.kind === 'hit' ? it.line : null;
   el.find.value = ''; st.find.q = ''; st.find.mode = 'find';
   if (st.file && st.file.path === it.path && st.file.in === st.where && st.file.rows) {
-    st.view = 'file'; paint(); drawRows(true);
+    backToFile();
     if (line) jumpTo(line); else focusCode();
     return;
   }
@@ -618,6 +724,7 @@ function choose(i) {
 /** Show `line` of the open file a third of the way down, briefly marked. */
 function jumpTo(line) {
   el.find.value = ''; st.find.q = '';
+  if (st.file && st.file.place) { st.file.place = null; arrive(); }   // a file that came while the finder showed: here, not where it asked
   st.view = 'file';
   markFor([line]);
   paint();
@@ -637,18 +744,22 @@ function remember(path) {
 
 function paint() {
   if (!el || !st.open) return;
-  paintActs();
   paintWhose();
+  paintActs();
   paintTitle();
   paintBody();
   paintBar();
 }
 
+/**
+ * The path in the room its own box has: the head gives the box what the pill, Edit (or Save and Cancel, or why not) and
+ * ✕ leave (flex-basis 0), and a ResizeObserver fits the path again whenever that changes (setupFiles).
+ */
 function paintTitle() {
   const f = st.file;
-  const crumbs = st.view === 'file' && f ? F.crumbsOf(repoName(), f.path) : F.crumbsOf(repoName(), st.view === 'folder' ? st.dir : (st.back && st.back.view === 'folder' ? st.back.dir : (f ? F.nameAndDir(f.path).dir : '')), { folder: true });
+  const crumbs = (st.view === 'file' || st.edit) && f ? F.crumbsOf(repoName(), f.path) : F.crumbsOf(repoName(), st.view === 'folder' ? st.dir : (st.back && st.back.view === 'folder' ? st.back.dir : (f ? F.nameAndDir(f.path).dir : '')), { folder: true });
   const z = st.geo.z;
-  const room = Math.max(120, el.title.parentElement.clientWidth - el.acts.offsetWidth - (el.needs.hidden ? 0 : el.needs.offsetWidth + 14) - el.close.offsetWidth - 34);
+  const room = Math.max(40, el.title.clientWidth - 2);
   const widthOf = (t, bold) => ctx.measure(visibleControls(t), bold ? z.name : z.path, bold ? 700 : 400);
   const fit = F.fitCrumbs(crumbs, { widthOf, sep: ctx.measure(' / ', z.path, 400), maxW: room });
   const editing = !!st.edit;
@@ -664,26 +775,44 @@ function paintTitle() {
   el.title.title = full;
 }
 
+/**
+ * Edit; while editing, Save (the primary) and Cancel, which give way while a question is asked under the path (its
+ * answers are the one thing to do then, Save mine anyway or Keep editing the one filled button); for a file that is not
+ * edited, why. Edit waits while the same file comes from the other copy.
+ */
 function paintActs() {
   const f = st.file;
   let html = '';
-  if (st.view === 'file' && f && !f.loading) {
+  if ((st.view === 'file' || st.edit) && f && !f.loading) {
     if (st.edit) {
-      html = `<button type="button" class="fv-btn pri" data-fv="save" data-key="save"${st.saving ? ' aria-disabled="true"' : ''}>Save</button><button type="button" class="fv-btn" data-fv="cancel" data-key="cancel">Cancel</button>`;
+      if (!st.ask) html = `<button type="button" class="fv-btn pri" data-fv="save" data-key="save"${st.saving ? ' aria-disabled="true"' : ''}>Save</button><button type="button" class="fv-btn" data-fv="cancel" data-key="cancel">Cancel</button>`;
     } else if (f.editable && f.kind === 'text') {
-      html = `<button type="button" class="fv-btn" data-fv="edit" data-key="edit">Edit</button>`;
+      html = `<button type="button" class="fv-btn" data-fv="edit" data-key="edit"${f.pending ? ' aria-disabled="true"' : ''}>Edit</button>`;
     } else if (f.why) {
       html = `<span class="fv-why">${esc(visibleControls(f.why))}</span>`;
     }
   }
   const saved = st.savedAt && performance.now() - st.savedAt < 2600 ? `<span class="fv-saved" aria-hidden="true">${esc(st.savedWord || 'Saved')}</span>` : '';
   const out = saved + html;
-  if (el.acts.dataset.html !== out) { const had = el.acts.contains(document.activeElement) ? document.activeElement.dataset.key : null; el.acts.innerHTML = out; el.acts.dataset.html = out; if (had) el.acts.querySelector(`[data-key="${had}"]`)?.focus({ preventScroll: true }); }
+  if (el.acts.dataset.html === out) return;
+  const had = el.acts.contains(document.activeElement) ? document.activeElement.dataset.key : null;
+  el.acts.innerHTML = out; el.acts.dataset.html = out;
+  if (!had) return;
+  // the button the keyboard was on, again; or, when a question took its place, the question's own first answer
+  const again = el.acts.querySelector(`[data-key="${had}"]`) || (st.ask ? el.whose.querySelector('.fv-ask .fv-btn.pri') || el.whose.querySelector('.fv-ask .fv-btn') : null);
+  (again || (st.edit ? el.text : el.code)).focus({ preventScroll: true });
 }
 
-/** The quiet line under the path: whose copy it is, or what asks first (a change on disk, an edit not saved), or a note. */
+/**
+ * The quiet line under the path: whose copy it is, or what asks first (a change on disk, an edit not saved), or a note.
+ * While the same file comes from the other copy, it stays as it is (its link waiting) until the answer is shown.
+ */
 function paintWhose() {
   const f = st.file;
+  if (f && f.pending && !st.ask && !(st.note && !st.note.quiet)) {
+    el.whose.querySelector('[data-fv="switch"]')?.setAttribute('aria-disabled', 'true');
+    return;
+  }
   let html = '';
   if (st.ask) {
     html = `<span class="fv-ask" role="group" aria-label="${esc(st.ask.text)}">${markHtml({ state: 'needs_ok' })}<span>${esc(st.ask.text)}</span>${st.ask.buttons.map(([label, key, pri]) => `<button type="button" class="fv-btn small${pri ? ' pri' : ''}" data-fv="${key}" data-key="ask:${key}">${esc(label)}</button>`).join('')}</span>`;
@@ -733,6 +862,8 @@ function paintBody() {
   el.list.hidden = !showList;
   el.code.hidden = !(st.view === 'file' && !st.edit && (showText || (f && f.loading)));
   el.edit.hidden = !st.edit;
+  // the finder over the editor: the edit stays where it is, at its place, unseen and out of the keyboard's way
+  el.edit.classList.toggle('fv-under', !!st.edit && showList);
   let note = '';
   if (st.view === 'file' && f) {
     if (f.kind === 'refused') note = esc(f.reply || 'Workbench could not read that file.');
@@ -779,8 +910,10 @@ function paintList() {
   });
   if (!items.length) {
     const q = st.find.q.trim();
+    // the start of a key is never said back, as a whole key is never kept
+    const keyish = !!(ctx.startsLikeSecret && ctx.startsLikeSecret(q));
     const words = files == null ? 'Reading the files…' : st.list.error ? st.list.error
-      : st.view === 'folder' ? 'This folder is empty.' : q ? `No file matches “${visibleControls(q)}”.` : 'Type to find a file, or a line: “40” jumps to line 40.';
+      : st.view === 'folder' ? 'This folder is empty.' : q ? (keyish ? 'No file matches that.' : `No file matches “${visibleControls(q)}”.`) : 'Type to find a file, or a line: “40” jumps to line 40.';
     html += `<p class="fv-empty">${esc(words)}</p>`;
   }
   const s = st.find.search;
@@ -792,7 +925,10 @@ function paintList() {
   markActive();
 }
 
-/** One row of the list: a folder, a file (its matched letters in bold), a line to jump to, or a line found in the files. */
+/**
+ * One row of the list: a folder, a file (its matched letters in bold), a line to jump to, a line found in the files, or
+ * the rest of a file's lines found ("and 4 more in export.ts", which shows them).
+ */
 function optionHtml(it) {
   // one mark: the first agent that changed it (its name, and the others', are in the row's name for screen readers)
   const marks = list => (list && list[0] ? markHtml(agentOf(list[0].agentId) || list[0]) : '');
@@ -801,6 +937,12 @@ function optionHtml(it) {
   if (it.kind === 'line') return `<span class="fv-mk"></span><span class="fv-nm">Line ${it.line}</span><span class="fv-dir">${F.pathHtml(F.nameAndDir(it.path).name)}</span>`;
   // the characters a row has room for (its padding, the mark and the gaps taken off), so nothing in it is cut by CSS
   const cols = Math.max(16, Math.floor((el.list.clientWidth - 2 * st.geo.z.padX - 24) / ctx.measure('M', st.geo.z.code, 400)) - 2);
+  if (it.kind === 'more') {
+    const { name, dir } = F.nameAndDir(it.path);
+    const lead = `and ${it.count.toLocaleString('en-US')}${it.atLeast ? ' or more' : ' more'} in `;
+    const shown = F.cutStart(name, [], Math.max(8, cols - lead.length));
+    return `<span class="fv-mk"></span><span>${esc(lead)}${F.pathHtml(shown.text)}</span><span class="sr"> in ${esc(F.shownPath(dir || 'the top folder'))}: show them</span>`;
+  }
   if (it.kind === 'hit') {
     const { name, dir } = F.nameAndDir(it.path);
     const where = `:${it.line}`;
@@ -879,7 +1021,7 @@ function act(what, b) {
   }
 }
 
-/** Switch to the same file in the other copy, near the same line. */
+/** Switch to the same file in the other copy, at the same place (openFile keeps what shows until it comes). */
 function switchTo(to) {
   const path = st.view === 'file' && st.file ? st.file.path : null;
   const keep = topLine();
@@ -910,7 +1052,7 @@ function askLeave(go) {
 
 function enterEdit() {
   const f = st.file;
-  if (!f || !f.editable || f.kind !== 'text' || st.edit) return;
+  if (!f || f.pending || !f.editable || f.kind !== 'text' || st.edit) return;
   const top = el.code.scrollTop, left = el.code.scrollLeft, line = topLine();
   st.edit = { text0: f.text, indent: F.guessIndent(f.text), hash: f.hash, seen: null, saved: false };
   st.ask = null;
@@ -922,8 +1064,11 @@ function enterEdit() {
   el.edit.scrollTop = top;
   el.text.scrollLeft = left;
   drawEditNums(true);
+  // the text box lays its lines out now, before the crossfade starts, so a long file's layout (a 1 MB file takes a
+  // tenth of a second) is paid before the first frame of the fade, not out of it
+  void el.text.scrollHeight;
   crossfade(true);
-  caretToLine(line);
+  caretToLine(Math.max(1, Math.floor(line)));
   focusOn(el.text);
 }
 
@@ -1115,7 +1260,7 @@ function pollSoon() { if (!st.polling) poll(); }
  */
 async function poll() {
   const f = st.file;
-  if (!st.open || document.hidden || st.moving || st.view !== 'file' || !f || f.loading || f.kind === 'refused' || st.saving || (st.ask && st.ask.kind !== 'leave')) return;
+  if (!st.open || document.hidden || st.moving || st.view !== 'file' || !f || f.loading || f.pending || f.kind === 'refused' || st.saving || (st.ask && st.ask.kind !== 'leave')) return;
   const seq = st.seq;
   st.polling = true;
   let r;
@@ -1123,7 +1268,8 @@ async function poll() {
   try { r = await api.file(f.in, f.path, check ? { check } : {}); }
   catch { st.polling = false; return; }
   st.polling = false;
-  if (seq !== st.seq || f !== st.file || !st.open) return;
+  // the person went to the finder or a folder meanwhile: the next check, once the file shows again, reads it
+  if (seq !== st.seq || f !== st.file || !st.open || st.view !== 'file') return;
   if (!r.ok) {
     if (r.why === 'gone') { st.file = { in: f.in, path: f.path, kind: 'refused', reply: visibleControls(r.reply), why: r.why }; paint(); }
     return;
@@ -1152,7 +1298,7 @@ function reread() {
   const f = st.file;
   if (!f || !f.path) return;
   const seq = ++st.seq, keep = topLine();
-  api.file(f.in, f.path).then(r => { if (seq === st.seq && r.ok && !r.same && !st.edit) show(r, { keep }); }, () => {});
+  api.file(f.in, f.path).then(r => { if (seq === st.seq && r.ok && !r.same && !st.edit) show(r, { keep, away: st.view !== 'file' }); }, () => {});
 }
 
 // ---------------------------------------------------------------- keys
@@ -1166,7 +1312,8 @@ export function filesKey(e) {
   if (!st.open) return false;
   const mod = ctx.isMac ? e.metaKey : e.ctrlKey;
   if (e.key === 'Escape') { e.preventDefault(); filesEscape(); return true; }
-  if (mod && !e.altKey && (e.key === 's' || e.key === 'S') && st.edit) { e.preventDefault(); save({ stay: true }); return true; }
+  // ⌘S saves in the editor; outside it, it does nothing (and the browser's "Save page as" never opens over the sheet)
+  if (mod && !e.altKey && (e.key === 's' || e.key === 'S')) { e.preventDefault(); if (st.edit) save({ stay: true }); return true; }
   if (mod && !e.altKey && (e.key === 'p' || e.key === 'P') && !e.shiftKey) { e.preventDefault(); openFiles({ mode: 'find' }); return true; }
   if (mod && !e.altKey && e.shiftKey && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); openFiles({ mode: 'search' }); return true; }
   if (e.metaKey || e.ctrlKey || e.altKey) return false;
@@ -1185,17 +1332,18 @@ export function filesKey(e) {
 
 /**
  * Esc, in order: the line that asks first goes (keeping the edit); typed words in the field go (and what they covered
- * comes back); the editor is left (asking first when something changed); then the sheet closes.
+ * comes back: the editor, with the keyboard in it, when the finder was over it); the editor is left (asking first when
+ * something changed); then the sheet closes.
  */
 export function filesEscape() {
   if (!st.open) return;
   if (st.ask) { act('keep'); return; }
-  if (document.activeElement === el.find && el.find.value) {
+  if (document.activeElement === el.find && (el.find.value || (st.edit && st.view === 'find'))) {
     el.find.value = ''; st.find.q = ''; st.find.mode = 'find';
     searchSoon('');
     const back = st.back;
     st.back = null;
-    if (back && back.view === 'file' && st.file) { st.view = 'file'; paint(); drawRows(true); }
+    if (st.file && (st.edit || (back && back.view === 'file'))) { backToFile(); if (st.edit) focusOn(el.text); }
     else if (back && back.view === 'folder') { st.view = 'folder'; st.dir = back.dir; paint(); }
     else paint();
     return;

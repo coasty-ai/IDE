@@ -305,7 +305,9 @@ async function gitView(v, s, d) {
  * chip, the field, a crumb, the link to an agent's copy, Edit):
  *   files       the top folder; a file in an agent's copy with its changed lines; the finder with files and lines found;
  *               the env file shown masked, with why it is not edited; a path too long for the head; a binary file; the
- *               file of 25,000 lines scrolled to its middle; and the needs-you pill when something needs you
+ *               file of 25,000 lines scrolled to its middle; the needs-you pill when something needs you, and the pill
+ *               beside why a file is not edited (an env file, mixed line endings, one over 1 MB), where the path must keep
+ *               to its own box (#fvTitle carries data-box, so text outside it is a failure)
  *   files-edit  the editor; the question when Esc would leave an edit; the conflict line when the file changed on disk
  */
 async function filesView(v, s, d) {
@@ -349,6 +351,13 @@ async function filesView(v, s, d) {
     await sleep(500); await settle(80);
     if (await b.ev(`document.getElementById('fvNeeds').hidden`)) failures.push(`${tag}: the needs-you pill did not show`);
     await check(`${tag} (the needs-you pill)`);
+    // the pill beside why a file is not edited: the path keeps to its own box (#fvTitle is measured), never under them
+    for (const [path, why] of [['.env', /holds keys/], ['src/legacy/mixed.txt', /mixes line endings/], ['data/fixtures/large-accounts.json', /too large/]]) {
+      await choose(path);
+      if (!why.test(await b.ev(`document.getElementById('fvActs').textContent`))) failures.push(`${tag}: ${path} did not say why it is not edited`);
+      if (await b.ev(`document.getElementById('fvNeeds').hidden`)) failures.push(`${tag}: the needs-you pill went with ${path}`);
+      await check(`${tag} (the needs-you pill beside why ${path.split('/').pop()} is not edited)`);
+    }
   } else if (v === 'files-edit') {
     await choose('src/invoices/export.ts');
     await click('#fvActs [data-fv="edit"]', 500);

@@ -1419,6 +1419,7 @@ el.files.setAttribute('aria-keyshortcuts', isMac ? 'Meta+P' : 'Control+P');
 setupFiles({
   getG: () => G, measure, still: () => debug.still, reduced, isMac,
   looksLikeSecret: t => secretShape.looksLikeSecret?.(t)?.secret === true,
+  startsLikeSecret: t => secretShape.startsLikeSecret?.(t) === true,
   onShow: shown => {
     if (shown) {
       closePop(); closeTray(); closeLook(false);

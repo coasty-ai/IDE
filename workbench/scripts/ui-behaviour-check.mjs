@@ -2439,18 +2439,260 @@ try {
     await ctl('mode', { delay: null });
   });
 
-  await run(FV + 'with reduced motion it fades in briefly, and the keyboard still lands in its field', async () => {
+  await run(FV + 'with reduced motion it fades in and out briefly, the board dimming and coming back with it, and the keyboard still lands in its field', async () => {
     await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
     try {
       await open('files');
       await sleep(900);
       await b.ev(`document.getElementById('filesChip').click(), 1`);
+      const dim = await b.ev(`(() => { const cs = getComputedStyle(document.getElementById('board')); return cs.transitionProperty + ' ' + cs.transitionDuration; })()`);
       await sleep(260);
       const st = await fv();
-      await b.key('Escape'); await sleep(200);
+      await b.key('Escape'); await sleep(40);
+      const going = await b.ev(`({ open: document.getElementById('fileSheet').open, fading: document.getElementById('fileSheet').getAnimations().some(a => a.playState === 'running') })`);
+      await sleep(260);
       const closed = await fv();
-      check(FV + 'with reduced motion it fades in briefly, and the keyboard still lands in its field', st.open && st.focus === 'fvFind' && !closed.open && closed.focus === 'filesChip', `${st.focus} → ${closed.focus}`);
+      check(FV + 'with reduced motion it fades in and out briefly, the board dimming and coming back with it, and the keyboard still lands in its field',
+        dim === 'opacity 0.14s' && st.open && st.focus === 'fvFind' && going.open && going.fading && !closed.open && closed.focus === 'filesChip',
+        `board "${dim}"; ${st.focus}; closing ${JSON.stringify(going)} → ${closed.focus}`);
     } finally { await b.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] }); }
+  });
+
+  // ---------------------------------------------------------------- the file view, after its review
+  const firstShown = () => b.ev(`(() => { const c = document.getElementById('fvCode'), r = c.getBoundingClientRect(); const row = [...document.querySelectorAll('#fvRows .fv-row')].find(x => x.getBoundingClientRect().bottom > r.top + 8 + 1); return { top: c.scrollTop, first: row ? +row.querySelector('.no').textContent : 0 }; })()`);
+  const rawOf = async (where, path) => (await (await fetch(`${base}/ctl/files?in=${where}&path=${encodeURIComponent(path)}`)).json()).raw;
+  const writeAsAgent = (where, path, text) => fetch(base + '/ctl/files', { method: 'POST', body: JSON.stringify({ in: where, path, text }) });
+
+  await run(FV + 'the finder over the editor: the edit stays unseen under its list, Save and Cancel and the path stay, and Esc gives the keyboard back to the editor', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('export.ts'); await b.key('Enter'); await sleep(800);
+    await click('#fvActs [data-fv="edit"]'); await sleep(300);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setSelectionRange(0, 0); document.execCommand('insertText', false, '// typed\\n'); return 1; })()`);
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('que'); await sleep(400);
+    const up = await fv();
+    const under = await b.ev(`getComputedStyle(document.getElementById('fvEdit')).visibility + ' ' + getComputedStyle(document.getElementById('fvList')).backgroundColor`);
+    await b.key('Escape'); await sleep(300);
+    const back = await fv();
+    const text = await b.ev(`document.getElementById('fvText').value.slice(0, 9)`);
+    check(FV + 'the finder over the editor: the edit stays unseen under its list, Save and Cancel and the path stay, and Esc gives the keyboard back to the editor',
+      up.list && up.edit && /^hidden rgb/.test(under) && up.acts === 'SaveCancel' && /export\.ts$/.test(up.title) && up.focus === 'fvFind'
+      && !back.list && back.edit && back.focus === 'fvText' && text === '// typed\n' && (await posts()).filter(x => x.path === '/api/file').length === 0,
+      `up ${JSON.stringify({ list: up.list, under, acts: up.acts, title: up.title, focus: up.focus })}; back ${JSON.stringify({ list: back.list, edit: back.edit, focus: back.focus, text })}`);
+  });
+
+  await run(FV + 'a file read again, and the same file in the other copy, come back to the same place to the pixel, however often', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('rates.ts'); await b.key('Enter'); await sleep(1300);
+    await b.ev(`(() => { const c = document.getElementById('fvCode'); const lh = parseFloat(getComputedStyle(document.getElementById('fvRows')).lineHeight); c.scrollTop = 11999 * lh + 8 + 5; return 1; })()`);
+    await sleep(300);
+    const reads = [await firstShown()];
+    for (let k = 0; k < 3; k++) {
+      // an agent writes the file's first line: the 2-second check reads it again, far above what shows
+      const raw = await rawOf('you', 'src/generated/rates.ts');
+      await writeAsAgent('you', 'src/generated/rates.ts', raw.replace(/^\/\/ (Rates|Every rate)/, (m, w) => `// ${w === 'Rates' ? 'Every rate' : 'Rates'}`));
+      await sleep(2600);
+      reads.push(await firstShown());
+    }
+    await b.ev(`(document.getElementById('fvCode').scrollTop = 0, 1)`); await sleep(200);
+    const top = (await shownRows())[0] || '';   // read again each time: the last of the three writes
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('export.ts'); await b.key('Enter'); await sleep(900);
+    await b.ev(`(() => { const c = document.getElementById('fvCode'); c.style.height = '80px'; const lh = parseFloat(getComputedStyle(document.getElementById('fvRows')).lineHeight); c.scrollTop = 5 * lh + 8 + 3; return 1; })()`);
+    await sleep(200);
+    const sw = [await firstShown()];
+    for (let k = 0; k < 4; k++) { await click('#fvWhose [data-fv="switch"]'); await sleep(900); sw.push(await firstShown()); }
+    await b.ev(`document.getElementById('fvCode').style.height = '', 1`);
+    check(FV + 'a file read again, and the same file in the other copy, come back to the same place to the pixel, however often',
+      reads.every(t => t.first === reads[0].first && Math.abs(t.top - reads[0].top) < 1) && reads[0].first === 12000 && /^1:\/\/ Every rate/.test(top)
+      && sw.every(t => t.first === sw[0].first && Math.abs(t.top - sw[0].top) < 1),
+      `read again ${JSON.stringify(reads)} (line 1 now "${top.slice(0, 24)}"); switched ${JSON.stringify(sw)}`);
+  });
+
+  await run(FV + 'the same file from the other copy: what shows stays, Edit waiting, until the answer comes; no blank page, and Edit and the whose line never drop out', async () => {
+    await open('files', { mode: { delay: { file: 400 } } });
+    await sleep(900);
+    await b.key('p', { meta: true }); await sleep(500);
+    await keysIn('export.ts'); await b.key('Enter'); await sleep(1300);
+    await b.ev(`(window.__sw = [], (() => { const t0 = performance.now(); const step = now => { const c = document.getElementById('fvCode'); window.__sw.push({ t: Math.round(now - t0), op: +getComputedStyle(c).opacity, hidden: c.hidden, rows: document.querySelectorAll('#fvRows .fv-row').length,
+      acts: document.getElementById('fvActs').textContent, wait: document.querySelector('#fvActs [data-fv="edit"]')?.getAttribute('aria-disabled') || '', whose: document.getElementById('fvWhose').textContent.slice(0, 26) }); if (now - t0 < 900) requestAnimationFrame(step); }; requestAnimationFrame(step); })(), document.querySelector('#fvWhose [data-fv="switch"]').click(), 1)`);
+    await sleep(1100);
+    const log = await b.ev('window.__sw');
+    const during = log.filter(x => x.t < 380);
+    const after = log[log.length - 1];
+    check(FV + 'the same file from the other copy: what shows stays, Edit waiting, until the answer comes; no blank page, and Edit and the whose line never drop out',
+      during.length > 3 && during.every(x => !x.hidden && x.rows > 0 && x.op >= 0.45 && x.acts === 'Edit' && /^Your folder/.test(x.whose)) && during.some(x => x.wait === 'true')
+      && log.every(x => x.op >= 0.45 && x.acts === 'Edit') && /^In Invoice export’s copy/.test(after.whose) && after.wait === '' && after.op === 1,
+      `${log.length} frames; during ${JSON.stringify(during.slice(-2))}; after ${JSON.stringify(after)}`);
+    await ctl('mode', { delay: null });
+  });
+
+  await run(FV + 'a file that comes after the person went to the finder or a folder waits there, and shows when they come back', async () => {
+    await open('files', { still: true, mode: { delay: { file: 1400 } } });
+    await sleep(900);
+    await b.key('p', { meta: true }); await sleep(1700);   // the list comes after 1.4 s
+    await keysIn('query.ts'); await sleep(200); await b.key('Enter'); await sleep(250);
+    await b.key('p', { meta: true }); await sleep(100);
+    await keysIn('car'); await sleep(1700);   // query.ts comes now
+    const finder = await fv();
+    await b.key('Escape'); await sleep(400);
+    const back = await fv();
+    const rows = (await shownRows()).length;
+    // a folder clicked in the path while a file is on its way
+    await b.key('p', { meta: true }); await sleep(200);
+    await keysIn('cart.ts'); await sleep(200); await b.key('Enter'); await sleep(200);
+    await b.ev(`[...document.querySelectorAll('#fvTitle .fv-crumb')].find(c => c.textContent === 'src')?.click(), 1`); await sleep(1800);
+    const folder = await fv();
+    await ctl('mode', { delay: null });
+    check(FV + 'a file that comes after the person went to the finder or a folder waits there, and shows when they come back',
+      finder.list && finder.field === 'car' && finder.focus === 'fvFind' && !finder.code && back.code && /query\.ts$/.test(back.title) && rows > 5
+      && folder.list && /storefront \/ src$/.test(folder.title) && !folder.code,
+      `finder ${JSON.stringify({ list: finder.list, field: finder.field, focus: finder.focus, code: finder.code })}; back "${back.title}" (${rows} rows); folder "${folder.title}" ${folder.list}`);
+  });
+
+  await run(FV + 'the 2-second check that lands while the finder is up leaves the finder alone', async () => {
+    await open('files', { still: true, mode: { delay: { file: 1400 } } });
+    await sleep(900);
+    await b.key('p', { meta: true }); await sleep(1700);
+    await keysIn('package.json'); await sleep(200); await b.key('Enter'); await sleep(1800);
+    const raw = await rawOf('you', 'package.json');
+    const n0 = (await fileReads()).filter(r => r.path === '/api/file' && r.check).length;
+    await writeAsAgent('you', 'package.json', raw.replace('"name"', '"description": "x",\n  "name"'));
+    // a check is sent (it takes 1.4 s to answer, and finds the change): then the finder, typed into
+    let sent = false;
+    for (let i = 0; i < 40 && !sent; i++) { await sleep(100); sent = (await fileReads()).filter(r => r.path === '/api/file' && r.check).length > n0; }
+    await sleep(150);
+    await b.ev(`document.getElementById('fvFind').focus(), 1`);
+    await keysIn('rea'); await sleep(1700);
+    const st = await fv();
+    await ctl('mode', { delay: null });
+    check(FV + 'the 2-second check that lands while the finder is up leaves the finder alone', sent && st.list && !st.code && st.field === 'rea' && st.focus === 'fvFind',
+      JSON.stringify({ sent, list: st.list, code: st.code, field: st.field, focus: st.focus }));
+  });
+
+  await run(FV + 'a key typed into the finder a letter at a time never goes out, nor its start, nor what comes after the field caught it', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    const key = ['ghp', 'k3mQ9wE5rT3yU1iO9pA8sD6fG4hJ2kL0zX5c'].join('_');
+    const r0 = (await fileReads()).length;
+    await b.key('f', { meta: true, shift: true }); await sleep(300);
+    for (const ch of key) { await b.key(ch); await sleep(200); }   // slower than the search waits for
+    await sleep(900);
+    const slow = (await fileReads()).slice(r0).filter(r => r.path === '/api/search').map(r => r.q || '');
+    const shown = await b.ev(`document.getElementById('fileSheet').textContent.includes(${JSON.stringify(key.slice(4, 12))}) || document.getElementById('fileSheet').textContent.includes(${JSON.stringify(key.slice(-12))})`);
+    const field = await b.ev(`document.getElementById('fvFind').value`);
+    await sleep(1800);   // the field takes letters again once nothing has come for a moment and a half
+    const r1 = (await fileReads()).length;
+    await b.ev(`document.getElementById('fvFind').focus(), 1`);
+    for (const ch of key) { await b.key(ch); await sleep(12); }   // a password manager's auto-type
+    await sleep(900);
+    const fast = (await fileReads()).slice(r1).filter(r => r.path === '/api/search').map(r => r.q || '');
+    const left = await b.ev(`document.getElementById('fvFind').value`);
+    const leak = list => list.filter(q => q.length > 6 && key.includes(q.trim()));
+    check(FV + 'a key typed into the finder a letter at a time never goes out, nor its start, nor what comes after the field caught it',
+      !leak(slow).length && !leak(fast).length && !shown && field === '' && left === '',
+      `slow: ${slow.length} searches, ${leak(slow).length} with a piece of it; fast: ${fast.length}, ${leak(fast).length}; on the page ${shown}; field "${field ? '(not empty)' : ''}", then "${left ? '(not empty)' : ''}"`);
+  });
+
+  await run(FV + 'lines found: three a file, the rest of a file in one row that shows them, and nothing from a file too large to show', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await b.key('f', { meta: true, shift: true }); await sleep(300);
+    await keysIn('invoice'); await sleep(900);
+    const rows = () => b.ev(`[...document.querySelectorAll('#fvList .fv-hit, #fvList .fv-more')].map(o => (o.classList.contains('fv-more') ? '+ ' : '') + o.textContent.replace(/\\s+/g, ' ').trim())`);
+    const before = await rows();
+    const perFile = {};
+    for (const r of before.filter(x => !x.startsWith('+ '))) { const p = r.split(':')[0]; perFile[p] = (perFile[p] || 0) + 1; }
+    const more = before.find(x => x.startsWith('+ '));
+    const at = before.indexOf(more);
+    await b.ev(`[...document.querySelectorAll('#fvList .fv-more')][0]?.click(), 1`); await sleep(300);
+    const after = await rows();
+    const bold = await b.ev(`(() => { const x = document.querySelector('#fvList .fv-hit b'); if (!x) return null; const cs = getComputedStyle(x); return cs.fontWeight + ' ' + cs.textDecorationLine; })()`);
+    check(FV + 'lines found: three a file, the rest of a file in one row that shows them, and nothing from a file too large to show',
+      !!more && /^\+ and \d+ more in \S+/.test(more) && Object.values(perFile).every(n => n <= 3) && !before.some(x => /large-accounts\.json/.test(x))
+      && !after.some(x => x === more) && after.length > before.length - 1 && !after[at].startsWith('+ ') && bold === '700 none',
+      `before ${JSON.stringify(before.slice(0, 8))}; after ${JSON.stringify(after.slice(Math.max(0, at - 1), at + 3))}; bold ${bold}`);
+  });
+
+  await run(FV + 'while a save meets a change on disk, the question is the one thing: Save and Cancel give way until it is answered', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('query.ts'); await b.key('Enter'); await sleep(800);
+    await click('#fvActs [data-fv="edit"]'); await sleep(300);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setRangeText('// mine\\n', 0, 0, 'end'); t.dispatchEvent(new Event('input')); return 1; })()`);
+    await writeAsAgent('you', 'src/invoices/query.ts', '// theirs\n');
+    await b.key('s', { meta: true }); await sleep(800);
+    const asked = await fv();
+    const on = await b.ev(`document.activeElement?.dataset?.key || ''`);
+    const filled = await b.ev(`[...document.querySelectorAll('#fileSheet .fv-btn.pri')].map(x => x.textContent)`);
+    await click('#fvWhose [data-fv="keep"]'); await sleep(300);
+    const kept = await fv();
+    check(FV + 'while a save meets a change on disk, the question is the one thing: Save and Cancel give way until it is answered',
+      /changed on disk while you were editing/.test(asked.whose) && asked.acts === '' && JSON.stringify(filled) === '["Save mine anyway"]' && on === 'ask:mine' && kept.acts === 'SaveCancel' && kept.focus === 'fvText',
+      `asked "${asked.acts}" filled ${JSON.stringify(filled)} focus ${on}; kept "${kept.acts}" ${kept.focus}`);
+  });
+
+  await run(FV + 'on the git screen, a new file\'s path opens it at line 1, a changed one\'s at its first change, each path once', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await click('#dram'); await sleep(700);
+    await click('#gitGraph .gr[data-id="work:f1"]'); await sleep(900);
+    const lines = await b.ev(`[...document.querySelectorAll('#gitDetail .dopen')].map(x => x.textContent + ' → ' + x.dataset.line)`);
+    const btn = await b.ev(`(() => { const b = [...document.querySelectorAll('#gitDetail .dopen')].find(x => x.textContent === 'src/invoices/batch.ts'); if (!b) return null; b.click(); return b.dataset.line; })()`);
+    await sleep(900);
+    const st = await fv();
+    const marked = await b.ev(`[...document.querySelectorAll('#fvRows .fv-row.fresh .no')].map(n => n.textContent).join(',')`);
+    const gold = await b.ev(`[document.querySelectorAll('#fvRows .fv-row.chg').length, document.querySelectorAll('#fvRows .fv-row').length]`);
+    check(FV + 'on the git screen, a new file\'s path opens it at line 1, a changed one\'s at its first change, each path once',
+      JSON.stringify(lines) === JSON.stringify(['src/invoices/export.ts → 2', 'src/invoices/query.ts → 5', 'src/invoices/batch.ts → 1', 'migrations/0042_invoice_lookup_index.sql → 1', 'test/invoices/large-account.test.ts → 1'])
+      && btn === '1' && /batch\.ts$/.test(st.title) && marked === '1' && gold[0] === gold[1] && gold[0] > 10,
+      `${JSON.stringify(lines)}; opened "${st.title}" marked ${marked}, gold ${gold[0]} of ${gold[1]}`);
+    await b.key('Escape'); await sleep(400);
+  });
+
+  await run(FV + '⌘P from inside a menu the sheet closes: after Esc the keyboard lands on something that shows', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await b.ev(`document.getElementById('brand').click(), 1`); await sleep(300);
+    await b.ev(`document.querySelector('#look input[name="theme"]:checked')?.focus(), 1`); await sleep(100);
+    const inLook = await b.ev(`!!document.activeElement.closest('#look')`);
+    await b.key('p', { meta: true }); await sleep(500);
+    await b.key('Escape'); await sleep(500);
+    const where = await b.ev(`(() => { const a = document.activeElement; return { id: a ? a.id : '', body: a === document.body, shows: !!a && a.getClientRects().length > 0 && !a.closest('[hidden], [inert]') }; })()`);
+    check(FV + '⌘P from inside a menu the sheet closes: after Esc the keyboard lands on something that shows', inLook && !where.body && where.shows, JSON.stringify(where));
+  });
+
+  await run(FV + '⌘S outside the editor is kept from the browser, and ⌘P while the sheet closes brings it back', async () => {
+    await open('files');
+    await sleep(900);
+    await b.ev(`document.getElementById('filesChip').click(), 1`); await sleep(700);
+    const prevented = await b.ev(`(() => { const e = new KeyboardEvent('keydown', { key: 's', metaKey: true, ctrlKey: !navigator.platform.startsWith('Mac'), bubbles: true, cancelable: true }); document.getElementById('fvFind').dispatchEvent(e); return e.defaultPrevented; })()`);
+    await b.key('Escape'); await sleep(90);
+    await b.key('p', { meta: true }); await sleep(700);
+    const st = await fv();
+    const dim = await b.ev(`document.documentElement.dataset.files || ''`);
+    const anims = await b.ev(`document.getAnimations().filter(a => a.playState === 'running').length`);
+    check(FV + '⌘S outside the editor is kept from the browser, and ⌘P while the sheet closes brings it back',
+      prevented && st.open && st.focus === 'fvFind' && st.list && dim === 'open' && anims === 0, JSON.stringify({ prevented, open: st.open, focus: st.focus, dim, anims }));
+  });
+
+  await run(FV + 'the keyboard\'s gold line on the page is drawn over the rows, and black-gold\'s page has no frame of its own inside the gold one', async () => {
+    await open('files', { still: true, theme: 'black-gold' });
+    await sleep(700);
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('export.ts'); await b.key('Enter'); await sleep(800);
+    await click('#fvWhose [data-fv="switch"]'); await sleep(800);
+    await b.ev(`document.getElementById('fvFind').focus(), 1`);
+    await b.key('Tab', { shift: true }); await sleep(100);   // the keyboard to the page, as a person moves it
+    const line = await b.ev(`(() => { const body = document.getElementById('fvBody'), cs = getComputedStyle(body, '::after'), x = getComputedStyle(body);
+      return { focus: document.activeElement.id, op: cs.opacity, z: cs.zIndex, h: cs.height, sides: x.borderLeftWidth + ' ' + x.borderRightWidth, tops: x.borderTopWidth }; })()`);
+    check(FV + 'the keyboard\'s gold line on the page is drawn over the rows, and black-gold\'s page has no frame of its own inside the gold one',
+      line.focus === 'fvCode' && line.op === '1' && +line.z > 1 && line.h === '2px' && line.sides === '0px 0px' && line.tops === '1px', JSON.stringify(line));
   });
 
   if (errors.length) for (const e of [...new Set(errors)]) check('no script errors', false, e);

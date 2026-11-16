@@ -462,8 +462,16 @@ function gitGraphOf(state, now = Date.now()) {
   return { ok: true, repo: { ...repo, head: repo.head || head.slice(0, 7) }, commits, more: false, agents };
 }
 
-/** A unified diff of one file, made up from its counts: a hunk of believable lines. */
+/**
+ * A unified diff of one file, made up from its counts: a hunk of believable lines. A new file's hunk is all added
+ * lines from line 1 (@@ -0,0 +1,N @@), as git writes it, so its path on the git screen opens it at line 1.
+ */
 function filePatch(f, i) {
+  if (f.status === 'added') {
+    const n = Math.max(1, Math.min(f.adds || 1, 40));
+    const lines = Array.from({ length: n }, (_, k) => `+${k ? `export const batch${k} = ${k * 50};` : '// sends invoices a batch at a time'}`);
+    return `diff --git a/${f.path} b/${f.path}\nnew file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null\n+++ b/${f.path}\n@@ -0,0 +1${n === 1 ? '' : `,${n}`} @@\n${lines.join('\n')}\n`;
+  }
   const ctx = ['', 'export function total(items) {', '  return items.reduce((sum, item) => sum + item.price, 0);', '}'];
   const adds = Math.min(f.adds, 40), dels = Math.min(f.dels, 20);
   const lines = [];
@@ -473,6 +481,42 @@ function filePatch(f, i) {
   lines.push(' ' + ctx[3]);
   const head = f.status === 'added' ? 'new file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null' : f.status === 'deleted' ? 'deleted file mode 100644\nindex 4f3e2d1..0000000\n--- a/' + f.path : 'index 1a2b3c4..5d6e7f8 100644\n--- a/' + f.path;
   return `diff --git a/${f.path} b/${f.path}\n${head}\n+++ ${f.status === 'deleted' ? '/dev/null' : 'b/' + f.path}\n@@ -${10 + i},${dels + 3} +${10 + i},${adds + 3} @@ export function total(items) {\n${lines.join('\n')}\n`;
+}
+
+/**
+ * A file's real change as git would write it, from its text before (null: a new file) and after: { path, status, adds,
+ * dels, patch }, hunks with three lines around each change, or null when nothing changed. For the 'files' scenario,
+ * whose agents' copies hold real text, so each path on the git screen opens where it changed.
+ */
+function realChange(path, before, after) {
+  const lines = t => { const r = String(t).split('\n'); if (r.length > 1 && r[r.length - 1] === '') r.pop(); return t === '' ? [] : r; };
+  const a = before == null ? [] : lines(before), b = lines(after);
+  const n = a.length, m = b.length, ops = [];
+  if (n * m > 4e6) return null;   // the samples are small; a large file is not diffed here
+  const L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push([' ', a[i]]); i++; j++; } else if (L[i + 1][j] >= L[i][j + 1]) ops.push(['-', a[i++]]); else ops.push(['+', b[j++]]);
+  }
+  while (i < n) ops.push(['-', a[i++]]);
+  while (j < m) ops.push(['+', b[j++]]);
+  const changed = ops.map((o, k) => (o[0] === ' ' ? -1 : k)).filter(k => k >= 0);
+  if (!changed.length) return null;
+  const oldAt = [], newAt = [];
+  for (let k = 0, o = 1, w = 1; k < ops.length; k++) { oldAt.push(o); newAt.push(w); if (ops[k][0] !== '+') o++; if (ops[k][0] !== '-') w++; }
+  const groups = [];
+  for (const k of changed) {
+    const last = groups[groups.length - 1];
+    if (last && k - 3 <= last[1]) last[1] = Math.min(ops.length, k + 4); else groups.push([Math.max(0, k - 3), Math.min(ops.length, k + 4)]);
+  }
+  const hunks = groups.map(([s, e]) => {
+    const part = ops.slice(s, e), oldN = part.filter(x => x[0] !== '+').length, newN = part.filter(x => x[0] !== '-').length;
+    return `@@ -${oldN ? oldAt[s] : oldAt[s] - 1},${oldN} +${newN ? newAt[s] : newAt[s] - 1},${newN} @@\n${part.map(([t, l]) => t + l).join('\n')}`;
+  });
+  const head = before == null ? 'new file mode 100644\nindex 0000000..1d2e3f4\n--- /dev/null' : `index 1a2b3c4..5d6e7f8 100644\n--- a/${path}`;
+  return { path, status: before == null ? 'added' : 'modified', adds: ops.filter(x => x[0] === '+').length, dels: ops.filter(x => x[0] === '-').length,
+    patch: `diff --git a/${path} b/${path}\n${head}\n+++ b/${path}\n${hunks.join('\n')}\n` };
 }
 
 /** The stress diff, for "Invoice export" in any scenario. */
@@ -492,17 +536,22 @@ function stressFiles() {
   ];
 }
 
-/** GET /api/agents/:id/changes, as engine.changes() answers it. */
-function changesOf(state, agentId) {
+/**
+ * GET /api/agents/:id/changes, as engine.changes() answers it. `own(root)`, when given, is that agent's real change, as
+ * its copy holds it (the 'files' scenario): then no made-up hunks and no stress diff.
+ */
+function changesOf(state, agentId, own = null) {
   const a = state.agents.find(x => x.id === agentId);
   if (!a) return { ok: false, reply: 'There is no such agent.' };
   const root = a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a;
   const work = root.work || (state.mode === 'demo' ? workOf(root) : null);
   if (!work || !work.branch || work.folder === false) return { ok: false, reply: `${root.name}’s folder is gone, so there is nothing to show.` };
-  let files = ((root.files && root.files.list) || []).map((f, i) => ({ path: f.path, status: f.adds && !f.dels && /test|docs|new/.test(f.path) ? 'added' : 'modified', adds: f.adds, dels: f.dels }));
+  let files = ((root.files && root.files.list) || []).map((f, i) => ({ path: f.path, status: f.adds && !f.dels && /test|docs|new|batch|migrations/.test(f.path) ? 'added' : 'modified', adds: f.adds, dels: f.dels }));
   files = files.map((f, i) => ({ ...f, patch: filePatch(f, i), cut: f.adds > 40 ? true : undefined }));
   let left = [];
-  if (root.name === 'Invoice export') { files = [...stressFiles(), ...files]; left = [{ path: '.env.local', why: 'ignored' }, { path: 'vendor/payments-sdk', why: 'nested-repo' }]; }
+  const real = own ? own(root) : null;
+  if (real) files = real;
+  else if (root.name === 'Invoice export') { files = [...stressFiles(), ...files]; left = [{ path: '.env.local', why: 'ignored' }, { path: 'vendor/payments-sdk', why: 'nested-repo' }]; }
   const active = ['starting', 'working', 'waiting_helpers', 'needs_ok', 'question', 'maybe_stuck'].includes(root.state);
   return { ok: true, agentId: root.id, name: root.name, branch: work.branch, into: state.repo ? state.repo.branch : 'main', live: active,
     diff: { workId: `${gitId(root.id + ':head')}:${gitId(root.id + ':tree')}`, since: gitId(root.id + ':since'), head: gitId(root.id + ':head'), files, left, omitted: 0 } };
@@ -867,7 +916,9 @@ const factsOf = name => connectFacts(name === 'full-live' ? 'connect-github' : n
 // ('storefront'), with Invoice export's changes in its copy; the 'files' scenario has a richer one:
 //   files   live, on main, nothing needing you: Invoice export done and checked with work not merged yet (its copy
 //           changes export.ts and query.ts and adds batch.ts, a migration and a test, which carry changedLines), Price
-//           rounding at work in its copy (it changed src/cart.ts), and Help pages saying it is done. The project holds a
+//           rounding at work in its copy (it changed src/cart.ts), and Help pages saying it is done (it changed README.md).
+//           Their counts, and their diffs on the git screen, are their copies' real changes (realChange), so each path there
+//           opens where it changed, a new file at line 1. The project holds a
 //           CRLF file (src/invoices/sample.csv), a file with hidden characters (src/cart.ts, a zero-width space) and a path
 //           with one (docs/notes/readme<U+202E>txt.exe), an env file shown masked (.env), a binary (assets/invoice-logo.png),
 //           one over 1 MB (data/fixtures/large-accounts.json), one of 25,000 lines just under 1 MB (src/generated/rates.ts), a
@@ -882,17 +933,27 @@ const sha256 = b => crypto.createHash('sha256').update(b).digest('hex');
 const DEMO_SAVED = 'This is the demo, so your change is kept only until Workbench closes.';
 const FILES_REPO = { name: 'storefront', root: '/Users/someone/code/storefront', head: 'a1b2c3d', branch: 'main', dirty: 0, identity: true };
 
+/** What each agent of the 'files' scenario changed in its copy, as git would count it: { name: [realChange, …] }. */
+let SAMPLE_WORK = null;
+function sampleWork() {
+  if (SAMPLE_WORK) return SAMPLE_WORK;
+  const s = filesSample();
+  SAMPLE_WORK = Object.fromEntries(Object.entries(s.agents).map(([name, files]) => [name, Object.entries(files)
+    .map(([path, text]) => realChange(path, typeof s.files[path] === 'string' ? s.files[path] : null, text)).filter(Boolean)]));
+  return SAMPLE_WORK;
+}
+
 /** The 'files' board: calm, live, on main; nothing needs you, so a question pushed later lights the sheet's pill. */
 function filesBoard(now) {
   const work = (a, o) => workOf(a, o);
+  // each agent's files and counts are its copy's real changes, so the board, the git screen and the file view agree
+  const counted = name => filesOf(sampleWork()[name].map(c => ({ path: c.path, adds: c.adds, dels: c.dels })));
   const raw = [
     { id: 'f1', name: 'Invoice export', state: 'done_checked', machineId: 'laptop', endedMin: 4, says: 'Invoices now go out in small batches, so large accounts can export without timing out.',
-      files: filesOf([{ path: 'src/invoices/export.ts', adds: 8, dels: 4 }, { path: 'src/invoices/query.ts', adds: 3, dels: 2 }, { path: 'src/invoices/batch.ts', adds: 16, dels: 0 },
-        { path: 'migrations/0042_invoice_lookup_index.sql', adds: 2, dels: 0 }, { path: 'test/invoices/large-account.test.ts', adds: 20, dels: 0 }]),
-      checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 41000 }] } },
-    { id: 'f2', name: 'Price rounding', state: 'working', machineId: 'laptop', now: 'Editing cart.ts', files: filesOf([{ path: 'src/cart.ts', adds: 3, dels: 1 }]) },
+      files: counted('Invoice export'), checks: { state: 'passed', results: [{ name: 'Unit tests', ok: true, ms: 41000 }] } },
+    { id: 'f2', name: 'Price rounding', state: 'working', machineId: 'laptop', now: 'Editing cart.ts', files: counted('Price rounding') },
     { id: 'f3', name: 'Help pages', state: 'done_claimed', machineId: 'laptop', endedMin: 12, harness: 'codex', says: 'I rewrote the README in plain language.',
-      files: filesOf([{ path: 'README.md', adds: 4, dels: 2 }]), checks: { state: 'none', results: [] } },
+      files: counted('Help pages'), checks: { state: 'none', results: [] } },
   ];
   for (const a of raw) a.work = work(a);
   const st = world(raw, now);
@@ -936,6 +997,8 @@ function filesSample() {
       'Invoice export': s.agent.files,
       'Price rounding': { 'src/cart.ts': files['src/cart.ts'].replace('return items.reduce((sum, item) => sum + item.price * item.quantity, 0);',
         'const cents = items.reduce((sum, item) => sum + item.price * item.quantity, 0);\n  // whole cents, so the total never shows a fraction\n  return Math.round(cents);') },
+      'Help pages': { 'README.md': files['README.md'].replace("The shop's code: the cart, the checkout and the invoice export for accounts.",
+        'The code of the shop: its cart, its checkout, and the export of invoices for large accounts.\n\nAsk in #storefront when something is unclear.') },
     },
   };
 }
@@ -1167,6 +1230,23 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       link: `This is a link to ${got.link}.`, secret: 'This file holds keys, so Workbench shows only their last four characters and does not edit it.', missing: 'This file is not there any more.' };
     if (kinds[got.kind]) return kinds[got.kind];
     return got.eol === 'mixed' ? 'This file mixes line endings, so Workbench does not edit it.' : null;
+  };
+  /**
+   * The 'files' scenario: an agent's changes on the git screen are its copy's real ones, against your folder as it
+   * started (each path its record names, as its copy holds it now), so each opens where it really changed.
+   */
+  const ownChanges = root => {
+    const w = filesWorld();
+    if (!w.base.agents[root.name]) return null;
+    const c = copyOf(root.id);
+    if (c.refusal) return null;
+    const out = [];
+    for (const f of (root.files && root.files.list) || []) {
+      const now = projOf(c.copy).textOf(f.path);
+      const got = now == null ? null : realChange(f.path, w.pristine.textOf(f.path), now);
+      if (got) out.push(got);
+    }
+    return out;
   };
   const readIn = (c, rel) => {
     if (Object.hasOwn(c.copy.links, rel)) { const t = c.copy.links[rel]; return { kind: 'link', link: t, hash: sha256(t), size: Buffer.byteLength(t), eol: 'none', bom: false }; }
@@ -1537,7 +1617,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
       if (gm) {
         GIT_READS.push({ at: Date.now(), path: p });
         if (mode.answer === 'refuse') return reply({ ok: false, reply: p === '/api/git' ? 'Workbench could not read the history of your repository.' : 'Workbench could not read that agent’s changes.' });
-        return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1])));
+        return reply(p === '/api/git' ? gitGraphOf(state) : changesOf(state, decodeURIComponent(gm[1]), name === 'files' ? ownChanges : null));
       }
       const m = /^\/api\/agents\/([^/]+)\/(answer|say|stop|raise-limit)$/.exec(p);
       if (m) {
