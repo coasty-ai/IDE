@@ -5,7 +5,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { listFiles, readFile, writeFile, changedLines, checkPath, isSaveFile, MAX_FILE_BYTES } from '../src/core/files.mjs';
+import {
+  listFiles, readFile, writeFile, changedLines, checkPath, isSaveFile, searchFiles, memoryProject, sampleProject, changedLinesBetween,
+  MAX_FILE_BYTES, MAX_SEARCH_RESULTS,
+} from '../src/core/files.mjs';
 
 // Keep the person's own git settings, name and email out of these repositories, and their home folder out of these
 // tests.
@@ -1037,4 +1040,187 @@ test('changedLines: a file the work took out of git but kept is compared with th
   const tmp = path.join(process.env.HOME, '.workbench', 'tmp');
   assert.deepEqual(fs.existsSync(tmp) ? fs.readdirSync(tmp).filter(n => n.startsWith('workbench-index-')) : [], []);
   assert.equal(git(ws, 'ls-files'), 'keep.js');
+});
+
+// ------------------------------------------------------------------ the list: ignored env files
+
+test('the list adds the env files a .gitignore hides, outside dependency folders, and says which they are', async () => {
+  // The upper-case name is named itself: whether `.env.*` hides it depends on whether git ignores case there.
+  const { root } = repo({ '.gitignore': '.env\n.env.*\n.ENV.production\n.envrc\n*.log\nnode_modules/\nconfig/local/\n', 'a.txt': 'a\n', 'apps/web/page.js': 'p\n' });
+  put(root, { '.env.example': 'KEY=\n' });
+  git(root, 'add', '-f', '.env.example'); // tracked, though the rules would hide it
+  git(root, 'commit', '-q', '-m', 'example');
+  put(root, {
+    '.env': 'KEY=1\n', '.envrc': 'export KEY=2\n', 'apps/web/.env.local': 'KEY=3\n', 'apps/web/.ENV.production': 'KEY=4\n',
+    'fresh/.env': 'KEY=5\n', // a new folder that holds nothing else
+    'node_modules/pkg/.env': 'KEY=6\n', 'vendor/lib/.env': 'KEY=7\n', 'apps/web/node_modules/x/.env.test': 'KEY=8\n', // dependencies
+    'prod.env': 'KEY=9\n', 'debug.log': 'not an env file\n', 'config/local/.env': 'KEY=10\n',
+  });
+  const got = await listFiles({ root });
+  assert.deepEqual(got.ignored, ['.env', '.envrc', 'apps/web/.ENV.production', 'apps/web/.env.local', 'fresh/.env']);
+  assert.deepEqual(got.files, ['.env', '.env.example', '.envrc', '.gitignore', 'a.txt', 'apps/web/.ENV.production', 'apps/web/.env.local',
+    'apps/web/page.js', 'fresh/.env', 'prod.env']);
+  assert.equal(got.truncated, undefined);
+  // They open as env files do: each value masked, never edited.
+  const env = await readFile({ root, rel: 'apps/web/.env.local' });
+  assert.deepEqual([env.kind, env.text], ['secret', 'KEY=••••\n']);
+  // With none hidden, the answer is as it was.
+  const { root: plain } = repo({ 'a.txt': 'a\n' });
+  assert.deepEqual(await listFiles({ root: plain }), { files: ['a.txt'] });
+});
+
+// ------------------------------------------------------------------ search
+
+test('search: fixed strings in tracked and new files, any case unless the words have a capital, with path, line and text', async () => {
+  const { root } = repo({
+    'src/cart.js': 'const total = 1;\nconst Total = 2; // Alpha\n', 'docs/a.md': 'alpha beta\nsee a.c and (x)\n', 'win.txt': 'one\r\nAlpha two\r\n',
+    'logo.png': Buffer.concat([Buffer.from('alpha'), Buffer.from([0, 1, 2])]), '.gitignore': '*.log\n',
+  });
+  put(root, { 'notes/new.txt': 'an alpha in a new file\n', 'debug.log': 'alpha, hidden by .gitignore\n' });
+  assert.deepEqual(await searchFiles({ root, query: 'alpha' }), { results: [
+    { path: 'docs/a.md', line: 1, text: 'alpha beta' },
+    { path: 'notes/new.txt', line: 1, text: 'an alpha in a new file' },
+    { path: 'src/cart.js', line: 2, text: 'const Total = 2; // Alpha' },
+    { path: 'win.txt', line: 2, text: 'Alpha two' },
+  ] });
+  assert.deepEqual((await searchFiles({ root, query: 'Total' })).results, [{ path: 'src/cart.js', line: 2, text: 'const Total = 2; // Alpha' }]);
+  // Fixed strings: nothing is a pattern, and words that start with "-" are words, not options.
+  assert.deepEqual((await searchFiles({ root, query: 'a.c' })).results, [{ path: 'docs/a.md', line: 2, text: 'see a.c and (x)' }]);
+  assert.deepEqual((await searchFiles({ root, query: '(x)' })).results.map(r => r.path), ['docs/a.md']);
+  assert.deepEqual(await searchFiles({ root, query: 'a*c' }), { results: [] });
+  put(root, { 'flags.txt': 'run it with -e alpha and --output\n' });
+  assert.deepEqual((await searchFiles({ root, query: '--output' })).results, [{ path: 'flags.txt', line: 1, text: 'run it with -e alpha and --output' }]);
+  assert.deepEqual((await searchFiles({ root, query: '-e alpha' })).results.map(r => r.path), ['flags.txt']);
+});
+
+test('search leaves out what the file view leaves out: env files, saves’ siblings, git’s own folder, and anything through a link', async () => {
+  const { root } = repo({ 'a.txt': 'needle\n', '.env.example': 'needle=1\n', 'prod.env': 'needle=2\n', 'cfg/LOUD.ENV': 'needle=3\n', '.envrc': 'export needle=4\n' });
+  put(root, { '.a.txt.workbench-save-0123456789abcdef': 'needle, half saved\n' });
+  fs.writeFileSync(path.join(outside, 'needles.txt'), 'needle outside\n');
+  fs.symlinkSync(path.join(outside, 'needles.txt'), path.join(root, 'out.txt'));
+  fs.symlinkSync(outside, path.join(root, 'ext'));
+  fs.appendFileSync(path.join(root, '.git', 'config'), '# needle\n');
+  assert.deepEqual(await searchFiles({ root, query: 'needle' }), { results: [{ path: 'a.txt', line: 1, text: 'needle' }] });
+});
+
+test('search cuts a long line to 400 characters around the match, and stops at the most results asked for', async () => {
+  const long = `${'a'.repeat(1000)}NEEDLE${'b'.repeat(1000)}`;
+  const many = Array.from({ length: 30 }, (_, i) => `needle ${i}`).join('\n') + '\n';
+  const { root } = repo({ 'min.js': `${long}\n`, 'start.js': `NEEDLE${'c'.repeat(1000)}\n`, 'many.txt': many, 'wide.txt': `${'界'.repeat(300)}NEEDLE${'界'.repeat(300)}\n` });
+  const r = await searchFiles({ root, query: 'NEEDLE' });
+  const at = p => r.results.find(x => x.path === p).text;
+  for (const p of ['min.js', 'start.js', 'wide.txt']) {
+    assert.ok(Array.from(at(p)).length <= 400, p);
+    assert.ok(at(p).includes('NEEDLE'), `${p}: the match shows`);
+  }
+  assert.match(at('min.js'), /^…a+NEEDLEb+…$/);
+  assert.match(at('start.js'), /^NEEDLEc+…$/);
+  assert.match(at('wide.txt'), /^…界+NEEDLE界+…$/);
+  assert.equal(MAX_SEARCH_RESULTS, 200);
+  const capped = await searchFiles({ root, query: 'needle', max: 10 });
+  assert.equal(capped.results.length, 10);
+  assert.equal(capped.truncated, true);
+  assert.equal((await searchFiles({ root, query: 'needle', max: 5000 })).results.length, 33, 'never more than 200, and here all of them');
+});
+
+test('search refuses words it cannot look for, in plain words, and says when git cannot', async () => {
+  const { root } = repo({ 'a.txt': 'a\n' });
+  await refused(searchFiles({ root, query: 'a' }), /^Type at least two characters to search for\.$/);
+  await refused(searchFiles({ root, query: '' }), /at least two characters/);
+  await refused(searchFiles({ root, query: 'x'.repeat(201) }), /^Workbench searches for at most 200 characters at a time\.$/);
+  await refused(searchFiles({ root, query: 'one\ntwo' }), /^Workbench searches for words on one line\.$/);
+  await refused(searchFiles({ root, query: 'one\rtwo' }), /on one line/);
+  await refused(searchFiles({ root, query: 'a\0b' }), /^Workbench cannot search for a NUL character\.$/);
+  await refused(searchFiles({ root, query: 'half \ud800' }), /cannot be searched for/);
+  await refused(searchFiles({ root, query: 42 }), /^There was nothing to search for\.$/);
+  assert.deepEqual(await searchFiles({ root, query: 'x'.repeat(200) }), { results: [] });
+  const plain = path.join(T, `not-a-repo-${++made}`);
+  fs.mkdirSync(plain);
+  await refused(searchFiles({ root: plain, query: 'ab' }), /^Git could not search the files in .*not-a-repo-\d+\.$/);
+});
+
+test('search: when git says too much or takes too long, what came whole is kept and the answer is cut', async (t) => {
+  const { root } = repo({ 'a.txt': 'needle\n' });
+  // A stand-in that answers `grep` with one whole record and half of the next, then waits; everything else goes to
+  // the real program.
+  const realGit = process.env.PATH.split(path.delimiter).map(d => path.join(d, 'git')).find(p => fs.existsSync(p));
+  const bin = path.join(T, `bin-${++made}`);
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    'for a in "$@"; do',
+    '  if [ "$a" = "grep" ]; then printf \'%s\\0%s\\0%s\\n%s\\0%s\\0%s\' a.txt 1 needle b.txt 2 nee; exec sleep 5; fi',
+    'done',
+    `exec '${realGit}' "$@"`,
+  ].join('\n') + '\n', { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${PATH}`;
+  t.after(() => { process.env.PATH = PATH; });
+  assert.deepEqual(await searchFiles({ root, query: 'needle', timeoutMs: 300 }), { results: [{ path: 'a.txt', line: 1, text: 'needle' }], truncated: true });
+});
+
+// ------------------------------------------------------------------ the demo's project, in memory
+
+test('the demo’s sample project: a handful of files in two folders, a CRLF file, an env file with a made-up key, and a hidden character', async () => {
+  const s = sampleProject();
+  const paths = Object.keys(s.files).sort();
+  assert.ok(paths.length >= 5 && paths.length <= 8, `${paths.length} files`);
+  assert.deepEqual([...new Set(paths.filter(p => p.includes('/')).map(p => p.slice(0, p.lastIndexOf('/'))))].sort(), ['src', 'src/invoices']);
+  assert.deepEqual([s.name, s.branch, s.agent.name], ['storefront', 'main', 'Invoice export']);
+  const p = memoryProject(s.files);
+  assert.deepEqual(await p.listFiles(), { files: paths, ignored: ['.env'] });
+  const kinds = {};
+  for (const rel of paths) kinds[rel] = (await p.readFile({ rel })).kind;
+  assert.deepEqual(Object.keys(kinds).filter(rel => kinds[rel] === 'secret'), ['.env']);
+  const env = await p.readFile({ rel: '.env' });
+  const key = /STRIPE_SECRET_KEY=(\S+)/.exec(s.files['.env'])[1];
+  assert.match(key, /^sk_test_[0-9a-f]{24}$/);
+  assert.equal(env.text.includes(key), false);
+  assert.ok(env.text.includes(`•••• ${key.slice(-4)}`));
+  assert.notEqual(/STRIPE_SECRET_KEY=(\S+)/.exec(sampleProject().files['.env'])[1], key, 'made at run time, new each time');
+  const crlf = paths.filter(rel => s.files[rel].includes('\r\n'));
+  assert.equal(crlf.length, 1);
+  assert.equal((await p.readFile({ rel: crlf[0] })).eol, 'crlf');
+  assert.equal(paths.filter(rel => /[​-‏‪-‮⁠-⁤﻿]/.test(s.files[rel])).length, 1, 'one file has a hidden character');
+  // The simulated agent's copy changes files and adds one; its changed lines are worked out from the texts.
+  for (const [rel, text] of Object.entries(s.agent.files)) {
+    const lines = changedLinesBetween(s.files[rel] ?? null, text);
+    assert.ok(lines.length > 0, rel);
+    if (!(rel in s.files)) assert.deepEqual(lines, Array.from({ length: text.split('\n').length - 1 }, (_, i) => i + 1), `${rel} is new`);
+  }
+});
+
+test('a project in memory is read, searched and saved by the file view’s own rules', async () => {
+  const p = memoryProject({ 'a.txt': 'one\ntwo\n', 'win.csv': 'a,b\r\n1,2\r\n', 'mixed.txt': 'a\r\nb\n', '.env': 'K=abcdefghijklmnop\n', 'bin.dat': Buffer.from([1, 0, 2]) });
+  assert.deepEqual(await p.readFile({ rel: 'missing.txt' }), { kind: 'missing', hash: null, size: 0, eol: 'none', bom: false });
+  await refused(p.readFile({ rel: '../a.txt' }), /is not the name of a file inside the project/);
+  await refused(p.readFile({ rel: '.git/config' }), /git’s own folder/);
+  const a = await p.readFile({ rel: 'a.txt' });
+  assert.deepEqual(a, { kind: 'text', text: 'one\ntwo\n', hash: sha('one\ntwo\n'), size: 8, lines: 2, eol: 'lf', bom: false });
+  // CRLF stays CRLF.
+  const w = await p.readFile({ rel: 'win.csv' });
+  assert.deepEqual(await p.writeFile({ rel: 'win.csv', text: 'a,b\n3,4\n', hash: w.hash }), { hash: sha('a,b\r\n3,4\r\n'), size: 10 });
+  assert.equal(p.textOf('win.csv'), 'a,b\n3,4\n');
+  // A save over a file that changed is refused with its hash now; force needs that hash.
+  await assert.rejects(p.writeFile({ rel: 'win.csv', text: 'x\n', hash: w.hash }), e => e.why === 'changed' && e.hash === sha('a,b\r\n3,4\r\n'));
+  await p.writeFile({ rel: 'win.csv', text: 'x\n', hash: sha('a,b\r\n3,4\r\n'), force: true });
+  await refused(p.writeFile({ rel: '.env', text: 'K=1\n', hash: (await p.readFile({ rel: '.env' })).hash }), /holds keys, so Workbench does not edit it/);
+  await refused(p.writeFile({ rel: 'mixed.txt', text: 'a\nb\n', hash: sha('a\r\nb\n') }), /mixes line endings/);
+  await refused(p.writeFile({ rel: 'bin.dat', text: 'x', hash: sha(Buffer.from([1, 0, 2])) }), /is a binary file/);
+  await refused(p.writeFile({ rel: 'new.txt', text: 'x', hash: sha('') }), /does not make new files/);
+  await refused(p.writeFile({ rel: 'a.txt', text: 'a\r\n', hash: a.hash }), /carriage return/);
+  // Search: as on disk, with env files and binary files left out.
+  assert.deepEqual(await p.searchFiles({ query: 'TWO' }), { results: [] });
+  assert.deepEqual(await p.searchFiles({ query: 'two' }), { results: [{ path: 'a.txt', line: 2, text: 'two' }] });
+  assert.deepEqual(await p.searchFiles({ query: 'abcdefgh' }), { results: [] });
+  await refused(p.searchFiles({ query: 'x' }), /at least two characters/);
+});
+
+test('changedLinesBetween: the lines of the new text that are new or changed', () => {
+  assert.deepEqual(changedLinesBetween('a\nb\nc\n', 'a\nB\nc\nd\n'), [2, 4]);
+  assert.deepEqual(changedLinesBetween('a\nb\nc\n', 'a\nc\n'), []);
+  assert.deepEqual(changedLinesBetween('a\nb\n', 'x\na\nb\n'), [1]);
+  assert.deepEqual(changedLinesBetween(null, 'x\ny'), [1, 2]);
+  assert.deepEqual(changedLinesBetween('same\n', 'same\n'), []);
+  assert.deepEqual(changedLinesBetween('', ''), []);
 });

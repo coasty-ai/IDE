@@ -1,5 +1,6 @@
-// The files of a project, for the file view: the list of them, one file read, one file saved, and the lines of a file
-// that an agent's work added or changed.
+// The files of a project, for the file view: the list of them (with the env files an ignore rule hides), one file read,
+// one file saved, a search through them, and the lines of a file that an agent's work added or changed. And, for the
+// demo, a small sample project that lives in memory and is read, searched and saved by the same rules.
 //
 // Paths come from the page, and an agent can steer what it asks for (agents name files and make links), so every path
 // is checked here (checkPath) and again by the engine: relative, with "/" between its parts, nothing that climbs out,
@@ -12,14 +13,20 @@
 // A save is atomic. The new bytes go into a new file beside the original, which is then renamed over it. That file is
 // the one exception to privateTemp(): a rename is atomic only within one folder's volume.
 //
+// Standing in a folder means process.chdir, which a worker thread cannot do and which belongs to the whole process:
+// this module runs on the main thread, and nothing else in Workbench may hand Node a relative path (see standingIn).
+//
 // Every git call goes through git() in workspace.mjs. Every refusal is a plain sentence: Node's and git's own words go
 // only in an error's `.detail`, for the log.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { git, privateTemp } from './workspace.mjs';
+import { git, privateTemp, isSaveFile } from './workspace.mjs';
 import { shownValue } from './keys.mjs';
 import { looksLikeSecret } from '../shared/secretshape.mjs';
+
+// The name of a save's sibling is one rule, kept with the work set that leaves it out (workspace.mjs).
+export { isSaveFile };
 
 /** The largest file the view shows or saves, in bytes: 1 MB. */
 export const MAX_FILE_BYTES = 1024 * 1024;
@@ -40,8 +47,6 @@ const BOM = Buffer.from([0xef, 0xbb, 0xbf]);
 const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 /** The longest name of one file, in bytes, on the file systems Workbench runs on. */
 const NAME_MAX = 255;
-/** The name of the sibling a save writes beside a file (see saveName). */
-const SAVE_NAME = /^\.[\s\S]+\.workbench-save-[0-9a-f]{16}$/;
 /**
  * The diff flags of workspace.mjs's patches (PATCH, which patchesOf uses), and no others: diff-index in place of
  * diff-tree, since one side is the working folder, which needs no -r.
@@ -219,17 +224,6 @@ function standingIn(at, rel, verb, fn) {
       process.chdir('/'); // where it stood was removed meanwhile
     }
   }
-}
-
-/**
- * Whether `rel` names the sibling a save writes beside a file, `.<name>.workbench-save-<16 hex>`: one is there only
- * while a save runs, or after a save was cut short. The list leaves these out.
- * @param {string} rel
- * @returns {boolean}
- */
-export function isSaveFile(rel) {
-  const s = String(rel);
-  return SAVE_NAME.test(s.slice(s.lastIndexOf('/') + 1));
 }
 
 // ------------------------------------------------------------------ reading
@@ -503,7 +497,7 @@ function sweepLeftovers() {
   }
   const before = Date.now() - LEFTOVER_MS;
   for (const name of names) {
-    if (!SAVE_NAME.test(name)) continue;
+    if (!isSaveFile(name)) continue;
     try {
       const st = fs.lstatSync(name);
       if (st.isFile() && st.mtimeMs < before) fs.unlinkSync(name);
@@ -576,13 +570,7 @@ function replace(at, mode, bytes, hash, rel, force) {
  */
 export async function writeFile({ root, rel, text, hash, force = false } = {}) {
   partsOf(rel, 'change');
-  if (typeof text !== 'string') throw plainError('There was no text to save.');
-  if (typeof hash !== 'string' || !SHA256.test(hash)) {
-    throw plainError(`Workbench does not know which version of ${shown(rel)} was edited, so nothing was saved.`);
-  }
-  if (text.includes('\r')) throw plainError('The text to save has a carriage return in it, which Workbench does not write, so nothing was saved.');
-  if (text.includes('\0')) throw plainError('The text to save has a NUL character in it, so nothing was saved.');
-  if (!text.isWellFormed()) throw plainError('The text to save has characters that cannot be written as UTF-8, so nothing was saved.');
+  checkText(rel, text, hash);
   const at = locate(root, rel, 'change');
   if (at.missing) throw notThere(rel);
   try {
@@ -603,21 +591,43 @@ function save(at, rel, text, hash, force) {
   if (cur.missing) throw notThere(rel);
   if (!cur.bytes) throw tooLarge(rel);
   const was = describe(rel, cur.bytes);
-  const kept = { binary: 'is a binary file', notutf8: 'is not UTF-8 text', secret: 'holds keys' }[was.kind];
-  if (kept) throw plainError(`${shown(rel)} ${kept}, so Workbench does not edit it.`);
-  if (was.eol === 'mixed') throw plainError(`${shown(rel)} mixes line endings, so Workbench does not edit it.`);
-  if (was.hash !== hash) throw changed(rel, was.hash, force);
+  checkEditable(rel, was, hash, force);
   try {
     fs.accessSync(at.name, fs.constants.W_OK);
   } catch (e) {
     if (e.code === 'EACCES' || e.code === 'EPERM' || e.code === 'EROFS') throw plainError(`${shown(rel)} is read-only, so Workbench did not change it.`);
     throw e;
   }
+  const bytes = bytesFor(rel, was, text);
+  replace(at, cur.mode, bytes, hash, rel, force);
+  return { hash: sha256(bytes), size: bytes.length };
+}
+
+/** What writeFile checks of the text and the hash before it looks at the file (see writeFile). */
+function checkText(rel, text, hash) {
+  if (typeof text !== 'string') throw plainError('There was no text to save.');
+  if (typeof hash !== 'string' || !SHA256.test(hash)) {
+    throw plainError(`Workbench does not know which version of ${shown(rel)} was edited, so nothing was saved.`);
+  }
+  if (text.includes('\r')) throw plainError('The text to save has a carriage return in it, which Workbench does not write, so nothing was saved.');
+  if (text.includes('\0')) throw plainError('The text to save has a NUL character in it, so nothing was saved.');
+  if (!text.isWellFormed()) throw plainError('The text to save has characters that cannot be written as UTF-8, so nothing was saved.');
+}
+
+/** Whether the file as it is now (`was`, as describe gives it) is one Workbench edits, and still holds `hash`. */
+function checkEditable(rel, was, hash, force) {
+  const kept = { binary: 'is a binary file', notutf8: 'is not UTF-8 text', secret: 'holds keys' }[was.kind];
+  if (kept) throw plainError(`${shown(rel)} ${kept}, so Workbench does not edit it.`);
+  if (was.eol === 'mixed') throw plainError(`${shown(rel)} mixes line endings, so Workbench does not edit it.`);
+  if (was.hash !== hash) throw changed(rel, was.hash, force);
+}
+
+/** The bytes that `text` makes over the file `was` describes: its line endings and its BOM kept. At most 1 MB. */
+function bytesFor(rel, was, text) {
   const body = Buffer.from(was.eol === 'crlf' ? text.replace(/\n/g, '\r\n') : text, 'utf8');
   const bytes = was.bom ? Buffer.concat([BOM, body]) : body;
   if (bytes.length > MAX_FILE_BYTES) throw plainError(`The edit would make ${shown(rel)} larger than 1 MB, so Workbench did not save it.`);
-  replace(at, cur.mode, bytes, hash, rel, force);
-  return { hash: sha256(bytes), size: bytes.length };
+  return bytes;
 }
 
 // ------------------------------------------------------------------ the list
@@ -658,21 +668,55 @@ const utf8OrNull = bytes => {
   }
 };
 
+/** Folders that hold other people's code, a project's dependencies: an env file in one is not the project's. */
+const DEPENDENCY_FOLDERS = new Set(['node_modules', 'bower_components', 'jspm_packages', 'vendor', '.venv', 'venv', '.tox',
+  '__pypackages__', 'site-packages', 'pods', 'carthage', '.bundle', '.yarn', '.pnpm-store', '.gradle', 'elm-stuff']);
+/** The most of git's list of hidden files that the list reads, for the env files in it. */
+const HIDDEN_LIST_BYTES = 16 * 1024 * 1024;
+
+/** An env file the list shows though an ignore rule hides it: named .env, .env.<anything> or .envrc, in any case. */
+function isDotEnv(rel) {
+  const name = rel.slice(rel.lastIndexOf('/') + 1).toLowerCase();
+  return name === '.env' || name === '.envrc' || name.startsWith('.env.');
+}
+
+const inDependencies = rel => rel.split('/').slice(0, -1).some(part => DEPENDENCY_FOLDERS.has(part.toLowerCase()));
+
+/**
+ * What git lists of the files its ignore rules hide, for the env files among them: { stdout, cut }. A folder that an
+ * ignore rule names is listed as the folder, and git does not look inside it. Never rejects: without these the list is
+ * still right, only shorter.
+ */
+async function hiddenFiles(cwd) {
+  try {
+    const r = await git(['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'],
+      { cwd, encoding: 'buffer', maxBuffer: HIDDEN_LIST_BYTES });
+    return { stdout: r.stdout, cut: false };
+  } catch (e) {
+    const tooMuch = !!e && (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || e.killed === true);
+    return tooMuch && Buffer.isBuffer(e.stdout) ? { stdout: e.stdout, cut: true } : { stdout: Buffer.alloc(0), cut: false };
+  }
+}
+
 /**
  * The project's files: what `git ls-files -z --cached --others --exclude-standard` lists, run as its two halves so that
  * tracked files come first when the list is cut: every tracked file (one in a conflict once), then every new file no
- * ignore rule hides. Left out: a repository inside the folder (git names it "folder/"), a name that is not UTF-8 (the
- * page could not ask for it by name), a name the path rules refuse, and the sibling of a save (see isSaveFile). When
- * the new files are more than git() reads at once, or git is stopped for taking too long listing them (an un-ignored
- * node_modules in an agent's copy, say), the names it gave whole are kept and the list is cut there: what git did not
- * give is not known. The tracked files are not cut that way: without them all, the list is refused.
+ * ignore rule hides. Between them come the env files an ignore rule hides (named .env, .env.<anything> or .envrc, in
+ * any case), outside dependency folders (node_modules, vendor and the like), so a person can see that a copy has its
+ * .env; they are named in `ignored` too. Left out: a repository inside the folder (git names it "folder/"), a name that
+ * is not UTF-8 (the page could not ask for it by name), a name the path rules refuse, and the sibling of a save (see
+ * isSaveFile). When the new files are more than git() reads at once, or git is stopped for taking too long listing them
+ * (an un-ignored node_modules in an agent's copy, say), the names it gave whole are kept and the list is cut there: what
+ * git did not give is not known. The tracked files are not cut that way: without them all, the list is refused.
  * @param {{ root: string, max?: number }} o max: at most this many, and never more than 50,000 (MAX_LIST_FILES)
- * @returns {Promise<{ files: string[], truncated?: true }>} paths from root with "/", ordered by path; truncated when
- *   there were more, or may have been. Rejects with a plain error when git cannot list them.
+ * @returns {Promise<{ files: string[], ignored?: string[], truncated?: true }>} paths from root with "/", ordered by
+ *   path; ignored: the hidden env files among them, ordered by path, when there are any; truncated when there were
+ *   more, or may have been. Rejects with a plain error when git cannot list them.
  */
 export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
   const top = realFolder(root);
   const limit = Number.isInteger(max) && max >= 0 ? Math.min(max, MAX_LIST_FILES) : MAX_LIST_FILES;
+  const hidden = hiddenFiles(top);
   let halves;
   try {
     halves = await Promise.all([
@@ -683,24 +727,145 @@ export async function listFiles({ root, max = MAX_LIST_FILES } = {}) {
     throw gitTrouble(e) || plainError(`Git could not list the files in ${top}.`, { cause: e });
   }
   const files = [];
+  const ignored = [];
   const seen = new Set();
   let truncated = false;
-  for (const { stdout, cut } of halves) {
+  for (const { stdout, cut, env } of [halves[0], { ...(await hidden), env: true }, halves[1]]) {
     for (const raw of nulFields(stdout, cut)) {
       const name = utf8OrNull(raw);
       if (name === null || name.endsWith('/') || seen.has(name) || isSaveFile(name) || pathProblem(name, 'open')) continue;
+      if (env && (!isDotEnv(name) || inDependencies(name))) continue;
       if (files.length >= limit) {
         truncated = true;
         break;
       }
       seen.add(name);
       files.push(name);
+      if (env) ignored.push(name);
     }
-    if (cut) truncated = true;
+    if (cut && !env) truncated = true; // a cut list of hidden files only leaves some env files out
     if (truncated) break;
   }
   files.sort();
-  return truncated ? { files, truncated: true } : { files };
+  const out = { files };
+  if (ignored.length) out.ignored = ignored.sort();
+  if (truncated) out.truncated = true;
+  return out;
+}
+
+// ------------------------------------------------------------------ search
+
+/** The most results a search gives. */
+export const MAX_SEARCH_RESULTS = 200;
+/** How long git may search, in milliseconds: then it is stopped, and what it found by then is kept. */
+const SEARCH_MS = 5000;
+/** The most of git's answer a search reads: what comes after it is not looked at. */
+const SEARCH_BYTES = 8 * 1024 * 1024;
+/** The longest text a result shows, in characters, cut around the match; and how much of it comes before the match. */
+const RESULT_CHARS = 400;
+const BEFORE_MATCH = 100;
+/** The words a search takes, in characters. */
+const QUERY_MIN = 2;
+const QUERY_MAX = 200;
+/** Env files, as isEnvFile names them, kept out of git's search: their values would show. Checked again by name. */
+const NO_ENV = [':(exclude,glob,icase)**/*.env', ':(exclude,glob,icase)**/.env.*', ':(exclude,glob,icase)**/.envrc'];
+/** UTF-8 read leniently, for a line's text: a broken character shows as U+FFFD. */
+const LENIENT = new TextDecoder('utf-8');
+
+/** The words to search for, checked: a string of 2 to 200 characters on one line, whole UTF-8. Throws a plain refusal. */
+function checkQuery(query) {
+  if (typeof query !== 'string') throw plainError('There was nothing to search for.');
+  if (query.includes('\0')) throw plainError('Workbench cannot search for a NUL character.');
+  if (/[\r\n]/.test(query)) throw plainError('Workbench searches for words on one line.');
+  if (!query.isWellFormed()) throw plainError('That has a character that cannot be searched for.');
+  const n = Array.from(query).length;
+  if (n < QUERY_MIN) throw plainError('Type at least two characters to search for.');
+  if (n > QUERY_MAX) throw plainError(`Workbench searches for at most ${QUERY_MAX} characters at a time.`);
+  return query;
+}
+
+const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * A line as a result shows it: whole when it is at most 400 characters; else 400 characters around the match, starting
+ * 100 before it, with "…" where it was cut. Characters are counted as code points, so none is cut in half.
+ */
+function around(text, query, icase) {
+  const chars = Array.from(text);
+  if (chars.length <= RESULT_CHARS) return text;
+  const found = icase ? text.search(new RegExp(escapeRegExp(query), 'iu')) : text.indexOf(query);
+  const at = found < 0 ? 0 : Array.from(text.slice(0, found)).length;
+  const start = Math.max(0, Math.min(at - BEFORE_MATCH, chars.length - RESULT_CHARS));
+  const piece = chars.slice(start, start + RESULT_CHARS);
+  if (start > 0) piece[0] = '…';
+  if (start + RESULT_CHARS < chars.length) piece[piece.length - 1] = '…';
+  return piece.join('');
+}
+
+/**
+ * git grep's records (`-z -n`: the path, a NUL, the line number, a NUL, then the line up to its newline), as buffers.
+ * When the answer was `cut` short, a last record without its newline was cut off part-way, and is left out.
+ */
+function* grepRecords(buf, cut) {
+  let at = 0;
+  while (at < buf.length) {
+    const a = buf.indexOf(0, at);
+    const b = a < 0 ? -1 : buf.indexOf(0, a + 1);
+    if (b < 0) return;
+    let c = buf.indexOf(10, b + 1);
+    if (c < 0) {
+      if (cut) return;
+      c = buf.length;
+    }
+    yield { path: buf.subarray(at, a), line: buf.subarray(a + 1, b), text: buf.subarray(b + 1, c) };
+    at = c + 1;
+  }
+}
+
+/**
+ * The lines that hold `query`, in the project's files: `git grep -n -I --fixed-strings --untracked --no-color -z`, with
+ * `-i` when the words have no capital letter. The words go to git on its stdin (`-f -`), never on its command line,
+ * which other programs on the computer can read: a person may search for a key. Tracked files and new files no ignore
+ * rule hides are searched, as they are in the folder; binary files are not (`-I`), nor is anything through a link.
+ * Results follow the list's rules (a name that is not UTF-8, one the path rules refuse, a save's sibling: left out),
+ * and env files are left out (git never reads them, and they are checked again by name): their values would show.
+ * When git takes longer than `timeoutMs`, or says more than 8 MB, it is stopped: the results it gave whole are kept,
+ * and the answer is `truncated`.
+ * @param {{ root: string, query: string, max?: number, timeoutMs?: number }} o query: 2 to 200 characters on one line;
+ *   max: at most this many results, and never more than 200 (MAX_SEARCH_RESULTS); timeoutMs: 5 seconds unless given
+ * @returns {Promise<{ results: { path: string, line: number, text: string }[], truncated?: true }>} ordered by path,
+ *   then line; text: the line without its line ending, cut to 400 characters around the match. Rejects with a plain
+ *   error for words it does not search for, and when git cannot search.
+ */
+export async function searchFiles({ root, query, max = MAX_SEARCH_RESULTS, timeoutMs = SEARCH_MS } = {}) {
+  const q = checkQuery(query);
+  const top = realFolder(root);
+  const limit = Number.isInteger(max) && max > 0 ? Math.min(max, MAX_SEARCH_RESULTS) : MAX_SEARCH_RESULTS;
+  const icase = !/\p{Lu}/u.test(q);
+  const args = ['grep', '-n', '-I', '--fixed-strings', '--untracked', '--no-color', '-z', ...(icase ? ['-i'] : []), '-f', '-', '--', '.', ...NO_ENV];
+  let out;
+  let cut = false;
+  try {
+    out = (await git(args, { cwd: top, input: `${q}\n`, encoding: 'buffer', okCodes: [1], timeout: timeoutMs, maxBuffer: SEARCH_BYTES })).stdout;
+  } catch (e) {
+    const stopped = !!e && (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || e.killed === true);
+    if (!stopped || !Buffer.isBuffer(e.stdout)) throw gitTrouble(e) || plainError(`Git could not search the files in ${top}.`, { cause: e });
+    out = e.stdout;
+    cut = true;
+  }
+  const results = [];
+  let truncated = cut;
+  for (const r of grepRecords(out, cut)) {
+    const name = utf8OrNull(r.path);
+    const line = Number(r.line.toString('latin1'));
+    if (name === null || isSaveFile(name) || isEnvFile(name) || pathProblem(name, 'open') || !Number.isInteger(line) || line < 1) continue;
+    if (results.length >= limit) {
+      truncated = true;
+      break;
+    }
+    results.push({ path: name, line, text: around(LENIENT.decode(r.text).replace(/\r$/, ''), q, icase) });
+  }
+  return truncated ? { results, truncated: true } : { results };
 }
 
 // ------------------------------------------------------------------ changed lines
@@ -802,4 +967,237 @@ export async function changedLines({ root, since, rel } = {}) {
   } catch (e) {
     throw await diffFailure(e, at.top, since, rel);
   }
+}
+
+// ------------------------------------------------------------------ the demo: a project in memory
+
+/** Lines of `text` as git counts them: a last line without a newline counts, an empty text has none. */
+function linesOf(text) {
+  const lines = String(text ?? '').split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+/** Past this many cells, two texts are not compared line by line: every line between their common ends counts. */
+const LCS_CELLS = 4_000_000;
+
+/**
+ * The line numbers (from 1) of `after` that are new or changed against `before`: the lines outside their longest common
+ * run of lines, after their common start and end are set aside. `before` null: every line of `after` is new. Lines only
+ * taken away mark nothing. For the demo, which has no git to ask.
+ * @param {string|null} before
+ * @param {string} after
+ * @returns {number[]}
+ */
+export function changedLinesBetween(before, after) {
+  const b = linesOf(after);
+  if (before == null) return b.map((_, i) => i + 1);
+  const a = linesOf(before);
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let e = 0;
+  while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+  const A = a.slice(s, a.length - e);
+  const B = b.slice(s, b.length - e);
+  const out = [];
+  if (!A.length || A.length * B.length > LCS_CELLS) {
+    for (let j = 0; j < B.length; j++) out.push(s + j + 1);
+    return out;
+  }
+  const L = Array.from({ length: A.length + 1 }, () => new Uint32Array(B.length + 1));
+  for (let i = A.length - 1; i >= 0; i--) {
+    for (let j = B.length - 1; j >= 0; j--) L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  }
+  for (let i = 0, j = 0; j < B.length;) {
+    if (i < A.length && A[i] === B[j]) {
+      i++;
+      j++;
+    } else if (i < A.length && L[i + 1][j] >= L[i][j + 1]) {
+      i++;
+    } else {
+      out.push(s + j + 1);
+      j++;
+    }
+  }
+  return out;
+}
+
+/**
+ * A project held in memory, for the demo: the file view's functions over files that last only for this run, by the
+ * same rules as on disk. `files`: { path: text or bytes }. A save changes the copy in memory, nothing else.
+ * @param {Record<string, string|Buffer>} files
+ * @returns {{ listFiles(): Promise<{ files: string[], ignored?: string[] }>, readFile(o: { rel: string }): Promise<object>,
+ *   writeFile(o: { rel: string, text: string, hash: string, force?: boolean }): Promise<{ hash: string, size: number }>,
+ *   searchFiles(o: { query: string, max?: number }): Promise<{ results: object[], truncated?: true }>, textOf(rel: string): string|null }}
+ *   listFiles, readFile, writeFile and searchFiles answer and refuse as their namesakes on disk do; `ignored` names the
+ *   env files (.env, .env.<anything>, .envrc), which a real project's ignore rules would hide. textOf: a text file's
+ *   text as readFile gives it, or null.
+ */
+export function memoryProject(files = {}) {
+  const held = new Map();
+  for (const [rel, body] of Object.entries(files)) {
+    checkPath(rel);
+    held.set(rel, Buffer.from(body));
+  }
+  const describeHeld = (rel, bytes) => (bytes.length > MAX_FILE_BYTES ? { kind: 'large', hash: null, size: bytes.length, eol: 'none', bom: false } : describe(rel, bytes));
+  return {
+    async listFiles() {
+      const list = [...held.keys()].sort();
+      const ignored = list.filter(isDotEnv);
+      return ignored.length ? { files: list, ignored } : { files: list };
+    },
+    async readFile({ rel } = {}) {
+      partsOf(rel, 'open');
+      const bytes = held.get(rel);
+      return bytes ? describeHeld(rel, bytes) : { ...MISSING };
+    },
+    async writeFile({ rel, text, hash, force = false } = {}) {
+      partsOf(rel, 'change');
+      checkText(rel, text, hash);
+      const cur = held.get(rel);
+      if (!cur) throw notThere(rel);
+      if (cur.length > MAX_FILE_BYTES) throw tooLarge(rel);
+      const was = describe(rel, cur);
+      checkEditable(rel, was, hash, force);
+      const bytes = bytesFor(rel, was, text);
+      held.set(rel, bytes);
+      return { hash: sha256(bytes), size: bytes.length };
+    },
+    async searchFiles({ query, max = MAX_SEARCH_RESULTS } = {}) {
+      const q = checkQuery(query);
+      const limit = Number.isInteger(max) && max > 0 ? Math.min(max, MAX_SEARCH_RESULTS) : MAX_SEARCH_RESULTS;
+      const icase = !/\p{Lu}/u.test(q);
+      const needle = icase ? q.toLowerCase() : q;
+      const results = [];
+      for (const rel of [...held.keys()].sort()) {
+        const bytes = held.get(rel);
+        if (isEnvFile(rel) || bytes.includes(0)) continue; // as on disk: no env file, no binary file
+        const lines = linesOf(LENIENT.decode(bytes));
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].replace(/\r$/, '');
+          if (!(icase ? line.toLowerCase() : line).includes(needle)) continue;
+          if (results.length >= limit) return { results, truncated: true };
+          results.push({ path: rel, line: i + 1, text: around(line, q, icase) });
+        }
+      }
+      return { results };
+    },
+    textOf(rel) {
+      const bytes = held.get(rel);
+      if (!bytes) return null;
+      const d = describeHeld(rel, bytes);
+      return d.kind === 'text' ? d.text : null;
+    },
+  };
+}
+
+/**
+ * The demo's sample project, made afresh at each call: "storefront" on main, seven files in two folders (src and
+ * src/invoices). One is CRLF (src/invoices/sample.csv), one holds a hidden character (a zero-width space in
+ * src/cart.ts), and .env holds a made-up Stripe test key, made at run time so no file of Workbench's holds one.
+ * `agent` is what the simulated agent Invoice export changed in its own copy, as its recorded files name them: two
+ * files changed and one added.
+ * @returns {{ name: string, branch: string, files: Record<string, string>, agent: { name: string, files: Record<string, string> } }}
+ */
+export function sampleProject() {
+  const key = ['sk', 'test', crypto.randomBytes(12).toString('hex')].join('_');
+  const query = [
+    "import { db } from '../db';",
+    '',
+    'export type Invoice = { number: string; date: string; total: string };',
+    '',
+  ];
+  return {
+    name: 'storefront',
+    branch: 'main',
+    files: {
+      'README.md': [
+        '# Storefront',
+        '',
+        "The shop's code: the cart, and the invoice export for accounts.",
+        '',
+        'Run `npm test` before you merge.',
+        '',
+      ].join('\n'),
+      'package.json': `${JSON.stringify({ name: 'storefront', private: true, type: 'module', scripts: { test: 'node --test', lint: 'eslint src' } }, null, 2)}\n`,
+      '.env': ['# Payments, for this computer only', `STRIPE_SECRET_KEY=${key}`, 'DATABASE_URL=postgres://localhost/storefront', 'PORT=3000', ''].join('\n'),
+      'src/cart.ts': [
+        "// The cart's total, in cents, so nothing is lost to rounding.",
+        'export type Item = { price: number; quantity: number };',
+        '',
+        'export function total(items: Item[]): number {',
+        '  return items.reduce((sum, item) => sum + item.price * item.quantity, 0);',
+        '}',
+        '',
+        '// The label shown beside the total.',
+        "export const label = 'Total​';",
+        '',
+      ].join('\n'),
+      'src/invoices/export.ts': [
+        "import { query } from './query';",
+        '',
+        '// Every invoice of an account, as CSV.',
+        'export async function exportInvoices(accountId: string): Promise<string> {',
+        '  const invoices = await query(accountId);',
+        "  const rows = invoices.map(i => [i.number, i.date, i.total].join(','));",
+        "  return ['number,date,total', ...rows].join('\\n');",
+        '}',
+        '',
+      ].join('\n'),
+      'src/invoices/query.ts': [
+        ...query,
+        '// Every invoice of an account, oldest first.',
+        'export async function query(accountId: string): Promise<Invoice[]> {',
+        "  return db.select('invoices', { accountId, order: 'date' });",
+        '}',
+        '',
+      ].join('\n'),
+      'src/invoices/sample.csv': ['number,date,total', 'INV-1001,2026-10-01,120.00', 'INV-1002,2026-10-03,89.50', 'INV-1003,2026-10-09,42.10', ''].join('\r\n'),
+    },
+    agent: {
+      name: 'Invoice export',
+      files: {
+        'src/invoices/export.ts': [
+          "import { query } from './query';",
+          "import { inBatches } from './batch';",
+          '',
+          '// Every invoice of an account, as CSV. Large accounts are read in small batches, so the export never times out.',
+          'export async function exportInvoices(accountId: string): Promise<string> {',
+          '  const rows: string[] = [];',
+          '  for await (const invoices of inBatches(query, accountId)) {',
+          "    rows.push(...invoices.map(i => [i.number, i.date, i.total].join(',')));",
+          '  }',
+          "  return ['number,date,total', ...rows].join('\\n');",
+          '}',
+          '',
+        ].join('\n'),
+        'src/invoices/query.ts': [
+          ...query,
+          "// One page of an account's invoices, oldest first.",
+          'export async function query(accountId: string, offset = 0, limit = 500): Promise<Invoice[]> {',
+          "  return db.select('invoices', { accountId, order: 'date', offset, limit });",
+          '}',
+          '',
+        ].join('\n'),
+        'src/invoices/batch.ts': [
+          "import type { Invoice } from './query';",
+          '',
+          'export const BATCH_SIZE = 500;',
+          '',
+          '// The invoices of an account, a batch at a time, until there are no more.',
+          'export async function* inBatches(',
+          '  query: (accountId: string, offset: number, limit: number) => Promise<Invoice[]>,',
+          '  accountId: string,',
+          '): AsyncGenerator<Invoice[]> {',
+          '  for (let offset = 0; ; offset += BATCH_SIZE) {',
+          '    const batch = await query(accountId, offset, BATCH_SIZE);',
+          '    if (batch.length) yield batch;',
+          '    if (batch.length < BATCH_SIZE) return;',
+          '  }',
+          '}',
+          '',
+        ].join('\n'),
+      },
+    },
+  };
 }
