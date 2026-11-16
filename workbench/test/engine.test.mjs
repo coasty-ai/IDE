@@ -4551,14 +4551,15 @@ test('the file view: a working agent’s copy is saved and left to it; a copy be
 
 /**
  * Live engines over one repository folder, with the real history (under `dir`) and the real file view: what one keeps,
- * the next one started restores, as an earlier agent. Agents' folders are real, and are kept at shutdown.
+ * the next one started restores, as an earlier agent. Agents' folders are real, and are kept at shutdown. Each engine
+ * waits `historyDebounceMs` before it writes the history by itself.
  */
 function earlierWorlds(ctx) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-engine-earlier-')));
   ctx.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const repoRoot = path.join(dir, 'repo');
   fs.mkdirSync(repoRoot);
-  return () => {
+  return ({ historyDebounceMs = 5 } = {}) => {
     const store = new Store();
     const claude = fakeAdapter('claude');
     const { deps, calls } = fakeDeps({ checks: CHECKS, folders: path.join(dir, 'wt') });
@@ -4567,7 +4568,7 @@ function earlierWorlds(ctx) {
     deps.workspace.removeWorkspace = async (o) => { calls.removeWorkspace.push(o); return { removed: false, kept: true }; };
     const engine = new Engine({
       store, mode: 'live', repo: { root: repoRoot, name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 0 }, hook: HOOK, adapters: { claude, codex: fakeAdapter('codex') },
-      machines: new FakeMachines(), deps, options: { tickMs: 10_000_000, historyDir: path.join(dir, 'history'), historyDebounceMs: 5, exitGraceMs: 20, stopTimeoutMs: 2000 },
+      machines: new FakeMachines(), deps, options: { tickMs: 10_000_000, historyDir: path.join(dir, 'history'), historyDebounceMs, exitGraceMs: 20, stopTimeoutMs: 2000 },
     });
     return { store, engine, claude, deps, calls };
   };
@@ -4634,6 +4635,46 @@ test('the file view: an earlier agent’s copy saved, then Workbench stopped bef
   assert.equal(third.store.get(a.id).state, 'done_claimed');
   assert.notEqual(third.store.get(a.id).checks?.state, 'passed');
   await third.engine.shutdown();
+});
+
+test('the file view: a save into a checked agent’s copy is in the history before it is answered, so a Workbench stopped hard then never comes back checked', async (ctx) => {
+  const world = earlierWorlds(ctx);
+  const b = await checkedEarlier(world); // an earlier agent, done and checked
+  // An engine that would wait a minute before it writes the history by itself: only a write made at once is there.
+  const first = world({ historyDebounceMs: 60_000 });
+  await first.engine.start();
+  const a = await started(first, { task: 'Round the tax down' });
+  a.runner.emit({ kind: EV.SESSION, sessionId: '7c9e6679-7425-40de-944b-e07fc1f90ae7' });
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I rounded the tax down.', backgroundTasks: 0, isError: false });
+  await until(() => first.store.get(a.id).state === 'done_checked');
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
+  const onDisk = (id) => {
+    const r = JSON.parse(fs.readFileSync(first.engine.history.file, 'utf8')).agents.find(x => x.id === id);
+    return [r?.state, r?.checks?.state];
+  };
+  first.engine.history.save();
+  assert.deepEqual([onDisk(a.id), onDisk(b.id)], [['done_checked', 'passed'], ['done_checked', 'passed']], 'both said checked on disk');
+  // Their checks start again and hold, until they are stopped.
+  first.deps.receipt.runChecks = (o) => new Promise((resolve) => {
+    first.calls.runChecks.push(o);
+    o.signal.addEventListener('abort', () => resolve({ state: 'failed', results: [{ name: 'unit tests', ok: false, ms: 0, tail: 'Not run.' }] }), { once: true });
+  });
+  for (const id of [a.id, b.id]) {
+    const f = await first.engine.file(id, 'cart.js');
+    assert.equal((await first.engine.saveFile(id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+    assert.deepEqual(onDisk(id), ['done_claimed', 'none'], 'the file says it before the save is answered');
+  }
+  await until(() => first.calls.runChecks.length === 2);
+  // Stopped hard: nothing more is written (no shutdown), and the next start reads the file as it is.
+  const next = world();
+  await next.engine.start();
+  for (const id of [a.id, b.id]) {
+    assert.deepEqual([next.store.get(id).earlier, next.store.get(id).state], [true, 'done_claimed']);
+    assert.notEqual(next.store.get(id).checks?.state, 'passed');
+  }
+  await next.engine.shutdown();
+  await first.engine.shutdown();
 });
 
 test('the file view in the demo: a sample project in memory, the simulated Invoice export’s copy with what it changed, and a save kept for this run, said once', async () => {

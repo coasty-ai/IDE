@@ -3236,8 +3236,11 @@ export class Engine extends EventEmitter {
     if (v.checks && v.checks.state !== 'none') drop.push({ kind: EV.CHECKS, agentId: id, checks: { state: 'none', results: [] } });
     if (drop.length) {
       this._apply(drop);
-      // An earlier agent's record says so at once too: stopped before its checks end, it must not come back checked.
-      if (!run && c.rec) this._keepEarlier(id, c.ws);
+      // The history says so at once too, before the save is answered, for this run's agents and earlier ones (whose
+      // record is built again first): a Workbench stopped before its checks end, even stopped hard within the history's
+      // wait before it writes, must not come back checked.
+      if (!run && c.rec) this._replaceEarlier(id, c.ws);
+      this._saveHistory();
     }
     const seq = run ? run.turnSeq : 0;
     // Not run.stopped: closing a finished agent's idle process (a merge, Stop) marks it stopped, and its copy is checked all the same.
@@ -3260,6 +3263,11 @@ export class Engine extends EventEmitter {
   _keepEarlier(id, workspace) {
     this._replaceEarlier(id, workspace);
     try { this.history?.schedule(); } catch (err) { this.log.warn('Could not save the history:', err); }
+  }
+
+  /** The history is written now, not after its wait (history.save() never throws: it logs what it could not write). */
+  _saveHistory() {
+    try { this.history?.save(); } catch (err) { this.log.warn('Could not save the history:', err); }
   }
 
   /**
