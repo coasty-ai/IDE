@@ -1,6 +1,6 @@
 {
   "name": "workbench-ide",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Workbench runs coding agents and shows what each one is doing, in plain language. The program is in workbench/.",
   "scripts": {
