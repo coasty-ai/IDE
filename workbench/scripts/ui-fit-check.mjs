@@ -17,7 +17,7 @@ import { launch, sleep } from './ui-cdp.mjs';
 const SIZES = ['960x900', '1024x700', '1280x680', '1440x789', '1512x862', '1728x1000', '1920x970', '2560x1300'];
 const THEMES = ['green', 'black-gold', 'ivory'];
 const DETAILS = ['calm', 'more'];
-const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
+const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 'tray', 'earlier', 'exact', 'reply', 'notice', 'confirm', 'prompt', 'stale', 'no-key', 'connecting', 'reconnecting', 'motion', 'swap',
   // D2: an agent's work in the lid, and the engine's cards for it (the 'merge' scenarios of scripts/ui-mock.mjs)
   'merge-card', 'discard-card', 'merge-conflict', 'merge-blocked', 'merge-lids',
   // what an agent controls, with characters that hide text or turn it: shown by their codes on the board and in the lid
@@ -26,6 +26,9 @@ const VIEWS = ['card-root', 'card-helper', 'card-pinned', 'machines', 'menu', 't
   'wire',
   // full permissions: the card the band's button brings, and a launch card's added sentence while they are on
   'perm-card', 'perm-launch'];
+
+// A prompt of three lines, as typed or pasted, each short enough for one line of the box at the narrowest board
+const PROMPT3 = 'The checkout total is off:\nexpected 42.10\nbut got 42.09';
 
 // D1: the git screen, opened by the DRAM: its graph, an agent's or a commit's detail, a repository with one commit
 const GIT_VIEWS = ['git', 'git-detail', 'git-empty', 'git-tangles'];
@@ -515,6 +518,26 @@ try {
         if (!/Start 8 agents/.test(all)) failures.push(`${tag}: the launch question did not show`);
         else if (Number(fit) < 3 && !/so they will not ask before any step/.test(all)) failures.push(`${tag}: the launch card did not say that they will not ask`);
         await check(tag);
+      } else if (v === 'prompt') {
+        // a prompt of three lines in the board's input, in a calm board ('prompt') and over a question with its answers
+        // ('demo', the permission first): the box grows to show its lines where the lid has room and scrolls inside where it
+        // has not, never over the lid's words; then Enter brings the launch card, which quotes the prompt on one line
+        for (const sc of ['prompt', 'longq']) {
+          await load(sc);
+          await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(PROMPT3)}; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+          await settle(120);
+          const box = await b.ev(`(() => { const i = document.getElementById('say'), line = parseFloat(getComputedStyle(i).lineHeight); return { shown: Math.round(i.clientHeight / line), all: Math.round(i.scrollHeight / line) }; })()`);
+          if (box.all !== 3) failures.push(`${tag}: the box should hold three lines of text (${sc}: ${box.all})`);
+          if (sc === 'prompt' && box.shown !== 3) failures.push(`${tag}: the box did not grow to show its three lines on a calm board (${box.shown})`);
+          await check(`${tag} (${sc}, three lines in the box)`);
+        }
+        await load('prompt');
+        await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(PROMPT3)}; i.dispatchEvent(new Event('input', { bubbles: true }));
+          i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); return true; })()`);
+        await sleep(900); await settle(100);
+        const h1 = await b.ev(`document.querySelector('#pages .page:not(.old) h1')?.textContent || ''`);
+        if (h1 !== 'Start a simulated Claude on “The checkout total is off: expected 42.10 but got 42.09”?') failures.push(`${tag}: the prompt's launch card did not show it on one line (${h1.slice(0, 60)})`);
+        await check(tag + ' (its launch card)');
       } else if (v === 'stale') {
         await ctl('scenario', { name: 'demo' }); await size(s); await b.goto(`${base}/?t=bad&still=1`, 1300); await setLook(t, d); await settle(100);
         const l = await check(tag);

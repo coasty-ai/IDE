@@ -14,6 +14,7 @@ import { Board } from './board.js';
 import { lidView, tickSince, focusKey } from './focus.js';
 import { cardHtml } from './card.js';
 import { setupVoice } from './voice.js';
+import { setupSayBox } from './saybox.js';
 import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand, lidAnswer } from './prefs.js';
 import * as ANSWERS from '/shared/answers.mjs';   // "looks good" and "not now", as the engine reads them
 import { markOf } from './look.js';
@@ -382,6 +383,8 @@ function renderNow(o = {}) {
   // the tray is drawn only while it holds agents of this run or an earlier one (board.js paintTray): when it empties, its
   // list closes and the keyboard there goes to the lid's sentence before the tray is hidden
   if (!G.tray) trayEmptied();
+  // the input grows into the lid's spare height only, so it never covers the lid's words (saybox.js)
+  sayBox.room(G.lidPageH - needForLayout(v));
   const hoverRoot = board.card.rootId || null;
   const left = board.render(G, { machines, tray, hoverRoot, litMachine: hoverMachine(), first: lastFirst || o.snap });
   lastFirst = false;
@@ -672,6 +675,16 @@ el.core.addEventListener('pointerleave', () => { pointer.inCore = false; render(
 el.core.addEventListener('focusout', e => { if (!el.core.contains(e.relatedTarget)) render(); });
 
 // ---------------------------------------------------------------- typing and talking
+// The input is a box that grows with its text, never over the lid's words (renderNow gives it the lid's spare height),
+// then scrolls inside. Enter sends; Shift+Enter adds a line; pasted text keeps its lines.
+const sayBox = setupSayBox({ field: el.say, bar: el.bar, send: text => submit(text), lineHeight: () => Math.ceil(parseFloat(getComputedStyle(el.say).lineHeight) || 19) });
+/** Put text in the input (or empty it), as typing would leave it. */
+function setSay(text) {
+  el.say.value = text;
+  el.bar.classList.toggle('typed', !!text);
+  sayBox.fit();
+}
+
 function startReply(a, mode, askId, state) {
   // the reply keeps the agent, the ask, and the state it was opened in: a message is sent only while that still holds
   S.reply = { agentId: a.id, mode, askId: mode === 'answer' ? askId : null, state: state || a.state };
@@ -683,12 +696,14 @@ function startReply(a, mode, askId, state) {
   el.to.title = `${mode === 'answer' ? 'Your answer goes to' : 'This goes to'} ${visibleControls(a.name)}`;
   el.bar.classList.add('replying');
   el.say.setAttribute('aria-label', mode === 'answer' ? `Your answer to ${visibleControls(a.name)}` : `What to tell ${visibleControls(a.name)}`);
+  sayBox.fit(); // the chip takes room from the field: its lines wrap again
   el.say.focus();
 }
 function endReply() {
   S.reply = null;
   el.bar.classList.remove('replying');
   el.say.setAttribute('aria-label', 'Type what you want, or hold the space bar to talk');
+  sayBox.fit();
 }
 el.toCancel.addEventListener('click', () => { endReply(); el.say.focus(); render(); });
 
@@ -733,8 +748,7 @@ async function submit(text) {
   if (refuseKey(text, true)) return;
   const b = bound || bindingNow();
   bound = null;
-  el.say.value = '';
-  el.bar.classList.remove('typed');
+  setSay('');
   // D1: "git", "show git", "open git", "source control", "show the graph" open the git screen (never sent to the engine)
   if (!S.reply && gitScreenWords(text) === 'open') { openGit({ opener: el.dram }); return; }
   // the page's own words: the look, the detail, and stepping through the queue. They never reach the engine.
@@ -759,11 +773,11 @@ async function submit(text) {
       const a = S.agents.get(r.agentId);
       let res;
       if (r.mode === 'answer' && r.askId) {
-        if (!a || !a.ask || a.ask.id !== r.askId) { el.say.value = text; say(`${a ? a.name : 'That agent'} asked something new. Have a look first.`); render(); return; }
+        if (!a || !a.ask || a.ask.id !== r.askId) { setSay(text); say(`${a ? a.name : 'That agent'} asked something new. Have a look first.`); render(); return; }
         res = await api.answer(r.agentId, r.askId, text);
       } else {
         // a message carries no ask id, so it goes only while the agent is as it was when the reply opened
-        if (!a || a.state !== r.state) { el.say.value = text; el.bar.classList.add('typed'); say('That changed. Have another look.', 5000); render(); return; }
+        if (!a || a.state !== r.state) { setSay(text); say('That changed. Have another look.', 5000); render(); return; }
         res = await api.say(r.agentId, text);
       }
       answeredOnce();
@@ -792,6 +806,7 @@ async function submit(text) {
   } catch (err) { say(err.message); }
   render();
 }
+// A textarea sends no form by itself: Enter sends through the box (saybox.js). This catches any other way a form is sent.
 el.bar.addEventListener('submit', e => { e.preventDefault(); submit(el.say.value); });
 
 // Voice is bound to what the screen the microphone turned on over showed (the lid, or the git screen's detail), and what
@@ -1154,7 +1169,7 @@ setInterval(() => {
 function refuseKey(text, board) {
   const said = keyRefusal(text, secretShape.looksLikeSecret);
   if (!said) return false;
-  if (board) { el.say.value = ''; el.bar.classList.remove('typed'); bound = null; }
+  if (board) { el.say.value = ''; el.bar.classList.remove('typed'); sayBox.fit(); bound = null; }
   say(said);
   showConnect(null, said);
   return true;
@@ -1385,7 +1400,7 @@ setupGitScreen({
 });
 
 RM.addEventListener('change', () => { if (RM.matches) board.settle(); renderNow({ snap: true }); });
-addEventListener('resize', () => { closePop(); closeTray(); renderNow({ snap: true }); });
+addEventListener('resize', () => { closePop(); closeTray(); renderNow({ snap: true }); sayBox.fit(); });
 document.fonts?.addEventListener?.('loadingdone', () => { widths.clear(); if (fontsReady) renderNow({ snap: true }); });
 
 // Boot: wait for the four weights of JetBrains Mono (the board is measured in it), then draw.
