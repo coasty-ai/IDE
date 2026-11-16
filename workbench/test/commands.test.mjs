@@ -1987,3 +1987,17 @@ test('full permissions: words that are exactly the name of an agent on the board
   assert.deepEqual(parseCommand('Full permissions', CTX.none), { kind: 'permissions', mode: 'full' });
   assert.deepEqual(parseCommand('Ask first', CTX.none), { kind: 'permissions', mode: 'ask' });
 });
+
+test('the setup card takes its buttons’ words, "run it" and "not now", and the usual yes and no', () => {
+  const ctx = { agents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c30', kind: 'setup' } };
+  for (const s of ['run it', 'Run it.', 'yes, run it', 'run the setup command', 'run it first', 'do it', 'yes', 'okay', 'go ahead']) {
+    assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: true }, s);
+  }
+  for (const s of ['not now', 'Not now.', 'no', 'cancel', 'skip it', 'skip the setup', 'no thanks', "don't run it"]) {
+    assert.deepEqual(parseCommand(s, ctx), { kind: 'confirm', go: false }, s);
+  }
+  // asked, not said: it stays; "start it" is a yes to launches only
+  for (const s of ['run it?', 'start it']) assert.notEqual(parseCommand(s, ctx).kind, 'confirm', s);
+  // without its card, "run it" is no answer to anything
+  assert.notDeepEqual(parseCommand('run it', CTX.none), { kind: 'confirm', go: true });
+});

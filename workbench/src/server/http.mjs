@@ -369,6 +369,9 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
   // Full permissions went on or off: every page gets a fresh snapshot, whose `permissions` lights the band's button.
   const onPermissions = () => onRemoved();
   if (typeof engine.on === 'function') engine.on('permissions', onPermissions);
+  // A setup card opened or closed (launches wait on it): every page gets a fresh snapshot, whose `setup` is the card.
+  const onSetup = () => onRemoved();
+  if (typeof engine.on === 'function') engine.on('setup', onSetup);
   // Agents & keys found an agent, or lost one, or the default changed: the snapshot's harnesses and connect summary say
   // so (the top band's light, the lid). Every page gets a fresh snapshot, once per burst, and only when they changed.
   let connectTimer = null;
@@ -870,6 +873,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     connect?.off?.('agents', onConnect);
     connect?.off?.('changed', onConnect);
     if (typeof engine.off === 'function') engine.off('permissions', onPermissions);
+    if (typeof engine.off === 'function') engine.off('setup', onSetup);
     clearTimeout(connectTimer);
     clearTimeout(flushTimer);
     clearInterval(pingTimer);

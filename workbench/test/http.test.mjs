@@ -1421,6 +1421,39 @@ test('when full permissions go on or off, every page gets a fresh snapshot with 
   assert.equal(eng.listenerCount('permissions'), 0, 'close() lets go of the engine');
 });
 
+test('when a setup card opens or closes, every page gets a fresh snapshot with it, and a page that opens meanwhile gets it too', async (t) => {
+  const s = new Store();
+  const eng = new FakeEngine(s);
+  const card = { id: '0a1b2c3d4e62', kind: 'setup', sentence: 'Run this setup command in each agent’s copy before it starts?', command: 'npm ci', detail: 'It comes from workbench.json.', yes: 'Run it', no: 'Not now' };
+  eng.snapshot = function snapshot() {
+    return { ...FakeEngine.prototype.snapshot.call(this), ...(this.setup ? { setup: this.setup } : {}) };
+  };
+  const srv = createServer({ engine: eng, store: s, token: TOKEN, hookTokenFor, port: 0, rootDir: ROOT, options: { coalesceMs: 20 } });
+  const { url } = await srv.listen();
+  const at = Number(new URL(url).port);
+  t.after(() => srv.close());
+  const sse = await openSse(`/api/stream?t=${TOKEN}`, at);
+  try {
+    assert.equal((await sse.next('snapshot')).data.setup, undefined);
+    eng.setup = card;
+    eng.emit('setup', card);
+    assert.deepEqual((await sse.next('snapshot')).data.setup, card);
+    const late = await openSse(`/api/stream?t=${TOKEN}`, at);
+    try {
+      assert.deepEqual((await late.next('snapshot')).data.setup, card, 'a page opened or reloaded while it waits');
+    } finally {
+      late.close();
+    }
+    eng.setup = null;
+    eng.emit('setup', null);
+    assert.equal((await sse.next('snapshot')).data.setup, undefined);
+  } finally {
+    sse.close();
+    await srv.close();
+  }
+  assert.equal(eng.listenerCount('setup'), 0, 'close() lets go of the engine');
+});
+
 // ------------------------------------------------------------------ helpers
 
 async function waitFor(fn, timeout = 2000) {

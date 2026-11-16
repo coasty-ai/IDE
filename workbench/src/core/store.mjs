@@ -270,6 +270,9 @@ export class Store extends EventEmitter {
         this._setState(v, ev.state, ev.reason ?? null, ev.ts, batch, index, changed);
         // The turn that reached the limit says so; a process that then exits with an error leaves it so (see _setState).
         if (ev.state === STATE.FAILED && ev.atLimit === true) v.atLimit = true;
+        // A starting root's reason is what it is doing while the engine makes its copy ready (the files it copies, the
+        // setup command, then what came of them): its `now`, until its first output.
+        if (ev.state === STATE.STARTING && typeof ev.reason === 'string' && ev.reason) v.now = ev.reason;
         break;
       }
 

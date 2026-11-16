@@ -568,6 +568,28 @@ test('any output moves a starting root to working: init, a turn, thinking, text'
   assert.equal(s.get('s2').state, 'starting', 'thinking switching off is not output');
 });
 
+test('a starting root’s reason is what it is doing: the engine’s words while its copy is made ready show as its now, until it does something', () => {
+  const { s } = recording();
+  s.apply(created('s1'));
+  s.apply(state('s1', 'starting', T0 + 100, { reason: null }));
+  assert.equal(s.get('s1').now, 'Starting', 'no reason: as it always was');
+  s.apply(state('s1', 'starting', T0 + 200, { reason: 'Copying .env and node_modules into its copy' }));
+  assert.deepEqual([s.get('s1').state, s.get('s1').now, s.get('s1').stateReason, s.get('s1').stateSince],
+    ['starting', 'Copying .env and node_modules into its copy', 'Copying .env and node_modules into its copy', T0], 'still starting since it was made');
+  s.apply(state('s1', 'starting', T0 + 300, { reason: 'Its copy has your .env and node_modules.' }));
+  assert.equal(s.get('s1').now, 'Its copy has your .env and node_modules.');
+  s.apply(state('s1', 'starting', T0 + 350, { reason: null }));
+  assert.equal(s.get('s1').now, 'Its copy has your .env and node_modules.', 'a starting state without words leaves them');
+  // its first output moves it to working; its first step says what it does now
+  s.apply({ kind: EV.SESSION, ts: T0 + 400, agentId: 's1', sessionId: 'x' });
+  assert.equal(s.get('s1').state, 'working');
+  s.apply(act('s1', 'start', 'Reading login.ts', T0 + 500));
+  assert.equal(s.get('s1').now, 'Reading login.ts');
+  // the reason of any other state is never its now
+  s.apply(state('s1', 'failed', T0 + 600, { reason: 'It could not start: boom' }));
+  assert.equal(s.get('s1').now, 'Reading login.ts');
+});
+
 test('a view has fullName: the event\'s whole description, or the name itself', () => {
   const { s } = recording();
   s.apply(created('f1', { name: 'Repository exploration', fullName: 'Repository exploration and architecture mapping' }));

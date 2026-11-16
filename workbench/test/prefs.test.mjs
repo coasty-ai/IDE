@@ -112,8 +112,10 @@ test('a damaged, oversized, linked or strange file reads as the defaults, and is
   const prefs = createPrefs({ file });
   fs.writeFileSync(file, '{ not json', { mode: 0o600 });
   assert.deepEqual(prefs.get(), DEFAULT_PREFS);
+  fs.writeFileSync(file, JSON.stringify({ theme: 'ivory', detail: 'more', answered: true, pad: 'x'.repeat(300 * 1024) }), { mode: 0o600 });
+  assert.deepEqual(prefs.get(), DEFAULT_PREFS, 'a file of more than 256 KB is not read');
   fs.writeFileSync(file, JSON.stringify({ theme: 'ivory', detail: 'more', answered: true, pad: 'x'.repeat(8000) }), { mode: 0o600 });
-  assert.deepEqual(prefs.get(), DEFAULT_PREFS, 'a file of more than 4 KB is not read');
+  assert.deepEqual(prefs.get(), { theme: 'ivory', detail: 'more', answered: true, permissions: 'ask' }, 'one of 8 KB is, without what it does not know');
   fs.writeFileSync(file, JSON.stringify({ theme: '<script>', detail: 'more', secret: 'kept?' }), { mode: 0o600 });
   assert.deepEqual(prefs.get(), { theme: 'green', detail: 'more', answered: false, permissions: 'ask' });
   // a link is never followed, for reading or writing: the save replaces the link with a file of its own
@@ -175,6 +177,56 @@ test('full permissions are one more known key, ask or full (ask by default), kep
   const m = memoryPrefs({ permissions: 'full' });
   assert.equal(m.get().permissions, 'full');
   assert.equal(m.set({ permissions: 'nope' }).prefs.permissions, 'ask');
+});
+
+test('agents’ copies: the repositories told about their env files, and the setup command each one said Run it to, are kept by root, merged with what another run saved', (t) => {
+  const H1 = 'a'.repeat(64), H2 = 'b'.repeat(64), H3 = 'c'.repeat(64);
+  // only absolute roots and SHA-256 hashes are kept; the keys show only once they hold something
+  assert.deepEqual(cleanPrefs({ copiesSaid: ['/r/a', 'relative', '/r/a', 7, '', '/r/\u0007bell', `/${'x'.repeat(1100)}`, '/r/b'] }).copiesSaid, ['/r/a', '/r/b']);
+  assert.deepEqual(cleanPrefs({ setupOk: { '/r/a': H1, '/r/b': 'not a hash', relative: H2, '/r/c': H2.toUpperCase(), '/r/d': H3 } }).setupOk, { '/r/a': H1, '/r/d': H3 });
+  for (const raw of [{ copiesSaid: 'x' }, { copiesSaid: [] }, { setupOk: [] }, { setupOk: null }, { setupOk: { '/r/a': 5 } }, { setupOk: { __proto__: { '/r/a': H1 } } }]) {
+    assert.deepEqual(Object.keys(cleanPrefs(raw)), ['theme', 'detail', 'answered', 'permissions'], JSON.stringify(raw));
+  }
+  // at most 100 of each, the newest kept
+  const many = Array.from({ length: 150 }, (_, i) => `/r/${i}`);
+  assert.deepEqual(cleanPrefs({ copiesSaid: many }).copiesSaid, many.slice(50));
+  assert.equal(Object.keys(cleanPrefs({ setupOk: Object.fromEntries(many.map(r => [r, H1])) }).setupOk).length, 100);
+
+  const file = prefsFile(home(t));
+  const a = createPrefs({ file });
+  const b = createPrefs({ file });
+  // each run adds to what the file holds when it saves, never over it
+  assert.equal(a.set({ copiesSaid: ['/r/a'], setupOk: { '/r/a': H1 } }).ok, true);
+  assert.equal(b.set({ copiesSaid: ['/r/b'], setupOk: { '/r/b': H2 } }).ok, true);
+  assert.deepEqual(a.get().copiesSaid, ['/r/a', '/r/b']);
+  assert.deepEqual(a.get().setupOk, { '/r/a': H1, '/r/b': H2 });
+  // a changed command replaces that repository's hash; a root said again moves to the end, so the newest are kept
+  a.set({ setupOk: { '/r/a': H3 }, copiesSaid: ['/r/a'] });
+  assert.deepEqual(b.get().setupOk, { '/r/b': H2, '/r/a': H3 });
+  assert.deepEqual(b.get().copiesSaid, ['/r/b', '/r/a']);
+  // a look saved later keeps them, and the page's own choices stay as they were
+  b.set(prefsChange({ theme: 'ivory' }));
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { theme: 'ivory', detail: 'calm', answered: false, permissions: 'ask', copiesSaid: ['/r/b', '/r/a'], setupOk: { '/r/b': H2, '/r/a': H3 } });
+  // the page never sets them, and never gets them
+  assert.throws(() => prefsChange({ copiesSaid: ['/r/x'], setupOk: { '/r/x': H1 } }), { status: 400 });
+  assert.equal(pageWithPrefs('<html>', a.get()), '<html data-theme="ivory" data-detail="calm" data-answered="0" data-permissions="ask">');
+  // for one run only, with the same rules
+  const m = memoryPrefs();
+  m.set({ copiesSaid: ['/r/a'], setupOk: { '/r/a': H1 } });
+  m.set({ copiesSaid: ['/r/b', 'relative'], setupOk: { '/r/b': H2 } });
+  assert.deepEqual(m.get().copiesSaid, ['/r/a', '/r/b']);
+  assert.deepEqual(m.get().setupOk, { '/r/a': H1, '/r/b': H2 });
+});
+
+test('agents’ copies: what could not be saved still counts for this run, merged the same way', (t) => {
+  const h = home(t);
+  fs.writeFileSync(path.join(h, '.workbench'), 'not a folder');
+  const { log } = recorder();
+  const prefs = createPrefs({ file: prefsFile(h), log });
+  assert.equal(prefs.set({ copiesSaid: ['/r/a'] }).ok, false);
+  assert.equal(prefs.set({ copiesSaid: ['/r/b'], setupOk: { '/r/b': 'd'.repeat(64) } }).ok, false);
+  assert.deepEqual(prefs.get().copiesSaid, ['/r/a', '/r/b']);
+  assert.deepEqual(prefs.get().setupOk, { '/r/b': 'd'.repeat(64) });
 });
 
 test('memoryPrefs keeps choices for one run only, with the same rules', () => {

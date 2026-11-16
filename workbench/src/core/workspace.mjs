@@ -22,6 +22,7 @@ const MAX_CONFIG_BYTES = 256 * 1024;
 const COUNT_FILE_MAX_BYTES = 2 * 1024 * 1024; // untracked files bigger than this are listed without a line count
 const COUNT_TOTAL_MAX_BYTES = 64 * 1024 * 1024; // stop reading untracked files after this much
 const LIMITS = { checks: 20, rules: 100, allow: 100 };
+const MAX_SETUP = 4000; // the longest setup command, as long as a check's
 const DEFAULT_CHECK_TIMEOUT_SEC = 300;
 
 // Variables that would point git at a different repository than the folder we ask about.
@@ -435,18 +436,19 @@ const HOLDS_REPO = new Error('the folder is a repository');
  * that could not be searched for env files is named with why 'failed', and the rest is copied all the same.
  * @param {{ repoRoot: string, path: string, platform?: string, run?: typeof git,
  *   copy?: (file: string, args: string[], o: { timeout: number }) => Promise<unknown>, timeoutMs?: number,
- *   clones?: boolean }} opts
+ *   clones?: boolean, onChosen?: (entries: { path: string, kind: 'env'|'deps'|'listed' }[]) => void }} opts
  *   repoRoot: the top folder of the person's checkout (prepareRepo's root); path: the workspace (createWorkspace's);
  *   platform: 'darwin' for the Mac's cp, anything else for GNU cp; run and copy: stand-ins for git() and cp (tests);
  *   timeoutMs: the whole fill's limit (10 minutes unless given); clones: whether the disk makes clones, as tests
- *   say it (a Mac looks, and elsewhere cp says, unless given)
+ *   say it (a Mac looks, and elsewhere cp says, unless given); onChosen: told once what is chosen, in the order it is
+ *   copied, before the first cp (so the engine can say what it copies); not told when git cannot list the folder
  * @returns {Promise<{ copied: { path: string, kind: 'env'|'deps'|'listed', cloned: boolean }[],
  *   skipped: { path: string, why: 'exists'|'link-outside'|'noclone'|'failed'|'venv'|'not-ignored'|'nested-repo', left?: true }[],
  *   ms: number }>}
  *   paths relative to the repository (a folder's without its "/"), each list in path order; cloned: made with clones
  *   (`cp -c` on a Mac, where the disk makes them, `--reflink=always` elsewhere), which take almost no disk
  */
-export async function fillWorkspace({ repoRoot, path: wsPath, platform = process.platform, run = git, copy = runCp, timeoutMs = FILL_TIMEOUT_MS, clones } = {}) {
+export async function fillWorkspace({ repoRoot, path: wsPath, platform = process.platform, run = git, copy = runCp, timeoutMs = FILL_TIMEOUT_MS, clones, onChosen } = {}) {
   const started = Date.now();
   const root = realRoot(repoRoot);
   if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath) || !isFolder(wsPath)) throw plainError('No workspace folder was given.');
@@ -662,7 +664,13 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
     else if (r.pieces) await Promise.all(r.pieces.map(handle));
   };
   const order = { env: 0, listed: 1, deps: 2 }; // the small files first
-  await Promise.all(chosen.entries.sort((a, b) => order[a.kind] - order[b.kind] || byPath(a, b)).map(handle));
+  const entries = chosen.entries.sort((a, b) => order[a.kind] - order[b.kind] || byPath(a, b));
+  if (typeof onChosen === 'function') {
+    try {
+      onChosen(entries.map(e => ({ path: e.path, kind: e.kind })));
+    } catch { /* a listener that breaks never stops the fill */ }
+  }
+  await Promise.all(entries.map(handle));
 
   // What git in the agent's folder would not ignore would become the agent's work (snapshotWork's `git add -A`), and
   // a merge would bring it into the person's branch: the rule that ignores it in the person's folder may be one they
@@ -685,6 +693,121 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
   }
   settleFolders(made);
   return done();
+}
+
+// The values in the env files a fill copied, so the engine can hide them in what the agent prints (see envValues).
+const ENV_FILE_MAX_BYTES = 256 * 1024; // a bigger env file is not read
+const ENV_VALUE_MAX = 8192; // a longer value is not kept whole (its lines still are)
+const ENV_VALUES_MAX = 1000;
+const ENV_FILES_MAX = 200;
+const ENV_LOOK_MAX = 5000; // names looked at inside the folders .worktreeinclude chose
+const ENV_DEPTH_MAX = 8;
+/**
+ * A line of a dotenv file as dotenv (the npm package) reads it: `KEY=value`, `export KEY=value` or `KEY: value`, the
+ * value quoted with ', " or ` (and then it may go on over several lines) or bare, up to a #. Comments and blank lines
+ * match nothing.
+ */
+const ENV_LINE = /^\s*(?:export\s+)?[\w.-]+(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?$/mg;
+
+/**
+ * The values a dotenv text holds, in each form a program may print one: as dotenv gives it ("\n" in double quotes is a
+ * line break), as the file has it, each of its lines when it has several, and a bare value with what follows a # on
+ * its line (dotenv cuts it there, the file does not).
+ */
+function dotenvValues(text) {
+  const out = [];
+  for (const m of String(text).replace(/\r\n?/g, '\n').matchAll(ENV_LINE)) {
+    const raw = (m[1] || '').trim();
+    if (!raw) continue;
+    const q = raw[0];
+    if ((q === '"' || q === "'" || q === '`') && raw.endsWith(q) && raw.length >= 2) {
+      const inner = raw.slice(1, -1);
+      out.push(inner);
+      if (q === '"') out.push(inner.replace(/\\n/g, '\n').replace(/\\r/g, '\r'));
+    } else {
+      out.push(raw);
+    }
+    const rest = /=\s*([^\n]*)$/.exec(m[0]) || /:\s+([^\n]*)$/.exec(m[0]);
+    if (rest && rest[1].trim() && !/^['"`]/.test(rest[1].trim())) out.push(rest[1].trim());
+  }
+  return out.flatMap(v => [v, ...(v.includes('\n') ? v.split('\n').map(l => l.trim()) : [])]);
+}
+
+/**
+ * The values in the env files that fillWorkspace copied into the workspace `path` (`copied`, its list), for the engine to
+ * hide in what the agent prints and in what the page and the log show: `{ values, files }`, `values` frozen, each of 8 or
+ * more characters and each once, and `files` the number of env files read. An env file is a regular file named .env,
+ * .env.<anything> or .envrc: an entry itself, or one inside a folder .worktreeinclude chose (looked into to a depth of
+ * 8, never into folders of installed packages, of version control or a virtualenv, nor into a repository). Nothing is
+ * read through a link, outside the workspace, nor from a file over 256 KB; at most 200 files and 1000 values.
+ * The values are never logged. Never rejects: what cannot be read gives nothing.
+ * @param {{ path: string, copied: { path: string, kind: string }[] }} opts
+ * @returns {Promise<{ values: readonly string[], files: number }>}
+ */
+export async function envValues({ path: wsPath, copied } = {}) {
+  const none = { values: Object.freeze([]), files: 0 };
+  if (typeof wsPath !== 'string' || !path.isAbsolute(wsPath) || !Array.isArray(copied)) return none;
+  let ws;
+  try {
+    ws = fs.realpathSync.native(wsPath);
+  } catch {
+    return none;
+  }
+  const values = new Set();
+  let files = 0;
+  let looked = 0;
+  const add = v => {
+    if (typeof v === 'string' && v.length >= 8 && v.length <= ENV_VALUE_MAX && values.size < ENV_VALUES_MAX) values.add(v);
+  };
+  const read = async file => {
+    if (files >= ENV_FILES_MAX) return;
+    let fh = null;
+    try {
+      // never through a link, and a FIFO never blocks
+      fh = await fs.promises.open(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+      const st = await fh.stat();
+      if (!st.isFile() || st.size > ENV_FILE_MAX_BYTES) return;
+      const text = (await fh.readFile()).toString('utf8');
+      files += 1;
+      for (const v of dotenvValues(text)) add(v);
+    } catch {
+      // gone, or not readable: nothing to hide
+    } finally {
+      await fh?.close().catch(() => {});
+    }
+  };
+  const walk = async (dir, depth) => {
+    if (depth > ENV_DEPTH_MAX || looked >= ENV_LOOK_MAX) return;
+    let names;
+    try {
+      names = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (names.some(e => isGitName(e.name))) return; // a repository of its own
+    for (const e of names) {
+      if (++looked > ENV_LOOK_MAX) return;
+      const p = path.join(dir, e.name);
+      if (e.isFile() && isEnvName(e.name)) await read(p);
+      else if (e.isDirectory() && !DEPENDENCY_FOLDERS.has(e.name) && !VCS_FOLDERS.has(e.name.toLowerCase()) && !VENV_NAMES.has(e.name)
+        && nothingAt(path.join(p, 'pyvenv.cfg'))) await walk(p, depth + 1);
+    }
+  };
+  for (const e of copied) {
+    if (!e || typeof e.path !== 'string') continue;
+    const parts = safeParts(e.path);
+    if (!parts || parts.some(isGitName) || !wayTo(ws, parts)) continue; // out of the folder, or through a link on the way
+    const p = path.join(ws, ...parts);
+    let st;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isFile() && isEnvName(parts[parts.length - 1])) await read(p);
+    else if (st.isDirectory() && e.kind === 'listed') await walk(p, 1);
+  }
+  return { values: Object.freeze([...values]), files };
 }
 
 /**
@@ -2637,7 +2760,8 @@ const defaults = () => ({ checks: [], rules: [], allow: [] });
  * Read workbench.json from a commit (`git show <ref>:workbench.json`), never from a working copy an
  * agent could have edited. Missing file: the defaults. Bad entries are skipped and reported.
  * @param {{ repoRoot: string, ref?: string, onProblem?: (sentence: string) => void }} opts
- * @returns {Promise<{ checks: { name: string, run: string, timeoutSec: number }[], rules: { say: string, paths: string[] }[], allow: string[] }>}
+ * @returns {Promise<{ checks: { name: string, run: string, timeoutSec: number }[], rules: { say: string, paths: string[] }[], allow: string[],
+ *   setup?: string }>}  setup: only when workbench.json holds one
  */
 export async function readRepoConfig({ repoRoot, ref = 'HEAD', onProblem } = {}) {
   const note = typeof onProblem === 'function' ? onProblem : () => {};
@@ -2692,6 +2816,12 @@ export function normalizeConfig(raw, onProblem) {
   each('checks', 'check', normCheck);
   each('rules', 'rule', normRule);
   each('allow', 'allowed command', normAllow);
+  // The setup command: one shell line (or a short script) for sh, which an agent's new copy runs before the agent starts,
+  // once the person has said Run it to that text (see the engine). Only there when workbench.json holds one.
+  if (raw.setup !== undefined && raw.setup !== null) {
+    if (isText(raw.setup, MAX_SETUP)) out.setup = raw.setup.trim();
+    else note('"setup" in workbench.json should be one command, so it was ignored.');
+  }
   return out;
 }
 

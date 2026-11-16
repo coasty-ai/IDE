@@ -456,13 +456,17 @@ const START_YES = new Set(['start', 'launch']);
  * "scrap it" and "trash it" ask for a throw-away card, but they do not answer one: that card takes only its button,
  * "throw it away", "discard it" or "do it", and "scrap that" is one sound from "scratch that", which means never mind.
  */
-const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw'], permissions: ['turn', 'switch'] };
-/** Words that may come with a card's own yes: "bring it in", "throw it away", "merge its changes", "turn it on". */
+const CARD_YES = { stop: ['stop'], say: ['send'], merge: ['merge', 'land', 'bring'], discard: ['discard', 'throw'], permissions: ['turn', 'switch'],
+  setup: ['run'] };
+/** Words that may come with a card's own yes: "bring it in", "throw it away", "merge its changes", "turn it on", "run the setup command". */
 const CARD_YES_FILL = { merge: ['in', 'its', 'work', 'changes', 'branch'], discard: ['away', 'out', 'its', 'work', 'changes', 'branch'],
-  permissions: ['on', 'full', 'permissions', 'permission'] };
-/** A card's own no: the throw-away card's "Keep it" button, and the full permissions card's "Keep asking", said. */
-const CARD_NO = { discard: ['keep'], permissions: ['keep'] };
-const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'], permissions: ['asking', 'off', 'me'] };
+  permissions: ['on', 'full', 'permissions', 'permission'], setup: ['setup', 'command', 'first'] };
+/**
+ * A card's own no: the throw-away card's "Keep it" button, the full permissions card's "Keep asking", said, and "skip it"
+ * at the setup card (whose "Not now" is a no already).
+ */
+const CARD_NO = { discard: ['keep'], permissions: ['keep'], setup: ['skip'] };
+const CARD_NO_FILL = { discard: ['its', 'work', 'changes', 'them', 'all'], permissions: ['asking', 'off', 'me'], setup: ['setup', 'command'] };
 
 /**
  * A reply to the confirm card on screen: true (yes), false (no), 'asks' (a yes asked rather than said, such as

@@ -15,12 +15,14 @@ Never report a vulnerability in a public issue, pull request or discussion.
 - **Git settings.** So a Codex agent can change the repository's git settings and hooks. Git runs those settings (a filter, say) and hooks as you, outside any sandbox, whenever it works in the repository, and Workbench's own git is no exception: Workbench checks your folder with git every 15 seconds, and runs git at the end of each agent's turn and when it shows, merges or throws away an agent's work. Such a setting can therefore run a program as you within seconds, with no click from you. Workbench turns off `core.fsmonitor` for all of its git, and hooks for its reviews, merges and throw-aways, but not filters.
 - **Temporary files.** Workbench keeps its own temporary files (scripts it opens in Terminal, the download of GitHub's `gh`, git's scratch files) in `~/.workbench/tmp`, a private folder, and never in the system's temporary folder, which Codex agents can write.
 - **Keys.** Keys you give agents are kept in your login keychain (on Linux, a keyring or private files), never in a log, a command line or the history, and the page shows only their last four characters. Agents can read the keys you give them, and so can anything they run.
+- **Agents' copies.** Each agent's copy of your repository gets the files git ignores that it needs to run: your `.env` files, keys included, and `node_modules`, or what a `.worktreeinclude` file lists, copied from your folder. The agent and anything it runs can read those keys. Values in the copied env files are hidden in what agents print, on the page and in the log, the same way as the keys you give agents.
+- **The setup command.** A repository's `workbench.json` may name a setup command, such as `npm ci`. It runs as you, in each new agent's copy before the agent starts, only after you say Run it to it, and Workbench asks again whenever it changes.
 
 ## Out of scope
 
 - What an agent, or code it runs, does with your rights: Workbench is not a sandbox. To keep agents away from your own files, run Workbench on a separate machine, such as a cloud VM.
 - Other programs that run as you on the same computer. They can read your agents' environments, and the keys in them.
-- What the repository you open sets up: the checks in its `workbench.json` run as shell commands, and its committed `.claude/` settings load into agents.
+- What the repository you open sets up: the checks in its `workbench.json` run as shell commands, so does its setup command once you said Run it, and its committed `.claude/` settings load into agents.
 - Bugs in Claude Code, Codex, git, GitHub's `gh` or your browser. Report those to their makers.
 - The demo, whose agents and machines are simulated.
 

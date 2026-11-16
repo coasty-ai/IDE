@@ -439,3 +439,18 @@ test('the words that answer a finished agent\'s lid are one list, for the engine
   assert.match(engine, /import \{ LOOKS_GOOD_RE, NOT_NOW_RE \} from '\.\.\/shared\/answers\.mjs';/);
   assert.doesNotMatch(engine, /const (LOOKS_GOOD_RE|NOT_NOW_RE)\b/);
 });
+
+test('how a secret shows and how text is masked are one rule, in src/shared/mask.mjs: the key store and the engine both use it', async () => {
+  const shared = await import('../src/shared/mask.mjs');
+  const keys = await import('../src/core/keys.mjs');
+  assert.equal(keys.shownValue, shared.shownValue, 'the key store gives the shared one');
+  assert.equal(keys.maskSecrets, shared.maskSecrets);
+  const value = ['sk', 'test', 'Zq81mNw2'].join('-');
+  assert.equal(shared.maskSecrets(`DATABASE_PASSWORD=${value} done`, Object.freeze([value])), 'DATABASE_PASSWORD=•••• mNw2 done');
+  assert.equal(shared.shownValue('short'), '••••');
+  const { readFileSync } = await import('node:fs');
+  const text = readFileSync(new URL('../src/shared/mask.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(text, /from 'node:/, 'the page may load it as it is');
+  const engine = readFileSync(new URL('../src/core/engine.mjs', import.meta.url), 'utf8');
+  assert.match(engine, /import \{ maskSecrets \} from '\.\.\/shared\/mask\.mjs';/);
+});

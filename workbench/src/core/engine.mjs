@@ -21,6 +21,7 @@ import { STATE, ENDED, ACTIVE, DONE, NEEDS_YOU } from '../shared/states.mjs';
 import { nameFromTask, firstSentence, extractQuestion, plain, describeRequest, quotable } from '../shared/narrate.mjs';
 import { money, spentAmount, duration, clip } from '../shared/format.mjs';
 import { looksLikeSecret } from '../shared/secretshape.mjs';
+import { maskSecrets } from '../shared/mask.mjs';
 // "Looks good" and "Not now", and the words that mean the same for finished work; the page uses the same list
 import { LOOKS_GOOD_RE, NOT_NOW_RE } from '../shared/answers.mjs';
 import { StuckDetector } from './stuck.mjs';
@@ -107,6 +108,27 @@ const OFF_NOT_KEPT = 'Full permissions are off for now, but Workbench could not 
 // A full permissions card made before the mode last changed: its question is not the one it asked.
 const MODE_CHANGED = 'That changed. Have another look.';
 const MODE_WORDS = 'Say whether agents should ask first or have full permissions.';
+// Agents' copies: the ignored files a new copy gets (fillWorkspace), and the setup command workbench.json may hold.
+const COPIES_NOTICE = 'Agents’ copies now get your .env files, keys included, and node_modules, so they can run the project. A .worktreeinclude file at the top of the repository chooses what is copied.';
+const SETUP_SENTENCE = 'Run this setup command in each agent’s copy before it starts?';
+const SETUP_DETAIL = 'It comes from workbench.json, and runs before each new agent starts. Workbench asks again if it changes.';
+const SETUP_RAN = 'OK. Each agent’s copy runs it before the agent starts.';
+const SETUP_NOT_KEPT = 'Workbench could not save that, so it asks again the next time it starts.';
+const SETUP_RUNNING = 'Running the setup command in its copy';
+const SETUP_SKIPPED = 'It starts without the setup command.';
+const SETUP_EXPIRED = 'Nobody answered whether to run the setup command, so the agents waiting for it start without it.';
+const SETUP_TIMEOUT_SEC = 600;
+// The most values of copied env files the engine hides (the newest are kept).
+const ENV_SECRETS_MAX = 1000;
+// What was not copied into an agent's copy, and why, in the order the start detail says it (see copiesWords).
+const SKIP_WORDS = [
+  ['noclone', (n, many) => `${n} ${many ? 'were' : 'was'} not copied: this disk cannot make quick copies.`],
+  ['not-ignored', (n, many) => `${n} ${many ? 'were' : 'was'} not copied: the rule that hides ${many ? 'them' : 'it'} from git is not committed.`],
+  ['nested-repo', (n, many) => `${n} ${many ? 'were' : 'was'} not copied: ${many ? 'they are repositories' : 'it is a repository'} of ${many ? 'their' : 'its'} own.`],
+  ['link-outside', (n, many) => `${n} ${many ? 'were' : 'was'} left out: ${many ? 'they lead' : 'it leads'} outside the repository.`],
+  ['failed', (n) => `${n} could not be copied.`],
+  ['venv', (n, many) => `${n} still ${many ? 'run' : 'runs'} the Python in your folder.`],
+];
 
 /** How a state reads after an agent's name: "Checkout fix needs your OK". */
 const PHRASE = Object.freeze({
@@ -233,6 +255,7 @@ function confirmVerb(c) {
     case 'merge': return 'merge it';
     case 'discard': return 'throw it away';
     case 'permissions': return 'turn on full permissions';
+    case 'setup': return 'run it';
     case 'stop': return `stop ${c.agentIds?.length > 1 ? 'them' : 'it'}`;
     case 'start': return `start ${c.tasks?.length > 1 ? 'them' : 'it'}`;
     default: return 'go ahead';
@@ -298,6 +321,48 @@ function pathWords(paths, max = 3) {
   const list = (Array.isArray(paths) ? paths : []).filter(p => typeof p === 'string' && p).map(p => quotable(p, 80));
   if (list.length <= max) return joinAnd(list);
   return `${list.slice(0, max).join(', ')} and ${list.length - max} more`;
+}
+
+/**
+ * The names of what an agent's copy gets from fillWorkspace's list: each env file and each path .worktreeinclude chose,
+ * by its path, and "node_modules" once for every folder of installed packages.
+ */
+function copyNames(entries) {
+  const list = (Array.isArray(entries) ? entries : []).filter(e => e && typeof e.path === 'string' && e.path);
+  const names = list.filter(e => e.kind !== 'deps').map(e => e.path);
+  if (list.some(e => e.kind === 'deps')) names.push('node_modules');
+  return names;
+}
+
+/** What a starting agent shows while its copy is filled ("Copying .env and node_modules into its copy"); null for nothing. */
+function copyingWords(entries) {
+  const names = copyNames(entries);
+  return names.length ? `Copying ${pathWords(names, names.length > 3 ? 2 : 3)} into its copy` : null;
+}
+
+/**
+ * The start detail's sentences about a fill: what the copy has ("Its copy has your .env, apps/web/.env.local and
+ * node_modules."), then what was not copied and why (SKIP_WORDS). Something that was there already is not news.
+ */
+function copiesWords(copied, skipped) {
+  const out = [];
+  const names = copyNames(copied);
+  if (names.length) out.push(`Its copy has your ${pathWords(names, 3)}.`);
+  const list = (Array.isArray(skipped) ? skipped : []).filter(e => e && typeof e.path === 'string' && e.path);
+  const whole = (e) => e.why === 'failed' && (e.path === '.' || e.path === '.worktreeinclude');
+  if (list.some(e => whole(e) && e.path === '.')) out.push('Workbench could not list the files to copy into its copy.');
+  if (list.some(e => whole(e) && e.path === '.worktreeinclude')) out.push('Workbench could not read .worktreeinclude, so nothing was copied.');
+  for (const [why, words] of SKIP_WORDS) {
+    const paths = list.filter(e => e.why === why && !whole(e)).map(e => e.path);
+    if (paths.length) out.push(words(pathWords(paths, 3), paths.length > 1));
+  }
+  return out;
+}
+
+/** A program's output for one log line: its lines joined by " | ", hidden characters as "?", its last 2000 characters. */
+function logTail(s) {
+  const t = String(s ?? '').split(/\r\n|[\r\n]/).map(l => l.replace(/\t/g, ' ').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '?').trim()).filter(Boolean).join(' | ');
+  return t.length > 2000 ? `…${t.slice(-2000)}` : t;
 }
 
 /**
@@ -486,8 +551,10 @@ export class Engine extends EventEmitter {
     this.machines = machines;
     this.deps = deps || {};
     this.connect = connect && typeof connect === 'object' ? connect : null;
-    // Hides the person's stored keys in text: for the runners, the checks and every event applied. Null without one.
-    this._mask = typeof this.connect?.mask === 'function' ? (s) => this._maskText(s) : null;
+    // Hides the person's stored keys, and the values of the env files copied into agents' copies, in text (see _mask).
+    this._maskFn = (s) => this._maskText(s);
+    // The values of the env files copied into agents' copies, frozen (maskSecrets keeps the plan of a frozen list).
+    this._envSecrets = Object.freeze([]);
     this.log = makeLog(log);
     this.prefs = prefs && typeof prefs === 'object' ? prefs : null;
     // Full permissions ('full'), or agents ask before risky steps ('ask'). Live mode starts with what the person kept;
@@ -519,6 +586,11 @@ export class Engine extends EventEmitter {
     this._shuttingDown = false;
     this._shutdownPromise = null;
     this._launching = new Set(); // launches under way (_startAgent): shutdown lets them finish first
+    // Agents' copies. The setup cards open now: id -> { id, key, root, command, hash, createdAt, waiters, bursts,
+    // promise, settle }, one per repository and command, shared by every launch that waits on it (_setupAnswer).
+    this._setupAsks = new Map();
+    this._setupKept = new Map(); // root -> the hash of the setup command said Run it to in this run (kept or not)
+    this._copiesSaid = new Set(); // repositories whose notice about agents' copies was said in this run
     // Merging and throwing away. Every job touches the same repository (the person's own folder, for a merge), so
     // they run one at a time, engine-wide (_gitJob). While an agent's job waits or runs, the agent is busy: nothing
     // else may wake, stop, continue or forget it. Shutdown waits for the jobs under way.
@@ -589,6 +661,9 @@ export class Engine extends EventEmitter {
       for (const held of [...this.held.values()]) {
         this._resolveHeld(held, { decision: 'deny', how: 'auto', reason: 'Workbench is shutting down.', silent: true });
       }
+      // A copy being made ready starts nothing now: its setup command stops, and every open setup card counts as Not now.
+      for (const r of this.runs.values()) r.prep?.abort();
+      for (const d of [...this._setupAsks.values()]) this._closeSetup(d, 'skip');
       // A launch under way (git still making its folder, a process starting) finishes first, so no agent starts unseen
       // after this: one whose folder was made too late starts nothing and gives the folder back (_launch), and one
       // already starting is stopped below with the others.
@@ -624,11 +699,17 @@ export class Engine extends EventEmitter {
         }
         batch.push({ kind: EV.STATE, agentId: v.id, state: STATE.STOPPED, reason: 'Workbench was closed' });
       }
+      // An agent whose runner never started (its copy was being made ready) is stopped too.
+      for (const r of this.runs.values()) {
+        const v = r.runner ? null : this.store.get(r.id);
+        if (v && ACTIVE.has(v.state)) batch.push({ kind: EV.STATE, agentId: v.id, state: STATE.STOPPED, reason: 'Workbench was closed' });
+      }
       if (batch.length) this._apply(batch);
       // Folders where nothing changed go; the others stay, so the person can look at the work afterwards.
-      // A runner that would not stop may still be writing in its folder: that one stays.
+      // A runner that would not stop may still be writing in its folder: that one stays, and so does a folder whose
+      // copy was still being made (cp may still be writing in it).
       const tidy = [...this.runs.values()].filter(r => r.workspace && !r.folderRemoved && !this._busy.has(r.id)
-        && this._runnerInfo(r)?.alive !== true);
+        && !r.prep && this._runnerInfo(r)?.alive !== true);
       tidy.push(...this._earlierToTidy());
       if (tidy.length) {
         await withTimeout(Promise.all(tidy.map(r => this._removeUnchanged(r))), this.options.tidyTimeoutMs)
@@ -673,6 +754,12 @@ export class Engine extends EventEmitter {
     try { this._checkStuck(now); } catch (err) { this.log.error('Stuck check failed:', err); }
     try { this._checkWaiting(now); } catch (err) { this.log.error('Background check failed:', err); }
     for (const [id, c] of this.confirms) if (now - c.createdAt > this.options.confirmTtlMs) this.confirms.delete(id);
+    // A setup card nobody answered counts as Not now: the launches waiting on it start without the setup command.
+    for (const d of [...this._setupAsks.values()]) {
+      if (now - d.createdAt <= this.options.confirmTtlMs) continue;
+      this.log.warn(SETUP_EXPIRED);
+      this._closeSetup(d, 'skip');
+    }
     if (now - this._lastMachinesAt >= this.options.machinesEveryMs) {
       this._lastMachinesAt = now;
       this._refreshMachines();
@@ -847,9 +934,31 @@ export class Engine extends EventEmitter {
 
   // ================================================================ keys
 
-  /** Text with the person's stored keys hidden (Connect's mask), or as it is when there is nothing to hide. */
+  /**
+   * The mask for text (text -> text): the person's stored keys (Connect's) and the values of the env files copied into
+   * agents' copies, hidden. For the runners, the checks, the setup command and every event applied. Null while there is
+   * nothing to hide: no Connect, and no env file copied yet.
+   */
+  get _mask() {
+    return typeof this.connect?.mask === 'function' || this._envSecrets.length ? this._maskFn : null;
+  }
+
+  /** Text with the person's stored keys and the copied env values hidden, or as it is when there is nothing to hide. */
   _maskText(s) {
-    if (typeof s !== 'string' || s.length < 8 || !this._mask) return s;
+    if (typeof s !== 'string' || s.length < 8) return s;
+    const out = typeof this.connect?.mask === 'function' ? this._maskStored(s) : s;
+    return this._envSecrets.length ? maskSecrets(out, this._envSecrets) : out;
+  }
+
+  /** The values of copied env files to hide from now on (8 characters or more), the newest ENV_SECRETS_MAX kept. */
+  _addEnvSecrets(values) {
+    const fresh = (Array.isArray(values) ? values : []).filter(v => typeof v === 'string' && v.length >= 8 && !this._envSecrets.includes(v));
+    if (fresh.length) this._envSecrets = Object.freeze([...this._envSecrets, ...fresh].slice(-ENV_SECRETS_MAX));
+  }
+
+  /** Text with the person's stored keys hidden (Connect's mask), or as it is when there is nothing to hide. */
+  _maskStored(s) {
+    if (typeof s !== 'string' || s.length < 8 || typeof this.connect?.mask !== 'function') return s;
     try {
       const out = this.connect.mask(s);
       return typeof out === 'string' ? out : s;
@@ -911,7 +1020,8 @@ export class Engine extends EventEmitter {
     try {
       if (looksLikeSecret(t)?.secret === true) return true;
     } catch { /* the mask may still know it */ }
-    return !!this._mask && this._mask(t) !== t;
+    // Stored keys only: a copied .env holds plain words too ("production"), which the person may well type.
+    return typeof this.connect?.mask === 'function' && this._maskStored(t) !== t;
   }
 
   _react(e) {
@@ -1223,9 +1333,11 @@ export class Engine extends EventEmitter {
   // ================================================================ stuck agents
 
   _checkStuck(now) {
+    // An agent whose copy is being made ready is quiet because Workbench is busy for it (or waits for the person's
+    // answer to the setup card), not because it is stuck.
     const views = this.store.list().filter(v => (v.state === STATE.WORKING || v.state === STATE.STARTING)
       && !this.stopped.has(v.id) && !this.stopped.has(v.rootId)
-      && !this.runs.get(v.id)?.deciding);
+      && !this.runs.get(v.id)?.deciding && !this.runs.get(v.id)?.prep);
     for (const f of this.stuck.check(now, views)) {
       const ask = this._newAsk(f.agentId, 'stuck', {
         sentence: f.sentence,
@@ -2220,6 +2332,8 @@ export class Engine extends EventEmitter {
     const run = this.runs.get(v.id);
     this.stopped.add(v.id);
     if (run) run.stopped = true;
+    // While its copy is made ready: its setup command stops, it waits on no setup card, and its runner never starts.
+    run?.prep?.abort();
     this._cancelReceipt(run); // stopping an agent stops the checks it is running
     // What a turn decided while a request was held would otherwise show for a moment before "stopped".
     for (const a of [v, ...this.store.descendants(v.id)]) this._dropLater(a.id);
@@ -2305,23 +2419,44 @@ export class Engine extends EventEmitter {
 
   // ================================================================ launching
 
-  /** Launch a root agent. Does not ask first: command() and the UI confirm before calling this. */
+  /**
+   * Launch a root agent, and resolve once its runner has started (or could not): in live mode, after its copy got its
+   * files and its setup command ran. Does not ask first: command() and the UI confirm before calling this.
+   */
   async startAgent(opts = {}) {
     const v = await this._startAgent(opts);
-    this._notice(v.state === STATE.FAILED ? `${v.name} could not start. ${v.stateReason || ''}`.trim() : `Started ${v.name}.`, v.id);
+    if (v.state === STATE.FAILED) this._notice(`${v.name} could not start. ${v.stateReason || ''}`.trim(), v.id);
+    else if (v.state !== STATE.STOPPED) this._notice(`Started ${v.name}.`, v.id);
     return v;
   }
 
-  /** A launch, tracked while it is under way so that shutdown can wait for it (see shutdown). */
-  _startAgent(opts) {
-    const p = this._launch(opts);
-    this._launching.add(p);
-    const done = () => this._launching.delete(p);
-    p.then(done, done);
-    return p;
+  /** A whole launch (see _begin): resolves to the agent's view once its runner has started, or could not. */
+  _startAgent(opts, burst = null) {
+    return this._begin(opts, burst).then(l => l.started);
   }
 
-  async _launch({ task, harness, model, machineId, budgetUsd, name } = {}) {
+  /**
+   * Begin a launch. Resolves to `{ view, started, done }` as soon as the agent is on the board and either its runner
+   * has started (`done`) or it does something slow first: its copy is filled, it waits for the setup card, or its setup
+   * command runs. `started` resolves to its view once the runner has started or could not. Both parts are tracked
+   * while they are under way, so that shutdown can wait for them (see shutdown). `burst`: what the launches of one
+   * launch card share (the answer to a setup card, see _setupAnswer).
+   */
+  _begin(opts, burst = null) {
+    const track = (p) => {
+      this._launching.add(p);
+      const done = () => this._launching.delete(p);
+      p.then(done, done);
+      return p;
+    };
+    return track(this._launch(opts, burst)).then(async ({ view, started, slow }) => {
+      track(started);
+      const first = await Promise.race([started.then(v => ({ v, done: true })), slow.then(() => ({ done: false }))]);
+      return { view: first.done ? first.v : (this.store.get(view.id) || view), started, done: first.done };
+    });
+  }
+
+  async _launch({ task, harness, model, machineId, budgetUsd, name } = {}, burst = null) {
     if (this._shuttingDown) throw plainError('Workbench is shutting down.');
     const text = String(task ?? '').trim();
     if (!text) throw plainError('Tell me what the agent should work on.');
@@ -2386,6 +2521,7 @@ export class Engine extends EventEmitter {
       turnSeq: 0, inTurn: false, deciding: false, stopped: false, lastText: '',
       receipt: null, checksDone: null, // the receipt being built (cancellable) and when its checks have ended
       waiting: null, background: null, backgroundAt: 0, accepted: null, // background work left running
+      prep: null, // while its copy is made ready (live): the AbortController that stops its setup command
     };
     this.runs.set(id, run);
     this._apply([
@@ -2393,34 +2529,287 @@ export class Engine extends EventEmitter {
       ...(workspace ? [{ kind: EV.WORK, agentId: id, work: { branch: workspace.branch, from: workspace.from, folder: true, merged: null, problem: null, thrownAway: null } }] : []),
       { kind: EV.STATE, agentId: id, state: STATE.STARTING, reason: null },
     ]);
+    const opts = {
+      agentId: id,
+      name: agentName,
+      task: text,
+      cwd: workspace?.path ?? null,
+      model: mdl,
+      budgetUsd: budget,
+      emit: (ev) => this.ingest(ev),
+      // Only a real Claude Code agent has the hook, with its own token. Codex and the simulator get none.
+      hook: this.mode === 'live' && h === 'claude' ? { url: this.hook?.url ?? null, token: this._hookToken(id) } : null,
+      log: this.log,
+      harness: h,
+      machineId: mach,
+    };
+    let slowNow;
+    const slow = new Promise(r => { slowNow = r; });
+    const started = this._finishLaunch(run, factory, opts, { burst, slow: slowNow });
+    return { view: this.store.get(id), started, slow };
+  }
+
+  /**
+   * The rest of a launch, once the agent is on the board: its copy made ready (live mode: _prepare), then its runner
+   * started. `o.slow` is called when something slow begins. Resolves to the agent's view; never rejects.
+   */
+  async _finishLaunch(run, factory, opts, o) {
+    let ready = true;
+    try {
+      ready = await this._prepare(run, o);
+    } catch (err) {
+      this.log.error(`Workbench could not make the copy of ${run.id} ready:`, err);
+    } finally {
+      run.prep = null;
+    }
+    if (!ready || run.stopped || this._shuttingDown) return this.store.get(run.id);
     try {
       run.runner = factory({
-        agentId: id,
-        name: agentName,
-        task: text,
-        cwd: workspace?.path ?? null,
-        model: mdl,
-        budgetUsd: budget,
-        emit: (ev) => this.ingest(ev),
-        // Only a real Claude Code agent has the hook, with its own token. Codex and the simulator get none.
-        hook: this.mode === 'live' && h === 'claude' ? { url: this.hook?.url ?? null, token: this._hookToken(id) } : null,
-        log: this.log,
-        harness: h,
-        machineId: mach,
-        ...this._runnerKeys(h), // live only: the person's keys for this agent, and the mask that hides them
+        ...opts,
+        ...this._runnerKeys(run.harness), // live only: the person's keys for this agent, and the mask that hides them
       });
       await run.runner.start();
     } catch (err) {
-      this.log.error(`Agent ${id} could not start:`, err);
+      this.log.error(`Agent ${run.id} could not start:`, err);
       const why = plainReason(err);
       this._apply([
-        { kind: EV.ENDED, agentId: id, outcome: 'error', error: why },
-        { kind: EV.STATE, agentId: id, state: STATE.FAILED, reason: `It could not start: ${why}` },
+        { kind: EV.ENDED, agentId: run.id, outcome: 'error', error: why },
+        { kind: EV.STATE, agentId: run.id, state: STATE.FAILED, reason: `It could not start: ${why}` },
       ]);
       if (this._runnerInfo(run)?.alive !== true) await this._removeUnchanged(run); // nothing ran in its folder
     }
     this._refreshMachines();
-    return this.store.get(id);
+    return this.store.get(run.id);
+  }
+
+  // ---------------------------------------------------------------- an agent's copy, before it starts
+
+  /**
+   * Live mode, for an agent with a folder: make its copy ready before its runner starts. In this order: its copy gets
+   * the ignored files it needs (fillWorkspace: .env files and node_modules, or what .worktreeinclude lists), whose env
+   * values are hidden from then on; then workbench.json's setup command runs in it, once the person has said Run it to
+   * that command (the setup card, asked while the copy is made); then the start detail says what came of both, as the
+   * agent's reason (its `now`, the line its chip shows on hover) and in the log. Neither a failed copy nor a failed
+   * setup command stops the launch. False when the agent was stopped meanwhile or Workbench is closing: nothing more is
+   * done for it.
+   */
+  async _prepare(run, { burst = null, slow = () => {} } = {}) {
+    const ws = run.workspace;
+    const root = this.repoInfo?.root;
+    if (this.mode !== 'live' || !ws || !root) return true;
+    const fill = typeof this.deps.workspace?.fillWorkspace === 'function';
+    const canSetup = typeof this.deps.receipt?.runSetup === 'function';
+    if (!fill && !canSetup) return true;
+    run.prep = new AbortController();
+    const gone = () => run.stopped || this._shuttingDown;
+    const name = this.store.get(run.id)?.name || 'The agent';
+    const said = [];
+    // The setup card is asked first, so that it shows while the copy is made, and so that every launch of a burst
+    // finds it open. The command runs after the copy.
+    const config = canSetup ? await run.config : null;
+    if (gone()) return false;
+    const setup = canSetup && typeof config?.setup === 'string' && config.setup.trim() ? config.setup : null;
+    let answer = null;
+    if (setup) {
+      answer = this._setupAnswer(run, root, setup, burst);
+      if (answer.asks) slow();
+    }
+    if (fill) {
+      slow();
+      said.push(...await this._fill(run, root, name));
+      if (gone()) return false;
+    }
+    if (answer) {
+      if (await answer === 'run') {
+        if (gone()) return false;
+        slow();
+        said.push(await this._runSetup(run, root, setup, name));
+      } else {
+        said.push(SETUP_SKIPPED);
+      }
+      if (gone()) return false;
+    }
+    const detail = said.filter(Boolean).join(' ');
+    if (detail) {
+      // Workbench's own words, made of file names: never masked (a copied value such as "production" is in ".env.production").
+      this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason: detail }], { masked: true });
+      this.log.info(`${logText(name)} is starting. ${detail}`);
+    }
+    return true;
+  }
+
+  /**
+   * Fill the agent's new copy (fillWorkspace), saying what it copies while it does, and hide the values of the env files
+   * it copied. The first time a repository's agents get an env file, the notice says so (once, kept in prefs). Returns
+   * the start detail's sentences about it; never rejects.
+   */
+  async _fill(run, root, name) {
+    const say = (reason) => {
+      if (reason && !run.stopped && !this._shuttingDown) this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason }], { masked: true });
+    };
+    let r;
+    try {
+      r = await this.deps.workspace.fillWorkspace({ repoRoot: root, path: run.workspace.path, onChosen: (entries) => say(copyingWords(entries)) });
+    } catch (err) {
+      this.log.warn(`Workbench could not copy the files ${logText(name)} needs into its folder, so it starts without them:`, err?.message || String(err));
+      return ['Workbench could not copy your ignored files into its copy.'];
+    }
+    const copied = Array.isArray(r?.copied) ? r.copied : [];
+    const skipped = Array.isArray(r?.skipped) ? r.skipped : [];
+    if (copied.length && typeof this.deps.workspace?.envValues === 'function') {
+      try {
+        const env = await this.deps.workspace.envValues({ path: run.workspace.path, copied });
+        this._addEnvSecrets(env?.values);
+        if (env?.files > 0) this._sayCopies(root);
+      } catch (err) {
+        this.log.warn('Workbench could not read the env files it copied:', err?.message || String(err));
+      }
+    }
+    return copiesWords(copied, skipped);
+  }
+
+  /** The notice about agents' copies, once per repository: said the first time its agents get an env file, and kept. */
+  _sayCopies(root) {
+    if (this._copiesSaid.has(root)) return;
+    this._copiesSaid.add(root);
+    let kept = [];
+    try {
+      kept = this.prefs?.get?.()?.copiesSaid || [];
+    } catch { /* not readable: said again */ }
+    if (Array.isArray(kept) && kept.includes(root)) return;
+    // Workbench's own words: never masked.
+    this._apply([{ kind: EV.NOTICE, text: COPIES_NOTICE }], { masked: true });
+    try {
+      this.prefs?.set?.({ copiesSaid: [root] });
+    } catch (err) {
+      this.log.warn('Workbench could not keep that it told you about agents’ copies:', err?.message || err);
+    }
+  }
+
+  /**
+   * Run the setup command in the agent's copy (receipt's runSetup): its own process group, ten minutes at most, the
+   * scrubbed environment with WORKBENCH_ROOT and WORKBENCH_AGENT_ID, stopped with the agent. Its output goes to the
+   * log only, masked. Returns the start detail's sentence about it; never rejects.
+   */
+  async _runSetup(run, root, command, name) {
+    this._apply([{ kind: EV.STATE, agentId: run.id, state: STATE.STARTING, reason: SETUP_RUNNING }], { masked: true });
+    let r;
+    try {
+      r = await this.deps.receipt.runSetup({
+        cwd: run.workspace.path, run: command,
+        env: { ...process.env, WORKBENCH_ROOT: root, WORKBENCH_AGENT_ID: run.id },
+        ...(this._mask ? { mask: this._mask } : {}),
+        signal: run.prep?.signal, timeoutSec: SETUP_TIMEOUT_SEC,
+      });
+    } catch (err) {
+      r = { ok: false, exitCode: null, timedOut: false, ms: 0, tail: err?.message || '' };
+    }
+    if (run.stopped || this._shuttingDown) return '';
+    const printed = logTail(r?.tail);
+    const end = printed ? ` The end of what it printed: ${printed}` : '';
+    if (r?.ok) {
+      this.log.info(`The setup command ran in the copy of ${logText(name)} (${duration(Number(r.ms) || 0) || 'under a second'}).${end}`);
+      return 'The setup command ran in it.';
+    }
+    const how = r?.timedOut ? 'it took more than 10 minutes' : Number.isInteger(r?.exitCode) ? `exit ${r.exitCode}` : 'it could not start';
+    this.log.warn(`The setup command failed in the copy of ${logText(name)} (${how}).${end}`);
+    if (r?.timedOut) return 'The setup command took more than 10 minutes, so its copy may not run yet.';
+    if (Number.isInteger(r?.exitCode)) return `The setup command failed (exit ${r.exitCode}), so its copy may not run yet.`;
+    return 'The setup command could not start, so its copy may not run yet.';
+  }
+
+  /**
+   * Whether the setup command `command` of the repository at `root` runs in this agent's copy: 'run' or 'skip'. It runs
+   * at once when the person said Run it to this very text before (kept in prefs by root, as its SHA-256, or said in this
+   * run), or when the setup card of the launch card this launch came from (`burst`) was answered already. Otherwise
+   * the setup card asks: one per repository and command, open until answered, and every launch that comes meanwhile
+   * waits on the same card. Run it is kept; Not now keeps nothing, so the next launch asks again; a card nobody answers
+   * counts as Not now after confirmTtlMs, and so does shutdown. An agent stopped meanwhile stops waiting ('skip'), and a
+   * card nobody waits on any more goes.
+   */
+  _setupAnswer(run, root, command, burst) {
+    const hash = crypto.createHash('sha256').update(command).digest('hex');
+    const key = `${root}\n${hash}`;
+    if (this._setupKeptFor(root) === hash) return Promise.resolve('run');
+    if (burst?.setup?.has(key)) return Promise.resolve(burst.setup.get(key));
+    let d = [...this._setupAsks.values()].find(x => x.key === key);
+    if (!d) {
+      d = { id: hex(6), key, root, command, hash, createdAt: this.now(), waiters: new Set(), bursts: new Set() };
+      d.promise = new Promise(r => { d.settle = r; });
+      this._setupAsks.set(d.id, d);
+      this.emit('setup', this._setupCard());
+    }
+    d.waiters.add(run.id);
+    if (burst) d.bursts.add(burst);
+    const signal = run.prep?.signal;
+    const waits = new Promise(resolve => {
+      const onAbort = () => {
+        d.waiters.delete(run.id);
+        if (!d.waiters.size) this._closeSetup(d, 'skip');
+        resolve('skip');
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      d.promise.then(a => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve(a);
+      });
+    });
+    waits.asks = true; // it waits for the person
+    return waits;
+  }
+
+  /** The hash of the setup command said Run it to for `root`: in this run, else as kept in prefs; null when none. */
+  _setupKeptFor(root) {
+    if (this._setupKept.has(root)) return this._setupKept.get(root);
+    try {
+      const h = this.prefs?.get?.()?.setupOk?.[root];
+      return typeof h === 'string' ? h : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Close an open setup card with its answer ('run' or 'skip'): every launch waiting on it, and its bursts, have it. */
+  _closeSetup(d, answer) {
+    if (!this._setupAsks.has(d.id)) return;
+    this._setupAsks.delete(d.id);
+    for (const b of d.bursts) {
+      if (!b.setup) b.setup = new Map();
+      b.setup.set(d.key, answer);
+    }
+    d.settle(answer);
+    this.emit('setup', this._setupCard());
+  }
+
+  /** The person's answer to a setup card: Run it (kept by repository and command) or Not now (kept nowhere). */
+  _answerSetup(d, go) {
+    const many = d.waiters.size > 1;
+    if (!go) {
+      this._closeSetup(d, 'skip');
+      return { reply: `OK. The ${many ? 'agents start' : 'agent starts'} without it, and Workbench asks again next time.` };
+    }
+    this._setupKept.set(d.root, d.hash);
+    let kept = true;
+    if (typeof this.prefs?.set === 'function') {
+      try {
+        kept = this.prefs.set({ setupOk: { [d.root]: d.hash } })?.ok !== false;
+      } catch (err) {
+        kept = false;
+        this.log.warn('Workbench could not keep your answer about the setup command:', err?.message || err);
+      }
+    }
+    this._closeSetup(d, 'run');
+    return { reply: kept ? SETUP_RAN : `${SETUP_RAN} ${SETUP_NOT_KEPT}` };
+  }
+
+  /** The setup card the page shows (the oldest one open), or null. */
+  _setupCard() {
+    const d = this._setupAsks.values().next().value;
+    return d ? { id: d.id, kind: 'setup', sentence: SETUP_SENTENCE, command: d.command, detail: SETUP_DETAIL, yes: 'Run it', no: 'Not now' } : null;
   }
 
   /**
@@ -3590,11 +3979,15 @@ export class Engine extends EventEmitter {
         // and not whatever would have taken its place.
         out = shown.gone
           ? { reply: GONE }
-          : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
+          : shown.kind === 'setup'
+            ? { reply: 'I did not catch that. Say “run it” or “not now”.', confirm: this._card(shown) }
+            : { reply: `I did not catch that. Say “do it” to ${confirmVerb(shown)}, or “cancel”.`, confirm: this._card(shown) };
       } else {
         // Any other command withdraws the card on screen, without a notice: the page lets go of it. A look at an
         // agent's changes does not: it is read-only, so the card keeps waiting, and the reply carries it, as for words
-        // not caught, so the page keeps it too ("show me the changes" before saying yes to a merge).
+        // not caught, so the page keeps it too ("show me the changes" before saying yes to a merge). Nor does a setup
+        // card: launches wait on it, and only its own answer (or its time running out) lets them go on. It is not in
+        // `confirms`, so nothing here deletes it, and the page keeps it from the snapshot.
         const keep = intent.kind === 'changes' && shown && !shown.gone;
         if (shown && !shown.gone && intent.kind !== 'confirm' && !keep) this.confirms.delete(shown.id);
         try {
@@ -3633,6 +4026,8 @@ export class Engine extends EventEmitter {
   _shownConfirm(confirmId) {
     const id = typeof confirmId === 'string' ? confirmId : '';
     if (!id) return null;
+    const d = this._setupAsks.get(id);
+    if (d) return { id: d.id, kind: 'setup', sentence: SETUP_SENTENCE, detail: SETUP_DETAIL, command: d.command, yes: 'Run it', no: 'Not now' };
     const c = this.confirms.get(id);
     if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) return { id, gone: true };
     const agentIds = c.agentIds ?? c.intent?.agentIds ?? (c.agentId ? [c.agentId] : undefined);
@@ -3644,16 +4039,18 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId?, agents? }. `kind` is always there
-   * (start, stop, say, forget, merge, discard or permissions); yes and no are the buttons' own words when they are not
-   * "Do it" and "Cancel"; agentId (merge and discard cards only) is the agent the card is about; agents (launch cards
-   * only) is how many agents it starts, so the page can say "it" or "they".
+   * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId?, agents?, command? }. `kind` is
+   * always there (start, stop, say, forget, merge, discard, permissions or setup); yes and no are the buttons' own words
+   * when they are not "Do it" and "Cancel"; agentId (merge and discard cards only) is the agent the card is about;
+   * agents (launch cards only) is how many agents it starts, so the page can say "it" or "they"; command (setup cards
+   * only) is the setup command it asks about.
    */
   _card(c) {
     const out = { id: c.id, sentence: c.sentence, detail: c.detail ?? null, kind: c.kind };
     if (c.yes) out.yes = c.yes;
     if (c.no) out.no = c.no;
     if (typeof c.danger === 'boolean') out.danger = c.danger;
+    if (c.kind === 'setup' && typeof c.command === 'string') out.command = c.command;
     if (c.kind === 'start' && Array.isArray(c.tasks)) out.agents = c.tasks.length;
     // a merge or throw-away card names the agent it is about, so the git screen can show it in that agent's detail
     if ((c.kind === 'merge' || c.kind === 'discard') && typeof c.agentId === 'string' && c.agentId) out.agentId = c.agentId;
@@ -3949,6 +4346,9 @@ export class Engine extends EventEmitter {
   }
 
   async _confirm(confirmId, go) {
+    // A setup card: Run it or Not now, for every launch waiting on it.
+    const d = this._setupAsks.get(String(confirmId ?? ''));
+    if (d) return this._answerSetup(d, go);
     const c = this.confirms.get(String(confirmId ?? ''));
     if (!c || this.now() - c.createdAt > this.options.confirmTtlMs) {
       if (c) this.confirms.delete(c.id);
@@ -3995,13 +4395,26 @@ export class Engine extends EventEmitter {
     const started = [];
     const problems = [];
     let openConnect = false; // an agent was gone by the time of the yes: Agents & keys is where to bring it back
+    // The launches of this card share the answer to a setup card (see _setupAnswer). Each is waited for until it is on
+    // the board and has started or begun something slow (its copy, its setup card, its setup command): the reply never
+    // waits on those, and one that then cannot start says so in a notice.
+    const burst = { setup: new Map() };
     for (const t of c.tasks) {
       try {
         const machineId = await this._pickMachine(t.machine, used);
         used.add(machineId);
-        const v = await this._startAgent({ task: t.task, harness: t.harness, machineId });
-        if (v.state === STATE.FAILED) problems.push(`${v.name} could not start. ${v.stateReason || ''}`.trim());
-        else started.push(v);
+        const l = await this._begin({ task: t.task, harness: t.harness, machineId }, burst);
+        const v = l.view;
+        if (v.state === STATE.FAILED) {
+          problems.push(`${v.name} could not start. ${v.stateReason || ''}`.trim());
+          continue;
+        }
+        started.push(v);
+        if (!l.done) {
+          l.started.then(after => {
+            if (after?.state === STATE.FAILED) this._notice(`${after.name} could not start. ${after.stateReason || ''}`.trim(), after.id);
+          }, () => {});
+        }
       } catch (err) {
         if (err?.openConnect && this.mode === 'live') openConnect = true;
         // A task refused for holding a key (stored after the card was made) is not quoted: a reply is never masked.
@@ -4242,6 +4655,9 @@ export class Engine extends EventEmitter {
       defaultBudgetUsd: this.defaultBudgetUsd,
       // 'full' while full permissions are on, else 'ask': the top band's Full permissions button
       permissions: this.permissionMode,
+      // Live only, while launches wait on it: the setup card ({ id, kind: 'setup', sentence, command, detail, yes, no }),
+      // which the page shows in the core until it is answered (POST /api/confirm/:id).
+      ...(this._setupAsks.size ? { setup: this._setupCard() } : {}),
     };
   }
 }

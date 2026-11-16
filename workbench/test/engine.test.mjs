@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,7 +12,7 @@ import * as commands from '../src/core/commands.mjs';
 import * as receiptMod from '../src/core/receipt.mjs';
 import * as workspaceMod from '../src/core/workspace.mjs';
 import * as policyMod from '../src/core/policy.mjs';
-import { createPrefs, prefsFile } from '../src/core/prefs.mjs';
+import { createPrefs, prefsFile, memoryPrefs } from '../src/core/prefs.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
 import { FakeSim, FakeGitSim, FakeMachines, fakeAdapter, fakeDeps, gate, gitError, until, FAKE_BASE, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
 
@@ -21,7 +22,7 @@ const subagentPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pret
 const rootPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-root-bash.json', import.meta.url), 'utf8'));
 
 /** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). */
-function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2, prefs = null } = {}) {
+function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2, prefs = null, log = null } = {}) {
   const store = new Store();
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
@@ -31,7 +32,7 @@ function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudget
   store.on('notice', n => notices.push(n.text));
   const engine = new Engine({
     store, mode: 'live', repo: REPO, hook: HOOK, defaultBudgetUsd,
-    adapters: adapters || { claude, codex }, machines, deps, prefs,
+    adapters: adapters || { claude, codex }, machines, deps, prefs, log,
     options: { permissionTimeoutMs: 5000, tickMs: 10_000_000, helperWaitMs: 60, exitGraceMs: 20, ...options },
   });
   return { store, engine, claude, codex, deps, calls, git, machines, notices };
@@ -174,6 +175,357 @@ test('start() in live mode checks which harnesses are available', async () => {
   assert.equal(snap.harnessInfo.codex.reason, 'Codex is not installed.');
   await assert.rejects(t.engine.startAgent({ task: 'x', harness: 'codex' }), /not available/);
   await t.engine.shutdown();
+});
+
+// ------------------------------------------------------------------ agents' copies: the files they need, and the setup command
+
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const FILLED = { copied: [{ path: '.env', kind: 'env' }, { path: 'apps/web/.env.local', kind: 'env' }, { path: 'node_modules', kind: 'deps' }], skipped: [] };
+const COPIES_NOTICE = 'Agents’ copies now get your .env files, keys included, and node_modules, so they can run the project. A .worktreeinclude file at the top of the repository chooses what is copied.';
+const SETUP_ASK = 'Run this setup command in each agent’s copy before it starts?';
+const SETUP_RAN = 'OK. Each agent’s copy runs it before the agent starts.';
+
+/**
+ * A live engine whose agents' copies are filled (stand-ins for fillWorkspace and envValues), with workbench.json's setup
+ * command `setup` (none when undefined), the person's kept choices in memory unless given, and its log kept. The runner's
+ * start is noted in calls.order, after 'fill' and 'setup'.
+ */
+function copies({ fill = FILLED, setup, env = { values: [], files: 2 }, prefs, options } = {}) {
+  const logs = [];
+  const t = live({ deps: { fill, setup }, prefs: prefs === undefined ? memoryPrefs() : prefs, options, log: (level, ...a) => logs.push(`${level} ${a.map(String).join(' ')}`) });
+  t.git.env = env;
+  t.logs = logs;
+  t.claude = fakeAdapter('claude', { onStart: () => t.calls.order.push('runner') });
+  t.engine.adapters.claude = t.claude;
+  return t;
+}
+/** The setup card the engine waits on, once it shows (the snapshot's `setup`). */
+const setupCard = (t) => until(() => t.engine.snapshot().setup);
+
+test('a new agent’s copy is filled first, then its setup command runs, then its runner starts; it says what it copies, and then what came of it', async () => {
+  const t = copies({ setup: 'npm ci', prefs: memoryPrefs({ setupOk: { [REPO.root]: sha('npm ci') } }) });
+  const g = gate();
+  t.git.fillGate = g;
+  const launch = t.engine.startAgent({ task: 'Fix the login redirect' });
+  await until(() => t.calls.fillWorkspace.length === 1);
+  const [v] = t.store.list();
+  assert.equal(v.state, 'starting');
+  assert.equal(v.now, 'Copying .env, apps/web/.env.local and node_modules into its copy', 'the hover line names what is being copied');
+  assert.deepEqual(t.calls.order, ['fill'], 'nothing else runs while it copies');
+  g.open();
+  const done = await launch;
+  assert.deepEqual(t.calls.order, ['fill', 'setup', 'runner']);
+  const fill = t.calls.fillWorkspace[0];
+  assert.deepEqual({ repoRoot: fill.repoRoot, path: fill.path }, { repoRoot: REPO.root, path: done.workspace });
+  assert.equal(typeof fill.onChosen, 'function');
+  assert.deepEqual(t.calls.envValues[0].copied.map(e => e.path), ['.env', 'apps/web/.env.local', 'node_modules'], 'the copied files are read for their values');
+  const setup = t.calls.runSetup[0];
+  assert.equal(setup.cwd, done.workspace);
+  assert.equal(setup.run, 'npm ci');
+  assert.equal(setup.timeoutSec, 600);
+  assert.equal(setup.env.WORKBENCH_ROOT, REPO.root, 'the person’s folder');
+  assert.equal(setup.env.WORKBENCH_AGENT_ID, done.id, 'so a Workbench started from it refuses, as one started from a check does');
+  assert.ok(setup.signal instanceof AbortSignal);
+  assert.equal(done.state, 'starting');
+  const detail = 'Its copy has your .env, apps/web/.env.local and node_modules. The setup command ran in it.';
+  assert.equal(done.now, detail, 'the start detail: the line its chip shows on hover');
+  assert.ok(t.logs.includes(`info Fix login redirect is starting. ${detail}`), t.logs.join('\n'));
+  assert.ok(t.logs.some(l => /^info The setup command ran in the copy of Fix login redirect\b.*added 12 packages/.test(l)), 'its output goes to the log');
+  assert.ok(t.notices.includes('Started Fix login redirect.'));
+  await t.engine.shutdown();
+});
+
+test('a copy that fails, or a setup command that fails, never stops the launch: the agent starts, and its start detail says so', async () => {
+  const t = copies({ setup: 'npm ci', prefs: memoryPrefs({ setupOk: { [REPO.root]: sha('npm ci') } }) });
+  t.git.fillError = new Error('cp: something broke');
+  t.git.setupResult = { ok: false, exitCode: 1, timedOut: false, ms: 9, tail: 'npm ERR! missing script: ci\nnpm ERR! see the log' };
+  const v = await t.engine.startAgent({ task: 'Fix the login redirect' });
+  assert.deepEqual(t.calls.order, ['fill', 'setup', 'runner']);
+  assert.equal(t.claude.runners[0].started, true);
+  assert.equal(v.now, 'Workbench could not copy your ignored files into its copy. The setup command failed (exit 1), so its copy may not run yet.');
+  assert.ok(t.logs.some(l => l.startsWith('warn Workbench could not copy the files Fix login redirect needs into its folder')), t.logs.join('\n'));
+  assert.ok(t.logs.some(l => l === 'warn The setup command failed in the copy of Fix login redirect (exit 1). The end of what it printed: npm ERR! missing script: ci | npm ERR! see the log'), t.logs.join('\n'));
+  // a limit reached, and a command that could not start
+  t.git.fillError = null;
+  t.git.setupResult = { ok: false, exitCode: null, timedOut: true, ms: 600_000, tail: 'Stopped after 600 seconds because it took too long.' };
+  assert.match((await t.engine.startAgent({ task: 'Fix the cart' })).now, / The setup command took more than 10 minutes, so its copy may not run yet\.$/);
+  t.git.setupResult = { ok: false, exitCode: null, timedOut: false, ms: 0, tail: 'Could not start this check: spawn /bin/sh ENOENT' };
+  assert.match((await t.engine.startAgent({ task: 'Fix the tax' })).now, / The setup command could not start, so its copy may not run yet\.$/);
+  await t.engine.shutdown();
+});
+
+test('the start detail says what was not copied, and why, in plain words', async () => {
+  const t = copies({ fill: { copied: [{ path: '.env', kind: 'env' }], skipped: [
+    { path: 'node_modules', why: 'noclone' }, { path: 'apps/web/node_modules', why: 'noclone' },
+    { path: '.env.local', why: 'not-ignored' }, { path: 'vendor/lib', why: 'nested-repo' }, { path: 'node_modules/out', why: 'link-outside' },
+    { path: 'data', why: 'failed' }, { path: 'tools/.venv', why: 'venv' }, { path: 'build', why: 'exists' },
+  ] } });
+  const v = await t.engine.startAgent({ task: 'Fix the login redirect' });
+  assert.equal(v.now, ['Its copy has your .env.',
+    'node_modules and apps/web/node_modules were not copied: this disk cannot make quick copies.',
+    '.env.local was not copied: the rule that hides it from git is not committed.',
+    'vendor/lib was not copied: it is a repository of its own.',
+    'node_modules/out was left out: it leads outside the repository.',
+    'data could not be copied.',
+    'tools/.venv still runs the Python in your folder.'].join(' '));
+  // nothing could be listed at all, or nothing was there to copy
+  t.git.fill = { copied: [], skipped: [{ path: '.', why: 'failed' }] };
+  assert.equal((await t.engine.startAgent({ task: 'Fix the cart' })).now, 'Workbench could not list the files to copy into its copy.');
+  t.git.fill = { copied: [], skipped: [{ path: '.worktreeinclude', why: 'failed' }] };
+  assert.equal((await t.engine.startAgent({ task: 'Fix the tax' })).now, 'Workbench could not read .worktreeinclude, so nothing was copied.');
+  t.git.fill = { copied: [], skipped: [] };
+  t.git.env = { values: [], files: 0 };
+  assert.equal((await t.engine.startAgent({ task: 'Fix the docs' })).now, 'Starting', 'nothing to copy: nothing to say');
+  await t.engine.shutdown();
+});
+
+test('the notice about agents’ copies is said once per repository, the first time an env file is copied, and kept', async (ctx) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-copies-prefs-')));
+  ctx.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const prefs = createPrefs({ file: prefsFile(home) });
+  // no env file copied (node_modules only): nothing to say yet
+  const t = copies({ prefs, env: { values: [], files: 0 }, fill: { copied: [{ path: 'node_modules', kind: 'deps' }], skipped: [] } });
+  await t.engine.startAgent({ task: 'Fix the login redirect' });
+  assert.ok(!t.notices.includes(COPIES_NOTICE));
+  // the first that gets an env file: said once, before "Started"
+  t.git.fill = FILLED;
+  t.git.env = { values: [], files: 2 };
+  await Promise.all([t.engine.startAgent({ task: 'Fix the cart' }), t.engine.startAgent({ task: 'Fix the tax' })]);
+  await t.engine.startAgent({ task: 'Fix the docs' });
+  assert.equal(t.notices.filter(n => n === COPIES_NOTICE).length, 1, t.notices.join('\n'));
+  assert.ok(t.notices.indexOf(COPIES_NOTICE) < t.notices.indexOf('Started Fix cart.'));
+  assert.deepEqual(prefs.get().copiesSaid, [REPO.root]);
+  await t.engine.shutdown();
+  // another run on the same repository does not say it again
+  const again = copies({ prefs });
+  await again.engine.startAgent({ task: 'Fix the login redirect' });
+  assert.ok(!again.notices.includes(COPIES_NOTICE));
+  await again.engine.shutdown();
+});
+
+test('values in copied env files are hidden in what the agent prints, on the page and in the log, as stored keys are; words that only hold one are not refused', async () => {
+  const url = ['postgres://app', 'pw-x81mQ@db.internal/app'].join(':');
+  const t = copies({ env: { values: [url, 'production'], files: 1 }, fill: { copied: [{ path: '.env.production', kind: 'env' }], skipped: [] } });
+  const v = await t.engine.startAgent({ task: 'Fix the login redirect' });
+  // Workbench's own words, made of file names, are not masked: .env.production is not ".env.••••"
+  assert.equal(v.now, 'Its copy has your .env.production.');
+  assert.ok(t.notices.includes(COPIES_NOTICE));
+  const runner = t.claude.runners[0];
+  assert.equal(typeof runner.opts.mask, 'function', 'the runner masks its output before it is read');
+  assert.equal(runner.opts.mask(`DATABASE_URL=${url}`), 'DATABASE_URL=•••• /app');
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.SAYS, text: `The .env has DATABASE_URL=${url} and NODE_ENV=production.` });
+  assert.equal(t.store.get(v.id).says, 'The .env has DATABASE_URL=•••• /app and NODE_ENV=••••.');
+  runner.emit({ kind: EV.STATE, state: 'failed', reason: `It could not reach ${url}.` });
+  assert.ok(t.logs.some(l => l === 'warn Fix login redirect failed: It could not reach •••• /app.'), t.logs.join('\n'));
+  assert.ok(!t.logs.some(l => l.includes(url)), 'never the value itself in the log');
+  // a value is no key: words that hold one still launch
+  const w = await t.engine.startAgent({ task: 'fix the production build' });
+  assert.notEqual(w.state, 'failed');
+  t.deps.commands.intent = { kind: 'task', task: 'fix the production build' };
+  assert.ok((await t.engine.command('fix the production build')).confirm, 'a launch card, not "that looks like a key"');
+  await t.engine.shutdown();
+});
+
+test('the setup card: asked the first time, Run it is kept for the repository and that command; Not now starts without it and asks again; a changed command asks again', async (ctx) => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-setup-prefs-')));
+  ctx.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const prefs = createPrefs({ file: prefsFile(home) });
+  const t = copies({ setup: 'npm ci', prefs });
+  let told = 0;
+  t.engine.on('setup', () => { told += 1; });
+  const first = t.engine.startAgent({ task: 'Fix the login redirect' });
+  const card = await setupCard(t);
+  assert.deepEqual({ ...card, id: undefined }, {
+    id: undefined, kind: 'setup', sentence: SETUP_ASK, command: 'npm ci', yes: 'Run it', no: 'Not now',
+    detail: 'It comes from workbench.json, and runs before each new agent starts. Workbench asks again if it changes.',
+  });
+  assert.match(card.id, /^[0-9a-f]{12}$/);
+  assert.equal(told, 1, 'the page hears of it (the server sends a fresh snapshot)');
+  await new Promise(r => setTimeout(r, 20));
+  assert.deepEqual(t.calls.order, ['fill'], 'it waits for the answer: no setup and no runner yet');
+  assert.equal(t.store.list()[0].state, 'starting');
+  assert.deepEqual(await t.engine.confirm(card.id, true), { reply: SETUP_RAN });
+  const v = await first;
+  assert.deepEqual(t.calls.order, ['fill', 'setup', 'runner']);
+  assert.equal(t.engine.snapshot().setup, undefined);
+  assert.equal(told, 2);
+  assert.deepEqual(prefs.get().setupOk, { [REPO.root]: sha('npm ci') }, 'kept by repository and command text');
+  assert.match(v.now, /The setup command ran in it\.$/);
+  // the same command again: no card
+  t.calls.order.length = 0;
+  await t.engine.startAgent({ task: 'Fix the cart' });
+  assert.deepEqual(t.calls.order, ['fill', 'setup', 'runner']);
+  // a changed command asks again; Not now starts it without, keeps nothing, and the next launch asks again
+  t.git.setup = 'npm ci && npm run build';
+  t.calls.order.length = 0;
+  const changed = t.engine.startAgent({ task: 'Fix the tax' });
+  const card2 = await setupCard(t);
+  assert.equal(card2.command, 'npm ci && npm run build');
+  assert.notEqual(card2.id, card.id);
+  assert.deepEqual(await t.engine.confirm(card2.id, false), { reply: 'OK. The agent starts without it, and Workbench asks again next time.' });
+  const w = await changed;
+  assert.deepEqual(t.calls.order, ['fill', 'runner']);
+  assert.match(w.now, /It starts without the setup command\.$/);
+  assert.deepEqual(prefs.get().setupOk, { [REPO.root]: sha('npm ci') });
+  const asked = t.engine.startAgent({ task: 'Fix the docs' });
+  const card3 = await setupCard(t);
+  assert.equal(card3.command, 'npm ci && npm run build');
+  assert.deepEqual(await t.engine.confirm(card3.id, true), { reply: SETUP_RAN });
+  await asked;
+  assert.deepEqual(prefs.get().setupOk, { [REPO.root]: sha('npm ci && npm run build') });
+  // an answer that comes twice finds nothing
+  assert.deepEqual(await t.engine.confirm(card3.id, true), { reply: 'That request is no longer waiting. Ask again if you still want it.' });
+  await t.engine.shutdown();
+});
+
+test('the setup card is asked once for a burst of launches, and its answer goes to every one of them', async () => {
+  const t = copies({ setup: 'uv sync' });
+  let told = 0;
+  t.engine.on('setup', () => { told += 1; });
+  // three launches from one launch card: the reply comes while they wait, and one card shows
+  t.deps.commands.intent = { kind: 'start', tasks: [{ task: 'fix the cart' }, { task: 'fix the tax' }, { task: 'fix the docs' }] };
+  const out = await t.engine.command('start three agents');
+  const yes = await t.engine.confirm(out.confirm.id, true);
+  assert.equal(yes.reply, 'Started Fix cart, Fix tax and Fix docs.', 'the launch card’s answer does not wait for the setup card');
+  const card = await setupCard(t);
+  // one more launched meanwhile joins the same card
+  const late = t.engine.startAgent({ task: 'Fix the login' });
+  await until(() => t.store.list().length === 4 && t.calls.fillWorkspace.length === 4);
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(t.engine.snapshot().setup.id, card.id);
+  assert.equal(told, 1, 'one card, never one per agent');
+  assert.equal(t.claude.runners.length, 0);
+  assert.deepEqual(await t.engine.confirm(card.id, false), { reply: 'OK. The agents start without it, and Workbench asks again next time.' });
+  await late;
+  await until(() => t.claude.runners.length === 4 && t.claude.runners.every(r => r.started));
+  assert.equal(t.calls.runSetup.length, 0);
+  assert.equal(told, 2);
+  // the next burst asks again, and Run it reaches each of them
+  const both = [t.engine.startAgent({ task: 'Fix the search' }), t.engine.startAgent({ task: 'Fix the billing' })];
+  const card2 = await setupCard(t);
+  assert.notEqual(card2.id, card.id);
+  await t.engine.confirm(card2.id, true);
+  await Promise.all(both);
+  assert.equal(t.calls.runSetup.length, 2);
+  assert.equal(told, 4);
+  await t.engine.shutdown();
+});
+
+test('the setup card: "run it" and "not now" answer it; other words leave it waiting; nobody answering counts as Not now after 10 minutes', async () => {
+  const t = copies({ setup: 'npm ci', options: { confirmTtlMs: 60_000 } });
+  const a = t.engine.startAgent({ task: 'Fix the login redirect' });
+  const card = await setupCard(t);
+  // the parser gets it as the card on screen, by its kind
+  t.deps.commands.intent = (text, ctx) => (text === 'run it' ? { kind: 'confirm', go: true } : { kind: 'status' });
+  await t.engine.command('what needs me', { confirmId: card.id });
+  assert.equal(t.calls.parse.at(-1).ctx.pendingConfirm.kind, 'setup');
+  assert.equal(t.engine.snapshot().setup.id, card.id, 'another command does not answer it for the person');
+  const said = await t.engine.command('run it', { confirmId: card.id });
+  assert.equal(said.reply, SETUP_RAN);
+  await a;
+  assert.equal(t.calls.runSetup.length, 1);
+  // kept now: the next launch runs it without a card
+  await t.engine.startAgent({ task: 'Fix the cart' });
+  // a near miss keeps a card, in its own words
+  t.git.setup = 'make setup';
+  const c = t.engine.startAgent({ task: 'Fix the tax' });
+  const card2 = await setupCard(t);
+  t.deps.commands.intent = { kind: 'unknown', text: 'hmm' };
+  const miss = await t.engine.command('hmm', { confirmId: card2.id });
+  assert.equal(miss.reply, 'I did not catch that. Say “run it” or “not now”.');
+  assert.equal(miss.confirm.id, card2.id);
+  assert.equal(miss.confirm.command, 'make setup');
+  // ten minutes (here one) without an answer: the agent starts without it
+  t.engine.tick(Date.now() + 61_000);
+  const v = await c;
+  assert.equal(t.calls.runSetup.length, 2, 'only the two that were said yes to');
+  assert.match(v.now, /It starts without the setup command\.$/);
+  assert.equal(t.engine.snapshot().setup, undefined);
+  assert.ok(t.logs.some(l => l === 'warn Nobody answered whether to run the setup command, so the agents waiting for it start without it.'), t.logs.join('\n'));
+  await t.engine.shutdown();
+});
+
+test('an agent whose copy is being made ready is never asked whether it is stuck: it waits for Workbench, or for the person', async () => {
+  const t = copies({ setup: 'npm ci', options: { stuckSilenceMs: 1000 } });
+  const a = t.engine.startAgent({ task: 'Fix the login redirect' });
+  const card = await setupCard(t);
+  t.engine.tick(Date.now() + 5000);
+  const [v] = t.store.list();
+  assert.equal(v.state, 'starting');
+  assert.equal(v.ask, null);
+  await t.engine.confirm(card.id, true);
+  await a;
+  await t.engine.shutdown();
+});
+
+test('an agent stopped while its copy is made ready never starts; shutdown answers the setup card Not now, and starts nothing', async () => {
+  const t = copies({ setup: 'npm ci', prefs: memoryPrefs({ setupOk: { [REPO.root]: sha('npm ci') } }) });
+  const g = gate();
+  t.git.fillGate = g;
+  const a = t.engine.startAgent({ task: 'Fix the login redirect' });
+  await until(() => t.calls.fillWorkspace.length === 1);
+  const [v] = t.store.list();
+  assert.equal((await t.engine.stop(v.id)).ok, true);
+  g.open();
+  const after = await a;
+  assert.equal(after.state, 'stopped');
+  assert.deepEqual(t.calls.order, ['fill'], 'neither its setup nor its runner');
+  assert.equal(t.claude.runners.length, 0);
+  // stopped while its setup command runs: the command is stopped too
+  t.git.fillGate = null;
+  t.git.setupGate = gate();
+  const b = t.engine.startAgent({ task: 'Fix the cart' });
+  await until(() => t.calls.runSetup.length === 1);
+  const w = t.store.list().find(x => x.name === 'Fix cart');
+  await t.engine.stop(w.id);
+  assert.equal(t.calls.runSetup[0].signal.aborted, true);
+  assert.equal((await b).state, 'stopped');
+  assert.equal(t.claude.runners.length, 0);
+  // the card is open when Workbench closes: nothing starts
+  t.git.setupGate = null;
+  t.git.setup = 'make setup';
+  const c = t.engine.startAgent({ task: 'Fix the tax' });
+  await setupCard(t);
+  const kept = await t.engine.shutdown();
+  const x = await c;
+  assert.equal(x.state, 'stopped');
+  assert.equal(x.stateReason, 'Workbench was closed');
+  assert.equal(t.claude.runners.length, 0);
+  assert.equal(t.engine.snapshot().setup, undefined);
+  assert.ok(Array.isArray(kept.kept));
+});
+
+test('a launch card is answered as soon as its agents are on the board; one that then cannot start says so', async () => {
+  const t = copies();
+  const g = gate();
+  t.git.fillGate = g;
+  t.claude = fakeAdapter('claude', { failStart: new Error('spawn claude ENOENT') });
+  t.engine.adapters.claude = t.claude;
+  t.deps.commands.intent = { kind: 'task', task: 'fix the login redirect' };
+  const out = await t.engine.command('fix the login redirect');
+  const yes = await t.engine.confirm(out.confirm.id, true);
+  assert.equal(yes.reply, 'Started Fix login redirect.');
+  assert.equal(t.calls.fillWorkspace.length, 1);
+  assert.equal(t.claude.runners.length, 0, 'still copying');
+  g.open();
+  await until(() => t.store.get(yes.agentIds[0]).state === 'failed');
+  await until(() => t.notices.some(n => n.startsWith('Fix login redirect could not start. It could not start:')));
+  await t.engine.shutdown();
+});
+
+test('the demo copies nothing and runs no setup command, whatever workbench.json says', async () => {
+  const store = new Store();
+  const sim = new FakeSim();
+  const { deps, calls } = fakeDeps({ fill: FILLED, setup: 'npm ci' });
+  const engine = new Engine({ store, mode: 'demo', hook: HOOK, adapters: { sim }, machines: new FakeMachines({ demo: true }), deps, prefs: memoryPrefs(), options: { tickMs: 10_000_000, simTickMs: 10_000_000 } });
+  await engine.start();
+  const v = await engine.startAgent({ task: 'Fix the login redirect' });
+  assert.equal(sim.runners.at(-1).started, true);
+  assert.deepEqual([calls.fillWorkspace.length, calls.envValues.length, calls.runSetup.length], [0, 0, 0]);
+  assert.equal(engine.snapshot().setup, undefined);
+  assert.equal(store.get(v.id).now, 'Starting');
+  await engine.shutdown();
 });
 
 // ------------------------------------------------------------------ end of a turn

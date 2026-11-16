@@ -23,6 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { presetById } from '../shared/keypresets.mjs';
 import { looksLikeSecret } from '../shared/secretshape.mjs';
+import { shownValue, maskSecrets } from '../shared/mask.mjs';
 
 /** A variable name a key may set (and not in FORBIDDEN_NAMES). */
 export const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
@@ -121,54 +122,9 @@ export function forbiddenName(name) {
 
 // ------------------------------------------------------------------ showing and masking values
 
-/** Printable ASCII that is safe inside a JSON string and a sentence: no space, no " and no \. */
-const SAFE_TAIL = /^[\x21\x23-\x5b\x5d-\x7e]{4}$/;
-
-/**
- * How a secret value is shown: "•••• " and its last 4 characters for values of 12 characters or more, "••••" for
- * shorter ones (and when the last 4 are not plain printable characters).
- */
-export function shownValue(value) {
-  const s = String(value ?? '');
-  if (s.length < 12) return '••••';
-  const tail = s.slice(-4);
-  return SAFE_TAIL.test(tail) ? `•••• ${tail}` : '••••';
-}
-
-const MASKS = new WeakMap();
-const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-function maskPlan(values) {
-  if (!values || typeof values[Symbol.iterator] !== 'function' || typeof values === 'string') return null;
-  if (MASKS.has(values)) return MASKS.get(values);
-  const masks = new Map();
-  for (const v of values) {
-    if (typeof v !== 'string' || v.length < 8) continue;
-    const shown = shownValue(v);
-    masks.set(v, shown);
-    // In a line of JSON (an agent's raw output) the value appears escaped.
-    const escaped = JSON.stringify(v).slice(1, -1);
-    if (escaped !== v) masks.set(escaped, shown);
-  }
-  const forms = [...masks.keys()].sort((a, b) => b.length - a.length);
-  const plan = forms.length ? { re: new RegExp(forms.map(escapeRe).join('|'), 'g'), masks } : null;
-  if (Object.isFrozen(values)) MASKS.set(values, plan);
-  return plan;
-}
-
-/**
- * `text` with every value of 8 or more characters replaced by how it is shown (shownValue), longest first, in one pass.
- * A value's JSON-escaped form is replaced too, so a raw line of JSON stays JSON. Returns `text` as it is when there is
- * nothing to mask.
- * @param {string} text
- * @param {Iterable<string>} values
- */
-export function maskSecrets(text, values) {
-  if (typeof text !== 'string' || !text) return text;
-  const plan = maskPlan(values);
-  if (!plan) return text;
-  return text.replace(plan.re, (m) => plan.masks.get(m));
-}
+// How a value shows ("•••• " and its last four characters) and masking text, in src/shared/mask.mjs: the engine hides
+// the values of copied env files with the same rule.
+export { shownValue, maskSecrets };
 
 // ------------------------------------------------------------------ checks, in plain words
 

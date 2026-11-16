@@ -206,11 +206,18 @@ export function gate() {
  * `discardGate`: hold the call until the gate opens; `mergeError`, `discardError`: throw). snapshotWork and workDiff
  * throw `snapshotError` and `workDiffError` when set, as the real ones throw plain errors (with `why` for a refusal);
  * gitGraph answers `graphResult` when set.
+ * Agents' copies (opt-in, so other tests see the engine as before): `fill` adds fillWorkspace and envValues. fillWorkspace
+ * tells onChosen what `git.fill` copies (or `git.fill.chosen`), waits for `git.fillGate`, throws `git.fillError`, and
+ * answers `git.fill` ({ copied, skipped }, or a function of the call); envValues answers `git.env` ({ values, files }).
+ * `setup` (a command, or null for none) is workbench.json's setup, read from `git.setup` at each launch, and adds
+ * receipt.runSetup, which waits for `git.setupGate` (or the abort of its signal) and answers `git.setupResult`.
+ * `calls.order` lists 'fill' and 'setup' as they start.
  */
-export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'passed', checksGate = null, checksGates = null, intent = null, folders = null } = {}) {
+export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'passed', checksGate = null, checksGates = null, intent = null, folders = null, fill = null, setup = undefined } = {}) {
   const calls = {
     decide: [], parse: [], createWorkspace: [], diffStats: [], readRepoConfig: [], checkRules: [], runChecks: [], removeWorkspace: [], killChecksSync: 0,
     prepareRepo: [], snapshotWork: [], workDiff: [], mergeWork: [], discardWork: [], gitGraph: [], gitIdentity: [],
+    fillWorkspace: [], envValues: [], runSetup: [], order: [],
   };
   const git = {
     branch: 'main', head: FAKE_BASE, dirty: 2,
@@ -225,6 +232,8 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
     mergeResult: null, mergeGate: null, mergeError: null,
     discardResult: null, discardGate: null, discardError: null,
     snapshotError: null, workDiffError: null, graphResult: null,
+    fill, fillGate: null, fillError: null, env: { values: [], files: 0 },
+    setup, setupGate: null, setupResult: null,
   };
   const workId = () => `${git.agentHead}:tree${git.seq}`;
   // The policy's contract in short. With full permissions on (`full: true`), what would ask is allowed, with the reason
@@ -324,7 +333,7 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
     },
     async readRepoConfig(o) {
       calls.readRepoConfig.push(o);
-      return { checks, rules, allow };
+      return { checks, rules, allow, ...(typeof git.setup === 'string' ? { setup: git.setup } : {}) };
     },
     async removeWorkspace(o) {
       calls.removeWorkspace.push(o);
@@ -353,6 +362,37 @@ export function fakeDeps({ checks = [], rules = [], allow = [], checkState = 'pa
     },
     killChecksSync() { calls.killChecksSync += 1; },
   };
+  if (fill) {
+    workspace.fillWorkspace = async (o) => {
+      calls.fillWorkspace.push(o);
+      calls.order.push('fill');
+      const r = typeof git.fill === 'function' ? git.fill(o) : git.fill;
+      const copied = (r?.copied || []).map(e => ({ cloned: true, ...e }));
+      o.onChosen?.((r?.chosen || copied).map(e => ({ path: e.path, kind: e.kind })));
+      if (git.fillGate) await git.fillGate.wait;
+      if (git.fillError) throw git.fillError;
+      return { copied, skipped: (r?.skipped || []).map(e => ({ ...e })), ms: 5 };
+    };
+    workspace.envValues = async (o) => {
+      calls.envValues.push(o);
+      return { values: Object.freeze([...(git.env?.values || [])]), files: git.env?.files ?? 0 };
+    };
+  }
+  if (setup !== undefined) {
+    receipt.runSetup = async (o) => {
+      calls.runSetup.push(o);
+      calls.order.push('setup');
+      if (git.setupGate) {
+        const aborted = new Promise(r => {
+          if (o.signal?.aborted) r(); else o.signal?.addEventListener('abort', r, { once: true });
+        });
+        if (await Promise.race([git.setupGate.wait.then(() => false), aborted.then(() => true)])) {
+          return { ok: false, exitCode: null, timedOut: false, ms: 1, tail: 'Stopped because the agent was stopped.' };
+        }
+      }
+      return git.setupResult ? { ...git.setupResult } : { ok: true, exitCode: 0, timedOut: false, ms: 5, tail: 'added 12 packages' };
+    };
+  }
   return { deps: { policy, commands, workspace, receipt }, calls, git };
 }
 
