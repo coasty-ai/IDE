@@ -572,10 +572,10 @@ test('a card about an agent\'s work keeps its detail up to fit step 5; at the la
     assert.ok(open.html.includes(`<div class="readall" data-scroll="1" tabindex="0" aria-label="All of it"><p class="meta">${detail}</p></div>`));
     assert.ok(labelled(open.html, 'Show less'));
   }
-  // a launch card is as before: its detail goes from fit step 3
-  const launch = { id: 'c2', kind: 'start', sentence: 'Start a simulated Claude on “fix it”?', detail: 'It runs on your laptop.' };
-  assert.match(lidView({ confirm: launch }, { fit: 2 }).html, /It runs on your laptop\./);
-  assert.doesNotMatch(lidView({ confirm: launch }, { fit: 3 }).html, /It runs on your laptop\./);
+  // a start card (more than one agent from one sentence) is as before: its detail goes from fit step 3
+  const launch = { id: 'c2', kind: 'start', sentence: 'Start three simulated Claude agents on “fix it”?', detail: 'This is the demo, so nothing is spent.' };
+  assert.match(lidView({ confirm: launch }, { fit: 2 }).html, /This is the demo, so nothing is spent\./);
+  assert.doesNotMatch(lidView({ confirm: launch }, { fit: 3 }).html, /This is the demo, so nothing is spent\./);
 });
 
 test('a card\'s words show characters that could hide or turn text', { skip }, async () => {

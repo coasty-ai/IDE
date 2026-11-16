@@ -307,7 +307,7 @@ const TABLE = [
   ['cancel', 'pendingStop', { kind: 'confirm', go: false }],
 
   // --- A stop or a message acts at once only when the words name the agent
-  // Words left over that match no agent say what to do: that is work, and gets the start confirm.
+  // Words left over that match no agent say what to do: that is work, the prompt for a new agent, which starts at once.
   ['stop the flaky test from timing out', 'none', { kind: 'task', task: 'stop the flaky test from timing out' }],
   ['end the onboarding flow with a summary screen', 'none', { kind: 'task', task: 'end the onboarding flow with a summary screen' }],
   ['cancel the invoice export when the account is closed', 'none', { kind: 'task', task: 'cancel the invoice export when the account is closed' }],
@@ -1067,7 +1067,7 @@ test('cards take their own words: "start it" only for a launch, "merge it" for a
     ['start it', 'pendingForget', unknown('start it')], ['launch it', 'pendingForget', unknown('launch it')],
     ['yes start it', 'pendingForget', unknown('yes start it')], ['start it is that right', 'pendingForget', unknown('start it is that right')],
     ['merge it', 'pendingForget', unknown('merge it')], ['discard it', 'pendingForget', unknown('discard it')],
-    // A launch card: the merge and throw-away words are not its words.
+    // A start card (more than one agent from one sentence): the merge and throw-away words are not its words.
     ['merge it', 'pendingStart', unknown('merge it')], ['throw it away', 'pendingStart', unknown('throw it away')],
     ['start it', 'pendingStart', yes], ['start it', 'pending', yes],
     // Launch words said to a stop or message card keep it too, rather than starting "it is that right".
@@ -1424,7 +1424,7 @@ test('a start with no work asks what the agent should work on; naming an agent w
     ['codex', 'none', noWorkFor('codex')],
     ['agent', 'none', noWork],
     ['the new agent', 'none', noWork],
-    // With work, it is the launch it always was; "start it" still answers a launch card.
+    // With work, it is the start it always was; "start it" still answers a start card.
     ['start an agent to fix the login', 'none', start(['fix the login'])],
     ['new agent: fix the login page', 'none', start(['fix the login page'])],
     ['start over', 'none', start(['over'])],

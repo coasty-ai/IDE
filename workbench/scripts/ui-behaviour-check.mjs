@@ -2354,56 +2354,102 @@ try {
     check(FP + 'the button sits in the top band just left of Agents & keys, lit amber in every look', ok, out.join('; '));
   });
 
-  // ---------------------------------------------------------------- agents' copies: the setup card a launch waits on
+  // ---------------------------------------------------------------- agents' copies: the setup card launches wait on
+  // Every prompt starts its agent at once, and its copy is made before it runs: in the 'setup' world (a live repository
+  // whose workbench.json holds npm ci, which nobody has said Run it to) the first one to need the command opens the card,
+  // which comes in the middle by itself; every start meanwhile waits on that card. Every name starts "setup card: ".
   const SC = 'setup card: ';
   const SETUP_LID = 'Before agents start / Run this setup command in each agent’s copy before it starts?';
+  const SETUP_HINT = 'Say “run it” or “not now”.';
+  const SETUP_WAITS = 'Waiting for your answer about the setup command';
   const confirmPosts = async () => (await posts()).filter(x => x.path.startsWith('/api/confirm/'));
   const codeNow = () => b.ev(`${page()}?.querySelector('.exact code')?.textContent || ''`);
   const cardIdOf = go => b.ev(`${page()}?.querySelector('[data-act="confirm"][data-go="${go}"]')?.dataset.confirm || ''`);
-  const launch = async task => {
-    await typeIn(`start an agent to ${task}`);
-    await sleep(1100);
-    const lid = await lidNow();
-    await clickIn('[data-act="confirm"][data-go="1"]');
-    await sleep(1500);
-    return lid;
-  };
+  const agentNamed = async name => (await ctl('state')).agents.find(x => x.name === name);
+  /** Type a prompt and send it: its agent starts at once. What the line under the board says then. */
+  const prompt = async text => { await typeIn(text); await sleep(1500); return said(); };
 
-  await run(SC + 'Do it on a launch, then the setup card comes in the middle by itself, and Run it runs it in that agent’s copy', async () => {
+  await run(SC + 'a prompt starts its agent at once, copying; the setup card comes in the middle by itself, and Run it runs it in that agent’s copy', async () => {
     await open('setup');
     await sleep(900);
-    const asked = await launch('fix the login redirect');
+    const started = await prompt('fix the login redirect');
     const card = await lidNow(), row = await acts(), code = await codeNow(), id = await cardIdOf(1);
+    const sent = (await posts()).filter(x => x.path === '/api/command').map(x => x.body);
     // while the card waits, its copy made, the agent says it waits for the answer (not "Copying …")
-    const waiting = (await ctl('state')).agents.find(x => x.name === 'Fix the login redirect')?.now;
+    const waiting = (await agentNamed('Fix login redirect'))?.now;
     await clickIn('[data-act="confirm"][data-go="1"]');
     await sleep(1300);
     const after = await lidNow(), words = await said(), p = await confirmPosts();
-    const a = (await ctl('state')).agents.find(x => x.name === 'Fix the login redirect');
-    check(SC + 'Do it on a launch, then the setup card comes in the middle by itself, and Run it runs it in that agent’s copy',
-      asked === 'You said / Start a simulated Claude on “fix the login redirect”?' && card === SETUP_LID && row === 'Run it*,Not now' && code === 'npm ci'
-      && waiting === 'Waiting for your answer about the setup command'
-      && /^s/.test(id) && p.length === 2 && p[1].path === `/api/confirm/${id}` && p[1].body.go === true
+    const a = await agentNamed('Fix login redirect');
+    check(SC + 'a prompt starts its agent at once, copying; the setup card comes in the middle by itself, and Run it runs it in that agent’s copy',
+      started === 'Started Claude on “fix the login redirect”.' && sent.length === 1 && sent[0].text === 'fix the login redirect' && !sent[0].confirmId
+      && card === SETUP_LID && row === 'Run it*,Not now' && code === 'npm ci' && waiting === SETUP_WAITS
+      && /^s/.test(id) && p.length === 1 && p[0].path === `/api/confirm/${id}` && p[0].body.go === true
       && words.includes('OK. Each agent’s copy runs it before the agent starts.') && after !== SETUP_LID && !!a && /The setup command ran in it\.$/.test(a.now),
-      `"${asked}" → "${card}" [${row}] "${code}" ${id}, waiting "${waiting}"; then "${after}" said "${words}"; ${JSON.stringify(p.map(x => [x.path, x.body]))}; now "${a?.now}"`);
+      `said "${started}" → "${card}" [${row}] "${code}" ${id}, waiting "${waiting}"; then "${after}" said "${words}"; ${JSON.stringify(sent)}; ${JSON.stringify(p.map(x => [x.path, x.body]))}; now "${a?.now}"`);
   });
 
-  await run(SC + 'Not now starts the agent without the command, and the next launch asks again', async () => {
+  await run(SC + 'Not now starts the agent without the command, and the next prompt asks again', async () => {
     await open('setup');
     await sleep(900);
-    await launch('fix the cart total');
+    await prompt('fix the cart total');
     const first = await cardIdOf(0);
     await clickIn('[data-act="confirm"][data-go="0"]');
     await sleep(1200);
     const words = await said();
-    const a = (await ctl('state')).agents.find(x => x.name === 'Fix the cart total');
-    await launch('fix the tax rounding');
+    const a = await agentNamed('Fix cart total');
+    await prompt('fix the tax rounding');
     const again = await lidNow(), second = await cardIdOf(1);
     const p = (await confirmPosts()).map(x => [x.path.replace(/^\/api\/confirm\//, ''), x.body.go]).filter(x => x[0].startsWith('s'));
-    check(SC + 'Not now starts the agent without the command, and the next launch asks again',
+    check(SC + 'Not now starts the agent without the command, and the next prompt asks again',
       /^s/.test(first) && words.includes('OK. The agent starts without it, and Workbench asks again next time.') && !!a && /It starts without the setup command\.$/.test(a.now)
       && again === SETUP_LID && /^s/.test(second) && second !== first && JSON.stringify(p) === JSON.stringify([[first, false]]),
       `${first} said "${words}"; now "${a?.now}"; again "${again}" ${second}; ${JSON.stringify(p)}`);
+  });
+
+  await run(SC + 'a yes said to it, alone or going on, keeps it with its hint and starts nothing; a prompt typed at it starts its agent, which waits on the same card', async () => {
+    await open('setup');
+    await sleep(900);
+    await prompt('fix the login redirect');
+    const id = await cardIdOf(1), count = async () => (await ctl('state')).agents.length;
+    const n0 = await count();
+    const kept = [];
+    for (const text of ['yes', 'yes, and then tell me']) {
+      await typeIn(text);
+      await sleep(1100);
+      kept.push({ text, said: await said(), lid: await lidNow(), id: await cardIdOf(1), n: await count() });
+    }
+    const started = await prompt('the cart total is wrong');
+    const lid = await lidNow(), still = await cardIdOf(1), n = await count();
+    await sleep(400);
+    const b2 = await agentNamed('Cart total is wrong');
+    const sent = (await posts()).filter(x => x.path === '/api/command').map(x => [x.body.text, x.body.confirmId || null]);
+    check(SC + 'a yes said to it, alone or going on, keeps it with its hint and starts nothing; a prompt typed at it starts its agent, which waits on the same card',
+      /^s/.test(id) && kept.every(k => k.said === SETUP_HINT && k.lid === SETUP_LID && k.id === id && k.n === n0)
+      && started === 'Started Claude on “the cart total is wrong”.' && lid === SETUP_LID && still === id && n === n0 + 1 && b2?.now === SETUP_WAITS
+      && JSON.stringify(sent.slice(1)) === JSON.stringify([['yes', id], ['yes, and then tell me', id], ['the cart total is wrong', id]]) && (await confirmPosts()).length === 0,
+      `${id}: ${JSON.stringify(kept)}; then said "${started}", "${lid}" ${still}, ${n0} → ${n} agents, its line "${b2?.now}"; ${JSON.stringify(sent)}`);
+  });
+
+  await run(SC + 'the start card of several agents starts them only on its yes; their copies are made, and one setup card asks for all of them', async () => {
+    await open('setup');
+    await sleep(900);
+    const n0 = (await ctl('state')).agents.length;
+    await typeIn('start three agents on the login page');
+    await sleep(1100);
+    const ask = await lidNow(), row = await acts(), n1 = (await ctl('state')).agents.length;
+    await clickIn('[data-act="confirm"][data-go="1"]');
+    await sleep(1600);
+    const started = await said(), card = await lidNow(), setupId = await cardIdOf(1);
+    const st = await ctl('state');
+    const three = st.agents.filter(x => x.task === 'the login page');
+    const confirms = (await confirmPosts()).map(x => [x.path.replace(/^\/api\/confirm\//, ''), x.body.go]);
+    check(SC + 'the start card of several agents starts them only on its yes; their copies are made, and one setup card asks for all of them',
+      ask === 'You said / Start three Claude agents on “the login page”?' && row === 'Start them*,Cancel' && n1 === n0
+      && started === 'Started three Claude agents on “the login page”.' && card === SETUP_LID && /^s/.test(setupId)
+      && three.length === 3 && three.every(x => x.state === 'starting' && x.now === SETUP_WAITS) && JSON.stringify(st.setupWaiting) === JSON.stringify(three.map(x => x.id))
+      && confirms.length === 1 && confirms[0][1] === true && /^c/.test(confirms[0][0]),
+      `"${ask}" [${row}] ${n0}→${n1}; said "${started}", then "${card}" ${setupId}; ${JSON.stringify(three.map(x => [x.state, x.now]))} waiting ${JSON.stringify(st.setupWaiting)}; ${JSON.stringify(confirms)}`);
   });
 
   await run(SC + 'a page opened while launches wait shows the card, its whole command, and "run it" typed answers it', async () => {

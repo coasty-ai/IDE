@@ -2031,14 +2031,37 @@ export class Engine extends EventEmitter {
 
   /**
    * "looks good" (and the engine's other words for it, LOOKS_GOOD_RE) or "not now", said at a finished agent's lid
-   * (command(): the parser's `answer` with no ask): what the lid's own button does. Where its work could be merged, the lid
-   * offers Merge and "Not now", and "looks good" is that "Not now": the work stays on its branch, in words that are no
-   * approval. The reply carries `looked`, so the page marks this finish looked at, as the button does; nothing is sent
-   * to the agent, and nothing starts.
+   * (command(): the parser's `answer` with no ask, as from the git screen's input; the board's page presses the lid's
+   * button itself): never a prompt, and nothing is sent to the agent. Only where the lid's own button for those words
+   * marks the finish looked at (ui/focus.js lidView: its "Not now" on work that could be merged, its "Looks good" with
+   * nothing to merge, "Dismiss" on work thrown away) does the reply carry `looked`, so the page marks it looked at and it
+   * goes to the done tray, as the button sends it. Elsewhere (the done tray's rule) the words change nothing: words that
+   * sound like approval never let work that could be merged go, and a failed check's or a merge problem's "Look later"
+   * only sets it aside, which is the page's own mark; the reply then names the lid's answers (_lidChoices).
    */
   async _lookedAt(v, text) {
-    const r = await this._answerDone(v, LOOKS_GOOD_RE.test(text) && this._mergeOffered(v) ? 'Not now' : text);
+    const choices = this._lidChoices(v, LOOKS_GOOD_RE.test(text));
+    if (choices) return { reply: choices };
+    const r = await this._answerDone(v, text);
     return { reply: r.reply, looked: v.id };
+  }
+
+  /**
+   * The answers a finished root's lid offers, in its words ("Choose “Merge into main” or “Not now”."), when its own button
+   * for "looks good" (`good`) or "not now" would not mark the finish looked at: a merge that did not go through, a failed
+   * check, and "looks good" on work that could be merged. Null where it would.
+   */
+  _lidChoices(v, good) {
+    const w = v.work || null;
+    const into = this._repoView()?.branch || null;
+    if (w?.thrownAway || (w?.merged && workSettled(v))) return null;
+    if (w?.problem && typeof w.problem === 'object') {
+      const target = (typeof w.problem.into === 'string' && w.problem.into) || into || w.from || null;
+      return w.problem.why === 'conflict' ? `Choose “Ask it to bring in ${target || 'my work'}” or “Look later”.` : 'Choose “Try again” or “Not now”.';
+    }
+    if (v.state === STATE.CHECKS_FAILED) return 'Choose “Ask it to fix that” or “Look later”.';
+    if (good && this._mergeOffered(v)) return `Choose “Merge into ${into}” or “Not now”.`;
+    return null;
   }
 
   /**

@@ -478,7 +478,7 @@ test('the setup card: "run it" and "not now" answer it; other words leave it wai
   assert.equal(t.calls.runSetup.length, 1);
   // kept now: the next launch runs it without a card
   await t.engine.startAgent({ task: 'Fix the cart' });
-  // a near miss keeps a card, in its own words
+  // a yes that is not enough keeps the card, and says how to answer it in its own words
   t.git.setup = 'make setup';
   const c = t.engine.startAgent({ task: 'Fix the tax' });
   const card2 = await setupCard(t);
@@ -3246,21 +3246,38 @@ test('finished work: "Not now" leaves the agent as it is, sends it nothing, and 
   await t.engine.shutdown();
 });
 
-test('"looks good" said at a finished agent\'s lid starts nothing: it answers its finish, and where Merge is offered it is "Not now"', async (ctx) => {
+test('"looks good" said at a finished agent\'s lid starts nothing, and marks it looked at only where the lid\'s own button for those words would: never on work that could be merged, a failed check or a merge that did not go through', async (ctx) => {
   const t = liveFolders(ctx);
   t.engine.deps.commands = commands;
   const a = await doneAgent(t);
   const before = a.runner.sent.length;
   assert.ok(t.store.get(a.id).files?.changed > 0, 'its work is not merged yet, so its lid offers Merge and Not now');
-  // there, "looks good" does what "Not now" does: it stays as it is, on its branch, and the reply is no approval
-  for (const said of ['looks good', 'not now', 'Thanks!', 'lgtm']) {
+  // there, "not now" is the lid's own "Not now": it stays as it is, on its branch, looked at, and the reply is no approval
+  for (const said of ['not now', 'Not now.']) {
     assert.deepEqual(await t.engine.command(said, { focusId: a.id }), { reply: `${a.v.name}’s work stays on its branch for now.`, looked: a.id }, said);
+  }
+  // words that sound like approval have no button there (the done tray's rule): they change nothing, and say how to answer
+  for (const said of ['looks good', 'Thanks!', 'lgtm']) {
+    assert.deepEqual(await t.engine.command(said, { focusId: a.id }), { reply: 'Choose “Merge into main” or “Not now”.' }, said);
   }
   assert.equal(t.claude.runners.length, 1, 'nothing started');
   assert.equal(a.runner.sent.length, before, 'nothing is sent to it');
   assert.equal(t.store.get(a.id).state, 'done_claimed');
-  // with nothing to merge, it is the lid's "Looks good"
-  t.store.get(a.id).work = null;
+  // a failed check: its "Look later" only sets it aside, a page's mark; neither word lets it go here
+  const v = t.store.get(a.id);
+  v.state = 'checks_failed';
+  for (const said of ['looks good', 'not now']) assert.deepEqual(await t.engine.command(said, { focusId: a.id }), { reply: 'Choose “Ask it to fix that” or “Look later”.' }, said);
+  // a merge that did not go through: the same
+  v.state = 'done_checked';
+  v.work = { ...v.work, problem: { why: 'conflict', sentence: 'It conflicts.', paths: ['cart.js'], into: 'main', at: 1 } };
+  for (const said of ['looks good', 'not now']) assert.deepEqual(await t.engine.command(said, { focusId: a.id }), { reply: 'Choose “Ask it to bring in main” or “Look later”.' }, said);
+  v.work = { ...v.work, problem: { why: 'blocked', sentence: 'Your own changes are in the way.', paths: [], into: 'main', at: 1 } };
+  assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: 'Choose “Try again” or “Not now”.' });
+  // thrown away: its "Dismiss" stands for both
+  v.work = { ...v.work, problem: null, thrownAway: { at: 1, saved: null } };
+  assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: `Good. ${a.v.name} stays as it is.`, looked: a.id });
+  // with nothing to merge, it is the lid's "Looks good", for both
+  v.work = null;
   assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: `Good. ${a.v.name} stays as it is.`, looked: a.id });
   assert.equal(t.claude.runners.length, 1);
   await t.engine.shutdown();

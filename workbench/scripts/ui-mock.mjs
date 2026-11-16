@@ -916,9 +916,9 @@ function fullWorld(name, now) {
 }
 // ---------------------------------------------------------------- agents' copies: the setup card
 //   setup       a live repository whose workbench.json holds a setup command (npm ci) nobody has said Run it to yet: a
-//               launch the person confirms puts its agent on the board copying its files, and the setup card opens in
-//               the core; Run it runs it in each copy waiting (and later launches run it without asking), Not now
-//               starts them without it and asks again next time
+//               prompt starts its agent at once (and a start card's yes its agents), on the board copying its files, and
+//               the setup card opens in the core; every start meanwhile waits on it; Run it runs it in each copy waiting
+//               (and later starts run it without asking), Not now starts them without it and asks again next time
 //   setup-card  the card already open, for a long command, with two agents waiting on it (one still copying, one whose
 //               copy is made says it waits for the answer) and one whose start detail says the setup command failed: the
 //               fit check's view
@@ -1104,8 +1104,8 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     const detail = state.mode === 'live' ? 'Each one works in its own folder and spends on its own. A Claude agent can spend up to $2.00.' : 'This is the demo, so nothing is spent.';
     return { kind: 'start', sentence: /\?”$/.test(sentence) ? sentence : `${sentence}?`, detail, yes: 'Start them', no: 'Cancel' };
   };
-  // Agents' copies, as the engine does them: the first launch to need the setup command opens the card (every page gets a
-  // snapshot with it), and every launch meanwhile waits on it; once said yes to, a launch runs it without asking.
+  // Agents' copies, as the engine does them: the first start to need the setup command opens the card (every page gets a
+  // snapshot with it), and every start meanwhile waits on it; once said yes to, a start runs it without asking.
   let setupSeq = 0;
   const runSetupIn = list => {
     for (const a of list) a.now = 'Running the setup command in its copy';
@@ -1942,12 +1942,20 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           if (!several && !/^(merge|land|throw|discard|scrap|forget|stop|tell|what needs me)\b/i.test(text)) return prompt();
           confirms.delete(shown.id);   // any other command withdraws the card on screen
         }
-        // "looks good" or "not now" at a finished agent's lid that has no button for them (the engine's _lookedAt): its
-        // finish is answered and looked at (`looked`), never a prompt; where its work could be merged, it is "Not now"
+        // "looks good" or "not now" that reach the engine with a finished agent in the centre (the git screen's input; the
+        // board presses the lid's own button): never a prompt (the engine's _lookedAt). Its finish is looked at (`looked`)
+        // only where the lid's button for those words would mark it so; a failed check, a merge that did not go through,
+        // and "looks good" on work that could be merged change nothing and name the lid's answers (_lidChoices)
         const finished = !shown && json?.focusId ? state.agents.find(x => x.id === json.focusId && !x.parentId && ['done_checked', 'done_claimed', 'checks_failed'].includes(x.state)) : null;
         if (finished && (LOOKS_GOOD_RE.test(text) || NOT_NOW_RE.test(text))) {
-          const notNow = NOT_NOW_RE.test(text) || (state.mode === 'live' && finished.work?.branch && finished.work.folder && !finished.work.thrownAway && !finished.work.merged);
-          const out = { reply: notNow && finished.work?.branch ? `${finished.name}’s work stays on its branch for now.` : notNow ? `${finished.name} stays as it is.` : `Good. ${finished.name} stays as it is.`, looked: finished.id };
+          const notNow = NOT_NOW_RE.test(text), w = finished.work || null, into = state.repo?.branch || 'main';
+          const mergeable = state.mode === 'live' && w?.branch && w.folder && !w.thrownAway && !w.merged;
+          const choices = w?.thrownAway ? null
+            : w?.problem ? (w.problem.why === 'conflict' ? `Choose “Ask it to bring in ${w.problem.into || into}” or “Look later”.` : 'Choose “Try again” or “Not now”.')
+              : finished.state === 'checks_failed' ? 'Choose “Ask it to fix that” or “Look later”.'
+                : !notNow && mergeable ? `Choose “Merge into ${into}” or “Not now”.` : null;
+          const out = choices ? { reply: choices }
+            : { reply: notNow && w?.branch ? `${finished.name}’s work stays on its branch for now.` : notNow ? `${finished.name} stays as it is.` : `Good. ${finished.name} stays as it is.`, looked: finished.id };
           send('notice', { text: out.reply });
           return reply(out);
         }

@@ -6,7 +6,10 @@
 // the 'connect-*' scenarios, and its panel (#connect), which opens by itself in 'connect-none', is checked at every size,
 // detail level and look there. The Full permissions button sits in the top band on every live page, lit in the 'full'
 // scenarios ('full-live' has both buttons, the widest the band gets), and its card is the 'perm-card' view. The setup card
-// a launch waits on, with a long command, and the card of an agent whose start detail is long, are the 'setup-card' view.
+// launches wait on, with a long command, and the card of an agent whose start detail is long, are the 'setup-card' view.
+// The file view's sheet is the 'files' and 'files-edit' views. The board's input box grows with its text: a prompt of
+// three lines is the 'prompt' view, and in the scenarios where the box meets the file view, the setup card, the full
+// permissions button and the done tray (BOX_SCENARIOS), each check is made again with three lines in the box.
 // Not part of npm test (it needs Chrome). No dependencies.
 //
 //   node scripts/ui-fit-check.mjs [--size 1280x680] [--scenario demo] [--theme ivory] [--detail more] [--view card] [--quick] [--verbose]
@@ -235,6 +238,59 @@ async function check(tag) {
   return r;
 }
 const size = async s => { const [w, h] = s.split('x').map(Number); await b.size(w, h); };
+
+/**
+ * Where the board's growing input box meets what the later changes drew, with a prompt of three lines in it (typed, not
+ * sent): the file view, opened over it by ⌘P, through a search in the files, a file read, then edited and saved
+ * ('files'); the setup card launches wait on ('setup-card'); the full permissions button ('full', 'full-live'); the done
+ * tray and its list ('done-tray', 'done-waits'); and a calm board ('prompt', 'setup'). It runs after each scenario's own
+ * check, at every size, detail level and look (with --quick, at two sizes).
+ */
+const BOX_SCENARIOS = ['files', 'setup', 'setup-card', 'prompt', 'full', 'full-live', 'done-tray', 'done-waits'];
+async function fillBox(text) {
+  await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await settle(120);
+}
+async function boxPass(sc, tag) {
+  await fillBox(PROMPT3);
+  const box = await b.ev(`(() => { const i = document.getElementById('say'), line = parseFloat(getComputedStyle(i).lineHeight); return { all: Math.round(i.scrollHeight / line), shown: Math.round(i.clientHeight / line) }; })()`);
+  if (box.all !== 3) failures.push(`${tag}: the box should hold three lines of text (${box.all})`);
+  if (box.shown < 1) failures.push(`${tag}: the box shows none of its lines`);
+  await check(`${tag} (three lines in the box)`);
+  if (sc === 'done-tray' || sc === 'done-waits') {
+    await b.ev(`document.getElementById('tray').click(), true`); await settle(150);
+    if (await b.ev(`document.getElementById('trayList').hidden`)) failures.push(`${tag}: the done tray did not open its list beside the box`);
+    await check(`${tag} (three lines in the box, the done tray's list)`);
+    await b.ev(`document.getElementById('tray').click(), true`); await settle(120);
+  }
+  if (sc === 'files') {
+    const sheet = () => b.ev(`document.getElementById('fileSheet').open`);
+    const find = async (text, ms) => { await b.ev(`(() => { const i = document.getElementById('fvFind'); i.focus(); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input')); return 1; })()`); await sleep(ms); await settle(60); };
+    await b.ev(`document.getElementById('say').focus(), 1`);
+    await b.key('p', { meta: true }); await sleep(700); await settle(80);
+    if (!(await sheet())) { failures.push(`${tag}: ⌘P did not open the file view over the box`); await fillBox(''); return; }
+    await find('inv', 1100);
+    if (!(await b.ev(`!!document.querySelector('#fvList .fv-hit')`))) failures.push(`${tag}: the file view's search found no lines in the files`);
+    await check(`${tag} (three lines in the box, the file view's search)`);
+    await find('src/invoices/export.ts', 700);
+    await b.ev(`(() => { const o = [...document.querySelectorAll('#fvList [role="option"]')].find(x => x.querySelector('.fv-nm')?.textContent === 'export.ts'); o?.click(); return !!o; })()`);
+    await sleep(800); await settle(80);
+    if (!/export\.ts$/.test(await b.ev(`document.getElementById('fvTitle').textContent`))) failures.push(`${tag}: the file view did not read export.ts`);
+    await check(`${tag} (three lines in the box, a file read)`);
+    await b.ev(`document.querySelector('#fvActs [data-fv="edit"]')?.click(), 1`); await sleep(500); await settle(80);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setRangeText('// a change\\n', 0, 0, 'end'); t.dispatchEvent(new Event('input')); return 1; })()`); await sleep(150);
+    await check(`${tag} (three lines in the box, a file edited)`);
+    await b.ev(`document.querySelector('#fvActs [data-fv="save"]')?.click(), 1`); await sleep(900); await settle(80);
+    if (!(await b.ev(`document.getElementById('fvEdit').hidden`))) failures.push(`${tag}: Save did not save the file and leave the editor`);
+    await check(`${tag} (three lines in the box, a file saved)`);
+    for (let k = 0; k < 4 && await sheet(); k++) { await b.key('Escape'); await sleep(450); }
+    await settle(80);
+    if (await sheet()) failures.push(`${tag}: Esc did not close the file view`);
+    if (await b.ev(`document.getElementById('say').value`) !== PROMPT3) failures.push(`${tag}: the box lost its lines while the file view was open`);
+    await check(`${tag} (three lines in the box, back from the file view)`);
+  }
+  await fillBox('');
+}
 
 /**
  * D1: the git screen's views. Each opens the git screen the way a person does, by clicking the DRAM, and checks it:
@@ -477,6 +533,7 @@ try {
         await setLook(t, d);
         await settle(90);
         await check(`${sc} ${s} ${d} ${t}`);
+        if (BOX_SCENARIOS.includes(sc) && (!quick || ['960x900', '1440x789'].includes(s))) await boxPass(sc, `${sc} ${s} ${d} ${t}`);
       }
     }
     process.stdout.write(`${sc} `);

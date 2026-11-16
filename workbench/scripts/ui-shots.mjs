@@ -21,7 +21,6 @@ const SHOTS = [
   { name: 'board-idle', scenario: 'idle' },
   { name: 'board-exact-command', scenario: 'longcmd' },
   { name: 'board-long-question', scenario: 'longq' },
-  { name: 'board-launch-question', scenario: 'demo', type: 'start an agent to fix the flaky checkout test' },
   { name: 'board-black-gold', scenario: 'demo', theme: 'black-gold' },
   { name: 'board-ivory', scenario: 'demo', theme: 'ivory' },
   { name: 'board-more-detail', scenario: 'demo', detail: 'more' },
@@ -35,6 +34,14 @@ const SHOTS = [
   { name: 'merge-failed-check', scenario: 'merge-more', query: '&focus=n1', theme: 'black-gold' },
   { name: 'merge-long-branch', scenario: 'merge-more', query: '&focus=n2', theme: 'ivory', detail: 'more' },
   { name: 'merge-not-on-a-branch', scenario: 'merge-detached' },
+  // every prompt goes to an agent: typed words start one at once (the line under the board says so), a prompt of three
+  // lines in the growing box (`box`: typed, not sent), and more than one agent from one sentence, asked first
+  { name: 'prompt-started', scenario: 'demo', type: 'the flaky checkout test fails one run in five' },
+  { name: 'prompt-box', scenario: 'prompt', box: 'The checkout total is off:\nexpected 42.10\nbut got 42.09' },
+  { name: 'prompt-start-card', scenario: 'demo', type: 'start three agents on the login page' },
+  // agents' copies: the setup card launches wait on, with a long command, also beside a prompt of three lines in the box
+  { name: 'setup-card', scenario: 'setup-card' },
+  { name: 'setup-card-box-ivory', scenario: 'setup-card', theme: 'ivory', box: 'The checkout total is off:\nexpected 42.10\nbut got 42.09' },
   // a Claude Code agent stopped at its spending limit: one more limit for this run, in place of "Try again"
   { name: 'limit-lid', scenario: 'limit' },
   { name: 'limit-lid-black-gold', scenario: 'limit', theme: 'black-gold', detail: 'more' },
@@ -97,6 +104,10 @@ try {
       await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(s.type)}; i.dispatchEvent(new Event('input')); document.getElementById('bar').requestSubmit(); return 1; })()`);
       await sleep(1200);
       await b.ev(`document.activeElement.blur(), 1`);
+    }
+    if (s.box) {
+      await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(s.box)}; i.dispatchEvent(new Event('input', { bubbles: true })); return 1; })()`);
+      await sleep(400);
     }
     for (const sel of s.click || []) { await b.ev(`(document.querySelector(${JSON.stringify(sel)})?.click(), 1)`); await sleep(900); }
     for (const x of s.steps || []) await step(x);
