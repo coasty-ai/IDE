@@ -30,6 +30,7 @@ const CODE_PAD = { top: 8, bottom: 18, left: 14, right: 28 };
 const KINDS_WITHOUT_TEXT = new Set(['binary', 'large', 'notutf8', 'link', 'missing']);
 /** What leaving the editor asks first for, when the person only leaves the editor (and stays on the file). */
 const STAY = () => {};
+const KEY_NOTE = 'That looks like a key, so it was not searched for. Keys go in Agents & keys, where they are kept safe.';
 /** The most rows a folder draws; the rest are found by typing. */
 const FOLDER_ROWS = 1000;
 
@@ -101,6 +102,7 @@ export function setupFiles(c) {
   el.edit.addEventListener('scroll', () => drawEditNums());
   el.text.addEventListener('input', onTextInput);
   el.text.addEventListener('keydown', onTextKey);
+  el.text.addEventListener('keyup', e => { if (/^(Arrow|Page|Home|End)/.test(e.key)) keepCaret(); });
   // a click outside the sheet (one that also began there, so a selection dragged past its edge does not) closes it
   let downOutside = false;
   const outside = e => { const r = el.dialog.getBoundingClientRect(); return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom; };
@@ -358,7 +360,7 @@ function show(r, { line = null, keep = null, fresh = null } = {}) {
   // "Reading export.ts…" goes; a note said in the line under the path (a save's, the demo's) stays its time
   if (st.note && st.note.quiet) st.note = null;
   st.view = 'file';
-  st.fresh = fresh ? { lines: new Set(fresh), until: performance.now() + 1700 } : { lines: new Set(line ? [line] : []), until: line ? performance.now() + 1700 : 0 };
+  markFor(fresh || (line ? [line] : []));
   st.win.key = '';
   paint();
   // the place: a line asked for (a third of the way down), the line that was at the top, or the top
@@ -439,6 +441,14 @@ function freshEnded() {
   if (st.fresh.until && performance.now() > st.fresh.until) st.fresh = { lines: new Set(), until: 0 };
 }
 
+/** Lines marked for a moment (a line found, lines changed on disk): drawn again unmarked once the moment is over. */
+let freshTimer = 0;
+function markFor(lines) {
+  st.fresh = { lines: new Set(lines), until: lines.length ? performance.now() + 1700 : 0 };
+  clearTimeout(freshTimer);
+  if (lines.length) freshTimer = setTimeout(() => { st.fresh = { lines: new Set(), until: 0 }; if (st.view === 'file' && !st.edit) drawRows(true); }, 1750);
+}
+
 const idle = typeof requestIdleCallback === 'function'
   ? fn => requestIdleCallback(fn, { timeout: 150 })
   : fn => setTimeout(() => { const t0 = performance.now(); fn({ timeRemaining: () => Math.max(0, 8 - (performance.now() - t0)) }); }, 16);
@@ -494,7 +504,10 @@ function showFolder(dir, { focusField: toField = false } = {}) {
 
 let findFrame = 0;
 function onFindInput() {
-  const q = el.find.value;
+  let q = el.find.value;
+  // a key typed or pasted here is never searched for, said back or kept: the field empties, as the board's input does
+  st.find.keyNote = false;
+  if (q.length >= 16 && ctx.looksLikeSecret && ctx.looksLikeSecret(q)) { el.find.value = ''; q = ''; st.find.keyNote = true; say(KEY_NOTE); }
   st.find.q = q;
   if (q && st.view !== 'find') { st.back = backOf(); st.view = 'find'; }
   st.find.active = 0;
@@ -601,7 +614,7 @@ function choose(i) {
 function jumpTo(line) {
   el.find.value = ''; st.find.q = '';
   st.view = 'file';
-  st.fresh = { lines: new Set([line]), until: performance.now() + 1700 };
+  markFor([line]);
   paint();
   const box = st.edit ? el.edit : el.code;
   box.scrollTop = Math.max(0, (line - 1) * st.geo.lh + CODE_PAD.top - box.clientHeight / 3);
@@ -748,7 +761,7 @@ function paintList() {
   st.find.items = items;
   if (st.find.active >= items.length) st.find.active = Math.max(0, items.length - 1);
   const files = st.list.files;
-  let html = '', group = null;
+  let html = st.view === 'find' && st.find.keyNote ? `<p class="fv-empty">${esc(KEY_NOTE)}</p>` : '', group = null;
   const optId = i => `fvo-${i}`;
   items.forEach((it, i) => {
     if (it.group && it.group !== group && (st.view === 'find')) {
@@ -756,7 +769,8 @@ function paintList() {
       const show = !(group === 'Files' && !items.some(x => x.group === 'In files'));
       if (show) html += `<p class="fv-group" role="presentation">${esc(group)}</p>`;
     }
-    html += `<div role="option" id="${optId(i)}" class="fv-opt${i === st.find.active ? ' on' : ''} fv-${it.kind}" data-i="${i}" aria-selected="${i === st.find.active}">${optionHtml(it)}</div>`;
+    const title = it.path && st.view === 'find' ? ` title="${esc(F.shownPath(it.path))}"` : '';
+    html += `<div role="option" id="${optId(i)}" class="fv-opt${i === st.find.active ? ' on' : ''} fv-${it.kind}" data-i="${i}" aria-selected="${i === st.find.active}"${title}>${optionHtml(it)}</div>`;
   });
   if (!items.length) {
     const q = st.find.q.trim();
@@ -780,18 +794,25 @@ function optionHtml(it) {
   const who = (list, words) => (list && list.length ? `<span class="sr">, ${esc(words)} ${esc(list.map(a => visibleControls(a.name)).join(', '))}</span>` : '');
   if (it.kind === 'folder') return `<span class="fv-mk">${marks(it.marks)}</span><span class="fv-nm">${F.pathHtml(it.name)}<span class="fv-slash">/</span></span>${who(it.marks, 'a folder with changes by')}`;
   if (it.kind === 'line') return `<span class="fv-mk"></span><span class="fv-nm">Line ${it.line}</span><span class="fv-dir">${F.pathHtml(F.nameAndDir(it.path).name)}</span>`;
+  // the characters a row has room for (its padding, the mark and the gaps taken off), so nothing in it is cut by CSS
+  const cols = Math.max(16, Math.floor((el.list.clientWidth - 2 * st.geo.z.padX - 24) / ctx.measure('M', st.geo.z.code, 400)) - 2);
   if (it.kind === 'hit') {
     const { name, dir } = F.nameAndDir(it.path);
-    const z = st.geo.z, room = Math.max(24, Math.floor((el.list.clientWidth - 60) / ctx.measure('M', z.code, 400)) - Array.from(name).length - 10);
-    const cut = F.cutAround(String(it.text || ''), F.matchRanges(it.text, st.find.search.q), Math.max(20, room));
-    return `<span class="fv-mk"></span><span class="fv-loc">${F.pathHtml(name)}<i>:${it.line}</i></span><span class="fv-line">${F.markedHtml(cut.text, cut.ranges)}</span><span class="sr"> in ${esc(F.shownPath(dir || 'the top folder'))}</span>`;
+    const where = `:${it.line}`;
+    const loc = F.cutStart(name, [], Math.max(8, Math.min(Array.from(name).length, cols - where.length - 20)));
+    const room = Math.max(12, cols - Array.from(loc.text).length - where.length - 2);
+    const cut = F.cutAround(String(it.text || ''), F.matchRanges(it.text, st.find.search.q), room);
+    return `<span class="fv-mk"></span><span class="fv-loc">${F.pathHtml(loc.text)}<i>${where}</i></span><span class="fv-line">${F.markedHtml(cut.text, cut.ranges)}</span><span class="sr"> in ${esc(F.shownPath(dir || 'the top folder'))}</span>`;
   }
   const { name, dir } = F.nameAndDir(it.path);
   const at = it.path.length - name.length;
   const hits = it.hits || [];
-  const nameRanges = F.hitRanges(hits.filter(h => h >= at).map(h => h - at)), dirRanges = F.hitRanges(hits.filter(h => h < at));
-  const ignored = st.view === 'folder' && it.ignored ? '<span class="fv-dir">hidden by .gitignore</span>' : '';
-  return `<span class="fv-mk">${marks(it.changedBy)}</span><span class="fv-nm">${F.markedHtml(name, nameRanges)}</span>${st.view === 'find' && dir ? `<span class="fv-dir">${F.markedHtml(dir, dirRanges)}</span>` : ''}${ignored}${who(it.changedBy, 'changed by')}`;
+  const ignored = st.view === 'folder' && it.ignored ? 'hidden by .gitignore' : '';
+  // the name first, whole where it can be; the folder after it keeps its end (the folders nearest the file)
+  const shownName = F.cutStart(name, F.hitRanges(hits.filter(h => h >= at).map(h => h - at)), Math.max(8, cols - (ignored ? ignored.length + 2 : 0)));
+  const dirRoom = cols - Array.from(shownName.text).length - 2;
+  const shownDir = st.view === 'find' && dir && dirRoom >= 6 ? F.cutStart(dir, F.hitRanges(hits.filter(h => h < at)), dirRoom) : null;
+  return `<span class="fv-mk">${marks(it.changedBy)}</span><span class="fv-nm">${F.markedHtml(shownName.text, shownName.ranges)}</span>${shownDir ? `<span class="fv-dir" aria-hidden="true">${F.markedHtml(shownDir.text, shownDir.ranges)}</span>` : ''}${ignored ? `<span class="fv-dir">${ignored}</span>` : ''}${st.view === 'find' && dir ? `<span class="sr"> in ${esc(F.shownPath(dir))}</span>` : ''}${who(it.changedBy, 'changed by')}`;
 }
 
 function markActive(scroll = false) {
@@ -885,10 +906,10 @@ function askLeave(go) {
 function enterEdit() {
   const f = st.file;
   if (!f || !f.editable || f.kind !== 'text' || st.edit) return;
-  st.edit = { text0: f.text, indent: F.guessIndent(f.text), hash: f.hash };
+  const top = el.code.scrollTop, left = el.code.scrollLeft, line = topLine();
+  st.edit = { text0: f.text, indent: F.guessIndent(f.text), hash: f.hash, seen: null, saved: false };
   st.ask = null;
   st.note = null;   // what the last save said is over: this is a new edit
-  const top = el.code.scrollTop, left = el.code.scrollLeft, line = topLine();
   el.text.value = f.text;
   el.text.setAttribute('aria-label', `${F.shownPath(f.path)}, as text you can change`);
   sizeEditor();
@@ -905,7 +926,7 @@ function enterEdit() {
 function leaveEdit({ ask = true, focus = true } = {}) {
   if (!st.edit) return;
   if (ask && editChanged()) { askLeave(STAY); return; }
-  const top = el.edit.scrollTop, left = el.text.scrollLeft;
+  const top = el.edit.scrollTop, left = el.text.scrollLeft, saved = st.edit.saved;
   st.edit = null;
   st.ask = null;
   paint();
@@ -915,12 +936,19 @@ function leaveEdit({ ask = true, focus = true } = {}) {
   drawRows(true);
   crossfade(false);
   if (focus) focusCode();
+  // ⌘S saved during this edit: the gold bars and the count come from the engine again
+  if (saved) reread();
 }
 
 /** The text box and the coloured view swap places at the same scroll, crossfading (at once with still=1). */
 function crossfade(toEdit) {
   if (ctx.still() || ctx.reduced() || document.hidden) return;
-  const inEl = toEdit ? el.edit : el.code;
+  const inEl = toEdit ? el.edit : el.code, outEl = toEdit ? el.code : el.edit;
+  // the view going out stays, fading, under (or over) the one coming in: the same words at the same places
+  outEl.hidden = false;
+  const out = outEl.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 170, easing: 'ease-in' });
+  const settle = () => { if (!!st.edit === toEdit) outEl.hidden = true; };
+  out.finished.then(settle, settle);
   inEl.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 170, easing: 'ease-out' });
 }
 
@@ -959,7 +987,21 @@ let typedFrame = 0;
 function onTextInput() {
   if (!st.edit) return;
   cancelAnimationFrame(typedFrame);
-  typedFrame = requestAnimationFrame(() => { const was = st.edit && st.edit.lines; sizeEditor(); if (st.edit && st.edit.lines !== was) drawEditNums(true); });
+  typedFrame = requestAnimationFrame(() => { const was = st.edit && st.edit.lines; sizeEditor(); if (st.edit && st.edit.lines !== was) drawEditNums(true); keepCaret(); });
+}
+
+/**
+ * The caret's line stays in sight: the text box is as tall as its lines, so its own scroll never moves, and a web view
+ * that does not scroll the box around it for the caret gets it scrolled here (Chrome already has, and this does nothing).
+ */
+function keepCaret() {
+  if (!st.edit || !st.geo) return;
+  const t = el.text, lh = st.geo.lh, box = el.edit;
+  let line = 1;
+  for (let i = t.value.indexOf('\n'), end = t.selectionEnd; i >= 0 && i < end; i = t.value.indexOf('\n', i + 1)) line++;
+  const top = (line - 1) * lh + CODE_PAD.top, bottom = top + lh;
+  if (top < box.scrollTop) box.scrollTop = Math.max(0, top - lh);
+  else if (bottom > box.scrollTop + box.clientHeight) box.scrollTop = bottom - box.clientHeight + lh;
 }
 
 /** Tab puts in the file's own indentation (or indents the lines chosen); Shift+Tab takes one step out; ⌘S saves. */
@@ -1008,6 +1050,7 @@ async function save({ stay = false, force = false, hash = null } = {}) {
   if (seq !== st.seq && !st.edit) { paint(); return; }
   if (!r.ok) {
     if (r.why === 'changed') {
+      if (st.edit && r.hash) st.edit.seen = r.hash;
       const who = agentOf(f.in);
       const theirs = who ? `${visibleControls(who.name)} changed this file while you were editing.` : 'This file changed on disk while you were editing.';
       st.ask = { kind: 'conflict', text: `${theirs} Your edit is still here.`, hash: r.hash, stay, buttons: [['Load theirs', 'theirs', false], ['Save mine anyway', 'mine', true], ['Keep editing', 'keep', false]] };
@@ -1022,6 +1065,8 @@ async function save({ stay = false, force = false, hash = null } = {}) {
   }
   st.edit.text0 = text;
   st.edit.hash = r.hash;
+  st.edit.saved = true;
+  st.edit.seen = null;
   // the view shows what was saved at once; reading it again brings the engine's own count of changed lines
   Object.assign(f, { text, hash: r.hash, rows: F.splitLines(text), html: new Map(), states: [''], scanned: 0 });
   f.lines = f.rows.length;
@@ -1031,7 +1076,8 @@ async function save({ stay = false, force = false, hash = null } = {}) {
   if (r.reply) note(visibleControls(r.reply), 9000);
   say(r.reply ? `Saved. ${r.reply}` : 'Saved.');
   setTimeout(() => paintActs(), 2700);
-  if (!stay) { leaveEdit({ ask: false }); reread(); }
+  // the Save button goes back to the coloured view, which reads the file again (leaveEdit); ⌘S stays
+  if (!stay) leaveEdit({ ask: false });
   else paint();
 }
 
@@ -1068,7 +1114,8 @@ async function poll() {
   const seq = st.seq;
   st.polling = true;
   let r;
-  try { r = await api.file(f.in, f.path, f.hash ? { check: f.hash } : {}); }
+  const check = (st.edit && st.edit.seen) || f.hash;
+  try { r = await api.file(f.in, f.path, check ? { check } : {}); }
   catch { st.polling = false; return; }
   st.polling = false;
   if (seq !== st.seq || f !== st.file || !st.open) return;
@@ -1080,6 +1127,9 @@ async function poll() {
   if (!f.hash && r.kind === f.kind && (r.size || 0) === f.size && !r.hash) return;
   if (st.edit) {
     if (st.ask && st.ask.kind === 'changed') return;
+    // what the person was told about already (they chose Keep editing): nothing new until it changes again
+    if (r.hash && r.hash === st.edit.seen) return;
+    st.edit.seen = r.hash || null;
     const who = agentOf(f.in);
     st.ask = { kind: 'changed', text: `${who ? `${visibleControls(who.name)} changed this file.` : 'This file changed on disk.'} Your edit is still here.`, theirs: r, buttons: [['Load theirs', 'theirs', false], ['Keep editing', 'keep', true]] };
     paint();

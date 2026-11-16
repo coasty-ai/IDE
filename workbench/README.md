@@ -95,7 +95,7 @@ Each state has its own mark and its own words, so nothing depends on colour:
 | cross | failed |
 | ring | stopped |
 
-Screenshots of each look and view are in `docs/screens/`: the board (`board-*.png`, with the git and files chips) and the git screen (`git-*.png`). `node scripts/ui-shots.mjs <folder>` takes them again, along with the lid's merge views (`merge-*.png`), an agent at its spending limit (`limit-*.png`) and the file view (`files-*.png`), which are not kept in the repository so that every agent's copy of it stays smaller; the `live-*.png` shots come from an earlier real run.
+Screenshots of each look and view are in `docs/screens/`: the board (`board-*.png`, with the git chip; they were taken before the files chip came) and the git screen (`git-*.png`). `node scripts/ui-shots.mjs <folder>` takes them again, along with the lid's merge views (`merge-*.png`), an agent at its spending limit (`limit-*.png`) and the file view (`files-*.png`), which are not kept in the repository so that every agent's copy of it stays smaller; the `live-*.png` shots come from an earlier real run.
 
 ## Agents & keys
 

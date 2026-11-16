@@ -749,7 +749,8 @@ body:has(#filesChip:hover, #filesChip:focus-visible) .flash-body { stroke: var(-
 
 /* ---------- while the sheet shows: the board (or the git screen) dims behind it, and its lit lines stay lit ---------- */
 #board, #main, #top, #gitScreen > * { transition: opacity .3s var(--ease); }
-#wires > * { transition: opacity .3s var(--ease), stroke .3s ease; }
+/* only the copper that dims eases: a lit line's glow keeps changing at once, as board.js draws it */
+#wires > :not(.lit):not(.glow):not(.pin):not(.pad):not(.padn) { transition: opacity .3s var(--ease), stroke .3s ease; }
 :root[data-files] #board, :root[data-files] #main, :root[data-files] #top, :root[data-files] #gitScreen > * { opacity: .34; }
 :root[data-files] #wires > :not(.lit):not(.glow):not(.pin):not(.pad):not(.padn) { opacity: .3; }
 :root[data-theme="ivory"][data-files] #board, :root[data-theme="ivory"][data-files] #main, :root[data-theme="ivory"][data-files] #top,
@@ -788,7 +789,8 @@ body:has(#filesChip:hover, #filesChip:focus-visible) .flash-body { stroke: var(-
 #fileSheet .fv-acts { flex: 0 1 auto; display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; max-width: 64%; }
 /* why a file is not edited, where Edit would be: one line where there is room, else two even lines */
 #fileSheet .fv-why { color: var(--lid-ink-3); text-align: right; overflow-wrap: anywhere; line-height: 1.35; text-wrap: balance; }
-#fileSheet .fv-saved { color: var(--k-ok); font-weight: 600; white-space: nowrap; }
+#fileSheet .fv-saved { color: var(--k-ok); font-weight: 600; white-space: nowrap; animation: fv-saved 2.6s ease both; }
+@keyframes fv-saved { 0% { opacity: 0; } 12%, 70% { opacity: 1; } 100% { opacity: 0; } }
 #fileSheet .fv-x { flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--lid-ink-2); font-size: 15px; line-height: 1; }
 #fileSheet .fv-x:hover { background: rgba(60, 58, 48, .10); color: var(--lid-ink); }
 #fileSheet .fv-needs { flex: none; display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border: 1px solid var(--k-need); border-radius: 4px; background: none;
@@ -845,7 +847,8 @@ body:has(#filesChip:hover, #filesChip:focus-visible) .flash-body { stroke: var(-
 #fileSheet .fv-row .tx { padding-left: 14px; padding-right: 28px; }
 #fileSheet .fv-row.chg { background: var(--fv-chg); }
 #fileSheet .fv-row.chg .no { background: var(--fv-chg); box-shadow: inset 3px 0 0 var(--fv-bar); }
-#fileSheet .fv-row.fresh, #fileSheet .fv-row.fresh .no { animation: fv-fresh 1.7s ease-out both; }
+/* a line marked for a moment: a gold tint that fades (a still tint, for the moment, without motion) */
+#fileSheet .fv-row.fresh, #fileSheet .fv-row.fresh .no { background-color: var(--fv-fresh); animation: fv-fresh 1.7s ease-out both; }
 @keyframes fv-fresh { 0%, 30% { background-color: var(--fv-fresh); } 100% { background-color: var(--fv-page); } }
 #fileSheet .fv-row.chg.fresh, #fileSheet .fv-row.chg.fresh .no { animation-name: fv-fresh-chg; }
 @keyframes fv-fresh-chg { 0%, 30% { background-color: var(--fv-fresh); } 100% { background-color: var(--fv-chg); } }
@@ -902,7 +905,7 @@ body:has(#filesChip:hover, #filesChip:focus-visible) .flash-body { stroke: var(-
 /* the lid's focus ring, on the lid's surface and on the field */
 #fileSheet button:focus-visible, #fvTitle:focus-visible { outline: 2px solid var(--lid-focus); outline-offset: 2px; }
 #fileSheet .fv-crumb:focus:not(:focus-visible), #fileSheet .fv-link:focus:not(:focus-visible) { outline: none; }
-@media (prefers-reduced-motion: reduce) { #board, #main, #top, #gitScreen > *, #wires > * { transition: none; } #fileSheet .fv-row.fresh, #fileSheet .fv-row.fresh .no { animation: none; } }
+@media (prefers-reduced-motion: reduce) { #board, #main, #top, #gitScreen > *, #wires > * { transition: none; } #fileSheet .fv-row.fresh, #fileSheet .fv-row.fresh .no, #fileSheet .fv-saved { animation: none; } }
 
 /* =====================================================================================================================
    Agents & keys: the button in the top band, and the connect panel, a dialog with the lid's surface over the board.

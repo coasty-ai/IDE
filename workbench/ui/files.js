@@ -343,6 +343,21 @@ export function cutAround(text, ranges, max) {
   return { text: lead + t.slice(start, end) + tail, ranges: moved };
 }
 
+/**
+ * Text cut to `max` characters from its start, keeping its end (a folder's nearest parts, a name's extension), with "…"
+ * where it was cut; the ranges moved with it, and any it cut away dropped.
+ */
+export function cutStart(text, ranges, max) {
+  const t = String(text ?? '');
+  if (t.length <= max) return { text: t, ranges: (ranges || []).map(r => [...r]) };
+  if (max <= 1) return { text: '…', ranges: [] };
+  let start = t.length - (max - 1);
+  if (/[\uDC00-\uDFFF]/.test(t[start])) start++;
+  const shift = 1 - start;
+  const moved = (ranges || []).map(([s, e]) => [Math.max(s, start) + shift, e + shift]).filter(([s, e]) => e > s && s >= 1);
+  return { text: '…' + t.slice(start), ranges: moved };
+}
+
 /** Places matched one by one (a file's letters) as runs: [start, end) pairs. */
 export function hitRanges(hits) {
   const out = [];

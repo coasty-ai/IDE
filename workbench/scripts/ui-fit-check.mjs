@@ -84,12 +84,15 @@ const CHECK = String.raw`(() => {
     // and the file view, #fileSheet, cover the whole board while they are open)
     const layer = p.closest('#card, #pop, #trayList, #look, #gitDetail, #connect, #fileSheet')?.id || 'board';
     for (let r of rects) {
-      // in a scroll box only what shows in it counts: above and below, and to either side (a long line of a file
-      // scrolls sideways in the file view, and is not cut)
+      // in a scroll box only what shows in it counts, above and below; and in the file view's code, to either side too
+      // (a long line of a file scrolls sideways there, and is not cut). Everywhere else nothing may run off sideways.
       if (scroll) {
         const s = scroll.getBoundingClientRect();
-        if (r.bottom < s.top || r.top > s.bottom || r.right < s.left || r.left > s.right) continue;
-        r = { left: Math.max(r.left, s.left), right: Math.min(r.right, s.right), top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+        if (r.bottom < s.top || r.top > s.bottom) continue;
+        if (scroll.id === 'fvCode') {
+          if (r.right < s.left || r.left > s.right) continue;
+          r = { left: Math.max(r.left, s.left), right: Math.min(r.right, s.right), top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+        }
       }
       texts.push({ r, p, n, layer });
       if (r.left < -tol || r.top < -tol || r.right > vw + tol || r.bottom > vh + tol) { out.push('off-screen text: ' + label(p)); break; }

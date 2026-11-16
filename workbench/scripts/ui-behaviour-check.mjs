@@ -2161,6 +2161,105 @@ try {
       `seen "${seen.whose}"; conflict "${conflict.whose}"; saves ${JSON.stringify(saves)}; theirs ${theirs.slice(0, 8)}; on disk now ${JSON.stringify(raw.raw.slice(0, 20))}`);
   });
 
+  await run(FV + 'Keep editing is remembered: the line does not come back for the same change, and ⌘S then Esc brings the changed lines anew', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('export.ts'); await b.key('Enter'); await sleep(800);
+    await click('#fvWhose [data-fv="switch"]'); await sleep(900);
+    const before = await fv();
+    await click('#fvActs [data-fv="edit"]'); await sleep(300);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setSelectionRange(0, 0); document.execCommand('insertText', false, '// one line more\\n'); return 1; })()`);
+    const now = await b.ev(`fetch('/api/file?in=f1&path=src%2Finvoices%2Fbatch.ts', { headers: { 'X-Workbench-Token': 'k' } }).then(r => r.json()).then(r => r.text)`);
+    void now;
+    await b.key('s', { meta: true }); await sleep(900);
+    await b.key('Escape'); await sleep(1200);
+    const after = await fv();
+    const gold = await b.ev(`document.querySelectorAll('#fvRows .fv-row.chg').length`);
+    // a change on disk while editing, kept: the 2-second check stays quiet about it
+    await click('#fvActs [data-fv="edit"]'); await sleep(300);
+    await b.ev(`(() => { const t = document.getElementById('fvText'); t.focus(); t.setRangeText('// mine\\n', 0, 0, 'end'); t.dispatchEvent(new Event('input')); return 1; })()`);
+    const disk = await b.ev(`fetch('/api/file?in=f1&path=src%2Finvoices%2Fexport.ts', { headers: { 'X-Workbench-Token': 'k' } }).then(r => r.json()).then(r => r.text)`);
+    await fetch(base + '/ctl/files', { method: 'POST', body: JSON.stringify({ in: 'f1', path: 'src/invoices/export.ts', text: '// theirs\n' + disk }) });
+    await sleep(2600);
+    const told = await fv();
+    await click('#fvWhose [data-fv="keep"]'); await sleep(2700);
+    const quiet = await fv();
+    check(FV + 'Keep editing is remembered: the line does not come back for the same change, and ⌘S then Esc brings the changed lines anew',
+      /6 lines changed/.test(before.whose) && /7 lines changed/.test(after.whose) && gold === 7 && !after.edit
+      && /^Invoice export changed this file\. Your edit is still here\./.test(told.whose) && quiet.edit && !/changed this file/.test(quiet.whose),
+      `before "${before.whose}", after ⌘S and Esc "${after.whose}" (${gold} gold), told "${told.whose}", after Keep editing "${quiet.whose}"`);
+  });
+
+  await run(FV + 'the editor on a file of 25,000 lines: at the same place, its numbers in step, the caret in sight, and quick to type in', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('rates.ts'); await b.key('Enter'); await sleep(1200);
+    await b.ev(`document.getElementById('fvFind').focus(), 1`);
+    await keysIn('12000'); await b.key('Enter'); await sleep(500);
+    const codeTop = await b.ev(`document.getElementById('fvCode').scrollTop`);
+    await click('#fvActs [data-fv="edit"]'); await sleep(500);
+    const ed = () => b.ev(`(() => { const e = document.getElementById('fvEdit'), t = document.getElementById('fvText'), box = e.getBoundingClientRect();
+      const first = [...document.querySelectorAll('#fvEnums span')].find(n => n.getBoundingClientRect().top >= box.top - 1);
+      const line = t.value.slice(0, t.selectionEnd).split('\\n').length, lh = parseFloat(getComputedStyle(t).lineHeight);
+      const caretY = box.top + (line - 1) * lh + 8 - e.scrollTop;
+      return { top: Math.round(e.scrollTop), first: first ? +first.textContent : 0, line, inSight: caretY >= box.top - 1 && caretY + lh <= box.bottom + 1 }; })()`);
+    const at = await ed();
+    for (let i = 0; i < 45; i++) await b.key('ArrowDown');
+    await sleep(300);
+    const down = await ed();
+    const t0 = Date.now();
+    await keysIn('abcdefghij');
+    const ms = Date.now() - t0;
+    check(FV + 'the editor on a file of 25,000 lines: at the same place, its numbers in step, the caret in sight, and quick to type in',
+      Math.abs(at.top - codeTop) < 2 && Math.abs(at.first - (at.line)) <= 1 && at.first > 11900 && at.inSight && down.line === at.line + 45 && down.inSight && down.top > at.top && ms < 2500,
+      `code ${Math.round(codeTop)}, editor ${JSON.stringify(at)} → ${JSON.stringify(down)}, ten keys in ${ms} ms`);
+  });
+
+  await run(FV + 'a key typed into the finder is never searched for: it stays out of every address', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    const key = ['ghp', 'Z9xY8wV7uT6sR5qP4oN3mL2kJ1hG0fE9dC8'].join('_');
+    await b.key('f', { meta: true, shift: true }); await sleep(300);
+    await b.ev(`(() => { const i = document.getElementById('fvFind'); i.value = ${JSON.stringify(key)}; i.dispatchEvent(new Event('input')); return 1; })()`);
+    await sleep(900);
+    const said = await b.ev(`document.getElementById('fvList').textContent`);
+    const field = await b.ev(`document.getElementById('fvFind').value`);
+    const anywhere = await b.ev(`document.getElementById('fileSheet').textContent.includes(${JSON.stringify(key.slice(4, 14))})`);
+    const reads = (await fileReads()).filter(r => (r.q || '').includes(key.slice(4, 14)) || (r.file || '').includes(key.slice(4, 14)));
+    await b.key('Escape'); await sleep(200);
+    check(FV + 'a key typed into the finder is never searched for: it stays out of every address', reads.length === 0 && field === '' && !anywhere && /looks like a key, so it was not searched for\. Keys go in Agents & keys/.test(said),
+      `${reads.length} reads carried it; field "${field ? '(not empty)' : ''}"; on the page ${anywhere}; "${said.slice(0, 90)}"`);
+  });
+
+  await run(FV + 'every hidden character an agent controls shows in the sheet: in the path, its title, the finder and a folder', async () => {
+    await open('files', { still: true });
+    await sleep(700);
+    const SCAN = String.raw`(async () => {
+      const { hasHidden } = await import('/ui/diffview.js');
+      const out = [], root = document.getElementById('fileSheet');
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let n; (n = walker.nextNode());) if (hasHidden(n.data.replace(/\n/g, ''))) out.push('text of ' + (n.parentElement.id || n.parentElement.className));
+      for (const e of root.querySelectorAll('*')) for (const at of ['aria-label', 'title', 'aria-description', 'placeholder', 'alt']) { const v = e.getAttribute(at); if (v && hasHidden(v.replace(/\n/g, ''))) out.push(at + ' of ' + (e.id || e.className)); }
+      return [...new Set(out)];
+    })()`;
+    const found = [];
+    await b.key('p', { meta: true }); await sleep(300);
+    await keysIn('readme'); await sleep(400);
+    const row = await b.ev(`[...document.querySelectorAll('#fvList [role="option"]')].map(o => o.textContent).find(t => t.includes('txt.exe')) || ''`);
+    found.push(...(await b.ev(SCAN)).map(x => 'finder: ' + x));
+    await b.ev(`[...document.querySelectorAll('#fvList [role="option"]')].find(o => o.textContent.includes('txt.exe'))?.click(), 1`); await sleep(900);
+    const title = await fv();
+    found.push(...(await b.ev(SCAN)).map(x => 'file: ' + x));
+    await b.ev(`[...document.querySelectorAll('#fvTitle .fv-crumb')].find(c => c.textContent === 'notes')?.click(), 1`); await sleep(500);
+    found.push(...(await b.ev(SCAN)).map(x => 'folder: ' + x));
+    const folderRows = (await fv()).rows;
+    check(FV + 'every hidden character an agent controls shows in the sheet: in the path, its title, the finder and a folder',
+      found.length === 0 && /readme⟦U\+202E⟧txt\.exe/.test(row) && /readme⟦U\+202E⟧txt\.exe$/.test(title.title) && folderRows.some(r => /⟦U\+202E⟧/.test(r)),
+      `raw: ${JSON.stringify(found)}; row "${row}"; title "${title.title}"; folder ${JSON.stringify(folderRows)}`);
+  });
+
   await run(FV + 'Load theirs shows the file as it is now, and no edit is left behind', async () => {
     await open('files', { still: true });
     await sleep(700);
@@ -2295,13 +2394,19 @@ try {
     const before = await shownRows();
     const now = await b.ev(`fetch('/api/file?in=you&path=src%2Finvoices%2Fquery.ts', { headers: { 'X-Workbench-Token': 'k' } }).then(r => r.json()).then(r => r.text)`);
     await fetch(base + '/ctl/files', { method: 'POST', body: JSON.stringify({ in: 'you', path: 'src/invoices/query.ts', text: now.replace('// Every invoice', '// A new line from an agent\n// Every invoice') }) });
-    await sleep(2700);
-    const after = await shownRows();
-    const marked = await b.ev(`[...document.querySelectorAll('#fvRows .fv-row.fresh .no')].map(n => n.textContent)`);
+    // the 2-second check reads it again: watch for it, and read the mark while it lasts (1.7 s)
+    let after = before, marked = [];
+    for (let i = 0; i < 40 && !after.some(r => /A new line from an agent/.test(r)); i++) {
+      await sleep(100);
+      after = await shownRows();
+      marked = await b.ev(`[...document.querySelectorAll('#fvRows .fv-row.fresh .no')].map(n => n.textContent)`);
+    }
+    await sleep(2000);
+    const gone = await b.ev(`document.querySelectorAll('#fvRows .fv-row.fresh').length`);
     const checks = (await fileReads()).filter(r => r.path === '/api/file' && r.check).length;
     check(FV + 'the view never goes stale: a file that changes on disk is read again near the same line, its new lines marked',
-      after.some(r => /A new line from an agent/.test(r)) && !before.some(r => /A new line from an agent/.test(r)) && marked.length === 1 && checks >= 1,
-      `marked ${JSON.stringify(marked)}, ${checks} light checks, ${JSON.stringify(after.slice(4, 6))}`);
+      after.some(r => /A new line from an agent/.test(r)) && !before.some(r => /A new line from an agent/.test(r)) && JSON.stringify(marked) === '["5"]' && gone === 0 && checks >= 1,
+      `marked ${JSON.stringify(marked)} (then ${gone}), ${checks} light checks, ${JSON.stringify(after.slice(4, 6))}`);
   });
 
   await run(FV + 'something that needs you lights a pill at the top; it closes the sheet and shows that in the middle', async () => {

@@ -195,6 +195,18 @@ test('search results: the open file’s first, at most 30, and the words found i
   assert.equal(F.hitRanges([1, 2, 3, 7, 9, 10]).join(';'), '1,4;7,8;9,11');
 });
 
+test('a folder too long for its row keeps its end, the folders nearest the file, with "…" where it was cut', () => {
+  const dir = 'src/very/deeply/nested/folders/for/the/crumbs';
+  assert.deepEqual(F.cutStart(dir, [[0, 3]], 100), { text: dir, ranges: [[0, 3]] });
+  assert.equal(dir.slice(39, 45), 'crumbs');
+  const cut = F.cutStart(dir, [[0, 3], [39, 45]], 20);
+  assert.equal(Array.from(cut.text).length, 20);
+  assert.ok(cut.text.startsWith('…') && cut.text.endsWith('the/crumbs'), cut.text);
+  assert.deepEqual(cut.ranges.map(([s, e]) => cut.text.slice(s, e)), ['crumbs'], 'a match cut away goes; one kept moves with the text');
+  assert.equal(F.cutStart(`a${U(0x1f600)}bcdef`, [], 5).text.length <= 6, true, 'never through a character past U+FFFF');
+  assert.deepEqual(F.cutStart('abc', [], 0), { text: '…', ranges: [] });
+});
+
 test('a line of code as HTML: its colours, its tabs at their stops, and hidden characters shown', () => {
   assert.equal(F.lineHtml([['k', 'const'], ['', ' a = '], ['n', '1'], ['', ';']]), '<span class="hk">const</span> a = <span class="hn">1</span>;');
   // a tab after "ab" in another part still stops at column 4
