@@ -275,9 +275,41 @@ function braceForms(units) {
 }
 
 /** Keywords after which a command still starts: a `{` or a `(` there opens a group or a subshell. */
-const COMMAND_START = /^\s*(?:(?:then|do|else|elif|if|while|until|!|time|coproc)\s+)*$/;
+const START_WORDS = new Set(['then', 'do', 'else', 'elif', 'if', 'while', 'until', '!', 'time', 'coproc']);
 /** Keywords whose parentheses hold a list or a pattern, not a subshell or a word's group: `case x in (a) …`, zsh's `for f (a b) …`. */
-const LIST_KEYWORD = /^\s*(?:case|for|foreach|select)\s/;
+const LIST_WORDS = new Set(['case', 'for', 'foreach', 'select']);
+/** A word that can name a function: no blank and none of the shell's punctuation. */
+const NAME_WORD = /^[^\s;&|()<>]+$/;
+
+/**
+ * The words a part's text starts with, read once as the text grows (lineParts keeps it on the part, `head`): its first words
+ * (`words`, each followed by a blank), the word being typed after them (from `start`, -1 when none), and whether every word so
+ * far is a keyword after which a command starts (`keywords`). Reading stops at three words once one is no such keyword: past
+ * that, no command starts in the part, and its first words are known. So every `(` and brace of a long part is read in a time
+ * that does not grow with it.
+ */
+function partHead(cur) {
+  const h = cur.head ?? (cur.head = { pos: 0, start: -1, words: [], keywords: true });
+  const t = cur.text;
+  while (h.pos < t.length && (h.keywords || h.words.length < 3)) {
+    const blank = /\s/.test(t[h.pos]);
+    if (h.start < 0) { if (!blank) h.start = h.pos; h.pos++; continue; }
+    if (!blank) { h.pos++; continue; }
+    const word = t.slice(h.start, h.pos);
+    h.words.push(word);
+    if (!START_WORDS.has(word)) h.keywords = false;
+    h.start = -1;
+    h.pos++;
+  }
+  return h;
+}
+
+/** The words of a part's text as partHead reads them, the one being typed included; null when more were read than that. */
+function headWords(cur) {
+  const h = partHead(cur);
+  if (h.pos < cur.text.length) return null;
+  return h.start >= 0 ? [...h.words, cur.text.slice(h.start)] : h.words;
+}
 
 /**
  * The parts of a command line as the floor for full permissions reads them (src/core/policy.mjs): each a whole command,
@@ -321,7 +353,12 @@ function lineParts(cmd, ups = [-1], top = 0) {
     }
     cur = fresh();
   };
-  const starts = () => COMMAND_START.test(cur.text);
+  // a command starts here: only keywords after which one starts came before (`if`, `then`, `!`, …), each followed by a blank
+  const starts = () => { const h = partHead(cur); return h.keywords && h.start < 0 && h.pos >= cur.text.length; };
+  // the part is a function's name so far, after `function` or not (`f`, `function f`): its `()` or its body follows
+  const fnName = (after) => { const ws = headWords(cur); return !!ws && (after ? ws.length === 2 && ws[0] === 'function' && NAME_WORD.test(ws[1])
+    : (ws.length === 1 && NAME_WORD.test(ws[0])) || (ws.length === 2 && ws[0] === 'function' && NAME_WORD.test(ws[1]))); };
+  const clear = () => { cur.text = ''; cur.head = null; };
   // a shell of its own: a subshell, or the one that runs another command's output
   const inner = () => { const id = ups.length; ups.push(frame); frame = id; nested++; };
   // another command's output: a hole in this word, which goes on after it; the commands inside are parts of their own
@@ -349,11 +386,11 @@ function lineParts(cmd, ups = [-1], top = 0) {
       continue;
     }
     // a case pattern's "(" and zsh's "for x (a b) …" list end the words before them, and the command after them starts afresh
-    if ((ch === '(' || ch === ')') && LIST_KEYWORD.test(cur.text)) { end(''); continue; }
+    if ((ch === '(' || ch === ')') && LIST_WORDS.has(partHead(cur).words[0])) { end(''); continue; }
     if (ch === '(') {
       if (starts()) { end(''); frames.push({ kind: 'paren', frame }); inner(); cur = fresh(); continue; }
       const fn = /^\(\s*\)/.exec(cmd.slice(k));
-      if (fn && /^\s*(?:function\s+)?[^\s;&|()<>]+\s*$/.test(cur.text)) { cur.text = ''; k += fn[0].length - 1; continue; } // NAME(): its body follows
+      if (fn && fnName(false)) { clear(); k += fn[0].length - 1; continue; } // NAME(): its body follows
       frames.push({ kind: 'group' });
       cur.text += ch;
       continue;
@@ -369,8 +406,8 @@ function lineParts(cmd, ups = [-1], top = 0) {
     const h = heredocAt(cmd, k);
     if (h) { heredoc = h; k = takeHeredoc(cur, h, k); continue; }
     if (ch === '>' || ch === '<' || (ch === '&' && cmd[k + 1] === '>')) { k = takeRedirect(cmd, k, cur); continue; }
-    if ((ch === '{' || ch === '}') && alone(k) && (starts() || (ch === '{' && /^\s*function\s+[^\s;&|()<>]+\s*$/.test(cur.text)))) {
-      cur.text = ''; // a group, or a function's body: its commands are the shell's own
+    if ((ch === '{' || ch === '}') && alone(k) && (starts() || (ch === '{' && fnName(true)))) {
+      clear(); // a group, or a function's body: its commands are the shell's own
       end(ch);
       continue;
     }

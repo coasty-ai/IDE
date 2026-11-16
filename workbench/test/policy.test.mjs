@@ -1834,7 +1834,8 @@ test('with full permissions on, a step that deletes what it was given, or writes
   ], FLOOR_REASON);
   // a hard link to a file there: writing through it, later, changes the file
   refusedWith([bash('ln .claude/settings.json h4.json'), bash('ln .mcp.json'), bash('ln -f -t backup .claude/settings.json'), bash('cp -l .claude/settings.json h5.json'),
-    bash('cp -al .claude backup'), bash('cp --link .mcp.json x.json'), bash('link .claude/settings.json h6.json'), bash('rsync -a --link-dest=.claude src/ dst/')], HARD_LINK);
+    bash('cp -al .claude backup'), bash('cp --link .mcp.json x.json'), bash('link .claude/settings.json h6.json'), bash('rsync -a --link-dest=.claude src/ dst/'),
+    bash('ln -tbackups .claude/settings.json')], HARD_LINK);
   // the shell command a package runner runs with -c is code
   refusedWith([bash("npx -c 'rm -rf .claude'"), bash("npm exec -c 'rm .mcp.json'")], CODE_CLAUDE);
   for (const row of [bash('ln .claude/settings.json h4.json'), bash('zip -m /tmp/cfg.zip .claude/settings.json'), bash('npx prettier --write .claude/settings.json')]) {
@@ -1857,7 +1858,10 @@ test('with full permissions on, listing an archive, testing it or unpacking it t
     bash('tar xOf hooks.tar .claude/settings.json'), bash('tar -df hooks.tar .claude')]);
   // what unpacks there is still refused; a command tar runs for each file it unpacks is code
   refusedWith([bash('unzip -o hooks.zip .mcp.json'), bash('unzip -q hooks.zip -d .claude'), bash('tar xf hooks.tar .claude/settings.json'),
-    bash('tar -xzf hooks.tgz -C .claude')], FLOOR_REASON);
+    bash('tar -xzf hooks.tgz -C .claude'),
+    // an option's value glued to its letter is no option of its own: OLD.tar's O, HOOKS.tgz's O, secret's t and c, .c's c
+    bash('tar -xzfHOOKS.tgz -C .claude'), bash('tar -xfOLD.tar .claude/settings.json'), bash('unzip -Psecret hooks.zip -d .claude'),
+    bash('gzip -S.c .claude/settings.json')], FLOOR_REASON);
   refusedWith([bash("tar -x --to-command='rm -rf .claude' -f hooks.tar")], CODE_CLAUDE);
   allowedInFull([bash("tar -x --to-command='wc -c' -f hooks.tar .claude/settings.json")]);
 });
@@ -1921,6 +1925,12 @@ test('every decide is bounded: many cd steps, || chains, 64 KB lines, many brace
     ['echo x > links/m0', WRITE_UNCLEAR],
     ['rm -f many/*.txt many/f*', FULL],
     [rep(50, () => 'echo x > many/f*', '; '), FULL],
+    // shells and interpreters fed their code, many groups after a long start, one option word of 64 KB
+    [upTo64k(() => 'sh < aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; '), FULL],
+    [upTo64k(() => 'python3 < aaaaaaaaaaaaaaaaaaaaaaaaaaaa; '), FULL],
+    [' '.repeat(30000) + 'x' + '(a)'.repeat(8000), FULL],
+    ['if '.repeat(10000) + 'x' + '(a)'.repeat(8000), FULL],
+    ['ls -' + 'a'.repeat(65000), FULL],
   ];
   const wrong = [];
   for (const [command, want] of lines) {

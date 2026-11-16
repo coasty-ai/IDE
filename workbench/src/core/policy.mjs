@@ -479,6 +479,7 @@ function commandFloor(command, base) {
   let carried = false; // a place a command writes holds a value the shell fills in: "$X", another command's output
   // the line names them, outside a heredoc's text: in the words of any of its parts, braces expanded and quotes taken away
   const named = parts.some(c => textNamesClaude((c.words ?? []).join(' ')));
+  const line = lineFacts(command, parts, named);
   const walked = base ? shellWalk(parts, base, MAY_REPEAT.test(command)) : null;
   const judged = new Map(); // each place, from the same folders, is judged once in a line
   const folderIds = new Map();
@@ -493,11 +494,11 @@ function commandFloor(command, base) {
       if (v === 'unclear') unclear = true;
       if (v === 'carried') carried = true;
     }
-    if (codeNamesClaude(c, command, parts) || builtProgram(c)) code = true;
+    if (codeNamesClaude(c, line) || builtProgram(c)) code = true;
     const call = c.bare ? packageCall(c.bare) ?? tarCommand(c.bare) : null;
     if (call !== null && namesExpanded(call)) code = true;
   }
-  if (!code && feedsNames(parts) && (named || textNamesClaude(command))) code = true;
+  if (!code && feedsNames(parts) && line.names()) code = true;
   const left = walked ? leftIn(walked.end, base) : null;
   if (left === 'claude') return R.fullCdClaude;
   if (code) return R.fullCodeClaude;
@@ -636,7 +637,10 @@ const WALK_PATH = 4096;
  */
 function shellWalk(parts, base, repeat) {
   const ups = parts.ups ?? [-1];
-  const key = s => [s.dir, s.prev, ...s.stack].map(d => (typeof d === 'symbol' ? d.description : String(d))).join('\n');
+  // a state's key: each folder by a number of its own, so a long path is read once however often it is compared
+  const ids = new Map();
+  const id = d => { if (!ids.has(d)) ids.set(d, ids.size); return ids.get(d); };
+  const key = s => [id(s.dir), id(s.prev), ...s.stack.map(id)].join(',');
   const uniq = list => [...new Map(list.map(s => [key(s), s])).values()];
   // whether the settings are named where they could reach a part's words: in the parts before it, its own output's included
   const reached = new Map();
@@ -791,17 +795,30 @@ const SHELL_RUNNERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh'
  * expands the braces of what it reads, so for one, a heredoc's text and each word are read with their braces expanded too
  * (`echo 'rm -rf .{claude,git}' | sh`). A script run from a file runs.
  */
-function codeNamesClaude(c, command, parts) {
+function codeNamesClaude(c, line) {
   const p = c.bare === undefined ? c : c.bare;
   if (!p || p.empty || c.inline || !CODE_RUNNERS.has(p.prog)) return false;
   const code = codeGiven(p);
   if (code === null) return false;
   if (code !== STDIN) return textNamesClaude(code);
-  const fed = hasPipe(command) || (c.redirects ?? []).some(r => r.kind === 'read' || r.kind === 'heredoc' || r.kind === 'string');
+  const fed = line.pipe() || (c.redirects ?? []).some(r => r.kind === 'read' || r.kind === 'heredoc' || r.kind === 'string');
   if (!fed) return false;
-  if (textNamesClaude(command) || parts.some(x => textNamesClaude((x.words ?? []).join(' ')))) return true;
-  if (!SHELL_RUNNERS.has(p.prog)) return false;
-  return [...heredocBodies(command), ...parts.flatMap(x => x.words ?? [])].some(namesExpanded);
+  return line.names() || (SHELL_RUNNERS.has(p.prog) && line.shellNames());
+}
+
+/**
+ * What a whole line holds, for codeNamesClaude and feedsNames, each read once however many of its parts ask: whether it has a
+ * pipe, whether it names Claude Code's settings (its words, braces expanded, and its text, its heredocs' included), and
+ * whether it does once a shell expands the braces of its heredocs' text and of each of its words.
+ */
+function lineFacts(command, parts, named) {
+  const memo = {};
+  const once = (k, f) => (k in memo ? memo[k] : (memo[k] = f()));
+  return {
+    pipe: () => once('pipe', () => hasPipe(command)),
+    names: () => once('names', () => named || textNamesClaude(command)),
+    shellNames: () => once('shell', () => [...heredocBodies(command), ...parts.flatMap(x => x.words ?? [])].some(namesExpanded)),
+  };
 }
 
 /** Whether shell text names Claude Code's settings once its braces are expanded; past expandBraces' caps, too much to read. */
@@ -1009,14 +1026,14 @@ function programTargets(prog, args) {
     }
     case 'gzip': case 'gunzip': case 'bzip2': case 'bunzip2': case 'xz': case 'unxz': case 'lzma': case 'zstd': case 'unzstd': {
       // each file they are given is replaced by its other form, unless they write to their output (-c); zstd's -o names one
-      if (optionWords(args).some(a => shortHas(a, 'c') || longIs(a, ['stdout', 'to-stdout']))) return [];
+      if (optionWords(args).some(a => flagHas(a, 'c', 'SoTMD') || longIs(a, ['stdout', 'to-stdout']))) return [];
       const { operands, opts } = argsOf(args, 'SoTMD', ['suffix', 'output', 'threads', 'memlimit']);
       return each([...operands, ...optValues(opts, 'o', 'output')]);
     }
     case 'zip': {
       // the archive it writes: its first word, or -O's; with -m (--move), what it puts in the archive is deleted, with what is inside it
       const { operands, opts } = argsOf(args, 'bntOP', ['temp-path', 'suffixes', 'output-file', 'password']);
-      const moves = optionWords(args).some(a => (!a.startsWith('--') && shortHas(a, 'm')) || longIs(a, ['move']));
+      const moves = optionWords(args).some(a => flagHas(a, 'm', 'bntOP') || longIs(a, ['move']));
       return [...each([operands[0], optValue(opts, 'O', 'output-file')].filter(w => w !== undefined)), ...(moves ? each(operands.slice(1), { deep: true }) : [])];
     }
     case 'link': { // link FILE NAME: a second name for FILE
@@ -1189,7 +1206,7 @@ function copyTargets(prog, args) {
   const { short, long } = COPY_VALUES[prog];
   const { operands, opts } = argsOf(args, short, long);
   const out = prog === 'rsync' ? optValues(opts, null, 'log-file').map(word => ({ word })) : [];
-  if (prog === 'install' && optionWords(args).some(a => shortHas(a, 'd') || longIs(a, ['directory']))) return [...out, ...operands.map(word => ({ word }))];
+  if (prog === 'install' && optionWords(args).some(a => flagHas(a, 'd', short) || longIs(a, ['directory']))) return [...out, ...operands.map(word => ({ word }))];
   const remote = w => /^[^/]*:/.test(w); // host:path, user@host:path, rsync://
   const dir = optValue(opts, 't', 'target-directory');
   let dest;
@@ -1200,8 +1217,8 @@ function copyTargets(prog, args) {
   const words = optionWords(args);
   // a hard link (ln without -s, cp -l): a second name for each source, through which it can be changed; rsync's --link-dest
   // makes them to the files of its folder. rsync --remove-source-files deletes the files it sent.
-  const recursive = words.some(a => shortHas(a, 'rRa') || longIs(a, ['recursive', 'archive']));
-  if ((prog === 'ln' && !words.some(a => shortHas(a, 's') || longIs(a, ['symbolic']))) || (prog === 'cp' && words.some(a => shortHas(a, 'l') || longIs(a, ['link'])))) {
+  const recursive = words.some(a => flagHas(a, 'rRa', short) || longIs(a, ['recursive', 'archive']));
+  if ((prog === 'ln' && !words.some(a => flagHas(a, 's', short) || longIs(a, ['symbolic']))) || (prog === 'cp' && words.some(a => flagHas(a, 'l', short) || longIs(a, ['link'])))) {
     for (const s of sources) out.push({ word: s, link: true, deep: prog === 'cp' && recursive });
   }
   if (prog === 'rsync') {
@@ -1290,14 +1307,17 @@ function perlDigits(a, j) {
  * counts. What it unpacks without naming members cannot be told, and runs. Listing (-t), comparing (-d) and unpacking to its
  * output (-O, --to-stdout) or to a command (--to-command, read as code: tarCommand) write nothing there.
  */
+/** tar's short options that take a value. */
+const TAR_VALUES = 'fCTXbKLNVgI';
+
 function tarTargets(args) {
   const list = args.length && /^[A-Za-z]+$/.test(args[0]) && /[crtuxA]/.test(args[0]) ? ['-' + args[0], ...args.slice(1)] : args;
-  const { operands, opts } = argsOf(list, 'fCTXbKLNVgI', ['file', 'directory', 'files-from', 'exclude-from', 'blocking-factor', 'starting-file',
+  const { operands, opts } = argsOf(list, TAR_VALUES, ['file', 'directory', 'files-from', 'exclude-from', 'blocking-factor', 'starting-file',
     'tape-length', 'newer', 'label', 'listed-incremental', 'use-compress-program', 'exclude']);
   const words = optionWords(list);
-  const create = words.some(a => shortHas(a, 'cruA') || longIs(a, ['create', 'append', 'update', 'catenate', 'concatenate']));
-  const toOutput = words.some(a => shortHas(a, 'O') || longIs(a, ['to-stdout', 'to-command']));
-  const extract = !toOutput && words.some(a => shortHas(a, 'x') || longIs(a, ['extract', 'get']));
+  const create = words.some(a => flagHas(a, 'cruA', TAR_VALUES) || longIs(a, ['create', 'append', 'update', 'catenate', 'concatenate']));
+  const toOutput = words.some(a => flagHas(a, 'O', TAR_VALUES) || longIs(a, ['to-stdout', 'to-command']));
+  const extract = !toOutput && words.some(a => flagHas(a, 'x', TAR_VALUES) || longIs(a, ['extract', 'get']));
   const out = optValues(opts, 'g', 'listed-incremental').map(word => ({ word }));
   const file = optValue(opts, 'f', 'file');
   if (create && file !== undefined && file !== '-') out.push({ word: file });
@@ -1329,7 +1349,7 @@ function unzipTargets(args) {
     if (/^-d./.test(a)) { dir = a.slice(2); exclude = false; continue; }
     if (a === '-x') { exclude = true; continue; }
     if (a === '-P') { k++; continue; }
-    if (a.startsWith('-')) { exclude = false; if (/^-[^-]*[lvtzpcZ]/.test(a)) reads = true; continue; }
+    if (a.startsWith('-')) { exclude = false; if (flagHas(a, 'lvtzpcZ', 'dP')) reads = true; continue; }
     if (archive === null) archive = a;
     else if (!exclude) members.push(a);
   }
@@ -1397,7 +1417,7 @@ function findPlaces(args) {
  * the name a copy gets inside a folder ("{}" as cp's source) is each such name (`find . -name .mcp.json -exec cp {} backup/ \;`).
  */
 function foundTargets(targets, finder) {
-  const { roots, names } = findPlaces(finder.args);
+  const { roots, names } = finder.places ?? (finder.places = findPlaces(finder.args)); // read once for all the commands it runs
   return targets.flatMap(t => {
     if (t.word.includes('{}')) return [...roots, ...names].map(place => ({ word: t.word.replaceAll('{}', place) }));
     if (!(t.into ?? '').includes('{}')) return [t];
@@ -2207,6 +2227,19 @@ export function splitWords(cmd) {
   };
 }
 
+/**
+ * Whether a short-option word (like -xzf) has any of the letters as options: read up to the first letter that takes a value
+ * (`values`), since the rest of the word is that value (`tar -xfOLD.tar` has no O, `ln -tbackups` no s).
+ */
+function flagHas(arg, letters, values = '') {
+  if (!/^-[^-]/.test(arg)) return false;
+  for (let j = 1; j < arg.length; j++) {
+    if (letters.includes(arg[j])) return true;
+    if (values.includes(arg[j])) return false;
+  }
+  return false;
+}
+
 /** A short-option cluster (like -uo) that contains any of the letters. */
 function shortHas(arg, letters) {
   return /^-[^-]/.test(arg) && [...arg.slice(1)].some(ch => letters.includes(ch));
@@ -2763,6 +2796,9 @@ function expandPattern(pattern, base, also, loose, budget, limit = GLOB_LIMIT) {
  * "/": git and the system read "--/../x" (a word, or a value as in --prefix=--/../x) as a path through a folder named
  * "--", which git makes itself.
  */
+/** The longest short-option word whose every tail readPieces reads as a place. */
+const PIECES_WORD = 1024;
+
 function readPieces(w) {
   const t = w.text;
   const out = new Set();
@@ -2771,8 +2807,12 @@ function readPieces(w) {
     if (w.glob && /[*?[^#]/.test(s)) s = globFolder(s);
     if (s) out.add(s);
   };
-  // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail.
-  if (/^-[^-]/.test(t)) for (let k = 2; k < t.length; k++) add(t.slice(k));
+  // A short-option cluster can end in an attached value: -bf/path, -rf../x. Check every tail; one too long for that is more
+  // than one check may read.
+  if (/^-[^-]/.test(t)) {
+    if (t.length > PIECES_WORD) { if (work) work.over = true; throw PAST_CAP; }
+    for (let k = 2; k < t.length; k++) add(t.slice(k));
+  }
   const parts = t.split(/([=:,])/);
   for (let i = 0; i < parts.length; i += 2) {
     if (parts[i - 1] === ':' && /^\/+$/.test(parts[i])) continue;
