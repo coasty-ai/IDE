@@ -37,6 +37,7 @@
 import { clip } from '../shared/format.mjs';
 import { ENDED, LOOK, DONE } from '../shared/states.mjs';
 import { FILLER } from '../shared/filler.mjs';
+import { LOOKS_GOOD_RE, NOT_NOW_RE } from '../shared/answers.mjs';
 
 // ---------------------------------------------------------------------------------------------
 // Words
@@ -2680,6 +2681,11 @@ function parse(said, c, { free = true } = {}) {
     if (go === 'asks' || go === 'keep') return { kind: 'unknown', text: said };
     if (go !== null) return { kind: 'confirm', go };
   }
+  // A finished agent's lid: "looks good" and the engine's other words for it, or "not now", said whole, answer its finish
+  // as its buttons do (the engine's _answerDone), never a prompt.
+  if (!c.pendingConfirm && finishedLid(c) && (LOOKS_GOOD_RE.test(said) || NOT_NOW_RE.test(said))) {
+    return { kind: 'answer', agentId: c.focus.id, askId: null, text: said };
+  }
   // Full permissions, said whole, come before a permission's own reply: "allow everything" and "don't ask me" would
   // otherwise be a no that carries those words. "yes" is no such word, so a yes still allows. While a question waits,
   // they are its answer (below). Only the whole utterance counts: after an agent's name ("claude, stop asking",
@@ -2780,6 +2786,15 @@ function parse(said, c, { free = true } = {}) {
     if (r) return r;
   }
   return prompt;
+}
+
+/**
+ * The agent in the centre is a finished root, whose lid takes "Looks good" or "Not now": done and checked, says it is
+ * done, or done with a failed check (DONE), this run's or an earlier one's, with nothing it asks.
+ */
+function finishedLid(c) {
+  const a = c.focus;
+  return !!a && isRoot(a) && DONE.has(a.state) && !hasAsk(a);
 }
 
 /** A word written as a call, as code is: "stop()", "stop(worker);", "status()". "stop (now)" and "stop!" are no such word. */

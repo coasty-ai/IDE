@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { presetById } from '../src/shared/keypresets.mjs';
 import { clip } from '../src/shared/format.mjs';
 import { nameFromTask } from '../src/shared/narrate.mjs';
-import { NOT_NOW_RE } from '../src/shared/answers.mjs';
+import { LOOKS_GOOD_RE, NOT_NOW_RE } from '../src/shared/answers.mjs';
 import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../src/core/prefs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -1554,6 +1554,15 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           const several = /^start (?:two|three|four|five|[2-5]|eight|8) /i.test(text);
           if (!several && !/^(merge|land|throw|discard|scrap|forget|stop|tell|what needs me)\b/i.test(text)) return prompt();
           confirms.delete(shown.id);   // any other command withdraws the card on screen
+        }
+        // "looks good" or "not now" at a finished agent's lid that has no button for them (the engine's _lookedAt): its
+        // finish is answered and looked at (`looked`), never a prompt; where its work could be merged, it is "Not now"
+        const finished = !shown && json?.focusId ? state.agents.find(x => x.id === json.focusId && !x.parentId && ['done_checked', 'done_claimed', 'checks_failed'].includes(x.state)) : null;
+        if (finished && (LOOKS_GOOD_RE.test(text) || NOT_NOW_RE.test(text))) {
+          const notNow = NOT_NOW_RE.test(text) || (state.mode === 'live' && finished.work?.branch && finished.work.folder && !finished.work.thrownAway && !finished.work.merged);
+          const out = { reply: notNow && finished.work?.branch ? `${finished.name}’s work stays on its branch for now.` : notNow ? `${finished.name} stays as it is.` : `Good. ${finished.name} stays as it is.`, looked: finished.id };
+          send('notice', { text: out.reply });
+          return reply(out);
         }
         if (stopWords) return stopNow();
         if (/^(merge|land)\b|^bring its changes in\b/i.test(text) || /^(throw (it|its work|its changes) away|throw away|discard|scrap)\b/i.test(text)) {

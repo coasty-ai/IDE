@@ -1125,19 +1125,18 @@ try {
     await sleep(900);
     await typeIt('looks good, merge it'); await sleep(1000);
     const p3 = await sent();
-    // so does "looks good" where the lid has no "Looks good": work that can merge offers Merge and "Not now", and words
-    // that sound like approval never press "Not now", which would send work not merged yet to the tray; the words are a
-    // prompt like any other, so an agent starts on them, and the finished work stays at the board's edge
+    // "looks good" where the lid has no "Looks good" (work that can merge offers Merge and "Not now") never starts an agent:
+    // it presses that lid's "Not now", so the work is looked at and goes to the tray, not merged, and no command is sent
     await open('done-waits');
     await sleep(900);
-    await typeIt('looks good'); await sleep(1000);
-    const p4 = await sent(), chips4 = await chipsNow();
+    await typeIt('looks good'); await sleep(1300);
+    const p4 = await sent(), chips4 = await chipsNow(), tray4 = await trayNow();
     check(DT + 'typed or said, "not now" and "looks good" at a finished agent\'s lid do what its button does, and no command is sent',
       p1.length === 1 && p1[0][0] === '/api/agents/w1/answer' && p1[0][1].answer === 'Not now' && !('askId' in p1[0][1]) && chips1 === '' && tray1 === '1 not merged'
       && /Invoice export is done and checked\./.test(lid) && p2.length === 1 && p2[0][0] === '/api/agents/228202/answer' && p2[0][1].answer === 'Looks good' && tray2 === '1 done'
       && p3.length === 1 && p3[0][0] === '/api/command' && p3[0][1].text === 'looks good, merge it'
-      && p4.length === 1 && p4[0][0] === '/api/command' && p4[0][1].text === 'looks good' && chips4.split(',')[0] === 'w1~' && chips4.split(',').length === 2,
-      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" with no such button: ${JSON.stringify(p4)}, chips "${chips4}"`);
+      && p4.length === 1 && p4[0][0] === '/api/agents/w1/answer' && p4[0][1].answer === 'Not now' && !('askId' in p4[0][1]) && chips4 === '' && tray4 === '1 not merged',
+      `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" where Merge is offered: ${JSON.stringify(p4)}, chips "${chips4}", tray "${tray4}"`);
   });
 
   // ---------------------------------------------------------------- D2: merge, review and throw away (the 'merge' scenarios)

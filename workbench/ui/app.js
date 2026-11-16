@@ -732,14 +732,19 @@ function applyPref(kind, value, { quietly = false } = {}) {
 
 /**
  * The lid's own button that typed or spoken words stand for ("Looks good", "Not now": lidAnswer), on the page shown now
- * (not one fading out, nor one still to rise), drawn for the agent the words were bound to when they began. null when
- * the words stand for no button, are bound to nothing (begun during a swap), or the lid has no such button for them.
+ * (not one fading out, nor one still to rise), drawn for the agent the words were bound to when they began. "looks good"
+ * presses the lid's Looks good, or, on a finished agent whose work can be merged (the lid offers Merge and "Not now"),
+ * that lid's "Not now": it is looked at and goes to the done tray, not merged, and nothing starts. null when the words
+ * stand for no button, are bound to nothing (begun during a swap), or the lid has no such button for them (the engine
+ * answers them then, never as a prompt).
  */
 function lidButton(label, b) {
   if (!label || !b || !b.agentId) return null;
   const page = el.pages.querySelector('.page:not(.old):not([data-hidden])');
-  const keys = label === 'Looks good' ? ['looksgood:Looks good'] : ['looksgood:Not now', 'later:Not now'];
-  return [...(page ? page.querySelectorAll('button[data-act]') : [])].find(x => x.dataset.agent === b.agentId && keys.includes(x.dataset.key)) || null;
+  const keys = label === 'Looks good' ? ['looksgood:Looks good', 'looksgood:Not now'] : ['looksgood:Not now', 'later:Not now'];
+  const buttons = [...(page ? page.querySelectorAll('button[data-act]') : [])].filter(x => x.dataset.agent === b.agentId);
+  for (const k of keys) { const x = buttons.find(y => y.dataset.key === k); if (x) return x; }
+  return null;
 }
 
 async function submit(text) {
@@ -793,6 +798,16 @@ async function submit(text) {
       // the agent it was drawn for
       if (res.confirm) S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
       else if (shown && S.confirm === shown) S.confirm = null;
+      // "looks good" or "not now" that the engine took as a finished agent's own answer (no button on its lid stood for
+      // them): this finish is looked at, as its button would have marked it
+      const looked = typeof res.looked === 'string' && ID_RE.test(res.looked) ? S.agents.get(res.looked) : null;
+      if (looked) {
+        markReviewed(looked);
+        answeredOnce();
+        if (S.focusId === looked.id) S.focusId = null;
+        if (S.pinId === looked.id) S.pinId = null;
+        moved();
+      }
       lookAt(res.focusId);
       // the reply to the person's own words: a new card, or the agent it names, shows at once (work that started names
       // none: the centre stays as it is, and the notice says what started)

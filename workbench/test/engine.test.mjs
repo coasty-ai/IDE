@@ -2688,6 +2688,26 @@ test('finished work: "Not now" leaves the agent as it is, sends it nothing, and 
   await t.engine.shutdown();
 });
 
+test('"looks good" said at a finished agent\'s lid starts nothing: it answers its finish, and where Merge is offered it is "Not now"', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.engine.deps.commands = commands;
+  const a = await doneAgent(t);
+  const before = a.runner.sent.length;
+  assert.ok(t.store.get(a.id).files?.changed > 0, 'its work is not merged yet, so its lid offers Merge and Not now');
+  // there, "looks good" does what "Not now" does: it stays as it is, on its branch, and the reply is no approval
+  for (const said of ['looks good', 'not now', 'Thanks!', 'lgtm']) {
+    assert.deepEqual(await t.engine.command(said, { focusId: a.id }), { reply: `${a.v.name}’s work stays on its branch for now.`, looked: a.id }, said);
+  }
+  assert.equal(t.claude.runners.length, 1, 'nothing started');
+  assert.equal(a.runner.sent.length, before, 'nothing is sent to it');
+  assert.equal(t.store.get(a.id).state, 'done_claimed');
+  // with nothing to merge, it is the lid's "Looks good"
+  t.store.get(a.id).work = null;
+  assert.deepEqual(await t.engine.command('looks good', { focusId: a.id }), { reply: `Good. ${a.v.name} stays as it is.`, looked: a.id });
+  assert.equal(t.claude.runners.length, 1);
+  await t.engine.shutdown();
+});
+
 test('finished work with no branch: "Not now" says it stays as it is, with no bare "OK."', async () => {
   const t = live();
   const a = await doneAgent(t);

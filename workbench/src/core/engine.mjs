@@ -1862,6 +1862,30 @@ export class Engine extends EventEmitter {
     return { ok: true, reply: `Passed your message to ${v.name}.` };
   }
 
+  /**
+   * "looks good" (and the engine's other words for it, LOOKS_GOOD_RE) or "not now", said at a finished agent's lid
+   * (command(): the parser's `answer` with no ask): what the lid's own button does. Where its work could be merged, the lid
+   * offers Merge and "Not now", and "looks good" is that "Not now": the work stays on its branch, in words that are no
+   * approval. The reply carries `looked`, so the page marks this finish looked at, as the button does; nothing is sent
+   * to the agent, and nothing starts.
+   */
+  async _lookedAt(v, text) {
+    const r = await this._answerDone(v, LOOKS_GOOD_RE.test(text) && this._mergeOffered(v) ? 'Not now' : text);
+    return { reply: r.reply, looked: v.id };
+  }
+
+  /**
+   * Whether the lid offers Merge for this root, by the page's rule (ui/queue.js mergeApplies): live mode, at rest, its
+   * folder and branch there and not thrown away, work not merged yet, and the person on a branch, with a name and email
+   * git is not known to lack.
+   */
+  _mergeOffered(v) {
+    const w = v && !v.parentId ? v.work : null;
+    const repo = this._repoView();
+    return this.mode === 'live' && !!w && !!w.branch && !!w.folder && !w.thrownAway && !ACTIVE.has(v.state)
+      && !!repo?.branch && repo.identity !== false && unmergedWork(v);
+  }
+
   async _answerDone(v, text) {
     if (!text || LOOKS_GOOD_RE.test(text)) return { ok: true, reply: `Good. ${v.name} stays as it is.` };
     // what happened, and no bare "OK." before it: words the person said are never answered with a word back
@@ -3805,6 +3829,11 @@ export class Engine extends EventEmitter {
         const named = this._askFor(v, askId);
         if (named.reply) return { reply: named.reply, focusId: v.id };
         const ask = named.ask;
+        // A finished agent's lid: "looks good" (and its kin) or "not now", said, does what its button does, and starts nothing
+        const words = String(intent.text ?? '').trim();
+        if (!ask && intent.kind === 'answer' && !v.parentId && DONE.has(v.state) && (LOOKS_GOOD_RE.test(words) || NOT_NOW_RE.test(words))) {
+          return this._lookedAt(v, words);
+        }
         if (!ask) return { reply: `${v.name} is not waiting for an answer.`, focusId: v.id };
         if (intent.askId && intent.askId !== ask.id) return { reply: `${v.name} is asking something else now. Have a look, then answer again.`, focusId: v.id };
         let r;

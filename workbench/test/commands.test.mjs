@@ -2232,11 +2232,15 @@ test('an agent named alone asks what it should work on; the engine names it, and
 });
 
 test('words said again are a prompt again, whatever became of the agent they started: starting, at work or ended', () => {
+  // "thanks" and "thank you" are also the engine's words for "Looks good": at a finished agent's own lid they answer its
+  // finish (see the looks-good test below), never a prompt
+  const lidWords = new Set(['thanks', 'thank you', 'Thanks!']);
   for (const said of ['thanks', 'hi', 'help', 'hello', 'cool', 'thank you', 'what do you think of this workbench', 'is this right?', 'Thanks!']) {
     for (const state of ['starting', 'working', 'waiting_helpers', 'done_claimed', 'done_checked', 'checks_failed', 'stopped', 'failed']) {
       const first = [fromTask(said, { id: 'q1', state })];
       for (const focusId of [null, 'q1']) {
-        assert.deepEqual(parseCommand(said, { agents: first, machines, harnesses, focusId }), task(said), `${said} [${state}, focus ${focusId}]`);
+        const atLid = focusId && lidWords.has(said) && ['done_claimed', 'done_checked', 'checks_failed'].includes(state);
+        assert.deepEqual(parseCommand(said, { agents: first, machines, harnesses, focusId }), atLid ? answer(said, 'q1', null) : task(said), `${said} [${state}, focus ${focusId}]`);
       }
     }
   }
@@ -2723,6 +2727,28 @@ test('more than one agent from one sentence is a start of that many (the engine 
     ['no, just one', 'pendingStart', noTo], ['cancel', 'pendingStart', noTo],
     // another card's yes, or one asked, keeps it
     ['send it', 'pendingStart', unknown('send it')], ['start them?', 'pendingStart', unknown('start them?')],
+  ]);
+});
+
+test('"looks good" and the engine\'s other words for it, said at a finished agent\'s lid, answer its finish and never start an agent', () => {
+  const checksFailed = { agents: [...agents, { id: 'cf9999', name: 'Order list', task: 'Sort the order list', state: 'checks_failed', kind: 'agent' }], machines, harnesses, focusId: 'cf9999' };
+  const earlierDone = { agents: dogAgents, machines, harnesses, focusId: '110008' };
+  const helpPages = { agents, machines, harnesses, focusId: '4d5e6f' }; // says it is done
+  for (const said of ['looks good', 'Looks good.', 'look good', 'lgtm', 'LGTM!', 'great', 'thanks', 'thank you', 'good', 'fine', 'ok', 'okay', 'all good',
+    'not now', 'Not now.']) {
+    for (const [ctx, id] of [[CTX.invoice, '1a2b3c'], [SWEPT.boardInvoice, 'd00001'], [DOG.dogDone, 'aa0001'], [helpPages, '4d5e6f'], [checksFailed, 'cf9999'], [earlierDone, '110008']]) {
+      assert.deepEqual(parseCommand(said, ctx), answer(said, id, null), `${said} [${id}]`);
+    }
+  }
+  // not at a finished agent's lid, or with more words: as before
+  sweptRows([
+    ['looks good', 'onboarding', said('looks good')], // at work
+    ['looks good', 'none', said('looks good')],
+    ['looks good', 'question', answer('looks good')], // a question's answer
+    ['looks good', 'helper', said('looks good')], // a helper's lid
+    ['looks good, merge it', 'invoice', merge('1a2b3c')],
+    ['looks good to me, thanks', 'invoice', said('looks good to me, thanks')],
+    ['looks good', 'pendingMerge', yesTo], // a card on screen takes it
   ]);
 });
 
