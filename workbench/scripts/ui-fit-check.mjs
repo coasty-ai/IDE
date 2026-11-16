@@ -530,7 +530,8 @@ try {
         await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = ${JSON.stringify(PROMPT3)}; i.dispatchEvent(new Event('input', { bubbles: true }));
           i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); return true; })()`);
         await sleep(900); await settle(100);
-        const said = await b.ev(`document.getElementById('said').textContent`);
+        // the whole notice: where the line under the board is narrow it shows cut to its lines, whole for screen readers
+        const said = await b.ev(`(() => { const e = document.getElementById('said'); return e.querySelector('.sr')?.textContent || e.textContent; })()`);
         const card = await b.ev(`!!document.querySelector('#pages .page:not(.old) [data-act="confirm"]')`);
         if (card) failures.push(`${tag}: a prompt brought a card`);
         if (said !== 'Started a simulated Claude on “The checkout total is off: expected 42.10 but got 42.09”.') failures.push(`${tag}: the notice did not quote the prompt on one line (${said.slice(0, 70)})`);

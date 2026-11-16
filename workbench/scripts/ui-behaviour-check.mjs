@@ -63,6 +63,8 @@ const run = async (name, fn) => { if (only && !only.some(o => name.includes(o)))
 const centre = sel => b.ev(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return null; const r = e.getBoundingClientRect(); return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)]; })()`);
 const realClick = async sel => { const p = await centre(sel); if (!p) return false; await b.mouse(p[0], p[1], true); return true; };
 const realClickIn = sel => realClick(`#pages .page:not(.old) ${sel}`);
+// what the line under the board says, whole: a long notice shows cut to its lines, with the whole of it for screen readers
+const saidAll = () => b.ev(`(() => { const s = document.getElementById('said'); return s.querySelector('.sr')?.textContent || s.textContent; })()`);
 const lidNow = async () => `${await b.ev(`${page()}?.querySelector('.count')?.textContent || ''`)} / ${await h1()}${(await b.ev(`!!${page()}?.querySelector('.also')`)) ? ' +also' : ''}`;
 const focusNow = () => b.ev(`(() => { const a = document.activeElement; if (!a || a === document.body) return 'body'; return (a.closest('#core') ? 'core:' : a.closest('#parts') ? 'board:' : '') + a.tagName + (a.dataset.act ? ':' + a.dataset.act : '') + (a.id ? '#' + a.id : ''); })()`);
 const tabTo = async (pred, max = 16) => { for (let i = 0; i < max; i++) { await b.key('Tab'); await sleep(40); if (await b.ev(`(() => { const a = document.activeElement; return !!a && (${pred}); })()`)) return true; } return false; };
@@ -161,7 +163,7 @@ try {
     await b.type('fix the login page'); await b.key('Enter');
     await sleep(1100);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const words = await b.ev(`document.getElementById('said').textContent`), after = await lidNow();
+    const words = await saidAll(), after = await lidNow();
     const chip = await b.ev(`[...document.querySelectorAll('.chip')].some(c => /Fix login page/.test(c.textContent))`);
     check('typed text starts an agent at once, with no card, and the line under the board says so',
       p.length === 1 && p[0].body.text === 'fix the login page' && p[0].body.confirmId === null && words === 'Started a simulated Claude on “fix the login page”.'
@@ -175,7 +177,7 @@ try {
     await b.type('thanks'); await b.key('Enter');
     await sleep(900);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const words = await b.ev(`document.getElementById('said').textContent`);
+    const words = await saidAll();
     check('"thanks" starts an agent, as any prompt does', p.length === 1 && p[0].body.text === 'thanks' && words === 'Started a simulated Claude on “thanks”.', JSON.stringify({ sent: p.map(x => x.body), words }));
   });
   await run('pasted code arrives intact: its first and last lines, its indentation and its braces', async () => {
@@ -192,7 +194,7 @@ try {
     await b.send('Emulation.setFocusEmulationEnabled', { enabled: false });
     await b.key('Enter'); await sleep(900);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const words = await b.ev(`document.getElementById('said').textContent`);
+    const words = await saidAll();
     check('pasted code arrives intact: its first and last lines, its indentation and its braces',
       p.length === 1 && p[0].body.text === code && words === 'Started a simulated Claude on “function total(cart) { return cart.reduce((a, b) => a + b, 0); }”.',
       JSON.stringify({ sent: p.map(x => x.body.text), words }));
@@ -205,7 +207,7 @@ try {
     await b.type('what needs me now'); await b.key('Enter');
     await sleep(900);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const words = await b.ev(`document.getElementById('said').textContent`), lid = await lidNow();
+    const words = await saidAll(), lid = await lidNow();
     check('"what needs me now" shows what needs you', p.length === 1 && words === '3 things need you.' && /Checkout fix/.test(lid) && (await ctl('state')).agents.length === agents,
       JSON.stringify({ sent: p.map(x => x.body), words, lid }));
   });
@@ -219,7 +221,7 @@ try {
     await b.ev(`document.getElementById('say').focus(), 1`);
     await b.type('fix the docs'); await b.key('Enter');
     await sleep(900);
-    const kept = await h1(), words = await b.ev(`document.getElementById('said').textContent`);
+    const kept = await h1(), words = await saidAll();
     await b.ev(`document.getElementById('say').focus(), 1`);
     await b.type('cancel'); await b.key('Enter');
     await sleep(700);
@@ -236,7 +238,7 @@ try {
     await b.ev(`(() => { const i = document.getElementById('say'); i.focus(); i.value = 'x'.repeat(70 * 1024); i.dispatchEvent(new Event('input', { bubbles: true })); return 1; })()`);
     await b.key('Enter'); await sleep(700);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const kept = await b.ev(`document.getElementById('say').value.length`), words = await b.ev(`document.getElementById('said').textContent`);
+    const kept = await b.ev(`document.getElementById('say').value.length`), words = await saidAll();
     check('words too long to send in one go stay in the box, and nothing is sent',
       p.length === 0 && kept === 70 * 1024 && words === 'That is too long to send in one go. The limit is 64 KB.', JSON.stringify({ sent: p.length, kept, words }));
     await b.ev(`(() => { const i = document.getElementById('say'); i.value = ''; i.dispatchEvent(new Event('input', { bubbles: true })); return 1; })()`);
@@ -249,16 +251,23 @@ try {
     await b.ev(`window.__sr.last && window.__sr.last.hear('um, uh'), 1`);
     await b.key(' ', { phase: 'up' }); await sleep(500);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const words = await b.ev(`document.getElementById('said').textContent`);
+    const words = await saidAll();
     check('spoken words that are only "um" or "uh" send nothing, and the page says nothing was heard', p.length === 0 && words === 'Nothing heard.', JSON.stringify({ sent: p.map(x => x.body), words }));
   });
-  await run('the ivory look shows the input bar\'s focus ring', async () => {
-    await open('prompt', { theme: 'ivory' });
-    await sleep(700);
-    const rest = await b.ev(`getComputedStyle(document.getElementById('bar')).boxShadow`);
-    await b.ev(`document.getElementById('say').focus(), 1`); await sleep(300);
-    const focused = await b.ev(`getComputedStyle(document.getElementById('bar')).boxShadow`);
-    check('the ivory look shows the input bar\'s focus ring', /\b2px\b/.test(focused) && focused !== rest, `rest "${rest}", focused "${focused}"`);
+  await run('the ivory look shows the input bar\'s focus ring, at rest and with something in the core', async () => {
+    const seen = [];
+    for (const sc of ['prompt', 'demo']) {
+      await open(sc, { theme: 'ivory' });
+      await sleep(700);
+      await b.ev(`document.activeElement && document.activeElement.blur && document.activeElement.blur(), 1`); await sleep(200);
+      const idle = await b.ev(`document.getElementById('core').classList.contains('idle')`);
+      const rest = await b.ev(`getComputedStyle(document.getElementById('bar')).boxShadow`);
+      await b.ev(`document.getElementById('say').focus(), 1`); await sleep(300);
+      const focused = await b.ev(`getComputedStyle(document.getElementById('bar')).boxShadow`);
+      seen.push({ sc, idle, rest, focused });
+    }
+    check('the ivory look shows the input bar\'s focus ring, at rest and with something in the core',
+      seen.every(x => /\b2px\b/.test(x.focused) && x.focused !== x.rest) && seen.some(x => x.idle) && seen.some(x => !x.idle), JSON.stringify(seen));
   });
   await run('the input grows with its text: Enter sends, Shift+Enter adds a line, a paste keeps its lines', async () => {
     await open('prompt');
@@ -281,7 +290,7 @@ try {
     await b.send('Emulation.setFocusEmulationEnabled', { enabled: false });
     await b.key('Enter'); await sleep(900);
     const p = (await posts()).filter(x => x.path === '/api/command');
-    const words = await b.ev(`document.getElementById('said').textContent`), after = [await value(), await lines()];
+    const words = await saidAll(), after = [await value(), await lines()];
     const git = await b.ev(`document.getElementById('gitSay').tagName`);
     const want = 'fix the login\nit fails on Safari\nTypeError: total is undefined\n  at render (cart.js:12)';
     check('the input grows with its text: Enter sends, Shift+Enter adds a line, a paste keeps its lines',
@@ -312,7 +321,7 @@ try {
     await realClick('#say'); await sleep(150);
     await b.type('start an agent to tidy the export'); await b.key('Enter');
     await sleep(1800);
-    const shown = await lidNow(), words = await b.ev(`document.getElementById('said').textContent`);
+    const shown = await lidNow(), words = await saidAll();
     const chip = await b.ev(`[...document.querySelectorAll('.chip')].some(c => /Tidy export/.test(c.textContent))`);
     check('an agent that typed work starts takes no one\'s place in the core: its chip comes on the board (pointer on the core)',
       shown === before && words === 'Started a simulated Claude on “tidy the export”.' && chip, `"${before}" → "${shown}"; said "${words}"; chip ${chip}`);
@@ -430,7 +439,7 @@ try {
       await clickIn('[data-act="answer"][data-answer="Deny"]');
       await sleep(900);
       const enabled = await b.ev(`!${page()}?.querySelector('[data-act="answer"][data-answer="Deny"]')?.disabled`);
-      const said = await b.ev(`document.getElementById('said').textContent`);
+      const said = await saidAll();
       const stillShown = await h1();
       check(`a failed answer can be tried again (${how})`, enabled && said.length > 0 && /Checkout fix/.test(stillShown) && !/token|fetch/i.test(said), `enabled ${enabled}, said "${said}"`);
     });
@@ -730,7 +739,7 @@ try {
     await sleep(500);
     await b.key('Enter'); await sleep(600);
     const p = (await posts()).filter(x => /\/(say|answer)$/.test(x.path) || x.path === '/api/command');
-    const said = await b.ev(`document.getElementById('said').textContent`);
+    const said = await saidAll();
     const kept = await b.ev(`document.getElementById('say').value`);
     check('a message is not sent once its agent has changed', p.length === 0 && /That changed/.test(said) && kept === 'please also update the changelog', `posts ${p.length}, said "${said}", kept "${kept}"`);
   });
@@ -1051,7 +1060,8 @@ try {
     await typeIt('looks good, merge it'); await sleep(1000);
     const p3 = await sent();
     // so does "looks good" where the lid has no "Looks good": work that can merge offers Merge and "Not now", and words
-    // that sound like approval never press "Not now", which would send work not merged yet to the tray
+    // that sound like approval never press "Not now", which would send work not merged yet to the tray; the words are a
+    // prompt like any other, so an agent starts on them, and the finished work stays at the board's edge
     await open('done-waits');
     await sleep(900);
     await typeIt('looks good'); await sleep(1000);
@@ -1060,7 +1070,7 @@ try {
       p1.length === 1 && p1[0][0] === '/api/agents/w1/answer' && p1[0][1].answer === 'Not now' && !('askId' in p1[0][1]) && chips1 === '' && tray1 === '1 not merged'
       && /Invoice export is done and checked\./.test(lid) && p2.length === 1 && p2[0][0] === '/api/agents/228202/answer' && p2[0][1].answer === 'Looks good' && tray2 === '1 done'
       && p3.length === 1 && p3[0][0] === '/api/command' && p3[0][1].text === 'looks good, merge it'
-      && p4.length === 1 && p4[0][0] === '/api/command' && p4[0][1].text === 'looks good' && chips4 === 'w1~',
+      && p4.length === 1 && p4[0][0] === '/api/command' && p4[0][1].text === 'looks good' && chips4.split(',')[0] === 'w1~' && chips4.split(',').length === 2,
       `typed: ${JSON.stringify(p1)} → chips "${chips1}", tray "${tray1}"; said at "${lid}": ${JSON.stringify(p2)} → tray "${tray2}"; more: ${JSON.stringify(p3)}; "looks good" with no such button: ${JSON.stringify(p4)}, chips "${chips4}"`);
   });
 
@@ -1069,7 +1079,7 @@ try {
   // Search cleanup (m7e8f9) has a merge that conflicts, Price rounding (mab0c1) one your own changes blocked.
   const acts = () => b.ev(`[...(${page()}?.querySelectorAll('.acts button') || [])].map(x => x.textContent + (x.classList.contains('pri') ? '*' : '')).join(',')`);
   const links = () => b.ev(`[...(${page()}?.querySelectorAll('.links button') || [])].map(x => x.textContent).join(',')`);
-  const said = () => b.ev(`document.getElementById('said').textContent`);
+  const said = () => saidAll();
   const typeIn = async text => { await b.ev(`document.getElementById('say').focus(), 1`); await b.type(text); await b.key('Enter'); };
   const workPosts = async () => (await posts()).filter(x => /\/(merge|discard|say|answer)$/.test(x.path) || x.path.startsWith('/api/confirm/') || x.path === '/api/command');
   // the git screen is builder D1's (#gitScreen in ui/index.html, ui/gitscreen.js): checks that need it say so when it is not here

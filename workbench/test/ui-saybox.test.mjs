@@ -109,4 +109,7 @@ test('the input bar shows its focus ring in every look: the ivory look\'s own bo
   // the ivory look sets the bar's own border with a stronger selector, so its focus ring needs one as strong
   assert.match(css, /:root\[data-theme="ivory"\] #bar \{/);
   assert.match(css, /:root\[data-theme="ivory"\] #bar:focus-within \{[^}]*inset 0 0 0 2px var\(--lid-focus\)/);
+  // and so does its quieter border while the board is at rest (#core.idle), as strong again
+  assert.match(css, /:root\[data-theme="ivory"\] #core\.idle #bar \{/);
+  assert.match(css, /:root\[data-theme="ivory"\] #core\.idle #bar:focus-within \{[^}]*inset 0 0 0 2px var\(--focus\)/);
 });
