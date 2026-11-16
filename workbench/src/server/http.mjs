@@ -3,7 +3,8 @@
 // the Host header, a 32-byte token compared in constant time (on the hook route, also the asking
 // agent's own hook token), and for POSTs the Origin, the JSON content type and a 64 KB body limit
 // (16 KB on the Agents & keys routes, which carry keys: never echoed, never logged, never in a URL;
-// 3 MB on POST /api/file alone, which carries a file of up to 1 MB of text from the file view).
+// 6 MB and 64 KB on POST /api/file alone, which carries a file of up to 1 MB of text from the file view, however
+// JSON writes it).
 // A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
 // The page goes out with the person's look, detail and first answer on its <html> tag (src/core/prefs.mjs), and the
 // permission mode the engine has on (data-permissions), so the Full permissions button is right from the first paint.
@@ -22,8 +23,12 @@ import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../core/pre
 
 const MAX_BODY = 64 * 1024;
 const MAX_CONNECT_BODY = 16 * 1024; // Agents & keys: a few keys of at most 2000 characters each
-const MAX_FILE_BODY = 3 * 1024 * 1024; // POST /api/file: up to 1 MB of text, written as JSON (escapes make it longer)
 const MAX_FILE_TEXT = 1024 * 1024; // the most text a save takes, in bytes of UTF-8: the most the file view shows
+// POST /api/file: room for 1 MB of text however JSON writes it. JSON writes a control character as \u00XX, six bytes for
+// one, so 1 MB of text can take 6 MB; 64 KB more holds the rest (a path of at most 4096 bytes written the same way, the
+// hash, the names). A body over it can only hold more than 1 MB of text.
+const MAX_FILE_BODY = 6 * MAX_FILE_TEXT + 64 * 1024;
+const TOO_MUCH_TEXT = 'The text is larger than 1 MB, so Workbench did not save it.';
 const CONNECT_ID_RE = /^[a-z][a-z0-9-]{0,39}$/; // an agent or a key preset, as Workbench names them
 const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/; // a variable's name (the key store refuses the dangerous ones)
 /** What the Agents & keys routes answer when this Workbench has no connect service. */
@@ -564,9 +569,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
 
   /** POST /api/file { in, path, text, hash, force? }: at most 1 MB of text (a 413 otherwise), then the engine's save. */
   function saveFile(b) {
-    if (typeof b.text === 'string' && Buffer.byteLength(b.text) > MAX_FILE_TEXT) {
-      throw new HttpError(413, 'The text is larger than 1 MB, so Workbench did not save it.');
-    }
+    if (typeof b.text === 'string' && Buffer.byteLength(b.text) > MAX_FILE_TEXT) throw new HttpError(413, TOO_MUCH_TEXT);
     return engine.saveFile(b.in, b.path, { text: b.text, hash: b.hash, force: b.force === true });
   }
 
@@ -778,6 +781,10 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
         body = await readJson(req, route.maxBody || (route.connect ? MAX_CONNECT_BODY : MAX_BODY));
       } catch (err) {
         if (err.status === 413) res.setHeader('Connection', 'close');
+        // The file view's save says it in the shape its other refusals have; a body over its limit holds too much text.
+        if (route.files && err instanceof HttpError) {
+          return sendJson(res, err.status, { ok: false, reply: err.status === 413 ? TOO_MUCH_TEXT : err.message, why: 'refused' });
+        }
         return sendError(res, err);
       }
     }

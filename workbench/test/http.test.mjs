@@ -786,25 +786,32 @@ test('the file view’s routes: the page’s key, GET by address or header, POST
   engine.fileAnswer = null;
 });
 
-test('POST /api/file alone takes a body of up to 3 MB, with at most 1 MB of text; every other route keeps its limit', async () => {
+test('POST /api/file alone takes a body of up to 6 MB, room for 1 MB of text however JSON writes it; every other route keeps its limit', async () => {
   engine.calls.length = 0;
   engine.fileAnswer = null;
-  // About 2.4 MB of JSON for 400 KB of text: control characters are written six bytes each.
-  const text = '\u0001'.repeat(400_000);
-  const big = await post('/api/file', { in: 'you', path: 'a.txt', text, hash: 'ab'.repeat(32) });
-  assert.ok(Buffer.byteLength(JSON.stringify({ text })) > 2 * 1024 * 1024);
+  // 1 MB of text, all control characters, which JSON writes six bytes each: over 6 MB of JSON, and still taken.
+  const text = '\u0001'.repeat(1024 * 1024);
+  const body = { in: 'you', path: 'a.txt', text, hash: 'ab'.repeat(32) };
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) > 6 * 1024 * 1024);
+  const big = await post('/api/file', body);
   assert.equal(big.status, 200, big.text);
-  assert.deepEqual(engine.calls.at(-1), ['saveFile', 'you', 'a.txt', { text: '400000 characters', hash: 'ab'.repeat(32), force: false }]);
-  // Over 3 MB (here 3.6 MB): refused, and the engine never sees it.
+  assert.deepEqual(engine.calls.at(-1), ['saveFile', 'you', 'a.txt', { text: `${1024 * 1024} characters`, hash: 'ab'.repeat(32), force: false }]);
+  // Over the limit, which only more than 1 MB of text can reach: refused in the file view's words, and the engine never
+  // sees it.
   const calls = engine.calls.length;
-  const tooBig = await post('/api/file', { in: 'you', path: 'a.txt', text: '\u0001'.repeat(600_000), hash: 'ab'.repeat(32) });
+  const tooMuch = { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' };
+  const tooBig = await post('/api/file', { in: 'you', path: 'a.txt', text: '\u0001'.repeat(1_100_000), hash: 'ab'.repeat(32) });
   assert.equal(tooBig.status, 413);
-  assert.equal(tooBig.json.error, 'The request is too large. The limit is 3 MB.');
-  // More than 1 MB of text, written as UTF-8.
+  assert.deepEqual(tooBig.json, tooMuch);
+  // More than 1 MB of text, written as UTF-8, within the limit: the same.
   const long = await post('/api/file', { in: 'you', path: 'a.txt', text: 'é'.repeat(524_289), hash: 'ab'.repeat(32) });
   assert.equal(long.status, 413);
-  assert.deepEqual(long.json, { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' });
-  assert.equal(engine.calls.length, calls, 'the engine saw neither');
+  assert.deepEqual(long.json, tooMuch);
+  // A body that is not JSON gets the file view's shape too.
+  const garbled = await request({ method: 'POST', path: '/api/file', body: '{"in": "you",', headers: auth({ 'Content-Type': 'application/json' }) });
+  assert.equal(garbled.status, 400);
+  assert.deepEqual(garbled.json, { ok: false, reply: 'The request body is not valid JSON.', why: 'refused' });
+  assert.equal(engine.calls.length, calls, 'the engine saw none of them');
   // The other routes keep theirs: 64 KB, and 16 KB on Agents & keys (see their own tests).
   for (const p of ['/api/command', '/api/agents/abc123/say', '/api/prefs']) {
     const r = await post(p, { text: 'x'.repeat(600 * 1024) });
