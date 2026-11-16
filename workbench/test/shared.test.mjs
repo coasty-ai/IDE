@@ -4,6 +4,7 @@ import { narrate, describeCommand, describeRequest, commandAction, shellCommands
 import { duration, tokens, money, percent, clip, shortModel, spentText, spentAmount } from '../src/shared/format.mjs';
 import { STATE, LOOK, PRIORITY, NEEDS_YOU, lookOf } from '../src/shared/states.mjs';
 import { EV, newAgentView, SPARK_BUCKETS } from '../src/shared/events.mjs';
+import { FILLER, onlyFiller } from '../src/shared/filler.mjs';
 
 test('narrate turns tool calls into short sentences', () => {
   assert.equal(narrate('Read', { file_path: '/repo/src/greet.js' }).sentence, 'Reading greet.js');
@@ -438,4 +439,10 @@ test('the words that answer a finished agent\'s lid are one list, for the engine
   const engine = readFileSync(new URL('../src/core/engine.mjs', import.meta.url), 'utf8');
   assert.match(engine, /import \{ LOOKS_GOOD_RE, NOT_NOW_RE \} from '\.\.\/shared\/answers\.mjs';/);
   assert.doesNotMatch(engine, /const (LOOKS_GOOD_RE|NOT_NOW_RE)\b/);
+});
+
+test('filler: words heard that are only um, uh or hmm, or nothing at all, send nothing; anything more is said', () => {
+  for (const t of ['um', 'Uh.', 'uh uh', 'hmm...', 'Hmm?', 'erm, um', '', '   ', '…']) assert.equal(onlyFiller(t), true, JSON.stringify(t));
+  for (const t of ['um yes', 'hmm stop', 'uh, fix the login', 'thanks', 'ok', 'no', '👍 hm', 'umbrella']) assert.equal(onlyFiller(t), false, JSON.stringify(t));
+  assert.ok(FILLER.has('um') && FILLER.has('hmm') && !FILLER.has('ok'));
 });

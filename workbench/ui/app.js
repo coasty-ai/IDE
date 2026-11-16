@@ -17,6 +17,7 @@ import { setupVoice } from './voice.js';
 import { setupSayBox } from './saybox.js';
 import { THEME_NAMES, DETAIL_NAMES, normalTheme, normalDetail, pagePrefs, pageCommand, lidAnswer } from './prefs.js';
 import * as ANSWERS from '/shared/answers.mjs';   // "looks good" and "not now", as the engine reads them
+import { onlyFiller } from '/shared/filler.mjs'; // spoken "um" or "uh" alone sends nothing
 import { markOf } from './look.js';
 import { esc, coalesce, patchChildren } from './util.js';
 import { balanceHeading } from './balance.js';
@@ -816,7 +817,8 @@ let voiceOver = null;   // 'board' | 'git' while listening, and until what was h
 const voice = setupVoice({
   mic: el.mic, heard: [el.heard, $('gitHeard')],
   onFinal: t => { const over = voiceOver; voiceOver = null; if (over === 'git') gitCommand(t, gitTake()); else submit(t); },
-  onNotice: t => say(t),
+  onNotice: (t, ms) => say(t, ms),
+  onlyFiller,
   onListening: (on, words) => {
     el.bar.classList.toggle('listening', on);
     gitListening(on);

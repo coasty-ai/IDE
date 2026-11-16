@@ -313,11 +313,11 @@ test('“help” is answered with what to say, “connect” opens Agents & keys
   t.deps.commands.intent = { kind: 'connect' };
   assert.deepEqual(await t.engine.command('add a key'), { reply: 'Opening Agents & keys.', openConnect: true });
   t.deps.commands.intent = { kind: 'start', task: null };
-  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should the agent work on?' });
+  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should Claude Code work on?' }); // it names the default agent
   t.deps.commands.intent = { kind: 'start', task: 'fix the cart total' };
   assert.equal((await t.engine.command('start an agent on the cart total')).reply, 'Started Claude on “fix the cart total”.');
   t.deps.commands.intent = null;
-  assert.match((await t.engine.command('blorp')).reply, /^I did not catch that\./, 'words not caught are still said so');
+  assert.equal((await t.engine.command('blorp')).reply, 'Started Claude on “blorp”.', 'words no parser read are a prompt');
   await t.engine.shutdown();
 });
 
@@ -336,7 +336,7 @@ test('“start codex” with no task keeps the agent it names: it asks what Code
   t.deps.commands.intent = noTask('claude');
   assert.deepEqual(await t.engine.command('start claude'), { reply: 'What should Claude Code work on?' });
   t.deps.commands.intent = noTask(null);
-  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should the agent work on?' });
+  assert.deepEqual(await t.engine.command('start an agent'), { reply: 'What should Claude Code work on?' });
   // Signed out, as Connect says it: the same words as work that names it.
   t.engine.setHarnesses({ codex: CODEX_SIGNED_OUT });
   t.deps.commands.intent = noTask('codex');

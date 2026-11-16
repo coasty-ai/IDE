@@ -9,26 +9,31 @@
 //   allow { agentId } / deny { agentId }            stop { agentIds }    stop_all
 //   say { agentId, text }   status { agentId? }     spend                sleep / wake { machineIds }
 //   sleep_idle              forget { agentIds }     continue { agentId }
-//   changes { agentId }     merge { agentId, into? }                     discard { agentId }
-//   confirm { go }          help                    connect              ack { thanks?, reply? }
-//   unknown { text }
+//   changes { agentId }     merge { agentId, into?, bare? }              discard { agentId, bare? }
+//   confirm { go }          connect                 unknown { text }
 //   permissions { mode: 'full'|'ask' }   full permissions on (the engine asks first, with a card) or off
-// Anything that is not one of Workbench's own commands, or an answer to what is on screen, is a prompt for a new agent
-// (task), asked first like every launch; bare acknowledgements with nothing waiting ("thanks", "ok") are an ack. Text of
-// several lines keeps its line breaks in the task, the answer or the message.
+// Anything that is not one of Workbench's own commands, or an answer to what is on screen, is the prompt for a new
+// agent: { kind: 'task', task } with the person's words exactly as typed (only the spaces around them go), and the
+// engine starts it at once. "thanks", "ok", "hi", "help", an emoji, a never-mind: all prompts. `unknown` is left for
+// nothing said, a yes that is not enough for the card on screen (or asked), and words that answer nothing while a
+// permission waits. Answers, messages and a start's task keep their edges too (asTyped).
 // Extra fields some intents carry: askId (allow, deny, answer), text (deny: the person's words, such as
 // "no, use the staging database"), conditional (deny: a yes that came with conditions, "yes but only in the
 // tests folder"; text is the whole reply), sure: false (stop, say: the words found the agent but did not name
 // it, so the engine asks first), needsMe (status: "what needs me"), into (merge: the branch the person named,
 // "main" or "master" or their current branch by name; left out for "my branch"). An allow never carries words.
 // changes, merge and discard always name a root agent (a helper stands for its agent); agentId is null when the
-// words did not make clear which one. Merge and discard are always asked first (the engine shows a card).
+// words did not make clear which one, and `bare` when they pointed at work with no agent meant ("throw it away" with
+// none in the centre): the engine then takes the one finished agent, or names them. Merge and discard are always asked
+// first (the engine shows a card). While two helpers of the agent in the centre wait, a yes or a no is { kind: 'allow' |
+// 'deny', agentId: <that agent>, askId: null }: the engine says which wait.
 // A launch's harness is the agent the words named ("codex", "claude"), or null: the engine then gives the work to
 // the person's default agent. A start that says no work ("start an agent", "new agent", "start codex") is { kind:
 // 'start', tasks: [], task: null, harness }, with harness the one agent the words named (else null), and the engine
 // asks what that agent should work on.
 import { clip } from '../shared/format.mjs';
-import { ENDED, LOOK } from '../shared/states.mjs';
+import { ENDED, LOOK, DONE } from '../shared/states.mjs';
+import { FILLER } from '../shared/filler.mjs';
 
 // ---------------------------------------------------------------------------------------------
 // Words
@@ -47,8 +52,11 @@ const CONTRACTIONS = Object.assign(Object.create(null), {
   todays: ["today's"],
 });
 
-/** Disfluencies, dropped wherever they appear. */
-const DISFLUENCY = new Set(['um', 'umm', 'ummm', 'uh', 'uhh', 'uhhh', 'uhm', 'er', 'erm', 'err', 'hmm', 'hm', 'hmmm', 'mm', 'mmm', 'ah', 'ahh', 'eh']);
+/**
+ * Filler (disfluencies), dropped wherever it appears to find a command ("um, stop everything"). Shared with the page,
+ * which sends nothing spoken that is only filler; typed, it is said all the same (parse).
+ */
+const DISFLUENCY = FILLER;
 /** Soft openers, dropped from the start ("okay so", "hey", "right"). */
 const SOFT_LEAD = new Set(['okay', 'so', 'well', 'hey', 'hi', 'hello', 'alright', 'right', 'like', 'actually', 'basically', 'oh', 'and', 'then', 'now', 'also', 'workbench', 'yo', 'listen']);
 /** Polite or framing openers, dropped from the start of commands and tasks. */
@@ -89,14 +97,8 @@ function normWord(raw) {
 
 /** A line break, as typed or pasted: "\n", "\r\n", "\r", or Unicode's line and paragraph separators. */
 const LINE_BREAK = /[\n\r\u2028\u2029]/;
-
-/**
- * Text of several lines as the person wrote it: each line break one "\n", and no spaces left at the end of a line. Every
- * other character stays where it was (indentation too: a stack trace or code keeps its shape).
- */
-function keepLines(s) {
-  return s.replace(/\r\n?|\u2028|\u2029/g, '\n').replace(/[^\S\n]+\n/g, '\n');
-}
+/** A letter or a digit, in any script: what makes a word. */
+const WORDY = /[\p{L}\p{M}\p{N}]/u;
 
 /**
  * Split text into tokens. `w` is the normalized word used for matching; `raw`, `start` and `end`
@@ -117,8 +119,9 @@ function lex(text) {
     const end = start + raw.length;
     gap.lastIndex = end;
     // the token ends a phrase: punctuation, or the end of a line (a line of its own reads as a phrase, as after a comma)
-    const tail = /[,;:.!?，。！？：；、]["'”’)]*$/.test(raw) || LINE_BREAK.test(gap.exec(text)[0]);
-    const at = { raw, start, end, tail, piece, skipped, src: text };
+    const nl = LINE_BREAK.test(gap.exec(text)[0]);
+    const tail = /[,;:.!?，。！？：；、]["'”’)]*$/.test(raw) || nl;
+    const at = { raw, start, end, tail, nl, piece, skipped, src: text };
     if (raw === '&' || raw === '+') { toks.push({ w: 'and', ...at }); skipped = 0; continue; }
     const w = normWord(raw);
     if (!w) { skipped++; continue; }
@@ -131,8 +134,8 @@ function lex(text) {
 
 /**
  * The person's own words for a run of tokens. Symbols between two words that follow each other in the text stay
- * ("use === instead of =="), and so do line breaks (with the next line's indentation); where a caller took words out
- * of the middle, the rest are joined by a space.
+ * ("use === instead of =="), and so does what lies between them over a line break (the next line's indentation); where
+ * a caller took words out of the middle, the rest are joined by a space.
  */
 function spanText(toks) {
   const seen = new Set();
@@ -144,7 +147,7 @@ function spanText(toks) {
     if (prev) {
       const together = prev.src === t.src && t.piece - prev.piece - 1 === t.skipped; // nothing taken out between them
       const between = together ? t.src.slice(prev.end, t.start) : '';
-      out += together && LINE_BREAK.test(between) ? keepLines(between) : together && t.skipped > 0 ? ` ${between.trim()} ` : ' ';
+      out += together && LINE_BREAK.test(between) ? between : together && t.skipped > 0 ? ` ${between.trim()} ` : ' ';
     }
     out += t.raw;
     prev = t;
@@ -152,14 +155,39 @@ function spanText(toks) {
   return out;
 }
 
-/**
- * Trim quotes and closing punctuation from task or message text. Text of several lines keeps its edges as written, less
- * the spaces around it: a pasted snippet's first quote or last semicolon is part of it.
- */
+/** Trim quotes and closing punctuation from words that were joined after others were taken out of them (spanText). */
 function tidy(s) {
   const t = String(s);
   if (LINE_BREAK.test(t.trim())) return t.trim();
   return t.replace(/^["'“”‘’]+/, '').replace(/["'“”‘’]+$/, '').replace(/[\s,;:.!]+$/, '').replace(/["'“”‘’]+$/, '').trim();
+}
+
+/** Whether nothing was taken out between these tokens: each follows the one before in the text. */
+function together(toks) {
+  return toks.every((t, i) => i === 0 || t.start === toks[i - 1].start || (t.src === toks[i - 1].src && t.piece - toks[i - 1].piece - 1 === t.skipped));
+}
+
+/**
+ * The person's own words for a run of tokens, as typed: an answer, a message, a task after the words that start it.
+ * When nothing was taken out between them, it is the text itself from the first to the last, reaching to the start of the
+ * text when nothing before the first is a word, and to the end when nothing after the last is one (an opening brace, a
+ * code fence, a closing quote or full stop: a pasted snippet keeps its edges). Only the spaces around it go. The first
+ * word may have been put in its base form ("an agent that fixes" -> "fix"). Words taken out of the middle (a program's
+ * name, a machine) leave the rest joined as spanText joins them.
+ */
+function asTyped(toks) {
+  if (!toks.length) return '';
+  if (!together(toks)) return tidy(spanText(toks));
+  const first = toks[0];
+  const last = toks[toks.length - 1];
+  const src = first.src;
+  const from = WORDY.test(src.slice(0, first.start)) ? first.start : 0;
+  const more = WORDY.test(src.slice(last.end)); // words follow: a machine, a program or a "please" taken off after it
+  const to = more ? last.end : src.length;
+  const head = src.slice(first.start, first.end) === first.raw ? '' : first.raw; // a word put in its base form
+  const text = (head ? src.slice(from, first.start) + head + src.slice(first.end, to) : src.slice(from, to)).trim();
+  // the comma that set off the words taken off after it is no part of it ("the checkout bug, each on its own machine")
+  return more ? text.replace(/[\s,;:]+$/, '') : text;
 }
 
 function seqAt(ws, i, seq) {
@@ -550,12 +578,22 @@ function confirmReply(toks, kind, c) {
     }
     return true;
   }
-  // "start it", "yes launch it", "start it is that right" to a card that is no launch: not its yes, and no new launch
-  // either ("Start Claude on “it is that right”?"). The card stays.
-  if (!launch && !no && ws.some(w => START_YES.has(w)) && ws.every(w => isYes(w) || START_YES.has(w) || CONFIRM_YES_FILL.has(w)
+  // Another card's own yes ("start it", "yes launch it", "send it", "start it is that right" to a stop card): not this
+  // card's yes, and no new work either: the card stays.
+  if (!no && ws.some(w => CARD_VERBS.has(w) && !isYes(w)) && ws.every(w => isYes(w) || CARD_VERBS.has(w) || CONFIRM_YES_FILL.has(w)
     || ownFill.includes(w) || QUESTION_START.has(w))) return 'keep';
+  // "scrap it", "trash that", "don't scrap it" to a throw-away card: one sound from "scratch that", so neither its yes nor
+  // its no, and never new work: the card stays, and says how to answer it.
+  if (kind === 'discard' && ws.some(w => w === 'scrap' || w === 'trash')
+    && ws.every(w => isYes(w) || isNo(w) || w === 'scrap' || w === 'trash' || CONFIRM_YES_FILL.has(w) || CONFIRM_NO_FILL.has(w) || ownFill.includes(w))) return 'keep';
+  // A permission's own answer ("allow it", "approve", "deny that"): not this card's, and never new work either.
+  const pr = permissionReply(words);
+  if (pr && (pr.kind === 'allow' || pr.kind === 'asks' || (pr.kind === 'deny' && !pr.text))) return 'keep';
   return null;
 }
+
+/** The yes words of one card kind or another that another card does not take: they keep that card (confirmReply). */
+const CARD_VERBS = new Set(['start', 'launch', 'send']);
 
 // A clear yes or no at the start of a longer reply. "go", "do", "okay" and "fine" are not here: they also begin
 // commands and work requests ("go to search cleanup", "okay fix the login"), which are tried first.
@@ -656,11 +694,11 @@ function permissionReply(toks) {
   // "don't we already have a linter?" asks; "don't use the production database" is a no that keeps its "don't"
   const dont = toks[replyStart(toks)];
   if (ws[0] === "don't" && (/[?？]["'”’)]*$/.test(toks[toks.length - 1].raw) || (!dont?.tail && ['we', 'you', 'i', 'they'].includes(ws[1])))) return { kind: 'asks' };
-  if (FIRST_NO.has(ws[0])) return { kind: 'deny', text: tidy(spanText(toks.slice(ws[0] === "don't" ? k : k + 1))) };
+  if (FIRST_NO.has(ws[0])) return { kind: 'deny', text: asTyped(toks.slice(ws[0] === "don't" ? k : k + 1)) };
   // "yes, but what does it delete?" asks first: no answer yet (see parse, step 5). "allow users to export their data" is
   // no reply at all: what is allowed there is not the request.
   if (PERMIT_WORDS.has(ws[0]) && ws[1] && !PERMIT_OBJECT.has(ws[1])) return null;
-  if (FIRST_YES.has(ws[0]) && !asksSomething(toks)) return { kind: 'deny', text: tidy(spanText(toks.slice(k))), conditional: true };
+  if (FIRST_YES.has(ws[0]) && !asksSomething(toks)) return { kind: 'deny', text: asTyped(toks.slice(k)), conditional: true };
   return null;
 }
 
@@ -672,11 +710,11 @@ function looseReply(toks) {
   const k = replyStart(toks);
   const first = toks[k] && toks[k].w;
   if (!first || k + 1 >= toks.length) return null;
-  if (NO_STRONG.has(first)) return { kind: 'deny', text: tidy(spanText(toks.slice(k))) };
+  if (NO_STRONG.has(first)) return { kind: 'deny', text: asTyped(toks.slice(k)) };
   // "go to the login page and it shows a 500", "do the same for the API" and "allow users to export" are no yes
   if ((first === 'go' || first === 'do') && !['ahead', 'it', 'for', 'on'].includes(toks[k + 1]?.w)) return null;
   if (PERMIT_WORDS.has(first) && toks[k + 1] && !PERMIT_OBJECT.has(toks[k + 1].w)) return null;
-  if (YES_STRONG.has(first)) return { kind: 'deny', text: tidy(spanText(toks.slice(k))), conditional: true };
+  if (YES_STRONG.has(first)) return { kind: 'deny', text: asTyped(toks.slice(k)), conditional: true };
   return null;
 }
 
@@ -725,9 +763,9 @@ function matchStop(core, c) {
   if (/[?？]["'”’)]*$/.test(core[core.length - 1].raw) && c.agents.some(a => saysWhole(ws, a))) return null;
   let rest = core.slice(v);
   // "stop, it's deleting the wrong files": after the stop and its comma comes why, not which agent
-  // only after a comma or a full stop, and not when the words name the agent ("stop, stop the flaky test",
-  // "stop, onboarding"); "kill: (1234) No such process" is pasted output
-  if (core[v - 1].tail && /[,.!，。！]["'”’)]*$/.test(core[v - 1].raw) && rest.length && STOP_WORDS.has(ws[0]) && !rest.some(t => STOP_ALL_WORDS.has(t.w))) {
+  // only after a comma, a full stop or the end of a line ("stop", then the reason on the next line), and not when the
+  // words name the agent ("stop, stop the flaky test", "stop, onboarding"); "kill: (1234) No such process" is pasted output
+  if (core[v - 1].tail && (/[,.!，。！]["'”’)]*$/.test(core[v - 1].raw) || core[v - 1].nl) && rest.length && STOP_WORDS.has(ws[0]) && !rest.some(t => STOP_ALL_WORDS.has(t.w))) {
     if (startsWithSeq(rest.map(t => t.w), STOP_VERBS)) {
       const again = matchStop(rest, c); // "stop, stop the flaky test"; "stop, stop deleting the files" is still a bare stop
       if (again && (again.intent.kind === 'stop' || again.intent.kind === 'stop_all') && again.intent.agentIds?.length !== 0) return again;
@@ -749,20 +787,22 @@ function matchStop(core, c) {
   if (ws[0] === 'cancel' && PRONOUN_REFS.has(refWords)) return null; // "cancel that" is not about an agent
   // "stop them": which ones is not clear, so the engine says so; never one agent picked by its spelling
   if (refWords === 'them' || refWords === 'they') return { intent: { kind: 'stop', agentIds: [] }, strong: false };
+  // "stop its work", "stop the work": the agent in the centre, as "stop it"
+  if (GENERIC_WORK.test(refWords)) return { intent: { kind: 'stop', agentIds: c.focusId ? [c.focusId] : [] }, strong: !!c.focusId };
   // "stop the tests from failing", "stop the flaky test from timing out": what to prevent, which is work; but "stop the
   // onboarding agent from running" is a stop
   const from = rest.findIndex((t, i) => i > 0 && i < rest.length - 1 && t.w === 'from');
   if (from > 0 && !rest.slice(from + 1).every(t => BARE_STOP.has(t.w))) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
   if (from > 0) rest = rest.slice(0, from);
-  // "stop an agent to fix the login" says what a new agent should do: work that gets the start confirm, never a stop
-  // of "Login fix" (the reference words would skip "an agent to" and find it).
+  // "stop an agent to fix the login" says what a new agent should do: work (the prompt, as typed: see parse), never a
+  // stop of "Login fix" (the reference words would skip "an agent to" and find it).
   if (launchPhrase(rest.map(t => t.w))) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
   const r = resolveList(stripTrailing(rest, STOP_TAIL), c);
   // Words that match nothing beside the agent's words say what to do, not which agent:
-  // "stop the flaky test from timing out" is work, so it gets the start confirm like other work.
+  // "stop the flaky test from timing out" is work, the prompt for a new agent like other work.
   if (r.ids.length && !r.full) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
-  // No agent matches (and it is no "it" or "that"): a work request that starts with a stop verb, so it gets the
-  // start confirm with the whole sentence as the task: "Start an agent to stop the flaky test from timing out?"
+  // No agent matches (and it is no "it" or "that"): a work request that starts with a stop verb, so the whole sentence
+  // is the prompt for a new agent: "Started Claude on “stop the flaky test from timing out”."
   if (!r.ids.length && !PRONOUN_REFS.has(refWords)) return { intent: { kind: 'task', task: tidy(spanText(core)) }, strong: false };
   const intent = { kind: 'stop', agentIds: r.ids };
   if (r.ids.length && !r.named) intent.sure = false; // found, but not by its name: the engine asks first
@@ -785,9 +825,17 @@ function matchForget(core, c) {
   return { intent: { kind: 'forget', agentIds: r.ids }, strong: r.named && !r.pronoun };
 }
 
-/** "continue search cleanup", "pick up it again": only for an agent from an earlier run (else the words go on). */
+/** Going on, said with nothing more: "go on", "keep going", "carry on", "continue". */
+const GO_ON = /^(?:go on|keep going|carry on|continue|resume|keep at it|keep working|continue working|go on then|carry on then)$/;
+
+/**
+ * "continue search cleanup", "pick up it again": only for an agent from an earlier run (else the words go on). "go on",
+ * "keep going", "carry on" and "continue" with nothing more continue the agent in the centre (a message that continues
+ * it); with none, they are a prompt. Weak: a question takes them as its answer, and a stuck agent as its own choice.
+ */
 function matchContinue(core, c) {
   const ws = core.map(t => t.w);
+  if (GO_ON.test(ws.join(' '))) return c.focusId ? { intent: { kind: 'continue', agentId: focusRoot(c) }, strong: false } : null;
   const v = startsWithSeq(ws, [['pick', 'up'], ['continue'], ['resume'], ['carry', 'on']]);
   if (!v) return null;
   const rest = stripTrailing(core.slice(v), [['again'], ['please']]);
@@ -843,6 +891,27 @@ function focusRoot(c) {
   if (!c.focus) return c.focusId; // not in the list: the engine looks it up and says so
   const r = rootOf(c.focus, c);
   return r ? r.id : null;
+}
+
+/** A card on screen that still waits (not one that ran out). */
+const liveCard = c => (c.pendingConfirm && !c.pendingConfirm.gone ? c.pendingConfirm : null);
+
+/**
+ * The root that words pointing at work mean ("it", "all of it", "everything it did"). With a card on screen, "it" is
+ * the card: its one agent (a merge or throw-away card names it, a stop card may), else none. Otherwise the agent in the
+ * centre, else the one agent of a card that ran out, else null.
+ */
+function pointedRoot(c) {
+  const card = c.pendingConfirm;
+  if (!liveCard(c)) {
+    const f = focusRoot(c);
+    if (f || !card) return f;
+  }
+  const id = typeof card.agentId === 'string' && card.agentId ? card.agentId
+    : Array.isArray(card.agentIds) && card.agentIds.length === 1 && typeof card.agentIds[0] === 'string' ? card.agentIds[0] : null;
+  if (!id) return null;
+  const a = c.agents.find(x => x.id === id);
+  return a ? (rootOf(a, c)?.id ?? null) : id;
 }
 
 /** The words are nothing but an agent's whole name ("diff viewer", "merge command"): a name, not a command. */
@@ -908,14 +977,14 @@ function workRef(toks, c) {
     return { ...whole, noun: !!head && head.id === whole.id };
   }
   const phrase = ws.join(' ');
-  if (PRONOUN_REFS.has(phrase)) return { id: focusRoot(c), form: 'pronoun', noun: false };
-  if (GENERIC_WORK.test(phrase)) return { id: focusRoot(c), form: 'generic', noun: true };
+  if (PRONOUN_REFS.has(phrase) || POINTED_WORK.test(phrase)) return { id: pointedRoot(c), form: 'pronoun', noun: false };
+  if (GENERIC_WORK.test(phrase)) return { id: pointedRoot(c), form: 'generic', noun: true };
   // "search cleanup's changes" (lexed without its "'s"), "this agent's work".
   if (ws.length > 1 && WORK_NOUN.has(ws[ws.length - 1])) {
     const head = ws.slice(0, -1);
     const named = namedRoot(head, c);
     if (named) return { ...named, noun: true };
-    if (PRONOUN_REFS.has(head.join(' '))) return { id: focusRoot(c), form: 'pronoun', noun: true };
+    if (PRONOUN_REFS.has(head.join(' '))) return { id: pointedRoot(c), form: 'pronoun', noun: true };
   }
   // "the changes from search cleanup", "all the work of 1a2b3c".
   const n = ws.findIndex(w => WORK_NOUN.has(w));
@@ -923,10 +992,16 @@ function workRef(toks, c) {
     const of = ws.slice(n + 2);
     const named = namedRoot(of, c);
     if (named) return { ...named, noun: true };
-    if (PRONOUN_REFS.has(of.join(' '))) return { id: focusRoot(c), form: 'pronoun', noun: true };
+    if (PRONOUN_REFS.has(of.join(' '))) return { id: pointedRoot(c), form: 'pronoun', noun: true };
   }
   return null;
 }
+
+/**
+ * Words that point at an agent's work without naming it, said after merge or throw away: "them", "all of it", "it all",
+ * "everything", "everything it did", "whatever it changed". Like "it", they mean the agent in the centre (pointedRoot).
+ */
+const POINTED_WORK = /^(?:all (?:of )?)?(?:it|that|this|them|these|those)(?: all)?$|^(?:everything|all|it all|them all|all of them)(?: (?:it|they) (?:did|made|changed|wrote|has done|have done|has changed|did here))?$|^(?:whatever|what) (?:it|they) (?:did|made|changed|wrote)$/;
 
 /**
  * Something else on screen that "it" or "the changes" may be about: a confirm card, or a request (a question, a
@@ -934,7 +1009,7 @@ function workRef(toks, c) {
  * keep their old meaning (the card's words, the answer, the permission's reply), never these commands.
  */
 function screenBusy(c) {
-  return !!c.pendingConfirm || hasAsk(c.asker);
+  return !!liveCard(c) || hasAsk(c.asker);
 }
 
 /** A form that does not name the agent: "it", "its changes", a bare "merge". */
@@ -942,12 +1017,30 @@ const weakForm = ref => ref.form === 'pronoun' || ref.form === 'generic' || ref.
 /** The words name the agent outright, so they win over an answer: its id, or its whole name. */
 const strongRef = ref => !weakForm(ref) && !ref.partial;
 /**
- * Words too loose to act on now, so they keep their old meaning. A weak form, while anything waits on screen: "it" may
- * be about that. Part of a name ("the unused imports" for Remove unused imports), while a question, a stuck ask or a
- * permission waits: the words are the reply to it, never a card that takes its place. A card has no "it" for a name,
- * so on a card part of a name is another command, as a whole name is (its old meaning would be a launch).
+ * Words too loose to act on now, so they keep their old meaning. A weak form, while a question, a stuck ask or a
+ * permission waits ("it" may be about that), or while a card waits that is about no one agent ("it" is that card).
+ * Part of a name ("the unused imports" for Remove unused imports), while a question, a stuck ask or a permission waits:
+ * the words are the reply to it, never a card that takes its place. A card has no "it" for a name, so on a card part of
+ * a name is another command, as a whole name is.
  */
-const tooLoose = (ref, c) => (weakForm(ref) && screenBusy(c)) || (!!ref.partial && hasAsk(c.asker));
+const tooLoose = (ref, c) => (weakForm(ref) && (liveCard(c) ? !ref.id : hasAsk(c.asker))) || (!!ref.partial && hasAsk(c.asker));
+
+/**
+ * What a merge or throw-away whose words are too loose for now gives: on a card about no one agent, the card stays
+ * (unknown: never new work); else nothing, and the words keep their old meaning (the answer, the permission's reply).
+ */
+const looseWork = (ref, c) => (weakForm(ref) && liveCard(c) ? { intent: { kind: 'unknown' }, strong: true } : null);
+
+/**
+ * The intent for a merge or throw-away of `ref`'s agent. Words that point at work without naming it, with no agent in
+ * the centre or on a card, are `bare`: the engine takes the one agent whose work it could act on, or names the ones it
+ * could, never a new prompt. Two agents of the name give no agent and no `bare`: the engine asks which one.
+ */
+function workIntent(kind, ref) {
+  const intent = { kind, agentId: ref.id };
+  if (!ref.id && weakForm(ref)) intent.bare = true;
+  return intent;
+}
 
 const INTO = new Set(['into', 'onto', 'to', 'in', 'on']);
 /** The person's current branch, said without its name. */
@@ -1002,7 +1095,7 @@ function matchMerge(core, c) {
   let ref = null;
   if (!rest.length) {
     if (bring || particle) return null;
-    ref = { id: focusRoot(c), form: 'bare', noun: false }; // "merge", "land"
+    ref = { id: pointedRoot(c), form: 'bare', noun: false }; // "merge", "land"
   } else {
     ref = workRef(rest, c); // the words whole: "merge add tests to parser"
     if (!ref) {
@@ -1018,7 +1111,7 @@ function matchMerge(core, c) {
           toks = toks.slice(0, -1);
           ref = toks.length ? workRef(toks, c) : null;
         }
-        if (!ref && !toks.length && !bring) ref = { id: focusRoot(c), form: 'bare', noun: false }; // "merge into main"
+        if (!ref && !toks.length && !bring) ref = { id: pointedRoot(c), form: 'bare', noun: false }; // "merge into main"
       }
     }
     if (!ref && ['in', 'over'].includes(rest[rest.length - 1].w)) { // "merge it in", "bring its changes in"
@@ -1029,8 +1122,8 @@ function matchMerge(core, c) {
   if (!ref) return null;
   // "bring" means a merge only with its work or "it": "bring search cleanup in" is no merge.
   if (bring && (!particle || !(ref.form === 'pronoun' || ref.noun))) return null;
-  if (tooLoose(ref, c)) return null;
-  const intent = { kind: 'merge', agentId: ref.id };
+  if (tooLoose(ref, c)) return looseWork(ref, c);
+  const intent = workIntent('merge', ref);
   if (into) intent.into = into;
   return { intent, strong: strongRef(ref) };
 }
@@ -1038,9 +1131,10 @@ function matchMerge(core, c) {
 const DISCARD_VERBS = new Set(['discard', 'scrap', 'trash']);
 
 /**
- * "throw away search cleanup's changes", "discard it", "throw it away", "scrap it": always asked first (the engine
- * shows a throw-away card). The words must name the agent, as for a merge; "discard unused imports" is no throw-away.
- * Strength is as for a merge: while Remove unused imports asks, "discard the unused imports" is the answer.
+ * "throw away search cleanup's changes", "discard it", "throw it away", "scrap it", "discard all of it", "throw away
+ * everything it did", a bare "discard": always asked first (the engine shows a throw-away card). The words must name the
+ * agent, as for a merge, or point at its work (POINTED_WORK); "discard unused imports" is no throw-away. Strength is as
+ * for a merge: while Remove unused imports asks, "discard the unused imports" is the answer.
  */
 function matchDiscard(core, c) {
   const ws = core.map(t => t.w);
@@ -1054,18 +1148,18 @@ function matchDiscard(core, c) {
   rest = stripTrailing(rest, WORK_TAIL);
   if (!particle) {
     const last = rest[rest.length - 1];
-    if (!last || (last.w !== 'away' && last.w !== 'out')) return null;
+    if (!last || (last.w !== 'away' && last.w !== 'out') || rest.length < 2) return null;
     rest = rest.slice(0, -1);
   }
-  if (!rest.length) return null; // "discard" alone throws nothing away
   // "scrap that" and "trash this" say never mind ("scratch that"), not which work to throw away. "scrap it" does.
   if ((ws[0] === 'scrap' || ws[0] === 'trash') && rest.length === 1 && (rest[0].w === 'that' || rest[0].w === 'this')) return null;
-  if ((ws[0] === 'scrap' || ws[0] === 'trash') && (rest[0].w === 'that' || rest[0].w === 'this') && (rest[0].tail || NEVER_MIND_JOIN.has(rest[1]?.w))) return null;
-  if (launchPhrase(rest.map(t => t.w))) return null;
-  const ref = workRef(rest, c);
+  if ((ws[0] === 'scrap' || ws[0] === 'trash') && (rest[0]?.w === 'that' || rest[0]?.w === 'this') && (rest[0].tail || NEVER_MIND_JOIN.has(rest[1]?.w))) return null;
+  // a bare "discard", "throw away" or "scrap": the agent in the centre, as "discard it"
+  if (rest.length && launchPhrase(rest.map(t => t.w))) return null;
+  const ref = rest.length ? workRef(rest, c) : { id: pointedRoot(c), form: 'bare', noun: false };
   if (!ref) return null;
-  if (tooLoose(ref, c)) return null;
-  return { intent: { kind: 'discard', agentId: ref.id }, strong: strongRef(ref) };
+  if (tooLoose(ref, c)) return looseWork(ref, c);
+  return { intent: workIntent('discard', ref), strong: strongRef(ref) };
 }
 
 /** Questions about what an agent changed. They may find the agent by its task words too, as status questions do. */
@@ -1131,8 +1225,9 @@ function changesIn(core, c) {
   // "what changed", a bare "diff": the focused agent, said without its name (on a merge or throw-away card, its agent).
   const focused = () => (screenBusy(c) ? cardReview(c) : { intent: { kind: 'changes', agentId: focusRoot(c) }, strong: false });
   // The work of the agent the words found. Words too loose for now (see tooLoose) are about what waits on screen.
-  const show = ref => (!tooLoose(ref, c) ? { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) }
-    : weakForm(ref) ? cardReview(c) : null);
+  // A weak form while anything waits on screen is about that: on a merge or throw-away card, the card's work (strong).
+  const show = ref => (weakForm(ref) && screenBusy(c) ? cardReview(c)
+    : !tooLoose(ref, c) ? { intent: { kind: 'changes', agentId: ref.id }, strong: strongRef(ref) } : null);
   for (const re of CHANGES_ASK) {
     const m = re.exec(s);
     if (!m) continue;
@@ -1161,11 +1256,12 @@ function changesIn(core, c) {
     if (!ref) return null; // "diff the two config files" is not about an agent
     return show(ref);
   }
-  // "review the changes" is work for an agent, but on a merge or throw-away card it looks at the work, as "show" does.
+  // "review the changes" is work for an agent, but on a merge or throw-away card it looks at the work, as "show" does;
+  // so does "review it" or "check it", whose "it" is the card's
   m = cardReview(c) && CHANGES_REVIEW.exec(s);
   if (m) {
     const ref = workRef(refTokens(m, s, core), c);
-    if (ref && ref.noun) return show(ref);
+    if (ref && (ref.noun || ref.form === 'pronoun')) return show(ref);
   }
   return null;
 }
@@ -1300,8 +1396,15 @@ const SPEND_EXACT = [
 ];
 const SPEND_WORD = /\b(spen[dt]|spending|cost|costs|costing|money|bill|budget|dollars|bucks)\b/;
 
-/** What the person does for an agent that waits, said after "what needs me to …": "look at", "approve", "answer". */
-const NEEDS_ME_DO = new Set(['look', 'check', 'answer', 'approve', 'review', 'decide', 'sign', 'confirm', 'respond', 'reply', 'read', 'first', 'most', 'currently']);
+/**
+ * What may come after "what needs me" and keep it the command: what the person does for an agent that waits ("what needs
+ * me to look at", "… to approve"), and a time, an urgency or a reason ("now", "urgently", "first", "today", "right now",
+ * "most", "this morning", "and why"). A tail that names something in the project makes it a prompt ("what needs me to
+ * approve this PR?").
+ */
+const NEEDS_ME_DO = new Set(['look', 'check', 'answer', 'approve', 'review', 'decide', 'sign', 'confirm', 'respond', 'reply', 'read', 'first', 'most', 'currently',
+  'urgently', 'urgent', 'asap', 'immediately', 'soon', 'soonest', 'quickly', 'mostly', 'especially', 'presently', 'tonight', 'morning', 'afternoon',
+  'evening', 'week', 'day', 'moment', 'anymore', 'before', 'lunch', 'end', 'because', 'reason', 'reasons', 'importantly', 'pressing', 'pressingly']);
 
 function isNeedsMe(ws) {
   if (!ws.length || ws.length > 12) return false;
@@ -1316,6 +1419,40 @@ function isNeedsMe(ws) {
   let last = -1;
   ws.forEach((w, i) => { if (ME.has(w) && w !== 'my') last = i; });
   return ws.slice(last + 1).every(w => NOTHING_WORDS.has(w) || NEEDS_ME_DO.has(w));
+}
+
+/** Words that describe which agent by when it started: the last, the first, the newest. -1 is the newest, 0 the oldest. */
+const WHICH_BY_AGE = Object.assign(Object.create(null), { last: -1, latest: -1, newest: -1, recent: -1, previous: -2, first: 0, oldest: 0, earliest: 0, second: 1, third: 2 });
+/** Words that describe which agent by how it is, and the states they mean. */
+const WHICH_BY_STATE = Object.assign(Object.create(null), {
+  stuck: ['maybe_stuck'], finished: [...DONE], done: [...DONE], failed: ['failed', 'checks_failed'], failing: ['failed', 'checks_failed'],
+  broken: ['failed', 'checks_failed'], working: ['starting', 'working', 'waiting_helpers'], running: ['starting', 'working', 'waiting_helpers'],
+  busy: ['starting', 'working', 'waiting_helpers'], waiting: ['needs_ok', 'question', 'maybe_stuck'], asking: ['needs_ok', 'question'],
+  blocked: ['needs_ok', 'question', 'maybe_stuck'], stopped: ['stopped'],
+});
+const DESCRIBED_NOUN = new Set(['agent', 'agents', 'one', 'ones', 'helper']);
+const DESCRIBED_FILL = new Set(['the', 'a', 'an', 'that', 'this', 'my', 'most', 'very', 'just', 'one', 'agent', 'helper']);
+
+/**
+ * An agent the words describe without naming it: "the last agent", "the latest one", "the first one", "the stuck one",
+ * "the newest agent", "the last stuck one". Null when they are no such words ("the last commit" names no agent: it needs
+ * "agent" or "one"); else { id }, the root they find, or { id: null } when they find none or several (then how they all
+ * are). By age, the order agents started in (`startedAt`, else the board's order).
+ */
+function describedAgent(ref, c) {
+  const ws = ref.map(t => t.w);
+  if (!ws.some(w => DESCRIBED_NOUN.has(w))) return null;
+  const desc = ws.filter(w => !DESCRIBED_FILL.has(w) && !DESCRIBED_NOUN.has(w));
+  if (!desc.length || !desc.every(w => Object.hasOwn(WHICH_BY_AGE, w) || Object.hasOwn(WHICH_BY_STATE, w))) return null;
+  const helper = ws.includes('helper');
+  let pool = c.agents.map((a, i) => ({ a, i })).filter(({ a }) => (helper ? !isRoot(a) : isRoot(a)) && !a.earlier);
+  for (const w of desc) if (Object.hasOwn(WHICH_BY_STATE, w)) pool = pool.filter(({ a }) => WHICH_BY_STATE[w].includes(a.state));
+  pool.sort((x, y) => (Number(x.a.startedAt) || 0) - (Number(y.a.startedAt) || 0) || x.i - y.i);
+  const age = desc.find(w => Object.hasOwn(WHICH_BY_AGE, w));
+  if (age === undefined) return { id: pool.length === 1 ? pool[0].a.id : null };
+  const k = WHICH_BY_AGE[age];
+  const pick = k < 0 ? pool[pool.length + k] : pool[k];
+  return { id: pick ? pick.a.id : null };
 }
 
 /** Map a regex capture group back to tokens (words are joined by single spaces). */
@@ -1351,6 +1488,10 @@ function matchStatusOrSpend(core, c, base = core) {
     if (!m) continue;
     const ref = refTokens(m, s, core);
     if (SPEND_WORD.test(ref.map(t => t.w).join(' '))) break; // "how much is this costing" is spend, below
+    // "what did the last agent do", "status of the stuck one": an agent described, not named. The one the words find, or
+    // how they all are when they find none.
+    const described = describedAgent(ref, c);
+    if (described) return { intent: described.id ? { kind: 'status', agentId: described.id } : { kind: 'status' }, strong: false };
     const r = resolveRef(ref, c);
     if (r.pronoun) return r.ids.length ? { intent: { kind: 'status', agentId: r.ids[0] }, strong: true } : { intent: { kind: 'status' }, strong: true };
     // A form that asks about progress takes a loose match; any other ("where is the config loaded", "open the diff
@@ -1444,14 +1585,14 @@ function matchSay(core, c) {
     }
     // One step needs the name and a clear break before the message: "tell search cleanup to ...".
     const sure = best.r.named && (best.cand.sep || !!best.r.pronoun);
-    const intent = { kind: 'say', agentId: best.r.ids[0], text: tidy(spanText(best.cand.msg)) };
+    const intent = { kind: 'say', agentId: best.r.ids[0], text: asTyped(best.cand.msg) };
     if (!sure) intent.sure = false;
     return { intent, strong: sure };
   }
   // "tell it to ..." with nothing focused: a say with no agent, so the engine can ask which one.
   // A name that matches no agent is not a say: sending it to whatever is focused would be wrong.
   if (pronoun) {
-    const text = tidy(spanText(pronoun.msg));
+    const text = asTyped(pronoun.msg);
     return text ? { intent: { kind: 'say', agentId: null, text }, strong: false } : null;
   }
   return null;
@@ -1637,15 +1778,15 @@ function buildTasks(rest, noun, c) {
     if (ws[k] !== 'and') continue;
     const h = harnessAt(ws, k + 1);
     if (!h || !['on', 'to', 'for', 'with'].includes(ws[k + 1 + h.len])) continue;
-    const first = tidy(spanText(toks.slice(0, k)));
-    const second = tidy(spanText(toks.slice(k + 2 + h.len)));
+    const first = asTyped(toks.slice(0, k));
+    const second = asTyped(toks.slice(k + 2 + h.len));
     if (!first || !second) break;
     const h1 = noun.harnesses[0] || har.harness || null;
     return [{ task: first, harness: h1, machine }, { task: second, harness: h.harness, machine }];
   }
 
   if (!toks.length || emptyTask(toks)) return null;
-  const task = tidy(spanText(toks));
+  const task = asTyped(toks);
   if (!task) return null;
   let harnesses = noun.harnesses.length ? noun.harnesses : [har.harness || null];
   if (harnesses.length === 1 && noun.count > 1) harnesses = new Array(Math.min(noun.count, MAX_LAUNCH)).fill(harnesses[0]);
@@ -1705,38 +1846,10 @@ function matchStart(core, c) {
   return { intent: { kind: 'start', tasks }, strong: noun.named };
 }
 
-// Help, and connecting agents and keys ---------------------------------------------------------
-
-/**
- * What "help" gets: what to say, and where agents are set up. Short, so it fits three lines under the DRAM at the
- * narrowest board. The engine answers the `help` intent with it.
- */
-export const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.';
-
-/** A greeting and nothing more: "hi", "hello there", "hey workbench", "good morning". */
-const GREETING = new Set(['hi', 'hello', 'hey', 'hiya', 'howdy', 'yo', 'greetings', 'morning', 'afternoon', 'evening']);
-const GREETING_FILL = new Set(['there', 'workbench', 'again', 'everyone', 'everybody', 'all', 'folks', 'good', 'oh', 'okay', 'so', 'well', 'and']);
-/** Asking what Workbench can do, said whole (after "please", "can you" and the like are dropped). */
-const HELP_PHRASES = new Set(['help', 'help me', 'i need help', 'need help', 'get help', 'what can you do', 'what can you do for me',
-  'what do you do', 'what can i do', 'what can i say', 'what can i ask', 'what can i type', 'what do i say', 'what should i say',
-  'what do i do', 'how does this work', 'how does it work', 'how does workbench work', 'how do i use this', 'how do i use it',
-  'how do i use workbench', 'how do i start', 'how do i begin', 'what is this', 'what is workbench', 'commands',
-  'what are the commands', 'list the commands', 'what do i type', 'what do i type here', 'what should i type', 'what can i type here',
-  'what do i write', 'what do i write here', 'what do i do here']);
-
-/**
- * "help", "hi", "what can you do", "how does this work". Weak: while the focused agent (or its one waiting helper) asks
- * something, the words are about that ask, and keep their old meaning (the answer, or what exactly a permission asks).
- * On a card they settle nothing, and the card stays with its own hint.
- */
-function matchHelp(core, base, c) {
-  const all = base.map(t => t.w);
-  const greeting = all.every(w => GREETING.has(w) || GREETING_FILL.has(w)) && all.some(w => GREETING.has(w));
-  if (!greeting && !HELP_PHRASES.has(core.map(t => t.w).join(' '))) return null;
-  if (c.pendingConfirm) return { intent: { kind: 'unknown' }, strong: true };
-  if (hasAsk(c.asker)) return null;
-  return { intent: { kind: 'help' }, strong: false };
-}
+// Connecting agents and keys -----------------------------------------------------------------------
+//
+// "help", "hi" and "what can you do" are no command of Workbench's: like any words that are none, they are a prompt for
+// a new agent (see parse). Agents & keys takes its own words.
 
 // The things a person connects: an agent program, GitHub or git, and keys.
 const C_DET = '(?:(?:my|your|our|the|a|an|some|new|more|another|other) )*';
@@ -1773,10 +1886,14 @@ function matchConnect(core) {
 
 // Full permissions ----------------------------------------------------------------------------
 
-/** The words that turn full permissions on, said whole: the engine asks first, with a card. */
+/**
+ * The words that turn full permissions on, said whole: the engine asks first, with a card. Said whole, they are never a
+ * prompt: anything typed that is no command starts an agent at once, so the ways a person asks for the mode are here.
+ */
 const PERMISSIONS_ON = [
   /^(?:(?:turn|switch) on )?full (?:permissions?|access)(?: on)?$/,
   /^(?:turn|switch) full (?:permissions?|access) on$/,
+  /^(?:enable|use|switch to|go to|give (?:agents|the agents|every agent|all agents|them)) full (?:permissions?|access)$/,
   /^allow everything$/,
   /^stop asking(?: me)?$/,
   /^(?:don't|do not) ask me$/,
@@ -1787,6 +1904,8 @@ const PERMISSIONS_OFF = [
   /^(?:turn|switch) off full (?:permissions?|access)$/,
   /^(?:turn|switch) full (?:permissions?|access) off$/,
   /^full (?:permissions?|access) off$/,
+  /^disable full (?:permissions?|access)$/,
+  /^(?:switch|go) (?:back )?to ask(?:ing)? (?:me )?first$/,
 ];
 
 /** 'full', 'ask', or null: what these words, whole, ask of full permissions. */
@@ -1861,14 +1980,19 @@ const WORK_VERBS = new Set(['add', 'fix', 'write', 'rewrite', 'create', 'build',
   'bring', 'teach', 'shorten', 'lengthen', 'split', 'combine', 'dedupe', 'deduplicate', 'untangle', 'fill', 'draw', 'build']);
 
 /**
- * A work request with no start verb: "fix the login redirect", and "work on the login bug", whose task is what comes
- * after "work on" ("the login bug"), as for "start an agent working on the login bug".
+ * A work request with no start verb: "fix the login redirect", "work on the login bug". The task is the person's words as
+ * typed (the caller gives them: `{ kind: 'task' }` carries no text here), unless they name a program or a machine ("fix
+ * the login redirect using codex", "… on cloud 2"): then a start for it, with those words taken off.
  */
 function matchTask(core, c) {
   let words = core;
   if (core.length > 2 && core[0].w === 'work' && core[1].w === 'on') words = core.slice(2);
   else if (core.length < 2 || !WORK_VERBS.has(core[0].w)) return null;
   if (emptyTask(words === core ? core.slice(1) : words)) return null; // "fix it", "do that", "work on it"
+  // "merge everything", "merge its work", "bring it all in": Workbench's own verb for an agent's work, pointing at an agent;
+  // where that is no command now (a request waits), it is no work either
+  const after = stripTrailing(core.slice(1), WORK_TAIL).map(t => t.w).filter(w => w !== 'in').join(' ');
+  if (['merge', 'land', 'bring'].includes(core[0].w) && (PRONOUN_REFS.has(after) || POINTED_WORK.test(after) || GENERIC_WORK.test(after))) return null;
   const last = core[core.length - 1].raw;
   if (/\?["'”’]*$/.test(last)) return null; // a question, not a request
   // An explicit harness or machine makes it a launch: "fix the login redirect using codex".
@@ -1879,13 +2003,12 @@ function matchTask(core, c) {
     return { kind: 'start', tasks: [], task: null, harness: har.harness };
   }
   if (mach.machine || har.harness) {
-    const task = tidy(spanText(har.toks));
+    const task = asTyped(har.toks);
     if (task && !emptyTask(har.toks)) {
       return { kind: 'start', tasks: [{ task, harness: har.harness || null, machine: mach.machine || laptopId(c) }] };
     }
   }
-  const task = tidy(spanText(words));
-  return task ? { kind: 'task', task } : null;
+  return { kind: 'task' };
 }
 
 // Work said to an agent by name, and free text --------------------------------------------------
@@ -1927,7 +2050,7 @@ function matchAddressed(core, c) {
   const named = core[end - 1];
   const rest = stripTrailing(stripPolite(stripSoft(core.slice(end))));
   if (!workAfterName(rest, named, c)) return null;
-  const task = tidy(spanText(rest));
+  const task = asTyped(rest);
   if (!task) return null;
   // weak only when the words may be said to the agent asking: no comma or colon after the name (as for
   // "claude, fix the login page", read by matchStart), and a program the asker runs, when its program is known
@@ -1976,7 +2099,6 @@ const SPACELESS = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Scrip
 /** Reactions that start a reply rather than a request: "thanks, …", "great job on …". */
 const PRAISE = new Set(['thanks', 'thank', 'cool', 'great', 'nice', 'perfect', 'awesome', 'lgtm', 'sweet', 'excellent', 'wow',
   'amazing', 'brilliant', 'love', 'cheers', 'good']);
-const ANSWER_LEAD = new Set(['yes', 'yeah', 'yep', 'yup', 'sure', 'no', 'nope', 'nah']);
 /** Reactions a command may come after: "looks good, merge it", "wait, stop everything", "nah, throw it away". */
 const REACTION = new Set([...PRAISE, 'yes', 'yeah', 'yep', 'yup', 'sure', 'looks', 'sounds', 'good', 'wait', 'ugh', 'oops', 'no',
   'nope', 'nah', 'whoa', 'approved', 'approve', 'fine', 'crap', 'damn', 'alright', 'okay', 'oh', 'hey']);
@@ -2020,152 +2142,29 @@ function contentCount(toks) {
 }
 
 /**
- * Whether words say what to work on: two words that are not NOTHING_WORDS (a long word in a script written without
- * spaces counts twice); or one, in three words or more ("prod is down", "the server won't start", "can we have tabs?"),
- * unless the words speak to Workbench ("are you working", "what do you mean"), point at what is on screen ("that fixed
- * it", "it's still broken", "why did it fail?"; "it would be nice to have tabs" is a want), or start a reply. After a
- * reaction that starts a reply and runs on ("great job on the login fix"), it takes three words that say something;
- * after a yes or a no run on ("yeah the tests are failing", "ok but not on main"), two.
+ * Whether words after an agent's name, with no comma or colon after it, say work for it (workAfterName): two words that
+ * are not NOTHING_WORDS (a long word in a script written without spaces counts twice); or one, in three words or more
+ * ("codex the server won't start"), unless the words speak to Workbench ("are you working"), or point at what is on
+ * screen ("it's still broken"; "it would be nice to have tabs" is a want).
  * @param {object[]} toks the words that count
- * @param {object} [o] `all`: the whole sentence, for its length and pronouns; `lead`: 'praise', 'answer' or null
+ * @param {object} [o] `all`: the whole sentence, for its length and pronouns
  */
-function saysSomething(toks, c, { all = toks, lead = null } = {}) {
+function saysSomething(toks, c, { all = toks } = {}) {
   const n = contentCount(toks);
-  if (n >= (lead === 'praise' ? 3 : 2)) return true;
-  if (n !== 1 || lead || all.length < 3) return false;
+  if (n >= 2) return true;
+  if (n !== 1 || all.length < 3) return false;
   const aw = all.map(t => t.w);
   if (aw.includes('you') || aw.includes('your')) return false;
   const want = POINTING.has(aw[0]) && ['would', 'should', 'could', 'might'].includes(aw[1]);
   return want || !pointsAtScreen(all);
 }
 
-// Acknowledgements --------------------------------------------------------------------------------
+// Free text ------------------------------------------------------------------------------------------
 
-/** Thanks, in a few languages. */
-const THANKS_WORDS = new Set(['thanks', 'thank', 'ty', 'cheers', 'appreciate', 'appreciated', 'gracias', 'danke', 'merci', 'grazie',
-  'obrigado', 'obrigada', 'спасибо', 'धन्यवाद', 'shukriya', '谢谢', '谢谢你', 'ありがとう', 'ありがとうございます', '감사합니다', '고마워']);
-/** A yes or a no, in a few languages: "yes", "nope", "cancel", "do it", "go ahead". */
-const YES_NO_WORDS = new Set(['yes', 'yeah', 'yep', 'yup', 'ya', 'yah', 'yea', 'sure', 'no', 'nope', 'nah', 'not', 'cancel', "don't",
-  'deny', 'allow', 'approve', 'approved', 'confirm', 'confirmed', 'proceed', 'do', 'go', 'ahead', 'sí', 'si', 'oui', 'ja', 'да', 'нет',
-  'nein', 'non', '是', '是的', '不', '不是', 'はい', 'いいえ', '네', '아니요']);
-/**
- * What a bare acknowledgement is made of: thanks, a yes or a no, a reaction ("ok", "cool", "sounds good", "got it"), an
- * aside ("let me think", "hold on", "testing one two three"), a goodbye, and the little words that go with them. A word
- * outside it ("start", "agent", "what", "readme") makes the words something else.
- */
-const ACK_WORDS = new Set([...THANKS_WORDS, ...YES_NO_WORDS,
-  'okay', 'alright', 'fine', 'cool', 'great', 'good', 'nice', 'awesome', 'perfect', 'excellent', 'amazing', 'brilliant', 'neat', 'sweet',
-  'lovely', 'love', 'wow', 'whoa', 'yay', 'lol', 'haha', 'oops', 'ugh', 'argh', 'damn', 'crap', 'heck', 'lgtm', 'noted', 'understood',
-  'understand', 'got', 'gotcha', 'makes', 'sense', 'sounds', 'looks', 'seems', 'right', 'correct', 'exactly', 'indeed', 'true', 'agreed',
-  'agree', 'well', 'done', 'job', 'never', 'mind', 'worries', 'problem', 'bye', 'goodbye', 'later', 'see', 'please',
-  'let', 'me', 'think', 'thinking', 'hold', 'hang', 'wait', 'sec', 'second', 'minute', 'moment', 'give', 'testing', 'one', 'two', 'three',
-  'i', 'you', 'it', 'that', 'this', 'is', 'so', 'very', 'much', 'a', 'lot', 'for', 'on', 'just', 'really', 'then', 'now', 'again', 'the',
-  'and', 'all', 'oh', 'too',
-  'muchas', 'schön', 'beaucoup', 'mille', 'большое', 'vale', 'genau', "d'accord", 'хорошо', 'ок', '好', '好的', '对', '嗯', '行', '可以',
-  '没问题', '收到', '了解', 'わかりました', 'うん']);
-/** Praise for work done: "good job", "nice work", "great work on the parser". */
-const PRAISE_WORK = new Set(['job', 'work', 'one']);
-
-/**
- * A bare acknowledgement, said with nothing waiting: it starts nothing, and the engine answers it in a word. `thanks`:
- * thanks or praise ("thanks", "thank you so much", "good job", "great job on the login fix", "thanks, that fixed it");
- * `reply`: a yes or a no to nothing ("yes", "do it", "go ahead", "cancel", "ok but not on main"); else any other ("ok",
- * "cool", "sounds good", "let me think"). Null when the words are more than that: a question ("who are you?"), or
- * anything else that is no acknowledgement ("readme", "keep going"), which is a prompt. `runOn`: also thanks or a yes or
- * a no that runs on with a little more ("great job on the login fix", "ok but not on main"); only for words that are no
- * work (see saysSomething), so "thanks, the footer is broken too" stays work.
- */
-function acknowledgement(base, { runOn = false } = {}) {
-  const said = addressedRest(base) || base; // "claude, thanks": the words after the agent's program and its comma
-  const all = said.map(t => t.w);
-  // an agent's program named in them ("ok codex", "thanks claude code") is who they are said to, not what they say
-  const toks = stripSoft(said.filter((t, i) => !harnessAt(all, i) && !(t.w === 'code' && harnessAt(all, i - 1))));
-  if (!toks.length) return null;
-  const ws = toks.map(t => t.w);
-  const phrase = ws.join(' ');
-  const thanks = all.some(w => THANKS_WORDS.has(w)) || /\bwell done\b/.test(all.join(' '))
-    || all.some((w, i) => PRAISE.has(w) && PRAISE_WORK.has(all[i + 1]));
-  const ack = thanks ? { kind: 'ack', thanks: true } : { kind: 'ack' };
-  if (ws.every(w => ACK_WORDS.has(w))) {
-    if (thanks || /^(?:no|not a) (?:problem|worries)$/.test(phrase) || /\b(?:bye|goodbye|see (?:you|ya))\b/.test(phrase)) return ack;
-    return ws.some(w => YES_NO_WORDS.has(w)) ? { kind: 'ack', reply: true } : ack;
-  }
-  if (!runOn || asksSomething(toks)) return null;
-  // thanks or praise that runs on with little more ("great job on the login fix", "thanks, that fixed it"), and a yes or a
-  // no that does ("ok but not on main", "no, not that one")
-  if (thanks && (THANKS_WORDS.has(ws[0]) || PRAISE.has(ws[0]))) return ack;
-  if (leadOf(said) === 'answer') return { kind: 'ack', reply: true };
-  return null;
-}
-
-/** What a never-mind may wave away besides "it" and "that": "scrap that idea", "forget that last message". */
-const NEVER_MIND_WHAT = new Set(['idea', 'plan', 'thought', 'question', 'request', 'message', 'last', 'one']);
-
-/** Never mind, said with nothing more: "forget it", "scratch that", "scrap that idea", "trash this". */
-function saidNeverMind(ws) {
-  const n = startsWithSeq(ws, NEVER_MIND) || (/^(?:scrap|trash) (?:this|that)$/.test(ws.slice(0, 2).join(' ')) ? 2 : 0);
-  return n > 0 && ws.slice(n).every(w => ACK_WORDS.has(w) || NEVER_MIND_WHAT.has(w));
-}
-
-/** Workbench's own verbs for an agent's work and for earlier agents. */
-const AGENT_VERBS = [['throw', 'away'], ['throw', 'out'], ['pick', 'up'], ['carry', 'on'], ['discard'], ['scrap'], ['trash'], ['throw'],
-  ['land'], ['merge'], ['bring'], ['forget'], ['continue'], ['resume']];
-/** What may follow one of them and still mean an agent: "it", "them", and words that say how ("throw it all away now"). */
-const AGENT_VERB_TAIL = new Set(['it', 'its', 'them', 'this', 'that', 'these', 'those', 'one', 'ones', 'all', 'away', 'out', 'in', 'up',
-  'please', 'now', 'again', 'too', 'then', 'just']);
-
-/**
- * Words that address an agent and say nothing else: an agent named alone ("codex", "agent", "the new agent", "start the
- * agent"), or one of Workbench's own verbs with nothing after it but "it", "them" or the like ("discard", "throw it away",
- * "merge them", "continue"). They are no prompt for another agent: they keep their old meaning (unknown, and on a card
- * that has run out, the engine says it is no longer waiting). Anything more names something that is no agent, so it is
- * a prompt as written ("throw away my work", "discard everything", "forget the old stuff").
- */
-function addressesAnAgent(ws) {
-  const n = parseNoun(ws, startsWithSeq(ws, START_STRONG));
-  if (n.hasNoun && n.end === ws.length) return true;
-  const v = startsWithSeq(ws, AGENT_VERBS);
-  return v > 0 && ws.slice(v).every(w => AGENT_VERB_TAIL.has(w));
-}
-
-/** The agent in the centre waits on the person through a helper, though not one the words could answer (two wait). */
+/** The agent in the centre waits on the person through its helpers, more than one of them, so a yes cannot say which. */
 function helpersWait(c) {
-  return !!c.focus && c.agents.some(a => a.id !== c.focus.id && (a.parentId === c.focus.id || a.rootId === c.focus.id) && hasAsk(a));
-}
-
-/**
- * Openers that start no task: greetings, fillers and affirmations; "right", "like", "now", "no" and praise only before a
- * comma ("right panel is empty", "no emails are sent" and "nice to have: tabs" keep theirs).
- */
-const TASK_LEAD = new Set(['okay', 'so', 'well', 'oh', 'alright', 'actually', 'basically', 'yo', 'listen', 'workbench', 'hey',
-  'hi', 'hello', 'hiya', 'howdy', 'greetings', 'yes', 'yeah', 'yep', 'yup', 'sure']);
-const TASK_LEAD_COMMA = new Set(['right', 'like', 'now', 'then', 'also', 'and', 'wait', 'looks', 'sounds', 'good', 'no', 'nope', 'nah', ...PRAISE]);
-const TASK_TAIL = [['please'], ['thanks'], ['thank', 'you']];
-
-/**
- * The person's own words for a free-text task: from the first word past the openers to the last word, as typed (a
- * symbol or another script kept), less a "please" or "thanks" at the end. "right panel is empty on mobile" keeps its
- * "right" and "the tests pass now" its "now"; "Hello! Can you help me build a website?" is "build a website?". One line
- * has its runs of spaces made one; text of several lines keeps its lines (see keepLines).
- */
-function freeTaskText(base, said) {
-  let toks = base;
-  for (let changed = true; changed && toks.length > 1;) {
-    changed = false;
-    const t = toks[0];
-    const seq = startsWithSeq(toks.map(x => x.w), REACTION_SEQ);
-    if (seq && seq < toks.length && toks[seq - 1].tail) { toks = toks.slice(seq); changed = true; continue; }
-    if (TASK_LEAD.has(t.w) || (TASK_LEAD_COMMA.has(t.w) && t.tail) || (t.w === 'there' && toks !== base)) { toks = toks.slice(1); changed = true; continue; }
-    // "can you", "help me" and the like go before work ("Can you help me build a website?" is "build a website?"), not
-    // before a question of the person's own ("can we have tabs?")
-    const polite = startsWithSeq(toks.map(x => x.w), POLITE);
-    const next = toks[polite]?.w;
-    if (polite && polite < toks.length && (WORK_VERBS.has(next) || POLITE.some(q => q[0] === next) || TASK_LEAD.has(next))) { toks = toks.slice(polite); changed = true; }
-  }
-  toks = stripTrailing(toks, TASK_TAIL);
-  if (!toks.length) return '';
-  const text = said.slice(toks[0].start, toks[toks.length - 1].end);
-  return tidy(LINE_BREAK.test(text) ? keepLines(text) : text.replace(/\s+/g, ' '));
+  if (!c.focus || hasAsk(c.focus)) return false;
+  return c.agents.filter(a => a.id !== c.focus.id && (a.parentId === c.focus.id || a.rootId === c.focus.id) && hasAsk(a)).length > 1;
 }
 
 /** The words of an agent's task that say something: retyping them is the same work again. */
@@ -2178,9 +2177,9 @@ function sameWork(core, a) {
 
 /**
  * An agent named in free text, as work for it: first ("codex why is the build slow"), last after a comma ("the login
- * page is broken, codex"), or with "using", "via" or "through" ("… using codex"), or at the very end after "with", "in" or
- * "on" ("… in codex"). Not in the middle of what the words say: "error in claude code extension" is a bug report.
- * @returns {{ harness: string|null, toks: object[] }}
+ * page is broken, codex": `last`), or with "using", "via" or "through" ("… using codex"), or at the very end after "with",
+ * "in" or "on" ("… in codex"). Not in the middle of what the words say: "error in claude code extension" is a bug report.
+ * @returns {{ harness: string|null, toks: object[], first?: true, last?: true }}
  */
 function harnessInFree(toks) {
   const ws = toks.map(t => t.w);
@@ -2198,25 +2197,25 @@ function harnessInFree(toks) {
     return { harness: g.harness, toks: [...toks.slice(0, i), ...toks.slice(end)] };
   }
   const last = ws.length - 1;
-  if (last > 0 && HARNESS_ALIAS[ws[last]] && toks[last - 1].tail) return { harness: HARNESS_ALIAS[ws[last]], toks: toks.slice(0, last) };
+  if (last > 0 && HARNESS_ALIAS[ws[last]] && toks[last - 1].tail) return { harness: HARNESS_ALIAS[ws[last]], toks: toks.slice(0, last), last: true };
   return { harness: null, toks };
 }
 
 /**
- * Anything else is a prompt for a new agent, as it is to a coding agent: "the login page is broken", "prod is down",
- * "why is the build slow?", "who are you?", "explain how the policy works", "todo app in react", a link on its own, and
- * words that name no agent after a command's verb ("discard the old migrations folder", "forget the old api and use
- * v2"). A launch always asks first, so its card is the check. An agent named (see harnessInFree) makes it a launch for
- * that one. Words that are about an agent rather than work give its status: a short remark or question that points at
- * what is on screen, with an agent in the centre ("is it done yet", "it's still broken", "why did that fail?"); an
- * agent's whole name and nothing more ("diff viewer"); an agent at work's own words ("the checkout bug"), unless they ask
- * for it ("can we have …"). Retyping an ended agent's task is that work again, not its status. Words that do not say
- * enough to be work are a bare acknowledgement (see acknowledgement) or else a prompt all the same. They are nothing
- * (null, so `unknown`) only when they address an agent and say nothing else (see addressesAnAgent: "codex", "start the agent", "throw it away", "merge them"), or say how an agent's
- * program is ("claude is stuck"); when a card that has run out is still on screen (unless they are work); and when they
- * are a yes or a no while two helpers of the agent in the centre wait.
+ * Free text, the last step, after the commands and the answers to what is on screen. Null means the prompt: the caller
+ * gives the person's words, exactly as typed, to a new agent (on the default program). Otherwise:
+ * - a short remark or question that points at what is on screen, with an agent in the centre ("is it done yet", "it's
+ *   still broken", "why did that fail?"): its status; so is an agent's whole name and nothing more ("diff viewer"), and
+ *   an agent at work's own words ("the checkout bug"), unless they ask for it ("can we have …"). Retyping an ended
+ *   agent's task is that work again, not its status;
+ * - an agent named alone ("codex", "claude code", "the agent", "start the agent"): a start with no work, so the engine
+ *   asks what it should work on;
+ * - a program named first, with a comma or a colon after it ("codex, thanks") or before work or a question ("codex why
+ *   is the build slow"), last after a comma ("the login page is broken, codex"), or with "using", "via" or "through"
+ *   (harnessInFree): a start for that program, its name taken off and the rest as typed (asTyped). Named first before
+ *   words that say how it is ("claude is stuck", "codex isn't installed"), the whole sentence is the prompt.
  */
-function matchFreeWork(core, c, base, said, lead = null) {
+function matchFreeWork(core, c, base) {
   if (!core.length) return null;
   const ws = core.map(t => t.w);
   const soft = stripSoft(base);
@@ -2232,35 +2231,16 @@ function matchFreeWork(core, c, base, said, lead = null) {
       if (a && (ENDED.has(a.state) || a.earlier ? r.named && !sameWork(core, a) : r.named || !asked)) return { kind: 'status', agentId: a.id };
     }
   }
-  const link = core.length === 1 && /^https?:\/\/[^\s/]+\.[^\s]+$/i.test(core[0].raw);
+  const noun = parseNoun(ws, startsWithSeq(ws, START_STRONG));
+  if (noun.named && noun.end === ws.length) return NO_TASK_START(noun.harnesses.length === 1 ? noun.harnesses[0] : null);
   const har = harnessInFree(core);
-  // A name first with no comma or colon says work for it only as a request or a question ("codex why is the build
-  // slow"), never as a remark about it ("claude broke the build" is the whole sentence, for the default agent).
-  const named = har.harness && har.first ? workAfterName(stripPolite(stripSoft(har.toks)), core[harnessAt(ws, 0).len - 1], c) : !!har.harness;
-  // "claude is stuck", "codex isn't installed": a remark about an agent's program is no work
-  if (har.harness && har.first && !named && COPULA.has(har.toks[0]?.w)) return null;
-  if (saidNeverMind(ws)) return { kind: 'ack' };
-  // a yes or a no while helpers of the agent in the centre wait is for one of them: not clear which (the engine says so)
-  const ackNow = ack => (ack.reply && helpersWait(c) ? null : ack);
-  const bare = acknowledgement(base);
-  if (bare) return ackNow(bare);
-  if (addressesAnAgent(ws)) return null;
-  const words = named ? har.toks : core;
-  if (!words.length) return null;
-  if (!link && !saysSomething(words, c, { all: soft, lead })) {
-    const ack = acknowledgement(base, { runOn: true });
-    if (ack) return ackNow(ack);
-    // a card still on screen, though it has run out: words that are no work are about it, and the engine says so
-    if (c.pendingConfirm) return null;
-    const prompt = freeTaskText(base, said);
-    return prompt ? { kind: 'task', task: prompt } : null;
-  }
-  if (named) {
-    const task = tidy(spanText(stripPolite(stripSoft(words))));
-    return task ? { kind: 'start', tasks: [{ task, harness: har.harness, machine: laptopId(c) }] } : null;
-  }
-  const task = freeTaskText(base, said);
-  return task ? { kind: 'task', task } : null;
+  if (!har.harness) return null;
+  const name = har.first ? core[harnessAt(ws, 0).len - 1] : null;
+  const words = har.first ? stripPolite(stripSoft(har.toks)) : har.toks;
+  // "claude is stuck", "claude broke the build": said about a program, not to it
+  if (name && !name.tail && !workAfterName(words, name, c)) return null;
+  const task = har.last ? asTyped(words).replace(/[\s,;:]+$/, '') : asTyped(words);
+  return task ? { kind: 'start', tasks: [{ task, harness: har.harness, machine: laptopId(c) }] } : null;
 }
 
 // Answers -------------------------------------------------------------------------------------
@@ -2269,9 +2249,14 @@ const KEEP_TRYING = new Set(['keep trying', 'keep going', 'let it keep trying', 
   'carry on', 'continue', 'leave it', 'leave it be', 'let it be', 'it is fine', 'fine', 'let it run', 'give it more time',
   'let it go on', 'try again', 'keep at it', 'let it keep at it']);
 
+/**
+ * The words as an answer to the question or stuck ask on screen: as typed, from the first word past a soft opener or the
+ * agent's name to the end, its edges kept (asTyped: a pasted snippet's braces, a last full stop). A reply that names one
+ * of the offered choices takes that choice's exact words.
+ */
 function answerIntent(base, focus, ask) {
   const toks = stripSoft(base);
-  let text = spanText(toks).replace(/[\s,]+$/, '').trim();
+  let text = asTyped(toks).replace(/,+$/, '').trim();
   const said = toks.map(t => t.w).join(' ');
   const options = Array.isArray(ask.options) ? ask.options.filter(o => typeof o === 'string') : [];
   // A reply that names one of the offered choices uses that choice's exact words, also past a reaction ("yeah stop it"
@@ -2306,29 +2291,48 @@ export function parseCommand(text, ctx) {
   }
 }
 
+/**
+ * What the words are, in order. 1. Answers to what is on screen: a card's yes or no, the words for full permissions, a
+ * permission's reply. 2. A command after a never-mind. 3. Workbench's own commands (stop, status and what needs me, merge,
+ * throw away, forget, tell, continue, changes, machines, connect). 4. The answer to a question. 5. Anything else is the
+ * prompt for a new agent, exactly as typed (`said`): there is no dead end, and no word back in place of work. `unknown`
+ * is left for three things only: nothing said; a yes that is not enough for the card on screen, or one asked rather than
+ * said (the card stays, and the engine says how to answer it); and words that answer nothing while a permission waits
+ * (the engine says so). With `free` false (the words after a never-mind), what would be the prompt is `unknown`.
+ */
 function parse(said, c, { free = true } = {}) {
   const base = lex(said).filter(t => !DISFLUENCY.has(t.w));
-  if (!base.length) return { kind: 'unknown', text: said };
   const holder = c.asker; // the focused agent, or its one helper that is waiting on the person
   const ask = holder ? holder.ask : null;
+  const card = liveCard(c);
+  const waiting = !!ask && (ask.type === 'question' || ask.type === 'stuck');
+  // A card on screen takes the words first: what it does not take never reaches a permission behind it.
+  const permission = !!ask && ask.type === 'permission' && !card;
+  const prompt = free ? { kind: 'task', task: said } : { kind: 'unknown', text: said };
+  // Nothing but filler, symbols or emoji ("👍", "hmm", "}"): typed, it is said all the same.
+  if (!base.length) {
+    if (!said) return { kind: 'unknown', text: said };
+    if (card) return prompt;
+    if (waiting) return { kind: 'answer', agentId: holder.id, askId: ask.id ?? null, text: said };
+    if (permission) return { kind: 'unknown', text: said };
+    return prompt;
+  }
   // Replies to a card or a permission may open with the agent's name: "claude, yes", "claude, allow it".
   const replyBase = addressedRest(base) || base;
 
   // 1. A confirm on screen is waiting for "yes" or "cancel" (only the one the page shows: see the engine).
   // "is that right?" asks about the card rather than answering it: it settles nothing, and the card stays. So does a
-  // yes that is not enough for that card (a bare "yes" to throwing work away): it never falls through to an answer.
+  // yes that is not enough for that card (a bare "yes" to throwing work away): it never falls through to a prompt.
   if (c.pendingConfirm) {
     const go = confirmReply(replyBase, c.pendingConfirm.kind, c);
     if (go === 'asks' || go === 'keep') return { kind: 'unknown', text: said };
     if (go !== null) return { kind: 'confirm', go };
   }
-  // 2. The focused agent is waiting for permission.
-  const permission = ask && ask.type === 'permission';
   // Full permissions, said whole, come before a permission's own reply: "allow everything" and "don't ask me" would
   // otherwise be a no that carries those words. "yes" is no such word, so a yes still allows. While a question waits,
-  // they are its answer (step 3). Only the whole utterance counts: after an agent's name ("claude, stop asking",
+  // they are its answer (below). Only the whole utterance counts: after an agent's name ("claude, stop asking",
   // "Onboarding, ask first") the words are work or a message for that agent, as before.
-  if (!(ask && (ask.type === 'question' || ask.type === 'stuck'))) {
+  if (!waiting) {
     const mode = matchPermissions(base, c);
     if (mode) return mode.intent;
   }
@@ -2338,25 +2342,27 @@ function parse(said, c, { free = true } = {}) {
     if (r.conditional) intent.conditional = true;
     return intent;
   };
+  // The focused agent is waiting for permission.
   if (permission) {
     const r = permissionReply(replyBase);
-    // "is it okay?" gets what exactly is asked for, and the request keeps waiting (as in step 5).
+    // "is it okay?" gets what exactly is asked for, and the request keeps waiting (as below).
     if (r && r.kind === 'asks') return { kind: 'status', agentId: holder.id };
     if (r) return reply(r);
   }
-  const waiting = ask && (ask.type === 'question' || ask.type === 'stuck');
-  // Nothing on screen waits for these words: no card that still waits, and no permission (a question takes them as its
-  // answer, below). Only then are words that are no command a prompt, or a bare acknowledgement.
-  const nothingWaits = free && (!c.pendingConfirm || c.pendingConfirm.gone) && !permission;
-  // "never mind, fix the checkout bug", "forget it, just stop the flaky test": a command or work after the never-mind is
-  // what is asked; a never-mind alone, or with a reason ("never mind, I fixed it"), asks nothing: with nothing on screen
-  // it is a bare acknowledgement, and a card keeps its hint. While a question waits, the whole reply is its answer.
+  // Two helpers of the agent in the centre wait: a yes or a no is for one of them, and the engine says which wait.
+  if (!card && !ask && helpersWait(c)) {
+    const r = permissionReply(replyBase);
+    if (r && (r.kind === 'allow' || r.kind === 'deny')) return { kind: r.kind, agentId: c.focusId, askId: null };
+  }
+  // 2. "never mind, fix the checkout bug", "forget it, just stop the flaky test": a command after the never-mind is what is
+  // asked. Anything else after it, or a never-mind alone, is said as it is: the prompt, never-mind and all ("never
+  // mind, the login page is broken"), or a card's no, or a question's answer.
   if (!waiting && !permission) {
     const nm = neverMind(base);
-    if (nm === 'alone') return nothingWaits ? { kind: 'ack' } : { kind: 'unknown', text: said };
-    if (nm) {
+    if (nm && nm !== 'alone') {
       const r = parse(said.slice(nm.start), c, { free: false });
-      return r.kind !== 'unknown' ? r : nothingWaits ? { kind: 'ack' } : { kind: 'unknown', text: said };
+      if (r.kind !== 'unknown' && r.kind !== 'task' && !(r.kind === 'start' && r.tasks?.length)) return r;
+      return prompt;
     }
   }
   // 3. Commands. While a question waits, only unmistakable commands win over an answer.
@@ -2368,7 +2374,7 @@ function parse(said, c, { free = true } = {}) {
   const brk = reacted.length < core.length && base.some(t => t.tail && t.end <= reacted[0].start);
   let found = null;
   // An agent's name with a comma or colon, then a command: the command ("claude, stop the flaky test", "codex: what
-  // needs me?", "claude stop"). Work after a name is a launch for that agent (matchStart, matchAddressed).
+  // needs me?", "claude stop"). Work after a name is a start for that agent (matchStart, matchAddressed).
   const voc = vocativeRest(core, c) || agentAddressed(core, c);
   if (voc) found = voc;
   if (!found) found = matchCommand(core, c, base);
@@ -2395,33 +2401,33 @@ function parse(said, c, { free = true } = {}) {
   // Words about the card on screen that it cannot act on ("show me the changes" on a card that does not say whose work
   // it is): the card stays, with its hint.
   if (found && found.intent.kind === 'unknown') return { kind: 'unknown', text: said };
+  // Work that a command's verb led ("stop the flaky test from timing out", "warn the user when …") is the prompt, as typed.
+  if (found && found.intent.kind === 'task') found = { ...found, intent: prompt };
   if (found && (found.strong || !waiting)) return found.intent;
+  // 4. The answer to the question or stuck ask on screen: the whole reply, as typed.
   if (waiting) return answerIntent(addressedRest(base) || base, holder, ask);
-  // 4. A work request with no start verb. Past a reaction only after a break, and with nothing on screen to answer:
-  // "yes, add tests too" on a launch card is no new launch, and "nice work on the parser" is praise. Never a bare
-  // acknowledgement that starts like work ("see you later").
-  const calm = !c.pendingConfirm && !permission;
-  const notWork = nothingWaits && !!acknowledgement(base);
-  const task = notWork ? null : matchTask(core, c) || (brk && calm ? matchTask(reacted, c) : null);
-  if (task) return task;
-  // 5. Words for the permission that are no command and no work. A question about it ("do I need to approve this?")
-  // gets what exactly it asks for, and the request keeps waiting; words that start like a yes or a no but say more
-  // are a no that carries them.
+  // A work request with no start verb ("fix the login redirect"): the prompt, or a start for the program or machine it
+  // names. Past a reaction only after a break, and with nothing on screen to answer: "yes, add tests too" on a card is
+  // no new work. With a permission waiting it is work all the same, as it was.
+  const calm = !card && !permission;
+  const work = matchTask(core, c) || (brk && calm ? matchTask(reacted, c) : null);
+  if (work) return work.kind === 'task' ? prompt : work;
+  // Words for the permission that are no command and no work. A question about it ("do I need to approve this?") gets
+  // what exactly it asks for, and the request keeps waiting; words that start like a yes or a no but say more are a no
+  // that carries them. Anything else answers nothing: the engine says the permission waits ("… is waiting for your OK").
   if (permission) {
     if (asksSomething(replyBase)) return { kind: 'status', agentId: holder.id };
     const r = looseReply(replyBase);
-    if (r) return reply(r);
+    return r ? reply(r) : { kind: 'unknown', text: said };
   }
-  // 6. Anything else is a prompt for a new agent (or, about an agent, its status), and a bare acknowledgement is an ack:
-  // there is no dead end. Not while a card or a request for permission waits: there, words that are no answer stay
-  // unknown, and the card keeps its hint. A card that has run out waits for nothing. After a reaction and a break, the
-  // rest is a sentence of its own ("thanks! the footer is broken too"); a reaction run into the words is part of them
-  // ("great job on the login fix" is praise).
-  if (nothingWaits) {
-    const r = matchFreeWork(brk ? reacted : core, c, base, said, brk ? null : leadOf(base));
+  // 5. Free text: words about an agent are its status, and a program named makes them work for it; anything else is the
+  // prompt, exactly as typed. With a card on screen the card stays where it is (the engine keeps it). After a reaction
+  // and a break, the rest is read by itself for a status ("thanks! is it done?").
+  if (free) {
+    const r = matchFreeWork(brk ? reacted : core, c, base);
     if (r) return r;
   }
-  return { kind: 'unknown', text: said };
+  return prompt;
 }
 
 const NEVER_MIND = [['never', 'mind'], ['forget', 'about', 'it'], ['forget', 'about', 'that'], ['forget', 'it'], ['forget', 'that'],
@@ -2475,7 +2481,7 @@ function agentAddressed(core, c) {
   const r = matchCommand(rest, { ...c, focusId: a.id, focus: a, asker: null }, rest);
   // full permissions are Workbench's, never an agent's: "Onboarding, ask first" is a message to it
   if (r && !['start', 'task', 'unknown', 'permissions'].includes(r.intent.kind)) return r;
-  const text = tidy(spanText(rest));
+  const text = asTyped(rest);
   return text ? { intent: { kind: 'say', agentId: a.id, text, sure: false }, strong: false } : null;
 }
 
@@ -2483,14 +2489,6 @@ function agentAddressed(core, c) {
 const WANT = /^(?:(?:i|we) (?:want|need|would like|should|have) to|we should|you should|i think we should|let's) /;
 function saysWant(base) {
   return WANT.test(stripSoft(base).map(t => t.w).join(' ') + ' ');
-}
-
-/** How the words start: 'praise' ("thanks", "great"), 'answer' ("yes", "no", "ok but"), or null. */
-function leadOf(base) {
-  const w = base[0].w;
-  if (PRAISE.has(w)) return 'praise';
-  if (ANSWER_LEAD.has(w) || (['okay', 'fine', 'alright'].includes(w) && base[1]?.w === 'but')) return 'answer';
-  return null;
 }
 
 /** The words after an agent's name and its comma or colon ("claude, yes"), else null. */
@@ -2526,11 +2524,10 @@ function matchCommand(core, c, base = core) {
   if (!core.length) return null;
   const ws = core.map(t => t.w);
   if (matchStopAll(ws)) return { intent: { kind: 'stop_all' }, strong: true };
-  // Help and Agents & keys take only their own words whole, so they come first: "open agents and keys" would be a
-  // launch of "keys", and "connect github" work. Changes, merge and throw-away come before status: "what did search
-  // cleanup change" and "show search cleanup's changes" were status questions, and still are when they name no agent.
-  return matchHelp(core, base, c)
-    || matchConnect(core)
+  // Agents & keys takes only its own words whole, so it comes first: "open agents and keys" would be a start on
+  // "keys", and "connect github" work. Changes, merge and throw-away come before status: "what did search cleanup
+  // change" and "show search cleanup's changes" were status questions, and still are when they name no agent.
+  return matchConnect(core)
     || matchPermissions(base, c)
     || matchMachines(core, c)
     || matchStop(core, c)
@@ -2610,8 +2607,9 @@ function describeStart(tasks, c) {
 }
 
 /**
- * A plain sentence describing an intent, for a confirm card.
- * "Start Claude on “fix the flaky checkout test”?"
+ * A plain sentence describing an intent, for a confirm card: "Stop Flaky test?", "Tell Onboarding “use the new copy”?".
+ * The engine asks first only for a stop or a message whose words did not name the agent; work starts at once, so the
+ * sentence for a start ("Start Claude on “fix the flaky checkout test”?") is for other callers.
  */
 export function describeIntent(intent, ctx) {
   const c = context(ctx);

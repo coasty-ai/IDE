@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCommand, describeIntent, HELP_REPLY } from '../src/core/commands.mjs';
+import { parseCommand, describeIntent } from '../src/core/commands.mjs';
 import { nameFromTask } from '../src/shared/narrate.mjs';
 
 // A small world like the demo seed. Asks sit on the agents, as in AgentView.
@@ -128,10 +128,9 @@ const start = (...tasks) => ({ kind: 'start', tasks: tasks.map(([task, harness =
 const allow = { kind: 'allow', agentId: 'a1b2c3', askId: 'ask-perm' };
 const deny = { kind: 'deny', agentId: 'a1b2c3', askId: 'ask-perm' };
 const answer = (text, agentId = 'd4e5f6', askId = 'ask-q') => ({ kind: 'answer', agentId, askId, text });
-/** Bare acknowledgements with nothing waiting start nothing: thanks and praise, a yes or a no to nothing, the rest. */
-const ack = { kind: 'ack' };
-const thanks = { kind: 'ack', thanks: true };
-const noReply = { kind: 'ack', reply: true };
+/** Anything that is no command and no answer is the prompt for a new agent: the person's words, exactly as typed. */
+const task = t => ({ kind: 'task', task: t });
+const unknown = t => ({ kind: 'unknown', text: t });
 
 // [what the person typed or said, context, expected intent]
 const TABLE = [
@@ -170,7 +169,7 @@ const TABLE = [
   ['Start Claude and Codex on the checkout bug, each on its own cloud machine.', 'none',
     start(['the checkout bug', 'claude', 'cloud'], ['the checkout bug', 'codex', 'cloud'])],
   ["What's checkout fix doing?", 'none', { kind: 'status', agentId: 'a1b2c3' }],
-  ['Update the docs for the new API.', 'none', { kind: 'task', task: 'Update the docs for the new API' }],
+  ['Update the docs for the new API.', 'none', { kind: 'task', task: 'Update the docs for the new API.' }], // the prompt, as typed
   ['new agent: fix the login page', 'none', start(['fix the login page'])],
   ['codex, write tests for the parser', 'none', start(['write tests for the parser', 'codex'])],
   ['message flaky test: try a longer timeout', 'none', { kind: 'say', agentId: '0a0b0c', text: 'try a longer timeout' }],
@@ -185,7 +184,7 @@ const TABLE = [
   ['whats checkout fix doing', 'none', { kind: 'status', agentId: 'a1b2c3' }],
   ['how much have i spent', 'none', { kind: 'spend' }],
   ['whats my spend', 'none', { kind: 'spend' }],
-  ['can you please fix the login redirect', 'none', { kind: 'task', task: 'fix the login redirect' }],
+  ['can you please fix the login redirect', 'none', { kind: 'task', task: 'can you please fix the login redirect' }],
   ['could you spin up an agent for the checkout bug', 'none', start(['the checkout bug'])],
   ['uh start a codex agent to refactor the payments module', 'none', start(['refactor the payments module', 'codex'])],
   ['start code x on the parser', 'none', start(['the parser', 'codex'])],
@@ -324,15 +323,15 @@ const TABLE = [
   ['message the help pages team about billing', 'none', { kind: 'say', agentId: '4d5e6f', text: 'team about billing', sure: false }],
 
   // --- Nothing waiting: a short reply starts nothing (the engine says nothing waits for a yes or no); anything else is a prompt
-  ['yes', 'none', noReply],
-  ['do it', 'none', noReply],
-  ['go ahead', 'none', noReply],
-  ['cancel', 'onboarding', noReply],
+  ['yes', 'none', task('yes')],
+  ['do it', 'none', task('do it')],
+  ['go ahead', 'none', task('go ahead')],
+  ['cancel', 'onboarding', task('cancel')],
   ['fix it', 'none', { kind: 'task', task: 'fix it' }],
-  ['start the agent', 'none', { kind: 'unknown', text: 'start the agent' }], // one that exists: no new launch
+  ['start the agent', 'none', { kind: 'start', tasks: [], task: null, harness: null }], // the engine asks what it should work on
   ['why is the build slow', 'none', { kind: 'task', task: 'why is the build slow' }], // a question is work, as a prompt
   ['', 'none', { kind: 'unknown', text: '' }],
-  ['um uh', 'none', { kind: 'unknown', text: 'um uh' }],
+  ['um uh', 'none', { kind: 'task', task: 'um uh' }], // typed, filler is said all the same (spoken, the page sends nothing)
 ];
 
 test(`parseCommand handles ${TABLE.length} phrasings`, () => {
@@ -379,7 +378,7 @@ test('only a plain yes allows: a yes with conditions is a no that carries the wh
     // A clear yes followed by more words.
     ['yes but only in the tests folder', cond('yes but only in the tests folder')],
     ['allow it but only once', cond('allow it but only once')],
-    ['Yes, only the tests folder.', cond('Yes, only the tests folder')],
+    ['Yes, only the tests folder.', cond('Yes, only the tests folder.')],
     ['sure but only in tests', cond('sure but only in tests')],
     ['approve the onboarding copy changes', cond('approve the onboarding copy changes')],
     ['so yes but not on main', cond('yes but not on main')],
@@ -395,7 +394,7 @@ test('only a plain yes allows: a yes with conditions is a no that carries the wh
     // Commands and work still win when they come first, and a question that is no reply leaves the request waiting.
     ['go to search cleanup', { kind: 'status', agentId: 'd4e5f6' }],
     ['okay what needs me', { kind: 'status', needsMe: true }],
-    ['okay fix the login redirect', { kind: 'task', task: 'fix the login redirect' }],
+    ['okay fix the login redirect', { kind: 'task', task: 'okay fix the login redirect' }],
     ['ok stop it', { kind: 'stop', agentIds: ['a1b2c3'] }],
     ['do it but only in the tests folder', cond('do it but only in the tests folder')],
     // A question about the request answers nothing: it gets what exactly is asked for, and the request waits.
@@ -415,8 +414,8 @@ test('only a plain yes allows: a yes with conditions is a no that carries the wh
     try { assert.deepEqual(got, expected); } catch { failures.push(`${JSON.stringify(text)}\n    expected ${JSON.stringify(expected)}\n    got      ${JSON.stringify(got)}`); }
   }
   assert.equal(failures.length, 0, '\n' + failures.join('\n'));
-  // Without a permission waiting, the same words are not answers: a yes or a no to nothing, which starts nothing.
-  assert.deepEqual(parseCommand('ok but not on main', CTX.none), noReply);
+  // Without a permission waiting, the same words are not answers: they are the prompt, as typed.
+  assert.deepEqual(parseCommand('ok but not on main', CTX.none), task('ok but not on main'));
 });
 
 test('a yes asked rather than said answers nothing: at a permission it is a status, and a card stays', () => {
@@ -508,9 +507,9 @@ test('a short reply goes to the helper that waits when its root is focused', () 
   ];
   assert.deepEqual(parseCommand('yes', { agents: tree, focusId: 'b0b0b0' }), { kind: 'allow', agentId: 'b0b0b0-33333333', askId: 'ask-helper' });
   assert.deepEqual(parseCommand('no', { agents: tree, focusId: 'b0b0b0' }), { kind: 'deny', agentId: 'b0b0b0-33333333', askId: 'ask-helper' });
-  // Two helpers waiting: not clear which one, so "yes" means nothing.
+  // Two helpers waiting: not clear which one, so a yes goes to the agent, and the engine says which helpers wait.
   const two = tree.map(a => (a.id === 'b0b0b0-44444444' ? { ...a, ask: { id: 'ask-2', type: 'question', sentence: 'Which tone?', options: [] } } : a));
-  assert.deepEqual(parseCommand('yes', { agents: two, focusId: 'b0b0b0' }), { kind: 'unknown', text: 'yes' });
+  assert.deepEqual(parseCommand('yes', { agents: two, focusId: 'b0b0b0' }), { kind: 'allow', agentId: 'b0b0b0', askId: null });
 });
 
 test('the default machine is the laptop from ctx, or "laptop" when there is none', () => {
@@ -585,8 +584,6 @@ const ctxOf = name => CTX[name] || DOG[name] || NAMED[name];
 const changes = agentId => ({ kind: 'changes', agentId });
 const merge = (agentId, into) => (into ? { kind: 'merge', agentId, into } : { kind: 'merge', agentId });
 const discard = agentId => ({ kind: 'discard', agentId });
-const task = t => ({ kind: 'task', task: t });
-const unknown = t => ({ kind: 'unknown', text: t });
 const yes = { kind: 'confirm', go: true };
 const no = { kind: 'confirm', go: false };
 
@@ -690,8 +687,8 @@ const SOURCE_CONTROL = [
   ['bring over the changes', 'invoice', merge('1a2b3c')],
   ["bring invoice export's changes in", 'none', merge('1a2b3c')],
   ["bring in invoice export's changes", 'none', merge('1a2b3c')],
-  ['merge it', 'none', merge(null)], // nothing focused: the engine asks which one
-  ['merge', 'none', merge(null)],
+  ['merge it', 'none', { kind: 'merge', agentId: null, bare: true }], // nothing focused: the engine takes the one it could merge, or asks which
+  ['merge', 'none', { kind: 'merge', agentId: null, bare: true }],
   ['merge it', 'helper', merge('a1b2c3')], // a helper works in its agent's folder
   ['merge a1b2c3-11111111', 'none', merge('a1b2c3')], // a helper's id stands for its agent
 
@@ -717,7 +714,7 @@ const SOURCE_CONTROL = [
   ['throw away all of its changes', 'invoice', discard('1a2b3c')],
   ["throw away it's changes", 'invoice', discard('1a2b3c')], // "it's" typed for "its"
   ['discard it', 'onboarding', discard('7a8b9c')], // still working: the engine says it will be stopped first
-  ['discard it', 'none', discard(null)],
+  ['discard it', 'none', { kind: 'discard', agentId: null, bare: true }],
   ['discard it', 'helper', discard('a1b2c3')],
 ];
 
@@ -739,7 +736,7 @@ test('the new words never take over work, answers or replies to a permission', (
     ['merge it with main', 'invoice', task('merge it with main')],
     ['merge it into the wizard', 'invoice', task('merge it into the wizard')],
     ['merge it into develop', 'invoice', task('merge it into develop')], // a branch it cannot check: see the "into" test
-    ['merge everything', 'none', task('merge everything')],
+    ['merge everything', 'none', { kind: 'merge', agentId: null, bare: true }], // the engine takes the one it could merge, or asks which
     ['merge the done one', 'none', task('merge the done one')], // state words find, never name
     ['merge the flaky checkout test', 'none', task('merge the flaky checkout test')], // task words, not its name
     ['merge search', 'none', task('merge search')], // one word of a two-word name
@@ -749,7 +746,7 @@ test('the new words never take over work, answers or replies to a permission', (
     ['merge invoice export and help pages', 'none', task('merge invoice export and help pages')], // one at a time
     // Words that name no agent's work are a prompt with the words as written; with nothing but "it" or "them" they still
     // address an agent, and keep their old meaning.
-    ['merge them', 'invoice', unknown('merge them')],
+    ['merge them', 'invoice', merge('1a2b3c')],
     ['discard unused imports', 'none', task('discard unused imports')],
     ['discard unused imports', 'invoice', task('discard unused imports')],
     ['discard my changes', 'invoice', task('discard my changes')], // the person's own, never an agent's
@@ -758,17 +755,17 @@ test('the new words never take over work, answers or replies to a permission', (
     ['discard all changes', 'invoice', task('discard all changes')],
     ['discard changes', 'invoice', task('discard changes')],
     ['discard read cart code', 'none', task('discard read cart code')],
-    ['discard', 'invoice', unknown('discard')], // throwing away needs an object
-    ['throw away', 'invoice', unknown('throw away')],
+    ['discard', 'invoice', discard('1a2b3c')], // the agent in the centre, asked first
+    ['throw away', 'invoice', discard('1a2b3c')],
     ['throw away the old logs', 'none', task('throw away the old logs')],
     ['throw an error when the token expires', 'none', task('throw an error when the token expires')], // "throw" throws away only with "away" or "out"
     ['scrap the old parser', 'none', task('scrap the old parser')],
     // "scrap that" is never mind ("scratch that"), even with an agent in the centre; "scrap it" asks to throw its work away.
-    ['scrap that', 'invoice', ack],
-    ['trash this', 'invoice', ack],
-    ['scrap that', 'none', ack],
-    ['scrap that now', 'invoice', ack],
-    ['scrap that idea', 'invoice', ack],
+    ['scrap that', 'invoice', task('scrap that')],
+    ['trash this', 'invoice', task('trash this')],
+    ['scrap that', 'none', task('scrap that')],
+    ['scrap that now', 'invoice', task('scrap that now')],
+    ['scrap that idea', 'invoice', task('scrap that idea')],
     ['land the plane', 'none', task('land the plane')],
     ['show the error on the login page', 'none', task('show the error on the login page')],
     ['show the error on the login page', 'invoice', task('show the error on the login page')],
@@ -928,7 +925,7 @@ test('merge and throw-away name the agent: dogfood names, same-named twins, earl
   assert.deepEqual(parseCommand('merge search cleanup v2', v2), merge('bb0002'));
   assert.deepEqual(parseCommand('merge search clean', v2), task('merge search clean'));
   // A helper whose agent is not in the list stands for nothing.
-  assert.deepEqual(parseCommand('discard it', { agents: [{ id: 'q-1', name: 'Lost helper', kind: 'helper', parentId: 'gone' }], focusId: 'q-1' }), discard(null));
+  assert.deepEqual(parseCommand('discard it', { agents: [{ id: 'q-1', name: 'Lost helper', kind: 'helper', parentId: 'gone' }], focusId: 'q-1' }), { kind: 'discard', agentId: null, bare: true });
 });
 
 test('words that two names share, and that are neither one\'s whole name, name no agent: they keep their old meaning', () => {
@@ -1079,8 +1076,9 @@ test('cards take their own words: "start it" only for a launch, "merge it" for a
     // The dogfood world's cards.
     ['merge it', 'dogPendingMerge', yes], ['merge the merge command', 'dogPendingMerge', merge('aa0001')],
     ['throw it away', 'dogPendingDiscard', yes], ['yes', 'dogPendingDiscard', unknown('yes')],
-    // A card that ran out: "it" is still the card, so the engine can say it is no longer waiting; a name is a new command.
-    ['merge it', 'pendingGone', unknown('merge it')], ['throw it away', 'pendingGone', unknown('throw it away')],
+    // A card that ran out: its yes hears so; "merge it" and "throw it away" are a card again, asked first (for the agent of the
+    // card that ran out when it said one; here the engine takes the one it could act on, or asks which), never new work.
+    ['merge it', 'pendingGone', { kind: 'merge', agentId: null, bare: true }], ['throw it away', 'pendingGone', { kind: 'discard', agentId: null, bare: true }],
     ['yes', 'pendingGone', yes], ['merge invoice export', 'pendingGone', merge('1a2b3c')],
     ["don't scrap it", 'pendingDiscard', unknown("don't scrap it")], // not its words: the card stays, with its hint
   ]);
@@ -1158,7 +1156,7 @@ test('on a merge or throw-away card, review words show its work; they never with
     // The card's own words still answer it.
     ['merge it', 'pendingMergeOf', yes], ['do it', 'pendingMergeOf', yes], ['cancel', 'pendingMergeOf', no],
     ['throw it away', 'pendingDiscardOf', yes], ['keep it', 'pendingDiscardOf', no], ['yes', 'pendingDiscardOf', unknown('yes')],
-    ['discard it', 'pendingMergeOf', unknown('discard it')],
+    ['discard it', 'pendingMergeOf', discard('1a2b3c')], // "it" is the card's agent: its throw-away card, asked first
     // A name is another agent's work, whatever card waits.
     ["show me help pages' changes", 'pendingMergeOf', changes('4d5e6f')],
     ['what did help pages change', 'pendingDiscardOf', changes('4d5e6f')],
@@ -1170,7 +1168,7 @@ test('on a merge or throw-away card, review words show its work; they never with
     ['show me the diff the way git does', 'pendingDiscardOf', unknown('show me the diff the way git does')],
     // Work that is not a review keeps its old meaning.
     ['show the error on the login page', 'pendingMergeOf', task('show the error on the login page')],
-    ['review it', 'pendingMergeOf', unknown('review it')],
+    ['review it', 'pendingMergeOf', changes('1a2b3c')], // "it" is the card's: its work
     ['check the tests first', 'pendingMergeOf', { kind: 'status', agentId: '0a0b0c' }], // as before: no word for the work
     // Without a card, review words keep their old meaning: "review the changes" is work, and a question takes the words.
     ['review the changes', 'invoice', task('review the changes')],
@@ -1179,10 +1177,14 @@ test('on a merge or throw-away card, review words show its work; they never with
   ]);
   // Only a merge or throw-away card has work to show: on the other cards the words are what they were.
   for (const text of ['show me the changes', 'what changed', 'review the changes']) {
-    for (const ctxName of ['pending', 'pendingStart', 'pendingStop', 'pendingSay', 'pendingForget', 'pendingGone']) {
+    for (const ctxName of ['pending', 'pendingStart', 'pendingStop', 'pendingSay', 'pendingForget']) {
       assert.notEqual(parseCommand(text, CTX[ctxName]).kind, 'changes', `${text} [${ctxName}]`);
     }
   }
+  // A card that ran out waits for nothing: the words are as with nothing on screen, and "the changes" are those of the
+  // agent its card was about, when it said one (the engine asks which one when no agent is meant).
+  assert.deepEqual(parseCommand('show me the changes', CTX.pendingGone), changes(null));
+  assert.deepEqual(parseCommand('show me the changes', SWEPT.boardGoneOf), changes('d00001'));
 });
 
 test('"stop an agent to fix the login" is a launch, not a stop of "Login fix"; "forget an agent …" forgets nothing', () => {
@@ -1323,34 +1325,34 @@ function rows(list) {
   assert.equal(failures.length, 0, '\n' + failures.join('\n'));
 }
 
-const help = { kind: 'help' };
 const connect = { kind: 'connect' };
 const noWork = { kind: 'start', tasks: [], task: null, harness: null };
 /** A start with no work that names one agent: the engine asks what that agent should work on. */
 const noWorkFor = (harness) => ({ ...noWork, harness });
 
-test('help: the words, greetings, and the reply the engine gives them', () => {
-  // Short, so it fits three lines under the DRAM at the narrowest board, and it says where agents are set up.
-  assert.equal(HELP_REPLY, 'Say what to work on, like “fix the login bug”. Or ask “what needs me”, or “stop everything”. Agents & keys sets up agents.');
-  const said = ['help', 'Help!', 'help me', 'help?', 'can you help', 'please help', 'I need help', 'hi', 'Hello', 'hey', 'hello there',
-    'Hi again', 'hey workbench', 'um hi', 'good morning', 'what can you do', 'What can you do?', 'what can I say', 'how does this work',
-    'How does this work?', 'so how does it work', 'what is this', 'commands'];
-  rows(said.flatMap(text => [[text, 'none', help], [text, 'onboarding', help], [text, 'invoice', help]]));
+test('help and greetings are no command of Workbench\'s: like any other words, they are a prompt, as typed', () => {
+  const words = ['help', 'Help!', 'help me', 'help?', 'can you help', 'please help', 'I need help', 'hi', 'Hello', 'hey', 'hello there',
+    'Hi again', 'hey workbench', 'um hi', 'good morning', 'what can you do', 'What can you do?', 'what can I say', 'commands'];
+  rows(words.flatMap(text => [[text, 'none', task(text)], [text, 'onboarding', task(text)], [text, 'invoice', task(text)]]));
+  // A question that points at what is on screen asks about the agent there, when there is one, as such questions do
+  for (const text of ['how does this work', 'How does this work?', 'so how does it work', 'what is this']) {
+    rows([[text, 'none', task(text)], [text, 'onboarding', { kind: 'status', agentId: '7a8b9c' }], [text, 'invoice', { kind: 'status', agentId: '1a2b3c' }]]);
+  }
   rows([
     // While a question or a stuck ask waits, the words are its answer.
     ['help', 'question', answer('help')],
     ['how does this work', 'question', answer('how does this work')],
     ['hi', 'stuck', answer('hi', '0a0b0c', 'ask-stuck')],
-    // At a permission they are about the request: a question gets what exactly it asks for.
+    // At a permission they are about the request: a question gets what exactly it asks for; else its hint.
     ['what do i do', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
     ['how does this work?', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
     ['help', 'permission', unknown('help')],
-    // On a card they settle nothing: the card stays, with its own hint.
-    ['help', 'pendingStart', unknown('help')],
-    ['hi', 'pendingMerge', unknown('hi')],
-    ['what can you do', 'pendingDiscardOf', unknown('what can you do')],
-    // Words that only begin like help, or greet and then ask, keep their meaning.
-    ['help me fix the login bug', 'none', task('fix the login bug')],
+    // On a card they are a prompt, and the card stays.
+    ['help', 'pendingStart', task('help')],
+    ['hi', 'pendingMerge', task('hi')],
+    ['what can you do', 'pendingDiscardOf', task('what can you do')],
+    // Words that greet and then ask a command keep their meaning; work after them is the prompt, as typed.
+    ['help me fix the login bug', 'none', task('help me fix the login bug')],
     ['hey workbench what is happening', 'none', { kind: 'status' }],
     ['hi, what needs me', 'none', { kind: 'status', needsMe: true }],
     ['how is help pages doing', 'none', { kind: 'status', agentId: '4d5e6f' }],
@@ -1417,10 +1419,10 @@ test('a start with no work asks what the agent should work on; naming an agent w
     ['have codex', 'stuck', answer('have codex', '0a0b0c', 'ask-stuck')],
     ['use codex', 'none', noWorkFor('codex')],
     // An agent that exists, or a name alone, is no new launch.
-    ['start the agent', 'none', unknown('start the agent')],
-    ['codex', 'none', unknown('codex')],
-    ['agent', 'none', unknown('agent')],
-    ['the new agent', 'none', unknown('the new agent')],
+    ['start the agent', 'none', noWork],
+    ['codex', 'none', noWorkFor('codex')],
+    ['agent', 'none', noWork],
+    ['the new agent', 'none', noWork],
     // With work, it is the launch it always was; "start it" still answers a launch card.
     ['start an agent to fix the login', 'none', start(['fix the login'])],
     ['new agent: fix the login page', 'none', start(['fix the login page'])],
@@ -1450,20 +1452,20 @@ test('a start with no work keeps the one agent it names, so the engine asks what
   ]);
 });
 
-test('"work on X" is work, like "fix X": its task is what comes after "work on"', () => {
+test('"work on X" is work, like "fix X": the prompt is the words as typed, or a start for the agent or machine named', () => {
   rows([
-    ['work on the login bug', 'none', task('the login bug')],
-    ['Work on the login bug.', 'none', task('the login bug')],
-    ['please work on the docs', 'none', task('the docs')],
-    ["let's work on the flaky test", 'none', task('the flaky test')],
-    ['can you work on fixing the parser', 'none', task('fixing the parser')],
+    ['work on the login bug', 'none', task('work on the login bug')],
+    ['Work on the login bug.', 'none', task('Work on the login bug.')],
+    ['please work on the docs', 'none', task('please work on the docs')],
+    ["let's work on the flaky test", 'none', task("let's work on the flaky test")],
+    ['can you work on fixing the parser', 'none', task('can you work on fixing the parser')],
     // The same words after a start: one task text either way.
     ['start an agent working on the login bug', 'none', start(['the login bug'])],
     // An agent or a machine named makes it a launch.
     ['work on the login bug using codex', 'none', start(['the login bug', 'codex'])],
     ['work on the parser on cloud 2', 'none', start(['the parser', null, 'cloud-2'])],
     // Nothing to work on, or a question waiting: as for other work.
-    ['work on it', 'none', task('work on it')], // a prompt like any other: the launch card is the check
+    ['work on it', 'none', task('work on it')], // a prompt like any other
     ['work on', 'none', task('work on')],
     ['work on the login bug', 'question', answer('work on the login bug')],
     ['work queue', 'dogNone', { kind: 'status', agentId: '220009' }], // its name alone: how it is doing
@@ -1492,15 +1494,15 @@ test('anything else that says something is work, as a prompt is to a coding agen
   checkRows([
     // What people type to a coding agent: problems, wants, questions, labels, a link.
     ['the login page is broken', 'none', task('the login page is broken')],
-    ['There is a bug in the checkout flow.', 'none', task('There is a bug in the checkout flow')],
+    ['There is a bug in the checkout flow.', 'none', task('There is a bug in the checkout flow.')],
     ['tests are failing in CI', 'none', task('tests are failing in CI')],
     ['the app crashes when I click save', 'none', task('the app crashes when I click save')],
     ['I want a dark mode toggle', 'none', task('I want a dark mode toggle')],
     ['I need a function that sorts users by age', 'none', task('I need a function that sorts users by age')],
     ['why does the build fail?', 'none', task('why does the build fail?')],
     ['how do I run the tests?', 'none', task('how do I run the tests?')],
-    ['can you explain how the engine works?', 'none', task('explain how the engine works?')],
-    ['Hello! Can you help me build a website?', 'none', task('build a website?')],
+    ['can you explain how the engine works?', 'none', task('can you explain how the engine works?')],
+    ['Hello! Can you help me build a website?', 'none', task('Hello! Can you help me build a website?')],
     ['what does this repo do?', 'none', task('what does this repo do?')], // one word of work, in a question
     ['go through the code and find bugs', 'none', task('go through the code and find bugs')],
     ['dark mode for the settings page', 'none', task('dark mode for the settings page')],
@@ -1509,7 +1511,7 @@ test('anything else that says something is work, as a prompt is to a coding agen
     ['todo app in react', 'none', task('todo app in react')],
     ['https://github.com/acme/shop/issues/12', 'none', task('https://github.com/acme/shop/issues/12')],
     ['the login page is broken', 'onboarding', task('the login page is broken')], // an agent in the centre, asking nothing
-    ['um so the login page is like broken', 'none', task('the login page is like broken')], // spoken
+    ['um so the login page is like broken', 'none', task('um so the login page is like broken')], // as said
     // Said to an agent by name: that agent.
     ['claude fix the readme', 'none', start(['fix the readme', 'claude'])],
     ['claude code fix the readme', 'none', start(['fix the readme', 'claude'])],
@@ -1517,21 +1519,21 @@ test('anything else that says something is work, as a prompt is to a coding agen
     ['codex, the login page is broken', 'none', start(['the login page is broken', 'codex'])],
     ['Claude Code, please add tests', 'none', start(['add tests', 'claude'])],
     // Bare acknowledgements start nothing; words that only talk about an agent are no work; anything else is a prompt.
-    ['ok', 'none', ack],
-    ['thanks', 'none', thanks],
-    ['thank you so much', 'none', thanks],
-    ['sounds good', 'none', ack],
-    ['makes sense', 'none', ack],
-    ['never mind', 'none', ack],
-    ['good job', 'none', thanks],
-    ['go ahead', 'none', noReply],
+    ['ok', 'none', task('ok')],
+    ['thanks', 'none', task('thanks')],
+    ['thank you so much', 'none', task('thank you so much')],
+    ['sounds good', 'none', task('sounds good')],
+    ['makes sense', 'none', task('makes sense')],
+    ['never mind', 'none', task('never mind')],
+    ['good job', 'none', task('good job')],
+    ['go ahead', 'none', task('go ahead')],
     ['keep going', 'none', task('keep going')],
     ['is anyone there', 'none', task('is anyone there')],
     ['can you hear me', 'none', task('can you hear me')],
     ['readme', 'none', task('readme')], // one word is a prompt too
-    ['ok but not on main', 'none', noReply],
-    ['claude is stuck', 'none', unknown('claude is stuck')], // the agent's name is no work
-    ['claude code is stuck', 'none', unknown('claude code is stuck')],
+    ['ok but not on main', 'none', task('ok but not on main')],
+    ['claude is stuck', 'none', task('claude is stuck')], // said about a program, not to it: the prompt, for the default agent
+    ['claude code is stuck', 'none', task('claude code is stuck')],
     ['claude, stop', 'none', { kind: 'stop', agentIds: [] }], // the words after the name are a command: which one is not clear
     ['what is changing', 'invoice', task('what is changing')], // a thin question, with no agent's work named: a prompt
     ['scrap the old parser', 'none', task('scrap the old parser')], // throw-away words that name no agent: a prompt as written
@@ -1541,12 +1543,12 @@ test('anything else that says something is work, as a prompt is to a coding agen
     ['search cleanup', 'none', task('search cleanup')], // a name that starts with a work verb stays work, as before
     ['diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }], // ended, but named
     // Something waits: the words are for it, as before.
-    ['the login page is broken', 'pending', unknown('the login page is broken')], // a card keeps its hint
+    ['the login page is broken', 'pending', task('the login page is broken')], // a prompt, and the card stays
     ['the login page is broken', 'permission', unknown('the login page is broken')], // a permission waits
     ['the login page is broken', 'question', answer('the login page is broken')], // a question waits: the answer
   ]);
-  // A word said twice is still one word (with no agent whose words it could be): a microphone check, which starts nothing.
-  assert.deepEqual(parseCommand('testing testing', { agents: [] }), ack);
+  // A microphone check typed is the prompt too, as typed (spoken filler alone is the page's, and sends nothing).
+  assert.deepEqual(parseCommand('testing testing', { agents: [] }), task('testing testing'));
 });
 
 // ------------------------------------------------------------------ what a sweep of real prompts found
@@ -1588,7 +1590,7 @@ test('reports, wants and questions are work, not a stop, a message or a status o
     ['right panel is empty on mobile', 'empty', task('right panel is empty on mobile')], // the person's words, as typed
     ['the tests pass now', 'empty', task('the tests pass now')],
     ['login 🐛 is back', 'empty', task('login 🐛 is back')],
-    ['yeah the tests are failing', 'empty', task('the tests are failing')],
+    ['yeah the tests are failing', 'empty', task('yeah the tests are failing')],
     ['throw an error when the config is missing', 'none', task('throw an error when the config is missing')],
     ['stop the tests from failing', 'W', task('stop the tests from failing')], // never a stop of "Tests are failing"
     ['tell the user their session expired instead of a blank page', 'W', task('tell the user their session expired instead of a blank page')],
@@ -1596,7 +1598,7 @@ test('reports, wants and questions are work, not a stop, a message or a status o
     ['tell me why the build is slow', 'none', task('tell me why the build is slow')],
     ['tell me why the tests fail', 'none', task('tell me why the tests fail')],
     ['can you tell me why the build is slow?', 'none', task('can you tell me why the build is slow?')], // the person's words: "tell" is no work verb
-    ['we should tell people when a merge fails', 'dogNone', task('tell people when a merge fails')],
+    ['we should tell people when a merge fails', 'dogNone', task('we should tell people when a merge fails')],
     ['how are errors handled in the api?', 'W', task('how are errors handled in the api?')],
     ['is the login page broken?', 'none', task('is the login page broken?')],
     ['is the login page working?', 'none', task('is the login page working?')],
@@ -1609,9 +1611,9 @@ test('reports, wants and questions are work, not a stop, a message or a status o
     ['show a spinner while the invoice export runs', 'none', task('show a spinner while the invoice export runs')],
     ['add build status', 'none', task('add build status')],
     ['check this out https://github.com/acme/shop/issues/12', 'none', task('check this out https://github.com/acme/shop/issues/12')],
-    ['never mind, fix the checkout bug', 'none', task('fix the checkout bug')],
-    ['forget it just fix the checkout bug', 'none', task('fix the checkout bug')], // never a forget of Checkout fix
-    ['scrap that and fix the login bug', 'none', task('fix the login bug')],
+    ['never mind, fix the checkout bug', 'none', task('never mind, fix the checkout bug')],
+    ['forget it just fix the checkout bug', 'none', task('forget it just fix the checkout bug')], // never a forget of Checkout fix
+    ['scrap that and fix the login bug', 'none', task('scrap that and fix the login bug')],
     // An agent named, first or last, takes the work, as with a work verb.
     ['codex why is the build slow', 'empty', start(['why is the build slow', 'codex'])],
     ['the login page is broken using codex', 'empty', start(['the login page is broken', 'codex'])],
@@ -1644,10 +1646,10 @@ test('commands keep their meaning after a reaction, said twice, or said to an ag
     ['which agents are done?', 'onboarding', { kind: 'status' }],
     ['what do you mean?', 'empty', task('what do you mean?')],
     ["what's next?", 'empty', task("what's next?")],
-    ['let me think', 'empty', ack],
+    ['let me think', 'empty', task('let me think')],
     ['why is nothing happening', 'empty', task('why is nothing happening')],
-    ['thanks, that fixed it', 'invoice', thanks],
-    ['great job on the login fix', 'empty', thanks],
+    ['thanks, that fixed it', 'invoice', task('thanks, that fixed it')],
+    ['great job on the login fix', 'empty', task('great job on the login fix')],
   ]);
   // At a permission: a question that starts with "don't" asks; a "don't" keeps its words, so the agent hears the no
   assert.deepEqual(parseCommand("don't we already have a linter?", CTX.permission), { kind: 'status', agentId: 'a1b2c3' });
@@ -1684,26 +1686,26 @@ Object.assign(SWEPT, {
 
 test('never-minds take back, praise praises, and an answer is never turned around', () => {
   sweptRows([
-    ['never mind, I fixed it', 'none', ack], // a reason, not a request
-    ['never mind, it works now', 'none', ack],
-    ['never mind the login bug', 'none', ack],
-    ['never mind the warnings, just fix the errors', 'none', task('fix the errors')],
-    ['ignore my last message', 'none', ack],
+    ['never mind, I fixed it', 'none', task('never mind, I fixed it')], // a reason, not a request
+    ['never mind, it works now', 'none', task('never mind, it works now')],
+    ['never mind the login bug', 'none', task('never mind the login bug')],
+    ['never mind the warnings, just fix the errors', 'none', task('never mind the warnings, just fix the errors')],
+    ['ignore my last message', 'none', task('ignore my last message')],
     ['cancel that deploy job', 'none', task('cancel that deploy job')], // "that" belongs to the job
     ['cancel that onboarding agent', 'none', { kind: 'stop', agentIds: ['7a8b9c'] }],
     ['forget that invoice export', 'none', { kind: 'forget', agentIds: ['1a2b3c'] }],
-    ['nice work on the parser', 'none', thanks],
-    ['good work on the docs', 'none', thanks],
-    ['great work on the login fix', 'Wdone', thanks],
-    ['yes, add tests too', 'pending', unknown('yes, add tests too')], // the card stays: no other launch in its place
+    ['nice work on the parser', 'none', task('nice work on the parser')],
+    ['good work on the docs', 'none', task('good work on the docs')],
+    ['great work on the login fix', 'Wdone', task('great work on the login fix')],
+    ['yes, add tests too', 'pending', task('yes, add tests too')], // the prompt, and the card stays (the engine keeps it)
     ['yes, stop it', 'stopQ', answer('yes, stop it')], // the answer to "Should I stop it?", not a stop of the one asking
     ['否', 'optionsQ', answer('否', 'd4e5f6', 'ask-o')], // never the first option because both lose their letters
-    ['好的', 'empty', ack], ['谢谢', 'empty', thanks], ['muchas gracias', 'empty', thanks],
+    ['好的', 'empty', task('好的')], ['谢谢', 'empty', task('谢谢')], ['muchas gracias', 'empty', task('muchas gracias')],
     ['that fixed it', 'empty', task('that fixed it')], ['this is annoying', 'empty', task('this is annoying')],
     ["it's stuck", 'onboarding', { kind: 'status', agentId: '7a8b9c' }],
     ['why did that fail?', 'onboarding', { kind: 'status', agentId: '7a8b9c' }],
-    ['please fix it', 'onboarding', task('fix it')],
-    ['testing one two three', 'empty', ack],
+    ['please fix it', 'onboarding', task('please fix it')],
+    ['testing one two three', 'empty', task('testing one two three')],
   ]);
 });
 
@@ -1729,7 +1731,7 @@ test('stops said in a hurry stop; a name before a command gives the command; a n
     ['Flaky test: stop', 'none', stop('0a0b0c')],
     ['Onboarding: use the new copy on step 2', 'none', { kind: 'say', agentId: '7a8b9c', text: 'use the new copy on step 2', sure: false }],
     ['tell onboarding the copy is final', 'none', { kind: 'say', agentId: '7a8b9c', text: 'the copy is final', sure: false }],
-    ['claude is stuck', 'none', unknown('claude is stuck')], ["codex isn't installed", 'empty', unknown("codex isn't installed")],
+    ['claude is stuck', 'none', task('claude is stuck')], ["codex isn't installed", 'empty', task("codex isn't installed")],
     ['claude and codex fix the login bug', 'empty', start(['fix the login bug', 'claude'], ['fix the login bug', 'codex'])],
     ['codex is there a memory leak in the worker', 'empty', start(['is there a memory leak in the worker', 'codex'])],
     ['codex，修复登录错误', 'empty', start(['修复登录错误', 'codex'])],
@@ -1755,7 +1757,7 @@ test('questions about an agent said loosely find it; questions about code and th
     ['how are my agents?', 'none', { kind: 'status' }],
     ['is claude still running?', 'onboarding', { kind: 'status' }],
     ['wat needs me', 'none', { kind: 'status', needsMe: true }],
-    ['what do I type here', 'empty', { kind: 'help' }],
+    ['what do I type here', 'empty', task('what do I type here')],
     ['does the signup form need my email?', 'empty', task('does the signup form need my email?')],
     ['how is shipping cost calculated?', 'empty', task('how is shipping cost calculated?')],
     ['open the login page in a modal', 'dogNone', task('open the login page in a modal')],
@@ -1766,9 +1768,9 @@ test('questions about an agent said loosely find it; questions about code and th
     ['no emails are being sent', 'empty', task('no emails are being sent')],
     ['check if the deploy is ok', 'empty', task('check if the deploy is ok')],
     ['use === instead of == in the validator', 'empty', task('use === instead of == in the validator')],
-    ['Hey there! Could you please fix the readme?', 'empty', task('fix the readme?')],
-    ['love it! can we also get tabs?', 'empty', task('can we also get tabs?')],
-    ['thanks! also the footer is broken', 'empty', task('also the footer is broken')],
+    ['Hey there! Could you please fix the readme?', 'empty', task('Hey there! Could you please fix the readme?')],
+    ['love it! can we also get tabs?', 'empty', task('love it! can we also get tabs?')],
+    ['thanks! also the footer is broken', 'empty', task('thanks! also the footer is broken')],
     ['site down', 'empty', task('site down')],
   ]);
   // At a permission, words that only start like a yes are no reply; a "don't," with a reason is a no that carries it
@@ -1817,7 +1819,7 @@ test('a stop names its agent after a comma; a stop past a reaction is no answer 
   assert.equal(failures.length, 0, '\n' + failures.join('\n'));
   // "…, codex" beside an agent named for the same words is a launch for Codex, not a message that says "codex"
   const named = { agents: [fromTask('the login page is broken', { id: 'lp0001', state: 'working' })], machines, harnesses, focusId: null };
-  assert.deepEqual(parseCommand('the login page is broken. codex', named), start(['the login page is broken', 'codex']));
+  assert.deepEqual(parseCommand('the login page is broken. codex', named), start(['the login page is broken.', 'codex']));
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1995,142 +1997,299 @@ test('full permissions: words that are exactly the name of an agent on the board
   assert.deepEqual(parseCommand('Ask first', CTX.none), { kind: 'permissions', mode: 'ask' });
 });
 
-// ------------------------------------------------------------------ any prompt: what is not Workbench's own words goes to an agent
+
+// ------------------------------------------------------------------ every prompt goes to an agent
 
 // As the owner measured it: nothing waiting, and one agent at work.
 const oneAtWork = { agents: [{ id: 'd4e5f6', name: 'Search cleanup', task: 'Clean up the search route handlers', state: 'working', kind: 'agent' }], machines, harnesses, focusId: null };
-Object.assign(SWEPT, { oneAtWork });
+// Two finished agents and one at work; an agent at the centre that two helpers wait through; one that is stuck.
+const boardAgents = [
+  { id: 'w00001', name: 'Search cleanup', task: 'Clean up the search route handlers', state: 'working', kind: 'agent', startedAt: 1000 },
+  { id: 'd00001', name: 'Invoice export', task: 'Stream rows in the invoice export', state: 'done_checked', kind: 'agent', startedAt: 2000 },
+  { id: 'd00002', name: 'Price rounding', task: 'Fix the price rounding', state: 'done_claimed', kind: 'agent', startedAt: 3000 },
+];
+const stuckOne = { id: 's00001', name: 'Flaky test', task: 'Fix the flaky checkout test', state: 'maybe_stuck', kind: 'agent', startedAt: 500,
+  ask: { id: 'ask-s', type: 'stuck', sentence: 'Flaky test has hit the same error three times.', options: ['Stop it', 'Let it keep trying'] } };
+const twoHelpers = [
+  { id: 'r00001', name: 'Checkout fix', task: 'Fix the checkout', state: 'working', kind: 'agent' },
+  { id: 'r00001-11111111', name: 'Find unused imports', task: 'Find the unused imports', state: 'question', kind: 'helper', parentId: 'r00001', rootId: 'r00001',
+    ask: { id: 'ask-h1', type: 'question', sentence: 'Should I look in the tests too?', options: [] } },
+  { id: 'r00001-22222222', name: 'Scan imports', task: 'Scan the imports', state: 'needs_ok', kind: 'helper', parentId: 'r00001', rootId: 'r00001',
+    ask: { id: 'ask-h2', type: 'permission', sentence: 'Scan imports wants to run a command', options: ['Allow', 'Deny'], primary: 'Allow' } },
+];
+Object.assign(SWEPT, {
+  oneAtWork,
+  board: { agents: boardAgents, machines, harnesses, focusId: null },
+  boardInvoice: { agents: boardAgents, machines, harnesses, focusId: 'd00001' },
+  boardStuck: { agents: [...boardAgents, stuckOne], machines, harnesses, focusId: null },
+  boardCard: { agents: boardAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c21', kind: 'merge', agentId: 'd00002' } },
+  boardStopCard: { agents: boardAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c22', kind: 'stop', agentIds: ['w00001'] } },
+  boardGone: { agents: boardAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c23', gone: true } },
+  boardGoneOf: { agents: boardAgents, machines, harnesses, focusId: null, pendingConfirm: { id: 'c24', gone: true, agentId: 'd00001' } },
+  helpers: { agents: twoHelpers, machines, harnesses, focusId: 'r00001' },
+});
+const noTask = (harness = null) => ({ kind: 'start', tasks: [], task: null, harness });
+const said = t => task(t); // the prompt is exactly what was typed
+const needsMe = { kind: 'status', needsMe: true };
 
-test('anything that is not one of Workbench\'s own commands, or an answer, is a prompt for a new agent: no dead end', () => {
+test('whatever is not Workbench\'s own words, or an answer to what is on screen, is a prompt, exactly as typed', () => {
+  const rows = [
+    // What the owner typed, and the words that once got "I did not catch that" or a word back.
+    'what do you think of this workbench', 'thanks', 'Thanks!', 'thank you so much', 'ok', 'okay', 'cool', 'great', 'perfect!', 'sounds good',
+    'got it', 'hi', 'hello', 'hey there', 'help', 'help me', 'what can you do', 'how does this work', 'commands', '👍', '🎉🎉', 'hmm', 'um', '???',
+    '...', 'is this right?', 'yes', 'no', 'nope', 'sure', 'do it', 'go ahead', 'cancel', 'ok but not on main', 'good job', 'nice work on the parser',
+    'great job on the login fix', 'thanks, that fixed it', 'never mind', 'never mind, the login page is broken', 'never mind, I fixed it',
+    'never mind the login bug', 'ignore my last message', 'scratch that', 'let me think', 'testing one two three', 'see you later', 'no worries',
+    'claude is stuck', 'codex isn\'t installed', '谢谢', 'muchas gracias', '好的', 'go on', 'keep going', 'carry on', 'continue',
+    // Prompts that were prompts already, now word for word: openers, "please", spaces and a last full stop all stay.
+    'Hello! Can you help me build a website?', 'please fix it', 'fix it', 'fix   the   login', 'Update the docs for the new API.',
+    'hey, who are you?', 'Who are you?', 'what model are you', 'explain how the permission policy works', '"quoted" words stay quoted',
+    'discard the old migrations folder', 'forget about the old api and use v2', 'scrap the old parser', 'throw away the old logs', 'land the plane',
+    'discard my changes', 'stop the old cron job', 'merge the feature branch', 'continue the refactor', 'status of the repo',
+    'what needs me to approve this PR?', 'what is the status of the deploy', 'what did the last commit change', 'readme', 'that fixed it',
+    'enable dark mode', 'full permissions for the admin role', 'check that the deploy role has full permissions on the bucket',
+  ];
+  const failures = [];
+  for (const text of rows) {
+    for (const ctx of ['none', 'oneAtWork', 'empty', 'board']) {
+      const got = parseCommand(text, SWEPT[ctx] || ctxOf(ctx));
+      if (JSON.stringify(got) !== JSON.stringify(said(text))) failures.push(`${JSON.stringify(text)} [${ctx}] -> ${JSON.stringify(got)}`);
+    }
+  }
+  assert.deepEqual(failures, []);
+});
+
+test('pasted text reaches the agent exactly as typed: lines, indentation, fences, braces, quotes and a closing brace stay', () => {
+  const pastes = [
+    'function total(cart) {\n  return cart.reduce((a, b) => a + b, 0);\n}',
+    '{\n  "name": "shop",\n  "private": true\n}',
+    '```js\nconst x = 1;\n```',
+    '"use strict" breaks the build here:\nconst total = require("./total");',
+    'The checkout page throws this:\nTypeError: Cannot read properties of undefined (reading \'total\')\n    at render (cart.js:12:5)',
+    '--- a/cart.js\n+++ b/cart.js\n@@ -1 +1 @@\n-total\n+sum',
+    '- [ ] fix the login\n- [ ] add a test',
+    'fix the login  \r\nit fails on Safari',
+    'thanks\nthe footer is broken too',
+    'never mind,\nthe login page is broken\n}',
+  ];
+  for (const text of pastes) {
+    for (const ctx of [oneAtWork, CTX.none, SWEPT.board]) assert.deepEqual(parseCommand(text, ctx), said(text), text);
+  }
+  // only the spaces around it go
+  assert.deepEqual(parseCommand('  \n  fix the login\n\n', oneAtWork), said('fix the login'));
+  // an answer keeps its edges too, and so does a message, from its first word to the end of what was said
+  const code = '{\n  "retries": 3\n}';
+  assert.deepEqual(parseCommand(code, CTX.question), answer(code));
+  assert.deepEqual(parseCommand('keep the old route.', CTX.question), answer('keep the old route.'));
+  assert.deepEqual(parseCommand('keep the old route\nbut log a warning when it is used', CTX.question), answer('keep the old route\nbut log a warning when it is used'));
+  assert.deepEqual(parseCommand('tell onboarding to use this copy:\n"Welcome back!"', CTX.none), { kind: 'say', agentId: '7a8b9c', text: 'use this copy:\n"Welcome back!"' });
+  assert.deepEqual(parseCommand('tell onboarding to use the new copy\non every step', CTX.none), { kind: 'say', agentId: '7a8b9c', text: 'use the new copy\non every step' });
+  // a start keeps the task's edges past the words that start it
+  assert.deepEqual(parseCommand('start an agent to fix this:\n```\nfoo()\n```', oneAtWork), start(['fix this:\n```\nfoo()\n```']));
+  assert.deepEqual(parseCommand('start an agent to fix the login\nit fails on Safari', oneAtWork), start(['fix the login\nit fails on Safari']));
+});
+
+test('a program named first, or asked by name, starts that program; its name is taken off and the rest is as typed', () => {
   sweptRows([
-    // Prompts that were prompts already.
-    ['what does this project do?', 'oneAtWork', task('what does this project do?')],
-    ['explain how the permission policy works', 'oneAtWork', task('explain how the permission policy works')],
-    ['tell me a joke', 'oneAtWork', task('tell me a joke')],
-    ['compare our approach to Conductor', 'oneAtWork', task('compare our approach to Conductor')],
-    ['connect the frontend to the API', 'oneAtWork', task('connect the frontend to the API')],
-    ['status code 500 on checkout', 'oneAtWork', task('status code 500 on checkout')],
-    // The dead ends: questions to the agent, and commands that name no agent, with the words as written.
-    ['what model are you', 'oneAtWork', task('what model are you')],
-    ['who are you', 'oneAtWork', task('who are you')],
-    ['Who are you?', 'none', task('Who are you?')],
-    ['discard the old migrations folder', 'oneAtWork', task('discard the old migrations folder')],
-    ['forget about the old api and use v2', 'oneAtWork', task('forget about the old api and use v2')],
-    ['scrap the old parser', 'none', task('scrap the old parser')],
-    ['throw away the old logs', 'none', task('throw away the old logs')],
-    ['trash the unused fixtures', 'none', task('trash the unused fixtures')],
-    ['land the plane', 'none', task('land the plane')],
-    ['discard my changes', 'none', task('discard my changes')],
-    ['stop the old cron job', 'oneAtWork', task('stop the old cron job')],
-    ['merge the feature branch', 'oneAtWork', task('merge the feature branch')],
-    ['continue the refactor', 'oneAtWork', task('continue the refactor')],
-    ['forget an agent to fix the login', 'dogNone', task('forget an agent to fix the login')],
-    // Short or thin words that said nothing to Workbench are a prompt too: the launch card is the check.
-    ['readme', 'none', task('readme')],
-    ['fix it', 'none', task('fix it')],
-    ['please fix it', 'onboarding', task('fix it')],
-    ['keep going', 'none', task('keep going')],
-    ["what's next?", 'empty', task("what's next?")],
-    ['what do you mean?', 'empty', task('what do you mean?')],
-    ['why is nothing happening', 'empty', task('why is nothing happening')],
-    ['that fixed it', 'empty', task('that fixed it')],
-    ['what is changing', 'invoice', task('what is changing')],
-    ['hey, who are you?', 'none', task('who are you?')],
-    // Words that only name an agent, or say how one is, address it: they are no prompt for another one.
-    ['codex', 'oneAtWork', unknown('codex')],
-    ['start the agent', 'oneAtWork', unknown('start the agent')],
-    ['claude is stuck', 'oneAtWork', unknown('claude is stuck')],
+    ['codex, fix the login', 'oneAtWork', start(['fix the login', 'codex'])],
+    ['codex: fix the login.', 'oneAtWork', start(['fix the login.', 'codex'])],
+    ['ask codex to fix the login', 'oneAtWork', start(['fix the login', 'codex'])],
+    ['codex fix the login', 'oneAtWork', start(['fix the login', 'codex'])],
+    ['claude, why is the build slow?', 'none', start(['why is the build slow?', 'claude'])],
+    ['the login page is broken, codex', 'none', start(['the login page is broken', 'codex'])],
+    ['claude: fix this\n```\nfoo()\n```', 'oneAtWork', start(['fix this\n```\nfoo()\n```', 'claude'])],
+    ['codex, hello', 'none', start(['hello', 'codex'])],
+    ['codex, thanks', 'none', noTask('codex')], // a "thanks" at the end is politeness: the engine asks what Codex should work on
   ]);
 });
 
-test('Workbench\'s own commands stay commands only when the words are the command, not part of a longer prompt', () => {
+test('an agent named alone asks what it should work on; the engine names it, and takes the next words as its prompt', () => {
   sweptRows([
-    ['status', 'oneAtWork', { kind: 'status' }],
-    ['what needs me', 'oneAtWork', { kind: 'status', needsMe: true }],
-    ['what needs me?', 'none', { kind: 'status', needsMe: true }],
-    ['what is it doing', 'oneAtWork', { kind: 'status' }],
-    ['what is it doing', 'onboarding', { kind: 'status', agentId: '7a8b9c' }],
-    ['what needs my attention right now', 'none', { kind: 'status', needsMe: true }],
-    ['what needs me to look at', 'none', { kind: 'status', needsMe: true }],
-    ['does anything need my approval?', 'none', { kind: 'status', needsMe: true }],
-    ['status of search cleanup', 'none', { kind: 'status', agentId: 'd4e5f6' }],
-    ['status of the agents', 'none', { kind: 'status' }],
-    ['update on everything', 'none', { kind: 'status' }],
-    ['give me an update on onboarding', 'none', { kind: 'status', agentId: '7a8b9c' }],
-    ['what is the frobnicator doing', 'none', { kind: 'status' }], // a question about progress: an agent not found
-    // ...and the same words with more after them are a prompt about the project.
-    ['status of the repo', 'oneAtWork', task('status of the repo')],
-    ['what needs me to approve this PR?', 'oneAtWork', task('what needs me to approve this PR?')],
-    ['what needs my review in the auth module', 'none', task('what needs my review in the auth module')],
-    ['what is the status of the deploy', 'none', task('what is the status of the deploy')],
-    ['give me the status of the build', 'none', task('give me the status of the build')],
-    ['what did the last commit change', 'none', task('what did the last commit change')],
-    // While a question waits they are its answer; on a card the card stays.
+    ['codex', 'oneAtWork', noTask('codex')], ['Codex', 'none', noTask('codex')], ['claude', 'empty', noTask('claude')], ['claude code', 'none', noTask('claude')],
+    ['the agent', 'none', noTask()], ['the agent', 'oneAtWork', noTask()], ['start the agent', 'oneAtWork', noTask()], ['start an agent', 'none', noTask()],
+    ['codex', 'question', answer('codex')], // a question takes it as its answer
+  ]);
+});
+
+test('on a card, words that answer it answer it; anything else is a prompt, and the card stays (the engine keeps it)', () => {
+  for (const ctx of ['pending', 'pendingStop', 'pendingMerge', 'pendingDiscard', 'pendingPermissions', 'boardCard', 'boardStopCard']) {
+    sweptRows([
+      ['thanks', ctx, said('thanks')], ['who are you', ctx, said('who are you')], ['fix the login', ctx, said('fix the login')],
+      ['👍', ctx, said('👍')], ['help', ctx, said('help')], ['the login page is broken', ctx, said('the login page is broken')],
+      ['cancel', ctx, { kind: 'confirm', go: false }], ['never mind', ctx, { kind: 'confirm', go: false }],
+    ]);
+  }
+  sweptRows([
+    ['yes', 'pendingStop', { kind: 'confirm', go: true }], ['do it', 'pendingMerge', { kind: 'confirm', go: true }],
+    // a yes that is not enough for the card, or asked: the card stays and nothing starts (the engine says how to answer it)
+    ['yes', 'pendingDiscard', unknown('yes')], ['yes', 'pendingPermissions', unknown('yes')], ['is that right?', 'pendingStop', unknown('is that right?')],
+    ['yes?', 'pendingMerge', unknown('yes?')],
+    // words about the work of the card's agent look at it, or ask for its other card
+    ['show me the changes', 'boardCard', changes('d00002')], ['throw it away', 'boardCard', discard('d00002')],
+    // a card that ran out waits for nothing: its yes hears so; other words are as with nothing on screen
+    ['yes', 'boardGone', { kind: 'confirm', go: true }], ['thanks', 'boardGone', said('thanks')], ['who are you', 'boardGone', said('who are you')],
+  ]);
+});
+
+test('at an agent\'s question the words are its answer, and at a permission its reply, as before', () => {
+  sweptRows([
+    ['👍', 'question', answer('👍')], ['thanks', 'question', answer('thanks')], ['hmm', 'question', answer('hmm')], ['help', 'question', answer('help')],
+    ['yes', 'permission', allow], ['no, use the staging database.', 'permission', { ...deny, text: 'use the staging database.' }],
+    ['is it okay?', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
+    // words that answer nothing there keep the permission's own hint (the engine: "… is waiting for your OK")
+    ['👍', 'permission', unknown('👍')], ['thanks', 'permission', unknown('thanks')], ['the login page is broken', 'permission', unknown('the login page is broken')],
+    // work in the words starts an agent, as it did
+    ['fix the login page', 'permission', said('fix the login page')],
+  ]);
+});
+
+test('"what needs me" with a time, an urgency or a reason after it is the needs-me status everywhere; a tail that names something in the project is a prompt', () => {
+  for (const text of ['what needs me', 'what needs me?', 'what needs me now', 'what needs me urgently', 'what needs me first', 'what needs me today',
+    'what needs me right now', 'what needs me most', 'what needs me most urgently', 'what needs my attention right now', 'What needs me now?',
+    'what needs me and why', 'what needs me this morning', 'what needs me to look at', 'does anything need my approval?']) {
+    for (const ctx of ['none', 'oneAtWork', 'question', 'stuck', 'permission', 'pendingMerge', 'boardGone']) {
+      assert.deepEqual(parseCommand(text, SWEPT[ctx] || ctxOf(ctx)), needsMe, `${text} [${ctx}]`);
+    }
+  }
+  sweptRows([
+    ['what needs me to approve this PR?', 'oneAtWork', said('what needs me to approve this PR?')],
+    ['what needs me to sign the CLA', 'none', said('what needs me to sign the CLA')],
+    ['what needs my review in the auth module', 'none', said('what needs my review in the auth module')],
     ['what needs me to approve this PR?', 'question', answer('what needs me to approve this PR?')],
-    ['status of the repo', 'pending', unknown('status of the repo')],
   ]);
 });
 
-test('bare acknowledgements with nothing waiting start nothing: thanks, a yes or a no to nothing, and the rest', () => {
+test('status that describes an agent without naming it is status, and that agent\'s when the words find one', () => {
   sweptRows([
-    ['thanks', 'none', thanks], ['Thanks!', 'oneAtWork', thanks], ['thank you so much', 'none', thanks], ['cheers', 'none', thanks],
-    ['muchas gracias', 'empty', thanks], ['谢谢', 'empty', thanks], ['ok thanks', 'none', thanks], ['claude, thanks', 'none', thanks],
-    ['good job', 'none', thanks], ['great job on the login fix', 'empty', thanks], ['nice work on the parser', 'none', thanks],
-    ['thanks, that fixed it', 'invoice', thanks],
-    ['ok', 'oneAtWork', ack], ['okay', 'none', ack], ['cool', 'oneAtWork', ack], ['great', 'oneAtWork', ack], ['sounds good', 'none', ack],
-    ['makes sense', 'none', ack], ['got it', 'none', ack], ['perfect!', 'none', ack], ['好的', 'empty', ack], ['never mind', 'none', ack],
-    ['never mind, I fixed it', 'none', ack], ['never mind the login bug', 'none', ack], ['ignore my last message', 'none', ack],
-    ['forget it', 'none', ack], ['scratch that', 'none', ack], ['let me think', 'empty', ack], ['testing one two three', 'empty', ack],
-    ['see you later', 'none', ack], ['see the logs', 'none', task('see the logs')], ['no worries', 'none', ack],
-    ['yes', 'none', noReply], ['no', 'oneAtWork', noReply], ['do it', 'none', noReply], ['go ahead', 'none', noReply], ['sure', 'none', noReply],
-    ['cancel', 'onboarding', noReply], ['nope', 'none', noReply], ['ok but not on main', 'none', noReply],
-    // Something waits: the words are for it, as before.
-    ['thanks', 'question', answer('thanks')],
-    ['thanks', 'pending', unknown('thanks')],
-    ['thanks', 'permission', unknown('thanks')],
-    ['yes', 'pending', { kind: 'confirm', go: true }],
-    ['yes', 'permission', allow],
-    ['ok', 'pendingGone', { kind: 'confirm', go: true }], // a yes to a card that ran out: the engine says it no longer waits
-    ['thanks', 'pendingGone', thanks], // and anything else to it waits for nothing
-    // Help and greetings are help, as before.
-    ['help', 'none', { kind: 'help' }], ['hi', 'oneAtWork', { kind: 'help' }],
+    ['what did the last agent do', 'board', { kind: 'status', agentId: 'd00002' }],
+    ['what did the latest one do', 'board', { kind: 'status', agentId: 'd00002' }],
+    ['what did the first one change', 'board', { kind: 'status', agentId: 'w00001' }],
+    ['status of the stuck one', 'boardStuck', { kind: 'status', agentId: 's00001' }],
+    ['what is the newest agent doing', 'board', { kind: 'status', agentId: 'd00002' }],
+    ['how is the oldest one doing', 'boardStuck', { kind: 'status', agentId: 's00001' }],
+    ['what did the finished one do', 'oneAtWork', { kind: 'status' }], // none finished: how they all are
+    ['status of the stuck one', 'board', { kind: 'status' }],
+    ['what did the last agent do', 'empty', { kind: 'status' }],
+    // a thing of the project's is still a prompt
+    ['what did the last commit change', 'board', said('what did the last commit change')],
+    ['status of the repo', 'board', said('status of the repo')],
   ]);
 });
 
-test('the words for full permissions, said whole, are the mode and never a prompt; words that only mention them are a prompt', () => {
+test('throw-away words that point at the agent in the centre, or come after its card ran out, are its throw-away card, never a prompt', () => {
+  for (const text of ['discard all of it', 'throw away everything it did', 'trash all of it', 'scrap all of that', 'throw it away', 'discard it',
+    'throw it all away', 'discard everything', 'throw them all away', 'discard']) {
+    assert.deepEqual(parseCommand(text, SWEPT.boardInvoice), discard('d00001'), `${text} [centre]`);
+    assert.deepEqual(parseCommand(text, CTX.invoice), discard('1a2b3c'), `${text} [invoice]`);
+    assert.deepEqual(parseCommand(text, SWEPT.boardGoneOf), discard('d00001'), `${text} [after its card ran out]`);
+    // nothing in the centre: the engine names the candidates, or takes the one finished agent's
+    assert.deepEqual(parseCommand(text, SWEPT.boardGone), { kind: 'discard', agentId: null, bare: true }, `${text} [after a card ran out]`);
+    assert.deepEqual(parseCommand(text, SWEPT.board), { kind: 'discard', agentId: null, bare: true }, `${text} [nothing in the centre]`);
+  }
+  // words that name something else are a prompt, as typed
+  sweptRows([['throw away my work', 'invoice', said('throw away my work')], ['scrap the old one', 'none', said('scrap the old one')],
+    ['forget the old stuff', 'oneAtWork', said('forget the old stuff')], ['scrap that', 'board', said('scrap that')]]);
+});
+
+test('a bare merge or throw-away: the agent in the centre, else the engine picks the one finished agent or asks which', () => {
+  sweptRows([
+    ['merge', 'boardInvoice', merge('d00001')], ['merge them', 'boardInvoice', merge('d00001')], ['merge it', 'boardInvoice', merge('d00001')],
+    ['land it', 'boardInvoice', merge('d00001')],
+    ['merge', 'board', { kind: 'merge', agentId: null, bare: true }], ['merge them', 'board', { kind: 'merge', agentId: null, bare: true }],
+    ['merge it', 'board', { kind: 'merge', agentId: null, bare: true }], ['throw it away', 'board', { kind: 'discard', agentId: null, bare: true }],
+    // a name still picks its agent; two with the name give no agent, and the engine asks which (no `bare`)
+    ['merge price rounding', 'board', merge('d00002')], ['merge search cleanup', 'dogNone', merge(null)],
+  ]);
+});
+
+test('a stop with its reason on the next line is a stop, as with a comma', () => {
+  sweptRows([
+    ['stop\nit is deleting the wrong files', 'onboarding', { kind: 'stop', agentIds: ['7a8b9c'] }],
+    ['stop, it is deleting the wrong files', 'onboarding', { kind: 'stop', agentIds: ['7a8b9c'] }],
+    ['Stop!\nIt is deleting the wrong files', 'onboarding', { kind: 'stop', agentIds: ['7a8b9c'] }],
+    ['stop\nonboarding', 'none', { kind: 'stop', agentIds: ['7a8b9c'] }],
+  ]);
+});
+
+test('while two helpers wait, a yes or a no is for one of them, and the engine says which wait', () => {
+  sweptRows([
+    ['ok', 'helpers', { kind: 'allow', agentId: 'r00001', askId: null }], ['yes', 'helpers', { kind: 'allow', agentId: 'r00001', askId: null }],
+    ['go ahead', 'helpers', { kind: 'allow', agentId: 'r00001', askId: null }], ['no', 'helpers', { kind: 'deny', agentId: 'r00001', askId: null }],
+    ['thanks', 'helpers', said('thanks')],
+  ]);
+});
+
+test('"go on", "keep going", "carry on" and "continue" continue the agent in the centre; with none, they are a prompt', () => {
+  for (const text of ['go on', 'keep going', 'carry on', 'continue', 'please continue', 'keep going please', 'Go on.']) {
+    assert.deepEqual(parseCommand(text, CTX.onboarding), { kind: 'continue', agentId: '7a8b9c' }, text);
+    assert.deepEqual(parseCommand(text, SWEPT.boardInvoice), { kind: 'continue', agentId: 'd00001' }, text);
+    assert.deepEqual(parseCommand(text, CTX.none), said(text), text);
+  }
+  // a stuck agent's own choice, and a question's answer, as before
+  assert.deepEqual(parseCommand('keep going', CTX.stuck), answer('Let it keep trying', '0a0b0c', 'ask-stuck'));
+  assert.deepEqual(parseCommand('go on', CTX.question), answer('go on'));
+});
+
+test('the words for full permissions, said whole, are the mode; a few more whole sentences ask for them too; words that only mention them are a prompt', () => {
   for (const [text, mode] of [['full permissions', 'full'], ['Full permissions on', 'full'], ['full permission please', 'full'], ['turn on full permissions', 'full'],
-    ['ask first', 'ask'], ['Ask first.', 'ask'], ['please ask first', 'ask'], ['turn off full permissions', 'ask']]) {
+    ['enable full permissions', 'full'], ['use full permissions', 'full'], ['switch to full permissions', 'full'], ['give agents full permissions', 'full'],
+    ['ask first', 'ask'], ['Ask first.', 'ask'], ['please ask first', 'ask'], ['turn off full permissions', 'ask'], ['disable full permissions', 'ask'],
+    ['switch to ask first', 'ask'], ['go back to asking first', 'ask']]) {
     for (const ctx of [CTX.none, CTX.onboarding, oneAtWork]) assert.deepEqual(parseCommand(text, ctx), { kind: 'permissions', mode }, text);
   }
-  assert.deepEqual(parseCommand('check that the deploy role has full permissions on the bucket', oneAtWork),
-    task('check that the deploy role has full permissions on the bucket'));
-  assert.deepEqual(parseCommand('full permissions for the admin role', oneAtWork), task('full permissions for the admin role'));
+  assert.deepEqual(parseCommand('check that the deploy role has full permissions on the bucket', oneAtWork), said('check that the deploy role has full permissions on the bucket'));
+  assert.deepEqual(parseCommand('full permissions for the admin role', oneAtWork), said('full permissions for the admin role'));
+  assert.deepEqual(parseCommand('give admins full access', oneAtWork), said('give admins full access'));
 });
 
-test('a prompt of several lines keeps its lines; a card that quotes it shows one line', () => {
-  const trace = 'The checkout page throws this:\nTypeError: Cannot read properties of undefined (reading \'total\')\n    at render (cart.js:12:5)';
-  assert.deepEqual(parseCommand(trace, oneAtWork), task(trace));
-  assert.equal(describeIntent(task(trace), oneAtWork), 'Start an agent on “The checkout page throws this: TypeError: Cannot read properties of undefined…”?');
-  // Windows line ends read as line ends; spaces at the end of a line go.
-  assert.deepEqual(parseCommand('fix the login  \r\nit fails on Safari', oneAtWork), task('fix the login\nit fails on Safari'));
-  // A start, an answer and a message keep their lines too.
-  assert.deepEqual(parseCommand('start an agent to fix the login\nit fails on Safari', oneAtWork), start(['fix the login\nit fails on Safari']));
-  assert.deepEqual(parseCommand('keep the old route\nbut log a warning when it is used', CTX.question), answer('keep the old route\nbut log a warning when it is used'));
-  assert.deepEqual(parseCommand('tell onboarding to use the new copy\non every step', CTX.none), { kind: 'say', agentId: '7a8b9c', text: 'use the new copy\non every step' });
-  // A line break ends a reaction as a comma does: what follows is judged by itself.
-  assert.deepEqual(parseCommand('thanks\nthe footer is broken too', oneAtWork), task('the footer is broken too'));
-  // One line reads as before: runs of spaces are one space.
-  assert.deepEqual(parseCommand('fix   the   login', oneAtWork), task('fix the login'));
-  // Pasted code keeps its edges: a first quote and a last semicolon are part of it (one line still loses its last full stop).
-  const code = '"use strict" breaks the build here:\nconst total = require("./total");';
-  assert.deepEqual(parseCommand(code, oneAtWork), task(code));
-  assert.deepEqual(parseCommand('Update the docs for the new API.', oneAtWork), task('Update the docs for the new API'));
+// ------------------------------------------------------------------ invariants
+
+/** Every context of these tests, for the sweeps below. */
+const ALL_CONTEXTS = () => ({ ...CTX, ...DOG, ...NAMED, ...SWEPT });
+/** Where the parser may still give `unknown`: nothing said; a card's yes that is not enough or is asked; a permission's hint. */
+function unknownAllowed(text, ctx) {
+  if (!text.trim()) return true;
+  const card = ctx.pendingConfirm && !ctx.pendingConfirm.gone;
+  if (card) return true; // the engine keeps the card and says how to answer it (and the parser's own tests pin which words)
+  const focus = ctx.focusId ? (ctx.agents || []).find(a => a.id === ctx.focusId) : null;
+  const helpersWithPermission = (ctx.agents || []).filter(a => focus && (a.parentId === focus.id || a.rootId === focus.id) && a.ask);
+  const permission = focus?.ask?.type === 'permission' || (helpersWithPermission.length === 1 && helpersWithPermission[0].ask.type === 'permission');
+  return permission;
+}
+
+test('no dead end: in every context, words give `unknown` only for a card that waits, a permission that waits, or nothing said', () => {
+  const corpus = ['what do you think of this workbench', 'thanks', 'ok', 'hi', 'help', '👍', 'hmm', 'is this right?', 'go on', 'never mind',
+    'never mind, the login page is broken', 'codex', 'the agent', 'discard', 'throw it away', 'merge them', 'claude is stuck', '???', '}',
+    'yes', 'no', 'cancel', 'do it', 'blorp', 'readme', 'what needs me urgently', 'status of the stuck one', 'scrap that', 'forget it', 'forget them',
+    'what can you do', 'good morning', 'hello there', 'testing one two three', 'start it', 'yes start it', 'stop them'];
+  const failures = [];
+  for (const [name, ctx] of Object.entries(ALL_CONTEXTS())) {
+    for (const text of corpus) {
+      const got = parseCommand(text, ctx);
+      if (got.kind === 'unknown' && !unknownAllowed(text, ctx)) failures.push(`${JSON.stringify(text)} [${name}] -> unknown`);
+      if (got.kind === 'ack' || got.kind === 'help') failures.push(`${JSON.stringify(text)} [${name}] -> ${got.kind}`);
+    }
+  }
+  assert.deepEqual(failures, []);
 });
 
-test('a verb of Workbench\'s with only "it" or "them" after it addresses an agent; with anything more it is a prompt', () => {
-  sweptRows([
-    ['discard', 'invoice', unknown('discard')], ['throw it away', 'pendingGone', unknown('throw it away')], ['throw them all away', 'invoice', unknown('throw them all away')],
-    ['throw away my work', 'invoice', task('throw away my work')], ['discard everything', 'none', task('discard everything')],
-    ['scrap the old one', 'none', task('scrap the old one')], ['forget the old stuff', 'oneAtWork', task('forget the old stuff')],
-  ]);
+test('Workbench\'s verbs with words that point at an agent never start work, in any context', () => {
+  const verbs = ['merge', 'land', 'discard', 'scrap', 'trash', 'throw away', 'stop'];
+  const objects = ['', 'it', 'them', 'this', 'that one', 'this one', 'all of it', 'everything', 'its work', 'its changes', 'the agent', 'it all'];
+  const failures = [];
+  for (const [name, ctx] of Object.entries(ALL_CONTEXTS())) {
+    for (const v of verbs) {
+      for (const o of objects) {
+        if ((v === 'scrap' || v === 'trash') && ['this', 'that one', 'this one'].includes(o)) continue; // "scrap this" is a never-mind
+        const text = `${v} ${o}`.trim();
+        const got = parseCommand(text, ctx);
+        if (got.kind === 'task' || (got.kind === 'start' && got.tasks?.length)) failures.push(`${JSON.stringify(text)} [${name}] -> ${JSON.stringify(got)}`);
+      }
+    }
+    for (const text of ['throw it away', 'throw them away', 'throw it all away', 'throw that away']) {
+      const got = parseCommand(text, ctx);
+      if (got.kind === 'task' || (got.kind === 'start' && got.tasks?.length)) failures.push(`${JSON.stringify(text)} [${name}] -> ${JSON.stringify(got)}`);
+    }
+  }
+  assert.deepEqual(failures, []);
 });
