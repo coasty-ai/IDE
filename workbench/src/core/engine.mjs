@@ -107,6 +107,13 @@ const OFF_NOT_KEPT = 'Full permissions are off for now, but Workbench could not 
 // A full permissions card made before the mode last changed: its question is not the one it asked.
 const MODE_CHANGED = 'That changed. Have another look.';
 const MODE_WORDS = 'Say whether agents should ask first or have full permissions.';
+// The file view (files, file, search, saveFile).
+const NO_FILES_MODULE = 'Workbench cannot show files right now.';
+const WHOSE_COPY = 'Say whose copy to show: yours, or an agent’s.';
+const DEMO_SAVED = 'This is the demo, so your change is kept only until Workbench closes.';
+const MERGING_INTO_YOURS = 'Workbench is merging into your folder now. Save again once it is done.';
+/** The most text a save takes, in bytes of UTF-8: 1 MB, the most the file view shows. */
+const MAX_SAVE_BYTES = 1024 * 1024;
 
 /** How a state reads after an agent's name: "Checkout fix needs your OK". */
 const PHRASE = Object.freeze({
@@ -532,6 +539,11 @@ export class Engine extends EventEmitter {
     this._gitChain = Promise.resolve();
     this._gitWork = new Set();   // git jobs under way
     this._mergedEarlier = new Set(); // earlier agents merged in this run: the shutdown tidy looks at their folders too
+    // The file view. An earlier agent has no run to hold the receipt a save into its copy starts (_recheck): it is held
+    // here, rootId -> { id, workspace, config, harness, receipt, deciding, checksDone, saves }, while it is built.
+    this._rechecks = new Map();
+    this._demoFiles = null;      // the demo's sample project, made when the file view first asks (_demo)
+    this._demoSaved = false;     // the demo's first save says that it lasts for this run only; later ones do not
     this.repoIdentity = null;    // live mode: does git know the person's name and email (true/false); null: not known
     this._repoKey = null;        // the repository as the page last heard of it (see _setRepo)
     this._repoReading = null;    // a periodic refresh of the repository under way
@@ -610,9 +622,10 @@ export class Engine extends EventEmitter {
         r.stopped = true;
         this.stopped.add(r.id);
       }
-      // Checks end alongside the agents (SIGTERM now, SIGKILL 2 s later in receipt.mjs): wait for them too.
+      // Checks end alongside the agents (SIGTERM now, SIGKILL 2 s later in receipt.mjs): wait for them too, an earlier
+      // agent's after a save included.
       const checks = [];
-      for (const r of this.runs.values()) {
+      for (const r of [...this.runs.values(), ...this._rechecks.values()]) {
         this._cancelReceipt(r);
         if (r.checksDone) checks.push(r.checksDone);
       }
@@ -1025,84 +1038,107 @@ export class Engine extends EventEmitter {
     if (says) batch.push({ kind: EV.SAYS, agentId, text: says });
     batch.push({ kind: EV.STATE, agentId, state: doneState(got.checksState), reason: got.reason });
     this._apply(batch);
+    this._lookAgainIfSaved(agentId, run, got.saves);
   }
 
   /**
-   * One receipt: steps 3 and 5 of a turn's end ("Agent lifecycle"). What is not merged yet (files, from `diffStats`)
-   * and the rules it broke, then, unless the turn ended with a question, the declared checks. One receipt at a time per
-   * agent: a newer one cancels this one (_cancelReceipt), and so do a new turn, a message the agent took, a stop and
-   * shutdown. `run` holds it (`receipt`, `deciding`, `checksDone`); `stale()` says when what it would apply is out of
-   * date. Resolves { checksState, reason } (see doneState), or null when it went stale: then nothing more is applied.
+   * One receipt: steps 3 and 5 of a turn's end ("Agent lifecycle"), and the same after a save from the file view
+   * (_recheck). What is not merged yet (files, from `diffStats`) and the rules it broke, then, unless the turn ended with
+   * a question, the declared checks. One receipt at a time per agent: a newer one cancels this one (_cancelReceipt), and
+   * so do a new turn, a message the agent took, a stop and shutdown. `run` holds it (`receipt`, `deciding`,
+   * `checksDone`; an earlier agent's recheck record stands in for a run); `stale()` says when what it would apply is out
+   * of date. A save into the agent's copy while it is built (`run.saves` counts them) stops the checks under way, which
+   * did not see it, and the receipt looks again from the start: no result is kept of what the checks did not see.
+   * Resolves { checksState, reason, saves } (see doneState; saves: the count of saves it saw), or null when it went
+   * stale: then nothing more is applied.
    */
   async _receipt(agentId, run, { question = null, stale = () => false } = {}) {
     let receipt = null; // this receipt once it starts; a newer one, a new turn, a message, a stop or shutdown cancels it
     const gone = () => stale() || !!receipt?.ctl.signal.aborted;
+    const saves = () => run?.saves || 0;
     // One receipt at a time per agent, the record made before a question included.
     if (run) {
       this._cancelReceipt(run);
-      receipt = { ctl: new AbortController() };
+      receipt = { ctl: new AbortController(), pass: null };
       run.receipt = receipt;
       run.deciding = true; // a clean exit while this runs is not a failure (Codex exits after every turn)
     }
     let checksState = 'none';
     let reason = null;
+    let seen = saves();
     try {
       const ws = run && run.workspace;
       if (ws && typeof this.deps.workspace?.diffStats === 'function') {
-        // What is not merged yet: since its last merge, else since the commit it started from.
-        const files = await this.deps.workspace.diffStats({ path: ws.path, base: sinceOf(ws) });
-        if (gone()) return null;
-        if (files) this._apply([{ kind: EV.FILES, agentId, files }]);
-        const config = (await run.config) || DEFAULT_CONFIG;
-        if (gone()) return null;
-        const changedPaths = (files?.list || []).map(f => f.path);
-        if (Array.isArray(config.rules) && config.rules.length && typeof this.deps.receipt?.checkRules === 'function') {
-          const rules = await this.deps.receipt.checkRules(config.rules, changedPaths);
+        for (;;) {
+          seen = saves();
+          checksState = 'none';
+          reason = null;
+          // What is not merged yet: since its last merge, else since the commit it started from.
+          const files = await this.deps.workspace.diffStats({ path: ws.path, base: sinceOf(ws) });
           if (gone()) return null;
-          if (rules) this._apply([{ kind: EV.RULES, agentId, rules }]);
-        }
-        if (!question && Array.isArray(config.checks) && config.checks.length && typeof this.deps.receipt?.runChecks === 'function') {
-          const partial = [];
-          // Checks of a receipt that was cancelled can take a moment to end: never run two sets in one folder.
-          if (run.checksDone) await run.checksDone;
+          if (files) this._apply([{ kind: EV.FILES, agentId, files }]);
+          const config = (await run.config) || DEFAULT_CONFIG;
           if (gone()) return null;
-          this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: [] } }]);
-          const onProgress = (p) => {
-            if (!p || typeof p !== 'object' || gone()) return;
-            if (Array.isArray(p.results)) partial.splice(0, partial.length, ...p.results);
-            else if (p.name != null && typeof p.ok === 'boolean') {
-              const i = partial.findIndex(r => r.name === p.name);
-              if (i >= 0) partial[i] = p; else partial.push(p);
-            } else return;
-            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: cleanResults(partial) } }]);
-          };
-          let res;
-          try {
-            // The checks run the agent's own code (its package.json, its tests), so they carry its marker as its shell
-            // does: a Workbench or an acceptance run started from a check then refuses, as it would in the agent.
-            // They get the keys that agent gets (added after the scrub), and their output is masked before it is cut.
-            const env = { ...process.env, WORKBENCH_AGENT_ID: agentId };
-            const keys = this._keysFor(run.harness);
-            const more = { ...(keys ? { keysEnv: keys } : {}), ...(this._mask ? { mask: this._mask } : {}) };
-            const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: receipt.ctl.signal, env, ...more }));
-            const done = running.then(() => {}, () => {});
-            run.checksDone = done;
-            done.then(() => { if (run.checksDone === done) run.checksDone = null; });
-            res = await running;
-          } catch (err) {
+          const changedPaths = (files?.list || []).map(f => f.path);
+          if (Array.isArray(config.rules) && config.rules.length && typeof this.deps.receipt?.checkRules === 'function') {
+            const rules = await this.deps.receipt.checkRules(config.rules, changedPaths);
             if (gone()) return null;
-            this.log.warn('The checks could not run:', err);
-            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'none', results: [] } }]);
-            throw plainError('Workbench could not run the checks.');
+            if (rules) this._apply([{ kind: EV.RULES, agentId, rules }]);
           }
-          if (gone()) return null;
-          checksState = res?.state === 'passed' || res?.state === 'failed' ? res.state : 'none';
-          const results = cleanResults(res?.results);
-          this._apply([{ kind: EV.CHECKS, agentId, checks: { state: checksState, results } }]);
-          if (checksState === 'failed') {
-            const failed = results.filter(r => !r.ok).map(r => `“${r.name}”`);
-            reason = failed.length ? `The ${failed.length === 1 ? 'check' : 'checks'} ${joinAnd(failed)} did not pass.` : null;
+          if (!question && Array.isArray(config.checks) && config.checks.length && typeof this.deps.receipt?.runChecks === 'function') {
+            const partial = [];
+            // Checks of a receipt that was cancelled, or of a pass a save stopped, can take a moment to end: never run
+            // two sets in one folder.
+            if (run.checksDone) await run.checksDone;
+            if (gone()) return null;
+            // This pass's checks stop when the receipt is cancelled, and when a save comes (see _afterSave).
+            const pass = new AbortController();
+            const stopPass = () => pass.abort();
+            receipt.pass = pass;
+            receipt.ctl.signal.addEventListener('abort', stopPass, { once: true });
+            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: [] } }]);
+            const onProgress = (p) => {
+              if (!p || typeof p !== 'object' || gone() || pass.signal.aborted) return;
+              if (Array.isArray(p.results)) partial.splice(0, partial.length, ...p.results);
+              else if (p.name != null && typeof p.ok === 'boolean') {
+                const i = partial.findIndex(r => r.name === p.name);
+                if (i >= 0) partial[i] = p; else partial.push(p);
+              } else return;
+              this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: cleanResults(partial) } }]);
+            };
+            let res;
+            try {
+              // The checks run the agent's own code (its package.json, its tests), so they carry its marker as its shell
+              // does: a Workbench or an acceptance run started from a check then refuses, as it would in the agent.
+              // They get the keys that agent gets (added after the scrub), and their output is masked before it is cut.
+              const env = { ...process.env, WORKBENCH_AGENT_ID: agentId };
+              const keys = this._keysFor(run.harness);
+              const more = { ...(keys ? { keysEnv: keys } : {}), ...(this._mask ? { mask: this._mask } : {}) };
+              const running = Promise.resolve().then(() => this.deps.receipt.runChecks({ cwd: ws.path, checks: config.checks, onProgress, signal: pass.signal, env, ...more }));
+              const done = running.then(() => {}, () => {});
+              run.checksDone = done;
+              done.then(() => { if (run.checksDone === done) run.checksDone = null; });
+              res = await running;
+            } catch (err) {
+              if (gone()) return null;
+              if (saves() !== seen) continue; // a save stopped them: look again
+              this.log.warn('The checks could not run:', err);
+              this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'none', results: [] } }]);
+              throw plainError('Workbench could not run the checks.');
+            } finally {
+              receipt.ctl.signal.removeEventListener('abort', stopPass);
+            }
+            if (gone()) return null;
+            if (saves() !== seen) continue; // they did not see all of it: look again
+            checksState = res?.state === 'passed' || res?.state === 'failed' ? res.state : 'none';
+            const results = cleanResults(res?.results);
+            this._apply([{ kind: EV.CHECKS, agentId, checks: { state: checksState, results } }]);
+            if (checksState === 'failed') {
+              const failed = results.filter(r => !r.ok).map(r => `“${r.name}”`);
+              reason = failed.length ? `The ${failed.length === 1 ? 'check' : 'checks'} ${joinAnd(failed)} did not pass.` : null;
+            }
           }
+          if (saves() === seen) break; // else a save came while it looked: look again
         }
       } else if (!question) {
         // No workspace (the demo): use whatever checks the simulator reported.
@@ -1120,7 +1156,7 @@ export class Engine extends EventEmitter {
       }
     }
     if (gone()) return null;
-    return { checksState, reason };
+    return { checksState, reason, saves: seen };
   }
 
   /** End a receipt still being built: its checks stop, nothing from it is applied, "checks running" goes away. */
@@ -1985,6 +2021,14 @@ export class Engine extends EventEmitter {
     }
     this._resuming.delete(v.id);
     this.earlierRecs.delete(v.id);
+    // It took the message: checks a save started in its copy no longer describe the work it takes up (they stop, and
+    // end before any of this run's begin).
+    const prior = this._rechecks.get(v.id);
+    if (prior) {
+      this._cancelReceipt(prior);
+      this._rechecks.delete(v.id);
+      run.checksDone = prior.checksDone;
+    }
     this._apply([
       { kind: EV.RESUMED, agentId: v.id, budgetUsd: budget },
       { kind: EV.STATE, agentId: v.id, state: STATE.WORKING, reason: null },
@@ -2060,6 +2104,8 @@ export class Engine extends EventEmitter {
         continue;
       }
       if (this._folderKept(v)) kept += 1;
+      this._cancelReceipt(this._rechecks.get(id)); // checks a save started in its copy stop with it
+      this._rechecks.delete(id);
       this.earlierRecs.delete(id);
       this.history?.forget(id);
       this.store.remove(id);
@@ -2237,7 +2283,7 @@ export class Engine extends EventEmitter {
     const run = this.runs.get(v.id);
     this.stopped.add(v.id);
     if (run) run.stopped = true;
-    this._cancelReceipt(run); // stopping an agent stops the checks it is running
+    this._cancelReceipt(run || this._rechecks.get(v.id)); // stopping an agent stops the checks it is running
     // What a turn decided while a request was held would otherwise show for a moment before "stopped".
     for (const a of [v, ...this.store.descendants(v.id)]) this._dropLater(a.id);
     this._denyHeldFor(v.id, 'The agent was stopped.', true);
@@ -2752,7 +2798,7 @@ export class Engine extends EventEmitter {
    */
   _isWorking(v) {
     if (ACTIVE.has(v.state) || this._resuming.has(v.id)) return true;
-    const run = this.runs.get(v.id);
+    const run = this.runs.get(v.id) || this._rechecks.get(v.id); // an earlier agent's receipt after a save, too
     return !!(run && (run.deciding || run.receipt));
   }
 
@@ -2930,6 +2976,315 @@ export class Engine extends EventEmitter {
     return out;
   }
 
+  // ---------------------------------------------------------------- the file view
+
+  /**
+   * The files of a copy (GET /api/files): yours (`where` "you", the person's repository) or an agent's. Each file says
+   * which agents changed it, from what each recorded (`changedBy`: in yours, every agent whose copy is still there; in
+   * an agent's copy, that agent), and whether an ignore rule hides it (`ignored`, the env files the list adds).
+   * @returns {Promise<{ ok: true, in: string, name: string|null, branch: string|null, files: { path: string,
+   *   changedBy?: { agentId: string, name: string, state: string }[], ignored?: true }[], truncated?: true }
+   *   | { ok: false, reply: string, why: 'refused'|'gone' }>}
+   */
+  async files(where) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    let got;
+    try {
+      got = c.project ? await c.project.listFiles() : await this.deps.files.listFiles({ root: c.root });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not list the files.');
+    }
+    const marks = this._changedBy(c);
+    const hidden = new Set(Array.isArray(got?.ignored) ? got.ignored : []);
+    const files = (Array.isArray(got?.files) ? got.files : []).map((p) => {
+      const f = { path: p };
+      if (marks.has(p)) f.changedBy = marks.get(p);
+      if (hidden.has(p)) f.ignored = true;
+      return f;
+    });
+    return { ok: true, in: c.in, name: c.name, branch: c.branch, files, ...(got?.truncated ? { truncated: true } : {}) };
+  }
+
+  /**
+   * One file of a copy (GET /api/file), as the core reads it (`kind`, `text`, `hash`, `size`, `lines`, `link`, `eol`,
+   * `bom`), with `changedLines` in an agent's copy (the lines its unmerged work added or changed), and whether the person
+   * may edit it (`editable`, else `why`, one line). `check`: the hash the page shows; when the file still has it, the
+   * answer is { ok: true, same: true } and nothing else.
+   */
+  async file(where, rel, { check = null } = {}) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    let got;
+    try {
+      this.deps.files.checkPath(rel); // the engine checks the path again
+      got = c.project ? await c.project.readFile({ rel }) : await this.deps.files.readFile({ root: c.root, rel });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not read that file.');
+    }
+    if (typeof check === 'string' && got.hash && got.hash === check) return { ok: true, same: true };
+    const out = { ok: true, in: c.in, path: rel, ...got };
+    if (c.v && (got.kind === 'text' || got.kind === 'secret') && got.lines) {
+      const lines = await this._changedLines(c, rel);
+      if (lines) out.changedLines = lines;
+    }
+    const why = this._notEditable(c, got);
+    out.editable = !why;
+    if (why) out.why = why;
+    return out;
+  }
+
+  /**
+   * The lines of a copy's files that hold `query` (GET /api/search): 2 to 200 characters, fixed, in any case unless they
+   * hold a capital. At most 200 results, each cut to 400 characters around the match; env files are left out.
+   * @returns {Promise<{ ok: true, in: string, results: { path: string, line: number, text: string }[], truncated?: true }
+   *   | { ok: false, reply: string, why: 'refused'|'gone' }>}
+   */
+  async search(where, query) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    let got;
+    try {
+      got = c.project ? await c.project.searchFiles({ query }) : await this.deps.files.searchFiles({ root: c.root, query });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not search the files.');
+    }
+    return { ok: true, in: c.in, results: Array.isArray(got?.results) ? got.results : [], ...(got?.truncated ? { truncated: true } : {}) };
+  }
+
+  /**
+   * Save the person's text over one file of a copy (POST /api/file). `hash`: the one the file was read with, or, with
+   * `force`, the one a `changed` refusal gave. In your folder the save is an uncommitted change, and the repository is
+   * read again so the page's count of those is right. In an agent's copy whose run has ended, what it changed is
+   * recorded and its checks run again, as at the end of a turn (_afterSave). In the demo it lasts for this run only,
+   * and the first save says so (`reply`).
+   * @returns {Promise<{ ok: true, hash: string, size: number, reply?: string }
+   *   | { ok: false, reply: string, why: 'refused'|'gone'|'changed', hash?: string }>}
+   */
+  async saveFile(where, rel, { text, hash, force = false } = {}) {
+    const c = this._copyOf(where);
+    if (c.refusal) return c.refusal;
+    try {
+      this.deps.files.checkPath(rel); // the engine checks the path again
+    } catch (err) {
+      return this._filesRefusal(err);
+    }
+    // Git may be taking an agent's work from its copy, or bringing it into your folder: not now.
+    if (c.v && this._busy.has(c.v.id)) return { ok: false, reply: this._busyReply(c.v), why: 'refused' };
+    if (c.in === 'you' && this.mode === 'live' && [...this._busy.values()].includes('merge')) return { ok: false, reply: MERGING_INTO_YOURS, why: 'refused' };
+    if (typeof text === 'string' && Buffer.byteLength(text) > MAX_SAVE_BYTES) return { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' };
+    let saved;
+    try {
+      const o = { rel, text, hash, force: force === true };
+      saved = c.project ? await c.project.writeFile(o) : await this.deps.files.writeFile({ root: c.root, ...o });
+    } catch (err) {
+      return this._filesRefusal(err, 'Workbench could not save that file.');
+    }
+    const out = { ok: true, hash: saved.hash, size: saved.size };
+    if (c.project) {
+      if (!this._demoSaved) out.reply = DEMO_SAVED;
+      this._demoSaved = true;
+    } else if (c.in === 'you') {
+      this.refreshRepo(); // never rejects: the page hears your folder's new count of uncommitted changes
+    } else {
+      this._afterSave(c);
+    }
+    return out;
+  }
+
+  /**
+   * Which copy a file view request names: "you" (your repository; the demo's sample project) or an agent's id, a
+   * helper's meaning its agent's. An agent's copy is there only while its folder is: its work not thrown away, its
+   * folder neither removed nor gone from the disk. { in, name, branch, root | project, v?, ws?, run?, rec? }, or
+   * { refusal } in plain words: `why` 'gone' for an agent or a copy that is not there, 'refused' for anything else.
+   */
+  _copyOf(where) {
+    const refusal = (reply, why = 'refused') => ({ refusal: { ok: false, reply, why } });
+    if (this._shuttingDown) return refusal('Workbench is shutting down.');
+    const F = this.deps.files;
+    const demo = this.mode === 'demo';
+    if (demo ? typeof F?.memoryProject !== 'function' || typeof F?.sampleProject !== 'function' || typeof F?.checkPath !== 'function'
+      : ['listFiles', 'readFile', 'writeFile', 'searchFiles', 'changedLines', 'checkPath'].some(fn => typeof F?.[fn] !== 'function')) {
+      return refusal(NO_FILES_MODULE);
+    }
+    if (where === 'you') {
+      if (demo) {
+        const d = this._demo();
+        return { in: 'you', name: d.sample.name, branch: d.sample.branch, project: d.you };
+      }
+      if (!this.repoInfo?.root) return refusal('Workbench is not working on a repository.');
+      return { in: 'you', name: this.repoInfo.name ?? null, branch: this.repoInfo.branch ?? null, root: this.repoInfo.root };
+    }
+    if (typeof where !== 'string' || !where) return refusal(WHOSE_COPY);
+    const v = this._rootOf(where);
+    if (!v) return refusal('I can’t find that agent.', 'gone');
+    if (v.work?.thrownAway) return refusal(`${v.name}’s work was thrown away, so its copy is gone.`, 'gone');
+    const goneFolder = `${v.name}’s folder is not on this computer any more.`;
+    if (demo) {
+      if (v.work && v.work.folder === false) return refusal(goneFolder, 'gone');
+      return { in: v.id, name: this._demo().sample.name, branch: v.work?.branch ?? null, project: this._demoCopy(v), v };
+    }
+    const at = this._workspaceOf(v);
+    if (!at?.ws || at.removed || !folderThere(at.ws.path)) {
+      if (at?.ws && !at.removed) this._markFolderGone(v);
+      return refusal(goneFolder, 'gone');
+    }
+    return { in: v.id, name: this.repoInfo?.name ?? null, branch: at.ws.branch ?? v.work?.branch ?? null, root: at.ws.path, v, ws: at.ws, run: at.run, rec: at.rec };
+  }
+
+  /** A refusal of the file view from what the core threw: its plain sentence (git's words go to the log only). */
+  _filesRefusal(err, fallback = 'Workbench could not do that.') {
+    if (err?.plain && typeof err.message === 'string' && err.message.trim()) {
+      if (err.detail) this.log.debug('The file view was refused:', err.message, err.detail);
+      const out = { ok: false, reply: err.message, why: err.why === 'changed' ? 'changed' : 'refused' };
+      if (err.why === 'changed' && typeof err.hash === 'string') out.hash = err.hash;
+      return out;
+    }
+    this.log.warn('The file view could not do that:', err);
+    return { ok: false, reply: fallback, why: 'refused' };
+  }
+
+  /**
+   * Which agents changed each path, from the files each recorded (its last receipt): in your copy, every agent whose copy
+   * is still there (not thrown away, its folder not known to be gone); in an agent's copy, that agent alone.
+   * @returns {Map<string, { agentId: string, name: string, state: string }[]>}
+   */
+  _changedBy(c) {
+    const marks = new Map();
+    const roots = c.v ? [this.store.get(c.v.id) || c.v] : this.store.list().filter(v => !v.parentId && !v.work?.thrownAway && v.work?.folder !== false);
+    for (const v of roots) {
+      const list = Array.isArray(v.files?.list) ? v.files.list : [];
+      for (const f of list) {
+        if (typeof f?.path !== 'string') continue;
+        if (!marks.has(f.path)) marks.set(f.path, []);
+        marks.get(f.path).push({ agentId: v.id, name: v.name, state: v.state });
+      }
+    }
+    return marks;
+  }
+
+  /** The lines of a file in an agent's copy that its unmerged work added or changed, or null when that is not known. */
+  async _changedLines(c, rel) {
+    if (c.project) {
+      const now = c.project.textOf(rel);
+      return now == null ? null : this.deps.files.changedLinesBetween(this._demo().pristine.textOf(rel), now);
+    }
+    const since = sinceOf(c.ws);
+    if (!since) return null;
+    try {
+      return await this.deps.files.changedLines({ root: c.root, since, rel });
+    } catch (err) {
+      this.log.debug(`Could not tell which lines of a file ${c.v.id} changed:`, err?.message ?? err);
+      return null;
+    }
+  }
+
+  /** Why the person may not edit this file, in one line, or null when they may. */
+  _notEditable(c, got) {
+    switch (got.kind) {
+      case 'binary': return 'This is a binary file.';
+      case 'large': return 'This file is too large to show here.';
+      case 'notutf8': return 'This file is not UTF-8 text, so Workbench does not show it.';
+      case 'link': return `This is a link to ${quotable(String(got.link ?? ''), 200)}.`;
+      case 'secret': return 'This file holds keys, so Workbench shows only their last four characters and does not edit it.';
+      case 'missing': return 'This file is not there any more.';
+      default: break;
+    }
+    if (got.eol === 'mixed') return 'This file mixes line endings, so Workbench does not edit it.';
+    if (c.v && this._busy.has(c.v.id)) return this._busyReply(c.v);
+    return null;
+  }
+
+  /**
+   * After a save into an agent's copy. A receipt being built (a turn's end, or a recheck) looks again: its checks under
+   * way stop, since they did not see the change (_receipt). Otherwise an agent whose run has ended (done, done and
+   * checked, or a failed check), of this run or an earlier one, is recorded and checked again (_recheck). An agent at
+   * work sees the change itself, and the end of its turn records it; a stopped or failed one claims nothing about its
+   * checks.
+   */
+  _afterSave(c) {
+    const v = this.store.get(c.v.id);
+    if (!v) return;
+    const held = c.run || this._rechecks.get(v.id) || null;
+    if (held) held.saves = (held.saves || 0) + 1;
+    if (held?.receipt) {
+      held.receipt.pass?.abort();
+      return;
+    }
+    if (!DONE.has(v.state) || this._resuming.has(v.id)) return;
+    this._recheck(v, c).catch(err => this.log.error('Could not check the work again after a save:', err));
+  }
+
+  /**
+   * Record an ended agent's work and run its checks again, as the end of a turn does (_receipt), then give it the done
+   * state they lead to. Its "done and checked" (or "a check failed") goes at once, before any check runs, so no card
+   * says checked about content its checks did not see: it says it is done, with its checks running. Its own words stay.
+   * An earlier agent's receipt is held in _rechecks, and its record for the next start is written again with what was
+   * found. A new turn, a message it takes, a stop, a throw-away, being picked up again and shutdown cancel it.
+   */
+  async _recheck(v, c) {
+    const id = v.id;
+    const run = c.run || null;
+    let held = run;
+    if (!held) {
+      held = this._rechecks.get(id) || { id, workspace: c.ws, config: this._loadConfig(c.ws), harness: v.harness, receipt: null, deciding: false, checksDone: null, saves: 0 };
+      this._rechecks.set(id, held);
+    }
+    if (v.state === STATE.DONE_CHECKED || v.state === STATE.CHECKS_FAILED) {
+      this._apply([{ kind: EV.STATE, agentId: id, state: STATE.DONE_CLAIMED, reason: null }]);
+    }
+    const seq = run ? run.turnSeq : 0;
+    // Not run.stopped: closing a finished agent's idle process (a merge, Stop) marks it stopped, and its copy is checked all the same.
+    const stale = () => this._shuttingDown || !this.store.get(id) || this._busy.has(id)
+      || (run ? run.turnSeq !== seq : this.store.get(id).earlier !== true);
+    let got;
+    try {
+      got = await this._receipt(id, held, { stale });
+    } finally {
+      if (!run && this._rechecks.get(id) === held && !held.receipt) this._rechecks.delete(id);
+    }
+    if (!got) return;
+    this._apply([{ kind: EV.STATE, agentId: id, state: doneState(got.checksState), reason: got.reason }]);
+    if (!run && c.rec) {
+      this._replaceEarlier(id, c.ws); // the next start knows what its checks found
+      try { this.history?.schedule(); } catch (err) { this.log.warn('Could not save the history:', err); }
+    }
+    this._lookAgainIfSaved(id, held, got.saves);
+  }
+
+  /**
+   * A save that came after a receipt last looked, but before its done state went out (they are one step apart): record
+   * and check again, so the done state describes what is there.
+   */
+  _lookAgainIfSaved(agentId, held, seen) {
+    if (!held || (held.saves || 0) === seen) return;
+    const v = this.store.get(agentId);
+    if (!v || !DONE.has(v.state)) return;
+    const c = this._copyOf(agentId);
+    if (c.refusal || !c.v) return;
+    this._recheck(v, c).catch(err => this.log.error('Could not check the work again after a save:', err));
+  }
+
+  /** The demo's sample project, made the first time the file view asks: yours, the sample as it started, and each agent's copy. */
+  _demo() {
+    if (!this._demoFiles) {
+      const F = this.deps.files;
+      const sample = F.sampleProject();
+      this._demoFiles = { sample, you: F.memoryProject(sample.files), pristine: F.memoryProject(sample.files), copies: new Map() };
+    }
+    return this._demoFiles;
+  }
+
+  /** An agent's copy in the demo: the sample, with what the simulated agent of that name changed in it, made when first asked. */
+  _demoCopy(v) {
+    const d = this._demo();
+    if (!d.copies.has(v.id)) {
+      const theirs = v.name === d.sample.agent.name ? d.sample.agent.files : {};
+      d.copies.set(v.id, this.deps.files.memoryProject({ ...d.sample.files, ...theirs }));
+    }
+    return d.copies.get(v.id);
+  }
+
   // ---------------------------------------------------------------- merge
 
   /**
@@ -3095,7 +3450,8 @@ export class Engine extends EventEmitter {
     // Nothing may write in its folder while git takes its work: close its idle process (and what it left running), and
     // let stopped checks end. It cannot start a turn by itself after this: _closeIdle marks it stopped first.
     await this._closeIdle(v);
-    if (run?.checksDone) await run.checksDone;
+    const checking = run || this._rechecks.get(id);
+    if (checking?.checksDone) await checking.checksDone;
     if (run && this._runnerInfo(run)?.alive === true) return { reply: `Workbench could not pause ${v.name}, so nothing was merged.`, focusId: id };
     v = this.store.get(id);
     const again = this._mergeRefusal(v, { state: c.state, ownJob: true });
@@ -3299,7 +3655,8 @@ export class Engine extends EventEmitter {
     } else {
       await this._closeIdle(v);
     }
-    if (run?.checksDone) await run.checksDone;
+    const checking = run || this._rechecks.get(id);
+    if (checking?.checksDone) await checking.checksDone;
     // A process that will not stop may still be writing there: its folder stays.
     if (run && this._runnerInfo(run)?.alive === true) return { reply: `Workbench could not stop ${v.name}, so its work was not thrown away.`, focusId: id };
     v = this.store.get(id) || v;

@@ -315,19 +315,21 @@ async function loadModules(demo, log) {
   const base = { Store: storeMod.Store, Engine: engineMod.Engine, createServer: httpMod.createServer, commands, Machines: machinesMod.Machines, prefs };
   if (demo) {
     const sim = await load('src/adapters/sim/simulator.mjs');
-    // Not needed by the simulator, but passed along when present.
-    const [policy, workspace, receipt] = await Promise.all([
+    // Not needed by the simulator, but passed along when present. The file view shows the demo's sample project.
+    const [policy, workspace, receipt, files] = await Promise.all([
       loadOptional('src/core/policy.mjs', log), loadOptional('src/core/workspace.mjs', log), loadOptional('src/core/receipt.mjs', log),
+      loadOptional('src/core/files.mjs', log),
     ]);
-    return { ...base, Simulator: sim.Simulator, policy, workspace, receipt };
+    return { ...base, Simulator: sim.Simulator, policy, workspace, receipt, files };
   }
-  const [policy, workspace, receipt, history] = await Promise.all([
+  const [policy, workspace, receipt, history, files] = await Promise.all([
     load('src/core/policy.mjs'), load('src/core/workspace.mjs'), load('src/core/receipt.mjs'), loadOptional('src/core/history.mjs', log),
+    loadOptional('src/core/files.mjs', log),
   ]);
   const [claude, codex] = await Promise.all([
     loadOptional('src/adapters/claude/runner.mjs', log), loadOptional('src/adapters/codex/runner.mjs', log),
   ]);
-  return { ...base, policy, workspace, receipt, history, claude, codex };
+  return { ...base, policy, workspace, receipt, history, files, claude, codex };
 }
 
 /** End a reason with one full stop: reasons are often whole sentences already. */
@@ -1077,7 +1079,7 @@ async function main() {
     machines,
     connect,
     prefs,
-    deps: { policy: mods.policy, commands: mods.commands, workspace: mods.workspace, receipt: mods.receipt, history: mods.history },
+    deps: { policy: mods.policy, commands: mods.commands, workspace: mods.workspace, receipt: mods.receipt, history: mods.history, files: mods.files },
     log,
   });
   for (const ev of early.splice(0)) engine.ingest(ev);
