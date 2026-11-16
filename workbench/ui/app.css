@@ -785,8 +785,9 @@ body:has(#filesChip:hover, #filesChip:focus-visible) .flash-body { stroke: var(-
   text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--lid-rule); transition: color .15s ease, text-decoration-color .15s ease; }
 #fileSheet .fv-crumb:hover { color: var(--lid-ink); text-decoration-color: var(--lid-ink-2); }
 #fileSheet .fv-crumb[aria-disabled="true"] { text-decoration: none; cursor: default; color: var(--lid-ink-3); }
-#fileSheet .fv-acts { flex: none; display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; max-width: 46%; }
-#fileSheet .fv-why { color: var(--lid-ink-3); text-align: right; overflow-wrap: anywhere; line-height: 1.35; }
+#fileSheet .fv-acts { flex: 0 1 auto; display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; max-width: 64%; }
+/* why a file is not edited, where Edit would be: one line where there is room, else two even lines */
+#fileSheet .fv-why { color: var(--lid-ink-3); text-align: right; overflow-wrap: anywhere; line-height: 1.35; text-wrap: balance; }
 #fileSheet .fv-saved { color: var(--k-ok); font-weight: 600; white-space: nowrap; }
 #fileSheet .fv-x { flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 4px; background: none; color: var(--lid-ink-2); font-size: 15px; line-height: 1; }
 #fileSheet .fv-x:hover { background: rgba(60, 58, 48, .10); color: var(--lid-ink); }

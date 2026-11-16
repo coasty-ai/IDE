@@ -30,6 +30,8 @@ const CODE_PAD = { top: 8, bottom: 18, left: 14, right: 28 };
 const KINDS_WITHOUT_TEXT = new Set(['binary', 'large', 'notutf8', 'link', 'missing']);
 /** What leaving the editor asks first for, when the person only leaves the editor (and stays on the file). */
 const STAY = () => {};
+/** The most rows a folder draws; the rest are found by typing. */
+const FOLDER_ROWS = 1000;
 
 let ctx = null, el = null;
 const st = {
@@ -92,7 +94,7 @@ export function setupFiles(c) {
     const o = e.target.closest('[role="option"]');
     if (o) choose(+o.dataset.i);
   });
-  el.bar.addEventListener('submit', e => { e.preventDefault(); choose(st.find.active); });
+  el.bar.addEventListener('submit', e => { e.preventDefault(); flushFind(); choose(st.find.active); });
   el.find.addEventListener('input', onFindInput);
   el.find.addEventListener('keydown', onFindKey);
   el.code.addEventListener('scroll', () => drawRows());
@@ -490,16 +492,37 @@ function showFolder(dir, { focusField: toField = false } = {}) {
   if (toField) focusField();
 }
 
+let findFrame = 0;
 function onFindInput() {
   const q = el.find.value;
   st.find.q = q;
   if (q && st.view !== 'find') { st.back = backOf(); st.view = 'find'; }
   st.find.active = 0;
   searchSoon(q);
-  paint();
+  // one paint a frame, however fast the letters come
+  cancelAnimationFrame(findFrame);
+  findFrame = requestAnimationFrame(() => { findFrame = 0; paint(); });
+  paintBar();
 }
 
+/**
+ * The files whose paths hold the query's letters in order. Each new letter narrows the last list, rather than reading
+ * every file again, so typing stays quick in a repository of 50,000 files.
+ */
+const pool = { files: null, q: '', list: null };
+function candidates(files, q) {
+  const key = q.replace(/\s+/g, '').toLowerCase();
+  const from = pool.files === files && pool.q && key.startsWith(pool.q) ? pool.list : files;
+  const list = from.filter(f => { const p = f.path.toLowerCase(); for (let i = 0, j = 0; i < key.length; i++, j++) { j = p.indexOf(key[i], j); if (j < 0) return false; } return true; });
+  Object.assign(pool, { files, q: key, list });
+  return list;
+}
+
+/** A list still waiting for its frame is painted now, so a key that acts on it acts on what was typed. */
+function flushFind() { if (findFrame) { cancelAnimationFrame(findFrame); findFrame = 0; paint(); } }
+
 function onFindKey(e) {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter') flushFind();
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     if (!st.find.items.length) return;
     e.preventDefault();
@@ -538,8 +561,11 @@ function listItems() {
   const files = st.list.files || [];
   if (st.view === 'folder') {
     const lst = F.folderListing(files, st.dir);
-    return [...lst.folders.map(f => ({ kind: 'folder', ...f })), ...lst.files.map(f => ({ kind: 'file', ...f }))];
+    const all = [...lst.folders.map(f => ({ kind: 'folder', ...f })), ...lst.files.map(f => ({ kind: 'file', ...f }))];
+    st.find.more = Math.max(0, all.length - FOLDER_ROWS);
+    return all.slice(0, FOLDER_ROWS);
   }
+  st.find.more = 0;
   const q = st.find.q.trim();
   const items = [];
   if (!q) {
@@ -550,7 +576,7 @@ function listItems() {
   }
   const jump = F.lineJump(q);
   if (jump && st.file && st.file.rows && st.file.rows.length) items.push({ kind: 'line', line: Math.min(jump, st.file.rows.length), path: st.file.path });
-  const found = F.findFiles(files, q, { max: 12 }).map(r => ({ kind: 'file', path: r.path, hits: r.hits, changedBy: r.file.changedBy, group: 'Files' }));
+  const found = F.findFiles(candidates(files, q), q, { max: 12 }).map(r => ({ kind: 'file', path: r.path, hits: r.hits, changedBy: r.file.changedBy, group: 'Files' }));
   const s = st.find.search, hits = s.q && s.results ? F.orderSearch(s.results, st.file ? st.file.path : null, 30).map(r => ({ kind: 'hit', ...r, group: 'In files' })) : [];
   if (st.find.mode === 'search') items.push(...hits, ...found); else items.push(...found, ...hits);
   return items;
@@ -741,6 +767,7 @@ function paintList() {
   const s = st.find.search;
   if (st.view === 'find' && s.q && s.error) html += `<p class="fv-empty">${esc(s.error)}</p>`;
   if (st.view === 'find' && s.q && s.results && !s.results.length && !s.error && st.find.q.trim() === s.q) html += `<p class="fv-empty">No line in the files holds “${esc(visibleControls(s.q))}”.</p>`;
+  if (st.view === 'folder' && st.find.more) html += `<p class="fv-empty">and ${st.find.more.toLocaleString('en-US')} more here: type a few letters of one to find it.</p>`;
   if (st.list.truncated) html += '<p class="fv-empty">Workbench lists the first 50,000 files.</p>';
   if (el.list.dataset.html !== html) { el.list.innerHTML = html; el.list.dataset.html = html; }
   markActive();
