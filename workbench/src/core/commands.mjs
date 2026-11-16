@@ -1490,6 +1490,9 @@ function refTokens(m, s, core) {
   return core.slice(from, to);
 }
 
+/** The person the words speak to: in "how are you" or "what are you thinking" they name no agent, so they are a prompt. */
+const YOU = new Set(['you', 'u', 'ya', 'yourself', 'yall', "y'all"]);
+
 /** Questions about the agents together: "which agents are done?", "are any agents still running", "how many agents are left". */
 const GENERAL_STATUS_RE = [
   /^(?:which|what) (?:of )?(?:the |my )?(?:agents|ones) (?:is|are) (?:still )?(?:done|finished|working|running|stuck|waiting|left|busy|idle|ready)$/,
@@ -1526,6 +1529,9 @@ function matchStatusOrSpend(core, c, base = core) {
     if (!m) continue;
     const ref = refTokens(m, s, core);
     if (SPEND_WORD.test(ref.map(t => t.w).join(' '))) break; // "how much is this costing" is spend, below
+    // "how are you", "what are you thinking", with no agent in the centre: no agent is called "you", so the words are said to
+    // one, a prompt. With an agent in the centre, "you" may be that agent ("what did you change"), as before.
+    if (!c.focusId && ref.some(t => YOU.has(t.w)) && ref.every(t => YOU.has(t.w) || REF_STOP.has(t.w))) continue;
     // "what did the last agent do", "status of the stuck one": an agent described, not named. The one the words find, or
     // how they all are when they find none.
     const described = describedAgent(ref, c);
@@ -2083,15 +2089,18 @@ const ASK_AFTER_IS = new Set(['there', 'it', 'this', 'that', 'the', 'a', 'an', '
 
 /**
  * The words after an agent's name (and a second one: "claude and codex …") say work for it, or null. `loose`: at the last
- * step (matchFreeWork), where nothing on screen waits for an answer, a question ("codex who are you?") and words that say
- * nothing by themselves ("codex hello") are said to it too; words about it ("claude is stuck") still are not.
+ * step (matchFreeWork), where nothing on screen waits for an answer, a question ("codex who are you?", and `said`, the
+ * words before their polite opener was taken off: "claude can you hear me") and words that say nothing by themselves
+ * ("codex hello") are said to it too, and so is a "you" right after "are", "did" or "were" ("codex are you there?",
+ * "claude did you run the tests?"); words about it ("claude is stuck", "codex did it") still are not.
  */
-function workAfterName(rest, named, c, { loose = false } = {}) {
+function workAfterName(rest, named, c, { loose = false, said = rest } = {}) {
   if (!rest.length || emptyTask(rest)) return false;
   const first = rest[0].w;
-  if (!named.tail && COPULA.has(first) && !((first === 'is' || first === 'are') && ASK_AFTER_IS.has(rest[1]?.w))) return false;
+  const toIt = loose && rest[1]?.w === 'you';
+  if (!named.tail && COPULA.has(first) && !toIt && !((first === 'is' || first === 'are') && ASK_AFTER_IS.has(rest[1]?.w))) return false;
   if (WORK_VERBS.has(first)) return rest.length >= 2 && !emptyTask(rest.slice(1));
-  if (loose && (isQuestion(rest) || contentCount(rest) === 0)) return true;
+  if (loose && (toIt || isQuestion(said) || contentCount(rest) === 0)) return true;
   return saysSomething(rest, c);
 }
 
@@ -2358,7 +2367,7 @@ function matchFreeWork(core, c, base) {
   const name = har.first ? core[harnessAt(ws, 0).len - 1] : null;
   const words = har.first ? stripPolite(stripSoft(har.toks)) : har.toks;
   // "claude is stuck", "claude broke the build": said about a program, not to it
-  if (name && !name.tail && !workAfterName(words, name, c, { loose: true })) return null;
+  if (name && !name.tail && !workAfterName(words, name, c, { loose: true, said: stripSoft(har.toks) })) return null;
   // only the program's name comes off: the words before it or after it are the prompt as typed, politeness and all
   const said = har.first ? har.toks : words;
   const task = har.last ? asTyped(said, { lead: true }).replace(/[\s,;:]+$/, '') : asTyped(said, { lead: !har.first });

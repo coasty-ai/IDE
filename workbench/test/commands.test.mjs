@@ -2155,6 +2155,13 @@ test('a program named first, before a question or words that say nothing, takes 
     ['claude code is this right?', 'empty', start(['is this right?', 'claude'])],
     ['codex hello', 'none', start(['hello', 'codex'])],
     ['codex thank you so much', 'none', start(['thank you so much', 'codex'])],
+    // a "you" right after "are", "did" or "were" is said to the program; so is a question that opens politely
+    ['codex are you there?', 'none', start(['are you there?', 'codex'])],
+    ['codex did you write the cart module?', 'none', start(['did you write the cart module?', 'codex'])],
+    ['claude were you able to run the tests', 'none', start(['were you able to run the tests', 'claude'])],
+    ['claude can you hear me', 'none', start(['can you hear me', 'claude'])],
+    ['claude was stuck', 'none', said('claude was stuck')],
+    ['codex did it', 'none', said('codex did it')],
     // a card stays where it is, as for any prompt
     ['codex who are you?', 'pendingStop', start(['who are you?', 'codex'])],
     // as before
@@ -2168,6 +2175,17 @@ test('a program named first, before a question or words that say nothing, takes 
     ['codex who are you?', 'question', answer('codex who are you?')],
     ['claude what does it delete?', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
   ]);
+});
+
+test('a question to "you" is said to an agent: "how are you" and "what are you thinking" are prompts, never how the agents are', () => {
+  for (const text of ['how are you', 'hi, how are you?', 'How are you doing?', 'what are you thinking', 'what are you doing', 'what are you up to?']) {
+    for (const ctx of ['none', 'empty', 'oneAtWork']) assert.deepEqual(parseCommand(text, SWEPT[ctx] || ctxOf(ctx)), said(text), `${text} [${ctx}]`);
+  }
+  // the agents, said as they are, are still how they are; and with an agent in the centre, "you" may be that agent
+  for (const text of ['how are the agents doing', 'what are they doing', 'how are we doing', 'is claude still running?', 'what is everyone doing']) {
+    assert.deepEqual(parseCommand(text, CTX.none), { kind: 'status' }, text);
+  }
+  assert.deepEqual(parseCommand('what did you change', CTX.invoice), { kind: 'status' });
 });
 
 test('an emoji, a thanks or any words said to a program by name are its prompt, with or without a comma', () => {

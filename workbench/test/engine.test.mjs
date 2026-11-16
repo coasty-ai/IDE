@@ -4324,7 +4324,7 @@ const NEVER_SAID = ['I did not catch that', 'You’re welcome.', 'OK.', 'There i
 test('every prompt goes to an agent: whatever is no command starts one at once, exactly as typed, and no reply is a word back in its place', async () => {
   const t = live();
   t.engine.deps.commands = commands;
-  const prompts = ['what do you think of this workbench', 'who are you', 'thanks', 'ok', 'hi', 'hello', 'help', 'what can you do', '👍', 'hmm',
+  const prompts = ['what do you think of this workbench', 'who are you', 'how are you', 'what are you thinking', 'thanks', 'ok', 'hi', 'hello', 'help', 'what can you do', '👍', 'hmm',
     'is this right?', 'go on', 'yes', 'no', 'do it', 'cancel', 'cool', 'never mind', 'never mind, the login page is broken', 'good job', 'blorp',
     'status of the repo', 'what needs me to approve this PR?', 'discard the old migrations folder', 'readme', 'claude is stuck',
     'Hello! Can you help me build a website?', 'Update the docs for the new API.', 'function total(cart) {\n  return cart.sum();\n}'];
@@ -4462,6 +4462,8 @@ test('what is said to a program by name reaches it with every word after the add
     ['ask claude that question again', 'claude', 'that question again'],
     ['use codex: which tests are flaky?', 'codex', 'which tests are flaky?'],
     ['codex who are you?', 'codex', 'who are you?'],
+    ['codex are you there?', 'codex', 'are you there?'],
+    ['claude can you hear me', 'claude', 'can you hear me'],
     ['claude what do you think of this workbench', 'claude', 'what do you think of this workbench'],
     ['@claude what do you think of this workbench', 'claude', 'what do you think of this workbench'],
     ['codex, 👍', 'codex', '👍'],
