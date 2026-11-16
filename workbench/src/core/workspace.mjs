@@ -717,7 +717,7 @@ const ENV_LINE = /^\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])
 const ENV_SECRET_NAME = /KEY|TOKEN|SECRET|PASS|PWD|AUTH|CRED|PRIVATE|SALT|DSN|WEBHOOK|(?:^|[_.-])(?:PW|PIN)(?:[_.-]|$)/i;
 // The shapes of a value that cannot be a secret (see plainEnvValue).
 const PLAIN_WORD = /^[A-Za-z]+$/;
-const PLAIN_NUMBER = /^[+-]?\d+(?:\.\d+)?$/;
+const PLAIN_NUMBER = /^(?:[+-]?\d+(?:\.\d+)?|v?\d+(?:\.\d+)+)$/; // 12345678, +15551234567, a version (v20.11.1)
 const HOST_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const HOST_NAME = new RegExp(`^(?:${HOST_LABEL}\\.)+[a-z]{2,63}$`); // db.internal, smtp.example.com
 const HOST_ONE = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/; // cache, as the host of redis://cache:6379
@@ -769,7 +769,7 @@ function plainHost(s, one = false) {
 /**
  * Whether a value from an env file cannot be a secret, so the engine does not hide it: copied .env files hold plain
  * words too ("production", "localhost"), which people and agents write, and hiding them would put "••••" in their words.
- * Letters only; a number; a host (127.0.0.1:5432, localhost:3000, smtp.example.com), or a network (10.0.0.0/16); or a
+ * Letters only; a number or a version (v20.11.1); a host (127.0.0.1:5432, localhost:3000, smtp.example.com), or a network (10.0.0.0/16); or a
  * web address with no user or password, no query and no fragment, whose path is lower-case words and short numbers
  * (http://localhost:3000/api/v1). A webhook's address is none of these: its secret is in its path. Anything else may be
  * a secret, and is hidden (us-east-1 too). The name, or a key's shape, can still say secret (see envValues).

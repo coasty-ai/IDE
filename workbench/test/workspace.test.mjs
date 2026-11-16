@@ -3364,7 +3364,7 @@ describe('filling a new workspace', { concurrency: TESTS_AT_ONCE }, () => {
     const awsId = ['AKIA', 'QWERTYUIOPASDFGH'].join(''); // letters only, but a key's shape
     const plain = {
       NODE_ENV: 'production', DB_HOST: 'localhost', DB_NAME: 'database', CHAT_ROLE: 'assistant', COUNTRY: 'Australia', BIG: '12345678',
-      PHONE: '+15551234567', HOST_IP: '127.0.0.1', LISTEN: 'localhost:3000', DB_ADDR: '127.0.0.1:5432', NET: '10.0.0.0/16',
+      PHONE: '+15551234567', NODE_VERSION: 'v20.11.10', TOOL_VERSION: '2024.10.1', HOST_IP: '127.0.0.1', LISTEN: 'localhost:3000', DB_ADDR: '127.0.0.1:5432', NET: '10.0.0.0/16',
       V6: '2001:db8::1', V6_PORT: '[2001:db8::1]:8080', SMTP_HOST: 'smtp.example.com', APP_URL: 'http://localhost:3000',
       API_BASE: 'https://api.example.com/v1/users/', CACHE_URL: 'redis://cache:6379', DOCS: 'https://example.com/docs/index.html',
     };
