@@ -2672,13 +2672,17 @@ try {
     await sleep(900);
     await b.ev(`document.getElementById('filesChip').click(), 1`); await sleep(700);
     const prevented = await b.ev(`(() => { const e = new KeyboardEvent('keydown', { key: 's', metaKey: true, ctrlKey: !navigator.platform.startsWith('Mac'), bubbles: true, cancelable: true }); document.getElementById('fvFind').dispatchEvent(e); return e.defaultPrevented; })()`);
+    // the sheet must never have closed in between (a ⌘P that came after the close would open it anew)
+    await b.ev(`(window.__closes = 0, document.getElementById('fileSheet').addEventListener('close', () => { window.__closes++; }), 1)`);
     await b.key('Escape'); await sleep(90);
+    const going = await b.ev(`document.getElementById('fileSheet').open && !document.documentElement.dataset.files`);
     await b.key('p', { meta: true }); await sleep(700);
     const st = await fv();
     const dim = await b.ev(`document.documentElement.dataset.files || ''`);
     const anims = await b.ev(`document.getAnimations().filter(a => a.playState === 'running').length`);
+    const closes = await b.ev(`window.__closes`);
     check(FV + '⌘S outside the editor is kept from the browser, and ⌘P while the sheet closes brings it back',
-      prevented && st.open && st.focus === 'fvFind' && st.list && dim === 'open' && anims === 0, JSON.stringify({ prevented, open: st.open, focus: st.focus, dim, anims }));
+      prevented && going && closes === 0 && st.open && st.focus === 'fvFind' && st.list && dim === 'open' && anims === 0, JSON.stringify({ prevented, going, closes, open: st.open, focus: st.focus, dim, anims }));
   });
 
   await run(FV + 'the keyboard\'s gold line on the page is drawn over the rows, and black-gold\'s page has no frame of its own inside the gold one', async () => {
