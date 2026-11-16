@@ -14,10 +14,12 @@
 //   permissions { mode: 'full'|'ask' }   full permissions on (the engine asks first, with a card) or off
 // Anything that is not one of Workbench's own commands, or an answer to what is on screen, is the prompt for a new
 // agent: { kind: 'task', task } with the person's words exactly as typed (only the spaces around them go), and the
-// engine starts it at once. "thanks", "ok", "hi", "help", an emoji, a never-mind: all prompts. `unknown` is left for
+// engine starts it at once. "thanks", "ok", "hi", "help", an emoji, a never-mind, pasted code that begins like a call
+// ("stop()"), and the same words said again while the agent they started still works: all prompts. `unknown` is left for
 // nothing said, a yes that is not enough for the card on screen (or asked), and words that answer nothing while a
 // permission waits. Answers, messages and a start's task keep their edges too (asTyped), and a start for a program
-// named ("codex, …", "ask codex to …", "… with codex") takes off only Workbench's words: "please" and "thanks" stay.
+// named ("codex, …", "ask codex to …", "… with codex") takes off only Workbench's words: "please", "thanks", and a
+// question word or "that" after the name ("ask claude which tests are flaky") stay.
 // Extra fields some intents carry: askId (allow, deny, answer), text (deny: the person's words, such as
 // "no, use the staging database"), conditional (deny: a yes that came with conditions, "yes but only in the
 // tests folder"; text is the whole reply), sure: false (stop, say: the words found the agent but did not name
@@ -779,8 +781,9 @@ function matchStop(core, c) {
   }
   const v = startsWithSeq(ws, STOP_VERBS);
   if (!v) return null;
-  // "Stop asking for password" is the name of the agent "Stop asking for password": said alone, it shows it, as any name does
-  if (bareName(ws, c)) return null;
+  // "Stop asking for password" is the name of the agent "Stop asking for password": said alone, it shows it, as any name
+  // does. A stop verb alone ("stop", "stop it") is always the stop, even beside an agent called "Stop" (pasted "stop()").
+  if (ws.filter(w => !REF_STOP.has(w)).length > 1 && bareName(ws, c)) return null;
   // "stop checkout test?" asks about the agent of that name; "can you stop the flaky test?" still stops
   if (/[?？]["'”’)]*$/.test(core[core.length - 1].raw) && c.agents.some(a => saysWhole(ws, a))) return null;
   let rest = core.slice(v);
@@ -1496,11 +1499,24 @@ const GENERAL_STATUS_RE = [
   /^how (?:are|is) (?:my |the |all |all my |all the )?(?:agents|things|everyone|everybody)$/,
 ];
 
+/**
+ * Whether the question on screen (the focused agent's, or its one waiting helper's) says this word, in its sentence or
+ * one of its choices: "Should I sort by date or by status?" says "status", so "status" may be its answer.
+ */
+function askUses(c, w) {
+  const ask = c.asker && c.asker.ask;
+  if (!ask || typeof ask !== 'object') return false;
+  const text = [ask.sentence, ask.detail, ...(Array.isArray(ask.options) ? ask.options : [])].filter(x => typeof x === 'string').join(' ');
+  const s = stem(w);
+  return lex(text).some(t => t.w === w || stem(t.w) === s);
+}
+
 function matchStatusOrSpend(core, c, base = core) {
   const ws = core.map(t => t.w);
   const s = ws.join(' ');
-  // One word ("update", "cost") could be the answer to a question, so only longer phrases are strong.
-  if (GENERAL_STATUS.has(s)) return { intent: { kind: 'status' }, strong: ws.length > 1 };
+  // Status is Workbench's own: strong, so it wins over the question on screen. One word ("status", "update") is weak only
+  // when that question says the word ("Should I update the lockfile?"): then it may be the answer.
+  if (GENERAL_STATUS.has(s)) return { intent: { kind: 'status' }, strong: ws.length > 1 || !askUses(c, ws[0]) };
   if (GENERAL_STATUS_RE.some(re => re.test(s))) return { intent: { kind: 'status' }, strong: true };
   // "what's waiting for me?": the trailing "for me" was taken off core, so the words as said count too
   if (isNeedsMe(ws) || isNeedsMe(stripPolite(stripSoft(base)).map(t => t.w))) return { intent: { kind: 'status', needsMe: true }, strong: true };
@@ -1756,17 +1772,26 @@ function takeHarness(toks) {
   return { harness: null, toks };
 }
 
-/** Drop the words that join the noun phrase to the task: "to", "on", "that fixes", "and have it". */
-function stripConnectors(toks) {
+/** The words that join a start's noun phrase to its work: "start codex on the parser", "spin up an agent for the docs". */
+const JOINS = ['to', 'on', 'for', 'about', 'with', 'at', 'into', 'and'];
+
+/**
+ * Drop the words that join the noun phrase to the task: "to", "on", "that fixes", "and have it". `relative`: "that",
+ * "which" and "who" may begin a clause about the agent ("an agent that fixes the login": "fix the login"), which is so
+ * only right after a word for an agent; after a program's name they are the prompt's own ("ask claude which tests are
+ * flaky", "codex, that is wrong"). `joins`: the words that join (JOINS); after "ask" or "tell" only "to" does, so "ask
+ * claude about the build" keeps "about the build".
+ */
+function stripConnectors(toks, { relative = true, joins = JOINS } = {}) {
   const ws = toks.map(t => t.w);
   let k = 0;
   let conj = false;
   if (ws[0] === 'and' && ['have', 'get', 'ask', 'tell', 'let', 'make'].includes(ws[1]) && ['it', 'them', 'him', 'her'].includes(ws[2])) {
     k = ws[3] === 'to' ? 4 : 3;
-  } else if (['to', 'on', 'for', 'about', 'with', 'at', 'into', 'and'].includes(ws[0])) {
+  } else if (joins.includes(ws[0])) {
     k = 1;
     if (['the', 'a', 'this'].includes(ws[1]) && ['task', 'job'].includes(ws[2])) k = ['of', 'to'].includes(ws[3]) ? 4 : 3;
-  } else if (['that', 'which', 'who'].includes(ws[0])) {
+  } else if (relative && ['that', 'which', 'who'].includes(ws[0])) {
     k = 1;
     if (['will', 'can', 'should', 'could', 'would', 'must'].includes(ws[1])) k = 2;
     else conj = true;
@@ -1783,15 +1808,16 @@ function emptyTask(toks) {
 
 /**
  * Build the start tasks from the words after the noun phrase. A harness is the agent the words named, or null when
- * they named none: the engine then gives the work to the person's default agent.
+ * they named none: the engine then gives the work to the person's default agent. `connect`: how the noun phrase joins
+ * its work (stripConnectors).
  * @returns {{ task: string, harness: string|null, machine: string }[] | null}
  */
-function buildTasks(rest, noun, c) {
+function buildTasks(rest, noun, c, connect = {}) {
   const mach = takeMachine(rest, c);
   let toks = mach.toks;
   const har = takeHarness(toks);
   toks = har.toks;
-  toks = stripConnectors(toks);
+  toks = stripConnectors(toks, connect);
   const machine = mach.machine || (noun.cloud ? 'cloud' : laptopId(c));
   const ws = toks.map(t => t.w);
 
@@ -1856,11 +1882,23 @@ function matchStart(core, c) {
     // parse: the words after the name are tried as a command). "new agent for this" and "codex on it" still ask for work.
     if (!stripPolite(stripSoft(rest)).some(t => !NOTHING_WORDS.has(t.w))) return null;
   }
-  const tasks = buildTasks(rest, noun, c);
-  // A start verb with no work after it ("start an agent", "start codex", "start", "add an agent on cloud 2"): the
-  // engine asks what the agent should work on. Only a start verb with a named agent wins over a waiting question:
-  // "use codex", "ask claude" or a bare "start" may well be the answer.
-  if (!tasks) return { intent: NO_TASK_START(noTaskHarness(noun, core.slice(noun.end), c)), strong: strongVerb && noun.named };
+  // "ask codex …", "tell claude …": what follows is what is said to it, so only "to" joins it to the work ("ask claude
+  // about the build" keeps "about the build"). "that", "which" and "who" join only after a word for an agent ("an agent
+  // that fixes the login"), never after a program's name or a break ("ask claude which tests are flaky").
+  const say = v === 1 && (ws[0] === 'ask' || ws[0] === 'tell');
+  const last = core[noun.end - 1];
+  const relative = noun.end > v && AGENT_NOUN.has(ws[noun.end - 1]) && !last.tail;
+  const tasks = buildTasks(rest, noun, c, { relative, joins: say ? ['to'] : JOINS });
+  if (!tasks) {
+    // "tell claude thanks", "ask codex 🤔": what is said to a program is its prompt, though the commands set it aside as
+    // politeness, or it holds no words at all. Weak: a question on screen takes the words as its answer.
+    const told = say && noun.harnesses.length === 1 && !rest.length ? afterName(last) : '';
+    if (told) return { intent: { kind: 'start', tasks: [{ task: told, harness: noun.harnesses[0], machine: laptopId(c) }] }, strong: false };
+    // A start verb with no work after it ("start an agent", "start codex", "start", "add an agent on cloud 2"): the
+    // engine asks what the agent should work on. Only a start verb with a named agent wins over a waiting question:
+    // "use codex", "ask claude" or a bare "start" may well be the answer.
+    return { intent: NO_TASK_START(noTaskHarness(noun, core.slice(noun.end), c)), strong: strongVerb && noun.named };
+  }
   // "use codex instead", "ask claude too": which agent, and no work; the engine asks what it should work on
   if (tasks.every(t => /^(?:(?:instead|rather|too|also|then|now|please|again)\b ?)+$/i.test(t.task))) {
     return { intent: NO_TASK_START(noTaskHarness(noun, core.slice(noun.end), c)), strong: strongVerb && noun.named };
@@ -2043,12 +2081,17 @@ const COPULA = new Set(['is', 'was', 'are', 'were', 'has', 'had', 'seems', 'look
 /** After "is" or "are", these words make a question, not a remark: "codex is there a memory leak in the worker". */
 const ASK_AFTER_IS = new Set(['there', 'it', 'this', 'that', 'the', 'a', 'an', 'any', 'my', 'our', 'your']);
 
-/** The words after an agent's name (and a second one: "claude and codex …") say work for it, or null. */
-function workAfterName(rest, named, c) {
+/**
+ * The words after an agent's name (and a second one: "claude and codex …") say work for it, or null. `loose`: at the last
+ * step (matchFreeWork), where nothing on screen waits for an answer, a question ("codex who are you?") and words that say
+ * nothing by themselves ("codex hello") are said to it too; words about it ("claude is stuck") still are not.
+ */
+function workAfterName(rest, named, c, { loose = false } = {}) {
   if (!rest.length || emptyTask(rest)) return false;
   const first = rest[0].w;
   if (!named.tail && COPULA.has(first) && !((first === 'is' || first === 'are') && ASK_AFTER_IS.has(rest[1]?.w))) return false;
   if (WORK_VERBS.has(first)) return rest.length >= 2 && !emptyTask(rest.slice(1));
+  if (loose && (isQuestion(rest) || contentCount(rest) === 0)) return true;
   return saysSomething(rest, c);
 }
 
@@ -2203,6 +2246,39 @@ function sameWork(core, a) {
 }
 
 /**
+ * The little words that may stand around an agent's own words when they are all that is said: "the onboarding agent",
+ * "the onboarding thing", "the one about onboarding", "the guy doing onboarding".
+ */
+const REF_AROUND = new Set(['the', 'a', 'an', 'this', 'that', 'these', 'those', 'my', 'our', 'your', 'its', 'one', 'ones', 'agent', 'agents',
+  'helper', 'helpers', 'task', 'job', 'thing', 'things', 'stuff', 'guy', 'bot', 'worker', 'session', 'instance', 'called', 'named', 'about',
+  'on', 'doing', 'working']);
+
+/**
+ * Whether the words are nothing but this agent's own: words of its name or its task (any of them, "in" and "what" too),
+ * and the little words that point at it (REF_AROUND). "the checkout bug" is Checkout fix's, and "memory leak in the
+ * websocket" that of the agent on it; "what do you think of this workbench" is no agent's, however many of its words a
+ * task has ("do" and "you" are no task's here).
+ */
+function onlyItsWords(core, a) {
+  const own = new Set();
+  const words = lex(`${a.name ?? ''} ${a.task ?? ''}`).map(t => t.w);
+  words.forEach((w, i) => {
+    own.add(w);
+    own.add(stem(w.replace(/-/g, '')));
+    for (const part of w.split('-')) if (part) own.add(stem(part)); // "feature-flag" has "feature" and "flag"
+    if (i + 1 < words.length) own.add(stem(w + words[i + 1])); // "check out" also reads as "checkout"
+  });
+  const ws = core.map(t => t.w);
+  for (let i = 0; i < ws.length; i++) {
+    if (REF_AROUND.has(ws[i])) continue;
+    if (i + 1 < ws.length && own.has(stem(ws[i] + ws[i + 1]))) { i++; continue; } // "the check out fix" for Checkout fix
+    if (own.has(ws[i]) || hit(own, stem(ws[i].replace(/-/g, '')))) continue; // hit: "clean" finds "cleanup"
+    return false;
+  }
+  return true;
+}
+
+/**
  * An agent named in free text, as work for it: first ("codex why is the build slow"), last after a comma ("the login
  * page is broken, codex": `last`), or with "using", "via" or "through" ("… using codex"), or at the very end after "with",
  * "in" or "on" ("… in codex"). Not in the middle of what the words say: "error in claude code extension" is a bug report.
@@ -2233,14 +2309,18 @@ function harnessInFree(toks) {
  * gives the person's words, exactly as typed, to a new agent (on the default program). Otherwise:
  * - a short remark or question that points at what is on screen, with an agent in the centre ("is it done yet", "it's
  *   still broken", "why did that fail?"): its status; so is an agent's whole name and nothing more ("diff viewer"), and
- *   an agent at work's own words ("the checkout bug"), unless they ask for it ("can we have …"). Retyping an ended
- *   agent's task is that work again, not its status;
+ *   an agent at work's own words ("the checkout bug"), unless they ask for it ("can we have …"). Both only when the words
+ *   are that agent's own and nothing else (onlyItsWords), said as a name and not asked ("what do you think" is a prompt
+ *   beside an agent called What do you think), and not its prompt said again (sameWork): the same words start another
+ *   agent, whatever became of the first;
  * - an agent named alone ("codex", "claude code", "the agent", "start the agent"): a start with no work, so the engine
- *   asks what it should work on;
- * - a program named first, with a comma or a colon after it ("codex, thanks") or before work or a question ("codex why
- *   is the build slow"), last after a comma ("the login page is broken, codex"), or with "using", "via" or "through"
- *   (harnessInFree): a start for that program, its name taken off and the rest as typed (asTyped). Named first before
- *   words that say how it is ("claude is stuck", "codex isn't installed"), the whole sentence is the prompt.
+ *   asks what it should work on; what follows a program's name, though no words ("codex 👍") or politeness ("codex
+ *   thanks"), is its prompt (afterName);
+ * - a program named first, with a comma or a colon after it ("codex, thanks"), or before work, a question or words that
+ *   say nothing ("codex why is the build slow", "codex who are you?", "codex hello"), last after a comma ("the login
+ *   page is broken, codex"), or with "using", "via" or "through" (harnessInFree): a start for that program, its name
+ *   taken off and the rest as typed (asTyped). Named first before words that say how it is ("claude is stuck", "codex
+ *   isn't installed"), the whole sentence is the prompt.
  */
 function matchFreeWork(core, c, base) {
   if (!core.length) return null;
@@ -2255,16 +2335,22 @@ function matchFreeWork(core, c, base) {
     const r = resolveRef(core, c);
     if (r.full && r.sure && !r.pronoun && r.ids.length === 1) {
       const a = c.agents.find(x => x.id === r.ids[0]);
-      if (a && (ENDED.has(a.state) || a.earlier ? r.named && !sameWork(core, a) : r.named || !asked)) return { kind: 'status', agentId: a.id };
+      // only its own words (onlyItsWords), said as a name rather than asked ("what do you think" is a question even beside an
+      // agent called "What do you think"), and not its prompt said again (sameWork: that is a new agent, whatever became
+      // of the first); an ended agent needs its name
+      if (a && !QUESTION_LEAD.has(core[0].w) && !sameWork(core, a) && onlyItsWords(core, a)
+        && (ENDED.has(a.state) || a.earlier ? r.named : r.named || !asked)) {
+        return { kind: 'status', agentId: a.id };
+      }
     }
   }
-  const noun = parseNoun(ws, startsWithSeq(ws, START_STRONG));
+  const verb = startsWithSeq(ws, START_STRONG);
+  const noun = parseNoun(ws, verb);
   if (noun.named && noun.end === ws.length) {
     const named = noun.harnesses.length === 1 ? noun.harnesses[0] : null;
-    // "codex, thanks", "claude, please": a program addressed, and words after it that the commands set aside as
-    // politeness. They are its prompt, as typed.
-    const after = named ? addressedRest(stripSoft(base)) : null;
-    const task = after ? asTyped(after) : '';
+    // "codex, thanks", "codex 👍", "claude please": a program addressed, and what follows it, which the commands set aside
+    // as politeness or which holds no words. It is its prompt, as typed. "start codex please" asks what Codex should do.
+    const task = named && !verb ? afterName(core[noun.end - 1]) : '';
     return task ? { kind: 'start', tasks: [{ task, harness: named, machine: laptopId(c) }] } : NO_TASK_START(named);
   }
   const har = harnessInFree(core);
@@ -2272,7 +2358,7 @@ function matchFreeWork(core, c, base) {
   const name = har.first ? core[harnessAt(ws, 0).len - 1] : null;
   const words = har.first ? stripPolite(stripSoft(har.toks)) : har.toks;
   // "claude is stuck", "claude broke the build": said about a program, not to it
-  if (name && !name.tail && !workAfterName(words, name, c)) return null;
+  if (name && !name.tail && !workAfterName(words, name, c, { loose: true })) return null;
   // only the program's name comes off: the words before it or after it are the prompt as typed, politeness and all
   const said = har.first ? har.toks : words;
   const task = har.last ? asTyped(said, { lead: true }).replace(/[\s,;:]+$/, '') : asTyped(said, { lead: !har.first });
@@ -2345,8 +2431,9 @@ function parse(said, c, { free = true } = {}) {
   // A card on screen takes the words first: what it does not take never reaches a permission behind it.
   const permission = !!ask && ask.type === 'permission' && !card;
   const prompt = free ? { kind: 'task', task: said } : { kind: 'unknown', text: said };
-  // Nothing but filler, symbols or emoji ("👍", "hmm", "}"): typed, it is said all the same.
-  if (!base.length) {
+  // Nothing but filler, symbols or emoji ("👍", "hmm", "}"): typed, it is said all the same. So is pasted code that begins
+  // like a call ("stop()", "stop();\n}", "status()"): never a command or a card's answer, whatever word it starts with.
+  if (!base.length || CODE_CALL.test(base[0].raw)) {
     if (!said) return { kind: 'unknown', text: said };
     if (card) return prompt;
     if (waiting) return { kind: 'answer', agentId: holder.id, askId: ask.id ?? null, text: said };
@@ -2466,16 +2553,22 @@ function parse(said, c, { free = true } = {}) {
   return prompt;
 }
 
+/** A word written as a call, as code is: "stop()", "stop(worker);", "status()". "stop (now)" and "stop!" are no such word. */
+const CODE_CALL = /^[\p{L}\p{N}_$.]*[\p{L}\p{N}_$]\(/u;
+
 const NEVER_MIND = [['never', 'mind'], ['forget', 'about', 'it'], ['forget', 'about', 'that'], ['forget', 'it'], ['forget', 'that'],
   ['scrap', 'that'], ['scratch', 'that'], ['cancel', 'that'], ['ignore', 'that'], ['ignore', 'my', 'last', 'message'],
   ['ignore', 'what', 'i', 'said'], ['disregard', 'that'], ['disregard', 'my', 'last', 'message']];
 const NEVER_MIND_JOIN = new Set(['and', 'just', 'instead', 'then', 'but', 'rather', 'so']);
+/** One word after a never-mind that is a command by itself: a stop of the agent in the centre ("never mind, stop"), or the status. */
+const NEVER_MIND_ONE = new Set([...STOP_WORDS, 'status']);
 
 /**
  * A never-mind at the start: 'alone' when it asks nothing more ("never mind", "never mind the login bug", "ignore my last
  * message"), else the first word of what follows a break or a join ("never mind, fix the checkout bug", "forget it
- * just fix the checkout bug", "never mind the warnings, just fix the errors"), or null. After "cancel that", "forget
- * that" and "scrap that" with no break, "that" belongs to what follows ("cancel that deploy job"): no never-mind.
+ * just fix the checkout bug", "never mind the warnings, just fix the errors", and one word that is a command by itself:
+ * "never mind, stop"), or null. After "cancel that", "forget that" and "scrap that" with no break, "that" belongs to what
+ * follows ("cancel that deploy job"): no never-mind.
  */
 function neverMind(base) {
   const soft = stripSoft(base);
@@ -2489,12 +2582,14 @@ function neverMind(base) {
   let k = n;
   if (!soft[k - 1].tail) {
     if (that && !NEVER_MIND_JOIN.has(soft[k]?.w)) return k === soft.length ? 'alone' : null;
+    // "never mind stop", said with no comma: that one word is the command
+    if (k === soft.length - 1 && NEVER_MIND_ONE.has(soft[k].w)) return soft[k];
     // "never mind the warnings, just fix the errors": past the words it waves away, to the next break or join
     while (k < soft.length && !soft[k - 1].tail && !NEVER_MIND_JOIN.has(soft[k].w)) k++;
   }
   let rest = soft.slice(k);
   while (rest.length && NEVER_MIND_JOIN.has(rest[0].w)) rest = rest.slice(1);
-  return rest.length >= 2 ? rest[0] : alone;
+  return rest.length >= 2 || (rest.length === 1 && NEVER_MIND_ONE.has(rest[0].w)) ? rest[0] : alone;
 }
 
 /**
@@ -2525,6 +2620,14 @@ function agentAddressed(core, c) {
 const WANT = /^(?:(?:i|we) (?:want|need|would like|should|have) to|we should|you should|i think we should|let's) /;
 function saysWant(base) {
   return WANT.test(stripSoft(base).map(t => t.w).join(' ') + ' ');
+}
+
+/**
+ * What was said after this word, as typed, past the comma, colon or dash that sets it off: "👍" in "codex, 👍", "thanks!"
+ * in "tell claude thanks!". '' when nothing but punctuation follows ("codex.", "codex?").
+ */
+function afterName(tok) {
+  return tok ? tok.src.slice(tok.end).replace(/^[\s,;:.!?–—-]+/, '').trim() : '';
 }
 
 /** The words after an agent's name and its comma or colon ("claude, yes"), else null. */

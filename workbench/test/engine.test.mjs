@@ -2616,17 +2616,29 @@ test('merge: the card asks first, counts first, and binds itself to the work it 
   await t.engine.shutdown();
 });
 
-test('finished work: "Not now" leaves the agent as it is, sends it nothing, and the reply is no approval', async (ctx) => {
+test('finished work: "Not now" leaves the agent as it is, sends it nothing, and the reply is no approval and no bare "OK."', async (ctx) => {
   const t = liveFolders(ctx);
   const a = await doneAgent(t);
   const before = a.runner.sent.length;
-  const out = await t.engine.answer(a.id, { answer: 'Not now' });
-  assert.equal(out.ok, true);
-  assert.equal(out.reply, `OK. ${a.v.name}’s work stays on its branch for now.`);
+  for (const said of ['Not now', 'not now']) {
+    const out = await t.engine.answer(a.id, { answer: said });
+    assert.equal(out.ok, true);
+    assert.equal(out.reply, `${a.v.name}’s work stays on its branch for now.`, said);
+    assert.ok(!/\bOK\./.test(out.reply), out.reply);
+  }
   assert.equal(a.runner.sent.length, before, '"Not now" is not a message for the agent');
   assert.equal(t.store.get(a.id).state, 'done_claimed');
   const good = await t.engine.answer(a.id, { answer: 'Looks good' });
   assert.equal(good.reply, `Good. ${a.v.name} stays as it is.`);
+  await t.engine.shutdown();
+});
+
+test('finished work with no branch: "Not now" says it stays as it is, with no bare "OK."', async () => {
+  const t = live();
+  const a = await doneAgent(t);
+  t.store.get(a.id).work = null; // as an agent whose folder Workbench never made a branch for
+  const out = await t.engine.answer(a.id, { answer: 'Not now' });
+  assert.equal(out.reply, `${a.v.name} stays as it is.`);
   await t.engine.shutdown();
 });
 
@@ -4416,6 +4428,91 @@ test('a prompt said to a program by name loses only the name: the rest reaches t
   }
   assert.deepEqual(t.codex.runners.map(r => r.opts.task), rows.map(([, task]) => task));
   assert.equal(t.claude.runners.length, 0);
+  await t.engine.shutdown();
+});
+
+test('the same words said twice start two agents while the first is still at work, and words that share a few with an agent at work start one too', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const twice = ['what do you think of this workbench', 'thanks', 'hi', 'help', 'is this right?'];
+  for (const said of twice) {
+    for (const time of ['first', 'second']) {
+      const out = await t.engine.command(said);
+      assert.equal(out.reply, `Started Claude on “${said}”.`, `${said}, the ${time} time`);
+    }
+  }
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), twice.flatMap(s => [s, s]));
+  assert.ok(t.store.list().every(v => !['done_claimed', 'done_checked', 'stopped', 'failed'].includes(v.state)), 'the first ones are still at work');
+  // an agent at work on a task that shares words with the owner's prompt, then ended: the prompt starts another each time
+  const { id } = await started(t, { task: 'Think about how to improve workbench' });
+  assert.equal((await t.engine.command('what do you think of this workbench')).reply, 'Started Claude on “what do you think of this workbench”.');
+  await t.engine.stop(id);
+  assert.equal((await t.engine.command('what do you think')).reply, 'Started Claude on “what do you think”.');
+  for (const r of t.notices) for (const s of NEVER_SAID) assert.ok(!r.includes(s), `${JSON.stringify(r)} says ${JSON.stringify(s)}`);
+  await t.engine.shutdown();
+});
+
+test('what is said to a program by name reaches it with every word after the address, and an emoji or a thanks is its prompt too', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const rows = [
+    ['ask claude which tests are flaky', 'claude', 'which tests are flaky'],
+    ['ask codex who wrote the cart module', 'codex', 'who wrote the cart module'],
+    ['tell codex who the owner is', 'codex', 'who the owner is'],
+    ['ask claude that question again', 'claude', 'that question again'],
+    ['use codex: which tests are flaky?', 'codex', 'which tests are flaky?'],
+    ['codex who are you?', 'codex', 'who are you?'],
+    ['claude what do you think of this workbench', 'claude', 'what do you think of this workbench'],
+    ['@claude what do you think of this workbench', 'claude', 'what do you think of this workbench'],
+    ['codex, 👍', 'codex', '👍'],
+    ['codex 👍', 'codex', '👍'],
+    ['ask codex 🤔', 'codex', '🤔'],
+    ['claude, 🙏', 'claude', '🙏'],
+    ['tell claude thanks', 'claude', 'thanks'],
+  ];
+  for (const [said, h, task] of rows) {
+    const out = await t.engine.command(said);
+    assert.equal(out.reply, `Started ${h === 'codex' ? 'Codex' : 'Claude'} on “${task}”.`, said);
+  }
+  assert.deepEqual(t.claude.runners.map(r => r.opts.task), rows.filter(([, h]) => h === 'claude').map(([, , task]) => task));
+  assert.deepEqual(t.codex.runners.map(r => r.opts.task), rows.filter(([, h]) => h === 'codex').map(([, , task]) => task));
+  await t.engine.shutdown();
+});
+
+test('"status" at an agent\'s question or a stuck agent is Workbench\'s status: nothing is sent, and the question keeps waiting', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const { id, runner } = await started(t);
+  runner.emit({ kind: EV.TURN, phase: 'start' });
+  runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I found two login routes.\n\nShould I remove the old one?', backgroundTasks: 0, isError: false });
+  await until(() => t.store.get(id).state === 'question');
+  const askId = t.store.get(id).ask.id;
+  for (const said of ['status', 'status?', 'update', 'progress']) {
+    const out = await t.engine.command(said, { focusId: id, askId });
+    assert.equal(out.reply, 'One thing needs you: Fix login redirect has a question.', said);
+  }
+  assert.deepEqual(runner.sent, [], 'nothing reached the agent');
+  assert.equal(t.store.get(id).ask?.id, askId, 'the question keeps waiting');
+  // its answer still reaches it
+  assert.equal((await t.engine.command('yes, remove it', { focusId: id, askId })).reply, 'Sent your answer to Fix login redirect.');
+  assert.deepEqual(runner.sent, ['yes, remove it']);
+  await t.engine.shutdown();
+});
+
+test('"never mind, stop" stops the agent in the centre; pasted code that begins with stop() is a prompt, and the agent keeps working', async () => {
+  const t = live();
+  t.engine.deps.commands = commands;
+  const one = await started(t);
+  for (const said of ['stop()\n}', 'stop();', 'stop()']) {
+    const out = await t.engine.command(said, { focusId: one.id });
+    assert.equal(out.reply, `Started Claude on “${commandsClip(said)}”.`, JSON.stringify(said));
+  }
+  assert.notEqual(t.store.get(one.id).state, 'stopped');
+  assert.deepEqual(t.claude.runners.slice(1).map(r => r.opts.task), ['stop()\n}', 'stop();', 'stop()'], 'each exactly as pasted');
+  const out = await t.engine.command('never mind, stop', { focusId: one.id });
+  assert.equal(out.reply, 'Stopped Fix login redirect.');
+  assert.equal(t.store.get(one.id).state, 'stopped');
+  assert.equal(t.claude.runners.length, 4, '"never mind, stop" started nothing');
   await t.engine.shutdown();
 });
 

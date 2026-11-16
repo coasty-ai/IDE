@@ -277,9 +277,10 @@ const TABLE = [
   ['stop the tests', 'question', answer('stop the tests')], // one loose word is not enough to stop an agent
   ['cost', 'question', answer('cost')],
   ['budget', 'question', answer('budget')],
-  ['update', 'question', answer('update')],
-  ['summary', 'question', answer('summary')],
-  ['report', 'question', answer('report')],
+  // status is Workbench's own: one word of it is the status, unless the question says that word (see below)
+  ['update', 'question', { kind: 'status' }],
+  ['summary', 'question', { kind: 'status' }],
+  ['report', 'question', { kind: 'status' }],
   ['stop onboarding', 'question', { kind: 'stop', agentIds: ['7a8b9c'] }], // a whole name is
   ['tell onboarding to use the new route', 'question', { kind: 'say', agentId: '7a8b9c', text: 'use the new route' }],
   ['give me an update', 'question', { kind: 'status' }],
@@ -2118,7 +2119,78 @@ test('a program named first, or asked by name, starts that program; its name is 
     // the words that start an agent, and a machine taken off after the work, are Workbench's: they still come off
     ['please start codex on the login page', 'none', start(['the login page', 'codex'])],
     ['fix the login page on cloud 1, please', 'none', start(['fix the login page', null, 'cloud-1'])],
-    ['codex thanks', 'none', noTask('codex')], // no comma: a program named, and politeness; the engine asks what Codex should work on
+  ]);
+});
+
+test('what is said to a program by name keeps every word after the address: question words, "that", and what the address is about', () => {
+  sweptRows([
+    ['ask claude which tests are flaky', 'none', start(['which tests are flaky', 'claude'])],
+    ['ask codex who wrote the cart module', 'none', start(['who wrote the cart module', 'codex'])],
+    ['ask codex who are you', 'none', start(['who are you', 'codex'])],
+    ['use codex: which tests are flaky?', 'none', start(['which tests are flaky?', 'codex'])],
+    ['tell codex who the owner is', 'none', start(['who the owner is', 'codex'])],
+    ['ask claude that question again', 'none', start(['that question again', 'claude'])],
+    ['tell codex that the build is broken', 'none', start(['that the build is broken', 'codex'])],
+    ['ask claude about the build', 'none', start(['about the build', 'claude'])],
+    ['ask codex for a review of the cart module', 'none', start(['for a review of the cart module', 'codex'])],
+    ['codex, which tests are flaky?', 'none', start(['which tests are flaky?', 'codex'])],
+    ['codex, that is wrong', 'none', start(['that is wrong', 'codex'])],
+    ['claude: who wrote this?', 'none', start(['who wrote this?', 'claude'])],
+    // the words that join a new agent to its work still come off: "to", and "that", "which" or "who" after a word for an agent
+    ['ask codex to write tests for the parser', 'none', start(['write tests for the parser', 'codex'])],
+    ['launch an agent that fixes the flaky test', 'none', start(['fix the flaky test'])],
+    ['start a codex agent which reviews the parser', 'none', start(['review the parser', 'codex'])],
+    ['spin up someone who writes the release notes', 'none', start(['write the release notes'])],
+    ['start codex on the login page', 'none', start(['the login page', 'codex'])],
+  ]);
+});
+
+test('a program named first, before a question or words that say nothing, takes them as its prompt, its name off; words about it stay a prompt for the default agent', () => {
+  sweptRows([
+    ['codex who are you?', 'none', start(['who are you?', 'codex'])],
+    ['codex what do you think of this workbench', 'none', start(['what do you think of this workbench', 'codex'])],
+    ['claude what do you think of this workbench', 'none', start(['what do you think of this workbench', 'claude'])],
+    ['@claude what do you think of this workbench', 'none', start(['what do you think of this workbench', 'claude'])],
+    ['codex how does this work', 'oneAtWork', start(['how does this work', 'codex'])],
+    ['claude code is this right?', 'empty', start(['is this right?', 'claude'])],
+    ['codex hello', 'none', start(['hello', 'codex'])],
+    ['codex thank you so much', 'none', start(['thank you so much', 'codex'])],
+    // a card stays where it is, as for any prompt
+    ['codex who are you?', 'pendingStop', start(['who are you?', 'codex'])],
+    // as before
+    ['codex why is the build slow', 'empty', start(['why is the build slow', 'codex'])],
+    ['codex, who are you?', 'none', start(['who are you?', 'codex'])],
+    ['claude is stuck', 'none', said('claude is stuck')],
+    ['claude code is stuck', 'none', said('claude code is stuck')],
+    ["codex isn't installed", 'none', said("codex isn't installed")],
+    ['claude broke the build', 'none', said('claude broke the build')],
+    // while a question waits, words that open with a program's name are its answer; at a permission, a question about it
+    ['codex who are you?', 'question', answer('codex who are you?')],
+    ['claude what does it delete?', 'permission', { kind: 'status', agentId: 'a1b2c3' }],
+  ]);
+});
+
+test('an emoji, a thanks or any words said to a program by name are its prompt, with or without a comma', () => {
+  sweptRows([
+    ['codex, 👍', 'none', start(['👍', 'codex'])],
+    ['codex 👍', 'none', start(['👍', 'codex'])],
+    ['codex: 🎉🎉', 'oneAtWork', start(['🎉🎉', 'codex'])],
+    ['claude, 🙏', 'none', start(['🙏', 'claude'])],
+    ['ask codex 🤔', 'none', start(['🤔', 'codex'])],
+    ['tell claude thanks', 'none', start(['thanks', 'claude'])],
+    ['tell codex thank you!', 'none', start(['thank you!', 'codex'])],
+    ['codex thanks', 'none', start(['thanks', 'codex'])],
+    ['claude code thanks!', 'none', start(['thanks!', 'claude'])],
+    ['hey codex, thanks', 'none', start(['thanks', 'codex'])],
+    ['codex please', 'none', start(['please', 'codex'])],
+    // as before
+    ['codex, thanks', 'none', start(['thanks', 'codex'])],
+    ['tell codex hi', 'none', start(['hi', 'codex'])],
+    // a program named alone, or with a start verb and politeness, still asks what it should work on
+    ['codex', 'none', noTask('codex')], ['codex.', 'none', noTask('codex')], ['codex?', 'none', noTask('codex')], ['tell claude', 'none', noTask('claude')],
+    ['start codex please', 'none', noTask('codex')], ['use codex', 'none', noTask('codex')], ['ok codex', 'none', noTask('codex')],
+    // while a question waits, they are its answer
+    ['tell claude thanks', 'question', answer('tell claude thanks')], ['codex 👍', 'question', answer('codex 👍')],
   ]);
 });
 
@@ -2141,19 +2213,54 @@ test('an agent named alone asks what it should work on; the engine names it, and
   ]);
 });
 
-test('words said again once the agent they started has ended are a prompt again; while it is at work they are its status', () => {
-  for (const [name, said] of [['Thanks', 'thanks'], ['Hi', 'hi'], ['Help', 'help'], ['Hello', 'hello'], ['Cool', 'cool'], ['Thank you', 'thank you']]) {
-    for (const state of ['done_claimed', 'done_checked', 'checks_failed', 'stopped', 'failed']) {
-      const ended = [{ id: 'q1', name, task: said, state, kind: 'agent' }];
+test('words said again are a prompt again, whatever became of the agent they started: starting, at work or ended', () => {
+  for (const said of ['thanks', 'hi', 'help', 'hello', 'cool', 'thank you', 'what do you think of this workbench', 'is this right?', 'Thanks!']) {
+    for (const state of ['starting', 'working', 'waiting_helpers', 'done_claimed', 'done_checked', 'checks_failed', 'stopped', 'failed']) {
+      const first = [fromTask(said, { id: 'q1', state })];
       for (const focusId of [null, 'q1']) {
-        assert.deepEqual(parseCommand(said, { agents: ended, machines, harnesses, focusId }), task(said), `${said} [${state}, focus ${focusId}]`);
+        assert.deepEqual(parseCommand(said, { agents: first, machines, harnesses, focusId }), task(said), `${said} [${state}, focus ${focusId}]`);
       }
     }
   }
-  for (const [name, said] of [['Thanks', 'thanks'], ['Help', 'help']]) {
-    const busy = [{ id: 'q1', name, task: said, state: 'working', kind: 'agent' }];
-    assert.deepEqual(parseCommand(said, { agents: busy, machines, harnesses, focusId: null }), { kind: 'status', agentId: 'q1' }, said);
+  // an agent from an earlier run too
+  assert.deepEqual(parseCommand('thanks', { agents: [fromTask('thanks', { id: 'q1', state: 'done_claimed', earlier: true })], machines, harnesses, focusId: null }), task('thanks'));
+});
+
+test('words that share a few words with an agent\'s name or task are a prompt; its name alone, or its work\'s own words and nothing more, are its status', () => {
+  const thinking = fromTask('Think about how to improve workbench', { id: 't00001', state: 'working' });
+  const users = fromTask('Find out what users think of the new workbench layout', { id: 't00002', state: 'working' });
+  for (const [text, agents] of [
+    ['what do you think of this workbench', [thinking]],
+    ['what do you think of this workbench', [users]],
+    ['what do you think of this workbench', [thinking, users]],
+    ['what do you think', [thinking]],
+    ['what do you think', [{ ...thinking, state: 'done_claimed' }]],
+    ['what do you think', [{ ...thinking, state: 'stopped' }]],
+    ['what do users think of the workbench', [users]],
+    ['is this right?', [fromTask('Is the right column sorted', { id: 't00003', state: 'working' })]],
+    // a question is asked, not a name said, even when it is all of an agent's name ("What do you think", from the owner's prompt)
+    ['what do you think', [fromTask('what do you think of this workbench', { id: 't00004', state: 'working' })]],
+    ['what do you think', [fromTask('what do you think of this workbench', { id: 't00004', state: 'working' }), fromTask('what do you think of this workbench', { id: 't00005', state: 'working' })]],
+  ]) {
+    for (const focusId of [null, agents[0].id]) {
+      assert.deepEqual(parseCommand(text, { agents, machines, harnesses, focusId }), task(text), `${text} [${agents.map(a => `${a.name}: ${a.state}`).join(', ')}, focus ${focusId}]`);
+    }
   }
+  // as before: an agent's name and nothing more, or the words of an agent at work and nothing more, are how it is doing
+  sweptRows([
+    ['onboarding', 'none', { kind: 'status', agentId: '7a8b9c' }],
+    ['the onboarding agent', 'none', { kind: 'status', agentId: '7a8b9c' }],
+    ['the checkout bug', 'none', { kind: 'status', agentId: 'a1b2c3' }],
+    ['diff viewer', 'dogNone', { kind: 'status', agentId: 'bb0002' }],
+    ['the check out fix', 'none', { kind: 'status', agentId: 'a1b2c3' }],
+    ['memory leak in the websocket', 'W', { kind: 'status', agentId: 'b00007' }],
+    // the little words that point at an agent may stand around its own
+    ['the onboarding thing', 'none', { kind: 'status', agentId: '7a8b9c' }],
+    ['the one about onboarding', 'none', { kind: 'status', agentId: '7a8b9c' }],
+    ['the guy doing onboarding', 'none', { kind: 'status', agentId: '7a8b9c' }],
+    ['the checkout bug please', 'none', { kind: 'status', agentId: 'a1b2c3' }],
+  ]);
+  assert.deepEqual(parseCommand('think about how', { agents: [thinking], machines, harnesses, focusId: null }), { kind: 'status', agentId: 't00001' });
 });
 
 test('on a card, words that answer it answer it; anything else is a prompt, and the card stays (the engine keeps it)', () => {
@@ -2202,6 +2309,60 @@ test('"what needs me" with a time, an urgency or a reason after it is the needs-
     ['what needs my review in the auth module', 'none', said('what needs my review in the auth module')],
     ['what needs me to approve this PR?', 'question', answer('what needs me to approve this PR?')],
   ]);
+});
+
+test('"status", "update" and "progress" alone are Workbench\'s status at a question or a stuck agent too, unless the question asks about that word', () => {
+  for (const text of ['status', 'Status?', 'update', 'progress', 'status update', 'status please']) {
+    for (const ctx of ['none', 'question', 'stuck', 'permission', 'oneAtWork']) {
+      assert.deepEqual(parseCommand(text, SWEPT[ctx] || ctxOf(ctx)), { kind: 'status' }, `${text} [${ctx}]`);
+    }
+  }
+  // a question that asks about the word takes it as its answer, as one of its choices would be
+  const asking = (sentence, options = []) => ({ agents: [{ id: 'k00001', name: 'Order list', task: 'Sort the order list', state: 'question', kind: 'agent',
+    ask: { id: 'ask-k', type: 'question', sentence, options } }], machines, harnesses, focusId: 'k00001' });
+  assert.deepEqual(parseCommand('status', asking('Should I sort the orders by date or by status?')), answer('status', 'k00001', 'ask-k'));
+  assert.deepEqual(parseCommand('update', asking('Should I update the lockfile, or pin the old version?')), answer('update', 'k00001', 'ask-k'));
+  assert.deepEqual(parseCommand('progress', asking('Which bar should I add?', ['Progress', 'Spinner'])), answer('Progress', 'k00001', 'ask-k'));
+  assert.deepEqual(parseCommand('status', asking('Should I keep the old route?')), { kind: 'status' });
+});
+
+test('a never-mind and then a stop is the stop: "never mind, stop" stops the agent in the centre', () => {
+  sweptRows([
+    ['never mind, stop', 'onboarding', { kind: 'stop', agentIds: ['7a8b9c'] }],
+    ['never mind. stop!', 'onboarding', { kind: 'stop', agentIds: ['7a8b9c'] }],
+    ['never mind stop', 'onboarding', { kind: 'stop', agentIds: ['7a8b9c'] }], // spoken, with no comma
+    ['forget it, pause', 'onboarding', { kind: 'stop', agentIds: ['7a8b9c'] }],
+    ['never mind, stop', 'none', { kind: 'stop', agentIds: [] }], // which one is not clear: the engine says so, and starts nothing
+    ['never mind, status', 'oneAtWork', { kind: 'status' }],
+    ['never mind, stop everything', 'onboarding', { kind: 'stop_all' }],
+    // anything else after it is said as it is: the prompt, never-mind and all
+    ['never mind, thanks', 'onboarding', said('never mind, thanks')],
+    ['never mind, yes', 'onboarding', said('never mind, yes')],
+  ]);
+});
+
+test('pasted code that begins like a command, such as stop(), is a prompt, never the command', () => {
+  for (const text of ['stop()\n}', 'stop();', 'stop()', 'stop(worker);\nreturn;', 'kill(pid)', 'merge(a, b)', 'status()', 'continue();']) {
+    for (const ctx of ['onboarding', 'invoice', 'none', 'boardInvoice']) {
+      assert.deepEqual(parseCommand(text, SWEPT[ctx] || ctxOf(ctx)), said(text), `${JSON.stringify(text)} [${ctx}]`);
+    }
+    assert.deepEqual(parseCommand(text, CTX.question), answer(text), `${JSON.stringify(text)} [question]`);
+    assert.deepEqual(parseCommand(text, CTX.pendingStop), said(text), `${JSON.stringify(text)} [stop card]`); // never the card's yes
+    assert.deepEqual(parseCommand(text, CTX.permission), unknown(text), `${JSON.stringify(text)} [permission]`);
+  }
+  // a stop said with ordinary punctuation is still a stop
+  for (const text of ['stop!', 'STOP.', 'stop it', 'stop;', 'stop, it is deleting the wrong files']) {
+    assert.deepEqual(parseCommand(text, CTX.onboarding), { kind: 'stop', agentIds: ['7a8b9c'] }, text);
+  }
+  // the agent that pasted code started is called "Stop": a stop verb alone still stops the agent in the centre, and a
+  // longer name still shows its own agent
+  const pasted = [...agents, fromTask('stop()', { id: 'c0de01', state: 'working' }), fromTask('stop();\n}', { id: 'c0de02', state: 'working' }),
+    { id: 'p00004', name: 'Stop asking', task: 'Stop asking for the email twice', state: 'working', kind: 'agent' }];
+  assert.equal(pasted.find(a => a.id === 'c0de01').name, 'Stop');
+  for (const text of ['stop', 'Stop!', 'stop it', 'never mind, stop']) {
+    assert.deepEqual(parseCommand(text, { agents: pasted, machines, harnesses, focusId: '7a8b9c' }), { kind: 'stop', agentIds: ['7a8b9c'] }, text);
+  }
+  assert.deepEqual(parseCommand('stop asking', { agents: pasted, machines, harnesses, focusId: '7a8b9c' }), { kind: 'status', agentId: 'p00004' });
 });
 
 test('status that describes an agent without naming it is status, and that agent\'s when the words find one', () => {

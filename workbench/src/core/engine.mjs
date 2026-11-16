@@ -1837,7 +1837,8 @@ export class Engine extends EventEmitter {
 
   async _answerDone(v, text) {
     if (!text || LOOKS_GOOD_RE.test(text)) return { ok: true, reply: `Good. ${v.name} stays as it is.` };
-    if (NOT_NOW_RE.test(text)) return { ok: true, reply: v.work?.branch ? `OK. ${v.name}’s work stays on its branch for now.` : `OK. ${v.name} stays as it is.` };
+    // what happened, and no bare "OK." before it: words the person said are never answered with a word back
+    if (NOT_NOW_RE.test(text)) return { ok: true, reply: v.work?.branch ? `${v.name}’s work stays on its branch for now.` : `${v.name} stays as it is.` };
     const sent = await this._sendTo(v, text);
     if (!sent.ok) return sent;
     return { ok: true, reply: sent.reply || `Sent your follow-up to ${v.name}.` };

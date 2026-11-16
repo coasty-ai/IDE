@@ -39,6 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { presetById } from '../src/shared/keypresets.mjs';
 import { clip } from '../src/shared/format.mjs';
 import { nameFromTask } from '../src/shared/narrate.mjs';
+import { NOT_NOW_RE } from '../src/shared/answers.mjs';
 import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../src/core/prefs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -916,7 +917,7 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
     // as the engine's _card: a merge or throw-away card names the agent it is about
     return { id, ...card, ...((card.kind === 'merge' || card.kind === 'discard') && extra.agentId ? { agentId: extra.agentId } : {}) };
   };
-  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}), ...((c.kind === 'merge' || c.kind === 'discard') && c.agentId ? { agentId: c.agentId } : {}), ...(c.kind === 'start' && c.agents ? { agents: c.agents } : {}) });
+  const cardOf = c => ({ id: c.id, sentence: c.sentence, detail: c.detail, kind: c.kind, ...(c.yes ? { yes: c.yes } : {}), ...(c.no ? { no: c.no } : {}), ...(typeof c.danger === 'boolean' ? { danger: c.danger } : {}), ...((c.kind === 'merge' || c.kind === 'discard') && c.agentId ? { agentId: c.agentId } : {}) });
   const rootOf = a => (a && a.parentId ? state.agents.find(x => x.id === a.rootId) || a : a);
   const joinAnd = xs => (xs.length <= 1 ? xs.join('') : xs.length === 2 ? `${xs[0]} and ${xs[1]}` : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
   const unend = s => String(s || '').replace(/[.\s]+$/, '');
@@ -1384,7 +1385,11 @@ export function startMock({ port = 0, host = '127.0.0.1', quiet = false } = {}) 
           return reply({ ok: true, reply: `${a.name} can spend $${limit.toFixed(2)} in all now, and it is continuing.` });
         }
         if (m[2] === 'answer') {
-          if (!a.ask && json && !json.askId && ['done_checked', 'done_claimed', 'checks_failed'].includes(a.state)) return reply({ ok: true, reply: `Good. ${a.name} stays as it is.` });
+          // finished work, as the engine's _answerDone: "Not now" says where its work stays, with no bare "OK." before it
+          if (!a.ask && json && !json.askId && ['done_checked', 'done_claimed', 'checks_failed'].includes(a.state)) {
+            if (NOT_NOW_RE.test(String(json.answer || '').trim())) return reply({ ok: true, reply: a.work?.branch ? `${a.name}’s work stays on its branch for now.` : `${a.name} stays as it is.` });
+            return reply({ ok: true, reply: `Good. ${a.name} stays as it is.` });
+          }
           if (!a.ask || !json || json.askId !== a.ask.id) return reply({ ok: false, reply: json && !json.askId && a.ask ? `Have a look at what ${a.name} is asking first.` : `${a.name} is not waiting for that any more.` });
           const was = a.ask, ans = String(json.answer || '');
           a.ask = null;
