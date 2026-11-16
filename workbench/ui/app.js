@@ -34,6 +34,9 @@ import { connectMeta, bandView, keyRefusal } from './connectview.js';
 // Full permissions: the top band's button beside Agents & keys (its words and state), sent to the engine when pressed.
 import { permButtonView } from './permissions.js';
 import * as secretShape from '/shared/secretshape.mjs';
+// The file view: the files chip (U3) beside the DRAM opens it, and so do ⌘P, ⌘⇧F and a path on the git screen
+// (fileview.js draws the sheet; this file opens it, hands it the keys while it shows, and holds the lid).
+import { setupFiles, openFiles, filesShown, filesKey, filesNeeds, filesRender, filesEscape } from './fileview.js';
 
 // The address is read once, before the key is taken out of it. Switches count only with the key (see address.js).
 const debug = debugSwitches(location.search);
@@ -46,8 +49,10 @@ const el = {
   parts: $('parts'), machines: $('machines'), tray: $('tray'), card: $('card'), pop: $('pop'), trayList: $('trayList'), look: $('look'),
   brand: $('brand'), mode: $('mode'), repo: $('repo'), conn: $('conn'), spend: $('spend'), wires: $('wires'), board: $('board'),
   dram: $('dram'), boardScreen: $('boardScreen'), gitScreen: $('gitScreen'), gitSay: $('gitSay'), connectBtn: $('connectBtn'),
-  permBtn: $('permBtn'),
+  permBtn: $('permBtn'), files: $('filesChip'),
 };
+/** ⌘ on a Mac, Ctrl elsewhere: ⌘P (Ctrl+P) finds a file, ⌘⇧F words in the files, ⌘S saves in the file view. */
+const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '');
 if (debug.still) el.body.classList.add('still');
 
 const RM = matchMedia('(prefers-reduced-motion: reduce)');
@@ -92,7 +97,7 @@ let G = null, lastFirst = true, fontsReady = false;
 // as other moves do; a swap that follows carries it to the new sentence.
 const lidHome = () => el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
 const board = new Board({
-  boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, dram: el.dram, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
+  boardSvg: el.board, wires: el.wires, parts: el.parts, core: el.core, dram: el.dram, files: el.files, machines: el.machines, tray: el.tray, said: el.said, cardEl: el.card,
   still: () => debug.still, reduced,
   hooks: {
     enter: (id, parentId) => { clearTimeout(leaveTimer); if (S.hoverId !== id) { S.hoverId = id; renderCard(); } },
@@ -158,6 +163,7 @@ const touch = () => { lastInputAt = performance.now(); };
 function engaged() {
   if (gitShown()) return true;   // D1: the lid keeps what it shows while the git screen is shown
   if (connectShown()) return true;   // and while Agents & keys covers it
+  if (filesShown()) return true;   // and while the file view does
   if (performance.now() - lastInputAt > 20000 && !voice.listening && !el.say.value) return false;
   const ae = document.activeElement;
   return pointer.inCore || (ae && ae !== document.body && el.core.contains(ae) && ae !== el.say) || !!el.say.value || voice.listening || !!S.reply;
@@ -395,16 +401,18 @@ function renderNow(o = {}) {
   paintTop(P, linkS);
   paintSaid();
   paintPlaceholder(P);
-  for (const x of [el.parts, el.wires, el.machines, el.dram]) x.classList.toggle('dim', linkS === 'stale');
+  for (const x of [el.parts, el.wires, el.machines, el.dram, el.files]) x.classList.toggle('dim', linkS === 'stale');
   el.parts.inert = linkS === 'stale' || linkS === 'no-key';
   el.machines.inert = linkS === 'stale' || linkS === 'no-key';
   paintDram(linkS);
+  el.files.inert = linkS === 'stale' || linkS === 'no-key';
   renderCard(true);
   if (!el.pop.hidden) renderMachinesPop();
   if (!el.trayList.hidden) renderTrayList();
   if (S.loaded && firstSnap) { firstSnap = false; applyDebug(); }
   gitRender();
   if (connectShown()) connectNeeds(needsInfo());
+  if (filesShown()) { filesNeeds(needsInfo()); filesRender(); }
 }
 const render = () => renderSoon();
 
@@ -848,6 +856,15 @@ document.addEventListener('keydown', e => {
   // While Agents & keys is open the board takes no keys at all: no typing into the board's input (a key typed with a
   // button focused must not land there), no talking, no arrows. Esc closes the panel and does nothing else.
   if (connectShown()) { if (e.key === 'Escape') { e.preventDefault(); closeConnect(); } return; }
+  // While the file view shows, it takes the keys (Esc, ⌘P, ⌘⇧F, ⌘S, letters to its field), and the board takes none:
+  // space types a space in its field and its editor, and never starts listening.
+  if (filesShown()) { filesKey(e); return; }
+  // ⌘P (Ctrl+P off a Mac) finds a file, ⌘⇧F words in the files: the file view, its field focused
+  if ((isMac ? e.metaKey : e.ctrlKey) && !e.altKey && !cannotSend(linkNow())) {
+    const k = String(e.key).toLowerCase();
+    if (k === 'p' && !e.shiftKey) { e.preventDefault(); showFiles({ mode: 'find' }); return; }
+    if (k === 'f' && e.shiftKey) { e.preventDefault(); showFiles({ mode: 'search' }); return; }
+  }
   if (e.key === 'Escape') { escape(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const ae = document.activeElement;
@@ -884,6 +901,7 @@ document.addEventListener('visibilitychange', () => {
 
 function escape() {
   if (connectShown()) { closeConnect(); return; }   // Agents & keys first: it covers everything else
+  if (filesShown()) { filesEscape(); return; }   // then the file view, over either screen
   if (gitShown() && !voice.listening && gitEscape()) return;   // D1: the detail closes, then back to the board
   if (!el.look.hidden) { closeLook(true); return; }
   if (!el.pop.hidden) { closePop(); return; }
@@ -1177,7 +1195,7 @@ function showConnect(opener = null, said = '') {
 let connectAutoOpened = false;
 function autoOpenConnect() {
   const c = S.meta.connect;
-  if (connectAutoOpened || !c || c.ready !== false || S.meta.mode === 'demo' || linkNow() !== 'live' || connectShown()) return;
+  if (connectAutoOpened || !c || c.ready !== false || S.meta.mode === 'demo' || linkNow() !== 'live' || connectShown() || filesShown()) return;
   connectAutoOpened = true;
   showConnect(null);
 }
@@ -1382,6 +1400,46 @@ setupGitScreen({
   pick: id => { if (S.confirm) dropConfirm(); S.focusId = id; moved(); },
   // going down: the board's menus and card close (they belong to the board); either way the board renders afresh
   onShow: shown => { if (shown) { closePop(); closeTray(); closeLook(false); S.pinId = null; S.hoverId = null; board.hideCard(); } renderSoon(); },
+  // a file's path in an agent's diff: that file in the agent's copy, at its first changed line, growing out of the path
+  openFile: o => showFiles({ where: o.agentId, path: o.path, line: o.line, opener: o.opener, origin: o.opener ? o.opener.getBoundingClientRect() : null }),
+});
+
+// ---------------------------------------------------------------- the file view: the files chip, ⌘P and ⌘⇧F, and the git screen's paths
+/**
+ * Open the file view over whichever screen shows. The board's menus and card close and voice stops (onShow), as for
+ * Agents & keys. `mode` 'find' (⌘P), 'search' (⌘⇧F) or 'browse' (the files chip); with `path`, that file in `where`'s copy.
+ */
+function showFiles(o = {}) {
+  if (cannotSend(linkNow())) return;
+  openFiles(o);
+}
+el.files.addEventListener('click', () => showFiles({ opener: el.files, mode: 'browse' }));
+el.files.setAttribute('aria-keyshortcuts', isMac ? 'Meta+P' : 'Control+P');
+
+setupFiles({
+  getG: () => G, measure, still: () => debug.still, reduced, isMac,
+  looksLikeSecret: t => secretShape.looksLikeSecret?.(t)?.secret === true,
+  onShow: shown => {
+    if (shown) {
+      closePop(); closeTray(); closeLook(false);
+      if (S.pinId || S.hoverId) { S.pinId = null; S.hoverId = null; board.hideCard(); }
+      if (voice.listening) voice.cancel();
+      holding = false;
+      filesNeeds(needsInfo());
+    }
+    renderSoon();
+  },
+  // "<Name> needs you" at the top of the sheet: that item in the lid, as picking its chip does (a card on screen is
+  // withdrawn), back on the board when the git screen shows
+  toLid: id => {
+    if (id && S.agents.has(id)) { if (S.confirm) dropConfirm(); S.focusId = id; moved(); }
+    if (gitShown()) { closeGit({ toLid: true }); return; }
+    renderNow();
+    el.pages.querySelector('.page:not(.old) h1')?.focus({ preventScroll: true });
+  },
+  // where the keyboard goes when what opened the sheet is gone: the git screen's heading, else the files chip, else the lid
+  home: () => (gitShown() ? (document.querySelector('#gitDetail h2') || document.getElementById('gitTitle'))
+    : (!el.files.hidden && !el.files.inert ? el.files : el.pages.querySelector('.page:not(.old) h1'))),
 });
 
 RM.addEventListener('change', () => { if (RM.matches) board.settle(); renderNow({ snap: true }); });

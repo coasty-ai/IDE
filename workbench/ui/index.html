@@ -65,6 +65,8 @@
 
   <!-- The DRAM under the core, wired to it: it opens the git screen. -->
   <button id="dram" type="button" aria-controls="gitScreen" data-box="dram" aria-label="Git: your branch and your agents’ branches. Opens the git screen."><span class="git" aria-hidden="true">git</span></button>
+  <!-- The files chip beside it (U3): it opens the file view, the core's lid grown into a sheet. -->
+  <button id="filesChip" type="button" hidden aria-haspopup="dialog" aria-controls="fileSheet" aria-keyshortcuts="Meta+P Control+P" data-box="fileschip" aria-label="Files: the files in your folder and your agents’ copies. Opens the file view."><span class="fl" aria-hidden="true">files</span></button>
 
   <div id="machines" role="group" aria-label="Machines"></div>
   <button id="tray" type="button" hidden aria-haspopup="dialog" aria-controls="trayList" aria-expanded="false"></button>
@@ -144,6 +146,34 @@
   </div>
   <p id="connectSaid" class="cn-said" role="status" aria-live="polite"></p>
   <div id="connectBody" class="cn-body" data-scroll="1"></div>
+</dialog>
+
+<!-- The file view: the core's lid grown into a wide sheet over whichever screen shows, one file at a time. fileview.js
+     fills it: the path you can click, whose copy it is, the code (or a folder, or what the field finds), and the field
+     that finds a file. Esc closes it, and the keyboard goes back to what opened it. -->
+<dialog id="fileSheet" aria-labelledby="fvTitle" data-box="filesheet">
+  <div class="fv-shade" aria-hidden="true"></div>
+  <div class="fv-sheet" id="fvSheet">
+    <header class="fv-head">
+      <h2 id="fvTitle" class="fv-path" tabindex="-1"></h2>
+      <button id="fvNeeds" class="fv-needs" type="button" hidden></button>
+      <span class="fv-acts" id="fvActs"></span>
+      <button id="fvClose" class="fv-x" type="button" aria-label="Close the file view">✕</button>
+    </header>
+    <div class="fv-whose" id="fvWhose"></div>
+    <div class="fv-body" id="fvBody">
+      <div class="fv-code" id="fvCode" data-scroll="1" tabindex="0"><div class="fv-sizer" id="fvSizer"><div class="fv-rows" id="fvRows"></div></div></div>
+      <div class="fv-edit" id="fvEdit" data-scroll="1" hidden><div class="fv-esizer" id="fvEsizer"><div class="fv-enums" id="fvEnums" aria-hidden="true"></div><textarea id="fvText" class="fv-ta" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea></div></div>
+      <div class="fv-list" id="fvList" role="listbox" aria-label="Files" data-scroll="1" hidden></div>
+      <div class="fv-note" id="fvNote" hidden></div>
+    </div>
+    <form class="fv-bar" id="fvBar" autocomplete="off">
+      <input id="fvFind" role="combobox" aria-controls="fvList" aria-expanded="false" aria-autocomplete="list" aria-label="Find a file, a line of this file, or words in the files" spellcheck="false" autocomplete="off">
+      <span class="ph" id="fvPh" aria-hidden="true">find a file</span>
+      <kbd id="fvKey" aria-hidden="true"></kbd>
+    </form>
+  </div>
+  <p class="sr" id="fvSaid" role="status" aria-live="polite"></p>
 </dialog>
 </body>
 </html>

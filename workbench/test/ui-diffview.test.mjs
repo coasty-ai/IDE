@@ -117,7 +117,7 @@ test('a hunk whose function line holds a line or paragraph separator, or a carri
 test('the git screen\'s files hold no raw hidden characters themselves', () => {
   for (const f of ['../ui/diffview.js', './ui-diffview.test.mjs', '../ui/gitgraph.js', '../ui/gitscreen.js', '../ui/layout.js', '../ui/board.js', '../ui/app.js',
     '../ui/index.html', '../ui/app.css', './ui-gitgraph.test.mjs', './ui-layout.test.mjs', '../scripts/ui-mock.mjs', '../scripts/ui-fit-check.mjs',
-    '../ui/words.js', './ui-words.test.mjs', '../ui/focus.js', './ui-focus.test.mjs', '../scripts/ui-contrast.mjs']) {
+    '../ui/words.js', './ui-words.test.mjs', '../ui/focus.js', './ui-focus.test.mjs', '../scripts/ui-contrast.mjs', '../ui/fileview.js', '../ui/api.js']) {
     // read in context, with line breaks and tabs (a file's own layout) left out: an emoji keeps its one selector
     const src = readFileSync(new URL(f, import.meta.url), 'utf8').replace(/[\n\t]/g, ' ');
     const raw = hiddenParts(src).filter(p => p.hidden).map(p => hex(p.text));
