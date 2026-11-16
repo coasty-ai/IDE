@@ -2724,6 +2724,25 @@ test('on a card, words that begin with its yes or no word answer it, whatever fo
     ['merge onboarding', 'pendingMerge', merge('7a8b9c')],
     ['no problem', 'pendingMerge', yesTo], // a yes, said with a "no"
   ]);
+  // Pinned on purpose, where a reading could merge work: the first words decide. A yes first is the card's yes, whatever
+  // follows it, a stop of everything too ("yes, stop everything" merges, and stops nothing); "go ahead" set off by a comma
+  // is that yes. Past an opener that is also a yes ("okay", "go ahead and"), one of Workbench's own commands is that
+  // command: "okay, stop it" stops (with a card, no agent is in the centre: which one is not clear) and "go ahead and stop
+  // everything" stops everything, the card staying; with no command after it, the opener is the yes ("ok so the login
+  // page is broken" merges, and the rest starts nothing).
+  sweptRows([
+    ['ok so the login page is broken', 'pendingMerge', yesTo],
+    ['yes, stop everything', 'pendingMerge', yesTo],
+    ['go ahead, stop everything', 'pendingMerge', yesTo],
+    ['okay, stop it', 'pendingMerge', stopOf()],
+    ['go ahead and stop everything', 'pendingMerge', stopAll],
+    ['okay, what needs me?', 'pendingMerge', { kind: 'status', needsMe: true }],
+  ]);
+  // a card that ran out takes a yes or a no with words after it as its yes or no too (the engine says it is no longer
+  // waiting); other words are read as with nothing on screen
+  sweptRows([
+    ['yes, and then tell me', 'boardGone', yesTo], ['no, because the tests are red', 'boardGone', noTo], ['add tests too', 'boardGone', said('add tests too')],
+  ]);
 });
 
 test('more than one agent from one sentence is a start of that many (the engine asks first, with a card); the card takes "start them"', () => {

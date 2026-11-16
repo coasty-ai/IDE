@@ -149,7 +149,7 @@ function gitCommandIn({ link = 'live', command }) {
     refuseKey: t => t === 'A-KEY-STAND-IN', touch() {}, gitScreenWords: () => null, closeGit() {}, pageCommand: () => null, applyPref() {},
     say: t => said.push(t), cannotSend: s => s === 'stale', linkNow: () => link, S: { confirm: null },
     api: { command: async (t, b) => { sent.push(t); return command(t, b); }, confirm: async () => ({}) },
-    lookAt() {}, openGit() {}, moved() {}, showConnect() {}, render() {}, ID_RE: /^[0-9a-f]{6,}$/,
+    lookAt() {}, lookedAt() {}, openGit() {}, moved() {}, showConnect() {}, render() {}, ID_RE: /^[0-9a-f]{6,}$/,
     gitPutBack: t => back.push(t),
   };
   vm.createContext(sandbox);

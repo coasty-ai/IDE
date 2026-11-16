@@ -747,6 +747,21 @@ function lidButton(label, b) {
   return null;
 }
 
+/**
+ * "looks good" or "not now" that the engine took as a finished agent's own answer, with no button on its lid standing for
+ * them (`looked` in the reply to /api/command, on the board or the git screen): this finish is looked at, as its button
+ * would have marked it, and the centre lets go of it.
+ */
+function lookedAt(res) {
+  const a = typeof res?.looked === 'string' && ID_RE.test(res.looked) ? S.agents.get(res.looked) : null;
+  if (!a) return;
+  markReviewed(a);
+  answeredOnce();
+  if (S.focusId === a.id) S.focusId = null;
+  if (S.pinId === a.id) S.pinId = null;
+  moved();
+}
+
 async function submit(text) {
   text = String(text || '').trim();
   if (!text) return;
@@ -798,16 +813,7 @@ async function submit(text) {
       // the agent it was drawn for
       if (res.confirm) S.confirm = shown && res.confirm.id === shown.id ? { ...res.confirm, agentId: shown.agentId } : res.confirm;
       else if (shown && S.confirm === shown) S.confirm = null;
-      // "looks good" or "not now" that the engine took as a finished agent's own answer (no button on its lid stood for
-      // them): this finish is looked at, as its button would have marked it
-      const looked = typeof res.looked === 'string' && ID_RE.test(res.looked) ? S.agents.get(res.looked) : null;
-      if (looked) {
-        markReviewed(looked);
-        answeredOnce();
-        if (S.focusId === looked.id) S.focusId = null;
-        if (S.pinId === looked.id) S.pinId = null;
-        moved();
-      }
+      lookedAt(res);
       lookAt(res.focusId);
       // the reply to the person's own words: a new card, or the agent it names, shows at once (work that started names
       // none: the centre stays as it is, and the notice says what started)
@@ -1407,6 +1413,7 @@ async function gitCommand(text, b = {}) {
       S.confirm = same ? { ...res.confirm, agentId: shown.agentId } : mine ? { ...res.confirm, agentId: focusId } : res.confirm;
       if (!mine) closeGit({ toLid: true });
     } else if (shown && S.confirm === shown) S.confirm = null;
+    lookedAt(res);
     lookAt(res.focusId);
     // as the core's input does: a new card says itself; anything else is said
     say(res.confirm && !same ? '' : (res.reply || ''));

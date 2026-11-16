@@ -3651,9 +3651,9 @@ export class Engine extends EventEmitter {
   // ================================================================ commands and confirms
 
   /**
-   * Plain-language command from the bar at the bottom (typed or spoken). Work starts at once, never asked first; stops
-   * and messages whose words found the agent without naming it need a confirm, and so do forgetting, merging and
-   * throwing away.
+   * Plain-language command from the bar at the bottom (typed or spoken). One agent's work starts at once, never asked
+   * first; more than one agent from one sentence needs a confirm, and so do stops and messages whose words found the
+   * agent without naming it, forgetting, merging and throwing away.
    * The page sends what it showed when the person began: `focusId`, the agent in the centre; `confirmId`, the confirm
    * card on screen; `askId`, the ask on screen. A yes or no settles only that confirm, and an answer (allow, deny,
    * free text) reaches only that ask. Commands (stop, tell, status, start, ...) act on what the words and the focus
@@ -3764,7 +3764,7 @@ export class Engine extends EventEmitter {
 
   /**
    * The card the page shows: { id, sentence, detail, kind, yes?, no?, danger?, agentId? }. `kind` is always there (stop,
-   * say, forget, merge, discard or permissions); yes and no are the buttons' own words when they are not "Do it" and
+   * say, forget, merge, discard, permissions or start); yes and no are the buttons' own words when they are not "Do it" and
    * "Cancel"; agentId (merge and discard cards only) is the agent the card is about.
    */
   _card(c) {
@@ -4013,7 +4013,8 @@ export class Engine extends EventEmitter {
   }
 
   /**
-   * Start these tasks' agents at once: a start is never asked, whether full permissions are on or off. A task whose
+   * Start these tasks' agents at once, whether full permissions are on or off: one agent is never asked about, and more
+   * than one from one sentence comes here after its card's yes (_proposeStart). A task whose
    * words name no agent goes to the default agent (_defaultHarness). With no agent ready, or one named that cannot run
    * here, nothing starts, and the reply says so and carries `openConnect`, so the page opens Agents & keys. With no task,
    * the reply asks what to work on: `named`, the agent the words named ("start codex"), is asked about by name when it
