@@ -3243,7 +3243,8 @@ export class Engine extends EventEmitter {
     } finally {
       if (!run && this._rechecks.get(id) === held && !held.receipt) this._rechecks.delete(id);
     }
-    if (!got) return;
+    // A newer receipt (a save that came just now started one) decides instead: this one's outcome is already old.
+    if (!got || held.receipt) return;
     this._apply([{ kind: EV.STATE, agentId: id, state: doneState(got.checksState), reason: got.reason }]);
     if (!run && c.rec) {
       this._replaceEarlier(id, c.ws); // the next start knows what its checks found
