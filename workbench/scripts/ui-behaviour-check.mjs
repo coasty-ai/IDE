@@ -856,6 +856,38 @@ try {
       `${Object.keys(before).length} chips, then ${Object.keys(after).length}; moved ${JSON.stringify(moved.map(id => [id, before[id], after[id]]))}`);
   });
 
+  await run(DT + 'on a dense board whose side is full, a newcomer with no room waits in the tray, which shows for it alone and names it', async () => {
+    // 23 at work, laptop and cloud by turns: the left holds twelve, as many as a side holds at this height, the right eleven
+    await open('done-waits');
+    await sleep(700);
+    const st = await ctl('state'), w1 = st.agents.find(a => a.id === 'w1'), at = Date.now();
+    const one = (i, machineId, o = {}) => ({ ...w1, id: 'z' + i, rootId: 'z' + i, name: `Crowd ${i}`, machineId, state: 'working', endedAt: null, stateSince: at,
+      startedAt: at - (90 - i) * 60000, now: 'Reading the code', says: null, checks: null, files: null, work: null, ...o });
+    await push('snapshot', { ...st, agents: Array.from({ length: 23 }, (_, i) => one(i, i % 2 ? 'cloud-1' : 'laptop')) });
+    await sleep(1300);
+    const sides = () => b.ev(`(() => { const c = document.getElementById('core').getBoundingClientRect(), mid = c.left + c.width / 2, out = { L: 0, R: 0 };
+      for (const e of document.querySelectorAll('#parts .node:not(.leaving) .chip')) { const r = e.getBoundingClientRect(); out[r.left + r.width / 2 < mid ? 'L' : 'R']++; } return out; })()`);
+    const listed = async () => { await click('#tray'); await sleep(300); const r = await b.ev(`[...document.querySelectorAll('#trayList h2, #trayList .row, #trayList .note')].map(r => (r.dataset.agent ? r.dataset.agent + ':' : '') + r.textContent.trim()).join(' | ')`); await b.key('Escape'); await sleep(250); return r; };
+    const s0 = await sides(), t0 = await trayNow(), p0 = await placesNow();
+    // one more laptop agent: the left is full, and it never takes the free row on the right
+    await push('agents', [one(40, 'laptop', { startedAt: Date.now() })]);
+    await sleep(1300);
+    const chips1 = await chipsNow(), s1 = await sides(), t1 = await trayNow(), p1 = await placesNow();
+    const names = await b.ev(`[document.getElementById('tray').getAttribute('aria-label'), document.getElementById('parts').getAttribute('aria-label')]`);
+    const rows1 = await listed();
+    // it asks: it takes the row of the newest one at work on its side, which waits in the tray in its place
+    await push('agents', [one(40, 'laptop', { startedAt: Date.now(), state: 'needs_ok', ask: { id: 'kz', type: 'permission', sentence: 'Crowd 40 wants to run a command', detail: 'npm test', options: ['Allow', 'Deny'], createdAt: Date.now() } })]);
+    await sleep(1300);
+    const chips2 = await chipsNow(), t2 = await trayNow(), rows2 = await listed();
+    const moved = Object.keys(p0).filter(id => p1[id] !== p0[id]);
+    check(DT + 'on a dense board whose side is full, a newcomer with no room waits in the tray, which shows for it alone and names it',
+      s0.L === 12 && s0.R === 11 && t0 === '' && !/z40/.test(chips1) && s1.L === 12 && s1.R === 11 && moved.length === 0 && t1 === '1 more working'
+      && names[0] === '1 more working with no room on the board. Show them.' && names[1] === 'Your agents and their helpers. 1 more working with no room on the board.'
+      && rows1 === 'Working, with no room on the board | z40:Crowd 40 · working'
+      && /z40/.test(chips2) && !/z22\b/.test(chips2) && t2 === '1 more working' && rows2 === 'Working, with no room on the board | z22:Crowd 22 · working',
+      `sides ${JSON.stringify(s0)}, tray "${t0}" → chips ${chips1.split(',').length} (z40 ${/z40/.test(chips1)}), sides ${JSON.stringify(s1)}, moved ${JSON.stringify(moved)}, tray "${t1}", names ${JSON.stringify(names)}, list "${rows1}"; asking: z40 ${/z40/.test(chips2)}, z22 ${/z22\b/.test(chips2)}, tray "${t2}", list "${rows2}"`);
+  });
+
   await run(DT + 'the keyboard on a chip that leaves goes to the core\'s sentence, and a card pinned to it goes too', async () => {
     await open('done-waits');
     await sleep(900);

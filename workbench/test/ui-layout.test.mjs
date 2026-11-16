@@ -89,6 +89,40 @@ test('on a dense board, an agent that leaves moves no other chip, at any window 
   }
 });
 
+test('on a dense board whose side is full, a newcomer with no room shows in the tray, at any window size, and the one an asker bumps does too', () => {
+  const T = 1_800_000_000_000;
+  const one = (id, machineId, i) => ({ id, parentId: null, rootId: id, name: `Agent ${id}`, machineId, state: 'working', now: 'Reading a.ts', stateSince: T - 60000,
+    startedAt: T - 3_600_000 + i * 1000, endedAt: null, ask: null, earlier: false, work: null, files: null });
+  const machines = [{ id: 'laptop', name: 'Your laptop', awake: true, note: '13 agents' }, { id: 'cloud-1', name: 'Cloud 1', awake: true, note: '11 agents · $0.40 an hour' }];
+  for (const [W, H] of WINDOWS) {
+    const P = sizeClass(W, H), maxRows = maxDenseRows(H, P), lanes = new Lanes(null);
+    // as many rows a side as the window holds when dense
+    const n = 6 * Math.max(2, Math.floor(maxRows / 6));
+    const lay = agents => {
+      const bm = boardModel(agents, { ...STATES, later: new Set(), reviewed: new Set() });
+      const p = boardAndTray(bm.roots, lanes, { laptop: r => r.machineId === 'laptop', maxRows });
+      return { p, G: layoutBoard({ W, H, P, detail: 'calm', roots: p.roots, laneOf: p.laneOf, nRows: p.nRows, dense: p.dense, lidNeed: 220, machines, tray: p.tray }) };
+    };
+    // they start one at a time, laptop and cloud by turns: the left fills, with one row free on the right
+    const list = [];
+    for (let i = 0; list.length < 2 * n - 1; i++) { list.push(one((i % 2 ? 'c' : 'l') + i, i % 2 ? 'cloud-1' : 'laptop', i)); lay(list); }
+    const full = lay(list);
+    assert.deepEqual([full.G.nodes.length, full.G.tray], [2 * n - 1, null], `${W}x${H}: all drawn, nothing in the tray`);
+    const newcomer = one('new', 'laptop', 999);
+    const a = lay([...list, newcomer]);
+    assert.deepEqual([a.G.nodes.length, a.p.trayIds.over], [2 * n - 1, ['new']], `${W}x${H}`);
+    assert.ok(a.G.tray, `${W}x${H}: the tray is drawn for the one with no room`);
+    assert.equal(a.G.tray.lead + a.G.tray.rest, '1 more working', `${W}x${H}`);
+    assert.deepEqual(boardProblems(a.G), [], `${W}x${H}`);
+    // it asks: it takes the row of the newest one at work on its side, and that one is in the tray
+    const b = lay([...list, { ...newcomer, state: 'needs_ok', ask: { id: 'k', type: 'permission', sentence: 'It wants to run a command', options: ['Allow', 'Deny'], createdAt: T } }]);
+    assert.ok(b.G.byId.get('new'), `${W}x${H}: the asker is drawn`);
+    assert.equal(b.p.trayIds.over.length, 1, `${W}x${H}`);
+    assert.ok(b.G.tray && !b.G.byId.get(b.p.trayIds.over[0]), `${W}x${H}: the one it bumped is in the tray`);
+    assert.deepEqual(boardProblems(b.G), [], `${W}x${H}`);
+  }
+});
+
 test('stops: beside you when it needs you, mid-board while it works, at the edge when done', () => {
   const { G } = board('demo', 1440, 900, 'calm');
   const by = name => G.nodes.find(n => n.r.name === name);
@@ -300,10 +334,11 @@ test('a long done tray never puts a machine on the DRAM\'s wire: the sections na
   const bad = [];
   let cutTray = 0, cutNames = 0;
   for (const [W, H] of WINDOWS) for (const detail of ['calm', 'more']) for (const counts of [{ done: 12, earlier: 6, over: 1 }, { done: 99, earlier: 99, over: 99 }, { done: 0, earlier: 40, over: 0 },
-    { done: 12, notMerged: 3, earlier: 6, over: 1 }, { done: 0, notMerged: 99, earlier: 99, over: 99 }])
+    { done: 12, notMerged: 3, earlier: 6, over: 1 }, { done: 0, notMerged: 99, earlier: 99, over: 99 }, { done: 0, earlier: 0, over: 7 }])
     for (const machines of [DEMO, DEMO.slice(0, 1), LONG]) {
       const P = sizeClass(W, H), words = trayWords(counts);
-      const tray = { count: counts.done + (counts.notMerged || 0) + counts.earlier, ...counts, marks: [], ...words };
+      // one mark for each agent it holds, as boardAndTray counts them: the ones at work with no room too
+      const tray = { count: counts.done + (counts.notMerged || 0) + counts.earlier + counts.over, ...counts, marks: [], ...words };
       const G = layoutBoard({ W, H, P, detail, roots: [], laneOf: () => null, nRows: maxDenseRows(H, P), dense: true, lidNeed: 220, machines, tray });
       const wx = G.dram.wire.x, tag = `${W}x${H} ${detail} ${words.text} ${machines.length} machine(s)${machines === LONG ? ' (long names)' : ''}`;
       for (const [i, m] of G.machines.entries()) {
@@ -327,7 +362,7 @@ test('a long done tray never puts a machine on the DRAM\'s wire: the sections na
   assert.ok(cutNames > 0, 'and only past that, names are cut');
   // at 960×900 with the demo's machines, the full words and whole names fit, the sections only narrowing
   const P = sizeClass(960, 900), words = trayWords({ done: 12, earlier: 6, over: 1 });
-  const G = layoutBoard({ W: 960, H: 900, P, detail: 'calm', roots: [], laneOf: () => null, nRows: maxDenseRows(900, P), dense: true, lidNeed: 220, machines: DEMO, tray: { count: 18, done: 12, earlier: 6, over: 1, marks: [], ...words } });
+  const G = layoutBoard({ W: 960, H: 900, P, detail: 'calm', roots: [], laneOf: () => null, nRows: maxDenseRows(900, P), dense: true, lidNeed: 220, machines: DEMO, tray: { count: 19, done: 12, earlier: 6, over: 1, marks: [], ...words } });
   assert.equal(G.tray.lead + G.tray.rest, '12 done, 6 from earlier, 1 more working');
   assert.ok(G.machines.every(m => m.label == null), 'whole names');
 });

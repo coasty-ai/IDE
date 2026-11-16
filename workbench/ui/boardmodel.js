@@ -94,10 +94,11 @@ export function splitBoard(roots) {
  * The board and its done tray, as the page draws them. Roots on the board hold lanes (`lanes`, lanes.js); the lanes of
  * roots that are not on it any more are freed, so a newcomer may take them, while the others keep theirs. Past twelve
  * roots on the board, or while one of them has no lane of its own, it goes dense: finished work there waits in the tray
- * too (it keeps its lane), each lane splits, and working agents with no room are counted in the tray. Once dense, it
- * stays dense while any root is on it, and everyone drawn keeps their place (denseLanes, given what it returned last
- * time): going back to whole lanes would move every chip, so it waits until that moves no one, when the board empties
- * or at a reload. The tray lists this run's finished agents newest first, then the earlier ones.
+ * too (it keeps its lane), each lane splits, and working agents with no room on their own side wait in the tray (they
+ * never take a row on the other side), which then shows even when they are all it holds. Once dense, it stays dense
+ * while any root is on it, and everyone drawn keeps their place (denseLanes, given what it returned last time): going
+ * back to whole lanes would move every chip, so it waits until that moves no one, when the board empties or at a reload.
+ * The tray lists this run's finished agents newest first, then the earlier ones, then the ones at work with no room.
  * @param {object[]} roots  boardModel(...).roots
  * @param {import('./lanes.js').Lanes} lanes
  * @param {{ laptop?: (r: object) => boolean, maxRows?: number, prune?: boolean }} [o]
@@ -128,11 +129,15 @@ export function boardAndTray(roots, lanes, { laptop = () => true, maxRows = Infi
   done = [...done].sort((a, b) => ended(b) - ended(a) || String(a.id).localeCompare(String(b.id)));
   const trayIds = { done: done.map(r => r.id), earlier: earlier.map(r => r.id), over: over.slice() };
   let tray = null;
+  // the tray shows whenever it holds anyone, also when that is only an agent at work with no room on the board: it is on
+  // neither side's lanes, and the tray is where it is found
   if (done.length || earlier.length || over.length) {
-    const marks = done.concat(earlier).map(r => ({ shape: r.mark, tone: r.tone }));
+    const onBoard = new Map(on.map(r => [r.id, r]));
+    // one mark for each agent it holds, in the order of its list: done, from earlier, then at work with no room
+    const marks = done.concat(earlier, over.map(id => onBoard.get(id))).map(r => ({ shape: r.mark, tone: r.tone }));
     // this run's agents in the tray, as its words count them: done, and work not merged yet
     const counts = { done: done.filter(r => !r.notMerged).length, notMerged: done.filter(r => r.notMerged).length, earlier: earlier.length, over: over.length };
-    tray = { count: done.length + earlier.length, ...counts, ids: trayIds.done.concat(trayIds.earlier, trayIds.over), marks, ...trayWords(counts) };
+    tray = { count: marks.length, ...counts, ids: trayIds.done.concat(trayIds.earlier, trayIds.over), marks, ...trayWords(counts) };
   }
   return { roots: shown, laneOf, nRows, dense, tray, trayIds };
 }
@@ -151,19 +156,22 @@ export function agoText(ms) {
 
 /**
  * What the done tray says, in a few words: "3 done", then ", 1 not merged", ", 5 from earlier" and ", 1 more working"
- * when there are such. `done`: this run's agents in the tray (finished, failed or stopped, and let go, or waiting there
- * on a dense board) whose work is in, thrown away or not to merge; `notMerged`: those whose work is done and not merged
- * yet (doneWords: "not merged", "checks failed"); `earlier`: agents from earlier runs; `over`: working agents with no
- * room on the board. lead is the bold part; text is all of it, plain (for measuring); sum is all of it for a screen
- * reader (the board's name says it too), and aria the tray's own name; short is lead and rest with "1 more" for "1 more
- * working", which the layout falls back on where the machines need the room (its list and its name keep all of it).
+ * when there are such; whatever it holds first leads ("1 not merged", "5 from earlier", "1 more working"), so it never
+ * says "0". `done`: this run's agents in the tray (finished, failed or stopped, and let go, or waiting there on a dense
+ * board) whose work is in, thrown away or not to merge; `notMerged`: those whose work is done and not merged yet
+ * (doneWords: "not merged", "checks failed"); `earlier`: agents from earlier runs; `over`: working agents with no room on
+ * the board. lead is the bold part; text is all of it, plain (for measuring); sum is all of it for a screen reader (the
+ * board's name says it too), and aria the tray's own name; short is lead and rest with "1 more" for ", 1 more working"
+ * after the others, which the layout falls back on where the machines need the room (its list and its name keep all of
+ * it).
  */
 export function trayWords({ done = 0, notMerged = 0, earlier = 0, over = 0 }) {
-  const lead = done ? `${done} done` : notMerged ? `${notMerged} not merged` : `${earlier} from earlier`;
-  const after = more => [done && notMerged ? `, ${notMerged} not merged` : '', (done || notMerged) && earlier ? `, ${earlier} from earlier` : '',
-    over ? `, ${over} ${more}` : ''].join('');
-  const rest = after('more working');
-  const sum = [done ? `${done} done` : '', notMerged ? `${notMerged} not merged` : '', earlier ? `${earlier} from an earlier run` : '',
-    over ? `${over} more working with no room on the board` : ''].filter(Boolean).join(', ');
-  return { lead, rest, text: lead + rest, sum, aria: `${sum}. Show them.`, short: { lead, rest: after('more') } };
+  const all = [[done, 'done', 'done'], [notMerged, 'not merged', 'not merged'], [earlier, 'from earlier', 'from an earlier run'],
+    [over, 'more working', 'more working with no room on the board']];
+  const held = all.filter(([n]) => n > 0);
+  const [first, ...others] = held.length ? held : [all[0]];
+  const lead = `${first[0]} ${first[1]}`;
+  const after = short => others.map(([n, words]) => `, ${n} ${short && words === 'more working' ? 'more' : words}`).join('');
+  const sum = held.map(([n, , said]) => `${n} ${said}`).join(', ');
+  return { lead, rest: after(false), text: lead + after(false), sum, aria: `${sum}. Show them.`, short: { lead, rest: after(true) } };
 }

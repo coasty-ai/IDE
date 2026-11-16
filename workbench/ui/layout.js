@@ -298,7 +298,8 @@ function chipShape(G, r, maxW) {
  * @param {boolean} input.dense
  * @param {number} input.lidNeed    height the lid's content needs, without the input
  * @param {object[]} input.machines [{ id, name, awake, note }]
- * @param {{ count: number, text: string }|null} input.tray
+ * @param {{ count: number, text: string }|null} input.tray  boardAndTray's tray: count is how many agents it holds (one mark
+ *   each, the ones at work with no room on the board too); none, and it is not drawn
  * @param {(text: string, px: number) => number} [input.measure]
  */
 export function layoutBoard(input) {
