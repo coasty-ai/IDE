@@ -195,7 +195,8 @@ export function lidView(f, o = {}) {
     const c = f.confirm;
     const words = CARD_COUNT[c.kind] || 'You said';
     // its words name branches, paths and tasks: anything that could hide or turn text is shown. A launch card adds,
-    // while full permissions are on (the snapshot's meta), that what it starts will not ask before any step.
+    // while full permissions are on (the snapshot's meta), that what it starts asks only before steps that name Claude
+    // Code's own settings.
     const note = c.kind === 'start' ? launchNote(S.meta.permissions, c.agents) : '';
     const sentence = visibleControls(c.sentence), detail = [c.detail ? visibleControls(c.detail) : '', note].filter(Boolean).join(' ');
     const t = long(sentence);

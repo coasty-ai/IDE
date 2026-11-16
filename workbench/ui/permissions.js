@@ -20,13 +20,13 @@ export function permButtonView(mode) {
     short: 'Full',
     name: 'Full permissions',
     title: on
-      ? 'Full permissions are on: agents run every step without asking. Press to turn them off.'
-      : 'Agents ask before risky steps. Press to let them run every step without asking.',
+      ? "Full permissions are on: agents ask only before steps that name Claude Code's own settings. Press to turn them off."
+      : "Agents ask before risky steps. Press so that they ask only before steps that name Claude Code's own settings.",
   };
 }
 
 /** What a launch card adds while full permissions are on, for the one agent it starts or for several. */
 export function launchNote(mode, agents = 1) {
   if (permissionMode(mode) !== 'full') return '';
-  return `Full permissions are on, so ${Number(agents) > 1 ? 'they' : 'it'} will not ask before any step.`;
+  return `Full permissions are on, so ${Number(agents) > 1 ? 'they ask' : 'it asks'} only before steps that name Claude Code's own settings.`;
 }

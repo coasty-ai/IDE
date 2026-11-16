@@ -717,7 +717,7 @@ test('the full permissions card: its own count line and words, no answer drawn a
   assert.equal(labelled(last.html, 'See all of it').act, 'exact');
 });
 
-test('while full permissions are on, a launch card says it will not ask before any step; off, it is as before', { skip }, async () => {
+test('while full permissions are on, a launch card says it asks only before steps that name Claude Code’s own settings; off, it is as before', { skip }, async () => {
   const { lidView, S } = await load();
   const one = { id: 'c2', kind: 'start', sentence: 'Start Claude Code on “fix the login page”?', detail: 'It can spend up to $2.00.', agents: 1 };
   const many = { id: 'c3', kind: 'start', sentence: 'Start 2 agents: Claude Code on “a” and Claude Code on “b”?', detail: 'Each one can spend up to $2.00.', agents: 2 };
@@ -728,11 +728,11 @@ test('while full permissions are on, a launch card says it will not ask before a
     assert.doesNotMatch(lidView({ confirm: one }, {}).say, /Full permissions/);
     S.meta.permissions = 'full';
     const v = lidView({ confirm: one }, {});
-    assert.ok(v.html.includes('<p class="meta">It can spend up to $2.00. Full permissions are on, so it will not ask before any step.</p>'), v.html);
-    assert.match(v.say, /Full permissions are on, so it will not ask before any step\.$/);
-    assert.ok(lidView({ confirm: many }, {}).html.includes('Each one can spend up to $2.00. Full permissions are on, so they will not ask before any step.'));
+    assert.ok(v.html.includes('<p class="meta">It can spend up to $2.00. Full permissions are on, so it asks only before steps that name Claude Code&#39;s own settings.</p>'), v.html);
+    assert.match(v.say, /Full permissions are on, so it asks only before steps that name Claude Code's own settings\.$/);
+    assert.ok(lidView({ confirm: many }, {}).html.includes('Each one can spend up to $2.00. Full permissions are on, so they ask only before steps that name Claude Code&#39;s own settings.'));
     // a launch card with no detail of its own still says it
-    assert.ok(lidView({ confirm: { ...one, detail: null } }, {}).html.includes('<p class="meta">Full permissions are on, so it will not ask before any step.</p>'));
+    assert.ok(lidView({ confirm: { ...one, detail: null } }, {}).html.includes('<p class="meta">Full permissions are on, so it asks only before steps that name Claude Code&#39;s own settings.</p>'));
     // only launch cards: a merge or a stop says nothing of it
     for (const kind of ['merge', 'discard', 'stop', 'say', 'forget', 'permissions']) {
       assert.doesNotMatch(lidView({ confirm: { id: 'c4', kind, sentence: 'Merge it?', detail: 'x.' } }, {}).html, /Full permissions are on/, kind);

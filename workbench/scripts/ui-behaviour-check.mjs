@@ -1927,7 +1927,7 @@ try {
       `kept ${JSON.stringify(kept)}; on ${JSON.stringify(on)}; said "${words}"; ${a.state} ${JSON.stringify(a.ask)}; confirms ${JSON.stringify(confirms)}`);
   });
 
-  await run(FP + 'while they are on, a launch card says it will not ask; pressed when on, the button turns them off at once, with no card', async () => {
+  await run(FP + 'while they are on, a launch card says it asks only before steps that name Claude Code’s own settings; pressed when on, the button turns them off at once, with no card', async () => {
     await typeIn('start an agent to fix the flaky checkout test');
     await sleep(1100);
     const detail = await lidDetail();
@@ -1937,8 +1937,8 @@ try {
     await realClick('#permBtn');
     await sleep(1000);
     const off = await permBtn(), lid = await lidNow(), words = await said(), p = await permPosts();
-    check(FP + 'while they are on, a launch card says it will not ask; pressed when on, the button turns them off at once, with no card',
-      /It runs on your laptop\. Full permissions are on, so it will not ask before any step\.$/.test(detail)
+    check(FP + 'while they are on, a launch card says it asks only before steps that name Claude Code’s own settings; pressed when on, the button turns them off at once, with no card',
+      /It runs on your laptop\. Full permissions are on, so it asks only before steps that name Claude Code's own settings\.$/.test(detail)
       && off.pressed === 'false' && !off.on && !/^Before agents stop asking/.test(lid) && /Agents ask again before risky steps\./.test(words)
       && p.length === 1 && JSON.stringify(p[0].body) === '{"mode":"ask"}',
       `launch "${detail}"; ${JSON.stringify(off)}; lid "${lid}"; said "${words}"; ${JSON.stringify(p.map(x => x.body))}`);

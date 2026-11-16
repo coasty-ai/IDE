@@ -98,8 +98,8 @@ const HELP_REPLY = 'Say what to work on, like “fix the login bug”. Or ask �
 const GONE = 'That request is no longer waiting. Ask again if you still want it.';
 // Full permissions: the card that asks first, and what is said when they go on and off.
 const FULL_SENTENCE = 'Let agents do anything without asking?';
-const FULL_DETAIL = 'Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. It stays on until you turn it off.';
-const FULL_ON = 'Full permissions are on. Agents no longer ask.';
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
 const FULL_OFF = 'Agents ask again before risky steps.';
 const FULL_REASON = 'Full permissions are on.';
 // When the choice cannot be saved and what is kept says otherwise, the next start differs from this run, and the reply says so.
@@ -1481,9 +1481,10 @@ export class Engine extends EventEmitter {
         // Who SendMessage may reach without asking: the main agent and this agent's own helpers, as its output named them.
         recipients: this._recipients(root, run),
       };
-      // With full permissions on, nothing asks: the policy allows it, or refuses the floor. The mode is read again once the
-      // policy has answered: turned on or off while it checked, the request is judged as the mode now on judges it. Each
-      // mode is asked about once, so this ends after two answers at most.
+      // With full permissions on, the policy allows what would ask, refuses the floor, and asks only about a step that names
+      // Claude Code's own settings. The mode is read again once the policy has answered: turned on or off while it checked,
+      // the request is judged as the mode now on judges it. Each mode is asked about once, so this ends after two answers
+      // at most.
       const verdicts = new Map();
       let full = this.permissionMode === 'full';
       for (;;) {
@@ -1690,7 +1691,7 @@ export class Engine extends EventEmitter {
   /**
    * The yes to the card: full permissions are on, kept for the next start, and every question waiting now that they allow is
    * allowed, as an automatic approval: held hook requests, helpers' too, and the demo's own asks, also those that came after
-   * the card was made. A request they would refuse keeps waiting for the person. The reply counts what it allowed ("Full
+   * the card was made. A request they would refuse, or still ask about, keeps waiting for the person. The reply counts what it allowed ("Full
    * permissions are on. 2 waiting questions were allowed."), and says so when the next start will not have them on.
    */
   _fullOn() {
@@ -1703,7 +1704,7 @@ export class Engine extends EventEmitter {
     for (const { v, ask } of sims) {
       this._answerSim(v, ask, 'Allow', { how: 'auto' }).catch(err => this.log.warn('The demo could not take an answer:', err));
     }
-    this.log.warn('Full permissions are on: agents run every step without asking.');
+    this.log.warn("Full permissions are on: agents ask only before steps that name Claude Code's own settings.");
     this.emit('permissions', 'full');
     const n = held.length + sims.length;
     const allowed = n ? `${n} waiting question${n === 1 ? ' was' : 's were'} allowed.` : '';
@@ -1753,7 +1754,7 @@ export class Engine extends EventEmitter {
     return kept;
   }
 
-  /** The held hook requests that full permissions allow (every one but those that would change Claude Code's settings). */
+  /** The held hook requests that full permissions allow (every one but those they refuse or still ask about: `inFull`). */
   _allowableHeld() {
     return [...this.held.values()].filter(h => !h.done && h.inFull === 'allow');
   }

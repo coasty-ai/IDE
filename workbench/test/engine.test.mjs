@@ -17,13 +17,14 @@ import * as policyMod from '../src/core/policy.mjs';
 import { createPrefs, prefsFile, memoryPrefs } from '../src/core/prefs.mjs';
 import { Simulator } from '../src/adapters/sim/simulator.mjs';
 import { FakeSim, FakeGitSim, FakeMachines, fakeAdapter, fakeDeps, gate, gitError, until, FAKE_BASE, FAKE_MERGE, FAKE_WORK } from './helpers/engine-fakes.mjs';
+import { slowFolder, slowLines } from './helpers/slow-lines.mjs';
 
 const REPO = { root: '/repos/shop', name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 2 };
 const HOOK = { url: 'http://127.0.0.1:9/hook/pretool', tokenFor: (id) => `tok-${id}` };
 const subagentPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-subagent.json', import.meta.url), 'utf8'));
 const rootPayload = JSON.parse(fs.readFileSync(new URL('./fixtures/hook-pretool-root-bash.json', import.meta.url), 'utf8'));
 
-/** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). */
+/** A live-mode engine with fake adapters and deps. Remember to call engine.shutdown(). `log` gets what it logs. */
 function live({ deps: depOpts = {}, options = {}, adapters = null, defaultBudgetUsd = 2, prefs = null, log = null } = {}) {
   const store = new Store();
   const claude = fakeAdapter('claude');
@@ -4354,8 +4355,8 @@ function prefsStore(start = {}) {
     set(change) { saved.push(change); now = { ...now, ...change }; return { ok: true, prefs: { ...now } }; },
   };
 }
-const FULL_DETAIL = 'Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. It stays on until you turn it off.';
-const FULL_ON = 'Full permissions are on. Agents no longer ask.';
+const FULL_DETAIL = "Every agent and its helpers can then run any command, change or delete any file your account can, and use your sign-ins, without asking. They still ask before steps that name Claude Code's own settings. It stays on until you turn it off.";
+const FULL_ON = "Full permissions are on. Agents ask only before steps that name Claude Code's own settings.";
 const FULL_OFF = 'Agents ask again before risky steps.';
 const FULL_REASON = 'Full permissions are on.';
 const pause = (ms = 10) => new Promise(r => setTimeout(r, ms));
@@ -4389,7 +4390,8 @@ test('full permissions: turning them on always asks first, with a card of its ow
 
 test('full permissions: the yes turns them on, keeps them, says so, and allows every question already waiting, helpers’ too', async () => {
   const prefs = prefsStore();
-  const t = live({ prefs });
+  const logged = [];
+  const t = live({ prefs, log: (level, ...args) => logged.push(`${level}: ${args.join(' ')}`) });
   const { id, runner } = await started(t);
   const helperId = `${id}-${subagentPayload.agent_id.slice(0, 8)}`;
   runner.emit({ kind: EV.CREATED, agentId: helperId, parentId: id, name: 'List repository files', harness: 'claude' });
@@ -4412,6 +4414,8 @@ test('full permissions: the yes turns them on, keeps them, says so, and allows e
   assert.equal(t.engine.snapshot().permissions, 'full');
   assert.deepEqual(prefs.saved, [{ permissions: 'full' }]);
   assert.equal(t.notices.filter(n => n === yes.reply).length, 1, 'said once');
+  // the log says so too, and that agents still ask before steps that name Claude Code's own settings
+  assert.deepEqual(logged.filter(l => /Full permissions/.test(l)), ["warn: Full permissions are on: agents ask only before steps that name Claude Code's own settings."]);
   assert.equal(t.store.get(id).ask, null);
   assert.equal(t.store.get(id).state, 'working');
   assert.equal(t.store.get(helperId).ask, null);
@@ -4516,7 +4520,7 @@ test('full permissions: when they cannot be kept for the next start, they still 
   await throwing.engine.shutdown();
 });
 
-test('full permissions with the real policy: what would ask runs as an automatic approval; the floor is still refused', async (ctx) => {
+test('full permissions with the real policy: what would ask runs as an automatic approval, the floor is still refused, and a step that names Claude Code’s settings asks', async (ctx) => {
   const t = liveFolders(ctx, { prefs: prefsStore({ permissions: 'full' }) });
   const seen = [];
   t.engine.deps.policy = { decide: (req) => { seen.push(req); return policyMod.decide(req); } };
@@ -4527,11 +4531,106 @@ test('full permissions with the real policy: what would ask runs as an automatic
   assert.equal((await hook('Read', { file_path: 'README.md' })).permissionDecisionReason, "Looking at files inside the agent's own folder is always allowed.");
   assert.deepEqual(await hook('Write', { file_path: '.claude/settings.json', content: '{}' }), { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Files in a .claude folder change how Claude Code itself runs, so agents may not change them.' });
   assert.deepEqual(await hook('Agent', { description: 'x', prompt: 'y', isolation: 'worktree' }), { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: "Helpers must work in this agent's own folder, not in a separate copy or on another computer. Start the helper again without isolation." });
-  assert.equal((await hook('Bash', { command: 'rm -rf .claude' })).permissionDecision, 'deny');
   assert.ok(seen.every(r => r.full === true));
-  assert.deepEqual(t.store.get(id).approvals, { auto: 3, byYou: 0, denied: 3 });
+  assert.deepEqual(t.store.get(id).approvals, { auto: 3, byYou: 0, denied: 2 });
   assert.equal(t.store.get(id).ask, null, 'nothing asked');
+  // a command that names Claude Code's own settings waits for the person, with the reason it asks for without full
+  // permissions and why they do not cover it; its question says only that the agent wants to run a command, never what
+  // the command does with them
+  const name = t.store.get(id).name;
+  const named = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: 'rm -rf .claude' } });
+  await until(() => t.store.get(id).ask);
+  assert.equal(t.store.get(id).state, 'needs_ok');
+  assert.equal(t.store.get(id).ask.sentence, `${name} wants to run a command`);
+  assert.equal(t.store.get(id).ask.why, "This command is not on the list of safe commands. Full permissions do not cover steps that name Claude Code's own settings.");
+  assert.equal(t.store.get(id).ask.detail, 'rm -rf .claude');
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await named).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(seen.length, 6, 'judged once, as full permissions judge it');
+  // one that writes .gitignore, not a file in those settings, is asked about in the same words
+  const ignore = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command: "echo '.claude/' >> .gitignore" } });
+  await until(() => t.store.get(id).ask);
+  assert.deepEqual([t.store.get(id).ask.sentence, t.store.get(id).ask.why, t.store.get(id).ask.detail], [`${name} wants to run a command`,
+    "The command chains, redirects or substitutes other commands. Full permissions do not cover steps that name Claude Code's own settings.", "echo '.claude/' >> .gitignore"]);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await ignore).hookSpecificOutput.permissionDecision, 'deny');
   await t.engine.shutdown();
+});
+
+test('full permissions: a step they do not cover asks while they are on, and stays waiting at the yes to their card', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  const { id } = await started(t);
+  // the stand-in policy's SettingsCommand names Claude Code's settings: it asks with full permissions on too
+  const p = t.engine.hookPreToolUse(id, { tool_name: 'SettingsCommand', tool_input: { command: 'rm -rf .claude' } });
+  await until(() => t.store.get(id).ask);
+  assert.equal(t.store.get(id).ask.why, "Needs a person. Full permissions do not cover steps that name Claude Code's own settings.");
+  assert.equal(await settled(p), false, 'it waits for the person');
+  // turned off and on again, their yes leaves it waiting, and counts nothing
+  await t.engine.permissions('ask');
+  const card = (await t.engine.permissions('full')).confirm;
+  assert.equal(card.detail, FULL_DETAIL, 'not counted among the questions they allow');
+  assert.equal((await t.engine.confirm(card.id, true)).reply, FULL_ON);
+  assert.equal(await settled(p), false);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Allow' });
+  assert.equal((await p).hookSpecificOutput.permissionDecision, 'allow');
+  await t.engine.shutdown();
+});
+
+test('full permissions off: a long line with many cd steps shows its question at once, checked by one decide for each mode', async (ctx) => {
+  const t = liveFolders(ctx, { prefs: prefsStore() });
+  const seen = [];
+  t.engine.deps.policy = { decide: (req) => { seen.push(req.full); return policyMod.decide(req); } };
+  const { id } = await started(t);
+  const folder = path.join(t.dir, fs.readdirSync(t.dir)[0]);
+  for (let i = 0; i < 200; i++) fs.mkdirSync(path.join(folder, `pkg${i}`));
+  const command = Array.from({ length: 200 }, (_, i) => `cd pkg${i} && npm test > out.txt && cd ..`).join(' && ');
+  const t0 = performance.now();
+  const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command } });
+  await until(() => t.store.get(id).ask);
+  // the first request of a fresh engine, before its code is compiled: the 250 ms limit is held by the test of the slow lines below
+  assert.ok(performance.now() - t0 < 1000, `the question came after ${Math.round(performance.now() - t0)} ms`);
+  // asked once as the mode is, and once as full permissions would judge it, for the yes to their card
+  assert.deepEqual(seen, [false, true]);
+  // too involved for full permissions to check in time: their card does not count it, and it waits for the person
+  assert.equal((await t.engine.permissions('full')).confirm.detail, FULL_DETAIL);
+  await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+  assert.equal((await pending).hookSpecificOutput.permissionDecision, 'deny');
+  await t.engine.shutdown();
+});
+
+test('full permissions on and off: each slow line the checkers found is answered or asked within 250 ms, and the engine keeps ticking', async (ctx) => {
+  for (const mode of ['ask', 'full']) {
+    const t = liveFolders(ctx, { prefs: prefsStore({ permissions: mode }) });
+    t.engine.deps.policy = policyMod;
+    const { id } = await started(t);
+    slowFolder(path.join(t.dir, fs.readdirSync(t.dir)[0]));
+    const wrong = [];
+    // one request: how long until it is answered or asked about, and the longest a 100 ms timer had to wait meanwhile
+    const once = async (command) => {
+      let last = performance.now();
+      let gap = 0;
+      const tick = setInterval(() => { const now = performance.now(); gap = Math.max(gap, now - last); last = now; }, 100);
+      const t0 = performance.now();
+      let out = null;
+      const pending = t.engine.hookPreToolUse(id, { tool_name: 'Bash', tool_input: { command } }).then(o => { out = o; });
+      await until(() => out || t.store.get(id).ask);
+      const ms = performance.now() - t0;
+      await pause(10); // a tick held up by the check comes as soon as it ends
+      clearInterval(tick);
+      if (!out) await t.engine.answer(id, { askId: t.store.get(id).ask.id, answer: 'Deny' });
+      await pending;
+      return { ms, stood: gap - 100 };
+    };
+    for (const { label, command } of slowLines()) {
+      // the fastest of up to three tries counts, as in policy.test.mjs: other tests running beside this one can slow one down
+      let best = await once(command);
+      for (let i = 1; i < 3 && best.ms >= 250; i++) { const r = await once(command); if (r.ms < best.ms) best = r; }
+      if (best.ms >= 250) wrong.push(`${label}, full permissions ${mode === 'full' ? 'on' : 'off'}: ${Math.round(best.ms)} ms`);
+      if (best.stood >= 250) wrong.push(`${label}, full permissions ${mode === 'full' ? 'on' : 'off'}: the engine stood still for ${Math.round(best.stood)} ms`);
+    }
+    assert.equal(wrong.length, 0, wrong.join('\n'));
+    await t.engine.shutdown();
+  }
 });
 
 test('full permissions in words: the real parser asks first for "stop asking", a bare yes is not enough, and "ask first" turns them off', async () => {
@@ -4557,12 +4656,59 @@ test('full permissions in words: the real parser asks first for "stop asking", a
   await t.engine.shutdown();
 });
 
+test('full permissions in words: a thanks before them still acts, a question never does, and their card takes its own words beside an agent of that name', async () => {
+  const t = live({ prefs: prefsStore() });
+  t.engine.deps.commands = commands;
+  const card = await t.engine.command('thank you, stop asking');
+  assert.equal(card.confirm.kind, 'permissions');
+  assert.equal((await t.engine.command('thanks, stop asking', { confirmId: card.confirm.id })).reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  // asked, the mark typed apart or not, they change nothing
+  for (const q of ['ask first ?', 'ask first?']) {
+    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal(t.engine.permissionMode, 'full', q);
+  }
+  assert.equal((await t.engine.command('thanks, ask first')).reply, FULL_OFF);
+  assert.equal(t.engine.permissionMode, 'ask');
+  // an agent called Stop asking: the words alone reach it, and at the card they are still the card's yes
+  const { id } = await started(t, { task: 'Stop asking' });
+  assert.equal(t.store.get(id).name, 'Stop asking');
+  assert.equal((await t.engine.command('stop asking')).confirm, undefined);
+  assert.equal(t.engine.permissionMode, 'ask');
+  const again = await t.engine.command('turn on full permissions');
+  assert.equal((await t.engine.command('stop asking', { confirmId: again.confirm.id })).reply, FULL_ON);
+  assert.equal(t.engine.permissionMode, 'full');
+  await t.engine.shutdown();
+});
+
+test('full permissions in words: an agent named like them is reached by its name, a question with "?!" changes nothing, and "turn it off then" answers their card', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  t.engine.deps.commands = commands;
+  const { id } = await started(t, { task: 'Turn off full permissions when the repo is public' });
+  assert.equal(t.store.get(id).name, 'Turn off full permissions');
+  for (const said of ['turn off full permissions', 'Turn off full permissions.']) {
+    const r = await t.engine.command(said);
+    assert.equal(r.confirm, undefined, `${said}: no launch card`);
+    assert.equal(t.engine.permissionMode, 'full', said);
+  }
+  for (const q of ['ask first?!', 'ask first? please', 'ask first?.']) {
+    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal(t.engine.permissionMode, 'full', q);
+  }
+  assert.equal((await t.engine.command('ask first')).reply, FULL_OFF);
+  const card = await t.engine.command('stop asking');
+  assert.equal((await t.engine.command('turn it off then', { confirmId: card.confirm.id })).reply, 'OK, agents still ask before risky steps.');
+  assert.equal(t.engine.permissionMode, 'ask');
+  await t.engine.shutdown();
+});
+
 test('full permissions: the launch, the spending limit and Codex are as before', async () => {
   const t = live({ prefs: prefsStore({ permissions: 'full' }) });
   t.engine.deps.commands = commands;
   const launch = await t.engine.command('start an agent to fix the login page');
   assert.equal(launch.confirm.kind, 'start');
-  // the card is the engine's as before; the page adds, while full permissions are on, that it will not ask
+  // the card is the engine's as before; the page adds, while full permissions are on, that it asks only before steps that
+  // name Claude Code's own settings
   assert.equal(launch.confirm.detail, 'It can spend up to $2.00. It works in its own copy of shop, made from the last commit. Your 2 uncommitted changes are not included.');
   assert.equal(launch.confirm.agents, 1, 'how many agents it starts, so the page can say it or they');
   const { id } = await started(t, { task: 'Fix the cart', harness: 'codex' });
