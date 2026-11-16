@@ -4738,7 +4738,6 @@ test('full permissions: when turning them off cannot be saved, the reply says th
 
 // ------------------------------------------------------------------ the file view
 
-const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
 const CHECKS = [{ name: 'unit tests', run: 'npm test', timeoutSec: 60 }];
 
 test('the file view: "you" is your folder and an agent’s id its own copy (a helper’s, its agent’s); anything else is refused in plain words', async (ctx) => {
