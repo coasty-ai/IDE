@@ -7,7 +7,7 @@ import { EV } from '../../shared/events.mjs';
 import { STATE } from '../../shared/states.mjs';
 import {
   buildClaudeLaunch, findClaude, scrubEnv, withNodeOnPath, userMessage, sessionFolders, sessionExists,
-  safeMask, maskParsed, maskedTail, DEFAULT_BUDGET_USD, DISALLOWED_TOOLS, CLAUDE_NOT_FOUND, MASK_MARGIN,
+  safeMask, maskParsed, maskedTail, DEFAULT_BUDGET_USD, DISALLOWED_TOOLS, CLAUDE_NOT_FOUND, MASK_MARGIN, CLAUDE_FORMAT,
 } from './args.mjs';
 import { createClaudeParser } from './parse.mjs';
 
@@ -210,7 +210,7 @@ export function createRunner(opts = {}) {
     let obj;
     // Keys are hidden before anything is cut short: the log's 120 characters here, the parser's and narrate()'s later.
     try { obj = JSON.parse(line); } catch { log('debug', `ignored output that is not JSON: ${mask(line).slice(0, 120)}`); return; }
-    if (hide) obj = maskParsed(obj, hide);
+    if (hide) obj = maskParsed(obj, hide, CLAUDE_FORMAT); // never the format's own words: a line would no longer read
     if (obj && obj.type === 'system' && obj.subtype === 'init') {
       if (obj.session_id) sessionId = String(obj.session_id);
       tellTools(obj);

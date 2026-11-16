@@ -10,9 +10,10 @@ import {
 import {
   buildClaudeLaunch, userMessage, shellQuote, hookCommand, hookSettings, scrubEnv, sessionFolders, findClaude, claudeBin,
   newestExtensionClaude, onPath, withNodeOnPath, WORKBENCH_PROMPT, DISALLOWED_TOOLS, BRIDGE_PATH, DEFAULT_BUDGET_USD,
-  CLAUDE_NOT_FOUND, EXTENSION_FOLDERS, withKeys, safeMask, maskParsed, maskCut, maskedTail, MASK_MARGIN,
+  CLAUDE_NOT_FOUND, EXTENSION_FOLDERS, withKeys, safeMask, maskParsed, maskCut, maskedTail, MASK_MARGIN, CLAUDE_FORMAT,
 } from '../src/adapters/claude/args.mjs';
 import { EV } from '../src/shared/events.mjs';
+import { maskSecrets } from '../src/shared/mask.mjs';
 
 const FAKE = fileURLToPath(new URL('./helpers/claude-fake.mjs', import.meta.url));
 const WORKBENCH = fileURLToPath(new URL('..', import.meta.url)); // the agent's folder in these tests
@@ -302,6 +303,52 @@ test('the masking helpers: every string of parsed output, the kept end of a stre
   assert.equal(safeMask(null)('abc'), 'abc');
   assert.equal(safeMask(() => { throw new Error('no'); })('abcdefghij'), 'abcdefghij');
   assert.equal(safeMask(() => 5)('abcdefghij'), 'abcdefghij');
+});
+
+test('maskParsed leaves the words of Claude Code’s own format alone, and hides every word a tool or the agent wrote', () => {
+  // A copied .env may hold one of those words ("assistant", a model's name): hidden there, a line no longer reads.
+  const value = ['fake', 'copied', 'value', 'q'.repeat(20)].join('-'); // made up here
+  const words = ['assistant', 'claude-haiku-4-5', 'toolu_01abcdef', 'msg_01abcdef', 'end_turn', 'TodoWrite', 'tool_result', 'completed', value];
+  const mask = (s) => maskSecrets(s, words);
+  const hidden = (s) => maskSecrets(s, words);
+  const said = {
+    type: 'assistant', session_id: 'sess-0001-x', parent_tool_use_id: 'toolu_01abcdef', uuid: 'uuid-0001-x',
+    message: {
+      id: 'msg_01abcdef', type: 'message', role: 'assistant', model: 'claude-haiku-4-5', stop_reason: 'end_turn',
+      content: [
+        { type: 'text', text: `the assistant read ${value}` },
+        { type: 'tool_use', id: 'toolu_01abcdef', name: 'TodoWrite', input: { name: 'assistant', model: 'claude-haiku-4-5', id: value, type: 'assistant', todos: [{ content: value, status: 'completed' }] } },
+      ],
+    },
+  };
+  maskParsed(said, mask, CLAUDE_FORMAT);
+  assert.deepEqual(said, {
+    type: 'assistant', session_id: 'sess-0001-x', parent_tool_use_id: 'toolu_01abcdef', uuid: 'uuid-0001-x',
+    message: {
+      id: 'msg_01abcdef', type: 'message', role: 'assistant', model: 'claude-haiku-4-5', stop_reason: 'end_turn',
+      content: [
+        { type: 'text', text: `the ${hidden('assistant')} read ${hidden(value)}` },
+        // a tool's input is the agent's: a name of the format there is hidden like any other word
+        { type: 'tool_use', id: 'toolu_01abcdef', name: 'TodoWrite', input: { name: hidden('assistant'), model: hidden('claude-haiku-4-5'), id: hidden(value), type: hidden('assistant'), todos: [{ content: hidden(value), status: hidden('completed') }] } },
+      ],
+    },
+  });
+  // A tool's result, in the message and beside it, is the tool's: hidden whatever its fields are called.
+  const result = {
+    type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_01abcdef', content: [{ type: 'text', text: value }, { type: 'assistant', id: value }] }] },
+    tool_use_result: { status: 'completed', model: 'claude-haiku-4-5', id: value },
+  };
+  maskParsed(result, mask, CLAUDE_FORMAT);
+  assert.deepEqual(result, {
+    type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_01abcdef', content: [{ type: 'text', text: hidden(value) }, { type: hidden('assistant'), id: hidden(value) }] }] },
+    tool_use_result: { status: hidden('completed'), model: hidden('claude-haiku-4-5'), id: hidden(value) },
+  });
+  // The name of a block that is not a tool call, and the format's words elsewhere in a line, are hidden.
+  const other = { type: 'system', subtype: 'init', model: 'claude-haiku-4-5', status: 'completed', cwd: `/w/${value}`, mcp_servers: [{ name: value, status: 'assistant' }], message: { content: [{ type: 'text', name: value }] } };
+  maskParsed(other, mask, CLAUDE_FORMAT);
+  assert.deepEqual(other, { type: 'system', subtype: 'init', model: 'claude-haiku-4-5', status: 'completed', cwd: hidden(`/w/${value}`), mcp_servers: [{ name: hidden(value), status: hidden('assistant') }], message: { content: [{ type: 'text', name: hidden(value) }] } });
+  // Without a format, every string is hidden, as before.
+  assert.deepEqual(maskParsed({ type: 'assistant' }, mask), { type: hidden('assistant') });
 });
 
 test('the hook command quotes its paths for the shell', () => {
@@ -853,4 +900,28 @@ test('a mask hides the person’s keys in Claude Code’s output before it is re
   await c.until((evs) => evs.find((e) => e.kind === EV.STATE && e.state === 'failed'), 'the failure');
   const ended = c.events.find((e) => e.kind === EV.ENDED && e.agentId === 'abc123');
   assert.match(ended.error, /fake claude: \[hidden\] with 3/);
+});
+
+test('a mask that hides a word of Claude Code’s format ("assistant", the model’s name) changes nothing of what the board is told', async () => {
+  const replay = async (mask) => {
+    const c = collector();
+    const r = makeRunner(c, { env: { FAKE_CLAUDE_FIXTURE: 'claude-subagent-run.jsonl' }, ...(mask ? { mask } : {}) });
+    await r.start();
+    await c.until((evs) => evs.filter((e) => e.kind === EV.TURN && e.phase === 'end').length === 3, 'three turn ends');
+    await r.stop();
+    return c.events;
+  };
+  const kinds = (evs) => {
+    const n = {};
+    for (const e of evs) n[e.kind] = (n[e.kind] || 0) + 1;
+    return n;
+  };
+  const plain = await replay(null);
+  const masked = await replay((s) => maskSecrets(s, ['assistant', 'claude-haiku-4-5-20251001']));
+  assert.ok(kinds(plain)[EV.ACTIVITY] > 2 && kinds(plain)[EV.PLAN] >= 1, 'the run has steps and a plan to lose');
+  assert.deepEqual(kinds(masked), kinds(plain), 'every step, plan, cost and thinking event still arrives');
+  const models = (evs) => evs.filter((e) => e.kind === EV.MODEL).map((e) => e.model);
+  assert.deepEqual(models(masked), models(plain));
+  assert.ok(models(masked).includes('claude-haiku-4-5-20251001'), 'the model’s name is shown as it is');
+  assert.deepEqual(masked.filter((e) => e.kind === EV.PLAN).map((e) => e.items), plain.filter((e) => e.kind === EV.PLAN).map((e) => e.items));
 });

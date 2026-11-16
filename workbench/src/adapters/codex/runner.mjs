@@ -44,6 +44,15 @@ const WORKBENCH_SECRETS = new Set(['WORKBENCH_HOOK_URL', 'WORKBENCH_HOOK_TOKEN']
 // an agent gets no handle on the editor's connection, and a Workbench an agent starts does not inherit the programs.
 // The Claude adapter removes the same ones.
 const HOST_VARS = /^(VSCODE_.*|ELECTRON_RUN_AS_NODE|GIT_EDITOR|WORKBENCH_CLAUDE_BIN|WORKBENCH_CODEX_BIN)$/;
+/**
+ * Where `codex exec --json` names things rather than says them, never masked (see maskParsed's OutputFormat): an
+ * event's type and thread id, and its item's id, type and status. A command, its output, a message or a tool's
+ * arguments and result are masked whatever their fields are called.
+ */
+export const CODEX_FORMAT = Object.freeze({
+  keep: new Set(['type', 'thread_id']),
+  inside: { item: { keep: new Set(['id', 'type', 'status']) } },
+});
 
 /** The Codex binary: `WORKBENCH_CODEX_BIN` (read at call time, so tests can point it at a fake) or `codex`. */
 export function codexBin(env = process.env) {
@@ -315,7 +324,7 @@ export function createRunner(opts = {}) {
       return;
     }
     // Keys are hidden before anything is cut short: the log's 120 characters above, the parser's and narrate()'s later.
-    if (hide) obj = maskParsed(obj, hide);
+    if (hide) obj = maskParsed(obj, hide, CODEX_FORMAT); // never the format's own words: a line would no longer read
     for (const ev of parser.push(obj)) forward(p, ev);
   }
 

@@ -5,8 +5,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { harness, available, createRunner, buildEnv, startArgs, resumeArgs, sandboxArgs, gitFolders, tomlString } from '../src/adapters/codex/runner.mjs';
+import { harness, available, createRunner, buildEnv, startArgs, resumeArgs, sandboxArgs, gitFolders, tomlString, CODEX_FORMAT } from '../src/adapters/codex/runner.mjs';
+import { maskParsed } from '../src/adapters/claude/args.mjs';
 import { EV } from '../src/shared/events.mjs';
+import { maskSecrets } from '../src/shared/mask.mjs';
 
 // Codex's own sandbox, as every turn widens it: the network on (the git folders follow, when there are any).
 const NET = ['-c', 'sandbox_workspace_write.network_access=true'];
@@ -345,6 +347,32 @@ test('a mask hides the person’s keys in Codex’s output before it is read, an
   await waitFor(() => f.events.some(e => e.kind === EV.STATE) && !failing.info().alive, 5000, 'the failure');
   const ended = f.events.find(e => e.kind === EV.ENDED);
   assert.equal(ended.error, 'Codex is not signed in, or its sign-in has expired.\n\nERROR: unexpected status 401 [hidden]');
+});
+
+test('a mask that hides a word of Codex’s format ("completed", "agent_message") changes nothing of what the board is told', async t => {
+  // A copied .env may hold such a word: hidden in "item.completed", every item of the turn would be lost.
+  const words = ['completed', 'agent_message', 'command_execution', 'in_progress', RUN_THREAD];
+  const replay = async (mask) => {
+    const s = setup(t);
+    const runner = createRunner({ agentId: 'f1', name: 'Explain repo', task: 'Explain this repo', cwd: s.ws, emit: s.emit, ...(mask ? { mask } : {}) });
+    await runner.start();
+    await waitFor(() => turnEnds(s.events).length === 1 && !runner.info().alive, 5000, 'the first turn');
+    return s.events;
+  };
+  const kinds = (events) => {
+    const n = {};
+    for (const e of events) n[e.kind] = (n[e.kind] || 0) + 1;
+    return n;
+  };
+  const plain = await replay(null);
+  const masked = await replay((text) => maskSecrets(text, words));
+  assert.ok(kinds(plain)[EV.ACTIVITY] > 2 && kinds(plain)[EV.SAYS] >= 1, 'the turn has steps and words to lose');
+  assert.deepEqual(kinds(masked), kinds(plain));
+  assert.deepEqual(masked.filter(e => e.kind === EV.SESSION).map(e => e.sessionId), [RUN_THREAD], 'its thread, to resume it');
+  // What a tool was given, or gave back, is hidden whatever its fields are called.
+  const line = { type: 'item.completed', item: { id: 'item_9', type: 'mcp_tool_call', status: 'completed', arguments: { type: 'completed', id: 'agent_message' }, result: { status: 'completed' } } };
+  maskParsed(line, (text) => maskSecrets(text, words), CODEX_FORMAT);
+  assert.deepEqual(line, { type: 'item.completed', item: { id: 'item_9', type: 'mcp_tool_call', status: 'completed', arguments: { type: '••••', id: '•••• sage' }, result: { status: '••••' } } });
 });
 
 // ---------------------------------------------------------------------------------------------
