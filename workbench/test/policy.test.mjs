@@ -1849,6 +1849,19 @@ test('with full permissions on, a step that deletes what it was given, or writes
     bash('npx jest --outputFile=out.json'), bash('ln -s .claude/settings.json settings-link'), bash('ln src/existing.js b.js'), bash('cp -l src/existing.js c.js')]);
 });
 
+test('with full permissions on, listing an archive, testing it or unpacking it to the output runs: nothing is written there', () => {
+  allowedInFull([bash('unzip -l hooks.zip .claude/settings.json'), bash('unzip -lq hooks.zip .claude/settings.json'), bash('unzip -v hooks.zip .claude/settings.json'),
+    bash('unzip -t hooks.zip .mcp.json'), bash('unzip -p hooks.zip .claude/settings.json > /tmp/s.json'), bash('unzip -c hooks.zip .mcp.json'),
+    bash('unzip -Z hooks.zip .claude/settings.json'), bash('unzip -z hooks.zip'), bash('tar -tf hooks.tar .claude/settings.json'), bash('tar tvf hooks.tar .claude'),
+    bash('tar --list -f hooks.tar .claude/settings.json'), bash('tar -xOf hooks.tar .claude/settings.json > /tmp/s.json'), bash('tar -x --to-stdout -f hooks.tar .mcp.json'),
+    bash('tar xOf hooks.tar .claude/settings.json'), bash('tar -df hooks.tar .claude')]);
+  // what unpacks there is still refused; a command tar runs for each file it unpacks is code
+  refusedWith([bash('unzip -o hooks.zip .mcp.json'), bash('unzip -q hooks.zip -d .claude'), bash('tar xf hooks.tar .claude/settings.json'),
+    bash('tar -xzf hooks.tgz -C .claude')], FLOOR_REASON);
+  refusedWith([bash("tar -x --to-command='rm -rf .claude' -f hooks.tar")], CODE_CLAUDE);
+  allowedInFull([bash("tar -x --to-command='wc -c' -f hooks.tar .claude/settings.json")]);
+});
+
 test('with full permissions on, an edit to a file that is also linked from another place on disk is refused, as it asks without them', () => {
   const rows = [{ tool: 'Write', input: { file_path: 'hard.txt' } }, { tool: 'Edit', input: { file_path: 'hard.txt' } },
     { tool: 'MultiEdit', input: { file_path: 'hard.txt' } }];

@@ -494,7 +494,7 @@ function commandFloor(command, base) {
       if (v === 'carried') carried = true;
     }
     if (codeNamesClaude(c, command, parts) || builtProgram(c)) code = true;
-    const call = c.bare ? packageCall(c.bare) : null;
+    const call = c.bare ? packageCall(c.bare) ?? tarCommand(c.bare) : null;
     if (call !== null && namesExpanded(call)) code = true;
   }
   if (!code && feedsNames(parts) && (named || textNamesClaude(command))) code = true;
@@ -1067,6 +1067,16 @@ function packageTool(prog, args) {
   return k < rest.length ? { prog: rest[k].replace(/^.*\//, '').replace(/@[^/]*$/, ''), args: rest.slice(k + 1) } : null;
 }
 
+/** The shell command tar runs for each file it unpacks (--to-command): code (or null). */
+function tarCommand(p) {
+  if (p.prog !== 'tar') return null;
+  for (let k = 0; k < p.args.length && p.args[k] !== '--'; k++) {
+    const m = /^--to-command(?:=(.*))?$/s.exec(p.args[k]);
+    if (m) return m[1] ?? p.args[k + 1] ?? null;
+  }
+  return null;
+}
+
 /** The shell command npx, `npm exec` and their kin run with -c (--call): code, which the floor reads as code (or null). */
 function packageCall(p) {
   const rest = p.prog === 'npm' && /^(?:exec|x)$/.test(p.args[0] ?? '') ? p.args.slice(1) : ['npx', 'pnpx', 'bunx'].includes(p.prog) ? p.args : null;
@@ -1277,7 +1287,8 @@ function perlDigits(a, j) {
 /**
  * tar: the archive it creates, appends to or updates (-f, unless "-"), its --listed-incremental file, and where it unpacks:
  * each -C folder, and each member it names, inside them (or in this folder). The old form without a dash (tar xzf a.tgz)
- * counts. What it unpacks without naming members cannot be told, and runs.
+ * counts. What it unpacks without naming members cannot be told, and runs. Listing (-t), comparing (-d) and unpacking to its
+ * output (-O, --to-stdout) or to a command (--to-command, read as code: tarCommand) write nothing there.
  */
 function tarTargets(args) {
   const list = args.length && /^[A-Za-z]+$/.test(args[0]) && /[crtuxA]/.test(args[0]) ? ['-' + args[0], ...args.slice(1)] : args;
@@ -1285,7 +1296,8 @@ function tarTargets(args) {
     'tape-length', 'newer', 'label', 'listed-incremental', 'use-compress-program', 'exclude']);
   const words = optionWords(list);
   const create = words.some(a => shortHas(a, 'cruA') || longIs(a, ['create', 'append', 'update', 'catenate', 'concatenate']));
-  const extract = words.some(a => shortHas(a, 'x') || longIs(a, ['extract', 'get']));
+  const toOutput = words.some(a => shortHas(a, 'O') || longIs(a, ['to-stdout', 'to-command']));
+  const extract = !toOutput && words.some(a => shortHas(a, 'x') || longIs(a, ['extract', 'get']));
   const out = optValues(opts, 'g', 'listed-incremental').map(word => ({ word }));
   const file = optValue(opts, 'f', 'file');
   if (create && file !== undefined && file !== '-') out.push({ word: file });
@@ -1301,11 +1313,15 @@ function tarTargets(args) {
   return out;
 }
 
-/** unzip: the folder it unpacks into (-d), and each member it names, inside it (or in this folder); -x's names are left out. */
+/**
+ * unzip: the folder it unpacks into (-d), and each member it names, inside it (or in this folder); -x's names are left out.
+ * Listing (-l, -v, -Z), testing (-t), showing the comment (-z) and unpacking to its output (-p, -c) write nothing.
+ */
 function unzipTargets(args) {
   let dir = null;
   let exclude = false;
   let archive = null;
+  let reads = false;
   const members = [];
   for (let k = 0; k < args.length; k++) {
     const a = args[k];
@@ -1313,10 +1329,11 @@ function unzipTargets(args) {
     if (/^-d./.test(a)) { dir = a.slice(2); exclude = false; continue; }
     if (a === '-x') { exclude = true; continue; }
     if (a === '-P') { k++; continue; }
-    if (a.startsWith('-')) { exclude = false; continue; }
+    if (a.startsWith('-')) { exclude = false; if (/^-[^-]*[lvtzpcZ]/.test(a)) reads = true; continue; }
     if (archive === null) archive = a;
     else if (!exclude) members.push(a);
   }
+  if (reads) return [];
   const into = dir ?? '.';
   return [...(dir === null ? [] : [{ word: dir }]), ...members.map(m => ({ word: into === '.' ? m : `${into.replace(/\/+$/, '')}/${m}` }))];
 }
