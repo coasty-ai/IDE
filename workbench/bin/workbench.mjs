@@ -315,19 +315,21 @@ async function loadModules(demo, log) {
   const base = { Store: storeMod.Store, Engine: engineMod.Engine, createServer: httpMod.createServer, commands, Machines: machinesMod.Machines, prefs };
   if (demo) {
     const sim = await load('src/adapters/sim/simulator.mjs');
-    // Not needed by the simulator, but passed along when present.
-    const [policy, workspace, receipt] = await Promise.all([
+    // Not needed by the simulator, but passed along when present. The file view shows the demo's sample project.
+    const [policy, workspace, receipt, files] = await Promise.all([
       loadOptional('src/core/policy.mjs', log), loadOptional('src/core/workspace.mjs', log), loadOptional('src/core/receipt.mjs', log),
+      loadOptional('src/core/files.mjs', log),
     ]);
-    return { ...base, Simulator: sim.Simulator, policy, workspace, receipt };
+    return { ...base, Simulator: sim.Simulator, policy, workspace, receipt, files };
   }
-  const [policy, workspace, receipt, history] = await Promise.all([
+  const [policy, workspace, receipt, history, files] = await Promise.all([
     load('src/core/policy.mjs'), load('src/core/workspace.mjs'), load('src/core/receipt.mjs'), loadOptional('src/core/history.mjs', log),
+    loadOptional('src/core/files.mjs', log),
   ]);
   const [claude, codex] = await Promise.all([
     loadOptional('src/adapters/claude/runner.mjs', log), loadOptional('src/adapters/codex/runner.mjs', log),
   ]);
-  return { ...base, policy, workspace, receipt, history, claude, codex };
+  return { ...base, policy, workspace, receipt, history, files, claude, codex };
 }
 
 /** End a reason with one full stop: reasons are often whole sentences already. */
@@ -337,15 +339,33 @@ function sentence(text) {
 }
 
 /**
- * The Claude Code adapter, told the --claude path when one was given. The engine calls available() and
- * createRunner() itself, and every launch looks Claude Code up again from this path.
+ * WORKBENCH_CODEX_BIN as it is read from anywhere: a relative path (one with a "/" that does not start with "~", or a
+ * script's name alone, which node reads as a path) is read from the folder Workbench was started in (`startedIn`),
+ * once, at start, and the whole path takes its place. The Codex adapter and Agents & keys read the variable when they
+ * look, and refuse a relative path (findCodex): Codex starts in an agent's folder, where the agent could put a program
+ * of its own at that path. Without that folder (it was removed before Workbench started), the path is left as it is,
+ * and so refused. Anything else is left as it is: a bare name is looked up on the PATH.
  */
-function claudeAdapter(mod, claudePath) {
-  if (!mod || !claudePath) return mod;
+export function placedCodexBin(value, startedIn) {
+  if (typeof value !== 'string' || !value || path.isAbsolute(value) || value === '~' || value.startsWith('~/')) return value;
+  if (!value.includes('/') && !/\.(mjs|cjs|js)$/i.test(value)) return value;
+  return typeof startedIn === 'string' && path.isAbsolute(startedIn) ? path.resolve(startedIn, value) : value;
+}
+
+/**
+ * The Claude Code adapter, told the --claude path when one was given, and the folder Workbench was started in
+ * (`startedIn`), from which a relative path in --claude or WORKBENCH_CLAUDE_BIN is read: never from the working folder
+ * of the moment, which the file view changes for a moment. The engine and Agents & keys call available() and
+ * createRunner() themselves, and every launch looks Claude Code up again from this path.
+ */
+export function claudeAdapter(mod, claudePath, startedIn = null) {
+  if (!mod) return mod;
+  const told = { ...(claudePath ? { claudePath } : {}), startedIn };
   return {
     ...mod,
-    available: (o = {}) => mod.available({ ...o, claudePath }),
-    createRunner: (o = {}) => mod.createRunner({ ...o, claudePath }),
+    // Only what the module has: one that lacks either is still incomplete (see `complete`).
+    ...(typeof mod.available === 'function' ? { available: (o = {}) => mod.available({ ...o, ...told }) } : {}),
+    ...(typeof mod.createRunner === 'function' ? { createRunner: (o = {}) => mod.createRunner({ ...o, ...told }) } : {}),
   };
 }
 
@@ -903,6 +923,16 @@ async function main() {
   // Unheard, each failed write (EPIPE) would be an unexpected error whose report is another failed write, a loop that
   // kept the shutdown from running until the forced exit.
   for (const stream of [process.stdout, process.stderr]) stream.on('error', () => {});
+  // The folder Workbench was started in, read once now: relative paths the person gave are read from it later, never
+  // from the working folder of the moment (the file view steps into a project's folder for a moment).
+  let startedIn = null;
+  try {
+    startedIn = process.cwd();
+  } catch { /* that folder was removed: a relative --claude path is then refused in plain words */ }
+  // A relative path to Codex is placed from the same folder, now: Agents & keys and every launch read the variable.
+  const codexGiven = process.env.WORKBENCH_CODEX_BIN;
+  const codexPlaced = placedCodexBin(codexGiven, startedIn);
+  if (codexPlaced !== codexGiven) process.env.WORKBENCH_CODEX_BIN = codexPlaced;
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     say(USAGE);
@@ -960,6 +990,9 @@ async function main() {
     return 1;
   }
   tightenHome(mods.prefs, log);
+  // Every use of the Claude Code adapter, Agents & keys' included, is told the --claude path and the folder Workbench
+  // was started in.
+  mods.claude = claudeAdapter(mods.claude, args.claude, startedIn);
 
   // --clone: copy the repository first, then go on as --repo <its folder>. For the Mac app, standard input is the
   // lifeline from now on: if it closes after the clone, Workbench stops as soon as it has started (appGone, below).
@@ -1017,7 +1050,7 @@ async function main() {
       }
     }
     ({ connect } = await openConnect(mods, args, log, { repoRoot: repo.root }));
-    const claude = claudeAdapter(mods.claude, args.claude);
+    const claude = mods.claude; // told the --claude path and the folder Workbench was started in (above)
     // Every program Workbench can drive goes to the engine, ready or not: the engine checks each one itself, and one
     // installed or signed in later, from the page, can then start without a restart (connect's 'agents' event).
     if (complete(claude)) adapters.claude = claude;
@@ -1077,7 +1110,7 @@ async function main() {
     machines,
     connect,
     prefs,
-    deps: { policy: mods.policy, commands: mods.commands, workspace: mods.workspace, receipt: mods.receipt, history: mods.history },
+    deps: { policy: mods.policy, commands: mods.commands, workspace: mods.workspace, receipt: mods.receipt, history: mods.history, files: mods.files },
     log,
   });
   for (const ev of early.splice(0)) engine.ingest(ev);

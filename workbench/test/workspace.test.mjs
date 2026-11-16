@@ -7,9 +7,10 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   prepareRepo, createWorkspace, removeWorkspace, diffStats, readRepoConfig, normalizeConfig, slugify, workspacesFolder,
-  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp, fillWorkspace, envValues, envValuesIn,
+  snapshotWork, workDiff, mergeWork, discardWork, gitGraph, gitIdentity, git as runGit, privateTemp, fillWorkspace, envValues, envValuesIn, isSaveFile,
 } from '../src/core/workspace.mjs';
 import { checkRules } from '../src/core/receipt.mjs';
+import { isSaveFile as fileViewSaveFile } from '../src/core/files.mjs';
 
 // Keep the person's own git settings (signing, hooks, default branch, name and email) out of these repositories, and
 // their home and temporary folders out of these tests.
@@ -820,6 +821,26 @@ describe('source control', { concurrency: TESTS_AT_ONCE }, () => {
     assert.match(patch('out-link'), /\nnew file mode 120000\n/);
     assert.ok(patch('out-link').endsWith(`+${outside}\n\\ No newline at end of file\n`));
     assert.ok(d.files.every(f => !String(f.patch).includes('SECRET OUTSIDE')), 'nothing from outside the folder');
+  });
+
+  test('a save’s sibling is Workbench’s, not the agent’s: the work set and the receipt leave it out, by the file view’s own rule', async () => {
+    const t = await agentRepo();
+    const { w } = t;
+    write(w('a.txt'), 'one\nTWO\nthree\n');
+    // The names stage 1 pinned for isSaveFile, written beside the agent's files: a save cut short leaves one.
+    const yes = ['.a.txt.workbench-save-0123456789abcdef', 'src/.b.js.workbench-save-00112233445566ff', '.x.workbench-save-ffffffffffffffff'];
+    const no = ['a.txt.workbench-save-0123456789abcdef', '.a.txt.workbench-save-0123', '.c.txt.workbench-save-0123456789ABCDEF',
+      '.workbench-save-0123456789abcdef', '.d.workbench-save-0123456789abcdef/inner.txt', '.e.txt.workbench-save-0123456789abcdef.bak'];
+    for (const rel of [...yes, ...no]) write(w(rel), 'half of the person’s text\n');
+    for (const rel of yes) assert.equal(fileViewSaveFile(rel) && isSaveFile(rel), true, rel);
+    for (const rel of no) assert.equal(fileViewSaveFile(rel) || isSaveFile(rel), false, rel);
+    const s = await snapshotWork({ repoRoot: t.root, path: t.ws.path, since: t.ws.base });
+    const kept = ['a.txt', ...no].sort();
+    assert.deepEqual(s.files.map(f => f.path), kept);
+    assert.deepEqual(s.left, [], 'left out without a word: they are not the agent’s');
+    for (const rel of yes) assert.equal(git(t.root, 'ls-tree', '-r', '--name-only', s.tree, '--', rel), '', rel);
+    const stats = await diffStats({ path: t.ws.path, base: t.ws.base });
+    assert.deepEqual(stats.list.map(f => f.path), kept, 'the receipt names the same files');
   });
 
   test('workDiff marks binary and large files, and cuts long patches and long lists', async () => {

@@ -506,6 +506,35 @@ test('findClaude looks in order, takes the newest extension, and never swaps a g
   assert.equal(claudeBin({ HOME: home, PATH: empty }), insiders.bin);
 });
 
+test('a relative path to Claude Code is read from the folder it is given, never from the working folder of the moment', async (t) => {
+  const dir = scratch(t);
+  const bin = path.join(dir, 'bin');
+  program(path.join(bin, 'claude'), 'echo 2.1.400');
+  // The same name where Workbench may stand for a moment (the file view steps into a project's folder).
+  const elsewhere = scratch(t);
+  program(path.join(elsewhere, 'bin', 'claude'), 'echo 9.9.9');
+  const env = { HOME: path.join(dir, 'home'), PATH: path.join(dir, 'empty') };
+  const was = process.cwd();
+  process.chdir(elsewhere);
+  t.after(() => process.chdir(was));
+  const unknown = (v, where) => `Workbench cannot tell where ${v} is: the path ${where} must start with / or ~.`;
+  assert.deepEqual(findClaude({ env, flag: 'bin/claude', cwd: dir }), { path: path.join(bin, 'claude'), from: 'flag' });
+  assert.deepEqual(findClaude({ env, flag: 'bin/claude' }), { path: null, from: 'flag', reason: unknown('bin/claude', 'given with --claude') });
+  assert.deepEqual(findClaude({ env: { ...env, WORKBENCH_CLAUDE_BIN: './bin/claude' } }), { path: null, from: 'env', reason: unknown('./bin/claude', 'in WORKBENCH_CLAUDE_BIN') });
+  assert.deepEqual(findClaude({ env, flag: 'bin/claude', cwd: 'relative/too' }), { path: null, from: 'flag', reason: unknown('bin/claude', 'given with --claude') });
+  assert.equal(claudeBin({ ...env, WORKBENCH_CLAUDE_BIN: 'bin/claude' }), 'claude');
+  assert.equal(claudeBin({ ...env, WORKBENCH_CLAUDE_BIN: 'bin/claude' }, { cwd: dir }), path.join(bin, 'claude'));
+  // available() and each launch are given the folder Workbench started in.
+  assert.deepEqual(await available({ env, claudePath: 'bin/claude', startedIn: dir }), { ok: true, version: '2.1.400', path: path.join(bin, 'claude'), from: 'flag' });
+  assert.deepEqual(await available({ env, claudePath: 'bin/claude' }), { ok: false, reason: unknown('bin/claude', 'given with --claude') });
+  const tests = path.dirname(path.dirname(FAKE));
+  const c = collector();
+  const r = makeRunner(c, { claudePath: path.relative(tests, FAKE), startedIn: tests });
+  await r.start();
+  await c.until(replyIs(/^You said: Say hello$/), 'the reply to the task');
+  await r.stop();
+});
+
 test('on the same version, a build for this processor is taken', (t) => {
   const home = path.join(scratch(t), 'home');
   const otherArch = process.arch === 'arm64' ? 'x64' : 'arm64';

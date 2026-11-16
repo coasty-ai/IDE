@@ -43,26 +43,43 @@ function gitEnv() {
  */
 const GIT_SAFE_CONFIG = ['-c', 'core.fsmonitor=false'];
 
+/** The name of the sibling a save from the file view writes beside a file: `.<name>.workbench-save-<16 hex>`. */
+const SAVE_NAME = /^\.[\s\S]+\.workbench-save-[0-9a-f]{16}$/;
+
+/**
+ * Whether `rel` names the sibling a save from the file view writes beside a file (src/core/files.mjs), by its last
+ * part: `.<name>.workbench-save-<16 hex>`. One is there only while a save runs, or after a save was cut short. It is
+ * Workbench's, not the agent's: the work set, the receipt and the file view's list leave it out.
+ * @param {string} rel
+ * @returns {boolean}
+ */
+export function isSaveFile(rel) {
+  const s = String(rel);
+  return SAVE_NAME.test(s.slice(s.lastIndexOf('/') + 1));
+}
+
 /**
  * Run git with an argument array.
  * @param {{ cwd?: string, timeout?: number, input?: string, okCodes?: number[], env?: Record<string, string|undefined>,
- *   encoding?: 'utf8'|'buffer', detached?: boolean }} [o]
+ *   encoding?: 'utf8'|'buffer', detached?: boolean, maxBuffer?: number }} [o]
  *   input goes to git's stdin; okCodes are exit codes that still count as success (check-ignore exits 1 when
  *   nothing matches); env adds variables after the scrub (a temporary GIT_INDEX_FILE, who a commit is by), and an
  *   undefined value takes one away; encoding 'buffer' gives stdout as bytes; detached starts git in a process group of
  *   its own, so a Ctrl-C in the terminal (which goes to the whole foreground group) reaches Workbench, which waits for
- *   the git work under way, and not git, which would stop part-way (a timeout still stops it)
+ *   the git work under way, and not git, which would stop part-way (a timeout still stops it); maxBuffer: git is
+ *   stopped once it says more than this many bytes (64 MB at most, and unless given)
  * @returns {Promise<{ stdout: string|Buffer, stderr: string, code: number }>} code is 0 or one of okCodes; rejects with
  *   the execFile error (plus .stdout and .stderr)
  */
-export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [], env, encoding = 'utf8', detached = false } = {}) {
+export function git(args, { cwd, timeout = GIT_TIMEOUT_MS, input, okCodes = [], env, encoding = 'utf8', detached = false, maxBuffer = MAX_BUFFER } = {}) {
   return new Promise((resolve, reject) => {
     const childEnv = gitEnv();
     for (const [k, v] of Object.entries(env || {})) {
       if (v === undefined) delete childEnv[k];
       else childEnv[k] = v;
     }
-    const options = { cwd, timeout, maxBuffer: MAX_BUFFER, encoding, env: childEnv, windowsHide: true };
+    const limit = Number.isInteger(maxBuffer) && maxBuffer > 0 ? Math.min(maxBuffer, MAX_BUFFER) : MAX_BUFFER;
+    const options = { cwd, timeout, maxBuffer: limit, encoding, env: childEnv, windowsHide: true };
     const child = (detached ? execFileDetached : execFile)('git', [...GIT_SAFE_CONFIG, ...args], options, (err, stdout, stderr) => {
       if (err && !(typeof err.code === 'number' && okCodes.includes(err.code) && !err.killed)) {
         err.stdout = stdout;
@@ -1558,7 +1575,9 @@ export async function diffStats({ path: wsPath, base } = {}) {
     list.push(entry);
   }
 
-  const others = (await git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: wsPath })).stdout.split('\0').filter(Boolean);
+  // A save's sibling (see isSaveFile) is Workbench's, never the agent's work, as the work set leaves it out too.
+  const others = (await git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: wsPath })).stdout.split('\0')
+    .filter(p => p && !isSaveFile(p));
   const seen = new Set([...list.map(f => f.path), ...others]);
   let hidden;
   try {
@@ -2001,12 +2020,14 @@ async function snap(run, root, folder, since, { review = true } = {}) {
       if (!copyIndex(own, env.GIT_INDEX_FILE)) await run(['read-tree', head], { cwd, env });
       // A repository inside the folder shows as "name/". `add -A` would fail on one with no commit yet (and then the
       // tree would look unchanged) or record one with commits as a link to that commit: leave them out, and say so.
+      // A save's sibling (see isSaveFile) is Workbench's, not the agent's: it is left out too, without a word.
       const others = nulList((await run(['ls-files', '--others', '--exclude-standard', '-z'], { cwd, env })).stdout);
       const nested = others.filter(p => p.endsWith('/'));
+      const out = [...nested, ...others.filter(p => !p.endsWith('/') && isSaveFile(p))];
       const add = ['-c', 'core.splitIndex=false', 'add', '-A'];
-      if (nested.length) {
+      if (out.length) {
         await run([...add, '--pathspec-from-file=-', '--pathspec-file-nul'],
-          { cwd, env, timeout: WORKTREE_TIMEOUT_MS, input: ['.', ...nested.map(p => `:(exclude,literal)${p}`)].map(s => `${s}\0`).join('') });
+          { cwd, env, timeout: WORKTREE_TIMEOUT_MS, input: ['.', ...out.map(p => `:(exclude,literal)${p}`)].map(s => `${s}\0`).join('') });
       } else {
         await run(add, { cwd, env, timeout: WORKTREE_TIMEOUT_MS });
       }

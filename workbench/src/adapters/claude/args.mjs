@@ -131,13 +131,15 @@ export function newestExtensionClaude(home) {
  * Where Claude Code is, looked up afresh on every call (the VS Code extension moves to a new folder with each
  * update). In this order: the --claude path (`flag`), WORKBENCH_CLAUDE_BIN (`env`), `claude` on the PATH (`path`),
  * then the newest Claude Code extension in VS Code, VS Code Insiders or Cursor (`vscode`). A path that was given but
- * is not there is reported as it is, never swapped for another Claude Code. A given path is read from `cwd`; a bare
- * name is looked up on the PATH.
- * @param {{ flag?: string|null, env?: Record<string,string|undefined>, cwd?: string }} [o]
+ * is not there is reported as it is, never swapped for another Claude Code. A bare name is looked up on the PATH. A
+ * relative path is read from `cwd`, the folder Workbench was started in, which every caller passes: never from the
+ * working folder of the moment, which the file view changes for a moment (src/core/files.mjs). Without an absolute
+ * `cwd`, a relative path is refused in plain words.
+ * @param {{ flag?: string|null, env?: Record<string,string|undefined>, cwd?: string|null }} [o]
  * @returns {{ path: string|null, from: 'flag'|'env'|'path'|'vscode'|null, reason?: string }}
  *   `reason`, a plain sentence, is there when no usable Claude Code was found; `path` then says what was tried
  */
-export function findClaude({ flag, env = process.env, cwd = process.cwd() } = {}) {
+export function findClaude({ flag, env = process.env, cwd = null } = {}) {
   const e = env || {};
   const home = e.HOME || (env === process.env ? os.homedir() : '');
   const given = (value, from) => {
@@ -148,7 +150,10 @@ export function findClaude({ flag, env = process.env, cwd = process.cwd() } = {}
       return found ? { path: found, from } : { path: null, from, reason: `There is no ${v} command on the PATH (the name ${where}).` };
     }
     if ((v === '~' || v.startsWith('~/')) && home) v = path.join(home, v.slice(1));
-    const p = path.resolve(cwd, v);
+    if (!path.isAbsolute(v) && !(typeof cwd === 'string' && path.isAbsolute(cwd))) {
+      return { path: null, from, reason: `Workbench cannot tell where ${v} is: the path ${where} must start with / or ~.` };
+    }
+    const p = path.resolve(path.isAbsolute(v) ? '/' : cwd, v);
     let st = null;
     try { st = fs.statSync(p); } catch { /* not there */ }
     if (!st) return { path: p, from, reason: `Claude Code is not at ${p}, the path ${where}.` };
@@ -164,9 +169,9 @@ export function findClaude({ flag, env = process.env, cwd = process.cwd() } = {}
   return { path: null, from: null, reason: CLAUDE_NOT_FOUND };
 }
 
-/** The Claude Code program to start: what findClaude finds, or `claude` when it finds nothing. */
-export function claudeBin(env = process.env, { flag } = {}) {
-  return findClaude({ flag, env }).path || 'claude';
+/** The Claude Code program to start: what findClaude finds (a relative path read from `cwd`), or `claude` when it finds nothing. */
+export function claudeBin(env = process.env, { flag, cwd = null } = {}) {
+  return findClaude({ flag, env, cwd }).path || 'claude';
 }
 
 /** Quote one word for a POSIX shell. Claude Code runs hook commands through a shell. */

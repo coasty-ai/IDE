@@ -2,7 +2,9 @@
 // PreToolUse hook endpoint. It listens on 127.0.0.1 only and checks, on every request it must:
 // the Host header, a 32-byte token compared in constant time (on the hook route, also the asking
 // agent's own hook token), and for POSTs the Origin, the JSON content type and a 64 KB body limit
-// (16 KB on the Agents & keys routes, which carry keys: never echoed, never logged, never in a URL).
+// (16 KB on the Agents & keys routes, which carry keys: never echoed, never logged, never in a URL;
+// 6 MB and 64 KB on POST /api/file alone, which carries a file of up to 1 MB of text from the file view, however
+// JSON writes it).
 // A page address with a query is served only when the query carries the token. No CORS headers are ever sent.
 // The page goes out with the person's look, detail and first answer on its <html> tag (src/core/prefs.mjs), and the
 // permission mode the engine has on (data-permissions), so the Full permissions button is right from the first paint.
@@ -21,6 +23,12 @@ import { memoryPrefs, cleanPrefs, prefsChange, pageWithPrefs } from '../core/pre
 
 const MAX_BODY = 64 * 1024;
 const MAX_CONNECT_BODY = 16 * 1024; // Agents & keys: a few keys of at most 2000 characters each
+const MAX_FILE_TEXT = 1024 * 1024; // the most text a save takes, in bytes of UTF-8: the most the file view shows
+// POST /api/file: room for 1 MB of text however JSON writes it. JSON writes a control character as \u00XX, six bytes for
+// one, so 1 MB of text can take 6 MB; 64 KB more holds the rest (a path of at most 4096 bytes written the same way, the
+// hash, the names). A body over it can only hold more than 1 MB of text.
+const MAX_FILE_BODY = 6 * MAX_FILE_TEXT + 64 * 1024;
+const TOO_MUCH_TEXT = 'The text is larger than 1 MB, so Workbench did not save it.';
 const CONNECT_ID_RE = /^[a-z][a-z0-9-]{0,39}$/; // an agent or a key preset, as Workbench names them
 const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/; // a variable's name (the key store refuses the dangerous ones)
 /** What the Agents & keys routes answer when this Workbench has no connect service. */
@@ -199,12 +207,18 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     return boundPort != null && (h === `127.0.0.1:${boundPort}` || h === `localhost:${boundPort}`);
   }
 
-  /** Read the body as JSON: at most `limit` bytes (64 KB unless the route says less), an object, or empty (treated as {}). */
+  /**
+   * Read the body as JSON: at most `limit` bytes (64 KB unless the route says otherwise), an object, or empty (treated
+   * as {}). Of a body over the limit, up to 1 MB is read and thrown away (1 MB past the limit, for a limit over 1 MB),
+   * so the client gets the 413; a body declared larger than that is refused before it is read.
+   */
   function readJson(req, limit = MAX_BODY) {
     return new Promise((resolve, reject) => {
-      const tooLarge = () => new HttpError(413, `The request is too large. The limit is ${Math.round(limit / 1024)} KB.`);
+      const said = limit >= 1024 * 1024 ? `${Math.round(limit / (1024 * 1024))} MB` : `${Math.round(limit / 1024)} KB`;
+      const tooLarge = () => new HttpError(413, `The request is too large. The limit is ${said}.`);
+      const drain = limit > DRAIN_LIMIT ? limit + DRAIN_LIMIT : DRAIN_LIMIT;
       const declared = Number(req.headers['content-length']);
-      if (Number.isFinite(declared) && declared > DRAIN_LIMIT) {
+      if (Number.isFinite(declared) && declared > drain) {
         reject(tooLarge());
         req.resume();
         return;
@@ -217,7 +231,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
         if (size > limit) {
           // Keep reading so the client gets the 413 instead of a reset connection.
           tooBig = true;
-          if (size > DRAIN_LIMIT) {
+          if (size > drain) {
             reject(tooLarge());
             req.destroy();
           }
@@ -451,6 +465,13 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     { method: 'GET', re: /^\/api\/agents\/([^/]+)\/changes$/, run: (b, m) => engine.changes(id(m[1])) },
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/merge$/, run: (b, m) => engine.proposeMerge(id(m[1]), { state: optState(b.state) }) },
     { method: 'POST', re: /^\/api\/agents\/([^/]+)\/discard$/, run: (b, m) => engine.proposeDiscard(id(m[1]), { state: optState(b.state) }) },
+    // The file view: the files of your folder ("you") or an agent's copy, one file (with `check`, the hash the page
+    // shows: { ok: true, same: true } while it still holds), a search, and a save. What the page sent goes to the
+    // engine as it is, which checks it all; its refusals are { ok: false, reply, why } with a 4xx code (handleFiles).
+    { method: 'GET', re: /^\/api\/files$/, files: true, run: (b, m, q) => engine.files(q.get('in')) },
+    { method: 'GET', re: /^\/api\/file$/, files: true, run: (b, m, q) => engine.file(q.get('in'), q.get('path'), { check: q.get('check') }) },
+    { method: 'GET', re: /^\/api\/search$/, files: true, run: (b, m, q) => engine.search(q.get('in'), q.get('q')) },
+    { method: 'POST', re: /^\/api\/file$/, files: true, maxBody: MAX_FILE_BODY, run: (b) => saveFile(b) },
     {
       // What the page showed when the person began: the agent, the confirm card and the ask on screen.
       method: 'POST', re: /^\/api\/command$/,
@@ -546,6 +567,32 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
       },
     },
   ];
+
+  // ------------------------------------------------------------ the file view
+
+  /** POST /api/file { in, path, text, hash, force? }: at most 1 MB of text (a 413 otherwise), then the engine's save. */
+  function saveFile(b) {
+    if (typeof b.text === 'string' && Buffer.byteLength(b.text) > MAX_FILE_TEXT) throw new HttpError(413, TOO_MUCH_TEXT);
+    return engine.saveFile(b.in, b.path, { text: b.text, hash: b.hash, force: b.force === true });
+  }
+
+  /**
+   * Run a file view route. Its answer goes out as the engine gave it: with 200, or for a refusal ({ ok: false, reply,
+   * why }) with 404 when the copy asked for is not there (`gone`), 409 when the file changed since it was read
+   * (`changed`, with its hash now), and 400 otherwise. The server's own refusal of a save (too much text) has the
+   * same shape. Anything the engine did not expect is the usual 500.
+   */
+  async function handleFiles(res, route, body, m, url) {
+    let out;
+    try {
+      out = await route.run(body, m, url.searchParams);
+    } catch (err) {
+      if (err instanceof HttpError) return sendJson(res, err.status, { ok: false, reply: err.message, why: 'refused' });
+      throw err;
+    }
+    const status = out?.ok === false ? (out.why === 'gone' ? 404 : out.why === 'changed' ? 409 : 400) : 200;
+    return sendJson(res, status, out ?? {});
+  }
 
   // ------------------------------------------------------------ the person's choices for the page
 
@@ -734,9 +781,13 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
       const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
       if (type !== 'application/json') return sendJson(res, 415, { error: 'Send JSON, with Content-Type: application/json.' });
       try {
-        body = await readJson(req, route.connect ? MAX_CONNECT_BODY : MAX_BODY);
+        body = await readJson(req, route.maxBody || (route.connect ? MAX_CONNECT_BODY : MAX_BODY));
       } catch (err) {
         if (err.status === 413) res.setHeader('Connection', 'close');
+        // The file view's save says it in the shape its other refusals have; a body over its limit holds too much text.
+        if (route.files && err instanceof HttpError) {
+          return sendJson(res, err.status, { ok: false, reply: err.status === 413 ? TOO_MUCH_TEXT : err.message, why: 'refused' });
+        }
         return sendError(res, err);
       }
     }
@@ -748,6 +799,7 @@ export function createServer({ engine, store, token, hookTokenFor = null, connec
     }
     const m = pathname.match(route.re);
     if (route.connect) return handleConnect(res, route, body, m);
+    if (route.files) return handleFiles(res, route, body, m, url);
     const result = await route.run(body, m);
     sendJson(res, 200, result ?? {});
   }

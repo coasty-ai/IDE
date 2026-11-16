@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Engine } from '../src/core/engine.mjs';
+import * as filesMod from '../src/core/files.mjs';
+import * as historyMod from '../src/core/history.mjs';
 import { Store } from '../src/core/store.mjs';
 import { EV } from '../src/shared/events.mjs';
 import * as commands from '../src/core/commands.mjs';
@@ -4733,3 +4735,472 @@ test('full permissions: when turning them off cannot be saved, the reply says th
     await t.engine.shutdown();
     await nextStart.engine.shutdown();
   });
+
+// ------------------------------------------------------------------ the file view
+
+const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
+const CHECKS = [{ name: 'unit tests', run: 'npm test', timeoutSec: 60 }];
+
+test('the file view: "you" is your folder and an agent’s id its own copy (a helper’s, its agent’s); anything else is refused in plain words', async (ctx) => {
+  const t = await realGit(ctx);
+  t.deps.files = filesMod;
+  assert.deepEqual(await t.engine.files('you'), { ok: true, in: 'you', name: 'repo', branch: 'main', files: [{ path: 'cart.js' }] });
+  const a = await started(t, { task: 'Fix the cart total' });
+  fs.writeFileSync(path.join(a.v.workspace, 'tax.js'), 'export const tax = 0.2;\n');
+  const theirs = await t.engine.files(a.id);
+  assert.equal(theirs.ok, true);
+  assert.equal(theirs.in, a.id);
+  assert.equal(theirs.name, 'repo');
+  assert.equal(theirs.branch, t.store.get(a.id).work.branch);
+  assert.deepEqual(theirs.files.map(f => f.path), ['cart.js', 'tax.js']);
+  // A helper works in its agent's folder.
+  a.runner.emit({ kind: EV.CREATED, agentId: `${a.id}-helper01`, parentId: a.id, name: 'Look for the tax rate' });
+  assert.equal((await t.engine.files(`${a.id}-helper01`)).in, a.id);
+  // Reading and searching go by the same rule.
+  assert.equal((await t.engine.file(a.id, 'tax.js')).text, 'export const tax = 0.2;\n');
+  assert.deepEqual(await t.engine.search(a.id, 'tax'), { ok: true, in: a.id, results: [{ path: 'tax.js', line: 1, text: 'export const tax = 0.2;' }] });
+  assert.deepEqual(await t.engine.search('you', 'tax'), { ok: true, in: 'you', results: [] });
+  assert.deepEqual(await t.engine.search('you', 't'), { ok: false, reply: 'Type at least two characters to search for.', why: 'refused' });
+  // Anything else.
+  assert.deepEqual(await t.engine.files('nobody'), { ok: false, reply: 'I can’t find that agent.', why: 'gone' });
+  for (const where of [42, null, '', undefined, ['you'], { id: a.id }]) {
+    assert.deepEqual(await t.engine.files(where), { ok: false, reply: 'Say whose copy to show: yours, or an agent’s.', why: 'refused' }, String(where));
+    assert.deepEqual(await t.engine.saveFile(where, 'cart.js', { text: 'x\n', hash: sha('x') }), { ok: false, reply: 'Say whose copy to show: yours, or an agent’s.', why: 'refused' });
+  }
+  await t.engine.shutdown();
+  for (const ask of [t.engine.files('you'), t.engine.file('you', 'cart.js'), t.engine.search('you', 'total'), t.engine.saveFile('you', 'cart.js', { text: 'x\n', hash: sha('x') })]) {
+    assert.deepEqual(await ask, { ok: false, reply: 'Workbench is shutting down.', why: 'refused' });
+  }
+});
+
+test('the file view: a copy whose work was thrown away, or whose folder went, is refused, and the view says so', async (ctx) => {
+  const t = await realGit(ctx);
+  t.deps.files = filesMod;
+  const a = await doneAgent(t);
+  const away = await t.engine.proposeDiscard(a.id, { state: 'done_claimed' });
+  assert.match((await t.engine.confirm(away.confirm.id, true)).reply, /^Threw away /);
+  const name = t.store.get(a.id).name;
+  const thrown = { ok: false, reply: `${name}’s work was thrown away, so its copy is gone.`, why: 'gone' };
+  assert.deepEqual(await t.engine.files(a.id), thrown);
+  assert.deepEqual(await t.engine.file(a.id, 'cart.js'), thrown);
+  assert.deepEqual(await t.engine.search(a.id, 'total'), thrown);
+  assert.deepEqual(await t.engine.saveFile(a.id, 'cart.js', { text: 'x\n', hash: sha('x') }), thrown);
+  const b = await started(t, { task: 'Round the tax down' });
+  fs.rmSync(b.v.workspace, { recursive: true, force: true });
+  const bName = t.store.get(b.id).name;
+  assert.deepEqual(await t.engine.file(b.id, 'cart.js'), { ok: false, reply: `${bName}’s folder is not on this computer any more.`, why: 'gone' });
+  assert.equal(t.store.get(b.id).work.folder, false);
+  await t.engine.shutdown();
+});
+
+test('the file view: your list marks the files agents changed, from what each recorded; an agent’s copy marks its own', async (ctx) => {
+  const t = await realGit(ctx);
+  t.deps.files = filesMod;
+  const run = async (task, write) => {
+    const a = await started(t, { task });
+    for (const [rel, text] of Object.entries(write)) fs.writeFileSync(path.join(a.v.workspace, rel), text);
+    a.runner.emit({ kind: EV.TURN, phase: 'start' });
+    a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'Done.', backgroundTasks: 0, isError: false });
+    await until(() => t.store.get(a.id).state === 'done_claimed', { timeout: 10_000 });
+    return t.store.get(a.id);
+  };
+  const a = await run('Fix the cart total', { 'cart.js': 'export const total = 2;\n' });
+  const b = await run('Add a tax line', { 'cart.js': 'export const total = 1;\nexport const tax = 1;\n', 'tax.js': 'export const rate = 0.2;\n' });
+  const mark = v => ({ agentId: v.id, name: v.name, state: 'done_claimed' });
+  const byId = (x, y) => (x.agentId < y.agentId ? -1 : 1);
+  const you = await t.engine.files('you');
+  assert.deepEqual(you.files.map(f => f.path), ['cart.js']);
+  assert.deepEqual(you.files[0].changedBy.sort(byId), [mark(a), mark(b)].sort(byId));
+  const theirs = await t.engine.files(b.id);
+  assert.deepEqual(theirs.files, [{ path: 'cart.js', changedBy: [mark(b)] }, { path: 'tax.js', changedBy: [mark(b)] }]);
+  // Work thrown away marks nothing any more.
+  await t.engine.confirm((await t.engine.proposeDiscard(a.id, { state: 'done_claimed' })).confirm.id, true);
+  assert.deepEqual((await t.engine.files('you')).files, [{ path: 'cart.js', changedBy: [mark(b)] }]);
+  await t.engine.shutdown();
+});
+
+test('the file view: a file in an agent’s copy says which lines its work changed; a check that finds the same file answers only that', async (ctx) => {
+  const t = await realGit(ctx);
+  t.deps.files = filesMod;
+  const a = await started(t, { task: 'Fix the cart total' });
+  const text = 'export const total = 1;\nexport const tax = 2;\n';
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), text);
+  const f = await t.engine.file(a.id, 'cart.js');
+  assert.deepEqual(f, { ok: true, in: a.id, path: 'cart.js', kind: 'text', text, hash: sha(text), size: Buffer.byteLength(text), lines: 2, eol: 'lf', bom: false, changedLines: [2], editable: true });
+  assert.deepEqual(await t.engine.file(a.id, 'cart.js', { check: f.hash }), { ok: true, same: true });
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), `${text}export const fee = 3;\n`);
+  const again = await t.engine.file(a.id, 'cart.js', { check: f.hash });
+  assert.equal(again.same, undefined);
+  assert.deepEqual(again.changedLines, [2, 3]);
+  // Your folder has no agent's lines; a check that is not a hash is as if none came.
+  const mine = await t.engine.file('you', 'cart.js', { check: 'not a hash' });
+  assert.deepEqual([mine.kind, mine.changedLines, mine.editable], ['text', undefined, true]);
+  assert.deepEqual(await t.engine.file('you', 'gone.js'), { ok: true, in: 'you', path: 'gone.js', kind: 'missing', hash: null, size: 0, eol: 'none', bom: false, editable: false, why: 'This file is not there any more.' });
+  // The path rules, checked again by the engine.
+  assert.deepEqual(await t.engine.file('you', '../cart.js'), { ok: false, reply: '“../cart.js” is not the name of a file inside the project.', why: 'refused' });
+  assert.deepEqual(await t.engine.file('you', '.git/config'), { ok: false, reply: 'Workbench leaves git’s own folder alone, so it does not open .git/config.', why: 'refused' });
+  assert.deepEqual(await t.engine.file('you', 42), { ok: false, reply: 'No file was named.', why: 'refused' });
+  await t.engine.shutdown();
+});
+
+test('the file view: what Workbench does not edit says why, in one line', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.deps.files = filesMod;
+  const a = await doneAgent(t);
+  const w = a.v.workspace;
+  const key = ['sk', 'live', crypto.randomBytes(12).toString('hex')].join('_');
+  fs.writeFileSync(path.join(w, 'logo.png'), Buffer.from([1, 0, 2]));
+  fs.writeFileSync(path.join(w, 'big.log'), Buffer.alloc(1024 * 1024 + 1, 0x61));
+  fs.writeFileSync(path.join(w, 'latin1.txt'), Buffer.from([0x63, 0xe9, 0x0a]));
+  fs.writeFileSync(path.join(w, 'mixed.txt'), 'a\r\nb\n');
+  fs.writeFileSync(path.join(w, '.env'), `STRIPE_SECRET_KEY=${key}\n`);
+  fs.symlinkSync('/etc/hosts', path.join(w, 'hosts'));
+  const why = async (rel) => {
+    const f = await t.engine.file(a.id, rel);
+    return [f.kind, f.editable, f.why];
+  };
+  assert.deepEqual(await why('logo.png'), ['binary', false, 'This is a binary file.']);
+  assert.deepEqual(await why('big.log'), ['large', false, 'This file is too large to show here.']);
+  assert.deepEqual(await why('latin1.txt'), ['notutf8', false, 'This file is not UTF-8 text, so Workbench does not show it.']);
+  assert.deepEqual(await why('mixed.txt'), ['text', false, 'This file mixes line endings, so Workbench does not edit it.']);
+  assert.deepEqual(await why('.env'), ['secret', false, 'This file holds keys, so Workbench shows only their last four characters and does not edit it.']);
+  assert.deepEqual(await why('hosts'), ['link', false, 'This is a link to /etc/hosts.']);
+  const env = await t.engine.file(a.id, '.env');
+  assert.equal(env.text.includes(key), false);
+  assert.equal(env.text, `STRIPE_SECRET_KEY=•••• ${key.slice(-4)}\n`);
+  await t.engine.shutdown();
+});
+
+test('the file view: a save in your folder is an uncommitted change, and the page hears your folder’s count of them at once', async (ctx) => {
+  const t = await realGit(ctx);
+  t.deps.files = filesMod;
+  await t.engine.start();
+  assert.equal(t.engine.snapshot().repo.dirty, 0);
+  const heard = [];
+  t.store.on('repo', r => heard.push(r));
+  const f = await t.engine.file('you', 'cart.js');
+  assert.deepEqual(await t.engine.saveFile('you', 'cart.js', { text: 'export const total = 3;\n', hash: f.hash }), { ok: true, hash: sha('export const total = 3;\n'), size: 24 });
+  assert.equal(fs.readFileSync(path.join(t.repo, 'cart.js'), 'utf8'), 'export const total = 3;\n');
+  await until(() => heard.length > 0, { timeout: 10_000 });
+  assert.equal(heard.at(-1).dirty, 1);
+  assert.equal(t.engine.snapshot().repo.dirty, 1);
+  await t.engine.shutdown();
+});
+
+test('the file view: a save over a file that changed is refused with its hash now; Save mine anyway needs that hash; refusals are plain', async (ctx) => {
+  const t = liveFolders(ctx);
+  t.deps.files = filesMod;
+  const a = await doneAgent(t);
+  const file = path.join(a.v.workspace, 'cart.js');
+  fs.writeFileSync(file, 'one\n');
+  const f = await t.engine.file(a.id, 'cart.js');
+  fs.writeFileSync(file, 'the agent\n');
+  const r = await t.engine.saveFile(a.id, 'cart.js', { text: 'mine\n', hash: f.hash });
+  assert.deepEqual(r, { ok: false, reply: 'cart.js changed on disk since it was opened, so nothing was written.', why: 'changed', hash: sha('the agent\n') });
+  assert.equal(fs.readFileSync(file, 'utf8'), 'the agent\n');
+  assert.deepEqual(await t.engine.saveFile(a.id, 'cart.js', { text: 'mine\n', hash: r.hash, force: true }), { ok: true, hash: sha('mine\n'), size: 5 });
+  assert.equal(fs.readFileSync(file, 'utf8'), 'mine\n');
+  assert.deepEqual(await t.engine.saveFile(a.id, 'cart.js', { text: 'x\n' }), { ok: false, reply: 'Workbench does not know which version of cart.js was edited, so nothing was saved.', why: 'refused' });
+  assert.deepEqual(await t.engine.saveFile(a.id, 'cart.js', { text: 'x'.repeat(1024 * 1024 + 1), hash: sha('mine\n') }), { ok: false, reply: 'The text is larger than 1 MB, so Workbench did not save it.', why: 'refused' });
+  assert.deepEqual(await t.engine.saveFile(a.id, 'new.js', { text: 'x\n', hash: sha('') }), { ok: false, reply: 'new.js is not there any more, and Workbench does not make new files.', why: 'refused' });
+  await t.engine.shutdown();
+});
+
+test('the file view: a save into the copy of an agent whose run has ended records its work and runs its checks again; it is done and checked again only once they saw the change', async (ctx) => {
+  const second = gate();
+  const t = liveFolders(ctx, { deps: { checks: CHECKS, checksGates: [null, second] } });
+  t.deps.files = filesMod;
+  const a = await doneAgent(t);
+  assert.equal(t.store.get(a.id).state, 'done_checked');
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'export const total = 1;\n');
+  const f = await t.engine.file(a.id, 'cart.js');
+  const before = { diffStats: t.calls.diffStats.length, runChecks: t.calls.runChecks.length };
+  assert.equal((await t.engine.saveFile(a.id, 'cart.js', { text: 'export const total = 2;\n', hash: f.hash })).ok, true);
+  // Before the answer came back: no "checked" about content its checks have not seen.
+  assert.equal(t.store.get(a.id).state, 'done_claimed');
+  await until(() => t.calls.runChecks.length === before.runChecks + 1);
+  assert.equal(t.calls.diffStats.length, before.diffStats + 1, 'what changed is recorded again first');
+  assert.equal(t.calls.runChecks.at(-1).cwd, a.v.workspace);
+  assert.equal(t.calls.runChecks.at(-1).env.WORKBENCH_AGENT_ID, a.id);
+  assert.deepEqual([t.store.get(a.id).state, t.store.get(a.id).checks.state], ['done_claimed', 'running']);
+  // Meanwhile nothing merges it: its checks are running.
+  assert.deepEqual(await t.engine.proposeMerge(a.id), { ok: false, reply: 'Fix cart total is still working. Merge it when it is done.' });
+  second.open();
+  await until(() => t.store.get(a.id).state === 'done_checked');
+  assert.equal(t.store.get(a.id).checks.state, 'passed');
+  assert.equal(t.store.get(a.id).says, 'I fixed the cart total.', 'its own words stay');
+  // A change its checks fail.
+  t.deps.receipt.runChecks = async (o) => {
+    t.calls.runChecks.push(o);
+    return { state: 'failed', results: [{ name: 'unit tests', ok: false, ms: 5, tail: 'expected 2, got 3' }] };
+  };
+  const g = await t.engine.file(a.id, 'cart.js');
+  await t.engine.saveFile(a.id, 'cart.js', { text: 'export const total = 3;\n', hash: g.hash });
+  await until(() => t.store.get(a.id).state === 'checks_failed');
+  assert.equal(t.store.get(a.id).stateReason, 'The check “unit tests” did not pass.');
+  await t.engine.shutdown();
+});
+
+test('the file view: a save into the copy of an agent that is done, with no checks to run, gives it a new finish all the same, as the end of a turn would', async (ctx) => {
+  const t = liveFolders(ctx); // no checks declared: its recheck records what changed, and it is done again
+  t.deps.files = filesMod;
+  const a = await doneAgent(t);
+  const was = t.store.get(a.id);
+  assert.equal(was.state, 'done_claimed');
+  const finished = was.endedAt;
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
+  const f = await t.engine.file(a.id, 'cart.js');
+  await pause(5); // so a new finish has a new time
+  const diffs = t.calls.diffStats.length;
+  assert.equal((await t.engine.saveFile(a.id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+  await until(() => t.calls.diffStats.length === diffs + 1 && t.store.get(a.id).endedAt !== finished);
+  const v = t.store.get(a.id);
+  assert.equal(v.state, 'done_claimed');
+  assert.ok(v.endedAt > finished, 'its finish moved, so a look the person gave the old one does not hide this one');
+  assert.equal(v.stateSince, v.endedAt);
+  assert.equal(v.says, 'I fixed the cart total.', 'its own words stay');
+  assert.equal(t.calls.runChecks.length, 0);
+  await t.engine.shutdown();
+});
+
+test('the file view: a save while a receipt is being built makes it look again; a save after a merge is checked all the same', async (ctx) => {
+  const turnEnd = gate();
+  const t = liveFolders(ctx, { deps: { checks: CHECKS, checksGates: [turnEnd] } });
+  t.deps.files = filesMod;
+  const a = await started(t, { task: 'Fix the cart total' });
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I fixed the cart total.', backgroundTasks: 0, isError: false });
+  await until(() => t.calls.runChecks.length === 1); // the turn's checks are running
+  assert.equal(t.store.get(a.id).state, 'working');
+  const f = await t.engine.file(a.id, 'cart.js');
+  assert.equal((await t.engine.saveFile(a.id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+  // The checks under way had not seen the change: they are stopped, and it looks again before it decides.
+  await until(() => t.store.get(a.id).state === 'done_checked');
+  assert.equal(t.calls.runChecks[0].signal.aborted, true);
+  assert.equal(t.calls.runChecks.length, 2);
+  assert.equal(t.calls.diffStats.length, 2);
+  assert.deepEqual(t.store.get(a.id).checks, { state: 'passed', results: [{ name: 'unit tests', ok: true, ms: 5 }] });
+  // A merge closes its idle process, which marks it stopped; a save into its copy afterwards is checked all the same.
+  assert.equal((await t.engine.confirm((await t.engine.proposeMerge(a.id)).confirm.id, true)).reply, 'Merged Fix cart total into main.');
+  const g = await t.engine.file(a.id, 'cart.js');
+  await t.engine.saveFile(a.id, 'cart.js', { text: 'three\n', hash: g.hash });
+  assert.equal(t.store.get(a.id).state, 'done_claimed');
+  await until(() => t.calls.runChecks.length === 3 && t.store.get(a.id).state === 'done_checked');
+  await t.engine.shutdown();
+});
+
+test('the file view: a working agent’s copy is saved and left to it; a copy being merged is refused, and so is your folder while a merge runs', async (ctx) => {
+  const t = liveFolders(ctx, { deps: { checks: CHECKS } });
+  t.deps.files = filesMod;
+  const a = await started(t, { task: 'Fix the cart total' });
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
+  const f = await t.engine.file(a.id, 'cart.js');
+  assert.equal(f.editable, true);
+  assert.equal((await t.engine.saveFile(a.id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+  assert.equal(t.store.get(a.id).state, 'working');
+  assert.equal(t.calls.runChecks.length, 0, 'the end of its turn records it');
+  const b = await doneAgent(t, { task: 'Add a tax line' }, 'I added the tax line.');
+  fs.writeFileSync(path.join(b.v.workspace, 'tax.js'), 'one\n');
+  const fb = await t.engine.file(b.id, 'tax.js');
+  t.git.mergeGate = gate();
+  const merging = t.engine.confirm((await t.engine.proposeMerge(b.id)).confirm.id, true);
+  await until(() => t.calls.mergeWork.length === 1);
+  const busy = `${t.store.get(b.id).name} is being merged now.`;
+  assert.deepEqual(await t.engine.saveFile(b.id, 'tax.js', { text: 'two\n', hash: fb.hash }), { ok: false, reply: busy, why: 'refused' });
+  assert.deepEqual([(await t.engine.file(b.id, 'tax.js')).editable, (await t.engine.file(b.id, 'tax.js')).why], [false, busy]);
+  assert.deepEqual(await t.engine.saveFile('you', 'cart.js', { text: 'x\n', hash: sha('x') }), { ok: false, reply: 'Workbench is merging into your folder now. Save again once it is done.', why: 'refused' });
+  t.git.mergeGate.open();
+  await merging;
+  assert.equal(fs.readFileSync(path.join(b.v.workspace, 'tax.js'), 'utf8'), 'one\n');
+  await t.engine.shutdown();
+});
+
+/**
+ * Live engines over one repository folder, with the real history (under `dir`) and the real file view: what one keeps,
+ * the next one started restores, as an earlier agent. Agents' folders are real, and are kept at shutdown. Each engine
+ * waits `historyDebounceMs` before it writes the history by itself.
+ */
+function earlierWorlds(ctx) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-engine-earlier-')));
+  ctx.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const repoRoot = path.join(dir, 'repo');
+  fs.mkdirSync(repoRoot);
+  return ({ historyDebounceMs = 5 } = {}) => {
+    const store = new Store();
+    const claude = fakeAdapter('claude');
+    const { deps, calls } = fakeDeps({ checks: CHECKS, folders: path.join(dir, 'wt') });
+    deps.history = historyMod;
+    deps.files = filesMod;
+    deps.workspace.removeWorkspace = async (o) => { calls.removeWorkspace.push(o); return { removed: false, kept: true }; };
+    const engine = new Engine({
+      store, mode: 'live', repo: { root: repoRoot, name: 'shop', head: FAKE_BASE, branch: 'main', dirty: 0 }, hook: HOOK, adapters: { claude, codex: fakeAdapter('codex') },
+      machines: new FakeMachines(), deps, options: { tickMs: 10_000_000, historyDir: path.join(dir, 'history'), historyDebounceMs, exitGraceMs: 20, stopTimeoutMs: 2000 },
+    });
+    return { store, engine, claude, deps, calls };
+  };
+}
+
+/** In a first engine of `world`, an agent done and checked, with a file in its folder; then that engine stops. */
+async function checkedEarlier(world) {
+  const first = world();
+  await first.engine.start();
+  const a = await started(first, { task: 'Fix the cart total' });
+  a.runner.emit({ kind: EV.SESSION, sessionId: '0f8fad5b-d9cb-469f-a165-70867728950e' });
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I fixed the cart total.', backgroundTasks: 0, isError: false });
+  await until(() => first.store.get(a.id).state === 'done_checked');
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
+  await first.engine.shutdown();
+  return a;
+}
+
+test('the file view: a save into an earlier agent’s copy runs its checks again too, and the next start knows what they found', async (ctx) => {
+  const world = earlierWorlds(ctx);
+  const a = await checkedEarlier(world);
+  const next = world();
+  await next.engine.start();
+  assert.deepEqual([next.store.get(a.id).earlier, next.store.get(a.id).state], [true, 'done_checked']);
+  next.deps.receipt.runChecks = async (o) => {
+    next.calls.runChecks.push(o);
+    return { state: 'failed', results: [{ name: 'unit tests', ok: false, ms: 5, tail: 'expected 1, got 2' }] };
+  };
+  const f = await next.engine.file(a.id, 'cart.js');
+  assert.equal(f.editable, true);
+  assert.equal((await next.engine.saveFile(a.id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+  assert.equal(next.store.get(a.id).state, 'done_claimed', 'no longer said to be checked');
+  await until(() => next.store.get(a.id).state === 'checks_failed');
+  assert.equal(next.calls.runChecks.length, 1);
+  assert.equal(next.calls.runChecks[0].cwd, a.v.workspace);
+  assert.equal(next.store.get(a.id).earlier, true, 'still an agent of an earlier run');
+  assert.deepEqual(next.engine.keptFolders(), [], 'and not one of this run’s');
+  await next.engine.shutdown();
+  const third = world();
+  await third.engine.start();
+  assert.deepEqual([third.store.get(a.id).state, third.store.get(a.id).stateReason], ['checks_failed', 'The check “unit tests” did not pass.']);
+  await third.engine.shutdown();
+});
+
+test('the file view: an earlier agent’s copy saved, then Workbench stopped before its checks ended: the next start does not say checked', async (ctx) => {
+  const world = earlierWorlds(ctx);
+  const a = await checkedEarlier(world);
+  const next = world();
+  await next.engine.start();
+  // Its checks start and hold, until they are stopped.
+  next.deps.receipt.runChecks = (o) => new Promise((resolve) => {
+    next.calls.runChecks.push(o);
+    o.signal.addEventListener('abort', () => resolve({ state: 'failed', results: [{ name: 'unit tests', ok: false, ms: 0, tail: 'Not run.' }] }), { once: true });
+  });
+  const f = await next.engine.file(a.id, 'cart.js');
+  assert.equal((await next.engine.saveFile(a.id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+  assert.deepEqual([next.store.get(a.id).state, next.store.get(a.id).checks], ['done_claimed', { state: 'none', results: [] }], 'its old results go with its old state');
+  await until(() => next.calls.runChecks.length === 1);
+  await next.engine.shutdown();
+  assert.equal(next.calls.runChecks[0].signal.aborted, true, 'shutdown stopped its checks');
+  const third = world();
+  await third.engine.start();
+  assert.equal(third.store.get(a.id).state, 'done_claimed');
+  assert.notEqual(third.store.get(a.id).checks?.state, 'passed');
+  await third.engine.shutdown();
+});
+
+test('the file view: a save into a checked agent’s copy is in the history before it is answered, so a Workbench stopped hard then never comes back checked', async (ctx) => {
+  const world = earlierWorlds(ctx);
+  const b = await checkedEarlier(world); // an earlier agent, done and checked
+  // An engine that would wait a minute before it writes the history by itself: only a write made at once is there.
+  const first = world({ historyDebounceMs: 60_000 });
+  await first.engine.start();
+  const a = await started(first, { task: 'Round the tax down' });
+  a.runner.emit({ kind: EV.SESSION, sessionId: '7c9e6679-7425-40de-944b-e07fc1f90ae7' });
+  a.runner.emit({ kind: EV.TURN, phase: 'start' });
+  a.runner.emit({ kind: EV.TURN, phase: 'end', finalText: 'I rounded the tax down.', backgroundTasks: 0, isError: false });
+  await until(() => first.store.get(a.id).state === 'done_checked');
+  fs.writeFileSync(path.join(a.v.workspace, 'cart.js'), 'one\n');
+  const onDisk = (id) => {
+    const r = JSON.parse(fs.readFileSync(first.engine.history.file, 'utf8')).agents.find(x => x.id === id);
+    return [r?.state, r?.checks?.state];
+  };
+  first.engine.history.save();
+  assert.deepEqual([onDisk(a.id), onDisk(b.id)], [['done_checked', 'passed'], ['done_checked', 'passed']], 'both said checked on disk');
+  // Their checks start again and hold, until they are stopped.
+  first.deps.receipt.runChecks = (o) => new Promise((resolve) => {
+    first.calls.runChecks.push(o);
+    o.signal.addEventListener('abort', () => resolve({ state: 'failed', results: [{ name: 'unit tests', ok: false, ms: 0, tail: 'Not run.' }] }), { once: true });
+  });
+  for (const id of [a.id, b.id]) {
+    const f = await first.engine.file(id, 'cart.js');
+    assert.equal((await first.engine.saveFile(id, 'cart.js', { text: 'two\n', hash: f.hash })).ok, true);
+    assert.deepEqual(onDisk(id), ['done_claimed', 'none'], 'the file says it before the save is answered');
+  }
+  await until(() => first.calls.runChecks.length === 2);
+  // Stopped hard: nothing more is written (no shutdown), and the next start reads the file as it is.
+  const next = world();
+  await next.engine.start();
+  for (const id of [a.id, b.id]) {
+    assert.deepEqual([next.store.get(id).earlier, next.store.get(id).state], [true, 'done_claimed']);
+    assert.notEqual(next.store.get(id).checks?.state, 'passed');
+  }
+  await next.engine.shutdown();
+  await first.engine.shutdown();
+});
+
+test('the file view in the demo: a sample project in memory, the simulated Invoice export’s copy with what it changed, and a save kept for this run, said once', async () => {
+  const t = await realDemo();
+  t.engine.deps.files = filesMod;
+  const inv = t.byName('Invoice export');
+  const you = await t.engine.files('you');
+  assert.deepEqual([you.ok, you.in, you.name, you.branch], [true, 'you', 'storefront', 'main']);
+  assert.deepEqual(you.files.map(f => f.path), ['.env', 'README.md', 'package.json', 'src/cart.ts', 'src/invoices/export.ts', 'src/invoices/query.ts', 'src/invoices/sample.csv']);
+  assert.equal(you.files.find(f => f.path === '.env').ignored, true);
+  const mark = [{ agentId: inv.id, name: 'Invoice export', state: inv.state }];
+  assert.deepEqual(you.files.find(f => f.path === 'src/invoices/export.ts').changedBy, mark);
+  const theirs = await t.engine.files(inv.id);
+  assert.equal(theirs.branch, inv.work.branch);
+  assert.deepEqual(theirs.files.find(f => f.path === 'src/invoices/batch.ts'), { path: 'src/invoices/batch.ts', changedBy: mark });
+  const exp = await t.engine.file(inv.id, 'src/invoices/export.ts');
+  assert.deepEqual([exp.kind, exp.editable, exp.changedLines], ['text', true, [2, 4, 6, 7, 8, 9]]);
+  assert.equal((await t.engine.file(inv.id, 'src/invoices/batch.ts')).changedLines.length, 15);
+  // Every file its record names (what the git screen shows of its work) opens in its copy, with the lines it changed.
+  const recorded = inv.files.list.map(f => f.path);
+  assert.ok(recorded.includes('migrations/0042_invoice_lookup_index.sql') && recorded.length >= 5, recorded.join(', '));
+  for (const rel of recorded) {
+    const f = await t.engine.file(inv.id, rel);
+    assert.deepEqual([f.kind, f.changedLines?.length > 0], ['text', true], rel);
+  }
+  assert.equal((await t.engine.file('you', 'src/invoices/export.ts')).changedLines, undefined);
+  const env = await t.engine.file('you', '.env');
+  assert.deepEqual([env.kind, env.editable], ['secret', false]);
+  assert.doesNotMatch(env.text, /sk_test_[0-9a-f]{24}/);
+  assert.equal((await t.engine.file('you', 'src/invoices/sample.csv')).eol, 'crlf');
+  assert.match((await t.engine.file('you', 'src/cart.ts')).text, /​/);
+  assert.deepEqual((await t.engine.search(inv.id, 'inBatches')).results.map(r => `${r.path}:${r.line}`),
+    ['src/invoices/batch.ts:6', 'src/invoices/export.ts:2', 'src/invoices/export.ts:7', 'test/invoices/large-account.test.ts:3', 'test/invoices/large-account.test.ts:12']);
+  // A save is kept for this run, and said so once.
+  const readme = await t.engine.file('you', 'README.md');
+  const first = await t.engine.saveFile('you', 'README.md', { text: '# Storefront\n\nChanged in the demo.\n', hash: readme.hash });
+  assert.deepEqual(first, { ok: true, hash: sha('# Storefront\n\nChanged in the demo.\n'), size: 35, reply: 'This is the demo, so your change is kept only until Workbench closes.' });
+  assert.equal((await t.engine.file('you', 'README.md')).text, '# Storefront\n\nChanged in the demo.\n');
+  const second = await t.engine.saveFile(inv.id, 'src/invoices/export.ts', { text: `// Exported in batches.\n${exp.text}`, hash: exp.hash });
+  assert.deepEqual(Object.keys(second).sort(), ['hash', 'ok', 'size']);
+  assert.deepEqual((await t.engine.file(inv.id, 'src/invoices/export.ts')).changedLines, [1, 3, 5, 7, 8, 9, 10]);
+  assert.equal(t.store.get(inv.id).state, inv.state, 'the simulated agents’ checks are not run again');
+  // Each agent has a copy of its own; the others changed nothing in the sample.
+  const other = t.byName('Help pages');
+  assert.equal((await t.engine.file(other.id, 'src/invoices/export.ts')).text, (await t.engine.file('you', 'src/invoices/export.ts')).text);
+  assert.deepEqual(await t.engine.saveFile('you', '.env', { text: 'x\n', hash: env.hash }), { ok: false, reply: '.env holds keys, so Workbench does not edit it.', why: 'refused' });
+  await t.engine.shutdown();
+});
+
+test('the file view: without the module that reads files, every request is refused in plain words', async (ctx) => {
+  const t = await realGit(ctx);
+  const no = { ok: false, reply: 'Workbench cannot show files right now.', why: 'refused' };
+  assert.deepEqual(await t.engine.files('you'), no);
+  assert.deepEqual(await t.engine.file('you', 'cart.js'), no);
+  assert.deepEqual(await t.engine.search('you', 'total'), no);
+  assert.deepEqual(await t.engine.saveFile('you', 'cart.js', { text: 'x\n', hash: sha('x') }), no);
+  const d = demo();
+  assert.deepEqual(await d.engine.files('you'), no);
+  await t.engine.shutdown();
+  await d.engine.shutdown();
+});
