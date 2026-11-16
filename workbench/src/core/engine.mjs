@@ -431,6 +431,12 @@ function errorReason(e) {
   return firstSentence(text, 160) || 'It stopped because of an error.';
 }
 
+/** The done state a receipt's checks lead to: all passed, one failed, or none ran. */
+function doneState(checksState) {
+  if (checksState === 'passed') return STATE.DONE_CHECKED;
+  return checksState === 'failed' ? STATE.CHECKS_FAILED : STATE.DONE_CLAIMED;
+}
+
 /** Check results without anything unexpected; tails stay short. */
 function cleanResults(results) {
   return (Array.isArray(results) ? results : []).map(r => {
@@ -973,9 +979,8 @@ export class Engine extends EventEmitter {
    */
   async _decide(agentId, run, e, seq) {
     const finalText = String(e.finalText ?? '');
-    let receipt = null; // this turn's receipt once it starts; a new turn, a message, a stop or shutdown cancels it
-    const stale = () => this._shuttingDown || !this.store.get(agentId)
-      || (run && (run.stopped || run.turnSeq !== seq)) || !!receipt?.ctl.signal.aborted;
+    // A new turn, a message, a stop or shutdown makes what this turn decides out of date.
+    const stale = () => this._shuttingDown || !this.store.get(agentId) || (run && (run.stopped || run.turnSeq !== seq));
     this._dropEngineAsk(agentId);
 
     let background = Number(e.backgroundTasks) || 0;
@@ -1000,6 +1005,38 @@ export class Engine extends EventEmitter {
       return;
     }
 
+    // The checks judge finished work: a turn that ends with a question runs none, but what it changed is recorded.
+    const question = extractQuestion(finalText);
+    const got = await this._receipt(agentId, run, { question, stale });
+    if (!got) return;
+    if (question) {
+      const ask = this._newAsk(agentId, 'question', { sentence: question, options: [] });
+      const batch = [];
+      const intro = firstSentence(finalText);
+      if (intro && intro !== question) batch.push({ kind: EV.SAYS, agentId, text: intro });
+      // Results of earlier checks would sit beside newer files.
+      if (this.store.get(agentId)?.checks) batch.push({ kind: EV.CHECKS, agentId, checks: null });
+      batch.push({ kind: EV.ASK, agentId, ask }, { kind: EV.STATE, agentId, state: STATE.QUESTION, reason: null });
+      this._apply(batch);
+      return;
+    }
+    const batch = [];
+    const says = firstSentence(finalText);
+    if (says) batch.push({ kind: EV.SAYS, agentId, text: says });
+    batch.push({ kind: EV.STATE, agentId, state: doneState(got.checksState), reason: got.reason });
+    this._apply(batch);
+  }
+
+  /**
+   * One receipt: steps 3 and 5 of a turn's end ("Agent lifecycle"). What is not merged yet (files, from `diffStats`)
+   * and the rules it broke, then, unless the turn ended with a question, the declared checks. One receipt at a time per
+   * agent: a newer one cancels this one (_cancelReceipt), and so do a new turn, a message the agent took, a stop and
+   * shutdown. `run` holds it (`receipt`, `deciding`, `checksDone`); `stale()` says when what it would apply is out of
+   * date. Resolves { checksState, reason } (see doneState), or null when it went stale: then nothing more is applied.
+   */
+  async _receipt(agentId, run, { question = null, stale = () => false } = {}) {
+    let receipt = null; // this receipt once it starts; a newer one, a new turn, a message, a stop or shutdown cancels it
+    const gone = () => stale() || !!receipt?.ctl.signal.aborted;
     // One receipt at a time per agent, the record made before a question included.
     if (run) {
       this._cancelReceipt(run);
@@ -1007,8 +1044,6 @@ export class Engine extends EventEmitter {
       run.receipt = receipt;
       run.deciding = true; // a clean exit while this runs is not a failure (Codex exits after every turn)
     }
-    // The checks judge finished work: a turn that ends with a question runs none, but what it changed is recorded.
-    const question = extractQuestion(finalText);
     let checksState = 'none';
     let reason = null;
     try {
@@ -1016,24 +1051,24 @@ export class Engine extends EventEmitter {
       if (ws && typeof this.deps.workspace?.diffStats === 'function') {
         // What is not merged yet: since its last merge, else since the commit it started from.
         const files = await this.deps.workspace.diffStats({ path: ws.path, base: sinceOf(ws) });
-        if (stale()) return;
+        if (gone()) return null;
         if (files) this._apply([{ kind: EV.FILES, agentId, files }]);
         const config = (await run.config) || DEFAULT_CONFIG;
-        if (stale()) return;
+        if (gone()) return null;
         const changedPaths = (files?.list || []).map(f => f.path);
         if (Array.isArray(config.rules) && config.rules.length && typeof this.deps.receipt?.checkRules === 'function') {
           const rules = await this.deps.receipt.checkRules(config.rules, changedPaths);
-          if (stale()) return;
+          if (gone()) return null;
           if (rules) this._apply([{ kind: EV.RULES, agentId, rules }]);
         }
         if (!question && Array.isArray(config.checks) && config.checks.length && typeof this.deps.receipt?.runChecks === 'function') {
           const partial = [];
           // Checks of a receipt that was cancelled can take a moment to end: never run two sets in one folder.
           if (run.checksDone) await run.checksDone;
-          if (stale()) return;
+          if (gone()) return null;
           this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'running', results: [] } }]);
           const onProgress = (p) => {
-            if (!p || typeof p !== 'object' || stale()) return;
+            if (!p || typeof p !== 'object' || gone()) return;
             if (Array.isArray(p.results)) partial.splice(0, partial.length, ...p.results);
             else if (p.name != null && typeof p.ok === 'boolean') {
               const i = partial.findIndex(r => r.name === p.name);
@@ -1055,12 +1090,12 @@ export class Engine extends EventEmitter {
             done.then(() => { if (run.checksDone === done) run.checksDone = null; });
             res = await running;
           } catch (err) {
-            if (stale()) return;
+            if (gone()) return null;
             this.log.warn('The checks could not run:', err);
             this._apply([{ kind: EV.CHECKS, agentId, checks: { state: 'none', results: [] } }]);
             throw plainError('Workbench could not run the checks.');
           }
-          if (stale()) return;
+          if (gone()) return null;
           checksState = res?.state === 'passed' || res?.state === 'failed' ? res.state : 'none';
           const results = cleanResults(res?.results);
           this._apply([{ kind: EV.CHECKS, agentId, checks: { state: checksState, results } }]);
@@ -1084,26 +1119,8 @@ export class Engine extends EventEmitter {
         run.deciding = false;
       }
     }
-    if (stale()) return;
-    if (question) {
-      const ask = this._newAsk(agentId, 'question', { sentence: question, options: [] });
-      const batch = [];
-      const intro = firstSentence(finalText);
-      if (intro && intro !== question) batch.push({ kind: EV.SAYS, agentId, text: intro });
-      // Results of earlier checks would sit beside newer files.
-      if (this.store.get(agentId)?.checks) batch.push({ kind: EV.CHECKS, agentId, checks: null });
-      batch.push({ kind: EV.ASK, agentId, ask }, { kind: EV.STATE, agentId, state: STATE.QUESTION, reason: null });
-      this._apply(batch);
-      return;
-    }
-    const state = checksState === 'passed' ? STATE.DONE_CHECKED
-      : checksState === 'failed' ? STATE.CHECKS_FAILED
-      : STATE.DONE_CLAIMED;
-    const batch = [];
-    const says = firstSentence(finalText);
-    if (says) batch.push({ kind: EV.SAYS, agentId, text: says });
-    batch.push({ kind: EV.STATE, agentId, state, reason });
-    this._apply(batch);
+    if (gone()) return null;
+    return { checksState, reason };
   }
 
   /** End a receipt still being built: its checks stop, nothing from it is applied, "checks running" goes away. */
