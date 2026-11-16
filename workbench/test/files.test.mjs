@@ -1149,14 +1149,15 @@ test('search: when git says too much or takes too long, what came whole is kept 
   fs.writeFileSync(path.join(bin, 'git'), [
     '#!/bin/sh',
     'for a in "$@"; do',
-    '  if [ "$a" = "grep" ]; then printf \'%s\\0%s\\0%s\\n%s\\0%s\\0%s\' a.txt 1 needle b.txt 2 nee; exec sleep 5; fi',
+    '  if [ "$a" = "grep" ]; then printf \'%s\\0%s\\0%s\\n%s\\0%s\\0%s\' a.txt 1 needle b.txt 2 nee; exec sleep 30; fi',
     'done',
     `exec '${realGit}' "$@"`,
   ].join('\n') + '\n', { mode: 0o755 });
   const PATH = process.env.PATH;
   process.env.PATH = `${bin}${path.delimiter}${PATH}`;
   t.after(() => { process.env.PATH = PATH; });
-  assert.deepEqual(await searchFiles({ root, query: 'needle', timeoutMs: 300 }), { results: [{ path: 'a.txt', line: 1, text: 'needle' }], truncated: true });
+  // Time enough for the stand-in to say its part on a busy machine; then it is stopped.
+  assert.deepEqual(await searchFiles({ root, query: 'needle', timeoutMs: 2000 }), { results: [{ path: 'a.txt', line: 1, text: 'needle' }], truncated: true });
 });
 
 // ------------------------------------------------------------------ the demo's project, in memory
