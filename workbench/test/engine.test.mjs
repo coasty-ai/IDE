@@ -4143,6 +4143,27 @@ test('full permissions in words: a thanks before them still acts, a question nev
   await t.engine.shutdown();
 });
 
+test('full permissions in words: an agent named like them is reached by its name, a question with "?!" changes nothing, and "turn it off then" answers their card', async () => {
+  const t = live({ prefs: prefsStore({ permissions: 'full' }) });
+  t.engine.deps.commands = commands;
+  const { id } = await started(t, { task: 'Turn off full permissions when the repo is public' });
+  assert.equal(t.store.get(id).name, 'Turn off full permissions');
+  for (const said of ['turn off full permissions', 'Turn off full permissions.']) {
+    const r = await t.engine.command(said);
+    assert.equal(r.confirm, undefined, `${said}: no launch card`);
+    assert.equal(t.engine.permissionMode, 'full', said);
+  }
+  for (const q of ['ask first?!', 'ask first? please', 'ask first?.']) {
+    assert.notEqual((await t.engine.command(q)).reply, FULL_OFF, q);
+    assert.equal(t.engine.permissionMode, 'full', q);
+  }
+  assert.equal((await t.engine.command('ask first')).reply, FULL_OFF);
+  const card = await t.engine.command('stop asking');
+  assert.equal((await t.engine.command('turn it off then', { confirmId: card.confirm.id })).reply, 'OK, agents still ask before risky steps.');
+  assert.equal(t.engine.permissionMode, 'ask');
+  await t.engine.shutdown();
+});
+
 test('full permissions: the launch, the spending limit and Codex are as before', async () => {
   const t = live({ prefs: prefsStore({ permissions: 'full' }) });
   t.engine.deps.commands = commands;
