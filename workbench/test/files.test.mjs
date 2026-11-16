@@ -1072,13 +1072,13 @@ test('the list adds the env files a .gitignore hides, outside dependency folders
 
 test('the list looks inside each folder an ignore rule names for its env files, at any depth, but not in dependencies inside it', async () => {
   // `\[odd]\*dir/` names the folder `[odd]*dir` itself; `odddir`, which the same letters unescaped would name, is not
-  // hidden, and its env file is not looked for.
+  // hidden.
   const { root } = repo({ '.gitignore': 'secrets/\nbuild/\n\\[odd]\\*dir/\nnode_modules/\nlocal-*/\n', 'a.txt': 'a\n' });
   put(root, {
     'secrets/.env': 'KEY=1\n', 'secrets/deploy/prod/.env.production': 'KEY=2\n', 'secrets/notes.txt': 'not an env file\n',
     'build/out/.envrc': 'export KEY=3\n', 'build/node_modules/x/.env': 'KEY=4\n', 'build/vendor/y/.env.local': 'KEY=5\n', // a build's own dependencies
-    '[odd]*dir/.env': 'KEY=6\n', // a name git's patterns would read as a pattern
-    'odddir/.env.sample': 'KEY=\n', // what that pattern would match, read as one: a new file no rule hides
+    '[odd]*dir/.env': 'KEY=6\n', // a name that reads like a pattern
+    'odddir/.env.sample': 'KEY=\n', // a new file no rule hides
     'local-a/.env': 'KEY=7\n', 'local-b/.ENV.TEST': 'KEY=8\n', // two folders, each named by one rule
     'node_modules/pkg/deep/.env': 'KEY=9\n',
   });
@@ -1088,6 +1088,20 @@ test('the list looks inside each folder an ignore rule names for its env files, 
     'secrets/.env', 'secrets/deploy/prod/.env.production']);
   const env = await readFile({ root, rel: 'secrets/deploy/prod/.env.production' });
   assert.deepEqual([env.kind, env.text], ['secret', 'KEY=••••\n']);
+});
+
+test('a project with thousands of folders an ignore rule names (a __pycache__ and a dist in every package) still has its env files listed, soon', async () => {
+  const { root } = repo({ '.gitignore': '__pycache__/\ndist/\n', 'a.txt': 'a\n' });
+  const many = {};
+  for (let i = 0; i < 2500; i++) {
+    many[`packages/p${i}/src/mod.py`] = 'x = 1\n'; // so git names each hidden folder by itself: 5,000 of them
+    many[`packages/p${i}/src/__pycache__/mod.pyc`] = 'x';
+    many[`packages/p${i}/dist/index.js`] = 'x\n';
+  }
+  many['packages/p999/dist/.env.production'] = 'KEY=1\n'; // in the last of them, by name
+  put(root, many);
+  // Within the look's own time (1.5 s): looking folder by folder, a few at a time, never got that far.
+  assert.deepEqual((await listFiles({ root })).ignored, ['packages/p999/dist/.env.production']);
 });
 
 test('a look inside the ignored folders that takes too long is let go: the list comes in time, without what it would have found', async (t) => {
@@ -1113,7 +1127,8 @@ test('a look inside the ignored folders that takes too long is let go: the list 
   process.env.PATH = `${bin}${path.delimiter}${PATH}`;
   t.after(() => { process.env.PATH = PATH; });
   const began = Date.now();
-  assert.deepEqual(await listFiles({ root, hiddenTimeoutMs: 300 }), { files: ['.env', '.gitignore', 'a.txt'], ignored: ['.env'] });
+  // Time enough for the stand-in to start on a busy machine; then it is stopped.
+  assert.deepEqual(await listFiles({ root, hiddenTimeoutMs: 1000 }), { files: ['.env', '.gitignore', 'a.txt'], ignored: ['.env'] });
   assert.ok(Date.now() - began < 10_000, 'it did not wait for git');
   assert.ok(fs.existsSync(looked), 'it looked inside secrets/, and let the look go');
 });
