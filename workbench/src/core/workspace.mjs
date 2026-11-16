@@ -361,6 +361,7 @@ async function takeBack(root, wsPath, branch) {
 
 const FILL_TIMEOUT_MS = 10 * 60_000; // the whole fill
 const CP_TIMEOUT_MS = 5 * 60_000; // one cp
+const CP_START_MS = 1000; // no cp starts with less of the fill's time left than this
 const CP_AT_ONCE = 8;
 /**
  * The most of what one cp says that is kept. A copy that cannot clone fails once for every file, far more than this
@@ -373,8 +374,11 @@ const INCLUDE_MAX_BYTES = 256 * 1024;
 /** Env files by name: .env, .env.<anything> (.env.local, .env.development.local) and direnv's .envrc. */
 const ENV_NAMES = ['.env', '.env.*', '.envrc'];
 const isEnvName = n => n === '.env' || n.startsWith('.env.') || n === '.envrc';
-/** Folders of installed packages and of version control: what is in them is never one of the project's own env files. */
-const DEPENDENCY_FOLDERS = new Set(['node_modules', 'bower_components', 'jspm_packages', '.venv', 'venv']);
+/**
+ * Folders of installed packages (and pnpm's store of them, Composer's and Bundler's vendor/) and of version control:
+ * what is in them is never one of the project's own env files, and is copied only as a clone.
+ */
+const DEPENDENCY_FOLDERS = new Set(['node_modules', 'bower_components', 'jspm_packages', '.pnpm-store', 'vendor', '.venv', 'venv']);
 const VCS_FOLDERS = new Set(['.git', '.hg', '.svn', '.bzr', '.jj', '.sl', '_darcs']);
 
 /**
@@ -384,23 +388,28 @@ const VCS_FOLDERS = new Set(['.git', '.hg', '.svn', '.bzr', '.jj', '.sl', '_darc
  * What: with a .worktreeinclude at the top of the person's folder (a regular file, never followed as a link), exactly the
  * paths git ignores there that match it, in gitignore syntax (kind 'listed'). Without one, every env file git ignores
  * (kind 'env') and every node_modules folder it ignores (kind 'deps'), outside folders of installed packages and of
- * version control. Python virtualenvs never by default (they hold absolute paths, and a copy runs the original's code);
- * one that .worktreeinclude names is copied anyway, and also listed in `skipped` with why 'venv'.
+ * version control, and node_modules only outside a folder git ignores as a whole. Python virtualenvs never by default
+ * (they hold absolute paths, and a copy runs the original's code); one that .worktreeinclude names is copied anyway,
+ * and also listed in `skipped` with why 'venv'.
  *
- * How: one cp per entry, at most CP_AT_ONCE at once, each within CP_TIMEOUT_MS and the time left of `timeoutMs`. A
- * folder of installed packages (node_modules) or of version control, or a virtualenv, is copied only as a clone, and
- * left out where none can be made; anything else is copied plainly then. On a Mac `/bin/cp -c -R -p` clones (APFS), and cannot to another volume.
+ * How: one cp per entry, at most CP_AT_ONCE at once, each within CP_TIMEOUT_MS and the time left of `timeoutMs`, and
+ * none started with less than CP_START_MS left. A folder of installed packages (node_modules) or of version control,
+ * a virtualenv, or a folder inside one of those, is copied only as a clone, and left out where none can be made;
+ * anything else is copied plainly then. On a Mac `/bin/cp -c -R -p` clones (APFS), and cannot to another volume.
  * Elsewhere GNU cp: `-a --reflink=always` for those folders (ext4 makes no clones), `-a --reflink=auto` for the rest.
  * Never with Node: on a Mac, fs.copyFile makes a full copy even when asked to clone, and fs.cp makes relative links
- * absolute unless told not to.
+ * absolute unless told not to. A folder made on the way gets the mode of the person's folder it stands for.
  *
- * An entry that fails is left out (its half-made copy removed) and the others go on. Nothing throws but bad arguments:
- * when git cannot list the folder, nothing is copied and `skipped` is [{ path: '.', why: 'failed' }]; when
- * .worktreeinclude cannot be read, [{ path: '.worktreeinclude', why: 'failed' }].
+ * An entry that fails is left out (its half-made copy removed) and the others go on. Only bad arguments reject: a
+ * `repoRoot` that is not the top folder of a checkout, or a `path` that git does not list as one of its worktrees.
+ * When git cannot list the folder, nothing is copied and `skipped` is [{ path: '.', why: 'failed' }]; when
+ * .worktreeinclude cannot be read, [{ path: '.worktreeinclude', why: 'failed' }]; a folder git ignores as a whole
+ * that could not be searched for env files is named with why 'failed', and the rest is copied all the same.
  * @param {{ repoRoot: string, path: string, platform?: string, run?: typeof git,
  *   copy?: (file: string, args: string[], o: { timeout: number }) => Promise<unknown>, timeoutMs?: number }} opts
- *   path: the workspace (createWorkspace's); platform: 'darwin' for the Mac's cp, anything else for GNU cp; run and
- *   copy: stand-ins for git() and cp (tests); timeoutMs: the whole fill's limit (10 minutes unless given)
+ *   repoRoot: the top folder of the person's checkout (prepareRepo's root); path: the workspace (createWorkspace's);
+ *   platform: 'darwin' for the Mac's cp, anything else for GNU cp; run and copy: stand-ins for git() and cp (tests);
+ *   timeoutMs: the whole fill's limit (10 minutes unless given)
  * @returns {Promise<{ copied: { path: string, kind: 'env'|'deps'|'listed', cloned: boolean }[],
  *   skipped: { path: string, why: 'exists'|'link-outside'|'noclone'|'failed'|'venv' }[], ms: number }>}
  *   paths relative to the repository (a folder's without its "/"), each list in path order; cloned: made with clones
@@ -417,6 +426,21 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
   const skipped = [];
   const done = () => ({ copied: copied.sort(byPath), skipped: skipped.sort(byPath), ms: Date.now() - started });
 
+  // Only into a worktree of this repository, from the top folder of the person's checkout: git names paths from the
+  // folder it runs in, so from a folder inside it app/.env would land at .env.
+  let top, worktrees;
+  try {
+    [top, worktrees] = await Promise.all([
+      run(['rev-parse', '--show-toplevel'], { cwd: root }).then(r => String(r.stdout).trim()),
+      listWorktrees(root, run),
+    ]);
+  } catch {
+    skipped.push({ path: '.', why: 'failed' });
+    return done();
+  }
+  if (!top || canonical(top) !== root) throw plainError(`The folder ${root} is not the top folder of a git repository.`);
+  if (!worktrees.some(w => canonical(w.path) === ws)) throw plainError(`The folder ${ws} is not a workspace of the repository at ${root}.`);
+
   let chosen;
   try {
     chosen = await chooseFill(run, root, deadline);
@@ -424,18 +448,19 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
     skipped.push({ path: e && e.include ? '.worktreeinclude' : '.', why: 'failed' });
     return done();
   }
+  skipped.push(...chosen.skipped);
 
   const mac = platform === 'darwin';
   const program = mac || fs.existsSync('/bin/cp') ? '/bin/cp' : 'cp';
   const cpWith = typeof copy === 'function' ? copy : runCp;
   const dep = dependencyFolders(root);
   let noClones = false; // a clone failed for want of clones: the two disks are the same for every entry
-  const made = []; // folders made on the way in the workspace
+  const made = new Map(); // folders made on the way in the workspace -> the person's folder each stands for
 
   /** One cp within the time left: { ok }, or { ok: false, noClone } with its half-made copy removed. */
   const cp = async (args, dst) => {
     const left = deadline - Date.now();
-    if (left <= 0) return { ok: false, noClone: false };
+    if (left < CP_START_MS) return { ok: false, noClone: false }; // too late to start one
     try {
       await cpWith(program, args, { timeout: Math.min(CP_TIMEOUT_MS, left) });
       return { ok: true };
@@ -460,13 +485,14 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
       return null; // gone since git listed it: nothing to copy
     }
     if (st.isSymbolicLink() && !linkStaysInside(root, src)) return 'link-outside';
-    const inTheWay = foldersFor(ws, parts, made);
+    const inTheWay = foldersFor(ws, parts, made, root);
     if (inTheWay) return inTheWay;
     if (!nothingAt(dst)) return 'exists';
     const folder = st.isDirectory();
-    // A folder of installed packages or of version control, or a virtualenv, only as a clone: a full copy of a
-    // node_modules is too slow and too big to make unasked. Anything else is copied plainly where clones cannot be made.
-    const cloneOnly = folder && (kind === 'deps' || dep.is(rel));
+    // A folder of installed packages or of version control, or a virtualenv, or one inside them (node_modules/next),
+    // only as a clone: a full copy of a node_modules is too slow and too big to make unasked. Anything else is copied
+    // plainly where clones cannot be made.
+    const cloneOnly = folder && (kind === 'deps' || dep.is(rel) || dep.above(rel));
     let cloned;
     if (mac) {
       // A clone takes almost no disk, and seconds for a node_modules.
@@ -498,7 +524,7 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
   };
 
   const order = { env: 0, listed: 1, deps: 2 }; // the small files first
-  const queue = chosen.sort((a, b) => order[a.kind] - order[b.kind] || byPath(a, b));
+  const queue = chosen.entries.sort((a, b) => order[a.kind] - order[b.kind] || byPath(a, b));
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(CP_AT_ONCE, queue.length) }, async () => {
     while (next < queue.length) {
@@ -512,10 +538,27 @@ export async function fillWorkspace({ repoRoot, path: wsPath, platform = process
       if (why) skipped.push({ path: entry.path, why });
     }
   }));
-  for (const dir of made.sort((a, b) => b.length - a.length)) { // deepest first
-    try { fs.rmdirSync(dir); } catch { /* something went into it */ }
-  }
+  settleFolders(made);
   return done();
+}
+
+/**
+ * The folders fillWorkspace made on the way (`made`: each -> the person's folder it stands for), once every copy is
+ * done: one that nothing went into is taken away again, deepest first; any other gets the mode of the person's folder,
+ * so that a 0644 .env the person keeps private with a 0700 folder is private in the agent's folder too. Each stays
+ * writable and searchable for its owner (a 0555 folder becomes 0755), or nothing could be put in or taken out of it.
+ */
+function settleFolders(made) {
+  for (const [dir, from] of [...made].sort((a, b) => b[0].length - a[0].length)) {
+    try {
+      fs.rmdirSync(dir);
+      continue;
+    } catch { /* something went into it */ }
+    try {
+      const st = fs.lstatSync(from);
+      if (st.isDirectory()) fs.chmodSync(dir, (st.mode & 0o777) | 0o700);
+    } catch { /* gone from the person's folder meanwhile: it stays 0700 */ }
+  }
 }
 
 const byPath = (a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
@@ -537,22 +580,26 @@ function runCp(file, args, { timeout = CP_TIMEOUT_MS } = {}) {
 }
 
 /**
- * What fillWorkspace copies: [{ path, kind, venvs? }], paths relative to `root` (a folder's without its "/"). Throws
- * when git cannot list them before `deadline`, or (marked .include) when .worktreeinclude cannot be read.
+ * What fillWorkspace copies: { entries: [{ path, kind, venvs? }], skipped: [{ path, why: 'failed' }] }, paths relative
+ * to `root` (a folder's without its "/"); `skipped` names the folders that could not be searched for env files. Throws
+ * when git cannot list the folder before `deadline`, or (marked .include) when .worktreeinclude cannot be read.
  */
 async function chooseFill(run, root, deadline) {
   const include = readInclude(root);
-  const ls = async args => nulList((await run(['ls-files', '-z', '--others', '--ignored', ...args],
-    { cwd: root, timeout: Math.max(1, Math.min(WORKTREE_TIMEOUT_MS, deadline - Date.now())) })).stdout);
+  const ls = async (args, until = deadline) => {
+    const left = until - Date.now();
+    if (left <= 0) throw new Error('no time left to ask git');
+    return nulList((await run(['ls-files', '-z', '--others', '--ignored', ...args], { cwd: root, timeout: Math.min(WORKTREE_TIMEOUT_MS, left) })).stdout);
+  };
   // What git ignores, a folder it ignores as a whole as one entry ("node_modules/"), never a tracked file.
   const ignored = await ls(['--exclude-standard', '--directory']);
-  if (include === null) return defaultFill(root, ignored, ls);
+  if (include === null) return defaultFill(root, ignored, ls, deadline);
   // What .worktreeinclude matches, read by git from a copy of Workbench's own: the bytes checked here, never a link.
   const scratch = privateTemp('workbench-include-');
   try {
     const file = path.join(scratch, 'worktreeinclude');
     fs.writeFileSync(file, include, { flag: 'wx', mode: 0o600 });
-    return listedFill(root, ignored, await ls([`--exclude-from=${file}`, '--directory']));
+    return { entries: listedFill(root, ignored, await ls([`--exclude-from=${file}`, '--directory'])), skipped: [] };
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
@@ -602,20 +649,33 @@ function listedFill(root, ignored, matching) {
 /**
  * Without one: every env file and every node_modules folder git ignores, outside folders of installed packages and of
  * version control (so never one node_modules inside another, nor a virtualenv's files). `ignored` shows a folder git
- * ignores as a whole only as itself, so env files are also looked for inside each such folder (.vercel/, say).
+ * ignores as a whole only as itself, so env files are also looked for inside each such folder (.vercel/, say), but not
+ * node_modules: one inside a folder git ignores as a whole is a build's own (build/node_modules). That search takes at
+ * most half of the time left, and is only a help: a folder it could not search is named in `skipped`, and the rest
+ * is copied all the same.
  */
-async function defaultFill(root, ignored, ls) {
+async function defaultFill(root, ignored, ls, deadline) {
   const dep = dependencyFolders(root);
   const deps = [...new Set(ignored.filter(p => lastPart(p) === 'node_modules' && !dep.above(p)))];
   const folders = ignored.filter(p => p.endsWith('/') && !dep.above(p) && !dep.is(p));
   const all = new Set(folders);
-  const specs = folders.filter(f => !heldAbove(all, f)).flatMap(f => ENV_NAMES.map(n => `:(glob)${globEscape(f)}**/${n}`));
+  const tops = folders.filter(f => !heldAbove(all, f));
   const found = [...ignored];
-  for (let i = 0; i < specs.length; i += ARG_BATCH) found.push(...await ls(['--exclude-standard', '--', ...specs.slice(i, i + ARG_BATCH)]));
+  const skipped = [];
+  const until = Date.now() + Math.max(0, deadline - Date.now()) / 2;
+  const each = Math.max(1, Math.floor(ARG_BATCH / ENV_NAMES.length));
+  for (let i = 0; i < tops.length; i += each) {
+    const some = tops.slice(i, i + each);
+    try {
+      found.push(...await ls(['--exclude-standard', '--', ...some.flatMap(f => ENV_NAMES.map(n => `:(glob)${globEscape(f)}**/${n}`))], until));
+    } catch {
+      skipped.push(...some.map(f => ({ path: f.replace(/\/+$/, ''), why: 'failed' })));
+    }
+  }
   // An env file is a file (or a link): a folder named .env is something else (a virtualenv, often), and another
   // repository inside an ignored folder comes back as a folder.
   const envs = [...new Set(found)].filter(p => !p.endsWith('/') && isEnvName(lastPart(p)) && !dep.above(p));
-  return [...envs.map(p => ({ path: p, kind: 'env' })), ...deps.map(p => ({ path: p.replace(/\/+$/, ''), kind: 'deps' }))];
+  return { entries: [...envs.map(p => ({ path: p, kind: 'env' })), ...deps.map(p => ({ path: p.replace(/\/+$/, ''), kind: 'deps' }))], skipped };
 }
 
 /** Which folders (relative to `root`) hold installed packages, a virtualenv or version control; each looked at once. */
@@ -671,17 +731,20 @@ function realFolders(top, parts) {
 }
 
 /**
- * Make the folders missing on the way to the path `parts` in `top`, noting each in `made`. Returns null, or why not:
+ * Make the folders missing on the way to the path `parts` in `top`, each 0700 while the fill goes on (settleFolders
+ * gives it its mode at the end), noting it in `made` with the folder of `from` it stands for. Returns null, or why not:
  * 'exists' when something other than a real folder is in the way, a link or a file (nothing is ever written through a
  * link), 'failed' when a folder cannot be made.
  */
-function foldersFor(top, parts, made) {
+function foldersFor(top, parts, made, from) {
   let dir = top;
+  let src = from;
   for (const part of parts.slice(0, -1)) {
     dir = path.join(dir, part);
+    src = path.join(src, part);
     try {
-      fs.mkdirSync(dir);
-      made.push(dir);
+      fs.mkdirSync(dir, { mode: 0o700 });
+      made.set(dir, src);
     } catch (e) {
       if (e.code !== 'EEXIST') return 'failed';
       if (!isRealFolder(dir)) return 'exists';
